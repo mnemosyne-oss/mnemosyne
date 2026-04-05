@@ -1,0 +1,14 @@
+name: mnemosyne
+version: 1.0.0
+description: Native AI memory system with SQLite - zero dependencies, sub-millisecond latency
+author: FluxSpeak AI
+provides_tools:
+  - mnemosyne_remember
+  - mnemosyne_recall
+  - mnemosyne_stats
+provides_hooks:
+  - pre_llm_call
+  - on_session_start
+  - post_tool_call
+dependencies: []
+# Mnemosyne requires no external dependencies - pure Python + SQLite
