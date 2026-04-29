@@ -112,15 +112,25 @@ class Mnemosyne:
 
     def remember(self, content: str, source: str = "conversation",
                  importance: float = 0.5, metadata: Dict = None,
-                 valid_until: str = None, scope: str = "session") -> str:
+                 valid_until: str = None, scope: str = "session",
+                 extract_entities: bool = False,
+                 extract: bool = False) -> str:
         """
         Store a memory directly to SQLite.
         Writes to both BEAM working_memory and legacy memories table.
+
+        Args:
+            extract_entities: If True, extract entities from content and store
+                as triples for fuzzy entity-aware recall. Default False.
+            extract: If True, extract structured facts from content using LLM
+                and store as triples. Default False.
         """
-        memory_id = generate_id(content)
+        # BEAM write first (generates its own ID)
+        memory_id = self.beam.remember(content, source=source, importance=importance, metadata=metadata,
+                           valid_until=valid_until, scope=scope)
         timestamp = datetime.now().isoformat()
 
-        # Legacy dual-write
+        # Legacy dual-write with same ID
         cursor = self.conn.cursor()
         cursor.execute("""
             INSERT INTO memories (id, content, source, timestamp, session_id, importance, metadata_json)
@@ -141,9 +151,36 @@ class Mnemosyne:
 
         self.conn.commit()
 
-        # BEAM write
-        self.beam.remember(content, source=source, importance=importance, metadata=metadata,
-                           valid_until=valid_until, scope=scope)
+        # Entity extraction (best-effort, never fails the memory write)
+        if extract_entities:
+            try:
+                from mnemosyne.core.entities import extract_entities_regex
+                from mnemosyne.core.triples import TripleStore
+                entities = extract_entities_regex(content)
+                if entities:
+                    triples = TripleStore(db_path=self.db_path)
+                    for entity in entities:
+                        triples.add(
+                            subject=memory_id,
+                            predicate="mentions",
+                            object=entity,
+                            source=source,
+                            confidence=0.8
+                        )
+            except Exception:
+                pass  # Entity extraction is best-effort
+
+        # Structured fact extraction (best-effort, never fails the memory write)
+        if extract:
+            try:
+                from mnemosyne.core.extraction import extract_facts_safe
+                from mnemosyne.core.triples import TripleStore
+                facts = extract_facts_safe(content)
+                if facts:
+                    triples = TripleStore(db_path=self.db_path)
+                    triples.add_facts(memory_id, facts, source=source, confidence=0.7)
+            except Exception:
+                pass  # Fact extraction is best-effort
 
         return memory_id
 
@@ -409,10 +446,14 @@ def _get_default():
 # Module-level convenience functions
 def remember(content: str, source: str = "conversation",
              importance: float = 0.5, metadata: Dict = None,
-             scope: str = "session", valid_until: str = None) -> str:
+             scope: str = "session", valid_until: str = None,
+             extract_entities: bool = False,
+             extract: bool = False) -> str:
     """Store a memory using the global instance"""
     return _get_default().remember(content, source, importance, metadata,
-                                   scope=scope, valid_until=valid_until)
+                                   scope=scope, valid_until=valid_until,
+                                   extract_entities=extract_entities,
+                                   extract=extract)
 
 
 def recall(query: str, top_k: int = 5, *, from_date: Optional[str] = None, to_date: Optional[str] = None, source: Optional[str] = None, topic: Optional[str] = None) -> List[Dict]:

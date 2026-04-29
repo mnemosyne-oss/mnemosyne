@@ -20,7 +20,7 @@ import threading
 import math
 import numpy as np
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Set
 from pathlib import Path
 
 from mnemosyne.core import embeddings as _embeddings
@@ -304,6 +304,119 @@ def _vec_available(conn: sqlite3.Connection) -> bool:
         return False
 
 
+def _extract_and_store_entities(beam: "BeamMemory", memory_id: str, content: str):
+    """
+    Extract entities from content and store as triples.
+    Called internally by remember() when extract_entities=True.
+    """
+    try:
+        from mnemosyne.core.entities import extract_entities_regex
+        from mnemosyne.core.triples import TripleStore
+        
+        entities = extract_entities_regex(content)
+        if not entities:
+            return
+        
+        triples = TripleStore(db_path=beam.db_path)
+        for entity in entities:
+            triples.add(
+                subject=memory_id,
+                predicate="mentions",
+                object=entity,
+                source="regex",
+                confidence=0.8
+            )
+    except Exception:
+        # Entity extraction is best-effort; never fail remember() because of it
+        pass
+
+
+def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, source: str = ""):
+    """
+    Extract structured facts from content using LLM and store as triples.
+    Called internally by remember() when extract=True.
+    """
+    try:
+        from mnemosyne.core.extraction import extract_facts_safe
+        from mnemosyne.core.triples import TripleStore
+        
+        facts = extract_facts_safe(content)
+        if not facts:
+            return
+        
+        triples = TripleStore(db_path=beam.db_path)
+        triples.add_facts(memory_id, facts, source=source, confidence=0.7)
+    except Exception:
+        # Fact extraction is best-effort; never fail remember() because of it
+        pass
+
+
+def _find_memories_by_entity(beam: "BeamMemory", entity_name: str, threshold: float = 0.8) -> List[str]:
+    """
+    Find memory IDs that mention an entity (or similar entity via fuzzy match).
+    Returns list of memory_id strings.
+    """
+    try:
+        from mnemosyne.core.entities import find_similar_entities
+        from mnemosyne.core.triples import TripleStore
+        
+        triples = TripleStore(db_path=beam.db_path)
+        
+        # Get all known entities
+        known_entities = triples.get_distinct_objects("mentions")
+        if not known_entities:
+            return []
+        
+        # Find similar entities
+        matches = find_similar_entities(entity_name, known_entities, threshold=threshold)
+        
+        # Collect memory IDs for all matched entities
+        memory_ids: Set[str] = set()
+        for matched_entity, _ in matches:
+            results = triples.query_by_predicate("mentions", object=matched_entity)
+            for row in results:
+                memory_ids.add(row["subject"])
+        
+        return list(memory_ids)
+    except Exception:
+        return []
+
+
+def _find_memories_by_fact(beam: "BeamMemory", query: str) -> List[str]:
+    """
+    Find memory IDs that have extracted facts matching the query.
+    Does simple keyword matching against stored fact triples.
+    Returns list of memory_id strings.
+    """
+    try:
+        from mnemosyne.core.triples import TripleStore
+        
+        triples = TripleStore(db_path=beam.db_path)
+        
+        # Get all fact triples
+        all_facts = triples.query_by_predicate("fact")
+        if not all_facts:
+            return []
+        
+        query_lower = query.lower()
+        query_words = set(query_lower.split())
+        
+        # Simple keyword matching against fact text
+        memory_ids: Set[str] = set()
+        for fact_row in all_facts:
+            fact_text = fact_row.get("object", "").lower()
+            # Check if any query word appears in the fact
+            if any(word in fact_text for word in query_words):
+                memory_ids.add(fact_row["subject"])
+            # Also check if the full query is a substring of the fact
+            elif query_lower in fact_text:
+                memory_ids.add(fact_row["subject"])
+        
+        return list(memory_ids)
+    except Exception:
+        return []
+
+
 def _in_memory_vec_search(conn: sqlite3.Connection, query_embedding: np.ndarray, k: int = 20) -> List[Dict]:
     """Fallback vector search using memory_embeddings table + numpy cosine similarity."""
     cursor = conn.cursor()
@@ -457,8 +570,22 @@ class BeamMemory:
 
     def remember(self, content: str, source: str = "conversation",
                  importance: float = 0.5, metadata: Dict = None,
-                 valid_until: str = None, scope: str = "session") -> str:
-        """Store into working_memory. Deduplicates exact content matches."""
+                 valid_until: str = None, scope: str = "session",
+                 extract_entities: bool = False,
+                 extract: bool = False) -> str:
+        """Store into working_memory. Deduplicates exact content matches.
+
+        Args:
+            content: The text to remember
+            source: Origin of the memory (e.g., "conversation", "document")
+            importance: 0.0-1.0 relevance score
+            metadata: Optional dict of additional fields
+            valid_until: ISO timestamp when this memory expires
+            scope: "session" or "global"
+            extract_entities: If True, extract and store entity mentions as triples
+            extract: If True, extract structured facts from content using LLM
+                and store as triples. Default False.
+        """
         # --- Deduplication: exact match ---
         existing_id = self._find_duplicate(content)
         if existing_id:
@@ -485,10 +612,18 @@ class BeamMemory:
               json.dumps(metadata or {}), valid_until, scope))
         self.conn.commit()
         self._trim_working_memory()
-        
+
         # Auto-generate temporal triple
         self._add_temporal_triple(memory_id, timestamp, source, content)
-        
+
+        # --- Entity extraction ---
+        if extract_entities:
+            _extract_and_store_entities(self, memory_id, content)
+
+        # --- Structured fact extraction ---
+        if extract:
+            _extract_and_store_facts(self, memory_id, content, source)
+
         return memory_id
 
     def remember_batch(self, items: List[Dict]) -> List[str]:
@@ -803,6 +938,183 @@ class BeamMemory:
                     "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
                     "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None
                 })
+
+        # ---- Entity-aware recall ----
+        entity_memory_ids = _find_memories_by_entity(self, query)
+        if entity_memory_ids:
+            # Fetch entity-matched memories and boost their scores
+            placeholders = ",".join("?" * len(entity_memory_ids))
+            cursor = self.conn.cursor()
+            cursor.execute(f"""
+                SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope
+                FROM working_memory
+                WHERE id IN ({placeholders})
+                  AND {wm_where}
+            """, (*tuple(entity_memory_ids), *wm_params))
+            entity_rows = cursor.fetchall()
+            
+            # Add entity-matched memories with boosted scores
+            existing_ids = {r["id"] for r in results}
+            for row in entity_rows:
+                if row["id"] in existing_ids:
+                    # Boost existing result
+                    for r in results:
+                        if r["id"] == row["id"]:
+                            r["score"] = round(min(r["score"] * 1.3, 1.0), 4)
+                            r["entity_match"] = True
+                            break
+                else:
+                    decay = _recency_decay(row["timestamp"])
+                    score = (0.6 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
+                    results.append({
+                        "id": row["id"],
+                        "content": row["content"][:500],
+                        "source": row["source"],
+                        "timestamp": row["timestamp"],
+                        "tier": "working",
+                        "score": round(score, 4),
+                        "keyword_score": 0.0,
+                        "dense_score": 0.0,
+                        "fts_score": 0.0,
+                        "importance": row["importance"],
+                        "recall_count": row["recall_count"] or 0,
+                        "last_recalled": row["last_recalled"],
+                        "recency_decay": round(decay, 4),
+                        "scope": row["scope"] if "scope" in row.keys() else "session",
+                        "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
+                        "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
+                        "entity_match": True
+                    })
+            
+            # Also check episodic memory for entity matches
+            em_placeholders = ",".join("?" * len(entity_memory_ids))
+            cursor.execute(f"""
+                SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope
+                FROM episodic_memory
+                WHERE id IN ({em_placeholders})
+                  AND (session_id = ? OR scope = 'global')
+                  AND (valid_until IS NULL OR valid_until > ?)
+                  AND superseded_by IS NULL
+            """, (*tuple(entity_memory_ids), self.session_id, datetime.now().isoformat()))
+            em_entity_rows = cursor.fetchall()
+            
+            em_existing_ids = {r["id"] for r in results}
+            for row in em_entity_rows:
+                if row["id"] in em_existing_ids:
+                    for r in results:
+                        if r["id"] == row["id"]:
+                            r["score"] = round(min(r["score"] * 1.3, 1.0), 4)
+                            r["entity_match"] = True
+                            break
+                else:
+                    decay = _recency_decay(row["timestamp"])
+                    score = (0.6 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
+                    results.append({
+                        "id": row["id"],
+                        "content": row["content"][:500],
+                        "source": row["source"],
+                        "timestamp": row["timestamp"],
+                        "tier": "episodic",
+                        "score": round(score, 4),
+                        "keyword_score": 0.0,
+                        "dense_score": 0.0,
+                        "fts_score": 0.0,
+                        "importance": row["importance"],
+                        "recall_count": row["recall_count"] or 0,
+                        "last_recalled": row["last_recalled"],
+                        "recency_decay": round(decay, 4),
+                        "scope": row["scope"] if "scope" in row.keys() else "session",
+                        "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
+                        "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
+                        "entity_match": True
+                    })
+
+        # ---- Fact-aware recall ----
+        fact_memory_ids = _find_memories_by_fact(self, query)
+        if fact_memory_ids:
+            placeholders = ",".join("?" * len(fact_memory_ids))
+            cursor = self.conn.cursor()
+            # Check working_memory for fact matches
+            cursor.execute(f"""
+                SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope
+                FROM working_memory
+                WHERE id IN ({placeholders})
+                  AND {wm_where}
+            """, (*tuple(fact_memory_ids), *wm_params))
+            fact_rows = cursor.fetchall()
+            
+            existing_ids = {r["id"] for r in results}
+            for row in fact_rows:
+                if row["id"] in existing_ids:
+                    for r in results:
+                        if r["id"] == row["id"]:
+                            r["score"] = round(min(r["score"] * 1.2, 1.0), 4)
+                            r["fact_match"] = True
+                            break
+                else:
+                    decay = _recency_decay(row["timestamp"])
+                    score = (0.5 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
+                    results.append({
+                        "id": row["id"],
+                        "content": row["content"][:500],
+                        "source": row["source"],
+                        "timestamp": row["timestamp"],
+                        "tier": "working",
+                        "score": round(score, 4),
+                        "keyword_score": 0.0,
+                        "dense_score": 0.0,
+                        "fts_score": 0.0,
+                        "importance": row["importance"],
+                        "recall_count": row["recall_count"] or 0,
+                        "last_recalled": row["last_recalled"],
+                        "recency_decay": round(decay, 4),
+                        "scope": row["scope"] if "scope" in row.keys() else "session",
+                        "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
+                        "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
+                        "fact_match": True
+                    })
+            
+            # Also check episodic memory for fact matches
+            cursor.execute(f"""
+                SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope
+                FROM episodic_memory
+                WHERE id IN ({placeholders})
+                  AND (session_id = ? OR scope = 'global')
+                  AND (valid_until IS NULL OR valid_until > ?)
+                  AND superseded_by IS NULL
+            """, (*tuple(fact_memory_ids), self.session_id, datetime.now().isoformat()))
+            em_fact_rows = cursor.fetchall()
+            
+            em_existing_ids = {r["id"] for r in results}
+            for row in em_fact_rows:
+                if row["id"] in em_existing_ids:
+                    for r in results:
+                        if r["id"] == row["id"]:
+                            r["score"] = round(min(r["score"] * 1.2, 1.0), 4)
+                            r["fact_match"] = True
+                            break
+                else:
+                    decay = _recency_decay(row["timestamp"])
+                    score = (0.5 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
+                    results.append({
+                        "id": row["id"],
+                        "content": row["content"][:500],
+                        "source": row["source"],
+                        "timestamp": row["timestamp"],
+                        "tier": "episodic",
+                        "score": round(score, 4),
+                        "keyword_score": 0.0,
+                        "dense_score": 0.0,
+                        "fts_score": 0.0,
+                        "importance": row["importance"],
+                        "recall_count": row["recall_count"] or 0,
+                        "last_recalled": row["last_recalled"],
+                        "recency_decay": round(decay, 4),
+                        "scope": row["scope"] if "scope" in row.keys() else "session",
+                        "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
+                        "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
+                        "fact_match": True
+                    })
 
         # ---- Episodic memory (vec + FTS5 hybrid) ----
         vec_results = {}

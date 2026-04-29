@@ -12,8 +12,8 @@ from typing import List, Dict, Optional
 DEFAULT_DB = Path.home() / ".hermes" / "mnemosyne" / "data" / "triples.db"
 
 
-def _get_conn(db_path: Path = None) -> sqlite3.Connection:
-    path = db_path or DEFAULT_DB
+def _get_conn(db_path = None) -> sqlite3.Connection:
+    path = Path(db_path) if db_path else DEFAULT_DB
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -117,6 +117,79 @@ class TripleStore:
         cursor.execute(f"SELECT * FROM triples WHERE {where_clause} ORDER BY valid_from DESC", params)
         
         return [dict(row) for row in cursor.fetchall()]
+
+    def query_by_predicate(self, predicate: str, object: str = None, subject: str = None) -> List[Dict]:
+        """
+        Query triples by predicate, optionally filtering by object or subject.
+        
+        Useful for entity queries: find all memories that mention a specific entity.
+        
+        Examples:
+            >>> kg.query_by_predicate("mentions", "Abdias")
+            # Returns all triples where someone/something mentions Abdias
+            
+            >>> kg.query_by_predicate("mentions", subject="memory_123")
+            # Returns entities mentioned by memory_123
+        """
+        cursor = self.conn.cursor()
+        
+        conditions = ["predicate = ?"]
+        params = [predicate]
+        
+        if object:
+            conditions.append("object = ?")
+            params.append(object)
+        if subject:
+            conditions.append("subject = ?")
+            params.append(subject)
+        
+        where_clause = " AND ".join(conditions)
+        cursor.execute(f"SELECT * FROM triples WHERE {where_clause} ORDER BY created_at DESC", params)
+        
+        return [dict(row) for row in cursor.fetchall()]
+    
+    def get_distinct_objects(self, predicate: str) -> List[str]:
+        """
+        Get all distinct object values for a given predicate.
+        
+        Useful for building entity lists: get all known entities that have been mentioned.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT DISTINCT object FROM triples WHERE predicate = ? ORDER BY object",
+            (predicate,)
+        )
+        return [row["object"] for row in cursor.fetchall()]
+
+    def add_facts(self, memory_id: str, facts: List[str], source: str = "", confidence: float = 0.7) -> int:
+        """
+        Batch-store extracted facts as triples.
+
+        Args:
+            memory_id: The subject memory ID
+            facts: List of fact strings to store
+            source: Source identifier
+            confidence: Confidence score for extracted facts (default 0.7)
+
+        Returns:
+            Number of facts stored
+        """
+        if not facts:
+            return 0
+
+        stored = 0
+        for fact in facts:
+            if fact and len(fact) > 10:
+                self.add(
+                    subject=memory_id,
+                    predicate="fact",
+                    object=fact,
+                    source=source,
+                    confidence=confidence
+                )
+                stored += 1
+
+        return stored
 
     def export_all(self) -> List[Dict]:
         """Export all triples to a list of dictionaries."""

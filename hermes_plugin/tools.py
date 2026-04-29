@@ -35,6 +35,16 @@ REMEMBER_SCHEMA = {
                 "type": "string",
                 "description": "'session' (default) or 'global' to make visible across all sessions",
                 "enum": ["session", "global"]
+            },
+            "extract_entities": {
+                "type": "boolean",
+                "description": "If true, extract named entities from content and link them for fuzzy recall (e.g. 'Abdias' and 'Abdias J.' will match)",
+                "default": False
+            },
+            "extract": {
+                "type": "boolean",
+                "description": "If true, extract structured facts from content using LLM and store as triples for fact-aware recall",
+                "default": False
             }
         },
         "required": ["content"]
@@ -260,14 +270,19 @@ def mnemosyne_remember(args: dict, **kwargs) -> str:
         source = args.get("source", "conversation")
         valid_until = args.get("valid_until")
         scope = args.get("scope", "session")
+        extract_entities = args.get("extract_entities", False)
 
         if not content:
             return json.dumps({"error": "Content is required"})
 
+        extract = args.get("extract", False)
+
         mem = _get_memory()
         memory_id = mem.remember(
             content, source=source, importance=importance,
-            valid_until=valid_until, scope=scope
+            valid_until=valid_until, scope=scope,
+            extract_entities=extract_entities,
+            extract=extract
         )
 
         return json.dumps({
@@ -275,6 +290,8 @@ def mnemosyne_remember(args: dict, **kwargs) -> str:
             "id": memory_id,
             "scope": scope,
             "valid_until": valid_until,
+            "extract_entities": extract_entities,
+            "extract": extract,
             "content_preview": content[:80] + "..." if len(content) > 80 else content
         })
 
