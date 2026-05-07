@@ -152,3 +152,95 @@ def test_on_session_end_no_op_without_beam():
     provider._beam = None
     # Must not raise.
     provider.on_session_end(messages=[])
+
+
+def test_on_session_end_logs_when_sleep_raises_in_daemon_thread(caplog):
+    """Codex finding 3: exceptions from beam.sleep() now happen in the daemon
+    thread; the wrapper must catch them and log at DEBUG instead of letting
+    the traceback escape uncaught."""
+    beam = MagicMock()
+    beam.sleep.side_effect = RuntimeError("synthetic explosion")
+    provider = MnemosyneMemoryProvider()
+    provider._beam = beam
+    provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 1.0  # plenty of time for the raise to happen
+
+    with caplog.at_level("DEBUG", logger="hermes_memory_provider"):
+        provider.on_session_end(messages=[])
+    # Wait for daemon thread to fully run the wrapper.
+    if provider._session_end_thread is not None:
+        provider._session_end_thread.join(timeout=2.0)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("session-end sleep failed" in m and "synthetic explosion" in m for m in msgs), msgs
+
+
+def test_shutdown_drains_in_flight_session_end_thread(caplog):
+    """Codex finding 4: shutdown() must briefly wait for an in-flight
+    session_end thread before clearing the host backend, otherwise the
+    daemon thread's late host call sees backend=None and degrades to remote."""
+    from hermes_memory_provider import hermes_llm_adapter
+
+    # Make the session_end thread block for ~0.4s — longer than the
+    # session_end timeout (0.1s) but well within the shutdown drain.
+    beam = MagicMock()
+    sleep_started = []
+    sleep_finished = []
+
+    def slow_sleep():
+        sleep_started.append(True)
+        time.sleep(0.4)
+        sleep_finished.append(True)
+
+    beam.sleep.side_effect = slow_sleep
+    provider = MnemosyneMemoryProvider()
+    provider._beam = beam
+    provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 0.1
+    provider.SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 1.0
+
+    # Start session_end (returns after 0.1s; daemon keeps running)
+    provider.on_session_end(messages=[])
+    assert provider._session_end_thread is not None
+    assert provider._session_end_thread.is_alive(), "daemon should still be running"
+
+    # Register the host backend so we can observe it being cleared
+    hermes_llm_adapter.register_hermes_host_llm()
+    assert get_host_llm_backend() is not None
+
+    # Shutdown should drain the in-flight thread BEFORE clearing the backend
+    provider.shutdown()
+
+    # By now the daemon thread should have finished
+    assert sleep_started, "daemon should have started"
+    assert sleep_finished, "shutdown should have drained the in-flight daemon"
+    assert get_host_llm_backend() is None  # cleared after drain
+
+
+def test_shutdown_proceeds_when_drain_times_out(caplog):
+    """If the drain takes longer than SHUTDOWN_DRAIN_TIMEOUT_SECONDS, shutdown
+    proceeds (we don't want shutdown to block indefinitely either)."""
+    from hermes_memory_provider import hermes_llm_adapter
+
+    beam = MagicMock()
+    beam.sleep.side_effect = lambda: time.sleep(5.0)
+    provider = MnemosyneMemoryProvider()
+    provider._beam = beam
+    provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 0.05
+    provider.SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 0.2
+
+    provider.on_session_end(messages=[])
+    hermes_llm_adapter.register_hermes_host_llm()
+
+    start = time.monotonic()
+    with caplog.at_level("DEBUG", logger="hermes_memory_provider"):
+        provider.shutdown()
+    elapsed = time.monotonic() - start
+
+    # Total shutdown should be bounded by drain timeout + small slack.
+    assert elapsed < 1.0, f"shutdown took {elapsed:.2f}s, expected <1s"
+    assert get_host_llm_backend() is None
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("session-end thread still running" in m for m in msgs), msgs
+
+
+def test_shutdown_drain_default_matches_design():
+    """Production drain default should remain 2s."""
+    assert MnemosyneMemoryProvider.SHUTDOWN_DRAIN_TIMEOUT_SECONDS == 2

@@ -84,7 +84,9 @@ def test_extract_facts_safe_no_llm():
     
     # Patch llm_available at the extraction module level to ensure it returns False,
     # regardless of what module-level constants were set at import time.
-    with patch("mnemosyne.core.extraction.llm_available", return_value=False):
+    # extract_facts() now calls local_llm.llm_available() through the live module
+    # reference (so monkeypatch on local_llm reaches it). Patch there.
+    with patch("mnemosyne.core.local_llm.llm_available", return_value=False):
         facts = extract_facts_safe("I love coffee and this is long enough for extraction")
         assert facts == []
     
@@ -103,7 +105,9 @@ def test_extract_facts_safe_exception_handling():
     
     # "x" is valid text but too short for meaningful extraction.
     # Patch llm_available to ensure no LLM call is attempted.
-    with patch("mnemosyne.core.extraction.llm_available", return_value=False):
+    # extract_facts() now calls local_llm.llm_available() through the live module
+    # reference (so monkeypatch on local_llm reaches it). Patch there.
+    with patch("mnemosyne.core.local_llm.llm_available", return_value=False):
         facts = extract_facts_safe("x")
         assert facts == []
     
@@ -287,6 +291,65 @@ def test_host_extract_facts_unchanged_when_HOST_LLM_ENABLED_false(monkeypatch):
         facts = extract_facts("some content")
     assert any("Remote fact" in f for f in facts)
     assert not any("Host fact" in f for f in facts)
+
+
+def test_host_extract_facts_preserves_bulleted_output(monkeypatch):
+    """REGRESSION (codex finding): host output like '- fact one' must survive
+    so _parse_facts() can strip the bullet prefix. Earlier the helper ran
+    output through _clean_output(), which deletes whole bullet lines."""
+    _enable_host(monkeypatch)
+    monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
+
+    # Codex/GPT often returns facts as a bulleted list — exactly the shape
+    # _clean_output() would otherwise nuke at re.sub(r"^\s*[-*]\s.*\n", "").
+    set_host_llm_backend(CallableLLMBackend(
+        "test",
+        lambda *a, **k: "- Chris uses Neovim.\n- Chris dislikes VSCode.\n- Chris uses tincreek email.",
+    ))
+    facts = extract_facts("Chris said he prefers Neovim, dislikes VSCode, and uses tincreek email.")
+    assert any("Neovim" in f for f in facts), f"bullet '-' lines were stripped: {facts}"
+    assert any("VSCode" in f for f in facts)
+    assert any("tincreek" in f for f in facts)
+    # And the bullet prefix should be gone (parse_facts strips it).
+    assert not any(f.startswith("-") for f in facts)
+
+
+def test_host_extract_facts_remote_path_uses_temperature_zero(monkeypatch):
+    """REGRESSION (codex finding 2): extract_facts must pass temperature=0.0
+    even on the standalone remote path, not just the host path."""
+    monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+    monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", False)  # force remote path
+    monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
+
+    captured = {}
+
+    def fake_remote(prompt, temperature=0.3):
+        captured["temperature"] = temperature
+        return "Some fact about something.\nAnother fact about elsewhere."
+
+    monkeypatch.setattr(local_llm, "_call_remote_llm", fake_remote)
+    facts = extract_facts("some content with facts")
+    assert facts  # parsed successfully
+    assert captured["temperature"] == 0.0, (
+        "Remote extraction path must use temperature=0.0 for determinism"
+    )
+
+
+def test_host_extract_facts_returns_empty_when_both_host_and_local_fail(monkeypatch):
+    """Codex finding 5 graceful-degradation path: if host attempts and local
+    raises (e.g., oversized prompt), return [] cleanly so AAAK fallback runs."""
+    _enable_host(monkeypatch)
+    monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
+    set_host_llm_backend(CallableLLMBackend("test", lambda *a, **k: None))
+
+    def fake_local_that_blows_up(prompt, max_new_tokens, stop):
+        raise RuntimeError("simulated oversized prompt")
+
+    with patch.object(local_llm, "_call_remote_llm") as mock_remote, \
+         patch.object(local_llm, "_load_llm", return_value=fake_local_that_blows_up):
+        facts = extract_facts("some content")
+        mock_remote.assert_not_called()  # A3 still holds
+    assert facts == []
 
 
 def test_host_extract_facts_swallows_exception_then_local(monkeypatch):

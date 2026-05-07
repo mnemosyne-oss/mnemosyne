@@ -292,8 +292,13 @@ def _try_host_llm(
         provider=HOST_LLM_PROVIDER,
         model=HOST_LLM_MODEL,
     )
-    cleaned = _clean_output(raw) if raw else None
-    return (True, cleaned if cleaned else None)
+    # NB: do NOT run host output through _clean_output(): that helper exists
+    # to scrub TinyLlama prompt-template echoes and bulleted prompt repeats
+    # from local-model output. Host LLMs (Codex/GPT-class) don't echo our
+    # prompt format, AND extract_facts() relies on `- bullet` lines surviving
+    # so _parse_facts() can consume them. Just trim whitespace.
+    text = raw.strip() if isinstance(raw, str) and raw.strip() else None
+    return (True, text)
 
 
 def _clean_output(text: str) -> str:
@@ -384,8 +389,13 @@ def llm_available() -> bool:
     return bool(_llm_available)
 
 
-def _call_remote_llm(prompt: str) -> Optional[str]:
-    """Call an OpenAI-compatible remote endpoint for summarization."""
+def _call_remote_llm(prompt: str, temperature: float = 0.3) -> Optional[str]:
+    """Call an OpenAI-compatible remote endpoint for summarization.
+
+    ``temperature`` defaults to 0.3 (paraphrase-safe for consolidation);
+    callers that need deterministic output (e.g., fact extraction) can
+    pass ``temperature=0.0``.
+    """
     if not LLM_BASE_URL:
         return None
 
@@ -408,7 +418,7 @@ def _call_remote_llm(prompt: str) -> Optional[str]:
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": LLM_MAX_TOKENS,
-        "temperature": 0.3,
+        "temperature": temperature,
         "stop": ["</s>", "<|user|>"]
     }
 

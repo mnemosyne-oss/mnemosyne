@@ -176,8 +176,10 @@ def test_graceful_fallback_no_llm():
         
         mem = Mnemosyne(session_id="test_session_5", db_path=db_path)
         
-        # Patch llm_available so extraction is skipped regardless of env state
-        with patch("mnemosyne.core.extraction.llm_available", return_value=False):
+        # Patch llm_available so extraction is skipped regardless of env state.
+        # extract_facts() calls local_llm.llm_available() through the live module
+        # reference, not through extraction's at-import-time binding.
+        with patch("mnemosyne.core.local_llm.llm_available", return_value=False):
             # This should NOT raise even though extract=True and no LLM
             memory_id = mem.remember(
                 "I love coffee",

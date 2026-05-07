@@ -121,9 +121,11 @@ def extract_facts(text: str) -> List[str]:
                 return []
         return []
 
-    # 1. Remote LLM.
+    # 1. Remote LLM. Pass temperature=0.0 so the C2 determinism contract
+    # holds even on the standalone remote path (where extract_facts shares
+    # _call_remote_llm with summarize_memories' default of 0.3).
     if local_llm.LLM_ENABLED and local_llm.LLM_BASE_URL:
-        raw_output = local_llm._call_remote_llm(prompt)
+        raw_output = local_llm._call_remote_llm(prompt, temperature=0.0)
         if raw_output:
             facts = _parse_facts(local_llm._clean_output(raw_output))
             if facts:

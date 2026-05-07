@@ -217,6 +217,11 @@ class MnemosyneMemoryProvider(MemoryProvider):
         self._turn_count = 0
         self._auto_sleep_threshold = 50
         self._auto_sleep_enabled = os.environ.get("MNEMOSYNE_AUTO_SLEEP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+        # Tracked so shutdown() can wait briefly for in-flight consolidation
+        # before clearing the host LLM backend, preventing the post-timeout
+        # daemon thread from racing with unregister and falling through to
+        # MNEMOSYNE_LLM_BASE_URL.
+        self._session_end_thread: Optional[threading.Thread] = None
 
     @property
     def name(self) -> str:
@@ -482,7 +487,19 @@ class MnemosyneMemoryProvider(MemoryProvider):
         try:
             logger.info("Mnemosyne session end — running consolidation")
             timeout = self.SESSION_END_SLEEP_TIMEOUT_SECONDS
-            sleep_thread = threading.Thread(target=self._beam.sleep, daemon=True)
+            beam = self._beam
+
+            def _sleep_with_logging():
+                # Wrap the target so exceptions get logged at the same
+                # severity the previous synchronous version used, instead
+                # of bubbling out as an uncaught daemon-thread traceback.
+                try:
+                    beam.sleep()
+                except Exception as inner:
+                    logger.debug("Mnemosyne session-end sleep failed: %s", inner)
+
+            sleep_thread = threading.Thread(target=_sleep_with_logging, daemon=True)
+            self._session_end_thread = sleep_thread
             sleep_thread.start()
             sleep_thread.join(timeout=timeout)
             if sleep_thread.is_alive():
@@ -507,7 +524,31 @@ class MnemosyneMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Mnemosyne mirror write failed: %s", e)
 
+    # How long shutdown() will wait for an in-flight session_end consolidation
+    # to finish before clearing the host backend. Bounded so shutdown is never
+    # held up indefinitely; just long enough to close the race window where
+    # the daemon thread's post-join host call could see a None backend and
+    # fall through to MNEMOSYNE_LLM_BASE_URL (violating the host-skips-remote
+    # contract). Tests may shorten this to keep the suite fast.
+    SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 2
+
     def shutdown(self) -> None:
+        # If session_end's daemon thread is still consolidating when shutdown
+        # arrives, briefly wait for it. Otherwise clearing the host backend
+        # next would race with the in-flight summarize/extract call and a
+        # post-timeout "host attempted" decision could degrade to remote URL
+        # despite A3.
+        thread = self._session_end_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self.SHUTDOWN_DRAIN_TIMEOUT_SECONDS)
+            if thread.is_alive():
+                logger.debug(
+                    "Mnemosyne shutdown: session-end thread still running after %ss; "
+                    "proceeding (daemon thread will be reaped on process exit)",
+                    self.SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+                )
+        self._session_end_thread = None
+
         # Symmetric with initialize(): clear the Hermes host LLM backend so a
         # process that later uses Mnemosyne outside Hermes does not retain a
         # stale reference into agent.auxiliary_client.
