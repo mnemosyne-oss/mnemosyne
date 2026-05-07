@@ -85,10 +85,25 @@ When `MNEMOSYNE_LLM_BASE_URL` is set, Mnemosyne uses the remote endpoint for con
 
 Works with: llama.cpp server, vLLM, Ollama, LM Studio, or any OpenAI-compatible API.
 
+### Host LLM Adapter (Hermes / agent integration)
+
+Route consolidation and fact extraction through a host-provided LLM (e.g., Hermes' authenticated `agent.auxiliary_client.call_llm`). Useful for OAuth-backed providers like `openai-codex` that don't fit the URL+API-key remote shape.
+
+| Variable | Default | Description |
+|---|---|---|
+| `MNEMOSYNE_HOST_LLM_ENABLED` | `false` | Opt in to host-adapter routing |
+| `MNEMOSYNE_HOST_LLM_PROVIDER` | *(none)* | Optional provider override, e.g. `openai-codex` |
+| `MNEMOSYNE_HOST_LLM_MODEL` | *(none)* | Optional model override, e.g. `gpt-5.1-mini` |
+| `MNEMOSYNE_HOST_LLM_N_CTX` | `32000` | Prompt-budget when host is the chosen path (TinyLlama-calibrated `LLM_N_CTX=2048` is too small for Codex/GPT-class) |
+
+When the host call fails, the adapter falls back to the local GGUF model rather than the remote URL. See [hermes-llm-integration.md](hermes-llm-integration.md) for the full behavior model and session-shutdown semantics.
+
 ### Fallback Chain
 
 ```
-1. Remote LLM (if MNEMOSYNE_LLM_BASE_URL is set)
+0. Host LLM adapter (if MNEMOSYNE_HOST_LLM_ENABLED=true AND a backend is registered)
+   ↓ (on failure: skip remote, go to local)
+1. Remote LLM (if MNEMOSYNE_LLM_BASE_URL is set AND host is not enabled)
    ↓ (on failure)
 2. Local LLM (ctransformers + TinyLlama GGUF)
    ↓ (on failure or not installed)
@@ -123,4 +138,8 @@ export MNEMOSYNE_SLEEP_BATCH=3000
 # Use Ollama for consolidation
 export MNEMOSYNE_LLM_BASE_URL=http://localhost:11434/v1
 export MNEMOSYNE_LLM_MODEL=llama3
+
+# OR: when running under Hermes, route through Hermes' authenticated provider
+# (e.g., an OAuth-backed openai-codex subscription) instead of a remote URL
+export MNEMOSYNE_HOST_LLM_ENABLED=true
 ```

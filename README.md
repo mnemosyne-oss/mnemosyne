@@ -154,6 +154,7 @@ hermes mnemosyne stats     # Shows working + episodic memory counts
 - **Temporal triples** -- Time-aware knowledge graph with automatic invalidation
 - **Entity extraction** -- Regex + Levenshtein fuzzy matching (no spaCy, no PyTorch)
 - **LLM-driven fact extraction** -- Structured facts from raw text with graceful fallback chain
+- **Host LLM adapter** -- Route consolidation and fact extraction through Hermes' authenticated provider (e.g., OAuth-backed Codex) without managing credentials in Mnemosyne
 - **Memory banks** -- Per-bank SQLite isolation for domain separation
 - **MCP server** -- 6 tools, stdio + SSE transports
 - **Temporal recall** -- Exponential decay scoring with configurable halflife
@@ -416,6 +417,7 @@ Catches `@mentions`, `#hashtags`, `"quoted phrases"`, and capitalized sequences 
 
 Extract structured facts from raw text using an LLM, with a graceful fallback chain:
 
+0. **Host LLM adapter** (if `MNEMOSYNE_HOST_LLM_ENABLED=true` and a backend is registered -- e.g. when running under Hermes)
 1. Remote OpenAI-compatible API (if `MNEMOSYNE_LLM_BASE_URL` is set)
 2. Local ctransformers GGUF model
 3. Skip -- extraction fails silently, memory is still stored
@@ -597,6 +599,22 @@ Use a remote model (llama.cpp server, vLLM, Ollama, etc.) instead of local TinyL
 | `MNEMOSYNE_LLM_MODEL` | *(none)* | Model identifier sent in requests |
 
 When `BASE_URL` is set, Mnemosyne skips local ctransformers and uses your remote model for consolidation. Falls back to local if remote is unreachable, then to aaak encoding.
+
+### Host LLM Adapter (Hermes / agent integration)
+
+Route consolidation and fact extraction through a host-provided LLM (e.g.,
+Hermes' authenticated `agent.auxiliary_client.call_llm`). Useful for
+OAuth-backed providers like `openai-codex` that don't fit the URL+API-key
+remote shape.
+
+| Variable | Default | Description |
+|---|---|---|
+| `MNEMOSYNE_HOST_LLM_ENABLED` | `false` | Opt in to host-adapter routing |
+| `MNEMOSYNE_HOST_LLM_PROVIDER` | *(none)* | Optional provider override, e.g. `openai-codex` |
+| `MNEMOSYNE_HOST_LLM_MODEL` | *(none)* | Optional model override, e.g. `gpt-5.1-mini` |
+| `MNEMOSYNE_HOST_LLM_N_CTX` | `32000` | Prompt-budget when host is the chosen path (TinyLlama-calibrated `LLM_N_CTX=2048` is too small for Codex/GPT-class) |
+
+When the host call fails, the adapter falls back to the local GGUF model rather than the remote URL. See [docs/hermes-llm-integration.md](docs/hermes-llm-integration.md) for the full behavior model and session-shutdown semantics.
 
 ---
 
