@@ -10,6 +10,7 @@
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/AxDSan/mnemosyne/actions/workflows/ci.yml/badge.svg)](https://github.com/AxDSan/mnemosyne/actions/workflows/ci.yml)
 [![BEAM](https://img.shields.io/badge/BEAM-ICLR%202026-purple.svg)](https://beam-benchmark.github.io/)
+[![Discord](https://img.shields.io/discord/1501969470191702227?color=5865F2&label=Discord&logo=discord&logoColor=white)](https://discord.gg/Cgzpw9x3R)
 
 Mnemosyne is a local-first memory system for the [Hermes Agent](https://github.com/NousResearch/hermes-agent) framework. It stores conversations, preferences, and knowledge in SQLite with native vector search (sqlite-vec) and full-text search (FTS5) -- no external databases, no API keys, no network calls.
 
@@ -650,6 +651,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 <div align="center">
 
 ### ❤️ Support Mnemosyne
+
+## Support & Community
+
+- **Discord**: [Join the Mnemosyne community](https://discord.gg/Cgzpw9x3R) for help, discussion, and announcements
+- **GitHub Issues**: [Report bugs or request features](https://github.com/AxDSan/mnemosyne/issues)
+- **Documentation**: [docs.mnemosyne.site](https://docs.mnemosyne.site)
+- **Email**: 1641797+AxDSan@users.noreply.github.com
 
 If this project saves you time or helps your agents remember, consider supporting it:
 
