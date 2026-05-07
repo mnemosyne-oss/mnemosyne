@@ -251,11 +251,11 @@ def test_host_extract_facts_uses_temperature_zero(monkeypatch):
 
     def fake(prompt, *, max_tokens, temperature, timeout, provider=None, model=None):
         captured.append({"temperature": temperature, "max_tokens": max_tokens})
-        return "Chris uses Neovim.\nChris dislikes VSCode."
+        return "Alex uses Neovim.\nAlex dislikes VSCode."
 
     set_host_llm_backend(CallableLLMBackend("test", fake))
     with patch.object(local_llm, "_call_remote_llm") as mock_remote:
-        facts = extract_facts("Chris said he prefers Neovim and dislikes VSCode.")
+        facts = extract_facts("Alex said they prefer Neovim and dislike VSCode.")
         mock_remote.assert_not_called()
 
     assert any("Neovim" in f for f in facts)
@@ -304,12 +304,12 @@ def test_host_extract_facts_preserves_bulleted_output(monkeypatch):
     # _clean_output() would otherwise nuke at re.sub(r"^\s*[-*]\s.*\n", "").
     set_host_llm_backend(CallableLLMBackend(
         "test",
-        lambda *a, **k: "- Chris uses Neovim.\n- Chris dislikes VSCode.\n- Chris uses tincreek email.",
+        lambda *a, **k: "- Alex uses Neovim.\n- Alex dislikes VSCode.\n- Alex uses example.com email.",
     ))
-    facts = extract_facts("Chris said he prefers Neovim, dislikes VSCode, and uses tincreek email.")
+    facts = extract_facts("Alex said they prefer Neovim, dislike VSCode, and use example.com email.")
     assert any("Neovim" in f for f in facts), f"bullet '-' lines were stripped: {facts}"
     assert any("VSCode" in f for f in facts)
-    assert any("tincreek" in f for f in facts)
+    assert any("example.com" in f for f in facts)
     # And the bullet prefix should be gone (parse_facts strips it).
     assert not any(f.startswith("-") for f in facts)
 
