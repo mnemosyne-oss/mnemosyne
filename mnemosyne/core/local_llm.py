@@ -206,10 +206,9 @@ def _call_local_llm(prompt: str) -> Optional[str]:
 def _build_prompt(memories: List[str], source: str = "") -> str:
     """Build a consolidation prompt from a list of memory strings.
 
-    Uses TinyLlama chat-template tokens (<|user|>, </s>, <|assistant|>)
-    suitable for the local GGUF model. For host LLM calls, use
-    :func:`_build_host_prompt` instead — Codex/GPT-class providers treat
-    these tokens as garbage text.
+    Uses a plain-text instruction format (no special model tokens)
+    suitable for both local GGUF models and any LLM. For host LLM
+    calls, use :func:`_build_host_prompt` instead.
     """
     header = (
         "Summarize the following memories into 1-3 concise sentences. "
@@ -219,7 +218,7 @@ def _build_prompt(memories: List[str], source: str = "") -> str:
         header += f" Source: {source}."
 
     lines = "\n".join(f"- {m}" for m in memories if m)
-    prompt = f"<|user|>\n{header}\n\n{lines}\n</s>\n<|assistant|>\n"
+    prompt = f"{header}\n\n{lines}\n\nSummary:"
     return prompt
 
 
@@ -482,12 +481,14 @@ def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
             return cleaned if cleaned else None
         return None
 
-    # 1. Remote API.
-    if LLM_ENABLED and LLM_BASE_URL:
+    # 1. Remote API (skip if MNEMOSYNE_FORCE_LOCAL=1 or remote call fails).
+    # When remote fails, fall through to local LLM instead of returning None.
+    if LLM_ENABLED and LLM_BASE_URL and not os.environ.get("MNEMOSYNE_FORCE_LOCAL", "").lower() in ("1", "true", "yes"):
         raw = _call_remote_llm(prompt)
         if raw:
             cleaned = _clean_output(raw)
             return cleaned if cleaned else None
+        # Remote failed — fall through to local LLM
 
     # 2. Local LLM (llama-cpp-python or ctransformers fallback).
     raw = _call_local_llm(prompt)

@@ -2131,6 +2131,7 @@ class BeamMemory:
 
             # --- Try LLM summarization (chunked to fit context) ---
             summary = None
+            llm_succeeded = False
             if local_llm.llm_available():
                 chunks = local_llm.chunk_memories_by_budget(lines, source=source)
                 if chunks:
@@ -2158,6 +2159,7 @@ class BeamMemory:
                                     summary = " | ".join(chunk_summaries)
                     if summary:
                         llm_used_count += 1
+                        llm_succeeded = True
 
             # --- Fallback to aaak encoding ---
             if summary is None:
@@ -2176,7 +2178,7 @@ class BeamMemory:
                     metadata={
                         "original_count": len(items),
                         "source": source,
-                        "llm_used": summary != f"[{source}] {aaak_encode(' | '.join(lines))}"
+                        "llm_used": llm_succeeded
                     }
                 )
                 placeholders = ",".join("?" * len(ids))
