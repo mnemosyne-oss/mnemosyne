@@ -317,18 +317,19 @@ hermes mnemosyne export --output mnemosyne_backup.json
 hermes mnemosyne import --input mnemosyne_backup.json
 
 # Import from Hindsight (JSON export or live API)
-hermes mnemosyne import --from hindsight --file hindsight-export.json --bank hermes
-hermes mnemosyne import --from hindsight --base-url http://localhost:8888 --bank hermes
+mnemosyne import-hindsight hindsight-export.json hermes
+mnemosyne import-hindsight http://localhost:8888 hermes
 
 # Clear scratchpad
 hermes mnemosyne clear
 ```
 
-> **Optional REST API**: For external access or integration with non-Python services, you can run the standalone memory server:
+> **Optional MCP server**: For external access or integration with MCP-compatible services, run the MCP server:
 > ```bash
-> python mnemosyne/cli.py server  # Runs on http://localhost:8090
+> mnemosyne mcp                          # stdio transport
+> mnemosyne mcp --transport sse --port 8080  # SSE transport
 > ```
-> This is entirely optional -- the core library works without it.
+> Mnemosyne does not currently expose a standalone REST API server.
 
 ### Python API
 
@@ -496,7 +497,7 @@ mnemosyne mcp --transport sse --port 8080
 │                                            │ triples     │  │
 │                                            └─────────────┘  │
 │                                                              │
-│  Core runs in-process. Optional REST API available.          │
+│  Core runs in-process. Optional MCP server available.        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -526,11 +527,11 @@ SQLite is already in your stack. Hermes uses it for session persistence. Mnemosy
 
 ## Backup, Export & Migration
 
-Mnemosyne stores everything in a single SQLite file at `~/.hermes/mnemosyne/data/mnemosyne.db`.
+By default, Mnemosyne stores its main database at `~/.hermes/mnemosyne/data/mnemosyne.db`. Named memory banks live under `~/.hermes/mnemosyne/data/banks/<name>/`, and standalone triple stores may create `triples.db` in the data directory.
 
 ```bash
-# Simple backup
-cp ~/.hermes/mnemosyne/data/mnemosyne.db ~/backups/mnemosyne_$(date +%Y%m%d).db
+# Simple backup of the full Mnemosyne data directory
+cp -a ~/.hermes/mnemosyne/data ~/backups/mnemosyne_data_$(date +%Y%m%d)
 
 # Export to JSON (portable across machines)
 hermes mnemosyne export --output mnemosyne_backup.json
@@ -541,7 +542,7 @@ hermes mnemosyne import --input mnemosyne_backup.json
 
 ### Migrate from other memory providers
 
-Import directly from 6 supported providers into Mnemosyne:
+Import directly from 7 supported providers into Mnemosyne:
 
 ```bash
 # List all supported providers
@@ -550,15 +551,15 @@ hermes mnemosyne import --list-providers
 # Mem0 → Mnemosyne
 hermes mnemosyne import --from mem0 --api-key sk-xxx
 
-# Letta → Mnemosyne (offline .af file)
-hermes mnemosyne import --from letta --agent-file-path ./agent.af
+# Letta → Mnemosyne
+hermes mnemosyne import --from letta --api-key sk-xxx
 
 # Zep → Mnemosyne
-hermes mnemosyne import --from zep --api-key sk-xxx --max-sessions 100
+hermes mnemosyne import --from zep --api-key sk-xxx
 
 # Hindsight → Mnemosyne (JSON export or live API)
-hermes mnemosyne import --from hindsight --file hindsight-export.json --bank hermes
-hermes mnemosyne import --from hindsight --base-url http://localhost:8888 --bank hermes
+mnemosyne import-hindsight hindsight-export.json hermes
+mnemosyne import-hindsight http://localhost:8888 hermes
 
 # Generate a migration script for any provider
 hermes mnemosyne import --from mem0 --generate-script --output-script migrate.py
@@ -568,6 +569,8 @@ hermes mnemosyne import --from zep --agentic
 ```
 
 **Supported providers:** Mem0, Letta (MemGPT), Zep, Cognee, Honcho, SuperMemory, **Hindsight**
+
+The generic Hermes CLI exposes the common importer options. Provider-specific options are available through the Python importers; for example, offline Letta AgentFile imports can use `LettaImporter(agent_file_path="./agent.af")`.
 
 All importers preserve metadata, timestamps, user/agent identity, and relationships (graph edges → triples). Use `--dry-run` to validate without writing.
 

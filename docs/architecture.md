@@ -75,7 +75,7 @@ print(f"Consolidated {result['consolidated']} memories")
 
 ## SQLite Backend
 
-All data lives in a single SQLite file at `~/.hermes/mnemosyne/data/mnemosyne.db`.
+By default, the main database lives at `~/.hermes/mnemosyne/data/mnemosyne.db`. Named memory banks use separate SQLite files under `~/.hermes/mnemosyne/data/banks/<name>/`, and standalone `TripleStore()` may use `triples.db` in the data directory.
 
 ### Tables
 

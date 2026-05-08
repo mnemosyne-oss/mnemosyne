@@ -308,4 +308,4 @@ If the `hermes_plugin` hook uses a different session ID than the MemoryProvider,
 
 ### Memory survives gateway restarts, machine reboots, and Fly.io VM recycles
 
-All data lives in `~/.hermes/mnemosyne/data/mnemosyne.db` — a single SQLite file. No Docker, no PostgreSQL, no network calls.
+By default, the main database lives at `~/.hermes/mnemosyne/data/mnemosyne.db`; named banks live under `~/.hermes/mnemosyne/data/banks/<name>/`. No Docker, no PostgreSQL, no required network calls.

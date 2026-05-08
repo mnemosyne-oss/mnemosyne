@@ -26,7 +26,7 @@ stats = mem.get_stats()
 from mnemosyne import remember, recall, get_stats, forget, update, get_context
 ```
 
-These functions create a default `Mnemosyne` instance and delegate to it.
+These functions create a default `Mnemosyne` instance and delegate to it. The optional `bank` parameter applies only to these module-level helpers; instance methods use the bank configured on `Mnemosyne(...)`.
 
 | Function | Signature | Description |
 |---|---|---|
@@ -35,7 +35,7 @@ These functions create a default `Mnemosyne` instance and delegate to it.
 | `get_stats()` | `() -> dict` | Memory statistics |
 | `forget()` | `(memory_id) -> bool` | Delete a memory |
 | `update()` | `(memory_id, **kwargs) -> bool` | Update a memory |
-| `get_context()` | `(query, top_k=5) -> str` | Get formatted context string |
+| `get_context()` | `(limit=10, bank=None) -> list[dict]` | Get recent working-memory context |
 
 ---
 
@@ -49,8 +49,9 @@ from mnemosyne.core.memory import Mnemosyne
 # Default instance
 mem = Mnemosyne()
 
-# With custom data directory
-mem = Mnemosyne(data_dir="/path/to/data")
+# With custom database path
+from pathlib import Path
+mem = Mnemosyne(db_path=Path("/path/to/mnemosyne.db"))
 
 # With memory bank
 mem = Mnemosyne(bank="work")
@@ -63,9 +64,12 @@ mem = Mnemosyne(session_id="my-agent-session")
 
 ```python
 Mnemosyne(
-    data_dir: str = None,        # Custom data directory (default: ~/.hermes/mnemosyne/data/)
-    session_id: str = None,      # Session identifier (default: auto-generated UUID)
-    bank: str = None             # Memory bank name for isolation
+    session_id: str = "default",     # Session identifier
+    db_path: Path = None,            # Custom database path
+    bank: str = None,                # Memory bank name for isolation
+    author_id: str = None,
+    author_type: str = None,
+    channel_id: str = None,
 )
 ```
 
@@ -189,11 +193,11 @@ stats = mem.get_stats()
 
 ### `get_context()`
 
-Get a formatted context string for LLM injection.
+Get recent working-memory context for prompt injection.
 
 ```python
-context = mem.get_context(query="recent tasks", top_k=5)
-# Returns formatted string ready for prompt injection
+context = mem.get_context(limit=5)
+# Returns a list of recent working-memory dictionaries
 ```
 
 ### `export_to_file()` / `import_from_file()`
@@ -240,9 +244,9 @@ beam = BeamMemory(
 | `recall(query, **kwargs) -> list` | Hybrid search across all tiers |
 | `sleep() -> dict` | Consolidate working → episodic |
 | `invalidate(memory_id, replacement_id=None) -> bool` | Mark memory as superseded |
-| `scratchpad_write(key, value) -> str` | Write to scratchpad |
-| `scratchpad_read(key) -> str` | Read from scratchpad |
-| `scratchpad_clear() -> int` | Clear scratchpad |
+| `scratchpad_write(content) -> str` | Write to scratchpad |
+| `scratchpad_read() -> list[dict]` | Read scratchpad entries |
+| `scratchpad_clear() -> None` | Clear scratchpad |
 
 ---
 
@@ -629,10 +633,10 @@ result.finished_at   # ISO timestamp
 ### Provider Registry
 
 ```python
-from mnemosyne.core.importers import import_from_provider, PROVIDER_REGISTRY
+from mnemosyne.core.importers import import_from_provider, PROVIDERS
 
 # See all supported providers
-print(PROVIDER_REGISTRY.keys())
+print(PROVIDERS.keys())
 # dict_keys(['mem0', 'letta', 'zep', 'cognee', 'honcho', 'supermemory', 'hindsight'])
 
 # Generic import dispatcher

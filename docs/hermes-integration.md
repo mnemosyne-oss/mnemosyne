@@ -70,6 +70,7 @@ Mnemosyne registers these tools in the Hermes tool registry:
 | `mnemosyne_invalidate` | Mark a memory as superseded |
 | `mnemosyne_export` | Export all memories to JSON |
 | `mnemosyne_import` | Import memories from JSON |
+| `mnemosyne_diagnose` | Run PII-safe diagnostics |
 
 ## CLI Commands
 
@@ -86,13 +87,14 @@ hermes mnemosyne version            # Show version
 
 ## Data Location
 
-All data is stored in:
+By default, data is stored under:
 
 ```
 ~/.hermes/mnemosyne/
 ├── data/
-│   ├── mnemosyne.db    # Main SQLite database (BEAM + legacy)
-│   └── triples.db      # Knowledge graph (same directory)
+│   ├── mnemosyne.db              # Main SQLite database (BEAM + legacy)
+│   ├── triples.db                # Used by standalone TripleStore()
+│   └── banks/<name>/mnemosyne.db # Named memory banks
 └── ...
 ```
 
@@ -110,15 +112,16 @@ Set `MNEMOSYNE_HOST_LLM_ENABLED=true` to enable. See
 [hermes-llm-integration.md](hermes-llm-integration.md) for the full behavior
 model, configuration reference, and session-shutdown semantics.
 
-## Optional REST API
+## Optional MCP Server
 
-For integration with non-Python services:
+For integration with MCP-compatible clients:
 
 ```bash
-python mnemosyne/cli.py server  # Runs on http://localhost:8090
+mnemosyne mcp                          # stdio transport
+mnemosyne mcp --transport sse --port 8080  # SSE transport
 ```
 
-This is entirely optional — the core library works without it.
+Mnemosyne does not currently expose a standalone REST API server.
 
 ## Uninstall
 
