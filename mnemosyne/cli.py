@@ -10,6 +10,7 @@ import os
 import sys
 import json
 from pathlib import Path
+from typing import NoReturn
 
 # Data directory — respects MNEMOSYNE_DATA_DIR env var
 DATA_DIR = os.environ.get(
@@ -17,6 +18,28 @@ DATA_DIR = os.environ.get(
     str(Path.home() / ".hermes" / "mnemosyne" / "data"),
 )
 os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def _fail(message: str, exit_code: int = 2) -> NoReturn:
+    """Print a CLI error and exit without a Python traceback."""
+    print(f"Error: {message}", file=sys.stderr)
+    raise SystemExit(exit_code)
+
+
+def _parse_float(value: str, name: str) -> float:
+    """Parse a float argument or exit with a user-facing CLI error."""
+    try:
+        return float(value)
+    except ValueError:
+        _fail(f"{name} must be a number: {value}")
+
+
+def _parse_int(value: str, name: str) -> int:
+    """Parse an integer argument or exit with a user-facing CLI error."""
+    try:
+        return int(value)
+    except ValueError:
+        _fail(f"{name} must be an integer: {value}")
 
 
 def _get_memory():
@@ -32,7 +55,7 @@ def cmd_store(args):
         return
     content = args[0]
     source = args[1] if len(args) > 1 else "cli"
-    importance = float(args[2]) if len(args) > 2 else 0.5
+    importance = _parse_float(args[2], "importance") if len(args) > 2 else 0.5
 
     mem = _get_memory()
     memory_id = mem.remember(
@@ -50,7 +73,7 @@ def cmd_recall(args):
         print("Usage: mnemosyne recall <query> [top_k]")
         return
     query = args[0]
-    top_k = int(args[1]) if len(args) > 1 else 5
+    top_k = _parse_int(args[1], "top_k") if len(args) > 1 else 5
 
     mem = _get_memory()
     results = mem.recall(query, top_k=top_k)
@@ -73,7 +96,7 @@ def cmd_update(args):
         return
     memory_id = args[0]
     content = args[1]
-    importance = float(args[2]) if len(args) > 2 else None
+    importance = _parse_float(args[2], "importance") if len(args) > 2 else None
 
     mem = _get_memory()
     success = mem.update(memory_id, content=content, importance=importance)
@@ -154,7 +177,14 @@ def cmd_import(args):
         print("Usage: mnemosyne import <file.json>")
         return
     mem = _get_memory()
-    result = mem.import_from_file(args[0])
+    try:
+        result = mem.import_from_file(args[0])
+    except FileNotFoundError:
+        _fail(f"Import file not found: {args[0]}")
+    except json.JSONDecodeError as e:
+        _fail(f"Invalid JSON in import file {args[0]}: {e}")
+    except ValueError as e:
+        _fail(str(e))
     print(f"Imported {result.get('count', 0)} memories from {args[0]}")
 
 
