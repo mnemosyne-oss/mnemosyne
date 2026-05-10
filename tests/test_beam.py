@@ -285,7 +285,7 @@ class TestSleepCycle:
             "channel_id must NOT propagate from caller to alien BeamMemory."
         )
 
-    def test_sleep_all_sessions_audit_recall_finds_caller_consolidations(self, temp_db):
+    def test_sleep_all_sessions_audit_recall_finds_caller_consolidations(self, temp_db, monkeypatch):
         """[C9] End-to-end check via the public recall API. After cross-session
         consolidation by a maintenance caller, recall(query, author_id=caller)
         must surface the caller's consolidations across all session boundaries.
@@ -293,6 +293,10 @@ class TestSleepCycle:
         Pre-fix this returned nothing because alien-session episodic rows had
         author_id=None. v2 plan §C9 prescribed exactly this filtered-recall
         contract."""
+        # Force deterministic concat-style consolidation so the seeded query
+        # tokens survive into the episodic content and the substring assertion
+        # is stable across CI environments where llama_cpp may be installed.
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
         beam = BeamMemory(
             session_id="caller",
             db_path=temp_db,
