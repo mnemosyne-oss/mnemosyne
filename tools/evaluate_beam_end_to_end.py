@@ -1075,9 +1075,70 @@ def _detect_contradictions(messages: list, question: str) -> str | None:
     return None
 
 
+_POLYPHONIC_VOICE_KEYS = frozenset({"vector", "graph", "fact", "temporal"})
+_LINEAR_VOICE_KEYS = frozenset({"vec", "fts", "keyword", "importance", "recency_decay"})
+
+
+def _summarize_recall_memories(memories: list) -> dict:
+    """Compact per-question recall provenance for analysis.
+
+    Captures engine identity + per-voice score sums + top-1 voice
+    breakdown. Lets `docs/benchmark-results-analysis.md` Recipe E
+    (per-voice attribution) work from the result JSON directly.
+
+    Shape:
+        {
+          "engine": "polyphonic" | "linear" | "unknown",
+          "kept_count": N,
+          "voice_sums": {voice_key: total_score, ...},
+          "top_result_voices": {voice_key: score, ...} | {},
+          "top_result_tier": "working" | "episodic" | None,
+        }
+
+    Returns a minimal dict when memories is empty (bypass paths
+    short-circuit before recall so the field still exists for
+    schema consistency).
+    """
+    if not memories:
+        return {"engine": "unknown", "kept_count": 0, "voice_sums": {},
+                "top_result_voices": {}, "top_result_tier": None}
+
+    # Engine ID by the voice_scores keyset of any result that has one.
+    engine = "unknown"
+    voice_sums: dict = {}
+    for m in memories:
+        vs = m.get("voice_scores") or {}
+        if not vs:
+            continue
+        if engine == "unknown":
+            keys = set(vs.keys())
+            if keys & _POLYPHONIC_VOICE_KEYS:
+                engine = "polyphonic"
+            elif keys & _LINEAR_VOICE_KEYS:
+                engine = "linear"
+        for k, v in vs.items():
+            try:
+                voice_sums[k] = voice_sums.get(k, 0.0) + float(v)
+            except (TypeError, ValueError):
+                pass  # ignore non-numeric voice values
+
+    top = memories[0] if memories else {}
+    return {
+        "engine": engine,
+        "kept_count": len(memories),
+        "voice_sums": {k: round(v, 4) for k, v in voice_sums.items()},
+        "top_result_voices": {
+            k: (round(float(v), 4) if isinstance(v, (int, float)) else v)
+            for k, v in (top.get("voice_scores") or {}).items()
+        },
+        "top_result_tier": top.get("tier"),
+    }
+
+
 def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                       conversation_messages: list = None, top_k: int = DEFAULT_TOP_K,
-                      ability: str = None) -> str:
+                      ability: str = None,
+                      return_memories: bool = False):
     """Retrieve memories and have LLM answer, with context strategy based on conversation size.
 
     Set `MNEMOSYNE_BENCHMARK_PURE_RECALL=1` to disable the per-ability
@@ -1088,7 +1149,21 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     BEAM-recovery experiment can measure each arm's recall quality
     without contamination from harness-side oracles. Default behavior
     (env unset or '0') preserves the existing benchmark mode.
+
+    Returns:
+        str when `return_memories=False` (default — backward-compat).
+        tuple[str, list[dict]] when `return_memories=True` — the second
+        element is the retrieved memories list (post-multi-strategy,
+        pre-LLM-context-build). Each memory dict carries `voice_scores`
+        from Gap G — required for per-voice attribution analysis.
+        Bypass paths return `(answer, [])` since they short-circuit
+        before recall.
     """
+    def _ret(answer, memories=None):
+        """Pack return value uniformly across all exit points."""
+        if return_memories:
+            return answer, (memories or [])
+        return answer
     # E7/E8/E9 gate: when set, the harness disables every shortcut that
     # would let the LLM produce an answer without going through
     # BeamMemory.recall(). The bypasses were useful for measuring
@@ -1114,7 +1189,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                 ]
                 answer = llm.chat(messages, temperature=0.0, max_tokens=4096)
                 print(f"    [TR-bypass] LLM answer: {answer[:150]}")
-                return answer
+                return _ret(answer)
             else:
                 print(f"    [TR-bypass] _compute_tr_answer returned None")
         else:
@@ -1171,7 +1246,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                     best_score = score
                     best_match = values[0]
             if best_match:
-                return best_match  # Direct fact answer, zero LLM cost
+                return _ret(best_match)  # Direct fact answer, zero LLM cost
         
         # ---- Phase 2: Full-context LLM fallback ----
         full_parts = []
@@ -1197,8 +1272,8 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
             {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
             {"role": "user", "content": f"{_cr_prefix}{context}\n\nQUESTION: {question}\n\nANSWER:"},
         ]
-        return llm.chat(messages, temperature=0.1, max_tokens=2048)
-    
+        return _ret(llm.chat(messages, temperature=0.1, max_tokens=2048))
+
     # ALWAYS use multi-strategy retrieval to test Mnemosyne's recall quality.
     # The previous <=500 bypass sent full raw conversations to the LLM,
     # completely bypassing Mnemosyne's retrieval pipeline.
@@ -1341,7 +1416,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
 
     # If we found a direct context→value match, return it immediately (zero LLM cost)
     if context_answer:
-        return context_answer
+        return _ret(context_answer, memories)
 
     # Inject CR contradiction context if detected
     _cr_prefix_ret = ""
@@ -1353,7 +1428,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         {"role": "user", "content": f"{_cr_prefix_ret}{context}\n\nQUESTION: {question}\n\nANSWER:"},
     ]
 
-    return llm.chat(messages, temperature=0.1, max_tokens=2048)
+    return _ret(llm.chat(messages, temperature=0.1, max_tokens=2048), memories)
 
 
 # ============================================================
@@ -1471,11 +1546,15 @@ def evaluate_conversation(
         if not question or not ideal:
             continue
 
-        # Step 1: LLM answers using Mnemosyne memories + conversation context
+        # Step 1: LLM answers using Mnemosyne memories + conversation context.
+        # `return_memories=True` gives us the per-question retrieved memory
+        # list so we can summarize voice-attribution provenance below.
         t0 = time.perf_counter()
-        ai_answer = answer_with_memory(llm, beam, question, 
-                                       conversation_messages=conversation.get("messages", []),
-                                       ability=ability)
+        ai_answer, recall_memories = answer_with_memory(
+            llm, beam, question,
+            conversation_messages=conversation.get("messages", []),
+            ability=ability, return_memories=True,
+        )
         answer_time = time.perf_counter() - t0
 
         # Handle None answer (LLM timeout/error)
@@ -1489,12 +1568,20 @@ def evaluate_conversation(
 
         score = judgment.get("overall_score", 0.0)
 
+        # Compact recall-provenance summary so per-voice attribution
+        # analysis (docs/benchmark-results-analysis.md Recipe E) works
+        # from the result file directly — no DB re-query needed. Full
+        # memory dicts would be ~10× larger; this summary captures
+        # what an analyst actually needs.
+        recall_provenance = _summarize_recall_memories(recall_memories)
+
         result = {
             "qid": qid,
             "ability": ability,
             "question": question[:200],
             "ideal_answer": ideal[:200],
             "ai_answer": ai_answer[:500],
+            "recall_provenance": recall_provenance,
             "score": score,
             "nuggets": judgment.get("nuggets", []),
             "assessment": judgment.get("brief_assessment", ""),

@@ -69,6 +69,13 @@ Top-level JSON object: `{metadata, results}`. Schema:
           "question": "what is the user's favorite color?",
           "ideal_answer": "blue",
           "ai_answer": "The user's favorite color is blue.",
+          "recall_provenance": {                 // see Recipe E for analysis usage
+            "engine": "polyphonic",              // "polyphonic" / "linear" / "unknown"
+            "kept_count": 10,
+            "voice_sums": {"vector": 4.2, "graph": 1.1, "fact": 0.0, "temporal": 0.3},
+            "top_result_voices": {"vector": 0.7, "graph": 0.2, "fact": 0.0, "temporal": 0.1},
+            "top_result_tier": "episodic"        // tier of the top-ranked memory
+          },
           "score": 1.0,                          // rubric score: 0.0, 0.5, or 1.0
           "nuggets": [...],                      // judge's nugget breakdown (may be empty)
           "assessment": "Correctly identifies blue from context.",
@@ -301,27 +308,76 @@ if diag["wm_fallback_rate"] > 0.2 or diag["em_fallback_rate"] > 0.2:
     print("⚠ High fallback rate — arm-vs-arm comparisons may not be credible")
 ```
 
-### E. Per-voice attribution (polyphonic runs)
+### E. Per-voice attribution (per question)
 
-Each result dict in `beam_e2e_results.json` carries a `voice_scores: dict`. On polyphonic runs, keys are `vector`, `graph`, `fact`, `temporal`. On linear runs, keys are `vec`, `fts`, `keyword`, `importance`, `recency_decay`. Engine identity is the dict's keyset.
+Each per-question result dict in `beam_e2e_results.json.results[i].results[j]` carries `recall_provenance` with a summary of which voices contributed. Shape:
 
-To find what fraction of polyphonic results were vector-voice-led:
+```jsonc
+{
+  "recall_provenance": {
+    "engine": "polyphonic",                  // or "linear" or "unknown"
+    "kept_count": 10,                        // memories the LLM saw
+    "voice_sums": {                          // per-voice score totals across kept results
+      "vector": 4.2,
+      "graph": 1.1,
+      "fact": 0.0,
+      "temporal": 0.3
+    },
+    "top_result_voices": {                   // voice_scores for the top-ranked memory
+      "vector": 0.7,
+      "graph": 0.2,
+      "fact": 0.0,
+      "temporal": 0.1
+    },
+    "top_result_tier": "episodic"
+  }
+}
+```
+
+To find what fraction of polyphonic-engine answers were vector-voice-led across a run:
 
 ```python
 import json
+from collections import Counter
+
 data = json.load(open("results/beam_e2e_results.json"))
-top_voice_counts = {}
+top_voice_counts = Counter()
 for conv in data["results"]:
     for q in conv["results"]:
-        # Need the underlying recall result; the harness currently
-        # captures voice_scores in BeamMemory.recall() output but
-        # doesn't (yet) thread that into the per-question result.
-        # See Gap E follow-ups; for now query the DB directly or
-        # add a hook in the harness.
-        pass
+        prov = q.get("recall_provenance", {})
+        if prov.get("engine") != "polyphonic":
+            continue
+        top_voices = prov.get("top_result_voices", {})
+        if not top_voices:
+            continue
+        # Voice with the highest score on the top-ranked result
+        leader = max(top_voices.items(), key=lambda kv: kv[1])[0]
+        top_voice_counts[leader] += 1
+
+print("Top-voice leader distribution (polyphonic engine):")
+for voice, n in top_voice_counts.most_common():
+    print(f"  {voice}: {n}")
 ```
 
-Note: at present the harness does NOT include per-question recall voice_scores in `beam_e2e_results.json` (only the final answer + judge score). Per-question voice provenance would require an additional hook in `evaluate_conversation()`. Tracked as a follow-up.
+To compute per-voice contribution by ability — e.g., "how much did the fact voice contribute to TR vs IE questions?":
+
+```python
+fact_contrib_by_ability = {}  # ability → list of fact voice_sums
+for conv in data["results"]:
+    for q in conv["results"]:
+        prov = q.get("recall_provenance", {})
+        if prov.get("engine") != "polyphonic":
+            continue
+        ability = q.get("ability")
+        fact_contrib = prov.get("voice_sums", {}).get("fact", 0.0)
+        fact_contrib_by_ability.setdefault(ability, []).append(fact_contrib)
+
+for ability, vals in fact_contrib_by_ability.items():
+    avg = sum(vals) / max(len(vals), 1)
+    print(f"  {ability}: avg fact-voice sum = {avg:.3f} across {len(vals)} questions")
+```
+
+`recall_provenance.engine == "unknown"` and `kept_count == 0` indicates a bypass path (TR oracle / IE-KU context-fact match) returned the answer without going through `BeamMemory.recall()`. With `--pure-recall` active, this should only happen on full-context-mode runs.
 
 ### F. Detect a run that ran without pure-recall mode
 

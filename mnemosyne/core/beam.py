@@ -141,10 +141,28 @@ DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "mnemosyne.db"
 
 import os
 
+def _env_truthy(name: str) -> bool:
+    """Parse an env var as truthy. Accepts `1`/`true`/`yes`/`on`
+    (case-insensitive, whitespace-stripped). Everything else
+    (including unset, empty, garbage) is False.
+
+    Complement of `_env_disabled` (defined below) — they exist for
+    different default-state use cases. Use `_env_truthy` when the
+    feature is default-OFF and an env var opts it on; use
+    `_env_disabled` when the feature is default-ON and an env var
+    opts it off.
+
+    Mirrors the helper of the same name in `tools/evaluate_beam_end_to_end.py`
+    for env-parsing consistency across the codebase.
+    """
+    val = os.environ.get(name, "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
 # BEAM benchmark optimizations (opt-in via env var, zero impact on production)
 # When enabled: broader FTS5 OR semantics, larger vector scan limits, always-include vectors.
 # Set MNEMOSYNE_BEAM_OPTIMIZATIONS=1 to activate for BEAM benchmarking only.
-_BEAM_MODE = os.environ.get("MNEMOSYNE_BEAM_OPTIMIZATIONS", "").lower() in ("1", "true", "yes")
+_BEAM_MODE = _env_truthy("MNEMOSYNE_BEAM_OPTIMIZATIONS")
 
 if os.environ.get("MNEMOSYNE_DATA_DIR"):
     DEFAULT_DATA_DIR = Path(os.environ.get("MNEMOSYNE_DATA_DIR"))
