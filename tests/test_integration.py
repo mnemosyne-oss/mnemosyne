@@ -155,12 +155,20 @@ class TestVeracityConsolidation(unittest.TestCase):
         self.assertGreater(len(conflicts), 0)
     
     def test_conflict_resolution(self):
+        from mnemosyne.core.veracity_consolidation import compute_fact_id
+
         self.cons.consolidate_fact("Alice", "is", "developer", "stated")
         self.cons.consolidate_fact("Alice", "is", "manager", "inferred")
         conflicts = self.cons.get_conflicts()
-        
+
         if conflicts:
-            self.cons.resolve_conflict(conflicts[0]["id"], "cf_Alice_is_developer")
+            # Post-fix ID is hash-based; use compute_fact_id to
+            # resolve to the stored ID rather than hard-coding the
+            # pre-fix legacy f-string form.
+            self.cons.resolve_conflict(
+                conflicts[0]["id"],
+                compute_fact_id("Alice", "is", "developer"),
+            )
             resolved = self.cons.get_conflicts()
             self.assertEqual(len(resolved), 0)
     

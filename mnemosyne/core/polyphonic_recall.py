@@ -31,7 +31,10 @@ from pathlib import Path
 from mnemosyne.core.typed_memory import classify_memory, MemoryType, get_type_priority
 from mnemosyne.core.binary_vectors import BinaryVectorStore
 from mnemosyne.core.episodic_graph import EpisodicGraph
-from mnemosyne.core.veracity_consolidation import VeracityConsolidator
+from mnemosyne.core.veracity_consolidation import (
+    VeracityConsolidator,
+    compute_fact_id,
+)
 
 
 @dataclass
@@ -204,8 +207,19 @@ class PolyphonicRecallEngine:
             )
             
             for fact in facts:
+                # Prefer the row's stored id (preserves pre-fix
+                # legacy IDs in mixed-format DBs); fall back to the
+                # canonical hash if the dataclass is missing id
+                # (e.g., older callers that built ConsolidatedFact
+                # without going through get_consolidated_facts).
+                # /review (Codex structured + Codex adversarial,
+                # 2-source GATE FAIL) caught the previous unconditional
+                # recompute as a legacy-row alignment regression.
+                fact_memory_id = fact.id or compute_fact_id(
+                    fact.subject, fact.predicate, fact.object
+                )
                 results.append(RecallResult(
-                    memory_id=f"cf_{fact.subject}_{fact.predicate}_{fact.object}",
+                    memory_id=fact_memory_id,
                     score=fact.confidence,
                     voice="fact",
                     metadata={
