@@ -272,29 +272,34 @@ class TestSleepCycle:
 
         # Post-sleep, exactly one episodic row should exist (one consolidated
         # summary for the session). Dense store should hold a row for it.
+        #
+        # Use ``beam.conn`` rather than a fresh ``sqlite3.connect`` for the
+        # check: when sqlite-vec is installed, the extension is loaded on
+        # beam.conn (where the writes happened) but NOT on a freshly-opened
+        # connection. Reading vec_episodes through a fresh connection would
+        # raise "no such table" and steer us into the wrong assertion
+        # branch. beam.conn is the authoritative reader for this state.
         from mnemosyne.core.beam import _vec_available
 
-        conn = sqlite3.connect(temp_db)
-        ep_ids = [r[0] for r in conn.execute("SELECT id FROM episodic_memory").fetchall()]
+        bc = beam.conn
+        ep_ids = [r[0] for r in bc.execute("SELECT id FROM episodic_memory").fetchall()]
         assert len(ep_ids) == 1, f"expected 1 consolidated episodic row, got {len(ep_ids)}"
 
-        if _vec_available(conn):
-            vec_count = conn.execute("SELECT COUNT(*) FROM vec_episodes").fetchone()[0]
-            conn.close()
+        if _vec_available(bc):
+            vec_count = bc.execute("SELECT COUNT(*) FROM vec_episodes").fetchone()[0]
             assert vec_count >= 1, (
                 "sleep consolidated an episodic row but vec_episodes is "
-                "empty — the embed→_vec_insert path did not run. Likely "
+                "empty -- the embed->_vec_insert path did not run. Likely "
                 "cause: _embeddings.embed() returned None silently, or "
                 "_vec_insert raised and was swallowed."
             )
         else:
-            mem_count = conn.execute(
+            mem_count = bc.execute(
                 "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?", (ep_ids[0],)
             ).fetchone()[0]
-            conn.close()
             assert mem_count >= 1, (
                 "sleep consolidated an episodic row but memory_embeddings "
-                "fallback is empty — the embed→INSERT path did not run."
+                "fallback is empty -- the embed->INSERT path did not run."
             )
 
     def test_sleep_consolidated_content_is_recallable(self, temp_db, monkeypatch):
@@ -1377,3 +1382,221 @@ class TestVeracity:
 
         results = beam.recall("Fact", top_k=10)
         assert len(results) >= 2
+
+
+class TestConsolidationHealth:
+    """Issue #115: Consolidation health monitoring."""
+
+    def test_health_no_data(self, temp_db):
+        """health() returns no_data when no consolidation has occurred."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        h = beam.health()
+        assert h["status"] == "no_data"
+        assert h["last_successful_consolidation"] is None
+        assert h["error_count"] == 0
+        assert h["stale_hours"] is None
+        assert "never run" in h["recommendation"].lower() or "no consolidation_log" in h["recommendation"].lower()
+
+    def test_health_healthy_after_sleep(self, temp_db, monkeypatch):
+        """health() returns healthy after a successful sleep()."""
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        # Inject old working memories
+        conn = sqlite3.connect(temp_db)
+        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+                (f"old{i}", f"task {i}", "conversation", old_ts, "s1"),
+            )
+        conn.commit()
+        conn.close()
+
+        beam.sleep(dry_run=False)
+
+        h = beam.health()
+        assert h["status"] == "healthy"
+        assert h["last_successful_consolidation"] is not None
+        # Should be recent (within 3 hours to handle UTC/local timezone differences)
+        last_ts = datetime.fromisoformat(h["last_successful_consolidation"])
+        assert (datetime.now() - last_ts).total_seconds() < 10800  # 3 hours
+
+    def test_health_stale(self, temp_db, monkeypatch):
+        """health() returns stale when last consolidation is > threshold."""
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        # Inject old working memories
+        conn = sqlite3.connect(temp_db)
+        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+                (f"old{i}", f"task {i}", "conversation", old_ts, "s1"),
+            )
+        conn.commit()
+        conn.close()
+
+        beam.sleep(dry_run=False)
+
+        # Backdate the consolidation_log to simulate staleness
+        conn = sqlite3.connect(temp_db)
+        stale_ts = (datetime.now() - timedelta(hours=48)).isoformat()
+        conn.execute("UPDATE consolidation_log SET created_at = ?", (stale_ts,))
+        conn.commit()
+        conn.close()
+
+        h = beam.health(stale_threshold_hours=24.0)
+        assert h["status"] == "stale"
+        assert h["stale_hours"] > 24.0
+
+    def test_health_healthy_within_threshold(self, temp_db, monkeypatch):
+        """health() returns healthy when last consolidation is within threshold."""
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        conn = sqlite3.connect(temp_db)
+        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        conn.execute(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+            ("old1", "test task", "conversation", old_ts, "s1"),
+        )
+        conn.commit()
+        conn.close()
+
+        beam.sleep(dry_run=False)
+
+        # Consolidation just happened -- should be within 25h threshold
+        h = beam.health(stale_threshold_hours=25.0)
+        assert h["status"] == "healthy"
+
+    def test_health_custom_threshold(self, temp_db, monkeypatch):
+        """health() respects a custom stale threshold."""
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        conn = sqlite3.connect(temp_db)
+        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        conn.execute(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+            ("old1", "test task", "conversation", old_ts, "s1"),
+        )
+        conn.commit()
+        conn.close()
+
+        beam.sleep(dry_run=False)
+
+        # Backdate to 12h ago
+        conn = sqlite3.connect(temp_db)
+        stale_ts = (datetime.now() - timedelta(hours=12)).isoformat()
+        conn.execute("UPDATE consolidation_log SET created_at = ?", (stale_ts,))
+        conn.commit()
+        conn.close()
+
+        # 24h threshold -> should be healthy
+        h_loose = beam.health(stale_threshold_hours=24.0)
+        assert h_loose["status"] == "healthy"
+
+        # 6h threshold -> should be stale
+        h_tight = beam.health(stale_threshold_hours=6.0)
+        assert h_tight["status"] == "stale"
+
+    def test_health_after_sleep_all_sessions(self, temp_db, monkeypatch):
+        """health() reflects sleep_all_sessions() work."""
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        conn = sqlite3.connect(temp_db)
+        old_ts = (datetime.now() - timedelta(hours=20)).isoformat()
+        conn.executemany(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("s1-old", "session one task", "conversation", old_ts, "s1"),
+                ("s2-old", "session two task", "conversation", old_ts, "s2"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        beam.sleep_all_sessions(dry_run=False)
+
+        h = beam.health()
+        assert h["status"] == "healthy"
+        assert h["last_successful_consolidation"] is not None
+
+
+class TestUpdateRefreshesDerivedState:
+    """Issue #110: update() must reindex FTS5 + recompute vector embeddings."""
+
+    def test_recall_returns_updated_content_after_update(self, temp_db):
+        """recall() should find the new content, not the stale original."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        original = "The sky is green"
+        mid = beam.remember(original, source="test")
+        assert mid is not None
+
+        # Verify original is recallable
+        results = beam.recall("sky color", top_k=3)
+        contents = [r["content"] for r in results]
+        assert any("green" in c for c in contents), (
+            f"Original content should be recallable, got: {contents}"
+        )
+
+        # Update to correct the content
+        updated = beam.update_working(mid, content="The sky is blue")
+        assert updated is True
+
+        # After update, recall should find the NEW content
+        results = beam.recall("sky color", top_k=3)
+        contents = [r["content"] for r in results]
+        assert any("blue" in c for c in contents), (
+            f"Updated content should be recallable, got: {contents}"
+        )
+        # The old content should NOT appear
+        assert not any("green" in c for c in contents), (
+            f"Stale original should not appear after update, got: {contents}"
+        )
+
+    def test_recall_returns_updated_content_fuzzy_query(self, temp_db):
+        """Even with a query that would match the old content,
+        recall() should return the updated content."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        mid = beam.remember("Alice works at Acme Corp", source="test")
+
+        # Update to a different fact
+        beam.update_working(mid, content="Alice works at Globex Inc")
+
+        results = beam.recall("Alice employer", top_k=3)
+        contents = [r["content"] for r in results]
+        assert any("Globex" in c for c in contents), (
+            f"Updated content should mention Globex, got: {contents}"
+        )
+
+    def test_update_without_content_change_preserves_embedding(self, temp_db):
+        """Updating only importance should not recompute embeddings."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        mid = beam.remember("The earth is round", source="test")
+
+        # Update only importance, not content
+        beam.update_working(mid, importance=0.9)
+
+        # Content should be unchanged
+        results = beam.recall("earth shape", top_k=3)
+        contents = [r["content"] for r in results]
+        assert any("round" in c for c in contents)
+
+    def test_mnemosyne_update_propagates_to_beam(self, temp_db):
+        """Mnemosyne.update() must also refresh FTS5 + vector embeddings."""
+        from mnemosyne.core.memory import Mnemosyne
+        mnem = Mnemosyne(session_id="s1", db_path=temp_db)
+        mid = mnem.remember("The capital of France is Paris", source="test")
+
+        # Use Mnemosyne.update() to correct the info
+        mnem.update(mid, content="The capital of France is Lyon")
+
+        results = mnem.recall("capital of France", top_k=3)
+        contents = [r["content"] for r in results]
+        assert any("Lyon" in c for c in contents), (
+            f"Mnemosyne.update should refresh derived state, got: {contents}"
+        )

@@ -293,7 +293,8 @@ class Mnemosyne:
                  importance: float = 0.5, metadata: Dict = None,
                  valid_until: str = None, scope: str = "session",
                  extract_entities: bool = False,
-                 extract: bool = False) -> str:
+                 extract: bool = False,
+                 trust_tier: str = None) -> str:
         """
         Store a memory directly to SQLite.
         Writes to both BEAM working_memory and legacy memories table.
@@ -305,6 +306,9 @@ class Mnemosyne:
                 target moved as part of E6 — see mnemosyne.core.annotations.)
             extract: If True, extract structured facts from content using LLM
                 and store in the AnnotationStore (kind='fact'). Default False.
+            trust_tier: Trust classification for prompt-injection defense.
+                None = use beam default ('STATED'). 'EXTERNAL_WRITE' for MCP
+                tool calls, 'IMPORTED' for bulk imports.
         """
         # BEAM write first (generates its own ID). Extract flags are passed
         # through so BeamMemory's canonical _extract_and_store_entities and
@@ -329,6 +333,7 @@ class Mnemosyne:
             importance=importance, metadata=metadata,
             valid_until=valid_until, scope=scope,
             extract_entities=extract_entities, extract=extract,
+            trust_tier=trust_tier,
         )
         timestamp = datetime.now().isoformat()
 
@@ -749,12 +754,13 @@ def remember(content: str, source: str = "conversation",
              importance: float = 0.5, metadata: Dict = None,
              scope: str = "session", valid_until: str = None,
              extract_entities: bool = False,
-             extract: bool = False, bank: str = None) -> str:
+             extract: bool = False, bank: str = None,
+             trust_tier: str = None) -> str:
     """Store a memory using the global instance"""
     return _get_default(bank).remember(content, source, importance, metadata,
                                        scope=scope, valid_until=valid_until,
                                        extract_entities=extract_entities,
-                                       extract=extract)
+                                       extract=extract, trust_tier=trust_tier)
 
 
 def recall(query: str, top_k: int = 5, *,

@@ -117,6 +117,47 @@ except ImportError:
             return norm
         return "unknown"
 
+# ------------------------------------------------------------------
+# Trust tier derivation from ingestion source (plugin-first architecture)
+# ------------------------------------------------------------------
+TRUST_TIER_MAP = {
+    "conversation": "STATED",       # Direct user input via agent
+    "user":          "STATED",       # Explicit user action
+    "cli":           "STATED",       # CLI direct user input
+    "mcp":           "EXTERNAL_WRITE",  # External MCP tool calls
+    "import":        "IMPORTED",     # Bulk import from file
+    "mem0":          "IMPORTED",     # External service import
+    "honcho_import": "IMPORTED",     # Honcho data migration
+    "honcho_summary":"IMPORTED",     # Honcho auto-summary
+    "consolidation": "DERIVED",      # System sleep/summarize output
+    "sleep_consolidation": "DERIVED", # Sleep cycle output
+    "regex":         "DERIVED",      # Automated regex extraction
+    "extraction":    "DERIVED",      # LLM fact extraction
+    "unknown":       "STATED",       # Unknown source, conservative default
+}
+
+def _source_to_trust_tier(source: str) -> str:
+    """Map ingestion source to trust_tier for prompt-injection defense.
+
+    Plugin-first design: callers describe WHAT they are (via `source`),
+    Mnemosyne decides HOW to trust it (via trust_tier mapping). New
+    ingestion paths only need to set `source` honestly — the mapping
+    centralizes the trust policy.
+    """
+    if not source:
+        return "STATED"
+    # Direct match first
+    if source in TRUST_TIER_MAP:
+        return TRUST_TIER_MAP[source]
+    # Heuristic fallback: any source containing 'import' → IMPORTED
+    if "import" in source.lower():
+        return "IMPORTED"
+    # Any source containing 'mcp' → EXTERNAL_WRITE
+    if "mcp" in source.lower():
+        return "EXTERNAL_WRITE"
+    # Conservative default: treat as direct user input
+    return "STATED"
+
 try:
     import numpy as np
 except ImportError:
@@ -321,7 +362,7 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
     `_deferred_commits`. Connection is otherwise identical to a
     plain sqlite3.Connection.
     """
-    path = db_path or _default_db_path()
+    path = Path(db_path) if db_path else _default_db_path()
     if not hasattr(_thread_local, 'conn') or _thread_local.conn is None or getattr(_thread_local, 'db_path', None) != str(path):
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(
@@ -639,6 +680,9 @@ def init_beam(db_path: Path = None):
     _add_column_if_missing(conn, "episodic_memory", "author_id", "TEXT DEFAULT NULL")
     _add_column_if_missing(conn, "episodic_memory", "author_type", "TEXT DEFAULT NULL")
     _add_column_if_missing(conn, "episodic_memory", "channel_id", "TEXT DEFAULT NULL")
+    # --- Migration: trust tier for prompt-injection defense (v2.6) ---
+    _add_column_if_missing(conn, "working_memory", "trust_tier", "TEXT DEFAULT 'STATED'")
+    _add_column_if_missing(conn, "episodic_memory", "trust_tier", "TEXT DEFAULT 'STATED'")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_wm_author ON working_memory(author_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_wm_channel ON working_memory(channel_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_em_author ON episodic_memory(author_id)")
@@ -1556,7 +1600,8 @@ class BeamMemory:
                  memory_id: str = None,
                  extract_entities: bool = False,
                  extract: bool = False,
-                 veracity: str = "unknown") -> str:
+                 veracity: str = "unknown",
+                 trust_tier: str = None) -> str:
         """Store into working_memory. Deduplicates exact content matches.
 
         When called from the legacy-compatible Mnemosyne.remember() path,
@@ -1587,13 +1632,20 @@ class BeamMemory:
         # silently fall through to UNKNOWN_WEIGHT at scoring time.
         veracity = clamp_veracity(veracity, context="remember")
 
-        # --- Content sanitization: extract binary payloads to blob storage ---
+    # --- Content sanitization: extract binary payloads to blob storage ---
         from mnemosyne.core.content_sanitizer import sanitize_content as _sanitize
         sanitized_content, blob_meta = _sanitize(content)
         if blob_meta:
             metadata = (metadata or {}).copy()
             metadata["_blob"] = blob_meta
             content = sanitized_content
+
+        # --- Auto-derive trust_tier from source if not explicitly set ---
+        if trust_tier is None:
+            trust_tier = _source_to_trust_tier(source)
+        # Clamp to known tiers
+        if trust_tier not in ("STATED", "DERIVED", "EXTERNAL_WRITE", "IMPORTED"):
+            trust_tier = "STATED"
 
         # --- Typed memory classification (Phase 1 -- zero overhead) ---
         memory_type = None
@@ -1633,6 +1685,7 @@ class BeamMemory:
                     channel_id = COALESCE(?, channel_id),
                     memory_type = COALESCE(?, memory_type),
                     veracity = CASE WHEN ? != 'unknown' THEN ? ELSE veracity END,
+                    trust_tier = COALESCE(?, trust_tier),
                     consolidated_at = NULL
                 WHERE id = ? AND session_id = ?
             """, (importance, datetime.now().isoformat(), source,
@@ -1640,6 +1693,7 @@ class BeamMemory:
                   self.author_id, self.author_type, self.channel_id,
                   memory_type,
                   veracity, veracity,
+                  trust_tier,
                   existing_id, self.session_id))
             self.conn.commit()
             # Run the same entity/fact extraction the new-row path runs, so
@@ -1664,11 +1718,11 @@ class BeamMemory:
         cursor.execute("""
             INSERT INTO working_memory
             (id, content, source, timestamp, session_id, importance, metadata_json, valid_until, scope,
-             author_id, author_type, channel_id, veracity, memory_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             author_id, author_type, channel_id, veracity, memory_type, trust_tier)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (memory_id, content, source, timestamp, self.session_id, importance,
               json.dumps(metadata or {}), valid_until, scope,
-              self.author_id, self.author_type, self.channel_id, veracity, memory_type))
+              self.author_id, self.author_type, self.channel_id, veracity, memory_type, trust_tier))
         self.conn.commit()
         self._trim_working_memory()
 
@@ -1694,6 +1748,7 @@ class BeamMemory:
                        *,
                        veracity: Optional[str] = None,
                        force_veracity: bool = False,
+                       trust_tier: str = "IMPORTED",
                        extract_entities: bool = False,
                        extract: bool = False) -> List[str]:
         """
@@ -1832,8 +1887,8 @@ class BeamMemory:
             meta_by_id[memory_id] = (item_source, item_veracity)
             cursor.execute("""
                 INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, metadata_json,
-                author_id, author_type, channel_id, memory_type, veracity)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                author_id, author_type, channel_id, memory_type, veracity, trust_tier)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 memory_id,
                 item["content"],
@@ -1847,6 +1902,7 @@ class BeamMemory:
                 item.get("channel_id", self.channel_id),
                 item_type,
                 item_veracity,
+                trust_tier,
             ))
         self.conn.commit()
         
@@ -2126,13 +2182,20 @@ class BeamMemory:
 
     def update_working(self, memory_id: str, content: str = None,
                        importance: float = None) -> bool:
-        """Update a working_memory entry."""
+        """Update a working_memory entry.
+
+        After updating content, reindexes FTS5 (via wm_au trigger) and
+        recomputes the vector embedding in memory_embeddings so recall()
+        returns the corrected content instead of stale derived state.
+        """
         cursor = self.conn.cursor()
         updates = []
         params = []
+        content_changed = False
         if content is not None:
             updates.append("content = ?")
             params.append(content)
+            content_changed = True
         if importance is not None:
             updates.append("importance = ?")
             params.append(importance)
@@ -2143,8 +2206,32 @@ class BeamMemory:
             f"UPDATE working_memory SET {', '.join(updates)} WHERE id = ? AND session_id = ?",
             params
         )
+        affected = cursor.rowcount
+
+        # Refresh derived state when content changed.
+        # FTS5 is handled by the wm_au trigger (AFTER UPDATE OF content),
+        # but memory_embeddings must be recomputed explicitly.
+        if content_changed and affected > 0 and _embeddings.available():
+            try:
+                vec = _embeddings.embed([content])
+                if vec is not None and len(vec) > 0:
+                    model = _embeddings._DEFAULT_MODEL
+                    emb_json = _embeddings.serialize(vec[0])
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO memory_embeddings"
+                        " (memory_id, embedding_json, model)"
+                        " VALUES (?, ?, ?)",
+                        (memory_id, emb_json, model),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "update_working: embedding refresh failed for %s"
+                    " (%s): %s",
+                    memory_id, type(exc).__name__, exc,
+                )
+
         self.conn.commit()
-        return cursor.rowcount > 0
+        return affected > 0
 
     def forget_working(self, memory_id: str) -> bool:
         # E6.a: the cascade-delete of annotations must be authorized by the
@@ -4212,6 +4299,91 @@ class BeamMemory:
         return [dict(row) for row in cursor.fetchall()]
 
     # ------------------------------------------------------------------
+    # Consolidation Health Check
+    # ------------------------------------------------------------------
+    def health(self, stale_threshold_hours: float = 24.0) -> Dict:
+        """Return consolidation health status for monitoring/alerting.
+
+        Checks:
+        - last successful consolidation timestamp (from consolidation_log)
+        - error count in recent attempts (last 100 log entries)
+        - stale threshold alert: no consolidation in `stale_threshold_hours`
+
+        Returns a dict with keys: ``status`` (\"healthy\" | \"stale\" | \"no_data\"),
+        ``last_successful_consolidation``, ``error_count``, ``stale_hours``,
+        ``details``, and ``recommendation``.
+        """
+        cursor = self.conn.cursor()
+
+        # Last successful consolidation across ALL sessions (not just
+        # self.session_id) so a health monitor run from an active session
+        # can detect that an inactive-session's sleep_all_sessions
+        # maintenance broke silently.
+        cursor.execute("""
+            SELECT max(created_at) AS last_consolidation
+            FROM consolidation_log
+            WHERE items_consolidated > 0
+        """)
+        row = cursor.fetchone()
+        last_ts_str = row["last_consolidation"] if row and row["last_consolidation"] else None
+
+        # Error count: look at entries with zero items_consolidated but
+        # a non-empty summary_preview that suggests an attempted run.
+        # Also scan sleep_all_sessions "errors" recorded via
+        # summary_preview text patterns.
+        cursor.execute("""
+            SELECT count(*) AS err_count
+            FROM consolidation_log
+            WHERE created_at > datetime('now', '-7 days')
+              AND (
+                  items_consolidated = 0
+                  AND summary_preview LIKE '%error%'
+                  OR summary_preview LIKE '%fail%'
+              )
+        """)
+        error_count = cursor.fetchone()["err_count"]
+
+        now = datetime.now()
+
+        # Determine status
+        if last_ts_str is None:
+            status = "no_data"
+            stale_hours = None
+            recommendation = (
+                "No consolidation_log entries found with items_consolidated > 0. "
+                "Either sleep() has never run, or all runs have produced zero "
+                "summaries. Run sleep_all_sessions() or check logs."
+            )
+        else:
+            last_ts = datetime.fromisoformat(last_ts_str)
+            stale_hours = round((now - last_ts).total_seconds() / 3600.0, 2)
+            if stale_hours > stale_threshold_hours:
+                status = "stale"
+                recommendation = (
+                    f"Last successful consolidation was {stale_hours:.1f} hours ago "
+                    f"(threshold: {stale_threshold_hours:.0f}h). "
+                    "Run sleep_all_sessions() to catch up, and investigate why "
+                    "scheduled consolidation stopped (e.g. LLM unreachable, "
+                    "silent failures in summarize_memories, or cron/loop down)."
+                )
+            else:
+                status = "healthy"
+                recommendation = "Consolidation is within the healthy window."
+
+        return {
+            "status": status,
+            "last_successful_consolidation": last_ts_str,
+            "error_count": error_count,
+            "stale_hours": stale_hours,
+            "stale_threshold_hours": stale_threshold_hours,
+            "details": {
+                "stale": status == "stale",
+                "consolidation_log_entries_checked": "last 7 days",
+            },
+            "recommendation": recommendation,
+        }
+
+    # ------------------------------------------------------------------
     # Consolidation / Sleep
     # ------------------------------------------------------------------
     def sleep(self, dry_run: bool = False) -> Dict:
@@ -4341,6 +4513,23 @@ class BeamMemory:
             summary = None
             llm_succeeded = False
             if local_llm.llm_available():
+                # --- Optional pre-compression for small local LLMs ---
+                if os.environ.get("MNEMOSYNE_USE_CAVEMAN", "").lower() in ("1", "true", "yes"):
+                    try:
+                        from rust_cave_001 import compress
+                        compressed = []
+                        for line in lines:
+                            try:
+                                c = compress(line)
+                                compressed.append(c if len(c) > 2 else line)
+                            except Exception:
+                                compressed.append(line)
+                        lines = compressed
+                    except ImportError:
+                        pass  # rust_cave_001 not installed, skip gracefully
+                    except Exception:
+                        pass  # Compression failed non-fatally, use original lines
+
                 chunks = local_llm.chunk_memories_by_budget(lines, source=source)
                 if chunks:
                     if len(chunks) == 1:
@@ -4371,6 +4560,11 @@ class BeamMemory:
 
             # --- Fallback to aaak encoding ---
             if summary is None:
+                logger.warning(
+                    "sleep: LLM summarization failed for source=%r (items=%d, "
+                    "llm_available=%s) — falling back to AAAK compression",
+                    source, len(items), local_llm.llm_available(),
+                )
                 combined = " | ".join(lines)
                 compressed = aaak_encode(combined)
                 summary = f"[{source}] {compressed}"
@@ -4495,6 +4689,10 @@ class BeamMemory:
                     summaries_created += int(result.get("summaries_created", 0) or 0)
                     llm_used += int(result.get("llm_used", 0) or 0)
             except Exception as exc:
+                logger.error(
+                    "sleep_all_sessions: session %r consolidation failed: %s",
+                    session_id, exc, exc_info=True,
+                )
                 errors.append({"session_id": session_id, "error": repr(exc)})
 
         # Run tiered degradation after all-sessions consolidation

@@ -62,3 +62,11 @@ DEVOPS_PLAN_*
 # GSD planning — operational docs stay private
 .planning/
 
+# Local secrets (S3 — keep .env out of git)
+.env
+.env.local
+.env.*.local
+
+# Local-only tooling artifacts (S4 housekeeping — security reports stay local)
+.gstack/
+

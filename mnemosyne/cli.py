@@ -211,13 +211,41 @@ def cmd_import(args):
     except ValueError as e:
         _fail(str(e))
     beam_stats = result.get("beam", {})
+
+    def _format_store_stats(stats, label):
+        """Format an import_all stats dict, exposing every bucket so the
+        renumbered count from C28 (rows preserved under a fresh id after
+        an id collision) doesn't silently disappear from the CLI summary.
+
+        Returns the label preceded by the count breakdown, e.g.
+        '3 new + 2 renumbered triples' or '5 triples'.
+        """
+        if not isinstance(stats, dict):
+            return f"0 {label}"
+        new = stats.get("inserted", 0)
+        renumbered = stats.get("imported_renumbered", 0)
+        skipped = stats.get("skipped", 0)
+        overwritten = stats.get("overwritten", 0)
+        parts = []
+        if new:
+            parts.append(f"{new} new")
+        if renumbered:
+            parts.append(f"{renumbered} renumbered")
+        if overwritten:
+            parts.append(f"{overwritten} overwritten")
+        if skipped:
+            parts.append(f"{skipped} skipped")
+        if not parts:
+            return f"0 {label}"
+        return f"{' + '.join(parts)} {label}"
+
     print(
         f"Imported "
         f"{beam_stats.get('working_memory', {}).get('inserted', 0)} working, "
         f"{beam_stats.get('episodic_memory', {}).get('inserted', 0)} episodic, "
         f"{result.get('legacy', {}).get('inserted', 0)} legacy, "
-        f"{result.get('triples', {}).get('inserted', 0)} triples, "
-        f"{result.get('annotations', {}).get('inserted', 0)} annotations "
+        f"{_format_store_stats(result.get('triples', {}), 'triples')}, "
+        f"{_format_store_stats(result.get('annotations', {}), 'annotations')} "
         f"from {args[0]}"
     )
 

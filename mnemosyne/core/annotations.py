@@ -317,24 +317,70 @@ class AnnotationStore:
     def import_all(self, annotations: List[Dict], force: bool = False) -> Dict:
         """Import annotations from a list of dicts.
 
-        Idempotent by default: skips records whose id already exists.
-        Set force=True to overwrite. Returns import statistics.
+        Default behavior (``force=False``):
+          - **No id collision** in the destination: insert with the
+            imported ``id``. Counted in ``stats["inserted"]``.
+          - **Id collision + identical content**: skip (legitimate
+            round-trip idempotency).
+            Counted in ``stats["skipped"]``.
+          - **Id collision + DIFFERENT content**: insert with a fresh
+            auto-assigned id, preserving the imported row. Counted in
+            ``stats["imported_renumbered"]``. Pre-C28 this case was
+            silently bucketed into ``stats["skipped"]`` and the row
+            was discarded.
+          - **No id supplied** (``id`` missing or ``None``): insert
+            with a fresh auto-assigned id. Counted in
+            ``stats["inserted"]``.
+
+        ``force=True`` keeps the explicit-overwrite contract: on id
+        collision the existing row is replaced regardless of content.
+
+        Content comparison uses the full set of stored columns
+        (memory_id / kind / value / source / confidence / created_at).
+
+        Returns import statistics with keys ``inserted``, ``skipped``,
+        ``overwritten``, ``imported_renumbered``. Sum of values equals
+        ``len(annotations)``.
         """
-        stats = {"inserted": 0, "skipped": 0, "overwritten": 0}
+        stats = {"inserted": 0, "skipped": 0, "overwritten": 0,
+                 "imported_renumbered": 0}
         cursor = self.conn.cursor()
+
+        _CONTENT_FIELDS = ("memory_id", "kind", "value", "source",
+                           "confidence", "created_at")
+        _INSERT_DEFAULTS = {"source": "imported", "confidence": 1.0}
+
+        def _normalized(item):
+            return {
+                f: item.get(f) if item.get(f) is not None else _INSERT_DEFAULTS.get(f)
+                for f in _CONTENT_FIELDS
+            }
+
+        # Within-batch duplicate-id detection (codex review #5).
+        seen_ids = set()
         for item in annotations:
             row_id = item.get("id")
             if row_id is not None:
-                cursor.execute("SELECT 1 FROM annotations WHERE id = ?", (row_id,))
-                exists = cursor.fetchone() is not None
-                if exists and not force:
-                    stats["skipped"] += 1
-                    continue
-                if exists and force:
-                    cursor.execute("DELETE FROM annotations WHERE id = ?", (row_id,))
-                    stats["overwritten"] += 1
-                else:
-                    stats["inserted"] += 1
+                if row_id in seen_ids:
+                    raise ValueError(
+                        f"import_all: duplicate id {row_id!r} in the imported "
+                        f"batch. Deduplicate the input before calling."
+                    )
+                seen_ids.add(row_id)
+
+        # BEGIN IMMEDIATE for snapshot consistency (codex review #6).
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            cursor.execute(
+                "SELECT id, memory_id, kind, value, source, confidence, "
+                "created_at FROM annotations"
+            )
+            existing_snapshot = {
+                row[0]: dict(zip(_CONTENT_FIELDS, row[1:]))
+                for row in cursor.fetchall()
+            }
+
+            def _insert_with_id(item, row_id):
                 cursor.execute(
                     """
                     INSERT INTO annotations
@@ -351,8 +397,8 @@ class AnnotationStore:
                         item.get("created_at"),
                     ),
                 )
-            else:
-                stats["inserted"] += 1
+
+            def _insert_without_id(item):
                 cursor.execute(
                     """
                     INSERT INTO annotations
@@ -368,7 +414,59 @@ class AnnotationStore:
                         item.get("created_at"),
                     ),
                 )
-        self.conn.commit()
+
+            # Three-bucket split (codex review #1).
+            explicit_no_collision = []
+            no_id = []
+            collisions = []
+            for item in annotations:
+                row_id = item.get("id")
+                if row_id is None:
+                    no_id.append(item)
+                elif row_id in existing_snapshot:
+                    collisions.append(item)
+                else:
+                    explicit_no_collision.append(item)
+
+            for item in explicit_no_collision:
+                _insert_with_id(item, item["id"])
+                stats["inserted"] += 1
+            for item in no_id:
+                _insert_without_id(item)
+                stats["inserted"] += 1
+
+            for item in collisions:
+                row_id = item["id"]
+                existing_content = existing_snapshot[row_id]
+                if force:
+                    cursor.execute(
+                        "DELETE FROM annotations WHERE id = ?", (row_id,)
+                    )
+                    _insert_with_id(item, row_id)
+                    stats["overwritten"] += 1
+                    continue
+                if _normalized(item) == existing_content:
+                    stats["skipped"] += 1
+                    continue
+                # Different content under the colliding id: renumber.
+                # Catch IntegrityError (codex review #3) for the
+                # ``idx_annot_unique`` index on ``(memory_id, kind,
+                # value)`` -- if those three match an existing row,
+                # the schema treats the rows as the same logical
+                # annotation regardless of metadata differences, so
+                # the renumber INSERT would otherwise fail. Skip
+                # rather than crash; the imported row is semantically
+                # already represented in dst.
+                try:
+                    _insert_without_id(item)
+                    stats["imported_renumbered"] += 1
+                except sqlite3.IntegrityError:
+                    stats["skipped"] += 1
+
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
         return stats
 
 

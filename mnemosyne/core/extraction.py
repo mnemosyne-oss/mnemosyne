@@ -73,6 +73,33 @@ def _parse_facts(raw_output: str) -> List[str]:
     return cleaned[:5]  # Cap at 5 facts
 
 
+def _call_local_extraction_llm(llm, prompt: str) -> str:
+    """Run deterministic local extraction for the loaded local LLM backend.
+
+    llama-cpp-python exposes ``max_tokens`` via its completion/chat APIs,
+    while ctransformers exposes ``max_new_tokens`` on the direct callable.
+    Using ctransformers kwargs against a llama.cpp ``Llama`` instance raises
+    ``unexpected keyword argument 'max_new_tokens'`` and disables fact
+    extraction on installs where llama-cpp-python is preferred.
+    """
+    if getattr(local_llm, "_llm_backend", None) == "llamacpp":
+        response = llm.create_chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=local_llm.LLM_MAX_TOKENS,
+            stop=["</s>", "<|user|>"],
+            temperature=0.0,
+        )
+        choices = response.get("choices", []) if isinstance(response, dict) else []
+        if choices:
+            return choices[0].get("message", {}).get("content", "") or ""
+        return ""
+    return llm(
+        prompt,
+        max_new_tokens=local_llm.LLM_MAX_TOKENS,
+        stop=["</s>", "<|user|>"],
+    )
+
+
 def extract_facts(text: str) -> List[str]:
     """
     Extract structured facts from raw text using LLM.
@@ -168,11 +195,7 @@ def extract_facts(text: str) -> List[str]:
             return []
         if llm is not None:
             try:
-                raw_output = llm(
-                    prompt,
-                    max_new_tokens=local_llm.LLM_MAX_TOKENS,
-                    stop=["</s>", "<|user|>"],
-                )
+                raw_output = _call_local_extraction_llm(llm, prompt)
                 facts = _parse_facts(local_llm._clean_output(raw_output))
                 if facts:
                     diag.record_success("local", fact_count=len(facts))
@@ -231,11 +254,7 @@ def extract_facts(text: str) -> List[str]:
         return []
     if llm is not None:
         try:
-            raw_output = llm(
-                prompt,
-                max_new_tokens=local_llm.LLM_MAX_TOKENS,
-                stop=["</s>", "<|user|>"],
-            )
+            raw_output = _call_local_extraction_llm(llm, prompt)
             facts = _parse_facts(local_llm._clean_output(raw_output))
             if facts:
                 diag.record_success("local", fact_count=len(facts))

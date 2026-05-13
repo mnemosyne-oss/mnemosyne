@@ -273,7 +273,7 @@ def _resolve_bank(arguments: Dict[str, Any]) -> str:
 def _handle_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_remember tool call."""
     content = arguments["content"]
-    source = arguments.get("source", "conversation")
+    source = arguments.get("source", "mcp")
     importance = arguments.get("importance", 0.5)
     metadata = arguments.get("metadata", {})
     extract_entities = arguments.get("extract_entities", False)
@@ -287,7 +287,7 @@ def _handle_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
         importance=importance,
         metadata=metadata,
         extract_entities=extract_entities,
-        extract=extract
+        extract=extract,
     )
 
     return {
@@ -413,6 +413,126 @@ def _handle_get_stats(arguments: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _handle_triple_add(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_triple_add tool call.
+
+    Routes annotation-flavored predicates (mentions, fact, occurred_on,
+    has_source) to AnnotationStore; everything else to TripleStore.
+    For occurred_on, valid_from is forwarded to AnnotationStore (issue #111).
+    """
+    import logging
+    _log = logging.getLogger("mnemosyne.mcp.triple_add")
+
+    from mnemosyne.core.annotations import ANNOTATION_KINDS, AnnotationStore
+    from mnemosyne.core.triples import TripleStore
+
+    predicate = arguments["predicate"]
+
+    if isinstance(predicate, str) and predicate in ANNOTATION_KINDS:
+        # Annotation-flavored predicate — route to AnnotationStore.
+        bank = _resolve_bank(arguments)
+        mem = _create_instance(bank=bank)
+        db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+
+        store = getattr(mem.beam, "annotations", None)
+        if store is None:
+            store = AnnotationStore(db_path=db_path, conn=mem.beam.conn)
+
+        valid_from = arguments.get("valid_from")
+
+        if predicate == "occurred_on" and valid_from:
+            row_id = store.add(
+                memory_id=arguments["subject"],
+                kind=predicate,
+                value=arguments["object"],
+                source=arguments.get("source", "conversation"),
+                confidence=arguments.get("confidence", 1.0),
+                valid_from=valid_from,
+            )
+        else:
+            if valid_from:
+                _log.warning(
+                    "mnemosyne_triple_add: valid_from=%r provided with "
+                    "predicate=%r (not occurred_on); valid_from discarded.",
+                    valid_from, predicate,
+                )
+            row_id = store.add(
+                memory_id=arguments["subject"],
+                kind=predicate,
+                value=arguments["object"],
+                source=arguments.get("source", "conversation"),
+                confidence=arguments.get("confidence", 1.0),
+            )
+
+        return {
+            "status": "added",
+            "annotation_id": row_id,
+            "store": "annotations",
+        }
+
+    # Current-truth temporal fact — route to TripleStore.
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+    kg = TripleStore(db_path=db_path)
+    triple_id = kg.add(
+        subject=arguments["subject"],
+        predicate=predicate,
+        object=arguments["object"],
+        valid_from=arguments.get("valid_from"),
+        source=arguments.get("source", "conversation"),
+        confidence=arguments.get("confidence", 1.0),
+    )
+    return {
+        "status": "added",
+        "triple_id": triple_id,
+        "store": "triples",
+    }
+
+
+def _handle_triple_query(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_triple_query tool call.
+
+    Mirrors the write-side routing: annotation predicates query
+    AnnotationStore; others query TripleStore.
+    """
+    from mnemosyne.core.annotations import ANNOTATION_KINDS, AnnotationStore
+    from mnemosyne.core.triples import TripleStore
+
+    predicate = arguments.get("predicate")
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+
+    if isinstance(predicate, str) and predicate in ANNOTATION_KINDS:
+        store = getattr(mem.beam, "annotations", None)
+        if store is None:
+            store = AnnotationStore(db_path=db_path, conn=mem.beam.conn)
+        results = store.query_by_kind(
+            kind=predicate,
+            value=arguments.get("object"),
+            memory_id=arguments.get("subject"),
+        )
+        return {
+            "results_count": len(results),
+            "results": results,
+            "store": "annotations",
+        }
+
+    kg = TripleStore(db_path=db_path)
+    results = kg.query(
+        subject=arguments.get("subject"),
+        predicate=predicate,
+        object=arguments.get("object"),
+        as_of=arguments.get("as_of"),
+    )
+    return {
+        "results_count": len(results),
+        "results": results,
+        "store": "triples",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -424,6 +544,8 @@ _TOOL_HANDLERS = {
     "mnemosyne_scratchpad_read": _handle_scratchpad_read,
     "mnemosyne_scratchpad_write": _handle_scratchpad_write,
     "mnemosyne_get_stats": _handle_get_stats,
+    "mnemosyne_triple_add": _handle_triple_add,
+    "mnemosyne_triple_query": _handle_triple_query,
 }
 
 

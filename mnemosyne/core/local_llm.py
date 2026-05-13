@@ -512,7 +512,7 @@ def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
 
     # If multiple chunks, do a second-pass summary to consolidate chunk summaries.
     if len(chunk_summaries) > 1:
-        final = _summarize_chunk(chunk_summaries, source=f"{source} [chunked {len(chunks)} parts]")
+        final = _summarize_chunk(chunk_summaries, chunk_source=f"{source} [chunked {len(chunks)} parts]")
         return final if final else chunk_summaries[0]
 
     return chunk_summaries[0]

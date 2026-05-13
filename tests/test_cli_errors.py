@@ -122,7 +122,13 @@ def test_import_reports_actual_imported_memory_counts(tmp_path):
     assert result.returncode == 0, result.stderr
     # Post-E6: annotations imported alongside triples (the temporal anchor
     # rows moved to the annotations table).
-    assert "Imported 1 working, 0 episodic, 1 legacy, 0 triples, 2 annotations" in result.stdout
+    # Post-C28: stores now report each stats bucket separately
+    # (e.g. "2 new annotations") instead of the bare count, so the
+    # imported_renumbered count from an id-collision import isn't
+    # silently dropped from the summary.
+    assert "Imported 1 working, 0 episodic, 1 legacy" in result.stdout
+    assert "0 triples" in result.stdout
+    assert "2 new annotations" in result.stdout
     assert "Imported 0 memories" not in result.stdout
 
 

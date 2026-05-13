@@ -191,17 +191,30 @@ def register(ctx):
 def _on_session_start(session_id, model, platform, **kwargs):
     """Initialize memory for new session"""
     mem_id = f"hermes_{session_id}" if session_id else "hermes_default"
-    mem = _get_memory(session_id=mem_id)
 
-    # Inject hard override rule so it survives across turns and sessions
+    # Inject hard override rule so it survives across turns and sessions.
+    # The whole body is wrapped, including _get_memory(): codex review
+    # finding #2 caught that Mnemosyne(...) construction failures (DB
+    # locked, permissions, schema mismatch, sqlite_vec setup, fastembed
+    # download error, ...) raised from `_get_memory` before the previous
+    # try/except could fire, so the new WARNING never reached the logs
+    # for the most common class of session-start failure.
     try:
+        mem = _get_memory(session_id=mem_id)
         mem.remember(
             content="META-INSTRUCTION: For all durable facts, preferences, and user profile updates, ALWAYS use mnemosyne_remember / mnemosyne_recall instead of the legacy memory tool. The memory tool is deprecated for durable storage. Mnemosyne is the primary and only memory system. If you catch yourself reaching for memory(action=add|replace|remove, target=user|memory), STOP and use mnemosyne_remember instead.",
             importance=0.99,
             source="system_override"
         )
-    except:
-        pass
+    except Exception as e:
+        # C27: surface session-start failures at WARNING. Pre-fix this was a
+        # bare except: pass that hid every kind of init issue (DB locked,
+        # missing schema column, permissions, embedding failure, etc.).
+        import logging
+        logging.getLogger(__name__).warning(
+            "Mnemosyne session-start failed (session=%s): %s",
+            session_id, e,
+        )
 
 
 def _compress_memory(content: str) -> str:
@@ -222,7 +235,29 @@ def _on_pre_llm_call(session_id, history, **kwargs):
        using the user's last message as the query
 
     This provides both short-term continuity AND long-term memory recall.
+
+    C13: defers to ``MnemosyneMemoryProvider.prefetch()`` when the
+    canonical surface is active. Without this guard both paths fire on
+    every LLM call, injecting two memory-context blocks into the system
+    prompt -- doubling the per-turn token cost (each block runs its own
+    recall and writes its own header) and confusing the agent with two
+    differently-formatted views of similar content. The provider's
+    initialize() sets ``hermes_memory_provider._provider_active = True``
+    once it's the active surface; this hook reads that flag and returns
+    None (no context injected from this path). Standalone plugin-only
+    installs are unaffected -- the flag stays False and this hook runs
+    as before.
     """
+    try:
+        from hermes_memory_provider import _provider_active
+        if _provider_active:
+            return None
+    except ImportError:
+        # The MemoryProvider package isn't installed in this environment
+        # -- plugin-only install path. Fall through to the existing
+        # injection logic below.
+        pass
+
     try:
         mem_id = f"hermes_{session_id}" if session_id else "hermes_default"
         mem = _get_memory(session_id=mem_id)
@@ -246,10 +281,12 @@ def _on_pre_llm_call(session_id, history, **kwargs):
 
         if user_message and len(user_message) > 3:
             # Search across ALL sessions (no session filter) for semantic matches
+            # Scoped to the user's author_id for cross-session consistency
             recall_results = mem.recall(
                 query=user_message,
                 top_k=5,
-                temporal_weight=0.2  # mild recency bias
+                temporal_weight=0.2,  # mild recency bias
+                author_id=mem.beam.author_id,
             )
 
         # Deduplicate: remove recall results that are already in context_memories
@@ -331,5 +368,13 @@ def _on_post_tool_call(tool_name, args, result, **kwargs):
                 source="tool_execution",
                 importance=0.1
             )
-    except:
-        pass  # Fail silently
+    except Exception as e:
+        # C27: log at DEBUG rather than swallow. This hook is opt-in via
+        # MNEMOSYNE_LOG_TOOLS=1, so the operator already wants the data --
+        # if it's failing silently the opt-in is broken without their
+        # knowledge.
+        import logging
+        logging.getLogger(__name__).debug(
+            "Mnemosyne post-tool-call hook failed for tool=%s: %s",
+            tool_name, e,
+        )

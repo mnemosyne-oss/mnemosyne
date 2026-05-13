@@ -16,6 +16,7 @@ from mnemosyne.core.extraction import (
     extract_facts,
     extract_facts_safe,
     _build_extraction_prompt,
+    _call_local_extraction_llm,
     _parse_facts,
     EXTRACTION_PROMPT,
 )
@@ -76,6 +77,52 @@ def test_parse_facts_empty():
     facts = _parse_facts("   \n   ")
     assert facts == []
     print("PASS: test_parse_facts_empty")
+
+
+def test_call_local_extraction_llm_uses_llamacpp_chat_api(monkeypatch):
+    """llama-cpp-python uses max_tokens, not ctransformers' max_new_tokens."""
+    monkeypatch.setattr(local_llm, "_llm_backend", "llamacpp")
+    monkeypatch.setattr(local_llm, "LLM_MAX_TOKENS", 123)
+
+    class FakeLlamaCpp:
+        def __init__(self):
+            self.kwargs = None
+
+        def create_chat_completion(self, **kwargs):
+            self.kwargs = kwargs
+            return {"choices": [{"message": {"content": "The user likes coffee."}}]}
+
+        def __call__(self, *args, **kwargs):  # pragma: no cover - should not run
+            raise AssertionError("llama.cpp extraction should use chat completion API")
+
+    llm = FakeLlamaCpp()
+    output = _call_local_extraction_llm(llm, "prompt")
+
+    assert output == "The user likes coffee."
+    assert llm.kwargs["max_tokens"] == 123
+    assert llm.kwargs["temperature"] == 0.0
+    assert "max_new_tokens" not in llm.kwargs
+
+
+def test_call_local_extraction_llm_preserves_ctransformers_kwargs(monkeypatch):
+    """ctransformers still receives max_new_tokens on the direct callable."""
+    monkeypatch.setattr(local_llm, "_llm_backend", "ctransformers")
+    monkeypatch.setattr(local_llm, "LLM_MAX_TOKENS", 456)
+
+    class FakeCTransformers:
+        def __init__(self):
+            self.kwargs = None
+
+        def __call__(self, prompt, **kwargs):
+            self.kwargs = kwargs
+            return "The user likes tea."
+
+    llm = FakeCTransformers()
+    output = _call_local_extraction_llm(llm, "prompt")
+
+    assert output == "The user likes tea."
+    assert llm.kwargs["max_new_tokens"] == 456
+    assert "max_tokens" not in llm.kwargs
 
 
 def test_extract_facts_safe_no_llm():

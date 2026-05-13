@@ -10,7 +10,7 @@ Example:
     >>> results = recall("user preferences")
 """
 
-__version__ = "2.7.0"
+__version__ = "2.8.0"
 __author__ = "Abdias J"
 __license__ = "MIT"
 
