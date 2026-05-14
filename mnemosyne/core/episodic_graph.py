@@ -421,7 +421,6 @@ class EpisodicGraph:
         Returns:
             List of dicts with keys: memory_id, edge_type, weight, depth
         """
-        related = set()  # Track IDs to avoid dupes
         results = []
         current_level = {memory_id}
         seen = {memory_id}
@@ -453,7 +452,6 @@ class EpisodicGraph:
                             "depth": hop,
                         })
 
-            related.update(next_level)
             current_level = next_level
 
         return results
@@ -575,7 +573,9 @@ if __name__ == "__main__":
     
     # Find related
     related = graph.find_related_memories("mem_001", depth=1)
-    print(f"\nRelated memories: {related}")
+    print(f"\nRelated memories:")
+    for r in related:
+        print(f"  {r['memory_id']} --{r['edge_type']}--> weight={r['weight']} (depth={r['depth']})")
     
     # Find facts by subject
     alice_facts = graph.find_facts_by_subject("Alice")

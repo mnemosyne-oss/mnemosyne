@@ -162,29 +162,35 @@ def test_extract_facts_safe_exception_handling():
 
 
 def test_triplestore_add_facts():
-    """Test TripleStore.add_facts() batch storage — migrated to AnnotationStore.
+    """Test TripleStore.add_facts() batch storage.
 
-    Post-E6: add_facts is a deprecation shim. Test calls AnnotationStore.add_many
-    directly instead.
+    Post-E6: add_facts is a deprecation shim that routes writes to the
+    AnnotationStore (not the triples table). This was changed during the
+    /review adversarial pass — pre-redirect, deprecated callers' facts
+    went into the triples table but the new recall path read from
+    annotations, making the facts silently invisible.
     """
+    import warnings
     from mnemosyne.core.annotations import AnnotationStore
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test.db"
         init_triples(db_path)
 
+        triples = TripleStore(db_path=db_path)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            count = triples.add_facts(
+                "mem_123",
+                ["The user loves coffee", "The user hates mornings", "x"],  # "x" too short
+                source="test",
+                confidence=0.7
+            )
+
+        assert count == 2  # "x" filtered out
+
+        # Post-E6: facts land in annotations where the recall path looks.
         ann_store = AnnotationStore(db_path=db_path)
-        count = ann_store.add_many(
-            "mem_123",
-            "fact",
-            ["The user loves coffee", "The user hates mornings"],
-            source="test",
-            confidence=0.7,
-        )
-
-        assert count == 2  # Both facts stored
-
-        # Verify via query
         all_facts = ann_store.query_by_memory(memory_id="mem_123", kind="fact")
         assert len(all_facts) == 2
         assert all(f["memory_id"] == "mem_123" for f in all_facts)
@@ -195,15 +201,13 @@ def test_triplestore_add_facts():
 
 
 def test_triplestore_add_facts_empty():
-    """Test add_facts() with empty list via AnnotationStore."""
-    from mnemosyne.core.annotations import AnnotationStore
-
+    """Test TripleStore.add_facts() with empty list."""
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test.db"
         init_triples(db_path)
-
-        ann_store = AnnotationStore(db_path=db_path)
-        count = ann_store.add_many("mem_456", "fact", [], source="test")
+        
+        triples = TripleStore(db_path=db_path)
+        count = triples.add_facts("mem_456", [], source="test")
         assert count == 0
         
         print("PASS: test_triplestore_add_facts_empty")

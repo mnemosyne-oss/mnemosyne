@@ -21,6 +21,8 @@ import sys
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from datetime import datetime
+from mnemosyne.core.episodic_graph import GraphEdge
 
 # Ensure mnemosyne core is importable from this directory
 _mnemosyne_root = Path(__file__).resolve().parent.parent
@@ -1214,8 +1216,12 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if not seed_id:
             return json.dumps({"error": "seed_memory_id is required"})
         depth = int(args.get("max_hops", 2))
+        if depth < 1:
+            return json.dumps({"error": "max_hops must be greater than 0"})
         edge_type = args.get("edge_type", "") or ""
         min_weight = float(args.get("min_weight", 0.0))
+        if not (0.0 <= min_weight <= 1.0):
+            return json.dumps({"error": "min_weight must be between 0.0 and 1.0"})
         if self._beam.episodic_graph is None:
             return json.dumps({"error": "Episodic graph not available"})
         related = self._beam.episodic_graph.find_related_memories(
@@ -1235,14 +1241,14 @@ class MnemosyneMemoryProvider(MemoryProvider):
         target_id = args.get("target_id", "").strip()
         relationship = args.get("relationship", "").strip()
         weight = float(args.get("weight", 0.5))
+        if not (0.0 <= weight <= 1.0):
+            return json.dumps({"error": "weight must be between 0.0 and 1.0"})
         if not all([source_id, target_id, relationship]):
             return json.dumps({
                 "error": "source_id, target_id, and relationship are required",
             })
         if self._beam.episodic_graph is None:
             return json.dumps({"error": "Episodic graph not available"})
-        from mnemosyne.core.episodic_graph import GraphEdge
-        from datetime import datetime
         edge = GraphEdge(
             source=source_id,
             target=target_id,
