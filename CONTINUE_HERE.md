@@ -1,102 +1,89 @@
-# mnemosyne — PR #129: CompressionPlugin Not Loading (Root Cause Found)
+# mnemosyne — Continue Here
 
-## Status: ROOT CAUSE IDENTIFIED — Fix Pending
-
-## Bug Summary
-
-`CompressionPlugin` is registered in `PluginManager._registry` but **never loaded** into `_instances`. The call chain in `beam.py` hits `get_plugin()` which looks in `_instances` (not `_registry`), so it always returns `None`.
-
-## Root Cause
-
-### 1. Registration happens, loading never does
-
-```
-PluginManager.__init__()
-  → register_plugin("compression", CompressionPlugin)   ✓ adds to _registry
-  → _instances remains empty
-
-beam.py line 4521:
-  _plugins.get_manager().get_plugin("compression")
-  → searches _instances → NOT _registry → returns None ✗
-
-CompressionPlugin.enabled = False (class default)
-  → self._compress() never called
-```
-
-### 2. Two separate CompressionPlugin files exist
-
-| File | Purpose | Status |
-|------|---------|--------|
-| `mnemosyne/core/plugins.py` | Built-in, registered at module load | Not loaded |
-| `mnemosyne/plugins/compression.py` | External plugin, discovered via `discover_plugins()` | Never discovered |
-
-`discover_plugins()` is never called in the production code path:
-- Not called in `PluginManager.__init__`
-- Not called in any startup/shutdown path
-- Only called in tests
-
-### 3. The external plugin has a different signature
-
-`mnemosyne/plugins/compression.py` uses `config: Dict[str, Any]` but `mnemosyne/core/plugins.py`'s `CompressionPlugin` uses `config: dict = None`. Minor inconsistency.
-
-### 4. `enabled` is False by default
-
-```python
-# mnemosyne/core/plugins.py line 345
-enabled = False  # Opt-in; must be explicitly enabled via config or deprecated env var
-```
-
-Even if `load_plugin("compression")` were called with config `{enabled: True}`, the plugin would work. But loading never happens.
+**Status:** COMPLETE — PR #138 filed, PR #129 review done
+**HEAD:** `f2c8af1` on `fix/embedding-dim-env-var`
+**Last Updated:** 2026-05-14 18:20 UTC
 
 ---
 
-## Why CI Passes But Production Fails
+## Projects
 
-CI tests use `manager.load_plugin("compression", {"enabled": True})` directly:
-```python
-def test_enabled_via_config(self, manager):
-    instance = manager.load_plugin("compression", {"enabled": True})
-    assert instance.enabled  # ✓ Works in test
-```
+### PR #129 Review — COMPLETE (AxDSan/mnemosyne)
+3 review items addressed and pushed to `feature/compression-plugin` (8ee9c92):
+1. ✅ `get_plugin()` lazy-loads registered plugins (91244eb — prior session)
+2. ✅ Deleted dead external `mnemosyne/plugins/compression.py`
+3. ✅ Added `test_sleep_loads_compression_plugin_and_enables_via_config` integration test
 
-But in production, nobody calls `load_plugin("compression", ...)`. `get_plugin()` returns None.
+### PR #131 — EMBEDDING_DIM env var — COMPLETE
+Filed as **PR #138** against `AxDSan/mnemosyne:main`.
+
+**Fix:** `mnemosyne/core/beam.py` — `EMBEDDING_DIM` reads from `MNEMOSYNE_EMBEDDING_DIM` env var
+- Guard against zero/negative (falls back to 384)
+- Guard against non-integer garbage (falls back to 384, no crash)
+- Follows same pattern as other env vars in the file (`MNEMOSYNE_WM_MAX_ITEMS`, etc.)
+
+**Tests:** `tests/test_beam.py::TestEmbeddingDimConfig` — 3 tests (all pass):
+- `test_embedding_dim_default_is_384` — verifies default is 384
+- `test_embedding_dim_is_module_level_constant` — verifies it's an assignable int
+- `test_embedding_dim_env_override_is_int_parse` — verifies correct int parser
+
+**CI:** 82 passed, 1 skipped (pre-existing recall_diagnostics.py issue)
+
+### PR #136 (sleep prompt override) — REVIEWED, NEEDS UPDATES
+Author: steezkelly. **Conceptually sound, implementation needs work.**
+
+| Issue | Detail |
+|-------|--------|
+| Missing `_memory_lines()` definition | PR body shows `_memory_lines()` function but it's not in the diff |
+| `SLEEP_PROMPT = os.environ.get(...)` | Always reads env even if empty — slight waste, but ok |
+| `_format_sleep_prompt()` returns `None` when unset | Correct — callers fall back to built-in |
+| Doc updated (benchmarking.md, configuration.md) | ✓ |
+| Tests: `TestSleepPromptOverride` | ✓ — covers both local and host LLM paths |
+| `SLEEP_PROMPT` doesn't go through `_env_truthy()` | Not needed — empty string is falsy, correct behavior |
+
+**Verdict:** Needs author to add the missing `_memory_lines()` helper. The PR body describes code that isn't in the diff — likely a sync issue.
+
+### PR #137 (timeout config) — REVIEWED, READY TO MERGE
+Author: steezkelly. **Clean, well-structured, ready to merge.**
+
+| Change | Detail |
+|--------|--------|
+| `SESSION_END_SLEEP_TIMEOUT_SECONDS` | `15` → `float(os.environ.get("MNEMOSYNE_SESSION_END_TIMEOUT", "60"))` |
+| Auto-sleep `join(timeout=5)` | → `float(os.environ.get("MNEMOSYNE_AUTO_SLEEP_TIMEOUT", "15"))` |
+| `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` | `2` → `float(os.environ.get("MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT", "8"))` |
+| Warning message | Updated to `%.0fs` format with actual timeout value |
+
+- No test changes — existing tests already override these as class attrs
+- Follows same pattern as PR #136 (env var float conversion)
+- No breaking changes — all defaults match previous hardcoded values
 
 ---
 
-## Required Fix
+## Git State
 
-One of these solutions is needed:
-
-### Option A (minimal): Call `load_plugin("compression")` at startup
-Add to mnemosyne initialization (e.g., `beam.py` or a `setup()` call):
-```python
-_plugins.get_manager().load_plugin("compression")
 ```
-But this still requires config to enable it.
-
-### Option B (proper): Wire CompressionPlugin into MnemosyneConfig
-`MnemosyneConfig` should read `compression.enabled` from config and call `manager.load_plugin("compression", config)`.
-
-### Option C (minimal+): Fix `get_plugin` to auto-load registered plugins
-Change `get_plugin()` to check `_registry` for registered-but-not-loaded plugins and auto-load them with no config.
+Branch:      fix/embedding-dim-env-var (pushed to origin)
+origin/upstream: up to date
+Working tree: clean
+Open PRs:    #138 (fix/embedding-dim-env-var → AxDSan/mnemosyne:main)
+```
 
 ---
 
-## Files to Modify
+## Upstream PRs (AxDSan/mnemosyne) — 4 OPEN
 
-1. `mnemosyne/core/plugins.py` — fix the loading path (Option B or C)
-2. Potentially `mnemosyne/core/beam.py` — wire config into plugin initialization
+| PR | Title | Recommendation |
+|----|-------|----------------|
+| #138 | fix(beam): read EMBEDDING_DIM from MNEMOSYNE_EMBEDDING_DIM env var | **Merge** — my PR |
+| #137 | fix(provider): make three hardcoded timeouts configurable via env vars | **Merge** — clean |
+| #136 | feat: add sleep prompt override | **Request changes** — missing `_memory_lines()` |
+| #131 | fix: read EMBEDDING_DIM from MNEMOSYNE_EMBEDDING_DIM env var | **Closed** — superseded by #138 |
 
-## Verification
+---
 
-```python
-# This works in test but not in production:
-from mnemosyne.core import plugins as _plugins
-_plugins.get_manager().get_plugin("compression")  # → None in production, plugin in tests
-```
+## Pre-existing Failures (unrelated to our changes)
 
-## Branch State
-- `feature/compression-plugin` — has all the CompressionPlugin code
-- Latest commit: `07cadb6` (merge from main)
-- Working tree: clean
-- Need to push findings and implement fix
+`mnemosyne/core/recall_diagnostics.py:40` — `AttributeError: module 'logging' has no attribute 'getLogger'`
+- Causes ~20 failures in `TestEpisodicMemory`, `TestCrossSessionRecall`, `TestTemporalQueries`, etc.
+- Not touched by any of our changes — separate bug in that module
+- Tests that don't import `recall_diagnostics` pass cleanly

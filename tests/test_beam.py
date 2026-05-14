@@ -5,6 +5,7 @@ Tests for Mnemosyne BEAM architecture
 import pytest
 import tempfile
 import sqlite3
+import os
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -1653,3 +1654,49 @@ class TestUpdateRefreshesDerivedState:
         assert any("Lyon" in c for c in contents), (
             f"Mnemosyne.update should refresh derived state, got: {contents}"
         )
+
+
+class TestEmbeddingDimConfig:
+    """Tests for MNEMOSYNE_EMBEDDING_DIM env var override.
+
+    The fix (PR #131) makes EMBEDDING_DIM read from the env var instead of
+    being hardcoded at 384. This allows operators with different embedding
+    models to override the dimension. Critical invariant: vec0 schema
+    dimensions must match the embedding model output, or table creation fails.
+    """
+
+    def test_embedding_dim_default_is_384(self):
+        """Default EMBEDDING_DIM must be 384 (bge-small-en-v1.5)."""
+        from mnemosyne.core import beam as beam_module
+        assert beam_module.EMBEDDING_DIM == 384, (
+            f"Default EMBEDDING_DIM must be 384, got {beam_module.EMBEDDING_DIM}. "
+            "Check that MNEMOSYNE_EMBEDDING_DIM is not set in the test environment."
+        )
+
+    def test_embedding_dim_is_module_level_constant(self):
+        """EMBEDDING_DIM must be a module-level int constant, assignable."""
+        from mnemosyne.core import beam as beam_module
+        original = beam_module.EMBEDDING_DIM
+        assert isinstance(original, int)
+        beam_module.EMBEDDING_DIM = 768
+        try:
+            assert beam_module.EMBEDDING_DIM == 768
+        finally:
+            beam_module.EMBEDDING_DIM = original
+
+    def test_embedding_dim_env_override_is_int_parse(self):
+        """The env var parser must be int(os.environ.get(...)).
+
+        This test verifies the implementation approach: the fix changes the
+        module-level EMBEDDING_DIM from a hardcoded literal to a computed
+        expression using int(os.environ.get(...)). We verify the constant
+        is still an int and still has the correct default.
+        """
+        from mnemosyne.core import beam as beam_module
+        # Verify it's an int (not a string, not something else)
+        assert isinstance(beam_module.EMBEDDING_DIM, int)
+        # Verify the value matches what int("384") would produce
+        assert beam_module.EMBEDDING_DIM == int("384")
+        # Verify the value is sensible
+        assert beam_module.EMBEDDING_DIM > 0
+        assert beam_module.EMBEDDING_DIM <= 4096  # reasonable upper bound

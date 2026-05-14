@@ -223,7 +223,11 @@ def _default_db_path() -> Path:
     return _default_data_dir() / "mnemosyne.db"
 
 # Config
-EMBEDDING_DIM = 384  # bge-small-en-v1.5
+try:
+    _emb_dim = int(os.environ.get("MNEMOSYNE_EMBEDDING_DIM", "384"))
+    EMBEDDING_DIM = _emb_dim if _emb_dim > 0 else 384
+except ValueError:
+    EMBEDDING_DIM = 384  # bge-small-en-v1.5
 WORKING_MEMORY_MAX_ITEMS = int(os.environ.get("MNEMOSYNE_WM_MAX_ITEMS", "10000"))
 WORKING_MEMORY_TTL_HOURS = int(os.environ.get("MNEMOSYNE_WM_TTL_HOURS", "24"))
 EPISODIC_RECALL_LIMIT = int(os.environ.get("MNEMOSYNE_EP_LIMIT", "50000"))
