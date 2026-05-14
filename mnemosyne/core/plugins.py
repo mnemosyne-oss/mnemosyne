@@ -526,8 +526,16 @@ class PluginManager:
         return result
 
     def get_plugin(self, name: str) -> Optional[MnemosynePlugin]:
-        """Return a loaded plugin instance, or None if not loaded."""
-        return self._instances.get(name)
+        """Return a loaded plugin instance, or None if not loaded.
+
+        Lazy-loads registered-but-unloaded plugins on first access so callers
+        that hold a reference can test `.enabled` without a separate load call.
+        """
+        if name in self._instances:
+            return self._instances[name]
+        if name in self._registry:
+            return self.load_plugin(name)
+        return None
 
     def is_loaded(self, name: str) -> bool:
         """Check if a plugin is currently loaded."""

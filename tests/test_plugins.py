@@ -306,13 +306,17 @@ class TestPluginManagerLoadUnload:
             manager.unload_plugin("logging")
 
     def test_get_plugin_returns_instance(self, manager):
-        """get_plugin returns the loaded instance."""
+        """get_plugin returns the loaded instance (lazy-loads if needed)."""
         loaded = manager.load_plugin("metrics")
         assert manager.get_plugin("metrics") is loaded
 
-    def test_get_plugin_returns_none(self, manager):
-        """get_plugin returns None for unloaded plugins."""
-        assert manager.get_plugin("metrics") is None
+    def test_get_plugin_lazy_loads_registered(self, manager):
+        """get_plugin auto-loads registered-but-unloaded plugins on access."""
+        # "metrics" is registered but not yet loaded
+        assert not manager.is_loaded("metrics")
+        instance = manager.get_plugin("metrics")
+        assert instance is not None  # auto-loaded
+        assert manager.is_loaded("metrics")
 
     def test_load_all(self, manager):
         """load_all loads every registered plugin."""
