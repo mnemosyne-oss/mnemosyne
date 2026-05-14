@@ -478,14 +478,22 @@ class MnemosyneMemoryProvider(MemoryProvider):
     # How long on_session_end will wait for sleep/consolidation to finish before
     # giving up and letting the daemon thread continue in the background. Tests
     # may shorten this to keep the suite fast. Override via MNEMOSYNE_SESSION_END_TIMEOUT.
-    _DEFAULT_SESSION_END_TIMEOUT = 15
-    _env_float = lambda key, default: float(os.environ[key]) if key in os.environ else default
-    SESSION_END_SLEEP_TIMEOUT_SECONDS = _env_float("MNEMOSYNE_SESSION_END_TIMEOUT", _DEFAULT_SESSION_END_TIMEOUT)
+    @staticmethod
+    def _parse_env_float(key: str, default: float) -> float:
+        """Read a float env var, falling back to default on missing or invalid value."""
+        val = os.environ.get(key)
+        if val is None:
+            return default
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return default
+
+    SESSION_END_SLEEP_TIMEOUT_SECONDS = _parse_env_float("MNEMOSYNE_SESSION_END_TIMEOUT", 15)
 
     # Auto-sleep thread join timeout. Re-read from env once at class level so
     # it's not re-parsed on every _maybe_auto_sleep call.
-    _DEFAULT_AUTO_SLEEP_TIMEOUT = 5
-    _AUTO_SLEEP_TIMEOUT_SECONDS = _env_float("MNEMOSYNE_AUTO_SLEEP_TIMEOUT", _DEFAULT_AUTO_SLEEP_TIMEOUT)
+    _AUTO_SLEEP_TIMEOUT_SECONDS = _parse_env_float("MNEMOSYNE_AUTO_SLEEP_TIMEOUT", 5)
 
     def __init__(self):
         self._beam: Optional[Any] = None
@@ -1368,8 +1376,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
     # fall through to MNEMOSYNE_LLM_BASE_URL (violating the host-skips-remote
     # contract). Tests may shorten this to keep the suite fast. Override via
     # MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT.
-    _DEFAULT_SHUTDOWN_DRAIN_TIMEOUT = 2
-    SHUTDOWN_DRAIN_TIMEOUT_SECONDS = _env_float("MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT", _DEFAULT_SHUTDOWN_DRAIN_TIMEOUT)
+    SHUTDOWN_DRAIN_TIMEOUT_SECONDS = _parse_env_float("MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT", 2)
 
     def shutdown(self) -> None:
         # If session_end's daemon thread is still consolidating when shutdown
