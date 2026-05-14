@@ -19,6 +19,7 @@ import importlib.util
 import inspect
 import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime
@@ -318,12 +319,118 @@ class FilterPlugin(MnemosynePlugin):
         return False
 
 
+class CompressionPlugin(MnemosynePlugin):
+    """
+    Built-in plugin for optional pre-compression of memory content
+    before LLM summarization/consolidation.
+
+    When enabled and a compression provider (e.g. ``rust_cave_001``)
+    is available, each memory line is compressed before chunking.
+    This reduces context window pressure for small local LLMs.
+
+    Config:
+        enabled (bool): Enable compression (default: False).
+        provider (str): Compression backend name (default: "caveman").
+            Currently only "caveman" (``rust_cave_001``) is supported.
+        threshold_chars (int): Minimum character count below which
+            compression is skipped (default: 20).
+
+    Env-var fallback (deprecated):
+        ``MNEMOSYNE_USE_CAVEMAN=1`` still works but shows a deprecation
+        warning. Prefer the config/plugin path.
+    """
+
+    name = "compression"
+    version = "1.0.0"
+    enabled = False  # Opt-in; must be explicitly enabled via config or deprecated env var
+
+    def __init__(self, config: dict = None):
+        super().__init__(config)
+        self._provider = self.config.get("provider", "caveman")
+        self._threshold = int(self.config.get("threshold_chars", 20))
+        self._caveman_available = False
+        self._caveman_import_attempted = False
+
+        # Apply enabled from config (overrides class-level default)
+        self.enabled = bool(self.config.get("enabled", False))
+
+        # --- Deprecated env-var fallback ---
+        env_val = os.environ.get("MNEMOSYNE_USE_CAVEMAN", "").lower()
+        if env_val in ("1", "true", "yes"):
+            import warnings
+            warnings.warn(
+                "MNEMOSYNE_USE_CAVEMAN env var is deprecated. "
+                "Use the compression plugin config instead: "
+                "'mnemosyne.plugins.compression.enabled: true'",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.enabled = True
+
+    def _lazy_init_caveman(self) -> None:
+        """Try importing rust_cave_001 once; cache result."""
+        if self._caveman_import_attempted:
+            return
+        self._caveman_import_attempted = True
+        try:
+            from rust_cave_001 import compress  # noqa: F811
+            self._caveman_available = True
+        except ImportError:
+            logger.debug("CompressionPlugin: rust_cave_001 not installed")
+        except Exception:
+            logger.warning("CompressionPlugin: unexpected import error", exc_info=True)
+
+    def compress_lines(self, lines: list[str]) -> list[str]:
+        """Compress a list of memory content lines in-place.
+
+        Returns the compressed lines (or originals on any failure).
+        No-op if the provider is not available.
+        """
+        if not self.enabled:
+            return lines
+        if self._provider != "caveman":
+            logger.warning("CompressionPlugin: unknown provider %r, skipping", self._provider)
+            return lines
+
+        self._lazy_init_caveman()
+        if not self._caveman_available:
+            return lines
+
+        from rust_cave_001 import compress  # type: ignore[import-untyped]
+
+        compressed: list[str] = []
+        for line in lines:
+            if len(line) < self._threshold:
+                compressed.append(line)
+                continue
+            try:
+                c = compress(line)
+                compressed.append(c if len(c) > 2 else line)
+            except Exception:
+                compressed.append(line)
+        return compressed
+
+    # --- Lifecycle hooks (minimal; compression is called explicitly) ---
+
+    def on_remember(self, memory: dict) -> None:
+        pass
+
+    def on_recall(self, memory: dict) -> None:
+        pass
+
+    def on_consolidate(self, summary: dict) -> None:
+        pass
+
+    def on_invalidate(self, memory_id: str) -> None:
+        pass
+
+
 class PluginManager:
     """
     Register, load, and manage Mnemosyne plugins.
 
     Supports:
-    - Built-in plugins (LoggingPlugin, MetricsPlugin, FilterPlugin)
+    - Built-in plugins (LoggingPlugin, MetricsPlugin, FilterPlugin, CompressionPlugin)
     - External plugins discovered from ~/.hermes/mnemosyne/plugins/
     - Manual registration of plugin classes
     """
@@ -337,6 +444,7 @@ class PluginManager:
         self.register_plugin("logging", LoggingPlugin)
         self.register_plugin("metrics", MetricsPlugin)
         self.register_plugin("filter", FilterPlugin)
+        self.register_plugin("compression", CompressionPlugin)
 
     def register_plugin(self, name: str, plugin_class: Type[MnemosynePlugin]) -> None:
         """

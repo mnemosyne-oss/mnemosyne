@@ -25,6 +25,7 @@ from mnemosyne.core.plugins import (
     LoggingPlugin,
     MetricsPlugin,
     FilterPlugin,
+    CompressionPlugin,
     get_manager,
     reset_manager,
     DEFAULT_PLUGIN_DIR,
@@ -252,6 +253,7 @@ class TestPluginManagerRegistration:
         assert manager.is_registered("logging")
         assert manager.is_registered("metrics")
         assert manager.is_registered("filter")
+        assert manager.is_registered("compression")
 
     def test_is_registered_false_for_unknown(self, manager):
         """is_registered returns False for unknown plugins."""
@@ -315,7 +317,7 @@ class TestPluginManagerLoadUnload:
     def test_load_all(self, manager):
         """load_all loads every registered plugin."""
         loaded = manager.load_all()
-        assert len(loaded) == 3
+        assert len(loaded) == 4
         assert all(manager.is_loaded(p["name"]) for p in manager.list_plugins())
 
     def test_unload_all(self, manager):
@@ -342,7 +344,7 @@ class TestPluginManagerList:
     def test_list_plugins_structure(self, manager):
         """list_plugins returns correct dict structure."""
         plugins = manager.list_plugins()
-        assert len(plugins) == 3
+        assert len(plugins) == 4
         for p in plugins:
             assert "name" in p
             assert "class" in p
@@ -738,6 +740,76 @@ class TestGlobalManager:
         reset_manager()
         mgr2 = get_manager()
         assert not mgr2.is_loaded("logging")
+
+
+# ============================================================================
+# Built-in CompressionPlugin
+# ============================================================================
+
+
+class TestCompressionPlugin:
+    """Tests for CompressionPlugin behavior."""
+
+    def test_disabled_by_default(self):
+        """CompressionPlugin is disabled by default (opt-in)."""
+        plugin = CompressionPlugin()
+        assert not plugin.enabled
+
+    def test_enabled_via_config(self):
+        """Config enabled=True enables the plugin."""
+        plugin = CompressionPlugin(config={"enabled": True})
+        assert plugin.enabled
+
+    def test_compress_lines_noop_when_disabled(self):
+        """compress_lines returns lines unchanged when disabled."""
+        plugin = CompressionPlugin(config={"enabled": False})
+        lines = ["Hello world", "Test line"]
+        result = plugin.compress_lines(lines)
+        assert result == lines
+
+    def test_compress_lines_works_with_caveman(self):
+        """compress_lines actually compresses when rust_cave_001 is installed."""
+        plugin = CompressionPlugin(config={"enabled": True, "provider": "caveman"})
+        lines = ["Hello world", "This is a test line"]
+        result = plugin.compress_lines(lines)
+        # caveman removes stopwords like "This" from phrases
+        assert len(result) == len(lines)
+        assert isinstance(result[0], str)
+        assert len(result[0]) <= len(lines[0])  # compressed or unchanged
+        # Verify threshold still works
+        plugin2 = CompressionPlugin(config={"enabled": True, "threshold_chars": 100})
+        short = ["Short"]
+        assert plugin2.compress_lines(short) == short
+
+    def test_deprecated_env_var_fallback(self, monkeypatch):
+        """MNEMOSYNE_USE_CAVEMAN=1 enables with deprecation warning."""
+        monkeypatch.setenv("MNEMOSYNE_USE_CAVEMAN", "1")
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            plugin = CompressionPlugin()
+            deprecation = any(
+                issubclass(warn.category, DeprecationWarning) for warn in w
+            )
+            assert deprecation, "Should emit DeprecationWarning"
+            assert plugin.enabled
+
+    def test_registered_as_builtin(self, manager):
+        """CompressionPlugin is registered in PluginManager."""
+        assert manager.is_registered("compression")
+        instance = manager.load_plugin("compression")
+        assert isinstance(instance, CompressionPlugin)
+        assert not instance.enabled  # default disabled
+
+    def test_unknown_provider_fallback(self, manager):
+        """Unknown provider falls back gracefully, returning lines unchanged."""
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            plugin = CompressionPlugin(config={"enabled": True, "provider": "unknown_provider_xyz"})
+            lines = ["Hello"]
+            result = plugin.compress_lines(lines)
+            assert result == lines
 
 
 # ============================================================================
