@@ -3,24 +3,31 @@ version: 2.5
 description: Native AI memory system with SQLite - zero dependencies, sub-millisecond latency
 author: Abdias J
 provides_tools:
-  - mnemosyne_remember
-  - mnemosyne_recall
-  - mnemosyne_stats
-  - mnemosyne_triple_add
-  - mnemosyne_triple_query
-  - mnemosyne_sleep
-  - mnemosyne_scratchpad_write
-  - mnemosyne_scratchpad_read
-  - mnemosyne_scratchpad_clear
-  - mnemosyne_invalidate
-  - mnemosyne_export
-  - mnemosyne_import
-  - mnemosyne_update
-  - mnemosyne_forget
-  - mnemosyne_diagnose
+ - mnemosyne_remember
+ - mnemosyne_recall
+ - mnemosyne_stats
+ - mnemosyne_triple_add
+ - mnemosyne_triple_query
+ - mnemosyne_sleep
+ - mnemosyne_scratchpad_write
+ - mnemosyne_scratchpad_read
+ - mnemosyne_scratchpad_clear
+ - mnemosyne_invalidate
+ - mnemosyne_export
+ - mnemosyne_import
+ - mnemosyne_update
+ - mnemosyne_forget
+ - mnemosyne_diagnose
 provides_hooks:
-  - pre_llm_call
-  - on_session_start
-  - post_tool_call
+ - pre_llm_call
+ - on_session_start
+ - post_tool_call
 dependencies: []
 # Mnemosyne requires no external dependencies - pure Python + SQLite
+
+# Plugin configuration schema
+plugin_config_schema:
+  mnemosyne.plugins.compression.enabled:
+    type: boolean
+    default: false
+    description: Enable memory compression using rust_cave_001 during consolidation. Only affects tier-3 memories exceeding MNEMOSYNE_TIER3_MAX_CHARS (default 300 chars). Legacy MNEMOSYNE_USE_CAVEMAN env var is respected as fallback but will be removed in v2.1.
