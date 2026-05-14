@@ -2,7 +2,7 @@
   "project": {
     "name": "Mnemosyne",
     "package": "mnemosyne-memory",
-    "version": "2.7.0",
+    "version": "2.8.0",
     "author": "Abdias J",
     "license": "MIT",
     "description": "Zero-Dependency, Sub-Millisecond AI Memory System using SQLite",

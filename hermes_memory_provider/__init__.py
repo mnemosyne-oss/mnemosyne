@@ -237,9 +237,130 @@ TRIPLE_QUERY_SCHEMA = {
     },
 }
 
+SCRATCHPAD_WRITE_SCHEMA = {
+    "name": "mnemosyne_scratchpad_write",
+    "description": "Write a temporary note to the Mnemosyne scratchpad.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "description": "Content to write"},
+        },
+        "required": ["content"],
+    },
+}
+
+SCRATCHPAD_READ_SCHEMA = {
+    "name": "mnemosyne_scratchpad_read",
+    "description": "Read the Mnemosyne scratchpad entries.",
+    "parameters": {"type": "object", "properties": {}},
+}
+
+SCRATCHPAD_CLEAR_SCHEMA = {
+    "name": "mnemosyne_scratchpad_clear",
+    "description": "Clear all entries from the Mnemosyne scratchpad.",
+    "parameters": {"type": "object", "properties": {}},
+}
+
+EXPORT_SCHEMA = {
+    "name": "mnemosyne_export",
+    "description": "Export all Mnemosyne memories to a JSON file for backup or migration.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "output_path": {
+                "type": "string",
+                "description": "File path to write the export JSON (e.g., /tmp/mnemosyne_backup.json)",
+            },
+        },
+        "required": ["output_path"],
+    },
+}
+
+UPDATE_SCHEMA = {
+    "name": "mnemosyne_update",
+    "description": "Update the content or importance of an existing memory by ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "ID of the memory to update"},
+            "content": {"type": "string", "description": "New content for the memory (optional)"},
+            "importance": {"type": "number", "description": "New importance from 0.0 to 1.0 (optional)"},
+        },
+        "required": ["memory_id"],
+    },
+}
+
+FORGET_SCHEMA = {
+    "name": "mnemosyne_forget",
+    "description": "Permanently delete a memory by ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "ID of the memory to delete"},
+        },
+        "required": ["memory_id"],
+    },
+}
+
+IMPORT_SCHEMA = {
+    "name": "mnemosyne_import",
+    "description": "Import Mnemosyne memories from a JSON file or another memory provider (Hindsight, Mem0). Idempotent by default.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "input_path": {
+                "type": "string",
+                "description": "File path to read the export JSON from (for file imports)",
+            },
+            "provider": {
+                "type": "string",
+                "description": "Provider to import from: 'hindsight', 'mem0'. Requires api_key.",
+            },
+            "api_key": {
+                "type": "string",
+                "description": "API key for the source provider (can also be set via env var)",
+            },
+            "user_id": {
+                "type": "string",
+                "description": "Filter imported memories by user ID (provider-specific)",
+            },
+            "agent_id": {
+                "type": "string",
+                "description": "Filter imported memories by agent ID (provider-specific)",
+            },
+            "base_url": {
+                "type": "string",
+                "description": "Base URL for self-hosted provider instances",
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": "If true, validate and transform but don't write any memories",
+                "default": False,
+            },
+            "channel_id": {
+                "type": "string",
+                "description": "Channel to assign imported memories to",
+            },
+            "force": {
+                "type": "boolean",
+                "description": "If true, overwrite existing records instead of skipping",
+                "default": False,
+            },
+        },
+    },
+}
+
+DIAGNOSE_SCHEMA = {
+    "name": "mnemosyne_diagnose",
+    "description": "Run PII-safe diagnostics on Mnemosyne installation. Checks dependencies, database state, and vector search readiness. Never includes memory content or API keys.",
+    "parameters": {"type": "object", "properties": {}},
+}
+
 ALL_TOOL_SCHEMAS = [
     REMEMBER_SCHEMA, RECALL_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
     INVALIDATE_SCHEMA, TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA,
+    SCRATCHPAD_WRITE_SCHEMA, SCRATCHPAD_READ_SCHEMA, SCRATCHPAD_CLEAR_SCHEMA,
+    EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
 ]
 
 
@@ -791,6 +912,22 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 return self._handle_triple_add(args)
             elif tool_name == "mnemosyne_triple_query":
                 return self._handle_triple_query(args)
+            elif tool_name == "mnemosyne_scratchpad_write":
+                return self._handle_scratchpad_write(args)
+            elif tool_name == "mnemosyne_scratchpad_read":
+                return self._handle_scratchpad_read(args)
+            elif tool_name == "mnemosyne_scratchpad_clear":
+                return self._handle_scratchpad_clear(args)
+            elif tool_name == "mnemosyne_export":
+                return self._handle_export(args)
+            elif tool_name == "mnemosyne_update":
+                return self._handle_update(args)
+            elif tool_name == "mnemosyne_forget":
+                return self._handle_forget(args)
+            elif tool_name == "mnemosyne_import":
+                return self._handle_import(args)
+            elif tool_name == "mnemosyne_diagnose":
+                return self._handle_diagnose(args)
             else:
                 return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
         except Exception as e:
@@ -911,6 +1048,103 @@ class MnemosyneMemoryProvider(MemoryProvider):
         results = query_triples(subject=subject, predicate=predicate, object=obj,
                                 db_path=self._beam.db_path)
         return json.dumps({"count": len(results), "results": results})
+
+    def _handle_scratchpad_write(self, args: Dict[str, Any]) -> str:
+        content = args.get("content", "").strip()
+        if not content:
+            return json.dumps({"error": "Content is required"})
+        pad_id = self._beam.scratchpad_write(content)
+        return json.dumps({"status": "written", "id": pad_id})
+
+    def _handle_scratchpad_read(self, args: Dict[str, Any]) -> str:
+        entries = self._beam.scratchpad_read()
+        return json.dumps({"entries_count": len(entries), "entries": entries})
+
+    def _handle_scratchpad_clear(self, args: Dict[str, Any]) -> str:
+        self._beam.scratchpad_clear()
+        return json.dumps({"status": "cleared"})
+
+    def _handle_export(self, args: Dict[str, Any]) -> str:
+        output_path = args.get("output_path", "").strip()
+        if not output_path:
+            return json.dumps({"error": "output_path is required"})
+        from mnemosyne.core.memory import Mnemosyne
+        mem = Mnemosyne(session_id=self._session_id, db_path=self._beam.db_path)
+        result = mem.export_to_file(output_path)
+        return json.dumps(result)
+
+    def _handle_update(self, args: Dict[str, Any]) -> str:
+        memory_id = args.get("memory_id", "").strip()
+        if not memory_id:
+            return json.dumps({"error": "memory_id is required"})
+        content = args.get("content")
+        importance = args.get("importance")
+        ok = self._beam.update_working(memory_id, content=content, importance=importance)
+        return json.dumps({
+            "status": "updated" if ok else "not_found",
+            "memory_id": memory_id,
+        })
+
+    def _handle_forget(self, args: Dict[str, Any]) -> str:
+        memory_id = args.get("memory_id", "").strip()
+        if not memory_id:
+            return json.dumps({"error": "memory_id is required"})
+        ok = self._beam.forget_working(memory_id)
+        return json.dumps({
+            "status": "deleted" if ok else "not_found",
+            "memory_id": memory_id,
+        })
+
+    def _handle_import(self, args: Dict[str, Any]) -> str:
+        provider = (args.get("provider") or "").strip().lower()
+        input_path = args.get("input_path", "").strip()
+        dry_run = bool(args.get("dry_run", False))
+        force = bool(args.get("force", False))
+
+        from mnemosyne.core.memory import Mnemosyne
+        mem = Mnemosyne(session_id=self._session_id, db_path=self._beam.db_path)
+
+        if provider:
+            api_key = args.get("api_key", "").strip()
+            user_id = args.get("user_id", "").strip() or None
+            agent_id = args.get("agent_id", "").strip() or None
+            base_url = args.get("base_url", "").strip() or None
+            channel_id = args.get("channel_id")
+
+            if not api_key:
+                import os
+                env_key = f"{provider.upper()}_API_KEY"
+                api_key = os.environ.get(env_key, "")
+            if not api_key:
+                return json.dumps({
+                    "error": f"api_key required for {provider} import. "
+                             f"Set {provider.upper()}_API_KEY env var or pass api_key parameter.",
+                })
+
+            from mnemosyne.core.importers import import_from_provider
+            result = import_from_provider(
+                provider, mem,
+                api_key=api_key,
+                user_id=user_id,
+                agent_id=agent_id,
+                base_url=base_url,
+                dry_run=dry_run,
+                channel_id=channel_id,
+            )
+            return json.dumps(result.to_dict())
+
+        if not input_path:
+            return json.dumps({
+                "error": "Either input_path (for file import) or provider "
+                         "(for cross-provider import) is required",
+            })
+        stats = mem.import_from_file(input_path, force=force)
+        return json.dumps({"status": "imported", "stats": stats})
+
+    def _handle_diagnose(self, args: Dict[str, Any]) -> str:
+        from mnemosyne.diagnose import run_diagnostics
+        result = run_diagnostics()
+        return json.dumps(result, indent=2, default=str)
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._turn_count = turn_number

@@ -17,6 +17,7 @@ def _isolated_env(tmp_path):
     env = os.environ.copy()
     env["HOME"] = str(home)
     env["MNEMOSYNE_DATA_DIR"] = str(data_dir)
+    env["MNEMOSYNE_NO_EMBEDDINGS"] = "1"
     return env, home, data_dir
 
 
@@ -76,6 +77,7 @@ def test_empty_mnemosyne_data_dir_falls_back_to_default_for_scripts(tmp_path):
     env = os.environ.copy()
     env["HOME"] = str(home)
     env["MNEMOSYNE_DATA_DIR"] = ""
+    env["MNEMOSYNE_NO_EMBEDDINGS"] = "1"
     _store_memory(env)
 
     backfill = subprocess.run(

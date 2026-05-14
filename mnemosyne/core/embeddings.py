@@ -113,9 +113,11 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
 
 def available() -> bool:
     """Check if dense retrieval is available."""
+    if os.environ.get("MNEMOSYNE_NO_EMBEDDINGS"):
+        return False
     if _is_api_model(_DEFAULT_MODEL):
         return bool(_OPENAI_API_KEY)
-    return _FASTEMBED_AVAILABLE and _get_model() is not None
+    return _FASTEMBED_AVAILABLE
 
 
 def available_api() -> bool:
