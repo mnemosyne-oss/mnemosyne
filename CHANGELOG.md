@@ -19,7 +19,7 @@ and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemos
 - **IP:port detection in link filter.** Raw IP addresses like `182.3.4.5:8877` are now caught alongside domain-based URLs.
 - **Automated version bump script.** Deterministic version bumper that updates all 8 version-carrying files and runs verification grep.
 
-### Changed / Deprecated
+### Changed
 
 - **Beam.py migration** — `beam.py` no longer directly imports and calls `rust_cave_001`. Instead it checks `_plugins.get_manager().get_plugin("compression")` and delegates to `CompressionPlugin.compress_lines()`. The `rust_cave_001` dependency is now fully encapsulated behind the plugin interface.
 - **MNEMOSYNE_USE_CAVEMAN** — still activates compression but emits a `DeprecationWarning` pointing to the config-based path. Use `MnemosyneConfig.compression.enabled = True` instead.
@@ -30,7 +30,6 @@ and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemos
 - **CI embedding timeout.** `fastembed` model downloads blocked subprocess tests. Added `MNEMOSYNE_NO_EMBEDDINGS` env guard and lazy-loading in `available()`.
 - **Provider export/import routing.** Fixed handlers to route through the `Mnemosyne` wrapper instead of `BeamMemory` directly.
 - **Stale version references.** Six files across the repo still displayed v2.7 after the initial v2.8.0 build (plugin yamls, docs pages, README badge, codebase surface). All corrected.
-
 ## [2.7.0] — 2026-05-12
 
 ### Fixed
