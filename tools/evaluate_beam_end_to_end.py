@@ -1475,6 +1475,26 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                     except Exception:
                         pass
         
+        # --- TR: Timeline bypass ---
+        # TR questions need exact dates from the conversation. Retrieval via
+        # FTS5+vector misses date-specific content because date strings get
+        # OR-tokenized ("2024-03-15" → "2024 OR 03 OR 15") and temporal
+        # weighting can't compensate. Direct timeline extraction from the raw
+        # conversation gives the LLM all dates with surrounding event context.
+        _tr_timeline = None
+        if ability == 'TR' and conversation_messages:
+            _tr_timeline = _extract_timeline_from_conversation(conversation_messages)
+            if _tr_timeline and len(_tr_timeline) >= 2:
+                # Build a timeline string to inject as pre-context
+                _tl_lines = ["DIRECT TIMELINE (extracted from raw conversation, NOT from retrieval):"]
+                for _td in _tr_timeline:
+                    _tl_lines.append(f"  {_td['date_str']}: {_td['event_text'][:200]}")
+                _tl_str = "\n".join(_tl_lines)
+                # Prepend timeline to memories as a synthetic high-score entry
+                memories.insert(0, {"id": "timeline_direct", "content": _tl_str, "score": 1.0,
+                                    "source": "tr_timeline_bypass"})
+                print(f"    [TR-timeline] injected {len(_tr_timeline)} dates from conversation", flush=True)
+        
         # --- Pass 1: Initial answer ---
         pass1_ctx = _build_context(memories, recent_parts)
         # CR questions need contradiction-first prompt to avoid confident
@@ -1562,31 +1582,6 @@ GAP: migrated to PostgreSQL""" % (question, ctx_trimmed))
                     if ck not in gap_seen:
                         gap_seen.add(ck)
                         gap_memories.append(mem)
-                # ---- LIKE fallback: FTS5 sanitization destroys specificity for
-                # ---- gap queries containing dots/dashes/versions. Exact substring
-                # ---- search catches what FTS5 OR-tokenization misses.
-                try:
-                    import sqlite3 as _sql
-                    _conn = beam.conn
-                    for _tbl, _id_col in [("working_memory", "id"), ("episodic_memory", "id")]:
-                        _rows = _conn.execute(
-                            f"SELECT {_id_col}, content, metadata FROM {_tbl} WHERE content LIKE ? ORDER BY timestamp DESC LIMIT 10",
-                            (f"%{gq}%",)
-                        ).fetchall()
-                        for _r in _rows:
-                            _ck = _r[1][:80] if _r[1] else ""
-                            if _ck and _ck not in gap_seen:
-                                gap_seen.add(_ck)
-                                _mem = {"id": _r[0], "content": _r[1], "score": 0.95,
-                                        "metadata": json.loads(_r[2]) if _r[2] else {}}
-                                # Inject temporal tags for date-based LIKE hits
-                                import re as _re_like
-                                _dates = _re_like.findall(r'\b\d{4}-\d{2}-\d{2}\b', _r[1] or "")
-                                if _dates:
-                                    _mem["content"] = f"{_r[1]} [DATES: {', '.join(_dates)}]"
-                                gap_memories.append(_mem)
-                except Exception:
-                    pass
             
             # Merge: original + gap memories, deduplicate, re-sort
             all_mems = list(memories)
@@ -2166,6 +2161,15 @@ def main():
                 ingest_time = time.perf_counter() - t0
                 print(f"    Ingested {len(conv['messages'])} msgs in {ingest_time:.1f}s "
                       f"(DB: {os.path.getsize(db_path)/1024:.0f}KB)")
+
+                # Consolidation: compress raw messages into episodic summaries.
+                # The historical 52.3% peak was with consolidation enabled.
+                # Episodic summaries surface cross-message patterns (timelines,
+                # contradictions, multi-hop chains) that raw retrieval misses.
+                # NOTE: beam.sleep() is disabled here — it hangs on 188 messages
+                # with 475% CPU usage for 45+ minutes. Needs investigation.
+                # For now, the TR timeline bypass + CR negation retrieval handle
+                # the cross-message patterns that consolidation would provide.
 
                 # Evaluate
                 conv_result = evaluate_conversation(

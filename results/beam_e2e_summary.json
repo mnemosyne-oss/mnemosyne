@@ -1,5 +1,5 @@
 {
-  "date": "2026-05-17T13:39:58.899400+00:00",
+  "date": "2026-05-17T19:17:40.411487+00:00",
   "metadata": {
     "model": "deepseek-v4-pro",
     "sample_size": 1,
@@ -12,27 +12,27 @@
         "count": 2
       },
       "CR": {
-        "avg_score": 0.064,
+        "avg_score": 0.1452922077922078,
         "count": 2
       },
       "EO": {
-        "avg_score": 0.047619047619047616,
+        "avg_score": 0.015151515151515152,
         "count": 2
       },
       "IE": {
-        "avg_score": 0.550531914893617,
+        "avg_score": 0.5,
         "count": 2
       },
       "KU": {
-        "avg_score": 0.00510204081632653,
+        "avg_score": 0.5,
         "count": 2
       },
       "MR": {
-        "avg_score": 0.0,
+        "avg_score": 0.13443396226415094,
         "count": 2
       },
       "SUM": {
-        "avg_score": 0.07663732536542034,
+        "avg_score": 0.06438481825478728,
         "count": 2
       },
       "TR": {
@@ -40,7 +40,7 @@
         "count": 2
       },
       "OVERALL": {
-        "avg_score": 0.15548629108680145,
+        "avg_score": 0.23240781293283266,
         "count": 16
       }
     }
