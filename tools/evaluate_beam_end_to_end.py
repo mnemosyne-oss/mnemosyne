@@ -1458,7 +1458,7 @@ GAP: added user authentication module
 GAP: migrated to PostgreSQL""" % (question, ctx_trimmed))
         
         gap_messages = [
-            {"role": "system", "content": "You extract exact entity strings from text for database filtering. Output ONLY 'GAP: ...' lines or 'NO_GAPS'. No pleasantries, no explanations."},
+            {"role": "system", "content": "OUTPUT ONLY lines starting with 'GAP: ' or the single word 'NO_GAPS'. Do NOT output ANY other text — no explanations, no analysis, no markdown. Just the GAP lines or NO_GAPS. FIRST WORD of your response must be either 'GAP:' or 'NO_GAPS'."},
             {"role": "user", "content": gap_prompt},
         ]
         try:
