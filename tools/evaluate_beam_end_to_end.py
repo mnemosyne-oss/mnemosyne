@@ -1439,6 +1439,42 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                 ctx_blocks.append("RETRIEVED MEMORIES:\n" + "\n\n".join(mem_strs))
             return "\n\n".join(ctx_blocks) if ctx_blocks else "[No memories found]"
         
+        # --- CR: Negation-aware retrieval ---
+        # CR rubrics require finding BOTH positive claims AND negations
+        # ("never worked with Flask" vs "implemented Flask routes").
+        # Regular FTS5 OR-search finds positive claims but misses negation
+        # statements because "never"/"not"/"haven't" are stop-words or
+        # don't co-occur with query terms in the same FTS5 token window.
+        # LIKE-based exact substring search catches what FTS5 misses.
+        if ability == 'CR':
+            import re as _re_cr_neg
+            # Extract key noun phrases from the question
+            _neg_terms = _re_cr_neg.findall(r'[A-Z][a-z]+(?:[-\s][A-Z][a-z]+)*', question)
+            _neg_exclude = {'have', 'could', 'which', 'what', 'this', 'that', 'does', 'about', 'there'}
+            _neg_terms = [t for t in _neg_terms if len(t) > 3 and t.lower() not in _neg_exclude]
+            if not _neg_terms:
+                _neg_terms = [w for w in question.split() if len(w) > 4][:3]
+            
+            _neg_seen = {m.get("content", "")[:80] for m in memories}
+            for _term in _neg_terms[:5]:
+                for _neg_word in ['never', 'not', "haven't", "didn't"]:
+                    try:
+                        _neg_rows = beam.conn.execute(
+                            "SELECT id, content, metadata FROM working_memory "
+                            "WHERE content LIKE ? AND (content LIKE ? OR content LIKE ?) LIMIT 5",
+                            (f"%{_term}%", f"%{_neg_word}%", f"%{_term}%{_neg_word}%")
+                        ).fetchall()
+                        for _nr in _neg_rows:
+                            _nk = _nr[1][:80] if _nr[1] else ""
+                            if _nk and _nk not in _neg_seen:
+                                _neg_seen.add(_nk)
+                                memories.insert(0, {
+                                    "id": _nr[0], "content": _nr[1], "score": 0.80,
+                                    "source": "negation_cr"
+                                })
+                    except Exception:
+                        pass
+        
         # --- Pass 1: Initial answer ---
         pass1_ctx = _build_context(memories, recent_parts)
         # CR questions need contradiction-first prompt to avoid confident
