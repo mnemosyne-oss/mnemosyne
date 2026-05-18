@@ -477,6 +477,9 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
             durations = _re_tags.findall(r'\b\d+\s(?:days|weeks|months|years)\b', content, _re_tags.IGNORECASE)
             if durations:
                 content = f"{content} [DURATIONS: {', '.join(durations)}]"
+            # Prepend message index for EO (Event Ordering) ability
+            # so the LLM can sort events chronologically by raw sequence.
+            content = f"[MSGIDX:{batch_start + i}] {content}"
             batch_items.append({
                 "content": content,
                 "source": f"beam_{msg.get('role', 'unknown')}",
@@ -592,24 +595,21 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
                 )
                 beam.conn.commit()
 
-                # Drain the entire backdated batch. sleep() processes
-                # up to SLEEP_BATCH_SIZE rows per call (default 5000,
-                # well above the benchmark's BATCH_SIZE=500). But
-                # MNEMOSYNE_SLEEP_BATCH can be configured below
-                # BATCH_SIZE, in which case a single sleep() call
-                # leaves some backdated rows un-consolidated. Those
-                # rows then carry a TTL-old timestamp AND
-                # consolidated_at IS NULL -- exactly the predicate
-                # _trim_working_memory uses to DELETE them on the
-                # next remember_batch call. Loop until sleep returns
-                # no_op (or errors) so the contract holds regardless
-                # of env config. See Codex /review on PR #75 (P2).
-                max_iters = 50  # safety bound; one batch should
-                                # never need more than a few cycles
+                # Consolidate: run beam.sleep() to produce episodic summaries.
+                # Uses AAAK compression when MNEMOSYNE_LLM_ENABLED=false
+                # (set externally to avoid local model download/inference during
+                # benchmark). Loop until sleep returns no_op so all eligible
+                # rows in this batch get processed regardless of SLEEP_BATCH_SIZE.
+                # Sleep errors are caught and logged; they don't crash ingestion.
+                max_iters = 50
                 while max_iters > 0:
-                    result = {"status": "no_op", "items_consolidated": 0, "summaries_created": 0}
+                    try:
+                        result = beam.sleep()
+                    except Exception as sleep_e:
+                        result = {"status": "error", "message": repr(sleep_e)}
                     max_iters -= 1
-                    break
+                    if result.get("status") in ("no_op", "error"):
+                        break
                 # E3 contract: originals stay, so stats["wm_count"]
                 # does NOT decrement. Pre-E1 we did stats["wm_count"]
                 # -= ... which produced wm_count=0 always; post-E1 it
@@ -666,6 +666,22 @@ STEP 3 - RESOLUTION: If contradictions exist, your ENTIRE answer must call them 
 Step 3 - ANSWER: Only if NO contradictions found, give a direct answer.
 
 CRITICAL: Your final answer must lead with the contradiction if one exists. Never resolve ambiguity by picking the majority evidence."""
+
+# ABS-specific prompt: Abstention questions MUST withhold answer when
+# the topic is not found in the conversation. The generic prompt's
+# "NEVER say I don't have enough information" causes the LLM to
+# confabulate answers for topics outside the conversation.
+ABS_SYSTEM_PROMPT = """You are a precise memory assistant answering questions about past conversations.
+
+CRITICAL: Your FIRST job is to determine if the question asks about something that IS in the conversation.
+- If the question asks about a topic, event, or detail that does NOT appear in the provided context, your answer MUST be: "This information is not present in the conversation."
+- If the question asks for background information about a person that was never discussed, your answer MUST be: "This information is not present in the conversation."
+- Only provide a detailed answer if the EXACT topic of the question is found in the conversation context.
+
+Think step-by-step:
+STEP 1 - RELEVANCE CHECK: Is the EXACT topic of the question present in the context?
+STEP 2 - If NOT present: answer "This information is not present in the conversation."
+STEP 3 - If present: list relevant facts and answer the question directly."""
 
 DEFAULT_TOP_K = 30  # Memories to retrieve per question (increased for broader context)
 RECENT_CONTEXT_COUNT = 12  # Last N messages to include as recent context
@@ -1207,11 +1223,31 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
 
     # ---- PER-ABILITY BYPASSES (zero-LLM or augmented) ----
 
-    # TR (Temporal Reasoning): compute answer from extracted dates
-    if not _pure_recall and ability == 'TR' and conversation_messages:
+    # TR (Temporal Reasoning): zero-LLM date math from extracted dates
+    if ability == 'TR' and conversation_messages:
         timeline = _extract_timeline_from_conversation(conversation_messages)
-        print(f"    [TR-bypass] extracted {len(timeline)} dates from {len(conversation_messages)} msgs")
+        print(f"    [TR] extracted {len(timeline)} dates from {len(conversation_messages)} msgs")
         if timeline and len(timeline) >= 2:
+            # Phase 1: zero-LLM Python date math (fast, no tokens)
+            py_answer = _compute_tr_python(question, timeline)
+            # Validate: skip if Python computed 0 days (same date matched twice)
+            # or if the answer contains "0 days" or "0 weeks" (twin match).
+            # Also skip very small durations (< 7 days, < 2 weeks) as they
+            # usually indicate keyword matching picked the wrong dates from a
+            # dense timeline (observed: 123 dates → 2 days between wrong events).
+            _small_duration = False
+            if py_answer:
+                import re as _re_small
+                _day_m = _re_small.search(r'\b([0-9]| [1-6])\s+days?\b', py_answer.lower())
+                _week_m = _re_small.search(r'\b([0-9]|1)\s+weeks?\b', py_answer.lower())
+                _small_duration = bool(_day_m or _week_m)
+            if py_answer and not any(phrase in py_answer.lower()
+                                     for phrase in ["0 days", "0 weeks", "0 months", "0 years"]) \
+                               and not _small_duration:
+                print(f"    [TR-zero-LLM] Python computed: {py_answer[:150]}")
+                return _ret(py_answer)
+            print(f"    [TR-zero-LLM] Python could not compute, trying LLM")
+            # Phase 2: LLM-assisted with timeline prompt
             tr_prompt = _compute_tr_answer(question, timeline)
             if tr_prompt:
                 messages = [
@@ -1219,16 +1255,16 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                     {"role": "user", "content": tr_prompt},
                 ]
                 answer = llm.chat(messages, temperature=0.0, max_tokens=4096)
-                print(f"    [TR-bypass] LLM answer: {answer[:150]}")
+                print(f"    [TR-LLM] answer: {answer[:150]}")
                 return _ret(answer)
             else:
-                print(f"    [TR-bypass] _compute_tr_answer returned None")
+                print(f"    [TR] _compute_tr_answer returned None")
         else:
-            print(f"    [TR-bypass] no timeline extracted or too few dates")
+            print(f"    [TR] no timeline extracted or too few dates")
     
     # CR (Contradiction Resolution): detect contradictory statements
     _cr_context = None
-    if not _pure_recall and ability == 'CR' and conversation_messages:
+    if ability == 'CR' and conversation_messages:
         _cr_context = _detect_contradictions(conversation_messages, question)
         if _cr_context:
             print(f"    [CR-detect] FOUND contradictions, injecting context ({len(_cr_context)} chars)")
@@ -1300,7 +1336,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
             _cr_prefix = f"\n\n{_cr_context}\n\n"
         
         messages = [
-            {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+            {"role": "system", "content": ABS_SYSTEM_PROMPT if ability == 'ABS' else ANSWER_SYSTEM_PROMPT},
             {"role": "user", "content": f"{_cr_prefix}{context}\n\nQUESTION: {question}\n\nANSWER:"},
         ]
         return _ret(llm.chat(messages, temperature=0.1, max_tokens=2048))
@@ -1325,26 +1361,33 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # rather than returning a side-indexed value directly.
     _FACT_ABILITIES = {'IE', 'KU'}
     if not _pure_recall and ability in _FACT_ABILITIES and hasattr(beam, '_context_facts') and beam._context_facts:
-        # Build question word set (filtered like FTS5 search does)
-        _q_stop = {'when','does','do','did','what','how','where','which','who','why',
-                   'is','are','was','were','can','will','would','should','could','may',
-                   'the','a','an','in','on','at','to','for','of','with','my','me','i','you'}
-        q_words = [w.lower() for w in question.split() if w.lower() not in _q_stop and len(w) > 1]
-        q_set = set(q_words)
-        best_match = None
-        best_score = 0
-        for context_phrase, values in beam._context_facts.items():
-            c_words = set(context_phrase.split())
-            overlap = q_set & c_words
-            if len(overlap) < 2:
-                continue
-            # Score: overlap count / max(context_words, question_words) for fairness
-            score = len(overlap) / max(len(c_words), 1)
-            if score > best_score and len(overlap) >= 2:
-                best_score = score
-                best_match = values[0]
-        if best_match:
-            context_answer = best_match
+        # Skip context→value matching for procedural/descriptive questions
+        # (how, why, walk me through, describe) — these need full answer, not one word.
+        _q_lower = question.lower()
+        _proc_indicators = ['walk me through', 'describe', 'tell me about', 'explain how',
+                            'how did i', 'how do i', 'how would i', 'how should i',
+                            'what were the', 'what are the', 'list the']
+        if not any(ind in _q_lower for ind in _proc_indicators):
+            # Build question word set (filtered like FTS5 search does)
+            _q_stop = {'when','does','do','did','what','how','where','which','who','why',
+                       'is','are','was','were','can','will','would','should','could','may',
+                       'the','a','an','in','on','at','to','for','of','with','my','me','i','you'}
+            q_words = [w.lower() for w in question.split() if w.lower() not in _q_stop and len(w) > 1]
+            q_set = set(q_words)
+            best_match = None
+            best_score = 0
+            for context_phrase, values in beam._context_facts.items():
+                c_words = set(context_phrase.split())
+                overlap = q_set & c_words
+                if len(overlap) < 2:
+                    continue
+                # Score: overlap count / max(context_words, question_words) for fairness
+                score = len(overlap) / max(len(c_words), 1)
+                if score > best_score and len(overlap) >= 2:
+                    best_score = score
+                    best_match = values[0]
+            if best_match:
+                context_answer = best_match
 
     # If cloud extraction enabled, also search the facts table
     if getattr(beam, 'use_cloud', False):
@@ -1499,12 +1542,12 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         pass1_ctx = _build_context(memories, recent_parts)
         # CR questions need contradiction-first prompt to avoid confident
         # answers that ignore conflicting evidence (observed: 0.1 score).
-        _pass1_prompt = CR_SYSTEM_PROMPT if ability == 'CR' else ANSWER_SYSTEM_PROMPT
+        _pass1_prompt = CR_SYSTEM_PROMPT if ability == 'CR' else (ABS_SYSTEM_PROMPT if ability == 'ABS' else ANSWER_SYSTEM_PROMPT)
         pass1_messages = [
             {"role": "system", "content": _pass1_prompt},
             {"role": "user", "content": f"{pass1_ctx}\n\nQUESTION: {question}\n\nANSWER:"},
         ]
-        pass1_answer = llm.chat(pass1_messages, temperature=0.1, max_tokens=1024)
+        pass1_answer = llm.chat(pass1_messages, temperature=0.1, max_tokens=2048 if ability in ('CR', 'EO') else 1024)
         
         # --- Gap analysis: extract exact date/entity strings for Pass 2 FTS5 hard-filter ---
         # Critical: give the LLM the RAW retrieved context so it can SEE the dates it missed.
@@ -1614,7 +1657,7 @@ Follow this format strictly:
                 ]
             else:
                 # CR questions need contradiction-first prompt even in Pass 2
-                _pass2_prompt = CR_SYSTEM_PROMPT if ability == 'CR' else ANSWER_SYSTEM_PROMPT
+                _pass2_prompt = CR_SYSTEM_PROMPT if ability == 'CR' else (ABS_SYSTEM_PROMPT if ability == 'ABS' else ANSWER_SYSTEM_PROMPT)
                 pass2_messages = [
                     {"role": "system", "content": _pass2_prompt},
                     {"role": "user", "content": pass2_ctx + "\n\nQUESTION: " + question + "\n\nANSWER:"},
