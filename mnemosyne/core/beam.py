@@ -633,6 +633,52 @@ def init_beam(db_path: Path = None):
         END
     """)
 
+    # --- NOUS: Structured Fact Tables (Phase 1) ---
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS nous_facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT DEFAULT 'default',
+            message_idx INTEGER,
+            fact_type TEXT,
+            key TEXT,
+            value TEXT,
+            context_snippet TEXT,
+            importance REAL DEFAULT 0.5,
+            timestamp TEXT
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_facts_key ON nous_facts(key)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_facts_type ON nous_facts(fact_type)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_facts_session ON nous_facts(session_id)")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS nous_timelines (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT DEFAULT 'default',
+            date TEXT,
+            message_idx INTEGER,
+            description TEXT,
+            source TEXT
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_timelines_date ON nous_timelines(date)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_timelines_session ON nous_timelines(session_id)")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS nous_kg (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT DEFAULT 'default',
+            subject TEXT,
+            predicate TEXT,
+            object TEXT,
+            message_idx INTEGER,
+            confidence REAL DEFAULT 0.7
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kg_subject ON nous_kg(subject)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kg_predicate ON nous_kg(predicate)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_kg_session ON nous_kg(session_id)")
+
     # --- Consolidation Log ---
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS consolidation_log (
@@ -2359,6 +2405,362 @@ class BeamMemory:
                          source=source, importance=importance,
                          metadata={"summary_of": source_wm_ids, **(metadata or {})})
         return memory_id
+
+    # ------------------------------------------------------------------
+    # NOUS: Structured Fact Extraction (Phase 1)
+    # ------------------------------------------------------------------
+    def extract_and_store_facts(self, content: str, message_idx: int = 0) -> dict:
+        """Extract structured facts from a message and store in facts/timelines/kg tables.
+        Uses regex patterns to match the same fact types as the BEAM benchmark oracles.
+        Returns dict of counts per fact_type."""
+        import re as _re
+        counts = {"metric": 0, "date": 0, "version": 0, "entity": 0,
+                  "sequence": 0, "timeline": 0, "negation": 0, "decision": 0}
+        session = self.session_id
+
+        # Metrics: numbers with units
+        _metric_re = _re.findall(
+            r'(\d+(?:[.,]\d+)?)\s*(ms|sec|seconds?|minutes?|hours?|days?|weeks?|'
+            r'months?|%|KB|MB|GB|TB|rows?|columns?|roles?|features?|bugs?|'
+            r'commits?|cards?|users?|items?|tests?|APIs?|endpoints?|sprints?|tickets?)',
+            content, _re.IGNORECASE)
+        for num, unit in _metric_re[:10]:
+            key = f"{unit.lower().rstrip('s')}"
+            val = f"{num}{unit}"
+            self._insert_fact(session, message_idx, 'metric', key, val,
+                              self._context_snippet(content, content.find(val[:10])), 0.65)
+            counts["metric"] += 1
+
+        # ISO Dates
+        for m in _re.finditer(r'\b(\d{4}-\d{2}-\d{2})\b', content):
+            dt = m.group(1)
+            ctx = self._context_snippet(content, m.start())
+            self._insert_fact(session, message_idx, 'date', 'iso_date', dt, ctx, 0.7)
+            self._insert_timeline(session, dt, message_idx, ctx[:120], 'iso_date')
+            counts["date"] += 1
+            counts["timeline"] += 1
+
+        # Named dates (e.g. March 29, 2024)
+        for m in _re.finditer(
+            r'((?:January|February|March|April|May|June|July|August|September|'
+            r'October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'
+            r'[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?,?\s*(?:\d{4})?)',
+            content, _re.IGNORECASE):
+            dt = m.group(1).strip()
+            ctx = self._context_snippet(content, m.start())
+            self._insert_fact(session, message_idx, 'date', 'named_date', dt, ctx, 0.7)
+            counts["date"] += 1
+
+        # Version strings
+        for m in _re.finditer(r'([A-Z][a-zA-Z]+(?:\s*[A-Z][a-zA-Z]+)*)\s+v?(\d+\.\d+(?:\.\d+)?)', content):
+            name = m.group(1).strip()
+            ver = m.group(2)
+            key = f"{name.lower().replace(' ', '_')}_version"
+            self._insert_fact(session, message_idx, 'version', key, ver,
+                              self._context_snippet(content, m.start()), 0.7)
+            counts["version"] += 1
+
+        # Negations (critical for CR)
+        for m in _re.finditer(
+            r'(I(?: have|\'ve)?\s*(?:never|not)\s+[^.,;!?\n]{15,120})',
+            content, _re.IGNORECASE):
+            neg_text = m.group(1).strip()
+            obj = neg_text.split("never", 1)[-1].split("not", 1)[-1].strip() if "never" in neg_text.lower() or " not " in neg_text.lower() else neg_text
+            self._insert_kg(session, 'user', 'negation', obj[:80], message_idx, 0.75)
+            counts["negation"] += 1
+
+        # Decisions
+        for m in _re.finditer(
+            r'(?:decided to|chose to|opted for|selected|picked|switching to)\s+([^.,;!?\n]{10,120})',
+            content, _re.IGNORECASE):
+            decision = m.group(1).strip()
+            self._insert_kg(session, 'user', 'decision', decision, message_idx, 0.65)
+            counts["decision"] += 1
+
+        # Entity-action pairs (MR support)
+        for m in _re.finditer(
+            r'(?:the|my|our)\s+([a-z_]+\s*(?:table|model|schema|API|endpoint|function|module|route|handler))'
+            r'\s+(?:needs?|requires?|should|could|would|will|has|have)\s+([^.,;!?\n]{10,80})',
+            content, _re.IGNORECASE):
+            entity = m.group(1).strip()
+            action = m.group(2).strip()
+            self._insert_kg(session, entity, 'requires', action, message_idx, 0.65)
+            counts["decision"] += 1
+
+        # Sequence markers (EO support)
+        for m in _re.finditer(
+            r'((?:first|second|third|fourth|fifth|finally|next|then|after that)[^.,;!?\n]{15,120})',
+            content, _re.IGNORECASE):
+            seq = m.group(1).strip()
+            first_word = seq.split()[0].lower()
+            self._insert_fact(session, message_idx, 'sequence', first_word, seq[:120],
+                              self._context_snippet(content, m.start()), 0.6)
+            counts["sequence"] += 1
+
+        self.conn.commit()
+        return counts
+
+    def _insert_fact(self, session: str, msg_idx: int, ftype: str,
+                     key: str, value: str, ctx: str, importance: float):
+        self.conn.execute(
+            "INSERT INTO nous_facts (session_id, message_idx, fact_type, key, value, context_snippet, importance) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (session, msg_idx, ftype, key, value, ctx, importance))
+
+    def _insert_timeline(self, session: str, date: str, msg_idx: int,
+                         desc: str, source: str = 'extraction'):
+        self.conn.execute(
+            "INSERT INTO nous_timelines (session_id, date, message_idx, description, source) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (session, date, msg_idx, desc, source))
+
+    def _insert_kg(self, session: str, subject: str, predicate: str,
+                   obj: str, msg_idx: int, confidence: float = 0.7):
+        self.conn.execute(
+            "INSERT INTO nous_kg (session_id, subject, predicate, object, message_idx, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session, subject, predicate, obj, msg_idx, confidence))
+
+    @staticmethod
+    def _context_snippet(content: str, pos: int, width: int = 60) -> str:
+        """Extract surrounding context around a position in content."""
+        start = max(0, pos - width)
+        end = min(len(content), pos + width)
+        snippet = content[start:end].strip()
+        if start > 0:
+            snippet = f"...{snippet}"
+        if end < len(content):
+            snippet = f"{snippet}..."
+        return snippet[:200]
+
+    # ------------------------------------------------------------------
+    # NOUS: Structured Fact Retrieval (Phase 2)
+    # ------------------------------------------------------------------
+    def nous_retrieve(self, query: str, ability: str = None, top_k: int = 10) -> dict:
+        """Route a query to the appropriate NOUS specialist table.
+        Returns dict with keys: context (str), facts (list), source (str).
+        Falls back to {'context': '', 'facts': [], 'source': 'fallback'} when empty."""
+        result = {"context": "", "facts": [], "source": "fallback"}
+
+        # Determine ability from query if not provided
+        if not ability:
+            ability = self._classify_ability(query)
+
+        if ability in ('IE', 'KU'):
+            return self._nous_fact_retrieve(query, top_k)
+        elif ability == 'TR':
+            return self._nous_timeline_retrieve(query, top_k)
+        elif ability == 'CR':
+            return self._nous_negation_retrieve(query, top_k)
+        elif ability == 'MR':
+            return self._nous_entity_retrieve(query, top_k)
+        elif ability == 'EO':
+            return self._nous_chrono_retrieve(query, top_k)
+        else:
+            return result
+
+    @staticmethod
+    def _classify_ability(query: str) -> str:
+        """Classify a question into BEAM ability based on keywords.
+        Returns ability string or empty for unclassified."""
+        q = query.lower()
+
+        # Temporal reasoning
+        if any(w in q for w in ['how many days', 'how many weeks', 'how many months',
+                                'how long', 'how much time', 'what date', 'what day',
+                                'when did', 'when does', 'what is the deadline',
+                                'how many years', 'between which dates',
+                                'timeline', 'how far apart']):
+            return 'TR'
+
+        # Event ordering
+        if any(w in q for w in ['list the order', 'walk me through', 'order in which',
+                                'chronological', 'in what order', 'sequence of events']):
+            return 'EO'
+
+        # Contradiction
+        if any(w in q for w in ['have i', 'did i', 'am i', 'has this',
+                                'contradict', 'contradiction', 'conflict']):
+            return 'CR'
+
+        # Information extraction / knowledge update (factual)
+        if any(w in q for w in ['how many', 'what is the', 'what are the',
+                                'what was the', 'what were the', 'what was my',
+                                'when does', 'what is', 'what was']):
+            if not any(w in q for w in ['how many days', 'how many weeks']):  # not TR
+                return 'IE'
+
+        # Abstention
+        if any(w in q for w in ['tell me about my background', 'previous development',
+                                'work experience', 'personal background']):
+            return 'ABS'
+
+        # Multi-hop
+        if any(w in q for w in ['across my', 'across all', 'in my project',
+                                'in my sessions', 'across sessions']):
+            return 'MR'
+
+        return ''
+
+    def _nous_fact_retrieve(self, query: str, top_k: int = 10) -> dict:
+        """Query nous_facts table for exact metric/version/entity matches.
+        Extracts numbers and key terms from query, matches against fact key/value."""
+        import re as _re
+        facts = []
+        cursor = self.conn
+
+        # Extract numbers from query (e.g., 150, 250, 5000)
+        numbers = _re.findall(r'\b(\d+)\b', query)
+        for num in numbers[:3]:
+            # Look for metric fact with this number
+            rows = cursor.execute(
+                "SELECT fact_type, key, value, context_snippet FROM nous_facts "
+                "WHERE value LIKE ? AND session_id = ? LIMIT ?",
+                (f'%{num}%', self.session_id, top_k)
+            ).fetchall()
+            for row in rows:
+                facts.append(dict(zip(['type', 'key', 'value', 'context'], row)))
+
+        # Extract key terms (capitalized phrases, tech terms)
+        terms = _re.findall(r'\b[A-Z][a-z]+(?:[-][A-Z][a-z]+)*\b', query)
+        stop_words = {'Have', 'Did', 'Do', 'Can', 'Will', 'Would', 'Should', 'What',
+                      'When', 'Where', 'Which', 'Who', 'How', 'Why', 'Is', 'Are',
+                      'Was', 'Were', 'The', 'A', 'An', 'This', 'That', 'My', 'Me',
+                      'I', 'You', 'How', 'Many', 'Much'}
+        terms = [t for t in terms if t not in stop_words]
+        for term in terms[:5]:
+            # Try matching as fact key
+            rows = cursor.execute(
+                "SELECT fact_type, key, value, context_snippet FROM nous_facts "
+                "WHERE (key LIKE ? OR value LIKE ?) AND session_id = ? LIMIT ?",
+                (f'%{term}%', f'%{term}%', self.session_id, top_k)
+            ).fetchall()
+            for row in rows:
+                facts.append(dict(zip(['type', 'key', 'value', 'context'], row)))
+
+        if facts:
+            ctx_lines = []
+            for f in facts[:top_k]:
+                ctx_lines.append(f"[Fact {f['type']}] {f['key']}: {f['value']}")
+            return {
+                "context": "\n".join(ctx_lines),
+                "facts": facts[:top_k],
+                "source": "nous_facts"
+            }
+        return {"context": "", "facts": [], "source": "fallback"}
+
+    def _nous_timeline_retrieve(self, query: str, top_k: int = 10) -> dict:
+        """Query nous_timelines for chronological events matching query terms."""
+        import re as _re
+        cursor = self.conn
+
+        # Extract dates from query
+        date_terms = _re.findall(r'\b(\d{4}-\d{2}-\d{2})\b', query)
+        month_names = ['january', 'february', 'march', 'april', 'may', 'june',
+                       'july', 'august', 'september', 'october', 'november', 'december']
+        months_in_query = [m for m in month_names if m in query.lower()]
+
+        if date_terms:
+            rows = cursor.execute(
+                "SELECT date, description, message_idx FROM nous_timelines "
+                "WHERE date LIKE ? AND session_id = ? ORDER BY date LIMIT ?",
+                (f'%{date_terms[0]}%', self.session_id, top_k)
+            ).fetchall()
+        elif months_in_query:
+            month = months_in_query[0][:3]
+            rows = cursor.execute(
+                "SELECT date, description, message_idx FROM nous_timelines "
+                "WHERE date LIKE ? AND session_id = ? ORDER BY date LIMIT ?",
+                (f'{month}%', self.session_id, top_k)
+            ).fetchall()
+        else:
+            # Recent timeline events
+            rows = cursor.execute(
+                "SELECT date, description, message_idx FROM nous_timelines "
+                "WHERE session_id = ? ORDER BY date DESC LIMIT ?",
+                (self.session_id, top_k)
+            ).fetchall()
+
+        if rows:
+            facts = [dict(zip(['date', 'description', 'msg_idx'], r)) for r in rows]
+            ctx_lines = [f"[{r[0]}] {r[1][:120]}" for r in rows]
+            return {"context": "\n".join(ctx_lines), "facts": facts, "source": "nous_timelines"}
+        return {"context": "", "facts": [], "source": "fallback"}
+
+    def _nous_negation_retrieve(self, query: str, top_k: int = 10) -> dict:
+        """Query nous_kg for negation predicates matching query terms."""
+        import re as _re
+        cursor = self.conn
+
+        terms = _re.findall(r'\b[A-Z][a-z]+\b', query)
+        stop_words = {'Have', 'Did', 'Do', 'Can', 'Will', 'Would', 'Should'}
+        terms = [t for t in terms if len(t) > 3 and t not in stop_words]
+
+        if not terms:
+            terms = [w for w in query.split() if len(w) > 3][:3]
+
+        for term in terms:
+            rows = cursor.execute(
+                "SELECT subject, object, message_idx FROM nous_kg "
+                "WHERE predicate='negation' AND (subject LIKE ? OR object LIKE ?) "
+                "AND session_id = ? LIMIT ?",
+                (f'%{term}%', f'%{term}%', self.session_id, top_k)
+            ).fetchall()
+            if rows:
+                facts = [dict(zip(['subject', 'object', 'msg_idx'], r)) for r in rows]
+                ctx_lines = [f"[Negation] user said never/not: {r[1]}" for r in rows]
+                return {"context": "\n".join(ctx_lines), "facts": facts, "source": "nous_kg_negation"}
+
+        return {"context": "", "facts": [], "source": "fallback"}
+
+    def _nous_entity_retrieve(self, query: str, top_k: int = 10) -> dict:
+        """Query nous_kg for entity-action pairs (predicates: requires, decision)."""
+        import re as _re
+        cursor = self.conn
+
+        terms = _re.findall(r'\b[A-Z][a-z]+\b', query)
+        stop_words = {'Have', 'Did', 'Do', 'Can', 'Will', 'Would', 'Should',
+                      'What', 'When', 'Where', 'Which', 'Who', 'How', 'Why'}
+        entities = [t.lower() for t in terms if t not in stop_words and len(t) > 3]
+
+        rows = []
+        if entities:
+            for entity in entities[:3]:
+                rows = cursor.execute(
+                    "SELECT subject, predicate, object, message_idx FROM nous_kg "
+                    "WHERE (subject LIKE ? OR object LIKE ?) AND session_id = ? LIMIT ?",
+                    (f'%{entity}%', f'%{entity}%', self.session_id, top_k)
+                ).fetchall()
+                if rows:
+                    break
+
+        if not rows:
+            rows = cursor.execute(
+                "SELECT subject, predicate, object, message_idx FROM nous_kg "
+                "WHERE session_id = ? ORDER BY message_idx LIMIT ?",
+                (self.session_id, top_k)
+            ).fetchall()
+
+        if rows:
+            facts = [dict(zip(['subject', 'predicate', 'object', 'msg_idx'], r)) for r in rows]
+            ctx_lines = [f"[{r[1]}] {r[0]} -> {r[2]}" for r in rows]
+            return {"context": "\n".join(ctx_lines), "facts": facts, "source": "nous_kg"}
+        return {"context": "", "facts": [], "source": "fallback"}
+
+    def _nous_chrono_retrieve(self, query: str, top_k: int = 10) -> dict:
+        """Query nous_facts for sequence markers, ordered by message_idx."""
+        cursor = self.conn
+        rows = cursor.execute(
+            "SELECT value, message_idx FROM nous_facts "
+            "WHERE fact_type='sequence' AND session_id = ? "
+            "ORDER BY message_idx ASC LIMIT ?",
+            (self.session_id, top_k)
+        ).fetchall()
+        if rows:
+            facts = [dict(zip(['sequence', 'msg_idx'], r)) for r in rows]
+            ctx_lines = [f"[{i+1}] {r[0]}" for i, r in enumerate(rows)]
+            return {"context": "\n".join(ctx_lines), "facts": facts, "source": "nous_sequences"}
+        return {"context": "", "facts": [], "source": "fallback"}
 
     def recall(self, query: str, top_k: int = 40, *,
                from_date: Optional[str] = None, to_date: Optional[str] = None,

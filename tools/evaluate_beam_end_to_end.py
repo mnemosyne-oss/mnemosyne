@@ -465,9 +465,10 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
 
         batch_items = []
         for i, msg in enumerate(batch_msgs):
-            content = msg.get("content", "")
-            if not content.strip():
+            raw_content = msg.get("content", "")
+            if not raw_content.strip():
                 continue
+            content = raw_content
             # Temporal tag injection: bake dates and durations into content
             # so FTS5 can find them during recall. Same pattern as memory.py.
             import re as _re_tags
@@ -518,6 +519,21 @@ def ingest_conversation(beam: BeamMemory, messages: list[dict]) -> dict:
 
         batch_ids = beam.remember_batch(batch_items)
         stats["wm_count"] += len(batch_items)
+
+        # NOUS: Structured fact extraction for every message in this batch
+        # Uses regex to extract metrics, dates, versions, negations, etc.
+        # into the new facts/timelines/knowledge_graph tables.
+        _fact_counts = {}
+        for j, msg in enumerate(batch_msgs):
+            _raw = msg.get("content", "")
+            if _raw.strip():
+                _fc = beam.extract_and_store_facts(_raw, batch_start + j)
+                for k, v in _fc.items():
+                    _fact_counts[k] = _fact_counts.get(k, 0) + v
+        if _fact_counts:
+            stats["nous_facts"] = _fact_counts
+            total = sum(_fact_counts.values())
+            print(f"    [NOUS] extracted {total} facts: {_fact_counts}", flush=True)
 
         # Cloud fact extraction: extract facts from batch if enabled
         if getattr(beam, 'use_cloud', False):
@@ -1348,6 +1364,22 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     
     # Multi-strategy retrieval
     memories = _multi_strategy_recall(beam, question, top_k * 3, ability=ability)  # Get 3x more for reranking
+
+    # ---- NOUS: Structured Fact Retrieval (Phase 2) ----
+    # Supplement recall with structured facts from nous_facts, nous_timelines,
+    # and nous_kg tables. These provide exact values that FTS5/vector search
+    # may miss (dates, metrics, versions, negations, sequences, entity mappings).
+    # Injected as synthetic high-score entries so they surface ahead of fuzzy matches.
+    try:
+        _nous_result = beam.nous_retrieve(question, ability=ability, top_k=top_k)
+        if _nous_result and _nous_result.get("source") != "fallback" and _nous_result.get("context"):
+            memories.insert(0, {
+                "content": f"[NOUS {_nous_result['source']}]\n{_nous_result['context']}",
+                "score": 0.95,
+                "source": f"nous_{_nous_result['source']}",
+            })
+    except Exception:
+        pass  # NOUS retrieval is best-effort
 
     # ---- Context→Value fact matching (Phase 7: direct regex-extracted facts, zero-LLM) ----
     # At ingestion, we built beam._context_facts: {"words around fact": ["fact value"]}.

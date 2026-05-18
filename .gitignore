@@ -70,3 +70,4 @@ DEVOPS_PLAN_*
 # Local-only tooling artifacts (S4 housekeeping — security reports stay local)
 .gstack/
 
+.planning/

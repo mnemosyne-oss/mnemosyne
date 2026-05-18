@@ -1,58 +1,58 @@
 {
   "metadata": {
-    "date": "2026-05-17T19:17:40.406486+00:00",
-    "run_started_at": "2026-05-17T18:47:22.482888+00:00",
-    "config_id": "fix-cr-negation",
-    "model": "deepseek-v4-pro",
-    "judge_model": "deepseek-v4-pro",
+    "date": "2026-05-18T01:00:09.178726+00:00",
+    "run_started_at": "2026-05-17T23:00:29.744939+00:00",
+    "config_id": "triple-v5-flash",
+    "model": "deepseek/deepseek-v4-flash:free",
+    "judge_model": "deepseek/deepseek-v4-flash:free",
     "top_k": 30,
-    "sample_size": 1,
+    "sample_size": 3,
     "scales": [
       "100K"
     ],
-    "total_conversations": 1,
+    "total_conversations": 3,
     "config": {
       "env": {
         "MNEMOSYNE_DATA_DIR": "/root/.hermes/mnemosyne/data",
-        "MNEMOSYNE_BENCHMARK_PURE_RECALL": "1"
+        "MNEMOSYNE_LLM_ENABLED": "false"
       },
-      "pure_recall": true,
-      "allow_harness_oracles": false,
+      "pure_recall": false,
+      "allow_harness_oracles": true,
       "full_context": false,
       "use_cloud": false
     },
     "diagnostics": {
       "recall": {
-        "created_at": "2026-05-17T20:47:22.485712",
-        "snapshot_at": "2026-05-17T21:17:40.406268",
+        "created_at": "2026-05-18T01:00:29.749237",
+        "snapshot_at": "2026-05-18T03:00:09.178374",
         "totals": {
-          "calls": 167,
+          "calls": 284,
           "calls_using_wm_fallback": 0,
-          "calls_using_em_fallback": 167,
+          "calls_using_em_fallback": 0,
           "calls_truly_empty": 0,
           "wm_fallback_rate": 0.0,
-          "em_fallback_rate": 1.0
+          "em_fallback_rate": 0.0
         },
         "by_tier": {
           "wm_fts": {
-            "calls_with_hits": 135,
-            "total_hits": 3353
+            "calls_with_hits": 197,
+            "total_hits": 5498
           },
           "wm_vec": {
-            "calls_with_hits": 167,
-            "total_hits": 15918
+            "calls_with_hits": 284,
+            "total_hits": 29951
           },
           "wm_fallback": {
             "calls_with_hits": 0,
             "total_hits": 0
           },
           "em_fts": {
-            "calls_with_hits": 0,
-            "total_hits": 0
+            "calls_with_hits": 220,
+            "total_hits": 383
           },
           "em_vec": {
-            "calls_with_hits": 0,
-            "total_hits": 0
+            "calls_with_hits": 121,
+            "total_hits": 185
           },
           "em_fallback": {
             "calls_with_hits": 0,
@@ -61,8 +61,8 @@
         }
       },
       "extraction": {
-        "created_at": "2026-05-17T20:47:22.491708",
-        "snapshot_at": "2026-05-17T21:17:40.406461",
+        "created_at": "2026-05-18T01:00:29.758670",
+        "snapshot_at": "2026-05-18T03:00:09.178688",
         "totals": {
           "calls": 0,
           "successes": 0,
@@ -122,22 +122,22 @@
           "ability": "ABS",
           "question": "How did the user feedback influence the UI/UX improvements I made before the public launch?",
           "ideal_answer": "Based on the provided chat, there is no information related to how user feedback influenced UI/UX improvements.",
-          "ai_answer": "",
+          "ai_answer": "Based on the conversation context, the user explicitly stated they were \u201cfinalizing deployment\u201d and wanted **UI/UX improvements based on user feedback** before the public launch. The assistant\u2019s responses then provided specific enhancements that address common feedback from users, including:\n\n- Adding a **dark mode toggle** (memory 153) \u2013 presumably in response to user requests for a more comfortable viewing experience.\n- Implementing a **collapsible sidebar** (memory 153) \u2013 to improve navigatio",
           "recall_provenance": {
             "engine": "linear",
             "kept_count": 90,
             "voice_sums": {
-              "vec": 47.8416,
+              "vec": 48.1406,
               "fts": 5.2,
-              "keyword": 120.9462,
+              "keyword": 120.955,
               "importance": 46.0,
               "recency_decay": 77.553
             },
             "top_result_voices": {
-              "vec": 0.5317,
-              "fts": 0.0,
-              "keyword": 2.2311,
-              "importance": 0.3,
+              "vec": 0.5808,
+              "fts": 3.6,
+              "keyword": 3.6,
+              "importance": 0.4,
               "recency_decay": 0.8617
             },
             "top_result_tier": "working"
@@ -145,433 +145,1145 @@
           "score": 0.0,
           "nuggets": [],
           "assessment": "",
-          "answer_time_ms": 71029.60115805035,
-          "judge_time_ms": 19184.526105003897
+          "answer_time_ms": 14148.92264601076,
+          "judge_time_ms": 3168.4857270447537
         },
         {
           "qid": "1:q1",
           "ability": "ABS",
           "question": "Can you tell me about my background and previous development projects?",
           "ideal_answer": "Based on the provided chat, there is no information related to your background or previous development projects.",
-          "ai_answer": "STEP 1 - RELEVANT FACTS: The user is building a personal budget tracker application. Key details include: using Flask 2.3.1, SQLite 3.39, Flask-Login 0.6.2, Flask-SQLAlchemy, Flask-Caching, Flask-WTF, Flask-Migrate. Features: user registration and login with hashed passwords (Argon2 or bcrypt), session management, transaction CRUD (GET/POST/PUT/DELETE /transactions), income/expense tracking, basic analytics, dashboard with charts (Chart.js 4.3.0), dark mode toggle, collapsible sidebar, WCAG 2.1 ",
+          "ai_answer": "",
           "recall_provenance": {
             "engine": "linear",
             "kept_count": 90,
             "voice_sums": {
-              "vec": 49.9309,
+              "vec": 50.1354,
               "fts": 0.0,
               "keyword": 175.604,
               "importance": 46.7,
-              "recency_decay": 77.544
+              "recency_decay": 77.553
             },
             "top_result_voices": {
-              "vec": 0.6324,
+              "vec": 0.6339,
               "fts": 0.0,
               "keyword": 3.124,
               "importance": 0.4,
-              "recency_decay": 0.8616
+              "recency_decay": 0.8617
             },
             "top_result_tier": "working"
           },
-          "score": 1.0,
+          "score": 0.0,
           "nuggets": [],
           "assessment": "",
-          "answer_time_ms": 42562.72067996906,
-          "judge_time_ms": 7018.774661002681
+          "answer_time_ms": 7310.024751990568,
+          "judge_time_ms": 17694.907718978357
         },
         {
           "qid": "1:q2",
           "ability": "CR",
           "question": "Have I worked with Flask routes and handled HTTP requests in this project?",
           "ideal_answer": "I notice you've mentioned contradictory information about this. You said you have never written any Flask routes or handled HTTP requests in this project, but you also mentioned implementing a basic h",
-          "ai_answer": "STEP 1 - SCAN: The user has made the following relevant statements:\n- \"I'm trying to optimize the dashboard API response time, which has recently improved to 250ms after adding some caching tweaks\" (implies existence of a dashboard API with routes handling HTTP requests).\n- The project context is a Flask budget tracker with dependencies like Flask 2.3.1, Flask-SQLAlchemy, Flask-Caching, etc., and discussions cover Flask routes, login sessions, and API optimization.\n- There is a specific negation",
+          "ai_answer": "",
           "recall_provenance": {
             "engine": "linear",
-            "kept_count": 109,
+            "kept_count": 90,
             "voice_sums": {
-              "vec": 69.885,
-              "fts": 37.4111,
-              "keyword": 286.4143,
-              "importance": 56.4,
-              "recency_decay": 93.9016
+              "vec": 58.2981,
+              "fts": 0.0,
+              "keyword": 249.0032,
+              "importance": 46.1,
+              "recency_decay": 77.544
             },
             "top_result_voices": {
-              "vec": 0.4886,
-              "fts": 5.1,
-              "keyword": 5.1,
-              "importance": 0.6,
-              "recency_decay": 0.8614
+              "vec": 0.6552,
+              "fts": 0.0,
+              "keyword": 5.6126,
+              "importance": 0.4,
+              "recency_decay": 0.8616
             },
             "top_result_tier": "working"
           },
-          "score": 0.14285714285714285,
+          "score": 0.0,
           "nuggets": [],
           "assessment": "",
-          "answer_time_ms": 106057.77688202215,
-          "judge_time_ms": 18862.602986977436
+          "answer_time_ms": 7651.113910018466,
+          "judge_time_ms": 2245.2865809900686
         },
         {
           "qid": "1:q3",
           "ability": "CR",
           "question": "Have I integrated Flask-Login for session management in my project?",
           "ideal_answer": "I notice you've mentioned contradictory information about this. You said you have never integrated Flask-Login or managed user sessions in this project, but you also mentioned that Flask-Login v0.6.2 ",
-          "ai_answer": "STEP 1 - SCAN: No user statements found about Flask-Login integration in the retrieved memories. The user has asked about initializing a Flask project, debugging errors, and defining a database schema, but never explicitly claimed to have integrated Flask-Login.\n\nSTEP 2 - CONTRADICTIONS: No contradictions detected. There are no conflicting user statements regarding Flask-Login integration.\n\nSTEP 3 - ANSWER: Based on the retrieved memories, you have not indicated that you have integrated Flask-Lo",
+          "ai_answer": "STEP 1 - SCAN: User statements about integrating Flask-Login:\n- In memory [MSGIDX:108], user said: \"I've never actually integrated into this project, so I'm starting from scratch - can you help me implement user session management with Flask-Login 0.6.2\"\n- In memory [MSGIDX:66], user said: \"I'm trying to integrate Flask-Login v0.6.2 for session management in my Flask app\"\n\nSTEP 2 - CONTRADICTIONS: No direct contradiction between these two statements. The first denies past integration (has not do",
           "recall_provenance": {
             "engine": "linear",
-            "kept_count": 102,
+            "kept_count": 90,
             "voice_sums": {
-              "vec": 66.8681,
-              "fts": 37.7985,
-              "keyword": 337.2795,
-              "importance": 51.2,
-              "recency_decay": 87.8514
+              "vec": 59.6781,
+              "fts": 0.0,
+              "keyword": 300.0145,
+              "importance": 45.2,
+              "recency_decay": 77.544
             },
             "top_result_voices": {
-              "vec": 0.5704,
-              "fts": 9.1,
-              "keyword": 9.1,
-              "importance": 0.7,
-              "recency_decay": 0.8612
+              "vec": 0.8675,
+              "fts": 0.0,
+              "keyword": 8.7965,
+              "importance": 0.3,
+              "recency_decay": 0.8616
             },
             "top_result_tier": "working"
           },
-          "score": 0.14772727272727273,
+          "score": 0.5,
           "nuggets": [],
           "assessment": "",
-          "answer_time_ms": 89563.02617001347,
-          "judge_time_ms": 17523.56158202747
+          "answer_time_ms": 24946.27977896016,
+          "judge_time_ms": 7915.089299029205
         },
         {
           "qid": "1:q4",
           "ability": "EO",
           "question": "Can you list the order in which I brought up different aspects of developing my personal budget tracker throughout our conversations, in order? Mention ONLY and ONLY three items.",
           "ideal_answer": "You mentioned aspects of your personal budget tracker in this order: 1) Setting up the core functionality including user authentication, expense tracking, and data visualization, 2) Implementing trans",
-          "ai_answer": "1. Initializing the Flask project with SQLite\n2. Planning the MVP schedule to meet the April 15 deadline\n3. Creating a sprint plan for user registration and login",
+          "ai_answer": ".workshop. Let me recall step-by-step steps,          steps for foamation!!!\n\nOkay, first things.:sequel, I recall Hearing\u659f\u914c, Trotz derWhat Freshman I (?) need to recall paso? Let\u2019s break down therunning\u2026: Actually: let's look at :)\nThe requested article/content is located(this (ops...Scope (\u2193)55 2 .MODEL and on Vaccine-ka\u91d1\u6c99VIP.com paral0 (. . his is\u3002NET programs comprising,\u30c1\u30e3 gereterq',# ]\\r Kla geometric,asontewrint':n \u6ce2 Slain aosuMMES), \\\"\\)[endJavascriptHel.deus .8xx can\n\n\n\n",
           "recall_provenance": {
             "engine": "linear",
-            "kept_count": 112,
+            "kept_count": 90,
             "voice_sums": {
-              "vec": 62.0287,
-              "fts": 48.0048,
-              "keyword": 204.9577,
-              "importance": 58.3,
-              "recency_decay": 96.441
+              "vec": 49.65,
+              "fts": 1.6,
+              "keyword": 158.5529,
+              "importance": 46.3,
+              "recency_decay": 77.535
             },
             "top_result_voices": {
-              "vec": 0.6633,
-              "fts": 5.1,
-              "keyword": 5.1,
+              "vec": 0.6642,
+              "fts": 0.0,
+              "keyword": 3.0231,
               "importance": 0.4,
-              "recency_decay": 0.861
+              "recency_decay": 0.8615
             },
             "top_result_tier": "working"
           },
-          "score": 0.030303030303030304,
+          "score": 0.0,
           "nuggets": [],
           "assessment": "",
-          "answer_time_ms": 162041.63093597163,
-          "judge_time_ms": 19062.94520199299
+          "answer_time_ms": 6168.1632730178535,
+          "judge_time_ms": 3196.3947860058397
         },
         {
           "qid": "1:q5",
           "ability": "EO",
           "question": "Can you walk me through the order in which I brought up different aspects of my app development and deployment across our conversations? Mention ONLY and ONLY five items.",
           "ideal_answer": "You mentioned the aspects in this order: 1) Setting up the initial project with database schema and local server configuration, 2) Implementing transaction creation with proper response handling and e",
-          "ai_answer": "",
+          "ai_answer": "STEP 1 - RELEVANT FACTS: From the conversation, the user's messages (in order) are:\n1. \"I'm working on a project where I need to document API endpoints and architecture decisions in Confluence...\"\n2. \"I'm trying to enhance the security of my application without compromising the user experience, so I'd like to implement a pragmatic approach to security enhancements...\"\n3. \"I'm trying to decide on the best architecture for my application, and I've decided against microservices for now, prioritizin",
           "recall_provenance": {
             "engine": "linear",
             "kept_count": 90,
             "voice_sums": {
-              "vec": 49.0203,
-              "fts": 3.2,
-              "keyword": 191.7507,
-              "importance": 46.7,
-              "recency_decay": 77.472
+              "vec": 49.2075,
+              "fts": 0.0,
+              "keyword": 191.7909,
+              "importance": 46.2,
+              "recency_decay": 77.535
             },
             "top_result_voices": {
-              "vec": 0.6156,
+              "vec": 0.6222,
               "fts": 0.0,
               "keyword": 3.9092,
               "importance": 0.4,
-              "recency_decay": 0.8608
+              "recency_decay": 0.8615
             },
             "top_result_tier": "working"
           },
-          "score": 0.0,
+          "score": 0.013605442176870748,
           "nuggets": [],
           "assessment": "",
-          "answer_time_ms": 36917.41618397646,
-          "judge_time_ms": 7298.137225036044
+          "answer_time_ms": 27868.36842302,
+          "judge_time_ms": 3367.8053780458868
         },
         {
           "qid": "1:q6",
           "ability": "IE",
           "question": "When does my first sprint end?",
           "ideal_answer": "My first sprint ends on March 29.",
-          "ai_answer": "STEP 1 - RELEVANT FACTS: The conversation contains a sprint plan with specific dates: \"Start Date: March 15, 2024\" and \"End Date: March 29, 2024\". This sprint is explicitly described as the \"first two-week sprint ending on March 29\".\n\nSTEP 2 - CONTRADICTIONS: No contradictory information regarding the sprint end date appears in the provided memories.\n\nSTEP 3 - TEMPORAL/CALCULATIONS: The sprint end date is directly stated as March 29, 2024. No computation needed.\n\nSTEP 4 - ANSWER: Your first spri",
+          "ai_answer": "March 29",
           "recall_provenance": {
             "engine": "linear",
             "kept_count": 90,
             "voice_sums": {
-              "vec": 45.1665,
-              "fts": 3.35,
-              "keyword": 92.8247,
-              "importance": 45.1,
-              "recency_decay": 77.463
+              "vec": 44.7469,
+              "fts": 5.15,
+              "keyword": 92.3747,
+              "importance": 45.0,
+              "recency_decay": 77.6642
             },
             "top_result_voices": {
-              "vec": 0.4784,
+              "vec": 0.5931,
               "fts": 0.0,
-              "keyword": 1.3583,
-              "importance": 0.4,
-              "recency_decay": 0.8607
+              "keyword": 0.7333,
+              "importance": 0.5,
+              "recency_decay": 0.8614
             },
             "top_result_tier": "working"
           },
-          "score": 1.0,
+          "score": 0.3333333333333333,
           "nuggets": [],
           "assessment": "",
-          "answer_time_ms": 9595.429880951997,
-          "judge_time_ms": 8161.375441995915
+          "answer_time_ms": 537.4713169876486,
+          "judge_time_ms": 2306.0294989845715
         },
         {
           "qid": "1:q7",
           "ability": "IE",
           "question": "How did I organize the tasks over the course of the sprint to ensure both backend and frontend aspects of the features were completed on time?",
           "ideal_answer": "You organized the sprint by scheduling backend-related tasks such as setting up the environment, defining the database schema, implementing registration and login, adding validation, and writing unit ",
-          "ai_answer": "The conversation context contains a sprint plan for user registration and login (March 15\u201329, 2024) with the goal to \u201cImplement user registration and login functionality\u201d and \u201cEnsure the application is secure and user-friendly.\u201d However, the detailed task breakdown\u2014including how backend (e.g., models, authentication logic, API endpoints) and frontend (e.g., forms, UI with Bootstrap, validation) work was distributed across days or assigned to specific roles\u2014is not fully provided in the retrieved ",
+          "ai_answer": "",
           "recall_provenance": {
             "engine": "linear",
             "kept_count": 90,
             "voice_sums": {
-              "vec": 52.3228,
-              "fts": 4.8,
-              "keyword": 164.0326,
-              "importance": 45.7,
-              "recency_decay": 77.463
+              "vec": 52.6452,
+              "fts": 3.2,
+              "keyword": 163.8352,
+              "importance": 45.9,
+              "recency_decay": 77.517
             },
             "top_result_voices": {
-              "vec": 0.5725,
+              "vec": 0.7449,
               "fts": 0.0,
-              "keyword": 2.541,
-              "importance": 0.3,
-              "recency_decay": 0.8607
+              "keyword": 1.7179,
+              "importance": 0.6,
+              "recency_decay": 0.8613
             },
             "top_result_tier": "working"
           },
           "score": 0.0,
           "nuggets": [],
           "assessment": "",
-          "answer_time_ms": 84561.4749279921,
-          "judge_time_ms": 10655.240197957028
+          "answer_time_ms": 6773.365565983113,
+          "judge_time_ms": 2877.668962988537
         },
         {
           "qid": "1:q10",
           "ability": "KU",
           "question": "What is the average response time of the dashboard API?",
           "ideal_answer": "Around 250ms due to caching optimizations",
-          "ai_answer": "STEP 1 - RELEVANT FACTS:\n- The dashboard API response time was initially **800ms** (from memory: \"...initially 800ms, and I've managed to reduce it to 300ms by optimizing SQL queries and caching results for 60 seconds...\")\n- After SQL optimizations and caching, it was reduced to **300ms** (same memory).\n- After further caching tweaks, it improved to **250ms** (from memory: \"...recently improved to 250ms after adding some caching tweaks...\")\n- A specific SQL query example was taking **500ms**, bu",
+          "ai_answer": "250ms",
           "recall_provenance": {
             "engine": "linear",
             "kept_count": 90,
             "voice_sums": {
-              "vec": 51.5323,
+              "vec": 51.7134,
               "fts": 3.2,
-              "keyword": 158.7276,
-              "importance": 46.1,
-              "recency_decay": 77.445
+              "keyword": 158.9076,
+              "importance": 46.5,
+              "recency_decay": 77.517
             },
             "top_result_voices": {
-              "vec": 0.5967,
+              "vec": 0.5941,
               "fts": 0.0,
               "keyword": 3.4658,
               "importance": 0.3,
-              "recency_decay": 0.8605
+              "recency_decay": 0.8613
             },
             "top_result_tier": "working"
           },
           "score": 1.0,
           "nuggets": [],
           "assessment": "",
-          "answer_time_ms": 51602.43601904949,
-          "judge_time_ms": 5189.169439021498
+          "answer_time_ms": 811.3883360056207,
+          "judge_time_ms": 1516.4420600049198
         },
         {
           "qid": "1:q11",
           "ability": "KU",
           "question": "How many commits have been merged into the main branch of my Git repository?",
           "ideal_answer": "165 commits have been merged into the main branch.",
-          "ai_answer": "150 commits. The conversation states that the repository had \"150 commits and 12 branches merged\" when the v1.0.0 release was tagged and pushed to GitHub.",
+          "ai_answer": "",
           "recall_provenance": {
             "engine": "linear",
             "kept_count": 90,
             "voice_sums": {
-              "vec": 46.6569,
+              "vec": 46.5087,
               "fts": 1.6,
               "keyword": 127.6446,
               "importance": 45.5,
-              "recency_decay": 77.436
+              "recency_decay": 77.517
             },
             "top_result_voices": {
-              "vec": 0.5307,
+              "vec": 0.5263,
               "fts": 0.0,
               "keyword": 2.133,
               "importance": 0.3,
-              "recency_decay": 0.8604
+              "recency_decay": 0.8613
             },
             "top_result_tier": "working"
           },
           "score": 0.0,
           "nuggets": [],
           "assessment": "",
-          "answer_time_ms": 6759.7961479914375,
-          "judge_time_ms": 1730.4320280090906
+          "answer_time_ms": 4991.839868016541,
+          "judge_time_ms": 2552.3760430514812
         },
         {
           "qid": "1:q12",
           "ability": "MR",
           "question": "How many new columns did I want to add to the transactions table across my requests?",
           "ideal_answer": "Two columns: 'category' and 'notes'.",
-          "ai_answer": "**1 new column**: a `category` column with type `VARCHAR(50)` for expense classification.",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
           "recall_provenance": {
             "engine": "linear",
-            "kept_count": 102,
+            "kept_count": 103,
             "voice_sums": {
-              "vec": 65.409,
-              "fts": 10.08,
-              "keyword": 148.2256,
-              "importance": 53.0,
-              "recency_decay": 87.7506
+              "vec": 65.8684,
+              "fts": 10.88,
+              "keyword": 149.0256,
+              "importance": 54.0,
+              "recency_decay": 88.6971
             },
             "top_result_voices": {
-              "vec": 0.6071,
+              "vec": 0.6045,
               "fts": 0.0,
               "keyword": 2.5725,
               "importance": 0.3,
-              "recency_decay": 0.8603
+              "recency_decay": 0.8612
             },
             "top_result_tier": "working"
           },
-          "score": 0.25,
+          "score": 0.0,
           "nuggets": [],
           "assessment": "",
-          "answer_time_ms": 48459.92757601198,
-          "judge_time_ms": 16487.77261399664
+          "answer_time_ms": 499361.05512001086,
+          "judge_time_ms": 91087.16450398788
         },
         {
           "qid": "1:q13",
           "ability": "MR",
           "question": "How many different user roles and security features am I trying to implement across my sessions?",
           "ideal_answer": "Three: password hashing, role-based access control, and account lockout after failed login attempts.",
-          "ai_answer": "STEP 1 - RELEVANT FACTS: The provided context focuses on a personal budget tracker application built with Flask. The user discusses implementing authentication, session management, and several security measures. However, no mention of multiple user roles (e.g., admin, manager, guest) appears anywhere. The term \"user\" is used generically. Security features repeatedly mentioned include:\n\n- Secure password storage (hashing with bcrypt/Werkzeug)\n- Session management (Flask-Login integration)\n- CSRF ",
+          "ai_answer": "Based on the conversation and retrieved memories, you are implementing **2 user roles** (admin and regular user) through role-based access control (RBAC) and **11 distinct security features** across your sessions:\n\n1. Password hashing (Argon2)\n2. Multi-Factor Authentication (MFA)\n3. Session management with Flask-Login\n4. Rate limiting\n5. Account lockout\n6. CSRF protection\n7. HTTPS (Let\u2019s Encrypt)\n8. Security headers (Flask-Talisman)\n9. Input validation (character limits)\n10. Secure secret key ma",
           "recall_provenance": {
             "engine": "linear",
-            "kept_count": 117,
+            "kept_count": 90,
             "voice_sums": {
-              "vec": 70.5194,
-              "fts": 51.35,
-              "keyword": 222.2584,
-              "importance": 61.3,
-              "recency_decay": 100.638
+              "vec": 56.496,
+              "fts": 3.2,
+              "keyword": 175.5334,
+              "importance": 45.9,
+              "recency_decay": 77.436
             },
             "top_result_voices": {
-              "vec": 0.6298,
+              "vec": 0.6396,
               "fts": 0.0,
               "keyword": 3.2039,
               "importance": 0.4,
-              "recency_decay": 0.8602
+              "recency_decay": 0.8604
             },
             "top_result_tier": "working"
           },
-          "score": 0.018867924528301886,
+          "score": 0.09090909090909091,
           "nuggets": [],
           "assessment": "",
-          "answer_time_ms": 174673.39542502305,
-          "judge_time_ms": 19123.98509902414
+          "answer_time_ms": 165077.12996401824,
+          "judge_time_ms": 91642.560762004
         },
         {
           "qid": "1:q16",
           "ability": "SUM",
           "question": "Can you provide a comprehensive summary of how my budget tracker project has progressed, including the key features implemented, the development timeline, security enhancements, and documentation effo",
           "ideal_answer": "Your budget tracker project evolved through several stages, starting with the initial setup of a Flask application featuring user authentication, expense tracking, and data visualization capabilities.",
-          "ai_answer": "STEP 1 - RELEVANT FACTS:\n- **Project**: Personal budget tracker web application built with Flask.\n- **Key Features**: \n  - User authentication (registration, login, logout) with secure password hashing.\n  - Transaction management (add income/expense, view transactions).\n  - Basic analytics (monthly income vs expenses, category-wise spending).\n  - Dashboard API response time optimized to 250ms via caching.\n  - Data visualization using Chart.js.\n  - Accessibility brought up to WCAG 2.1 AA standard",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
           "recall_provenance": {
             "engine": "linear",
             "kept_count": 90,
             "voice_sums": {
-              "vec": 52.3488,
+              "vec": 52.393,
               "fts": 0.0,
-              "keyword": 118.8638,
-              "importance": 45.8,
-              "recency_decay": 77.391
+              "keyword": 119.0208,
+              "importance": 45.7,
+              "recency_decay": 77.4
             },
             "top_result_voices": {
-              "vec": 0.7654,
+              "vec": 0.7684,
               "fts": 0.0,
               "keyword": 1.9507,
               "importance": 0.4,
-              "recency_decay": 0.8599
+              "recency_decay": 0.86
             },
             "top_result_tier": "working"
           },
-          "score": 0.07212475633528265,
+          "score": 0.0,
           "nuggets": [],
           "assessment": "",
-          "answer_time_ms": 75109.50443398906,
-          "judge_time_ms": 18111.54626699863
+          "answer_time_ms": 92603.07024000213,
+          "judge_time_ms": 91137.17016601004
         },
         {
           "qid": "1:q17",
           "ability": "SUM",
           "question": "Can you give me a comprehensive summary of how I handled the security and database challenges in my budget tracker app across our discussions?",
           "ideal_answer": "Throughout our conversations, you progressively developed a secure and reliable budget tracker application by addressing several key challenges. Initially, you focused on implementing password hashing",
-          "ai_answer": "STEP 1 - RELEVANT FACTS:\n- Password Hashing: The user switched to Argon2 for password hashing as a significant security upgrade. Multiple discussions covered best practices: use strong modern algorithms (bcrypt, scrypt, Argon2), salting, and proper configuration of Argon2 parameters.\n- Authentication & Session Management: Integrated Flask-Login 0.6.2 into Flask 2.3.1 to replace manual session handling. Implemented login, logout, session validation, and secure session management. Added user loade",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
           "recall_provenance": {
             "engine": "linear",
             "kept_count": 90,
             "voice_sums": {
-              "vec": 56.081,
+              "vec": 56.3418,
               "fts": 0.0,
               "keyword": 230.2044,
               "importance": 46.4,
-              "recency_decay": 77.382
+              "recency_decay": 77.373
             },
             "top_result_voices": {
-              "vec": 0.7307,
+              "vec": 0.735,
               "fts": 0.0,
               "keyword": 4.8278,
               "importance": 0.4,
-              "recency_decay": 0.8598
+              "recency_decay": 0.8597
             },
             "top_result_tier": "working"
           },
-          "score": 0.05664488017429194,
+          "score": 0.009615384615384616,
           "nuggets": [],
           "assessment": "",
-          "answer_time_ms": 53556.97644199245,
-          "judge_time_ms": 18953.482433978934
+          "answer_time_ms": 92086.18089399533,
+          "judge_time_ms": 91234.29766105255
         },
         {
           "qid": "1:q18",
           "ability": "TR",
           "question": "How many weeks do I have between finishing the transaction management features and the final deployment deadline?",
           "ideal_answer": "I have exactly 4 weeks between finishing the transaction management features on January 15, 2024, and the final deployment deadline on March 15, 2024.",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "unknown",
+            "kept_count": 0,
+            "voice_sums": {},
+            "top_result_voices": {},
+            "top_result_tier": null
+          },
+          "score": 0.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 91823.07245896664,
+          "judge_time_ms": 2441.496615007054
+        },
+        {
+          "qid": "1:q19",
+          "ability": "TR",
+          "question": "How many days were there between the end of my first sprint and the deadline for completing the analytics features in sprint 2?",
+          "ideal_answer": "There were 21 days between the end of the first sprint on March 29 and the analytics deadline on April 19.",
+          "ai_answer": "21 days (from March 29, 2024 to April 19, 2024).",
+          "recall_provenance": {
+            "engine": "unknown",
+            "kept_count": 0,
+            "voice_sums": {},
+            "top_result_voices": {},
+            "top_result_tier": null
+          },
+          "score": 1.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 7458.690469968133,
+          "judge_time_ms": 3098.378042981494
+        }
+      ]
+    },
+    {
+      "conversation_id": "2",
+      "scale": "100K",
+      "num_questions": 20,
+      "num_evaluated": 16,
+      "results": [
+        {
+          "qid": "2:q0",
+          "ability": "ABS",
+          "question": "What are the specific ESLint rules from the Airbnb style guide that I enforced in this project?",
+          "ideal_answer": "Based on the provided chat, there is no information related to the specific ESLint rules enforced from the Airbnb style guide.",
+          "ai_answer": "Based on the conversation, the specific ESLint rules from the Airbnb style guide that were enforced in this project are:\n\n- **Indenting**: The configuration includes a rule for indentation (likely 2 spaces, per Airbnb convention).\n- **Semicolons**: A rule requiring semicolons at the end of statements.\n- **Variable Naming**: A rule enforcing camelCase for variable names.\n\nThe `.eslintrc.json` file extends the Airbnb base style guide and adds these custom rules. The exact rule names (e.g., `indent",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 57.6124,
+              "fts": 0.0,
+              "keyword": 195.0411,
+              "importance": 46.0,
+              "recency_decay": 77.553
+            },
+            "top_result_voices": {
+              "vec": 0.6283,
+              "fts": 0.0,
+              "keyword": 2.2038,
+              "importance": 0.4,
+              "recency_decay": 0.8617
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 11703.39018595405,
+          "judge_time_ms": 5804.177123005502
+        },
+        {
+          "qid": "2:q1",
+          "ability": "ABS",
+          "question": "What specific bugs were logged in the Jira board besides the 'TypeError' in autocomplete.js?",
+          "ideal_answer": "Based on the provided chat, there is no information related to any other bugs logged in the Jira board besides the mentioned TypeError.",
+          "ai_answer": "STEP 1 - RELEVANT FACTS: The provided conversation context and retrieved memories contain no mention of a Jira board or any bugs logged, including the 'TypeError' in autocomplete.js or any other specific bugs.\n\nSTEP 2 - CONTRADICTIONS: None.\n\nSTEP 3 - TEMPORAL/CALCULATIONS: Not applicable.\n\nSTEP 4 - ANSWER: The conversation context does not include any information about bugs logged in a Jira board. Therefore, I cannot list specific bugs beyond the 'TypeError' in autocomplete.js, which itself is ",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 54.7169,
+              "fts": 3.2,
+              "keyword": 188.925,
+              "importance": 46.6,
+              "recency_decay": 77.553
+            },
+            "top_result_voices": {
+              "vec": 0.5449,
+              "fts": 0.0,
+              "keyword": 2.312,
+              "importance": 0.4,
+              "recency_decay": 0.8617
+            },
+            "top_result_tier": "working"
+          },
+          "score": 1.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 10111.245492007583,
+          "judge_time_ms": 18994.86362497555
+        },
+        {
+          "qid": "2:q2",
+          "ability": "CR",
+          "question": "Have I obtained an API key for this project?",
+          "ideal_answer": "I notice you've mentioned contradictory information about this. You said you have an API key for the project, but you also mentioned that you have never obtained one. Could you clarify which is correc",
+          "ai_answer": "STEP 1 - SCAN: I examined all retrieved memories for statements about obtaining an API key. The following memories indicate that an API key exists and is used:\n- [MSGIDX:63] discusses setting up the environment to use the OpenWeather API with an API key stored in a `.env` file.\n- [MSGIDX:7] recommends managing API keys separately.\n- [MSGIDX:11] includes code with a placeholder `appid` parameter.\n- Multiple memories show implementation using `process.env.OPENWEATHER_API_KEY` or similar.\nNo memory",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 55.9548,
+              "fts": 219.2556,
+              "keyword": 219.2556,
+              "importance": 46.8,
+              "recency_decay": 77.544
+            },
+            "top_result_voices": {
+              "vec": 0.5244,
+              "fts": 3.9733,
+              "keyword": 3.9733,
+              "importance": 0.7,
+              "recency_decay": 0.8616
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.125,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 8489.800965995528,
+          "judge_time_ms": 14680.631643044762
+        },
+        {
+          "qid": "2:q3",
+          "ability": "CR",
+          "question": "Have I ever fixed any bugs related to the autocomplete feature in my project?",
+          "ideal_answer": "I notice you've mentioned contradictory information about this. You said you fixed bugs by adding null checks that reduced error rates, but you also mentioned never fixing any bugs related to the auto",
+          "ai_answer": "STEP 1 \u2013 SCAN:  \n- User statement (from memory MSGIDX:132): \"I've never fixed any bugs related to the autocomplete feature\"  \n\nSTEP 2 \u2013 CONTRADICTIONS:  \nNo conflicting statements found.  \n\nSTEP 3 \u2013 RESOLUTION:  \nNo contradictions to resolve.  \n\nSTEP 4 \u2013 ANSWER:  \nBased on your own statement, you have never fixed any bugs related to the autocomplete feature in your project.",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 55.9976,
+              "fts": 0.0,
+              "keyword": 239.5117,
+              "importance": 45.2,
+              "recency_decay": 77.535
+            },
+            "top_result_voices": {
+              "vec": 0.7205,
+              "fts": 0.0,
+              "keyword": 4.35,
+              "importance": 0.4,
+              "recency_decay": 0.8615
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.25,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 11450.718134001363,
+          "judge_time_ms": 6654.912734986283
+        },
+        {
+          "qid": "2:q4",
+          "ability": "EO",
+          "question": "Can you list the order in which I brought up different aspects of implementing the city autocomplete feature across our conversations, in order? Mention ONLY and ONLY five items.",
+          "ideal_answer": "You mentioned aspects of the city autocomplete feature in this order: 1) Implementing debounce delay to reduce API calls, 2) Handling API response times exceeding the debounce delay, 3) Addressing rap",
+          "ai_answer": "Based on the conversation order (message indices), here are the five aspects you brought up regarding implementing the city autocomplete feature, in chronological order:\n\n1. Completing the city autocomplete implementation using the OpenWeather Geocoding API with a debounce delay.\n2. Handling cases where API response time exceeds the debounce delay.\n3. Handling invalid city names and user-friendly error messages for HTTP 404 and 400 status codes.\n4. Enhancing the weather app with error handling, ",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 53.2174,
+              "fts": 4.8,
+              "keyword": 179.9061,
+              "importance": 46.3,
+              "recency_decay": 77.535
+            },
+            "top_result_voices": {
+              "vec": 0.7523,
+              "fts": 0.0,
+              "keyword": 3.0655,
+              "importance": 0.4,
+              "recency_decay": 0.8615
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.5,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 28923.958274011966,
+          "judge_time_ms": 15409.16981495684
+        },
+        {
+          "qid": "2:q5",
+          "ability": "EO",
+          "question": "Can you list the order in which I brought up different aspects of handling errors and promise rejections in my weather app code throughout our conversations in order? Mention ONLY and ONLY five items.",
+          "ideal_answer": "You mentioned these aspects in this order: 1) Handling user-friendly messages for specific HTTP error codes while using asynchronous fetch calls, 2) Implementing try/catch blocks around async fetch ca",
+          "ai_answer": "1. Handling errors properly in the `fetchWeather` function (e.g., validating response data and displaying errors).\n2. Handling HTTP 404 and 400 errors specifically for invalid city names (user-friendly error messages).\n3. Adding error handling alongside a debounce delay for API calls (enhancing the overall weather app).\n4. Handling API errors gracefully in the debounce function (improving the debounce utility).\n5. Implementing rate limiting and handling quota exceeded errors (tracking daily API ",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 60.993,
+              "fts": 3.2,
+              "keyword": 172.9969,
+              "importance": 47.0,
+              "recency_decay": 77.526
+            },
+            "top_result_voices": {
+              "vec": 0.6886,
+              "fts": 0.0,
+              "keyword": 2.4735,
+              "importance": 0.4,
+              "recency_decay": 0.8614
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.1076923076923077,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 55909.50151800644,
+          "judge_time_ms": 38982.13177599246
+        },
+        {
+          "qid": "2:q6",
+          "ability": "IE",
+          "question": "What technologies did I say I was using to start my project targeting that API endpoint?",
+          "ideal_answer": "You said you were using vanilla JavaScript ES2021, HTML5, and CSS3.",
+          "ai_answer": "v2.5",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 55.5285,
+              "fts": 0.0,
+              "keyword": 110.6883,
+              "importance": 46.2,
+              "recency_decay": 77.508
+            },
+            "top_result_voices": {
+              "vec": 0.6451,
+              "fts": 0.0,
+              "keyword": 1.4851,
+              "importance": 0.7,
+              "recency_decay": 0.8612
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 993.7231660005637,
+          "judge_time_ms": 18166.750939039048
+        },
+        {
+          "qid": "2:q7",
+          "ability": "IE",
+          "question": "How did you recommend managing the flow of requests when my app risks overwhelming the service due to frequent retries and bursts of activity?",
+          "ideal_answer": "I recommended implementing a queue system combined with resetting counters based on elapsed time intervals, and to handle repeated retries, I suggested adding exponential backoff with capped delays to",
+          "ai_answer": "v2.5",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 54.7661,
+              "fts": 0.0,
+              "keyword": 125.1599,
+              "importance": 47.6,
+              "recency_decay": 77.508
+            },
+            "top_result_voices": {
+              "vec": 0.5622,
+              "fts": 0.0,
+              "keyword": 1.6292,
+              "importance": 0.4,
+              "recency_decay": 0.8612
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 847.454552014824,
+          "judge_time_ms": 48571.04716298636
+        },
+        {
+          "qid": "2:q10",
+          "ability": "KU",
+          "question": "What is the daily call quota for the API key used in my application?",
+          "ideal_answer": "1,200 calls per day",
+          "ai_answer": "March 10, 2024",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 56.8652,
+              "fts": 0.0,
+              "keyword": 279.0771,
+              "importance": 46.0,
+              "recency_decay": 77.499
+            },
+            "top_result_voices": {
+              "vec": 0.6397,
+              "fts": 0.0,
+              "keyword": 5.1714,
+              "importance": 0.3,
+              "recency_decay": 0.8611
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 741.9326839735731,
+          "judge_time_ms": 16750.641429971438
+        },
+        {
+          "qid": "2:q11",
+          "ability": "KU",
+          "question": "What is the test coverage percentage for my API integration module?",
+          "ideal_answer": "78%",
+          "ai_answer": "March 27, 2024",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 54.7853,
+              "fts": 0.0,
+              "keyword": 186.8253,
+              "importance": 47.1,
+              "recency_decay": 77.49
+            },
+            "top_result_voices": {
+              "vec": 0.6128,
+              "fts": 0.0,
+              "keyword": 3.8182,
+              "importance": 0.3,
+              "recency_decay": 0.861
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 636.5439200308174,
+          "judge_time_ms": 91284.78526696563
+        },
+        {
+          "qid": "2:q12",
+          "ability": "MR",
+          "question": "How many different features or concerns did I mention wanting to handle across my weather app conversations?",
+          "ideal_answer": "Four",
           "ai_answer": "",
           "recall_provenance": {
             "engine": "linear",
-            "kept_count": 99,
+            "kept_count": 90,
             "voice_sums": {
-              "vec": 57.5114,
-              "fts": 7.95,
-              "keyword": 152.0497,
-              "importance": 50.4,
-              "recency_decay": 85.0995
+              "vec": 57.7764,
+              "fts": 4.8,
+              "keyword": 195.3015,
+              "importance": 46.9,
+              "recency_decay": 77.481
             },
             "top_result_voices": {
-              "vec": 0.5555,
-              "fts": 2.3,
-              "keyword": 2.3,
-              "importance": 0.3,
+              "vec": 0.6654,
+              "fts": 0.0,
+              "keyword": 3.6294,
+              "importance": 0.7,
+              "recency_decay": 0.8609
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 140228.1537160161,
+          "judge_time_ms": 91133.65266495384
+        },
+        {
+          "qid": "2:q13",
+          "ability": "MR",
+          "question": "Between my fetch call latency and my autocomplete API response time, which one is currently faster based on my tests?",
+          "ideal_answer": "Your fetch call latency is faster than your autocomplete API response time.",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 62.0456,
+              "fts": 7.2,
+              "keyword": 211.285,
+              "importance": 47.2,
+              "recency_decay": 77.445
+            },
+            "top_result_voices": {
+              "vec": 0.6572,
+              "fts": 0.0,
+              "keyword": 3.8,
+              "importance": 0.4,
+              "recency_decay": 0.8605
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 93325.07700601127,
+          "judge_time_ms": 91284.64949200861
+        },
+        {
+          "qid": "2:q16",
+          "ability": "SUM",
+          "question": "Can you give me a comprehensive summary of how my weather app project has progressed, including the key features, improvements, and development steps we've discussed so far?",
+          "ideal_answer": "Your weather app project began with a basic implementation using JavaScript and the OpenWeather API, where you sought guidance on structuring your code and improving error handling. The assistant reco",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 61.448,
+              "fts": 0.0,
+              "keyword": 162.5434,
+              "importance": 47.5,
+              "recency_decay": 77.418
+            },
+            "top_result_voices": {
+              "vec": 0.7241,
+              "fts": 0.0,
+              "keyword": 2.2296,
+              "importance": 0.4,
+              "recency_decay": 0.8602
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.010869565217391304,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 92191.26639299793,
+          "judge_time_ms": 91621.57204997493
+        },
+        {
+          "qid": "2:q17",
+          "ability": "SUM",
+          "question": "Can you summarize what I learned about implementing and improving city autocomplete features in my weather app?",
+          "ideal_answer": "You explored how to implement a city autocomplete feature using the OpenWeather Geocoding API with a 300ms debounce to reduce API calls. The implementation included adding error handling, displaying a",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 63.2082,
+              "fts": 0.0,
+              "keyword": 220.1824,
+              "importance": 46.4,
+              "recency_decay": 77.391
+            },
+            "top_result_voices": {
+              "vec": 0.8871,
+              "fts": 0.0,
+              "keyword": 3.8686,
+              "importance": 0.4,
+              "recency_decay": 0.8599
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.013513513513513514,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 91839.39356997143,
+          "judge_time_ms": 91085.23783495184
+        },
+        {
+          "qid": "2:q18",
+          "ability": "TR",
+          "question": "How many days passed between when I obtained my OpenWeather API key and when I completed the UI wireframe for my weather app?",
+          "ideal_answer": "2 days passed between obtaining the OpenWeather API key on March 10, 2024, and completing the UI wireframe on March 12, 2024.",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "unknown",
+            "kept_count": 0,
+            "voice_sums": {},
+            "top_result_voices": {},
+            "top_result_tier": null
+          },
+          "score": 0.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 92023.25382700656,
+          "judge_time_ms": 91151.01655904436
+        },
+        {
+          "qid": "2:q19",
+          "ability": "TR",
+          "question": "How many days do I have between scheduling the meeting and the start of the testing period for my project?",
+          "ideal_answer": "There are 21 days between scheduling the meeting on March 15 and the start of the two-week testing period beginning April 5.",
+          "ai_answer": "Between March 11 (March 11, 2024) and April 5, 2024 (April 05, 2024), there are 25 days.",
+          "recall_provenance": {
+            "engine": "unknown",
+            "kept_count": 0,
+            "voice_sums": {},
+            "top_result_voices": {},
+            "top_result_tier": null
+          },
+          "score": 0.07407407407407407,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 392.0792430290021,
+          "judge_time_ms": 91284.18317600153
+        }
+      ]
+    },
+    {
+      "conversation_id": "3",
+      "scale": "100K",
+      "num_questions": 20,
+      "num_evaluated": 16,
+      "results": [
+        {
+          "qid": "3:q0",
+          "ability": "ABS",
+          "question": "What specific criteria did I use to prioritize tasks on the Trello board during sprint 1?",
+          "ideal_answer": "Based on the provided chat, there is no information related to the specific criteria used to prioritize tasks on the Trello board during sprint 1.",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 50.2515,
+              "fts": 3.2,
+              "keyword": 190.5939,
+              "importance": 44.7,
+              "recency_decay": 77.553
+            },
+            "top_result_voices": {
+              "vec": 0.7086,
+              "fts": 0.0,
+              "keyword": 2.2041,
+              "importance": 0.6,
+              "recency_decay": 0.8617
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 92134.8556940211,
+          "judge_time_ms": 91106.48278996814
+        },
+        {
+          "qid": "3:q1",
+          "ability": "ABS",
+          "question": "What was the rationale behind choosing Formspree API v2 for contact form submission?",
+          "ideal_answer": "Based on the provided chat, there is no information related to the rationale behind choosing Formspree API v2 for contact form submission.",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 55.1735,
+              "fts": 1.6,
+              "keyword": 164.0124,
+              "importance": 45.5,
+              "recency_decay": 77.526
+            },
+            "top_result_voices": {
+              "vec": 0.8074,
+              "fts": 0.0,
+              "keyword": 4.4281,
+              "importance": 0.4,
+              "recency_decay": 0.8614
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.029411764705882353,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 91973.78086199751,
+          "judge_time_ms": 91140.569685027
+        },
+        {
+          "qid": "3:q2",
+          "ability": "CR",
+          "question": "Have I used Bootstrap components in my project before?",
+          "ideal_answer": "I noticed that there are conflicting statements regarding your use of Bootstrap components. You mentioned preferring Bootstrap 5.3.0 and using its classes, but also said you have never implemented any",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 58.4553,
+              "fts": 0.0,
+              "keyword": 248.3939,
+              "importance": 44.7,
+              "recency_decay": 77.508
+            },
+            "top_result_voices": {
+              "vec": 0.8235,
+              "fts": 0.0,
+              "keyword": 4.4069,
+              "importance": 0.7,
+              "recency_decay": 0.8612
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 183151.0582959745,
+          "judge_time_ms": 91521.24811400427
+        },
+        {
+          "qid": "3:q3",
+          "ability": "CR",
+          "question": "Have I tested the contact form submission with any API integration before?",
+          "ideal_answer": "I notice you've mentioned contradictory information about this. You said you used Bootstrap\u2019s form-control and btn-primary classes for consistent styling and hover effects, which suggests some integra",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 55.6774,
+              "fts": 5.2,
+              "keyword": 164.156,
+              "importance": 46.3,
+              "recency_decay": 77.463
+            },
+            "top_result_voices": {
+              "vec": 0.7662,
+              "fts": 0.0,
+              "keyword": 3.3303,
+              "importance": 0.6,
+              "recency_decay": 0.8607
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.0196078431372549,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 183644.06346797477,
+          "judge_time_ms": 91128.59148200369
+        },
+        {
+          "qid": "3:q4",
+          "ability": "EO",
+          "question": "Can you list the order in which I brought up different aspects of integrating and customizing the framework in my projects across our conversations, in order? Mention ONLY and ONLY three items.",
+          "ideal_answer": "You mentioned these aspects in this order: 1) Setting up the responsive grid and components like navbar and cards using the framework version 5.3.0, 2) Integrating specific styling classes such as for",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 52.6835,
+              "fts": 1.6,
+              "keyword": 145.9885,
+              "importance": 46.0,
+              "recency_decay": 77.427
+            },
+            "top_result_voices": {
+              "vec": 0.6957,
+              "fts": 0.0,
+              "keyword": 1.7054,
+              "importance": 0.6,
+              "recency_decay": 0.8603
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 183809.75728097837,
+          "judge_time_ms": 91463.25369499391
+        },
+        {
+          "qid": "3:q5",
+          "ability": "EO",
+          "question": "Can you list the order in which I brought up different aspects of my project development throughout our conversations in order? Mention ONLY and ONLY five items.",
+          "ideal_answer": "You mentioned aspects of your project development in this order: 1) Planning the initial sprint timeline and layout/navigation goals, 2) Working on the second sprint focusing on SEO basics and backend",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 49.3301,
+              "fts": 1.6,
+              "keyword": 154.5496,
+              "importance": 45.4,
+              "recency_decay": 77.391
+            },
+            "top_result_voices": {
+              "vec": 0.6643,
+              "fts": 0.0,
+              "keyword": 1.7136,
+              "importance": 0.6,
+              "recency_decay": 0.8599
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.02631578947368421,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 183526.1504399823,
+          "judge_time_ms": 91151.3606349472
+        },
+        {
+          "qid": "3:q6",
+          "ability": "IE",
+          "question": "How long did I say the entire project is expected to take?",
+          "ideal_answer": "The project is estimated to take 3 sprints of 2 weeks each, totaling 6 weeks.",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 45.4035,
+              "fts": 0.0,
+              "keyword": 158.0054,
+              "importance": 45.5,
+              "recency_decay": 77.355
+            },
+            "top_result_voices": {
+              "vec": 0.5494,
+              "fts": 0.0,
+              "keyword": 3.0885,
+              "importance": 0.7,
               "recency_decay": 0.8595
             },
             "top_result_tier": "working"
@@ -579,39 +1291,263 @@
           "score": 0.0,
           "nuggets": [],
           "assessment": "",
-          "answer_time_ms": 209067.43991503026,
-          "judge_time_ms": 4015.4533960158005
+          "answer_time_ms": 92247.8803829872,
+          "judge_time_ms": 91437.61788401753
         },
         {
-          "qid": "1:q19",
-          "ability": "TR",
-          "question": "How many days were there between the end of my first sprint and the deadline for completing the analytics features in sprint 2?",
-          "ideal_answer": "There were 21 days between the end of the first sprint on March 29 and the analytics deadline on April 19.",
-          "ai_answer": "",
+          "qid": "3:q7",
+          "ability": "IE",
+          "question": "How did you recommend structuring the work to ensure the initial phase focusing on layout and navigation was completed on time within the overall project schedule?",
+          "ideal_answer": "I recommended breaking the project into three sprints of two weeks each, with the first sprint dedicated to setting up the basic layout and navigation, aiming to complete it by the deadline of April 1",
+          "ai_answer": "6 weeks",
           "recall_provenance": {
             "engine": "linear",
             "kept_count": 90,
             "voice_sums": {
-              "vec": 46.6681,
+              "vec": 51.1189,
               "fts": 3.6,
-              "keyword": 188.1541,
-              "importance": 46.2,
-              "recency_decay": 77.337
+              "keyword": 183.9957,
+              "importance": 44.2,
+              "recency_decay": 77.328
             },
             "top_result_voices": {
-              "vec": 0.5445,
-              "fts": 0.0,
-              "keyword": 4.4767,
+              "vec": 0.4727,
+              "fts": 3.6,
+              "keyword": 3.6,
               "importance": 0.3,
-              "recency_decay": 0.8593
+              "recency_decay": 0.8592
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.038461538461538464,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 1045.4910899861716,
+          "judge_time_ms": 91634.27439896623
+        },
+        {
+          "qid": "3:q10",
+          "ability": "KU",
+          "question": "What is the deadline for completing the first sprint focused on the basic layout and navigation?",
+          "ideal_answer": "April 5, 2024",
+          "ai_answer": "April 1, 2024",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 48.4597,
+              "fts": 0.0,
+              "keyword": 241.3807,
+              "importance": 44.5,
+              "recency_decay": 77.31
+            },
+            "top_result_voices": {
+              "vec": 0.569,
+              "fts": 0.0,
+              "keyword": 4.2353,
+              "importance": 0.6,
+              "recency_decay": 0.859
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.25,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 668.2626220281236,
+          "judge_time_ms": 91291.1724059959
+        },
+        {
+          "qid": "3:q11",
+          "ability": "KU",
+          "question": "How many project cards are included in my gallery using Bootstrap 5.3.0?",
+          "ideal_answer": "There are 10 project cards included in the gallery.",
+          "ai_answer": "8 cards",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 54.0247,
+              "fts": 0.0,
+              "keyword": 215.0838,
+              "importance": 45.5,
+              "recency_decay": 77.301
+            },
+            "top_result_voices": {
+              "vec": 0.6783,
+              "fts": 0.0,
+              "keyword": 3.3974,
+              "importance": 0.4,
+              "recency_decay": 0.8589
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.125,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 727.2073560161516,
+          "judge_time_ms": 91383.6562029901
+        },
+        {
+          "qid": "3:q12",
+          "ability": "MR",
+          "question": "How many project cards do I have in total after adding the new ones to my gallery?",
+          "ideal_answer": "You have 10 project cards in total after adding the new ones.",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 47.3851,
+              "fts": 0.0,
+              "keyword": 204.6489,
+              "importance": 45.3,
+              "recency_decay": 77.283
+            },
+            "top_result_voices": {
+              "vec": 0.5952,
+              "fts": 0.0,
+              "keyword": 2.1508,
+              "importance": 0.6,
+              "recency_decay": 0.8587
             },
             "top_result_tier": "working"
           },
           "score": 0.0,
           "nuggets": [],
           "assessment": "",
-          "answer_time_ms": 40853.26930799056,
-          "judge_time_ms": 5354.697633010801
+          "answer_time_ms": 183213.84752198355,
+          "judge_time_ms": 91317.43009400088
+        },
+        {
+          "qid": "3:q13",
+          "ability": "MR",
+          "question": "Considering my form validation code, lazy loading setup, GA4 anonymized tracking, and bounce rate monitoring, how can I estimate the combined impact on user experience and site performance improvement",
+          "ideal_answer": "By analyzing my form validation improvements reducing dependency size and enhancing UX, lazy loading decreasing initial load time by 350ms, GA4 anonymized tracking ensuring privacy compliance, and bou",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 56.1707,
+              "fts": 3.2,
+              "keyword": 158.3901,
+              "importance": 45.5,
+              "recency_decay": 77.247
+            },
+            "top_result_voices": {
+              "vec": 0.677,
+              "fts": 0.0,
+              "keyword": 1.6473,
+              "importance": 0.6,
+              "recency_decay": 0.8583
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 183490.15043204417,
+          "judge_time_ms": 91144.30767297745
+        },
+        {
+          "qid": "3:q16",
+          "ability": "SUM",
+          "question": "Can you give me a comprehensive summary of how my portfolio website project has developed, including the key features and challenges I've worked through so far?",
+          "ideal_answer": "Your portfolio website project has progressed through several important stages. Initially, you focused on building the basic HTML5 structure with sections for About, Skills, Projects, and Contact, usi",
+          "ai_answer": "### Comprehensive Summary of Portfolio Website Project Development\n\nYour portfolio website project has evolved from an initial static HTML structure to a fully optimized, accessible, and performant single-page application using **Bootstrap 5.3.0** (later upgraded to 5.3.1). Here\u2019s a detailed breakdown of the key features, milestones, and challenges encountered and resolved.\n\n---\n\n## 1. **Project Timeline & Planning**\n- **Initial estimate**: 6 weeks (3 sprints of 2 weeks each), with a **deadline ",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 54.9625,
+              "fts": 0.0,
+              "keyword": 133.4973,
+              "importance": 46.8,
+              "recency_decay": 77.211
+            },
+            "top_result_voices": {
+              "vec": 0.7444,
+              "fts": 0.0,
+              "keyword": 1.9489,
+              "importance": 0.5,
+              "recency_decay": 0.8579
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.07036247334754797,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 58547.864924999885,
+          "judge_time_ms": 91233.28973300522
+        },
+        {
+          "qid": "3:q17",
+          "ability": "SUM",
+          "question": "Can you summarize how I approached and resolved the various issues with my web project over time?",
+          "ideal_answer": "Throughout our discussions, you tackled several challenges related to your web project, progressing from debugging layout issues to handling form submissions and server errors. Initially, you sought h",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "linear",
+            "kept_count": 90,
+            "voice_sums": {
+              "vec": 53.7371,
+              "fts": 0.0,
+              "keyword": 125.9671,
+              "importance": 46.1,
+              "recency_decay": 77.184
+            },
+            "top_result_voices": {
+              "vec": 0.7113,
+              "fts": 0.0,
+              "keyword": 1.4862,
+              "importance": 0.6,
+              "recency_decay": 0.8576
+            },
+            "top_result_tier": "working"
+          },
+          "score": 0.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 92238.77685901243,
+          "judge_time_ms": 92588.94475799752
+        },
+        {
+          "qid": "3:q18",
+          "ability": "TR",
+          "question": "How many days are there between the deadline for my first sprint and the updated deadline for the accessibility improvements?",
+          "ideal_answer": "There are 4 days between the original first sprint deadline on April 1, 2024, and the updated deadline for accessibility improvements on April 5, 2024.",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "unknown",
+            "kept_count": 0,
+            "voice_sums": {},
+            "top_result_voices": {},
+            "top_result_tier": null
+          },
+          "score": 0.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 91722.63181599556,
+          "judge_time_ms": 91125.4255619715
+        },
+        {
+          "qid": "3:q19",
+          "ability": "TR",
+          "question": "How many days passed between when I planned the peer review and when I completed the final code review for my project?",
+          "ideal_answer": "31 days passed between planning the peer review on April 2, 2024, and completing the final code review on May 3, 2024.",
+          "ai_answer": "[LLM_ERROR: all models failed. Last: 429 Client Error: Too Many Requests for url: https://openrouter.ai/api/v1/chat/completions]",
+          "recall_provenance": {
+            "engine": "unknown",
+            "kept_count": 0,
+            "voice_sums": {},
+            "top_result_voices": {},
+            "top_result_tier": null
+          },
+          "score": 0.0,
+          "nuggets": [],
+          "assessment": "",
+          "answer_time_ms": 91757.02784501482,
+          "judge_time_ms": 91184.109608992
         }
       ]
     }
