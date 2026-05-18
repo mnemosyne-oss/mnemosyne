@@ -2425,7 +2425,11 @@ class BeamMemory:
             r'commits?|cards?|users?|items?|tests?|APIs?|endpoints?|sprints?|tickets?)',
             content, _re.IGNORECASE)
         for num, unit in _metric_re[:10]:
-            key = f"{unit.lower().rstrip('s')}"
+            unit_clean = unit.lower()
+            # Strip plural 's' but preserve "ms" (milliseconds)
+            if unit_clean.endswith('s') and not unit_clean.endswith('ms'):
+                unit_clean = unit_clean[:-1]
+            key = unit_clean
             val = f"{num}{unit}"
             self._insert_fact(session, message_idx, 'metric', key, val,
                               self._context_snippet(content, content.find(val[:10])), 0.65)
@@ -2586,8 +2590,13 @@ class BeamMemory:
         # Information extraction / knowledge update (factual)
         if any(w in q for w in ['how many', 'what is the', 'what are the',
                                 'what was the', 'what were the', 'what was my',
-                                'when does', 'what is', 'what was']):
-            if not any(w in q for w in ['how many days', 'how many weeks']):  # not TR
+                                'when does', 'what is', 'what was',
+                                'what version', 'which version',
+                                'when was', 'when were',
+                                'how much', 'how big', 'how large', 'how fast']):
+            if not any(w in q for w in ['how many days', 'how many weeks',
+                                        'how many months', 'how many years',
+                                        'how far apart']):  # not TR
                 return 'IE'
 
         # Abstention
@@ -2600,28 +2609,42 @@ class BeamMemory:
                                 'in my sessions', 'across sessions']):
             return 'MR'
 
+        # Catch-all: any question starting with a wh-word that wasn't caught
+        # by a more specific ability (TR/EO/CR) defaults to IE.
+        if q.startswith(('what ', 'when ', 'where ', 'which ', 'who ', 'how ')):
+            return 'IE'
+
         return ''
 
     def _nous_fact_retrieve(self, query: str, top_k: int = 10) -> dict:
         """Query nous_facts table for exact metric/version/entity matches.
-        Extracts numbers and key terms from query, matches against fact key/value."""
+        Uses multi-pass strategy:
+          Pass 1: numbers from query → search fact values
+          Pass 2: capitalized terms → search keys + values
+          Pass 3: synonym map (latency→ms, version→version, etc.) → search by type+unit
+          Pass 4: context_snippet fallback → search raw surrounding text
+        Returns {'context': str, 'facts': list, 'source': str} or fallback."""
         import re as _re
         facts = []
+        seen = set()
         cursor = self.conn
+        q_lower = query.lower()
 
-        # Extract numbers from query (e.g., 150, 250, 5000)
+        # -- Pass 1: Numbers in query → find matching fact values --
         numbers = _re.findall(r'\b(\d+)\b', query)
         for num in numbers[:3]:
-            # Look for metric fact with this number
             rows = cursor.execute(
                 "SELECT fact_type, key, value, context_snippet FROM nous_facts "
                 "WHERE value LIKE ? AND session_id = ? LIMIT ?",
                 (f'%{num}%', self.session_id, top_k)
             ).fetchall()
             for row in rows:
-                facts.append(dict(zip(['type', 'key', 'value', 'context'], row)))
+                fk = (row[1], row[2])
+                if fk not in seen:
+                    seen.add(fk)
+                    facts.append(dict(zip(['type', 'key', 'value', 'context'], row)))
 
-        # Extract key terms (capitalized phrases, tech terms)
+        # -- Pass 2: Capitalized/key terms in query → search key + value --
         terms = _re.findall(r'\b[A-Z][a-z]+(?:[-][A-Z][a-z]+)*\b', query)
         stop_words = {'Have', 'Did', 'Do', 'Can', 'Will', 'Would', 'Should', 'What',
                       'When', 'Where', 'Which', 'Who', 'How', 'Why', 'Is', 'Are',
@@ -2629,14 +2652,86 @@ class BeamMemory:
                       'I', 'You', 'How', 'Many', 'Much'}
         terms = [t for t in terms if t not in stop_words]
         for term in terms[:5]:
-            # Try matching as fact key
             rows = cursor.execute(
                 "SELECT fact_type, key, value, context_snippet FROM nous_facts "
                 "WHERE (key LIKE ? OR value LIKE ?) AND session_id = ? LIMIT ?",
                 (f'%{term}%', f'%{term}%', self.session_id, top_k)
             ).fetchall()
             for row in rows:
-                facts.append(dict(zip(['type', 'key', 'value', 'context'], row)))
+                fk = (row[1], row[2])
+                if fk not in seen:
+                    seen.add(fk)
+                    facts.append(dict(zip(['type', 'key', 'value', 'context'], row)))
+
+        # -- Pass 3: Synonym/keyword mapping --
+        # Maps common question words to (fact_type, [unit_hints]).
+        # unit_hints=None means return all facts of that type.
+        _SYNONYM_MAP = [
+            ('version', 'version', None),
+            ('latency', 'metric', ['ms']),
+            ('speed', 'metric', ['ms']),
+            ('response time', 'metric', ['ms']),
+            ('how many', 'metric', None),
+            ('how much', 'metric', None),
+            ('what date', 'date', None),
+            ('what day', 'date', None),
+            ('deployed', 'date', None),
+            ('deploy', 'date', None),
+            ('released', 'date', None),
+            ('release', 'date', None),
+            ('launched', 'date', None),
+        ]
+        if not facts:
+            for phrase, ftype, unit_hints in _SYNONYM_MAP:
+                if phrase in q_lower:
+                    if unit_hints:
+                        for unit in unit_hints:
+                            rows = cursor.execute(
+                                "SELECT fact_type, key, value, context_snippet FROM nous_facts "
+                                "WHERE fact_type = ? AND key LIKE ? AND session_id = ? LIMIT ?",
+                                (ftype, f'%{unit}%', self.session_id, top_k)
+                            ).fetchall()
+                    else:
+                        rows = cursor.execute(
+                            "SELECT fact_type, key, value, context_snippet FROM nous_facts "
+                            "WHERE fact_type = ? AND session_id = ? LIMIT ?",
+                            (ftype, self.session_id, top_k)
+                        ).fetchall()
+                    for row in rows:
+                        fk = (row[1], row[2])
+                        if fk not in seen:
+                            seen.add(fk)
+                            facts.append(dict(zip(['type', 'key', 'value', 'context'], row)))
+                    if facts:
+                        break
+
+        # -- Pass 4: context_snippet fallback --
+        # Search the original surrounding text for meaningful query words.
+        # Catches "What is the latency?" where "latency" is in the snippet
+        # but not in the structured key/value fields.
+        if not facts:
+            q_stop = {'what', 'when', 'where', 'which', 'who', 'how', 'why',
+                      'is', 'are', 'was', 'were', 'do', 'does', 'did',
+                      'can', 'will', 'would', 'should', 'could', 'may',
+                      'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for',
+                      'of', 'with', 'my', 'me', 'i', 'you', 'it', 'its',
+                      'this', 'that', 'these', 'those', 'tell', 'list',
+                      'describe', 'explain', 'walk', 'me', 'through'}
+            q_words = [w for w in _re.findall(r'\b[a-zA-Z]{3,}\b', q_lower)
+                       if w not in q_stop]
+            for word in q_words[:5]:
+                rows = cursor.execute(
+                    "SELECT fact_type, key, value, context_snippet FROM nous_facts "
+                    "WHERE context_snippet LIKE ? AND session_id = ? LIMIT ?",
+                    (f'%{word}%', self.session_id, top_k)
+                ).fetchall()
+                for row in rows:
+                    fk = (row[1], row[2])
+                    if fk not in seen:
+                        seen.add(fk)
+                        facts.append(dict(zip(['type', 'key', 'value', 'context'], row)))
+                if facts:
+                    break
 
         if facts:
             ctx_lines = []
