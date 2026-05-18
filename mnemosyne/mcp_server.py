@@ -100,7 +100,9 @@ async def _run_stdio() -> None:
 
     @server.list_tools()
     async def list_tools():
-        return get_tool_definitions()
+        from mcp.types import Tool
+        raw = get_tool_definitions()
+        return [Tool(**t) for t in raw]
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list:
@@ -110,7 +112,7 @@ async def _run_stdio() -> None:
         except Exception as e:
             return [TextContent(type="text", text=json.dumps({"status": "error", "message": str(e)}, indent=2))]
 
-    async with stdio_server(server) as (read_stream, write_stream):
+    async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
@@ -146,7 +148,9 @@ def _build_sse_app(host: str = "127.0.0.1"):
 
     @server.list_tools()
     async def list_tools():
-        return get_tool_definitions()
+        from mcp.types import Tool
+        raw = get_tool_definitions()
+        return [Tool(**t) for t in raw]
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list:

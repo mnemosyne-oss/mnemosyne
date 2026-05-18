@@ -274,6 +274,26 @@ class TestMCPIntegration:
         names = [t["name"] for t in tools]
         assert "mnemosyne_remember" in names
 
+    def test_tool_definitions_convertible_to_tool_pydantic(self):
+        """Tool dict definitions must be compatible with mcp SDK 1.x Tool Pydantic model.
+
+        The SDK 1.x list_tools handler expects Tool() instances with typed fields.
+        If get_tool_definitions() returns dicts with unexpected keys or missing
+        required fields, Tool(**t) will raise a ValidationError.
+        """
+        try:
+            from mcp.types import Tool
+        except ImportError:
+            pytest.skip("mcp SDK not installed")
+
+        tools = get_tool_definitions()
+        for t in tools:
+            tool = Tool(**t)
+            assert isinstance(tool, Tool)
+            assert tool.name == t["name"]
+            assert tool.description == t.get("description")
+            assert tool.inputSchema == t["inputSchema"]
+
     def test_top_level_cli_forwards_mcp_arguments(self, tmp_path):
         """`mnemosyne mcp ...` must pass subcommand args to the MCP parser."""
         env = os.environ.copy()

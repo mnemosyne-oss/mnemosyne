@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemosyne) (MAJOR.MINOR).
 
+## [2.9.0] — 2026-05-17
+
+### Fixed
+
+- **MCP SDK 1.x compatibility** (`mcp_server.py`). The `stdio_server()`
+  transport no longer accepts a `Server` object as argument since v0.9.1;
+  the stream pair is obtained via `async with stdio_server()` and then
+  passed to `server.run()`. Tool definitions are now returned as `Tool`
+  Pydantic objects instead of raw dicts, matching the SDK 1.x `list_tools`
+  handler signature. Both stdio and SSE transports are patched.
+
 ## [2.8.0] — 2026-05-14
 
 ### Added
