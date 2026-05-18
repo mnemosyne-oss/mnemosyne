@@ -72,6 +72,7 @@ if not OPENROUTER_API_KEY:
 NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 DEFAULT_MODEL = "deepseek-v4-pro"
+CONSOLIDATION_MODEL = "deepseek/deepseek-v4-flash:free"  # Cheap model for LLM-based consolidation summaries
 FALLBACK_MODELS = []  # Disabled -- fallback cascade burned $30 in credits
 DEFAULT_TOP_K = 10  # Memories to retrieve per question
 MAX_MEMORY_CONTEXT_CHARS = 8000  # Max chars of retrieved context to send to LLM
@@ -1396,7 +1397,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     _FACT_ABILITIES = {'IE', 'KU'}
     if not _pure_recall and ability in _FACT_ABILITIES and hasattr(beam, '_context_facts') and beam._context_facts:
         # Skip context→value matching for procedural/descriptive questions
-        # (how, why, walk me through, describe) — these need full answer, not one word.
+        # (how, why, walk me through, describe). These need full answer, not one word.
         _q_lower = question.lower()
         _proc_indicators = ['walk me through', 'describe', 'tell me about', 'explain how',
                             'how did i', 'how do i', 'how would i', 'how should i',
@@ -1590,7 +1591,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         # Trim context aggressively to prevent length truncation on the gap analysis call.
         # 2000 chars is enough to find dates; any more risks token overrun on small models.
         ctx_trimmed = pass1_ctx if len(pass1_ctx) < 2000 else pass1_ctx[:2000] + "...[truncated]"
-        # Use %s formatting — immune to curly braces in user content
+        # Use %s formatting, immune to curly braces in user content
         gap_prompt = ("""You are a precision entity extractor. Scan the context below and extract EXACT strings needed to answer the question.
 
 QUESTION: %s
@@ -2255,10 +2256,17 @@ def main():
                 ingest_time = time.perf_counter() - t0
 
                 # Post-ingestion consolidation sweep: catch any rows that the
-                # per-batch sleep loop didn't process (e.g. edge batches where
-                # no_op fired early). Knobs: AAAK compression used when
-                # MNEMOSYNE_LLM_ENABLED=false, SLEEP_BATCH_SIZE controls per-cycle
-                # row limit. Errors are non-fatal, logged to stats.
+                # per-batch sleep loop didn't process. Uses LLM-based summarization
+                # (cheap flash model via OpenRouter) instead of AAAK compression
+                # to produce dense episodic summaries. The 52.3% peak relied on
+                # LLM summaries collapsing related facts from 10+ messages into one.
+                # Configure the remote LLM path before the sweep so local_llm
+                # routes to OpenRouter instead of falling back to AAAK.
+                import mnemosyne.core.local_llm as _llm
+                _llm.LLM_ENABLED = True
+                _llm.LLM_BASE_URL = OPENROUTER_BASE_URL
+                _llm.LLM_API_KEY = OPENROUTER_API_KEY
+                _llm.LLM_REMOTE_MODEL = CONSOLIDATION_MODEL
                 _consolidation_attempts = 0
                 while _consolidation_attempts < 50:
                     try:
@@ -2270,7 +2278,7 @@ def main():
                         stats.setdefault("post_ingest_sleep_errors", []).append(repr(_se))
                         break
                 if _consolidation_attempts > 0:
-                    print(f"    [consolidation-sweep] consolidated {_consolidation_attempts} additional batch(es) post-ingest", flush=True)
+                    print(f"    [consolidation-sweep] LLM-based: consolidated {_consolidation_attempts} additional batch(es) post-ingest", flush=True)
 
                 print(f"    Ingested {len(conv['messages'])} msgs in {ingest_time:.1f}s "
                       f"(DB: {os.path.getsize(db_path)/1024:.0f}KB)")
