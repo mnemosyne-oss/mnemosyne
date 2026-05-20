@@ -17,6 +17,15 @@ except ImportError:
     np = None
 
 # --- fastembed (local ONNX) ---
+import warnings
+
+# fastembed >=0.7 switched multilingual-e5-large from CLS -> mean pooling.
+# The new behaviour is correct for E5 models; suppress the noise.
+warnings.filterwarnings(
+    "ignore",
+    message=".*multilingual-e5-large.*now uses mean pooling.*",
+)
+
 try:
     from fastembed import TextEmbedding
 except Exception:
