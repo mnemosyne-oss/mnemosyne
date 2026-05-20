@@ -17,7 +17,7 @@ import os
 import unittest
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -73,31 +73,44 @@ class TestTemporalBoostFunction(unittest.TestCase):
         boost = _temporal_boost(future.isoformat(), now, halflife_hours=24.0)
         self.assertAlmostEqual(boost, 1.0, places=5)
 
+    def test_boost_offset_aware_timestamp_against_naive_query_time(self):
+        """Aware memory timestamps can be compared to naive query_time."""
+        query_time = datetime(2026, 4, 29, 12, 0, 0)
+        timestamp = "2026-04-29T09:00:00+00:00"
+        boost = _temporal_boost(timestamp, query_time, halflife_hours=3.0)
+        self.assertAlmostEqual(boost, 0.367879, places=3)
+
 
 class TestParseQueryTime(unittest.TestCase):
     """Unit tests for _parse_query_time helper."""
 
     def test_none_returns_now(self):
-        """None -> datetime.now() (approximately)."""
+        """None -> current UTC time (approximately)."""
         result = _parse_query_time(None)
         self.assertIsInstance(result, datetime)
-        self.assertLess((datetime.now() - result).total_seconds(), 1.0)
+        self.assertEqual(result.tzinfo, timezone.utc)
+        self.assertLess((datetime.now(timezone.utc) - result).total_seconds(), 1.0)
 
-    def test_datetime_passed_through(self):
-        """datetime object returned as-is."""
+    def test_datetime_normalized_to_utc(self):
+        """Naive datetime object is treated as UTC."""
         dt = datetime(2026, 4, 29, 12, 0, 0)
         result = _parse_query_time(dt)
-        self.assertEqual(result, dt)
+        self.assertEqual(result, datetime(2026, 4, 29, 12, 0, 0, tzinfo=timezone.utc))
 
     def test_iso_string_parsed(self):
-        """ISO string parsed correctly."""
+        """Naive ISO string parsed as UTC."""
         result = _parse_query_time("2026-04-29T12:00:00")
-        self.assertEqual(result, datetime(2026, 4, 29, 12, 0, 0))
+        self.assertEqual(result, datetime(2026, 4, 29, 12, 0, 0, tzinfo=timezone.utc))
+
+    def test_offset_aware_iso_string_normalized_to_utc(self):
+        """Offset-aware ISO string is normalized to UTC."""
+        result = _parse_query_time("2026-04-29T15:00:00+03:00")
+        self.assertEqual(result, datetime(2026, 4, 29, 12, 0, 0, tzinfo=timezone.utc))
 
     def test_date_only_string(self):
         """Date-only string gets midnight time appended."""
         result = _parse_query_time("2026-04-29")
-        self.assertEqual(result, datetime(2026, 4, 29, 0, 0, 0))
+        self.assertEqual(result, datetime(2026, 4, 29, 0, 0, 0, tzinfo=timezone.utc))
 
     def test_invalid_string_raises(self):
         """Invalid string raises ValueError."""
@@ -201,6 +214,22 @@ class TestTemporalRecallEndToEnd(unittest.TestCase):
         results = self.beam.recall("event", top_k=5,
                                     temporal_weight=0.3,
                                     query_time=last_week)
+        self.assertGreaterEqual(len(results), 1)
+
+    def test_offset_aware_imported_timestamp_with_default_query_time(self):
+        """Imported aware timestamps do not crash temporal scoring."""
+        self.beam.remember("Imported Hindsight launch memory",
+                           source="hindsight", importance=0.5)
+
+        imported_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        cursor = self.beam.conn.cursor()
+        cursor.execute("""
+            UPDATE working_memory SET timestamp = ? WHERE content LIKE ?
+        """, (imported_time, "%Hindsight launch%"))
+        self.beam.conn.commit()
+
+        results = self.beam.recall("Hindsight launch", top_k=5,
+                                    temporal_weight=0.3)
         self.assertGreaterEqual(len(results), 1)
 
     def test_temporal_halflife_override(self):

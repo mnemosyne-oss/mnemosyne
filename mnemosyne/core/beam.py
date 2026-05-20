@@ -25,7 +25,7 @@ import threading
 import math
 
 logger = logging.getLogger(__name__)
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Any, Set, Union
 from pathlib import Path
 
@@ -981,6 +981,22 @@ def _normalize_weights(vec_weight: Optional[float], fts_weight: Optional[float],
     return (vw / total, fw / total, iw / total)
 
 
+def _normalize_datetime_utc(dt: datetime) -> datetime:
+    """Return dt as a timezone-aware UTC datetime.
+
+    Naive datetimes are treated as UTC to preserve existing naive timestamp
+    behavior while avoiding naive/aware comparison crashes.
+    """
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_iso_datetime_utc(value: str) -> datetime:
+    """Parse an ISO datetime string and normalize it to UTC."""
+    return _normalize_datetime_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
+
+
 def _recency_decay(timestamp_str: str, halflife_hours: float = RECENCY_HALFLIFE_HOURS) -> float:
     """Calculate recency decay factor. 1.0 = brand new, ~0.5 = one halflife old.
     
@@ -989,32 +1005,33 @@ def _recency_decay(timestamp_str: str, halflife_hours: float = RECENCY_HALFLIFE_
     if not timestamp_str:
         return 0.5  # Unknown age = neutral
     try:
-        ts = datetime.fromisoformat(timestamp_str)
-        age_hours = (datetime.now() - ts).total_seconds() / 3600.0
+        ts = _parse_iso_datetime_utc(timestamp_str)
+        age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
         return math.exp(-age_hours / halflife_hours)
     except Exception:
         return 0.5
 
 
 def _parse_query_time(query_time: Optional[Union[str, datetime]]) -> datetime:
-    """Parse query_time parameter into a datetime object.
+    """Parse query_time parameter into a timezone-aware UTC datetime object.
 
-    - None -> datetime.now()
-    - str  -> parsed from ISO format
-    - datetime -> returned as-is
+    - None -> current UTC time
+    - str  -> parsed from ISO format and normalized to UTC
+    - datetime -> normalized to UTC
+    Naive values are treated as UTC for backward compatibility.
     """
     if query_time is None:
-        return datetime.now()
+        return datetime.now(timezone.utc)
     if isinstance(query_time, datetime):
-        return query_time
+        return _normalize_datetime_utc(query_time)
     if isinstance(query_time, str):
         # Try ISO format with various precisions
         try:
-            return datetime.fromisoformat(query_time)
+            return _parse_iso_datetime_utc(query_time)
         except ValueError:
             # Try appending time if only date provided
             try:
-                return datetime.fromisoformat(f"{query_time}T00:00:00")
+                return _parse_iso_datetime_utc(f"{query_time}T00:00:00")
             except ValueError:
                 raise ValueError(f"Invalid query_time format: {query_time!r}. Expected ISO datetime string.")
     raise TypeError(f"query_time must be str, datetime, or None; got {type(query_time).__name__}")
@@ -1033,7 +1050,7 @@ def _parse_ts_fast(ts: str) -> Optional[datetime]:
     if cached is not None:
         return cached
     try:
-        dt = datetime.fromisoformat(ts)
+        dt = _parse_iso_datetime_utc(ts)
     except (ValueError, TypeError):
         return None
     if len(_TS_CACHE) >= _TS_CACHE_MAX:
@@ -1056,6 +1073,7 @@ def _temporal_boost(memory_timestamp_str: str, query_time: datetime,
     ts = _parse_ts_fast(memory_timestamp_str)
     if ts is None:
         return 0.0
+    query_time = _normalize_datetime_utc(query_time)
 
     # Clamp future timestamps to query_time (no negative deltas)
     if ts > query_time:
@@ -3375,13 +3393,13 @@ class BeamMemory:
         Temporal scoring (Phase 3):
             temporal_weight: Float 0.0-1.0. Soft boost for memories near query_time.
                 0.0 = no temporal boost (default, backward compatible).
-            query_time: Target time for temporal scoring. None = now().
+            query_time: Target time for temporal scoring. None = current UTC time.
             temporal_halflife: Hours for temporal decay. None = env var or 24h default.
 
         Temporal scoring (Phase 3):
             temporal_weight: Float 0.0-1.0. Soft boost for memories near query_time.
                 0.0 = no temporal boost (default, backward compatible).
-            query_time: Target time for temporal scoring. None = now().
+            query_time: Target time for temporal scoring. None = current UTC time.
             temporal_halflife: Hours for temporal decay. None = env var or 24h default.
 
         Configurable hybrid scoring (Phase 4):
