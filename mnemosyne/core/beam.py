@@ -2676,6 +2676,7 @@ class BeamMemory:
             'sequence': r'((?:first|second|third|fourth|fifth|finally|next|then|after that)[^.,;!?\n]{15,120})',
             'instruction_false_positives': ['i think you should leave', 'should behave', 'their work style'],
             'instruction_imperative': 'always|never|remember|use|keep|avoid|ensure|check|verify|run|test|build|deploy|push|pull|merge|commit|close|open|update|install|configure|set|enable|disable|add|remove|create|delete|start|stop|restart|reload|reset|try|implement|write|read|switch|move|copy|rename|send|reply|respond',
+            'instruction': r'(?:always|never|must|must not|should(?: not)?(?=\s+(?:you|we|i|one)\s+(?:IMPVERBS))|need(?:s)? to(?: not)?|required to|prefer(?: not)? to|want to(?: avoid| ensure| use| keep))\s+([^.,;!?\n]{10,200})',
             'preference': r'(?:I(?: |\')?(?:like|love|prefer|hate|dislike|enjoy|use|stick with|switched to|moved to|changed to|want|need|tend to|usually|would rather|don\'t like|don\'t want|not a fan of|am okay with|am comfortable with|am used to|am happy with|am tired of|am sick of|prefer not to|try to avoid|find it easier to|find it better to|find it useful to))\s+([^.,;!?\n]{10,200})',
             'event_keywords': ['meeting', 'call', 'scheduled', 'happened', 'occurred', 'plan to', 'will be on', 'due on', 'release', 'deadline', 'launched', 'deployed', 'released', 'published', 'posted', 'started', 'began', 'finished', 'completed', 'ended', 'event', 'conference', 'workshop', 'appointment'],
             'named_months': r'((?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?,?\s*(?:\d{4})?)',
@@ -2685,8 +2686,9 @@ class BeamMemory:
             'decision': r'(?:entschied(?: mich|en)?|habe mich entschieden|wechselte zu|umgestellt auf|umgestiegen auf|gewählt habe|ausgesucht|ausgewählt|genommen habe)\s+([^.,;!?\n]{10,120})',
             'entity': r'(?:der|die|das|mein|meine|dein|deine|unser|unsere|Ihr|Ihre)\s+([a-z_]+(?:\s+(?:Tabelle|Modell|Schema|API|Endpunkt|Funktion|Modul|Route|Handler|Tool|Plugin|Script|Konfiguration|Einstellung|Workflow|Pipeline|Prozess|System|Server|Client|Service|Datenbank|Query|Datei|Repo|Branch|PR|Issue|Task|Job)))\s+(?:braucht|benötigt|sollte|könnte|würde|wird|hat|hat|nutzt|verwendet|läuft|bearbeitet|verarbeitet|unterstützt)\s+([^.,;!?\n]{10,80})',
             'sequence': r'((?:zuerst|als erstes|als zweites|als drittes|als viertes|als fünftes|schließlich|als nächstes|dann|danach|daraufhin)[^.,;!?\n]{15,120})',
-            'instruction_false_positives': [],
+            'instruction_false_positives': ['du solltest gehen'],
             'instruction_imperative': 'immer|nie|niemals|merke|denk|verwende|nutze|behalte|vermeide|stelle sicher|prüfe|überprüfe|teste|baue|implementiere|schreibe|lösche|installiere|konfiguriere|aktualisiere|erstelle|entferne|starte|stoppe|setze|aktiviere|deaktiviere|füge hinzu|benenne um|sende|antworte',
+            'instruction': r'(?:immer|nie|niemals|muss|darf nicht|sollte(?: nicht)?(?=\s+(?:du|wir|ich|man|ihr)\s+(?:IMPVERBS))|braucht|benötigt|möchte(?: vermeiden|sicherstellen|nutzen|behalten)|will(?: nicht)?)\s+([^.,;!?\n]{10,200})',
             'preference': r'(?:Ich(?: |\')?(?:mag|liebe|bevorzuge|hasse|mag nicht|nutze|verwende|benutze|bin bei geblieben|habe gewechselt zu|bin umgestiegen auf|bin umgestellt auf|will|möchte|brauche|tendiere zu|normalerweise|würde lieber|finde es einfacher|finde es besser|finde es nützlich|bin zufrieden mit|bin okay mit|bin es leid|versuche zu vermeiden))\s+([^.,;!?\n]{10,200})',
             'event_keywords': ['treffen', 'meeting', 'termin', 'anruf', 'geplant', 'passiert', 'stattgefunden', 'fällig', 'release', 'deadline', 'veröffentlicht', 'deployed', 'gestartet', 'begonnen', 'beendet', 'abgeschlossen', 'konferenz', 'workshop', 'termin'],
             'named_months': r'((?:Januar|Februar|März|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember|Jan|Feb|Mär|Apr|Mai|Jun|Jul|Aug|Sep|Okt|Nov|Dez)\s+\d{1,2}(?:\.)?\s*(?:\d{4})?)',
@@ -2871,8 +2873,8 @@ class BeamMemory:
             _instr_lower = instr.lower()
             if any(fp in _instr_lower for fp in _INSTRUCTION_FALSE_POSITIVES):
                 continue
-            # Skip bare "should" questions not directed at anyone
-            if _re.match(r'^should\s+(?:i|we|it|they|he|she|the)\b', instr, _re.IGNORECASE):
+            # Skip bare "should"/"sollte" questions not directed at anyone
+            if _re.match(r'^(?:should|sollte)\s+(?:i|we|it|they|he|she|the|ich|wir|es|man|der|die|das)\b', instr, _re.IGNORECASE):
                 continue
             self.conn.execute(
                 "INSERT INTO memoria_instructions (session_id, message_idx, instruction, topic, context_snippet) "
