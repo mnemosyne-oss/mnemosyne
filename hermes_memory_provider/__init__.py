@@ -6,6 +6,8 @@ Deploy to Hermes via:
 Then set in ~/.hermes/config.yaml:
     memory:
       provider: mnemosyne
+      mnemosyne:
+        shared_surface: true  # optional: profile-isolated private banks + shared surface read access
 
 This gives Mnemosyne first-class MemoryProvider integration (system prompt
 injection, pre-turn prefetch, post-turn sync, tool dispatch) while remaining
@@ -703,6 +705,23 @@ class MnemosyneMemoryProvider(MemoryProvider):
             elif isinstance(patterns, list):
                 patterns = [str(p).strip() for p in patterns if str(p).strip()]
             self._ignore_patterns = patterns
+
+        # Simple shared-surface mode: one quiet config knob for the common case.
+        # Enables private profile banks plus read access to the curated shared surface DB.
+        # Advanced shared_surface_* keys below remain available for overrides.
+        shared_surface = kwargs.get("shared_surface")
+        if shared_surface is None:
+            shared_surface = self._read_config_key("shared_surface")
+        if shared_surface is not None:
+            if isinstance(shared_surface, str):
+                shared_surface_enabled = shared_surface.lower() in ("true", "1", "yes", "on")
+            else:
+                shared_surface_enabled = bool(shared_surface)
+            if shared_surface_enabled:
+                self._profile_isolation_enabled = True
+                self._shared_surface_read_enabled = True
+            else:
+                self._shared_surface_read_enabled = False
 
         # profile_isolation: separate DB per Hermes profile (bank-based).
         # Default OFF. When enabled, each profile derives its own Mnemosyne bank.
