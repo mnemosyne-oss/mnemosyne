@@ -2769,7 +2769,6 @@ class BeamMemory:
             'preference': r'(?:I(?: |\')?(?:like|love|prefer|hate|dislike|enjoy|use|stick with|switched to|moved to|changed to|want|need|tend to|usually|would rather|don\'t like|don\'t want|not a fan of|am okay with|am comfortable with|am used to|am happy with|am tired of|am sick of|prefer not to|try to avoid|find it easier to|find it better to|find it useful to))\s+([^.,;!?\n]{10,200})',
             'event_keywords': ['meeting', 'call', 'scheduled', 'happened', 'occurred', 'plan to', 'will be on', 'due on', 'release', 'deadline', 'launched', 'deployed', 'released', 'published', 'posted', 'started', 'began', 'finished', 'completed', 'ended', 'event', 'conference', 'workshop', 'appointment'],
             'named_months': r'((?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?,?\s*(?:\d{4})?)',
-            'instruction': r'(?:always|never|must|must not|should(?: not)?(?=\s+(?:you|we|i|one)\s+(?:IMPVERBS))|need(?:s)? to(?: not)?|required to|prefer(?: not)? to|want to(?: avoid| ensure| use| keep))\s+([^.,;!?\n]{10,200})',
         },
         'de': {
             'negation': r'(Ich(?: habe|\'ve)?\s+(?:nie|niemals|nicht)\s+[^.,;!?\n]{15,120})',
@@ -2782,7 +2781,6 @@ class BeamMemory:
             'preference': r'(?:Ich(?: |\')?(?:mag|liebe|bevorzuge|hasse|mag nicht|nutze|verwende|benutze|bin bei geblieben|habe gewechselt zu|bin umgestiegen auf|bin umgestellt auf|will|möchte|brauche|tendiere zu|normalerweise|würde lieber|finde es einfacher|finde es besser|finde es nützlich|bin zufrieden mit|bin okay mit|bin es leid|versuche zu vermeiden))\s+([^.,;!?\n]{10,200})',
             'event_keywords': ['treffen', 'meeting', 'termin', 'anruf', 'geplant', 'passiert', 'stattgefunden', 'fällig', 'release', 'deadline', 'veröffentlicht', 'deployed', 'gestartet', 'begonnen', 'beendet', 'abgeschlossen', 'konferenz', 'workshop', 'termin'],
             'named_months': r'((?:Januar|Februar|März|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember|Jan|Feb|Mär|Apr|Mai|Jun|Jul|Aug|Sep|Okt|Nov|Dez)\s+\d{1,2}(?:\.)?\s*(?:\d{4})?)',
-            'instruction': r'(?:immer|nie|niemals|muss|muss nicht|sollte(?: nicht)?(?=\s+(?:du|wir|ich|man)\s+(?:immer|nie|merke|denk|IMPVERBS))|müssen?|brauchen?|benötigen?|möchte(?: nicht)?)\s+([^.,;!?\n]{10,200})',
         },
         'ru': {
             'negation': r'(?:Я(?: |\')?(?:никогда|не)|(?:никогда|не)\s+будет)\s+[^.,;!?\n]{6,120}',
