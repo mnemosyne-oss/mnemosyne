@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import urllib.request
 from typing import List, Optional
 from functools import lru_cache
@@ -46,11 +47,14 @@ _API_CALL_COUNT = 0
 
 def _is_api_model(model_name: str) -> bool:
     """Check if the model should use the OpenAI-compatible API."""
-    return (
-        model_name.startswith("openai/")
-        or "text-embedding" in model_name
-        or model_name.startswith("text-embedding")
-    )
+    if model_name.startswith("openai/") or "text-embedding" in model_name or model_name.startswith("text-embedding"):
+        return True
+    # Custom endpoint: if OPENROUTER_BASE_URL is set to a non-OpenRouter URL,
+    # assume the user has their own API server and any model name should route there.
+    base_url = os.environ.get("OPENROUTER_BASE_URL", "")
+    if base_url and "openrouter.ai" not in base_url:
+        return True
+    return False
 
 
 def _get_embedding_dim(model_name: str) -> int:
@@ -81,6 +85,9 @@ def _get_embedding_dim(model_name: str) -> int:
         "openai/text-embedding-3-large": 3072,
         "text-embedding-3-small": 1536,
         "text-embedding-3-large": 3072,
+        # --- Jina ---
+        "jina-embeddings-v5-omni-nano": 768,
+        "jina-embeddings-v5-omni-small": 1024,
     }
     # Check env override first
     env_dim = os.environ.get("MNEMOSYNE_EMBEDDING_DIM")
@@ -109,9 +116,12 @@ def _get_model():
 
 
 def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
-    """Embed texts via OpenAI-compatible API (OpenRouter)."""
+    """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint)."""
     global _API_CALL_COUNT
-    if not _OPENAI_API_KEY:
+    # Require API key for OpenRouter; custom endpoints may not need one.
+    base_url = os.environ.get("OPENROUTER_BASE_URL", _OPENAI_BASE_URL)
+    is_custom = "openrouter.ai" not in base_url
+    if not is_custom and not _OPENAI_API_KEY:
         return None
 
     url = f"{_OPENAI_BASE_URL.rstrip('/')}/embeddings"
@@ -121,16 +131,23 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     }).encode()
 
     headers = {
-        "Authorization": f"Bearer {_OPENAI_API_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://mnemosyne.site",
         "X-Title": "Mnemosyne Embedding",
     }
+    if _OPENAI_API_KEY:
+        headers["Authorization"] = f"Bearer {_OPENAI_API_KEY}"
 
     for attempt in range(3):
         try:
             req = urllib.request.Request(url, data=payload, headers=headers)
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            ctx = ssl.create_default_context()
+            # Support custom CA bundles (NixOS, enterprise proxies, etc.)
+            # SSL_CERT_FILE takes priority, then REQUESTS_CA_BUNDLE.
+            cert_file = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
+            if cert_file:
+                ctx.load_verify_locations(cert_file)
+            with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
                 data = json.loads(resp.read())
             embeddings = [item["embedding"] for item in data["data"]]
             _API_CALL_COUNT += 1
@@ -150,6 +167,10 @@ def available() -> bool:
     if os.environ.get("MNEMOSYNE_NO_EMBEDDINGS"):
         return False
     if _is_api_model(_DEFAULT_MODEL):
+        # Custom endpoints (non-OpenRouter) may not require an API key
+        base_url = os.environ.get("OPENROUTER_BASE_URL", "")
+        if base_url and "openrouter.ai" not in base_url:
+            return True
         return bool(_OPENAI_API_KEY)
     return _FASTEMBED_AVAILABLE
 
