@@ -71,3 +71,8 @@ DEVOPS_PLAN_*
 .gstack/
 
 .planning/
+
+# Local runtime state (never commit)
+.hermes/
+results/
+[bank]/
