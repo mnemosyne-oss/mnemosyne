@@ -2751,8 +2751,17 @@ class BeamMemory:
             return 'de'
         german_markers = {'ich', 'du', 'wir', 'ist', 'nicht', 'für', 'und',
                           'der', 'die', 'das', 'ein', 'eine', 'kein', 'keine',
-                          'mein', 'meine', 'dann', 'auch', 'immer', 'nie', 'niemals'}
-        words = set(text_lower.split())
+                          'mein', 'meine', 'dann', 'auch', 'immer', 'nie', 'niemals',
+                          'mag', 'will', 'möchte', 'kann', 'kannst', 'können',
+                          'habe', 'hast', 'hat', 'haben', 'bin', 'bist', 'sind', 'seid',
+                          'einen', 'einer', 'eines', 'dem', 'den', 'beim', 'zum', 'zur',
+                          'nach', 'mit', 'von', 'bei', 'aus', 'auf', 'vor', 'aber',
+                          'oder', 'weil', 'denn', 'dass', 'sehr', 'schon', 'noch',
+                          'mal', 'man', 'nur', 'wenn', 'wie', 'als', 'doch',
+                          'gerne', 'gern', 'lieber', 'einfach', 'eigentlich',
+                          'vielleicht', 'natürlich', 'genau', 'bereits', 'eben'}
+        import re
+        words = set(re.findall(r'\w+', text_lower))
         if len(words & german_markers) >= 2:
             return 'de'
         return 'en'
@@ -2776,7 +2785,14 @@ class BeamMemory:
             'decision': r'(?:entschied(?: mich|en)?|habe mich entschieden|wechselte zu|umgestellt auf|umgestiegen auf|gewählt habe|ausgesucht|ausgewählt|genommen habe)\s+([^.,;!?\n]{10,120})',
             'entity': r'(?:der|die|das|mein|meine|dein|deine|unser|unsere|Ihr|Ihre)\s+([a-z_]+(?:\s+(?:Tabelle|Modell|Schema|API|Endpunkt|Funktion|Modul|Route|Handler|Tool|Plugin|Script|Konfiguration|Einstellung|Workflow|Pipeline|Prozess|System|Server|Client|Service|Datenbank|Query|Datei|Repo|Branch|PR|Issue|Task|Job)))\s+(?:braucht|benötigt|sollte|könnte|würde|wird|hat|hat|nutzt|verwendet|läuft|bearbeitet|verarbeitet|unterstützt)\s+([^.,;!?\n]{10,80})',
             'sequence': r'((?:zuerst|als erstes|als zweites|als drittes|als viertes|als fünftes|schließlich|als nächstes|dann|danach|daraufhin)[^.,;!?\n]{15,120})',
-            'instruction_false_positives': ['du solltest gehen'],
+            'instruction_false_positives': [
+                'du solltest gehen',
+                'ich denke du solltest',
+                'sollte funktionieren',
+                'sollte klappen',
+                'sollte passen',
+                'sollte sich',
+            ],
             'instruction_imperative': 'immer|nie|niemals|merke|denk|verwende|nutze|behalte|vermeide|stelle sicher|prüfe|überprüfe|teste|baue|implementiere|schreibe|lösche|installiere|konfiguriere|aktualisiere|erstelle|entferne|starte|stoppe|setze|aktiviere|deaktiviere|füge hinzu|benenne um|sende|antworte',
             'instruction': r'(?:immer|nie|niemals|muss|darf nicht|sollte(?: nicht)?(?=\s+(?:du|wir|ich|man|ihr)\s+(?:IMPVERBS))|braucht|benötigt|möchte(?: vermeiden|sicherstellen|nutzen|behalten)|will(?: nicht)?)\s+([^.,;!?\n]{10,200})',
             'preference': r'(?:Ich(?: |\')?(?:mag|liebe|bevorzuge|hasse|mag nicht|nutze|verwende|benutze|bin bei geblieben|habe gewechselt zu|bin umgestiegen auf|bin umgestellt auf|will|möchte|brauche|tendiere zu|normalerweise|würde lieber|finde es einfacher|finde es besser|finde es nützlich|bin zufrieden mit|bin okay mit|bin es leid|versuche zu vermeiden))\s+([^.,;!?\n]{10,200})',
