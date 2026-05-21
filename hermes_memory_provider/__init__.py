@@ -197,6 +197,55 @@ RECALL_SCHEMA = {
     },
 }
 
+SHARED_REMEMBER_SCHEMA = {
+    "name": "mnemosyne_shared_remember",
+    "description": (
+        "Store compact cross-agent surface memory in a dedicated shared Mnemosyne DB. "
+        "Use only for stable user/system/workflow metadata or general preferences. "
+        "Normal mnemosyne_remember writes stay private."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "description": "Surface memory content to store."},
+            "kind": {"type": "string", "description": "meta | preference | correction | identity", "default": "meta"},
+            "importance": {"type": "number", "description": "Importance 0.0-1.0. Default 0.8.", "default": 0.8},
+            "veracity": {"type": "string", "description": "stated | inferred | tool | imported | unknown", "default": "unknown"},
+            "metadata": {"type": "object", "description": "Optional metadata object.", "default": {}},
+        },
+        "required": ["content"],
+    },
+}
+
+SHARED_RECALL_SCHEMA = {
+    "name": "mnemosyne_shared_recall",
+    "description": "Search only the shared Mnemosyne surface DB.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "limit": {"type": "integer", "default": 5},
+        },
+        "required": ["query"],
+    },
+}
+
+SHARED_FORGET_SCHEMA = {
+    "name": "mnemosyne_shared_forget",
+    "description": "Delete one working shared-surface memory by exact ID.",
+    "parameters": {
+        "type": "object",
+        "properties": {"memory_id": {"type": "string"}},
+        "required": ["memory_id"],
+    },
+}
+
+SHARED_STATS_SCHEMA = {
+    "name": "mnemosyne_shared_stats",
+    "description": "Return shared surface DB path and counts.",
+    "parameters": {"type": "object", "properties": {}},
+}
+
 SLEEP_SCHEMA = {
     "name": "mnemosyne_sleep",
     "description": (
@@ -471,7 +520,8 @@ GRAPH_LINK_SCHEMA = {
 }
 
 ALL_TOOL_SCHEMAS = [
-    REMEMBER_SCHEMA, RECALL_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
+    REMEMBER_SCHEMA, RECALL_SCHEMA, SHARED_REMEMBER_SCHEMA, SHARED_RECALL_SCHEMA,
+    SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
     INVALIDATE_SCHEMA, GET_SCHEMA, TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA,
     SCRATCHPAD_WRITE_SCHEMA, SCRATCHPAD_READ_SCHEMA, SCRATCHPAD_CLEAR_SCHEMA,
     EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
@@ -515,6 +565,9 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
     def __init__(self):
         self._beam: Optional[Any] = None
+        self._surface_beam: Optional[Any] = None
+        self._shared_surface_bank = "surface"
+        self._shared_surface_path: Optional[Path] = None
         # C27: capture init exception so downstream methods can surface it
         # instead of silently no-op'ing. `_beam is None AND _init_error is None`
         # means a deliberate skip (subagent/cron/skill_loop context, or pre-init);
@@ -657,6 +710,12 @@ class MnemosyneMemoryProvider(MemoryProvider):
             else:
                 self._profile_isolation_enabled = bool(profile_isolation)
 
+        shared_surface_path = kwargs.get("shared_surface_path")
+        if shared_surface_path is None:
+            shared_surface_path = self._read_config_key("shared_surface_path")
+        if shared_surface_path:
+            self._shared_surface_path = Path(str(shared_surface_path)).expanduser()
+
     def _should_filter(self, content: str) -> bool:
         """Check if content matches any ignore pattern. Returns True if it should be skipped."""
         if not self._ignore_patterns:
@@ -690,6 +749,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
             {"key": "vector_type", "description": "Vector storage type (note: not yet wired to BeamMemory at runtime; reserved for future use)", "choices": ["float32", "int8", "bit"], "default": "int8"},
             {"key": "ignore_patterns", "description": "Regex patterns to filter from memory storage (one per line in config, or comma-separated). Memories matching any pattern are skipped.", "default": []},
             {"key": "profile_isolation", "description": "Enable per-profile memory isolation via Mnemosyne banks. Each Hermes profile gets its own SQLite database under mnemosyne/data/banks/<profile>/. Default false for backward compatibility.", "default": False},
+            {"key": "shared_surface_path", "description": "SQLite path for shared surface memories. Default is <mnemosyne>/data/shared/mnemosyne.db.", "default": "data/shared/mnemosyne.db"},
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -784,6 +844,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
         # and handle_tool_call() to silently write into the wrong session.
         # _init_error reset complements this for the failure-recovery case.
         self._beam = None
+        self._surface_beam = None
         self._init_error = None
 
         self._agent_context = kwargs.get("agent_context", "primary")
@@ -830,6 +891,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 BeamMemory = _get_beam_class()
                 self._beam = BeamMemory(session_id=self._session_id)
                 logger.info("Mnemosyne initialized: session=%s", self._session_id)
+
         except Exception as e:
             # C27: capture the exception so system_prompt_block() can render a
             # visible "UNAVAILABLE" banner every turn and handle_tool_call()
@@ -877,6 +939,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 "# Mnemosyne Memory\n"
                 "Active (native local memory). Use mnemosyne_remember to store ANY "
                 "durable fact, preference, identity, or insight. Use mnemosyne_recall to search. "
+                "Use mnemosyne_shared_* tools for manual shared surface CRUD. "
                 "The legacy memory tool is deprecated for durable storage — Mnemosyne is primary."
             )
         # C27: when init failed (as opposed to a deliberate skip-context),
@@ -1040,6 +1103,14 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 return self._handle_remember(args)
             elif tool_name == "mnemosyne_recall":
                 return self._handle_recall(args)
+            elif tool_name == "mnemosyne_shared_remember":
+                return self._handle_shared_remember(args)
+            elif tool_name == "mnemosyne_shared_recall":
+                return self._handle_shared_recall(args)
+            elif tool_name == "mnemosyne_shared_forget":
+                return self._handle_shared_forget(args)
+            elif tool_name == "mnemosyne_shared_stats":
+                return self._handle_shared_stats(args)
             elif tool_name == "mnemosyne_sleep":
                 return self._handle_sleep(args)
             elif tool_name == "mnemosyne_stats":
@@ -1147,6 +1218,117 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
         results = self._beam.recall(query, **recall_kwargs)
         return json.dumps({"query": query, "count": len(results), "temporal_weight": temporal_weight, "results": results})
+
+    @staticmethod
+    def _surface_hash(content: str) -> str:
+        import hashlib
+        normalized = " ".join(str(content).lower().split())
+        return hashlib.sha256(f"surface:v1:{normalized}".encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
+    def _surface_label(content: str, kind: str) -> str:
+        prefixes = ("surface meta:", "surface preference:", "surface correction:", "surface identity:", "surface fact:")
+        if content.lower().startswith(prefixes):
+            return content
+        label = {
+            "meta": "Surface meta",
+            "preference": "Surface preference",
+            "correction": "Surface correction",
+            "identity": "Surface identity",
+        }.get(kind, "Surface meta")
+        return f"{label}: {content}"
+
+    def _ensure_surface_beam(self) -> None:
+        if self._surface_beam is not None:
+            return
+        BeamMemory = _get_beam_class()
+        shared_path = self._shared_surface_path or (_mnemosyne_root / "data" / "shared" / "mnemosyne.db")
+        shared_path.parent.mkdir(parents=True, exist_ok=True)
+        self._shared_surface_path = shared_path
+        self._surface_beam = BeamMemory(session_id="hermes_shared_surface", db_path=shared_path)
+        logger.info("Mnemosyne shared surface initialized: db=%s", shared_path)
+
+    def _require_surface_beam(self) -> Optional[str]:
+        try:
+            self._ensure_surface_beam()
+        except Exception as exc:
+            logger.warning("Mnemosyne shared surface init failed: %s", exc)
+        if self._surface_beam is None:
+            return "shared surface DB is not initialized"
+        return None
+
+    def _handle_shared_remember(self, args: Dict[str, Any]) -> str:
+        from mnemosyne.core.veracity_consolidation import clamp_veracity
+        err = self._require_surface_beam()
+        if err:
+            return json.dumps({"error": err})
+        content = (args.get("content") or "").strip()
+        if not content:
+            return json.dumps({"error": "content is required"})
+        if content.startswith("[USER]") or content.startswith("[ASSISTANT]"):
+            return json.dumps({"error": "raw conversation content is not allowed in shared memory"})
+        kind = (args.get("kind") or "meta").strip().lower()
+        if kind not in {"meta", "preference", "correction", "identity"}:
+            return json.dumps({"error": "kind must be one of: meta, preference, correction, identity"})
+        importance = max(0.0, min(float(args.get("importance", 0.8)), 1.0))
+        metadata = args.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            return json.dumps({"error": "metadata must be an object"})
+        veracity = clamp_veracity(args.get("veracity"), context="mnemosyne_shared_remember")
+        surface_content = self._surface_label(content, kind)
+        stable_id = "sf_" + self._surface_hash(surface_content)
+        meta = dict(metadata)
+        meta.update({"shared_memory": True, "surface_kind": kind, "write_path": "manual_tool", "source_profile_session": self._session_id})
+        existing_id = self._surface_beam._find_duplicate(surface_content)
+        memory_id = self._surface_beam.remember(
+            content=surface_content,
+            source="surface_manual",
+            importance=importance,
+            metadata=meta,
+            scope="global",
+            memory_id=stable_id,
+            veracity=veracity,
+        )
+        return json.dumps({
+            "status": "existing_shared" if existing_id else "stored_shared",
+            "memory_id": memory_id,
+            "content_preview": surface_content[:120],
+            "shared_db": str(self._shared_surface_path or ""),
+            "kind": kind,
+            "veracity": veracity,
+        })
+
+    def _handle_shared_recall(self, args: Dict[str, Any]) -> str:
+        err = self._require_surface_beam()
+        if err:
+            return json.dumps({"error": err})
+        query = args.get("query", "")
+        if not query:
+            return json.dumps({"error": "query is required"})
+        top_k = int(args.get("limit", 5))
+        results = []
+        for r in self._surface_beam.recall(query, top_k=top_k):
+            r = dict(r)
+            r["shared_surface"] = True
+            r["bank"] = self._shared_surface_bank
+            results.append(r)
+        return json.dumps({"query": query, "count": len(results), "shared_db": str(self._shared_surface_path or ""), "results": results})
+
+    def _handle_shared_forget(self, args: Dict[str, Any]) -> str:
+        err = self._require_surface_beam()
+        if err:
+            return json.dumps({"error": err})
+        memory_id = (args.get("memory_id") or "").strip()
+        if not memory_id:
+            return json.dumps({"error": "memory_id is required"})
+        ok = self._surface_beam.forget_working(memory_id)
+        return json.dumps({"status": "deleted" if ok else "not_found", "memory_id": memory_id, "shared_db": str(self._shared_surface_path or "")})
+
+    def _handle_shared_stats(self, args: Dict[str, Any]) -> str:
+        err = self._require_surface_beam()
+        if err:
+            return json.dumps({"error": err})
+        return json.dumps({"provider": "mnemosyne_shared", "shared_db": str(self._shared_surface_path or ""), "working": self._surface_beam.get_working_stats(), "episodic": self._surface_beam.get_episodic_stats()})
 
     def _handle_sleep(self, args: Dict[str, Any]) -> str:
         dry_run = bool(args.get("dry_run", False))

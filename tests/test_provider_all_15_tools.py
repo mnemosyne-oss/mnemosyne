@@ -49,10 +49,10 @@ def _tool_names(provider) -> set[str]:
 class TestToolRegistration:
     """Verify the provider registers and dispatches all 15 tools."""
 
-    def test_all_15_tools_registered(self, tmp_path):
+    def test_all_tools_registered(self, tmp_path):
         provider = _provider(tmp_path)
         names = _tool_names(provider)
-        assert len(names) == 18, f"Expected 18 tools, got {len(names)}"
+        assert len(names) == 22, f"Expected 22 tools, got {len(names)}"
 
     def test_new_8_tools_present(self, tmp_path):
         provider = _provider(tmp_path)
@@ -66,6 +66,12 @@ class TestToolRegistration:
         names = _tool_names(provider)
         for tool in ("remember", "recall", "sleep", "stats",
                      "invalidate", "triple_add", "triple_query"):
+            assert f"mnemosyne_{tool}" in names
+
+    def test_shared_surface_tools_present(self, tmp_path):
+        provider = _provider(tmp_path)
+        names = _tool_names(provider)
+        for tool in ("shared_remember", "shared_recall", "shared_forget", "shared_stats"):
             assert f"mnemosyne_{tool}" in names
 
     def test_unknown_tool_returns_error(self, tmp_path):
