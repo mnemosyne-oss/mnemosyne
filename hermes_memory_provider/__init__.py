@@ -30,6 +30,12 @@ if str(_mnemosyne_root) not in sys.path:
     sys.path.insert(0, str(_mnemosyne_root))
 
 from mnemosyne.core.episodic_graph import GraphEdge
+from hermes_memory_provider.shared_surface import (
+    surface_hash,
+    looks_secret_for_surface,
+    classify_surface_candidate,
+    label_surface_content,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1099,86 +1105,6 @@ class MnemosyneMemoryProvider(MemoryProvider):
             )
         return ""
 
-    _SURFACE_SECRET_PATTERNS = [
-        "api_key", "apikey", "secret", "password", "passwd", "bearer",
-        "private key", "ssh-rsa", "-----begin", "credential", "cookie",
-    ]
-    _SURFACE_META_PATH_TERMS = [
-        "path", "repo", "repository", "project root", "project path", "vault", "wiki",
-        "config", "database", "db", "bank", "directory", "folder", "lives at",
-        "located at", "stored at", "is at", "under", "home", "port", "service",
-    ]
-    _SURFACE_PREFERENCE_TERMS = [
-        "prefers", "preference", "dislikes", "wants agents", "wants system",
-        "always", "never", "do not", "don't", "workflow", "style", "when given",
-    ]
-    _SURFACE_SOURCE_CONTENT_TERMS = [
-        "added to", "summary of", "readme", "paper", "article", "blog post",
-        "documentation says", "source says", "repo is", "repository is", "project is",
-        "library", "framework", "implements", "written in", "built with",
-        "https://", "http://",
-    ]
-
-    @staticmethod
-    def _surface_hash(content: str) -> str:
-        import hashlib
-        normalized = " ".join(str(content).lower().split())
-        return hashlib.sha256(f"surface:v1:{normalized}".encode("utf-8")).hexdigest()[:24]
-
-    def _looks_secret_for_surface(self, content: str) -> bool:
-        lowered = content.lower()
-        if any(p in lowered for p in self._SURFACE_SECRET_PATTERNS):
-            return True
-        # Cheap high-entropy-ish guard for obvious credential assignments.
-        import re
-        if re.search(r"(?i)(key|token|secret|password)\s*[:=]\s*['\"]?[A-Za-z0-9_./+=-]{16,}", content):
-            return True
-        return False
-
-    def _classify_surface_candidate(self, content: str, source: str,
-                                    metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
-        """Return allowed surface kind, or None to keep memory private.
-
-        Surface memory is only durable meta about user/system/workflow.
-        Content learned from wiki/web/source material stays private by default.
-        """
-        import re
-        lowered = content.lower()
-        meta = metadata or {}
-
-        if meta.get("source_doc") or meta.get("url") or meta.get("page") or meta.get("source_url"):
-            return None
-
-        # Global source-content block: external/research facts are not shared surface,
-        # even when they mention repo/project/library names.
-        if any(term in lowered for term in self._SURFACE_SOURCE_CONTENT_TERMS):
-            # Narrow exception: explicit location/config facts with actual local path
-            # are meta, not source content.
-            has_local_path = bool(re.search(r"(?:^|\s)(?:/home/|~/|~\.hermes/)", content))
-            has_meta_term = any(term in lowered for term in self._SURFACE_META_PATH_TERMS)
-            if not (has_local_path and has_meta_term and not re.search(r"https?://", content)):
-                return None
-
-        if source in {"preference", "correction", "identity", "builtin_memory_user"} or source.startswith("builtin_memory_"):
-            if any(term in lowered for term in self._SURFACE_PREFERENCE_TERMS) or source in {"identity", "correction"}:
-                return {
-                    "preference": "preference",
-                    "builtin_memory_user": "preference",
-                    "correction": "correction",
-                    "identity": "identity",
-                }.get(source, "preference")
-
-        has_local_path = bool(re.search(r"(?:^|\s)(?:/home/|~/|~\.hermes/)", content))
-        if has_local_path and any(term in lowered for term in self._SURFACE_META_PATH_TERMS):
-            return "meta"
-
-        if re.search(r"\b(port|service)\b.*\b\d{2,5}\b", lowered):
-            return "meta"
-
-        if any(term in lowered for term in self._SURFACE_PREFERENCE_TERMS):
-            return "preference"
-
-        return None
 
     def _surface_already_promoted(self, stable_id: str) -> bool:
         if self._surface_beam is None:
@@ -1233,21 +1159,15 @@ class MnemosyneMemoryProvider(MemoryProvider):
         stripped = content.strip()
         if not self._shared_surface_promote_raw_turns and (stripped.startswith("[USER]") or stripped.startswith("[ASSISTANT]")):
             return
-        if self._looks_secret_for_surface(stripped):
+        if looks_secret_for_surface(stripped):
             return
-        surface_kind = self._classify_surface_candidate(stripped, normalized_source, metadata)
+        surface_kind = classify_surface_candidate(stripped, normalized_source, metadata)
         if surface_kind is None:
             return
         surface_content = stripped
         if not surface_content.lower().startswith(("surface fact:", "surface preference:", "surface correction:", "surface identity:", "surface meta:")):
-            label = {
-                "preference": "Surface preference",
-                "correction": "Surface correction",
-                "identity": "Surface identity",
-                "meta": "Surface meta",
-            }.get(surface_kind, "Surface meta")
-            surface_content = f"{label}: {surface_content}"
-        stable_id = "sf_" + self._surface_hash(surface_content)
+            surface_content = label_surface_content(surface_content, surface_kind)
+        stable_id = "sf_" + surface_hash(surface_content)
         if self._surface_already_promoted(stable_id):
             return
         meta = dict(metadata or {})
@@ -1603,16 +1523,16 @@ class MnemosyneMemoryProvider(MemoryProvider):
         force = bool(args.get("force", False))
         if content.startswith("[USER]") or content.startswith("[ASSISTANT]"):
             return json.dumps({"error": "raw conversation content is not allowed in shared memory"})
-        if self._looks_secret_for_surface(content):
+        if looks_secret_for_surface(content):
             return json.dumps({"error": "secret-like content is not allowed in shared memory"})
-        classifier_kind = self._classify_surface_candidate(content, kind if kind != "meta" else "fact", metadata)
+        classifier_kind = classify_surface_candidate(content, kind if kind != "meta" else "fact", metadata)
         if classifier_kind is None and not force:
             return json.dumps({"error": "content did not pass shared-surface classifier; keep it private or retry with force=true only after explicit user approval", "status": "rejected_private_candidate"})
         label = {"meta": "Surface meta", "preference": "Surface preference", "correction": "Surface correction", "identity": "Surface identity"}[kind]
         surface_content = content
         if not surface_content.lower().startswith(("surface meta:", "surface preference:", "surface correction:", "surface identity:", "surface fact:")):
-            surface_content = f"{label}: {surface_content}"
-        stable_id = "sf_" + self._surface_hash(surface_content)
+            surface_content = label_surface_content(surface_content, kind)
+        stable_id = "sf_" + surface_hash(surface_content)
         existed = self._surface_already_promoted(stable_id)
         meta = dict(metadata)
         meta.update({"shared_memory": True, "surface_kind": kind, "write_path": "manual_tool", "source_profile_session": self._session_id, "classifier_kind": classifier_kind, "force": force})
