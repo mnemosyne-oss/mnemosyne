@@ -1421,7 +1421,7 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
         ).fetchall()
     elif vec_type == "int8":
         rows = conn.execute(
-            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_int8(?, 'unit') ORDER BY distance LIMIT {k}",
+            f'SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_int8(?, "unit") AND k={k} ORDER BY distance',
             (emb_json,)
         ).fetchall()
     else:
