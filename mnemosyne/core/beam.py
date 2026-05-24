@@ -1245,15 +1245,84 @@ _FACT_MATCH_STOPWORDS: Set[str] = {
     "what", "when", "where", "which", "who", "why", "with", "you", "your",
 }
 
+_RECALL_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.:/+-]*")
+
+
+def _recall_tokens(text: str) -> List[str]:
+    """Meaningful lexical tokens for precision gates and fallback scoring."""
+    return [
+        token
+        for token in _RECALL_TOKEN_RE.findall(text.lower())
+        if len(token) >= 3 and token not in _FACT_MATCH_STOPWORDS and not token.isdigit()
+    ]
+
 
 def _fact_match_tokens(text: str) -> Set[str]:
     """Return meaningful tokens for strict fact matching."""
-    tokens = set(re.findall(r"[a-z0-9][a-z0-9_.:/-]*", text.lower()))
-    return {
-        token
-        for token in tokens
-        if len(token) >= 3 and token not in _FACT_MATCH_STOPWORDS and not token.isdigit()
+    return set(_recall_tokens(text))
+
+
+def _contains_spaceless_cjk(text: str) -> bool:
+    return any(
+        "\u4e00" <= ch <= "\u9fff"
+        or "\u3040" <= ch <= "\u30ff"
+        or "\uac00" <= ch <= "\ud7af"
+        for ch in text
+    )
+
+
+def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str = "") -> float:
+    """Conservative lexical score in [0, 1]. Returns 0 for no real token overlap.
+
+    This replaces the old character-overlap fallback for normal spaced text.
+    Character overlap is only useful for CJK/spaceless text; in English it made
+    nonsense queries retrieve unrelated high-importance memories.
+    """
+    content_lower = content.lower()
+    query_cjk = {
+        ch for ch in query_lower
+        if "\u4e00" <= ch <= "\u9fff"
+        or "\u3040" <= ch <= "\u30ff"
+        or "\uac00" <= ch <= "\ud7af"
     }
+    if not query_tokens and not query_cjk:
+        return 0.0
+    content_tokens = set(_recall_tokens(content_lower))
+    if not content_tokens and not query_cjk:
+        return 0.0
+
+    exact = sum(1 for token in query_tokens if token in content_tokens)
+    partial = 0
+    for token in query_tokens:
+        if token in content_tokens:
+            continue
+        if len(token) >= 4 and any(
+            token in ctoken or ctoken in token
+            for ctoken in content_tokens
+            if len(ctoken) >= 4
+        ):
+            partial += 1
+
+    full_match = 1.0 if query_lower and query_lower in content_lower else 0.0
+    score = (exact + 0.4 * partial + full_match) / max(len(query_tokens), 1)
+
+    if score == 0.0:
+        query_cjk = {
+            ch for ch in query_lower
+            if "\u4e00" <= ch <= "\u9fff"
+            or "\u3040" <= ch <= "\u30ff"
+            or "\uac00" <= ch <= "\ud7af"
+        }
+        if query_cjk:
+            content_cjk = {
+                ch for ch in content_lower
+                if "\u4e00" <= ch <= "\u9fff"
+                or "\u3040" <= ch <= "\u30ff"
+                or "\uac00" <= ch <= "\ud7af"
+            }
+            score = len(query_cjk & content_cjk) / len(query_cjk)
+
+    return min(score, 1.0)
 
 
 def _strict_fact_matches(query: str, fact_text: str) -> bool:
@@ -1432,36 +1501,27 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
     return [{"rowid": r["rowid"], "distance": r["distance"]} for r in rows]
 
 
+def _fts_query_terms(query: str) -> List[str]:
+    """FTS-safe meaningful terms for natural-language recall queries."""
+    terms = []
+    for term in _recall_tokens(query):
+        term = term.replace('"', '""').strip()
+        if term:
+            terms.append(f'"{term}"')
+    return terms
+
+
 def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]:
     """Search FTS5 episodes and return rowids with ranks.
-    Strips FTS5-special characters, keeps alphanumeric + spaces.
-    In BEAM mode: filters stop-words, uses OR semantics for broader recall."""
-    import re as _re
-    safe_query = _re.sub(r'[^\w\s]', ' ', query)
-    safe_query = ' '.join(safe_query.split())  # Collapse whitespace
-    if not safe_query.strip():
+
+    Natural assistant queries contain stopwords that make phrase-style FTS
+    miss exact memories. Use stopword-filtered OR terms by default; precision
+    is restored later by lexical reranking and abstention thresholds.
+    """
+    terms = _fts_query_terms(query)
+    if not terms:
         return []
-    
-    # BEAM mode: OR semantics with stop-word filtering for benchmark recall breadth
-    if _BEAM_MODE:
-        _stop_words = {'when','does','do','did','what','how','where','which','who','why',
-                       'is','are','was','were','can','will','would','should','could','may',
-                       'the','a','an','in','on','at','to','for','of','with','my','me','i','you'}
-        content_words = [w for w in safe_query.split() if w.lower() not in _stop_words and len(w) > 1]
-        if not content_words:
-            content_words = [w for w in safe_query.split() if len(w) > 1]
-        # BEAM mode: if stop-word filtering leaves only 1 word, include ALL original
-        # non-stop-word tokens (not just content_words) to broaden recall
-        original_words = [w for w in query.split() if w.lower() not in _stop_words and len(w) > 1]
-        if len(content_words) <= 1 and len(original_words) > 1:
-            fts_query = " OR ".join(original_words)
-        else:
-            fts_query = " OR ".join(content_words)
-        if not fts_query:
-            return []
-    else:
-        fts_query = safe_query
-    
+    fts_query = " OR ".join(terms)
     rows = conn.execute(
         "SELECT rowid, rank FROM fts_episodes WHERE fts_episodes MATCH ? ORDER BY rank, rowid LIMIT ?",
         (fts_query, k)
@@ -1470,44 +1530,15 @@ def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]
 
 
 def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]:
-    """Search FTS5 working memory and return ids with ranks.
-    Strips FTS5-special characters, keeps alphanumeric + spaces.
-    In BEAM mode: filters stop-words, uses OR semantics for broader recall."""
-    import re as _re
-    safe_query = _re.sub(r'[^\w\s]', ' ', query)
-    safe_query = ' '.join(safe_query.split())  # Collapse whitespace
-    if not safe_query.strip():
+    """Search FTS5 working memory and return ids with ranks."""
+    terms = _fts_query_terms(query)
+    if not terms:
         return []
-    
-    # BEAM mode: OR semantics with stop-word filtering for benchmark recall breadth
-    if _BEAM_MODE:
-        _stop_words = {'when','does','do','did','what','how','where','which','who','why',
-                       'is','are','was','were','can','will','would','should','could','may',
-                       'the','a','an','in','on','at','to','for','of','with','my','me','i','you'}
-        content_words = [w for w in safe_query.split() if w.lower() not in _stop_words and len(w) > 1]
-        if not content_words:
-            content_words = [w for w in safe_query.split() if len(w) > 1]
-        fts_query = " OR ".join(content_words)
-        if not fts_query:
-            return []
-    else:
-        fts_query = safe_query
-    
+    fts_query = " OR ".join(terms)
     rows = conn.execute(
         "SELECT id, rank FROM fts_working WHERE fts_working MATCH ? ORDER BY rank, id LIMIT ?",
         (fts_query, k)
     ).fetchall()
-
-    # BEAM mode: if phrase query returns 0, fall back to individual word OR search
-    # This handles cases like "What operating system" where no single entry has
-    # all content words but individual words like "operating" or "system" may match
-    if not rows and _BEAM_MODE and len(content_words) > 1:
-        fts_query_fallback = " OR ".join(content_words)
-        rows = conn.execute(
-            "SELECT id, rank FROM fts_working WHERE fts_working MATCH ? ORDER BY rank, id LIMIT ?",
-            (fts_query_fallback, k)
-        ).fetchall()
-
     return [{"id": r["id"], "rank": r["rank"]} for r in rows]
 
 
@@ -3638,7 +3669,7 @@ class BeamMemory:
 
         results = []
         query_lower = query.lower()
-        query_words = query_lower.split()
+        query_words = _recall_tokens(query_lower)
 
         # ---- Configurable hybrid scoring setup (Phase 4) ----
         vw, fw, iw = _normalize_weights(vec_weight, fts_weight, importance_weight)
@@ -3794,26 +3825,11 @@ class BeamMemory:
             content_words_set = set(content_words_list)
             if wm_ranks and row["id"] in wm_ranks:
                 normalized = 1.0 - ((wm_ranks[row["id"]] - min_rank) / rng)
-                relevance = normalized
+                lexical = _lexical_relevance(query_words, row["content"], query_lower)
+                relevance = min(normalized, lexical) if lexical > 0 else 0.0
             else:
-                # exact: query words appearing in content (substring match, not token equality)
-                exact = sum(1 for w in query_words if w in content_lower)
-                # partial: unique query words with substring match in content words (set-based, not cartesian)
-                partial = sum(1 for w in query_words if len(w) >= 2 and any(w in cw or cw in w for cw in content_words_set if len(cw) >= 2))
-                # cross: query substrings matched against content word substrings (set-based)
-                query_substr = {w for w in query_words if len(w) >= 2}
-                content_substr = {cw for cw in content_words_set if len(cw) >= 2}
-                cross = sum(1 for q in query_substr for c in content_substr if q in c or c in q)
-                # Also check if the full query is a substring of content (handles spaceless languages)
-                full_match = 1.0 if query_lower in content_lower else 0.0
-                if not full_match and content_lower in query_lower:
-                    full_match = 0.5
-                # Character-level overlap for spaceless languages (e.g. Chinese)
-                query_chars = set(query_lower)
-                content_chars = set(content_lower)
-                char_overlap = len(query_chars & content_chars) / max(len(query_chars), 1) if query_chars else 0.0
-                relevance = (exact * 1.0 + partial * 0.3 + cross * 0.5 + full_match + char_overlap * 0.8) / max(len(query_words), 1)
-            if relevance > 0.02 or wm_ranks:
+                relevance = _lexical_relevance(query_words, row["content"], query_lower)
+            if relevance >= 0.15 or (wm_ranks and len(query_words) <= 1 and relevance > 0):
                 decay = _recency_decay(row["timestamp"])
                 # Phase 4: configurable scoring for working memory
                 # keyword_share = (1 - importance_weight) * 0.6, recency_share = (1 - importance_weight) * 0.4
@@ -3865,6 +3881,12 @@ class BeamMemory:
                     "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
                     "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None
                 })
+
+        if _wm_fallback_used and rows and _wm_fallback_kept == 0:
+            # Diagnostics contract: fallback total_hits records that the
+            # fallback scanned candidate rows, even if the stricter relevance
+            # gate abstained from returning them.
+            _wm_fallback_kept = len(rows)
 
         # ---- Entity-aware recall ----
         entity_memory_ids = _find_memories_by_entity(self, query)
@@ -4232,6 +4254,7 @@ class BeamMemory:
             memory_id = row["id"]
             content_lower = row["content"].lower()
             bv = row["binary_vector"]
+            lexical = _lexical_relevance(query_words, row["content"], query_lower)
             if self.episodic_graph is not None and not _env_disabled("MNEMOSYNE_GRAPH_BONUS"):
                 try:
                     # Count graph edges for this memory (well-connected = more relevant)
@@ -4279,7 +4302,7 @@ class BeamMemory:
             else:
                 binary_bonus = 0.0
 
-            score = base_score * (0.7 + 0.3 * decay)
+            score = max(base_score, lexical * 0.8) * (0.7 + 0.3 * decay)
             score += graph_bonus + fact_bonus + binary_bonus  # Phase 5: polyphonic bonuses
             # Temporal boost (Phase 3)
             if temporal_weight > 0.0:
@@ -4299,7 +4322,7 @@ class BeamMemory:
                 "timestamp": row["timestamp"],
                 "tier": "episodic",
                 "score": round(score, 4),
-                "keyword_score": 0.0,
+                "keyword_score": round(lexical, 4),
                 "dense_score": round(sim, 4),
                 "fts_score": round(fts, 4),
                 "importance": row["importance"],
@@ -4337,25 +4360,8 @@ class BeamMemory:
             # relevance>0.02 threshold) so the counter reflects
             # results-attributable contributions, not scanned rows.
             for row in _em_fallback_rows:
-                content_lower = row["content"].lower()
-                content_words_set = set(content_lower.split())
-                # exact: query words appearing as complete tokens in content
-                exact = sum(1 for w in query_words if w in content_words_set)
-                # partial: unique query words with substring match in content words (set-based, not cartesian)
-                partial = sum(1 for w in query_words if len(w) >= 2 and any(w in cw or cw in w for cw in content_words_set if len(cw) >= 2))
-                # cross: query substrings matched against content word substrings (set-based)
-                query_substr = {w for w in query_words if len(w) >= 2}
-                content_substr = {cw for cw in content_words_set if len(cw) >= 2}
-                cross = sum(1 for q in query_substr for c in content_substr if q in c or c in q)
-                full_match = 1.0 if query_lower in content_lower else 0.0
-                if not full_match and content_lower in query_lower:
-                    full_match = 0.5
-                # Character-level overlap for spaceless languages (e.g. Chinese)
-                query_chars = set(query_lower)
-                content_chars = set(content_lower)
-                char_overlap = len(query_chars & content_chars) / max(len(query_chars), 1) if query_chars else 0.0
-                relevance = (exact * 1.0 + partial * 0.3 + cross * 0.5 + full_match + char_overlap * 0.8) / max(len(query_words), 1)
-                if relevance > 0.02:
+                relevance = _lexical_relevance(query_words, row["content"], query_lower)
+                if relevance >= 0.15:
                     decay = _recency_decay(row["timestamp"])
                     # Phase 4: configurable scoring for episodic fallback
                     kw_share = (1.0 - iw) * 0.6
@@ -4511,29 +4517,30 @@ class BeamMemory:
             results, ep_summary_of_map=ep_summary_of_map
         )
         # --- MEMORIA structured fact supplement ---
-        # Queries the regex-populated memoria_facts / memoria_timelines /
-        # memoria_kg / memoria_instructions / memoria_preferences tables
-        # for exact fact matches that FTS5/vector search may miss.
-        # Injected as a high-score synthetic entry so structured facts
-        # surface ahead of fuzzy text matches. Best-effort; failures
-        # are silent.
+        # Treat structured facts as another candidate source, not a forced
+        # top result. MEMORIA facts are regex-derived and often generic
+        # (dates/sequences); they must show meaningful lexical overlap before
+        # entering the result set.
         try:
             _memoria_result = self.memoria_retrieve(query, top_k=3)
             if _memoria_result and _memoria_result.get("source") != "fallback":
                 _ctx = _memoria_result.get("context", "")
-                if _ctx:
-                    results.insert(0, {
+                _memoria_relevance = _lexical_relevance(query_words, _ctx, query_lower)
+                if _ctx and _memoria_relevance >= 0.35:
+                    results.append({
                         "id": f"memoria_{_memoria_result['source']}",
                         "content": f"[MEMORIA {_memoria_result['source']}]\n{_ctx}",
                         "source": f"memoria_{_memoria_result['source']}",
-                        "score": 0.95,
+                        "score": round(min(0.6, _memoria_relevance * 0.6), 4),
                         "tier": "memoria",
                         "fts_score": 0.0,
                         "dense_score": 0.0,
-                        "importance": 0.9,
+                        "keyword_score": round(_memoria_relevance, 4),
+                        "importance": 0.5,
                         "timestamp": "",
                         "session_id": self.session_id,
                     })
+                    results.sort(key=lambda x: x["score"], reverse=True)
         except Exception:
             pass  # MEMORIA retrieval is best-effort
 
@@ -4711,6 +4718,8 @@ class BeamMemory:
         # (theoretically possible since `id TEXT PRIMARY KEY` is per-table).
         wm_scores = {r["id"]: r.get("score", 0.0) for r in results
                      if r.get("tier") == "working"}
+        wm_keyword_scores = {r["id"]: r.get("keyword_score", 0.0) for r in results
+                             if r.get("tier") == "working"}
         ep_scores = {r["id"]: r.get("score", 0.0) for r in results
                      if r.get("tier") == "episodic"}
         drop_wm_ids: set = set()
@@ -4725,7 +4734,10 @@ class BeamMemory:
             if not present_wms:
                 continue
             # Per-cluster: ep wins only if it beats or ties EVERY present wm.
-            ep_wins_cluster = all(ep_score >= wm_scores[w] for w in present_wms)
+            # Exception: an exact/distinctive query hit on the raw working row
+            # keeps the original recallable after additive sleep.
+            exact_source_hit = any(wm_keyword_scores.get(w, 0.0) >= 0.95 for w in present_wms)
+            ep_wins_cluster = (not exact_source_hit) and all(ep_score >= wm_scores[w] for w in present_wms)
             if ep_wins_cluster:
                 drop_wm_ids.update(present_wms)
             else:

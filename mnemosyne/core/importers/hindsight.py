@@ -398,6 +398,21 @@ class HindsightImporter(BaseImporter):
             logger.debug("backfill: embed() returned None for rowid=%s, content=%.50r", rowid, content)
             return
         vec = vecs[0]
+        memory_row = conn.execute(
+            "SELECT id FROM episodic_memory WHERE rowid = ?",
+            (rowid,),
+        ).fetchone()
+        if memory_row is not None:
+            try:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
+                    VALUES (?, ?, ?)
+                    """,
+                    (memory_row["id"], json.dumps(vec.tolist()), getattr(_embeddings, "MODEL_NAME", "import_backfill")),
+                )
+            except Exception as exc:
+                logger.debug("backfill: memory_embeddings INSERT failed for rowid=%s: %s", rowid, exc)
         if _vec_available and _vec_insert and _vec_available(conn):
             _vec_insert(conn, rowid, vec.tolist())
         if _mib is not None:
