@@ -104,6 +104,17 @@ class TestRecallPrecisionRegressions(unittest.TestCase):
         results = self.beam.recall("purple bicycle quantum oatmeal unrelated", top_k=5)
         self.assertEqual([], results)
 
+    def test_three_token_noise_abstains_on_single_shared_token(self):
+        self.beam.remember(
+            "Invoice drills use the order identifier as the primary key.",
+            source="imported_fixture",
+            importance=0.9,
+            scope="global",
+            veracity="imported",
+        )
+        results = self.beam.recall("customer invoices quantum", top_k=5)
+        self.assertEqual([], results)
+
     def test_memoria_date_or_sequence_fact_does_not_force_top_slot(self):
         results = self.beam.recall("Where is the Orion runner jar and how should it bind?", top_k=5)
         self.assertTrue(results)

@@ -1266,6 +1266,8 @@ _RECALL_SYNONYMS: Dict[str, tuple[str, ...]] = {
     "professional": ("software", "builder"),
     "url": ("link", "profile"),
     "current": ("now", "live", "latest"),
+    "feeling": ("feel", "feels"),
+    "imposter": ("self-doubt", "doubt", "insecure"),
 }
 
 
@@ -1303,7 +1305,7 @@ def _minimum_recall_relevance(query_tokens: List[str]) -> float:
     if len(query_tokens) >= 4:
         return 0.3
     if len(query_tokens) == 3:
-        return 0.2
+        return 0.5
     return 0.15
 
 
