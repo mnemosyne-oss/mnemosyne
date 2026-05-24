@@ -75,6 +75,35 @@ class TestRecallPrecisionRegressions(unittest.TestCase):
         results = self.beam.recall("zxqvplm norf greeble snargle twompset", top_k=5)
         self.assertEqual([], results)
 
+    def test_natural_language_nonsense_abstains_despite_one_real_token(self):
+        self.beam.remember(
+            "Quantum field theory research notes are stored in the physics archive.",
+            source="imported_fixture",
+            importance=0.9,
+            scope="global",
+            veracity="imported",
+        )
+        self.beam.conn.execute(
+            """
+            INSERT INTO episodic_memory
+                (id, content, source, timestamp, session_id, importance, scope, veracity)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "episodic_quantum_note",
+                "Quantum field theory research notes are stored in the physics archive.",
+                "imported_fixture",
+                "2026-05-24T00:00:00",
+                "precision",
+                0.9,
+                "global",
+                "imported",
+            ),
+        )
+        self.beam.conn.commit()
+        results = self.beam.recall("purple bicycle quantum oatmeal unrelated", top_k=5)
+        self.assertEqual([], results)
+
     def test_memoria_date_or_sequence_fact_does_not_force_top_slot(self):
         results = self.beam.recall("Where is the Orion runner jar and how should it bind?", top_k=5)
         self.assertTrue(results)

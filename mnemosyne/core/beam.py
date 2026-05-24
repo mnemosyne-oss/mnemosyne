@@ -1248,9 +1248,10 @@ def _find_memories_by_entity(beam: "BeamMemory", entity_name: str, threshold: fl
 _FACT_MATCH_STOPWORDS: Set[str] = {
     "a", "an", "and", "are", "as", "at", "be", "by", "can", "could",
     "did", "do", "does", "for", "from", "had", "has", "have", "how", "i",
-    "in", "is", "it", "its", "me", "my", "of", "on", "or", "our", "should",
-    "that", "the", "their", "there", "this", "to", "use", "uses", "was", "we",
-    "what", "when", "where", "which", "who", "why", "with", "you", "your",
+    "in", "is", "it", "its", "me", "my", "of", "on", "or", "our", "related",
+    "should", "that", "the", "their", "there", "this", "to", "totally", "unrelated",
+    "use", "uses", "was", "we", "what", "when", "where", "which", "who", "why",
+    "with", "you", "your",
 }
 
 _RECALL_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.:/+-]*")
@@ -1291,6 +1292,19 @@ def _expanded_query_tokens(tokens: List[str]) -> List[str]:
                 seen.add(candidate)
                 expanded.append(candidate)
     return expanded
+
+
+def _minimum_recall_relevance(query_tokens: List[str]) -> float:
+    """Raise the lexical gate for broad natural-language queries.
+
+    One matching real word is enough for short lookup-style queries, but not
+    for broad nonsense strings like "purple bicycle quantum oatmeal".
+    """
+    if len(query_tokens) >= 4:
+        return 0.3
+    if len(query_tokens) == 3:
+        return 0.2
+    return 0.15
 
 
 def _fact_match_tokens(text: str) -> Set[str]:
@@ -3881,6 +3895,7 @@ class BeamMemory:
             min_rank = 0.0
             rng = 1.0
 
+        min_relevance = _minimum_recall_relevance(query_words)
         for row in rows:
             content_lower = row["content"].lower()
             content_words_list = content_lower.split()
@@ -3892,10 +3907,10 @@ class BeamMemory:
                 # ceiling. Multi-fact queries can legitimately need several
                 # different rows; using min(normalized, lexical) dropped lower
                 # ranked but strongly lexical rows from the top-k entirely.
-                relevance = (0.75 * lexical + 0.25 * normalized) if lexical > 0 else 0.0
+                relevance = (0.75 * lexical + 0.25 * normalized) if lexical >= min_relevance else 0.0
             else:
                 relevance = _lexical_relevance(query_words, row["content"], query_lower)
-            if relevance >= 0.15 or (wm_ranks and len(query_words) <= 1 and relevance > 0):
+            if relevance >= min_relevance or (wm_ranks and len(query_words) <= 1 and relevance > 0):
                 decay = _recency_decay(row["timestamp"])
                 # Phase 4: configurable scoring for working memory
                 # keyword_share = (1 - importance_weight) * 0.6, recency_share = (1 - importance_weight) * 0.4
@@ -4321,6 +4336,12 @@ class BeamMemory:
             content_lower = row["content"].lower()
             bv = row["binary_vector"]
             lexical = _lexical_relevance(query_words, row["content"], query_lower)
+            # FTS rank says a candidate matched *a* term; it does not mean the
+            # candidate answers a broad natural-language query. Require enough
+            # lexical coverage before admitting FTS-only episodic rows, while
+            # still allowing genuinely strong vector-only hits through.
+            if lexical < min_relevance and sim < 0.65:
+                continue
             if self.episodic_graph is not None and not _env_disabled("MNEMOSYNE_GRAPH_BONUS"):
                 try:
                     # Count graph edges for this memory (well-connected = more relevant)
@@ -4427,7 +4448,7 @@ class BeamMemory:
             # results-attributable contributions, not scanned rows.
             for row in _em_fallback_rows:
                 relevance = _lexical_relevance(query_words, row["content"], query_lower)
-                if relevance >= 0.15:
+                if relevance >= min_relevance:
                     decay = _recency_decay(row["timestamp"])
                     # Phase 4: configurable scoring for episodic fallback
                     kw_share = (1.0 - iw) * 0.6
