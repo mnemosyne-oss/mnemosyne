@@ -665,20 +665,22 @@ def init_beam(db_path: Path = None):
             previous_value TEXT,
             updated_msg_idx INTEGER,
             valid_from_msg_idx INTEGER,
-            valid_to_msg_idx INTEGER
+            valid_to_msg_idx INTEGER,
+            source_memory_id TEXT
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_facts_key ON memoria_facts(key)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_facts_type ON memoria_facts(fact_type)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_facts_session ON memoria_facts(session_id)")
     # Migration: add versioning columns to existing tables (safe re-run)
-    for col in ['version_id', 'previous_value', 'updated_msg_idx', 'valid_from_msg_idx', 'valid_to_msg_idx']:
+    for col in ['version_id', 'previous_value', 'updated_msg_idx', 'valid_from_msg_idx', 'valid_to_msg_idx', 'source_memory_id']:
         _add_column_if_missing(conn, "memoria_facts", col, {
             'version_id': 'INTEGER DEFAULT 0',
             'previous_value': 'TEXT',
             'updated_msg_idx': 'INTEGER',
             'valid_from_msg_idx': 'INTEGER',
             'valid_to_msg_idx': 'INTEGER',
+            'source_memory_id': 'TEXT',
         }.get(col, 'TEXT'))
 
     cursor.execute("""
@@ -688,7 +690,8 @@ def init_beam(db_path: Path = None):
             date TEXT,
             message_idx INTEGER,
             description TEXT,
-            source TEXT
+            source TEXT,
+            source_memory_id TEXT
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_timelines_date ON memoria_timelines(date)")
@@ -702,7 +705,8 @@ def init_beam(db_path: Path = None):
             instruction TEXT,
             active INTEGER DEFAULT 1,
             topic TEXT,
-            context_snippet TEXT
+            context_snippet TEXT,
+            source_memory_id TEXT
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_instr_session ON memoria_instructions(session_id)")
@@ -716,7 +720,8 @@ def init_beam(db_path: Path = None):
             preference TEXT,
             topic TEXT,
             evolution TEXT,
-            context_snippet TEXT
+            context_snippet TEXT,
+            source_memory_id TEXT
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_pref_session ON memoria_preferences(session_id)")
@@ -729,12 +734,15 @@ def init_beam(db_path: Path = None):
             predicate TEXT,
             object TEXT,
             message_idx INTEGER,
-            confidence REAL DEFAULT 0.7
+            confidence REAL DEFAULT 0.7,
+            source_memory_id TEXT
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_kg_subject ON memoria_kg(subject)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_kg_predicate ON memoria_kg(predicate)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_kg_session ON memoria_kg(session_id)")
+    for table in ('memoria_timelines', 'memoria_instructions', 'memoria_preferences', 'memoria_kg'):
+        _add_column_if_missing(conn, table, 'source_memory_id', 'TEXT')
 
     # --- Consolidation Log ---
     cursor.execute("""
@@ -1247,6 +1255,18 @@ _FACT_MATCH_STOPWORDS: Set[str] = {
 
 _RECALL_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.:/+-]*")
 
+_RECALL_SYNONYMS: Dict[str, tuple[str, ...]] = {
+    # Small, conservative query expansion for common user-facing wording.
+    # These terms fix multi-fact questions whose stored facts use the
+    # natural wording of a preference/policy rather than the abstract word
+    # in the question (e.g. "branding preference" -> "positioning/wants").
+    "branding": ("brand", "positioning", "identity", "wording"),
+    "preference": ("prefer", "prefers", "want", "wants", "reject", "rejects", "avoid", "grounded"),
+    "professional": ("software", "builder"),
+    "url": ("link", "profile"),
+    "current": ("now", "live", "latest"),
+}
+
 
 def _recall_tokens(text: str) -> List[str]:
     """Meaningful lexical tokens for precision gates and fallback scoring."""
@@ -1255,6 +1275,22 @@ def _recall_tokens(text: str) -> List[str]:
         for token in _RECALL_TOKEN_RE.findall(text.lower())
         if len(token) >= 3 and token not in _FACT_MATCH_STOPWORDS and not token.isdigit()
     ]
+
+
+def _expanded_query_tokens(tokens: List[str]) -> List[str]:
+    """Return query tokens plus a bounded synonym expansion.
+
+    Expansion is query-side only and de-duplicated in order. It broadens FTS
+    candidate generation without lowering the lexical abstention gate.
+    """
+    expanded: List[str] = []
+    seen: Set[str] = set()
+    for token in tokens:
+        for candidate in (token, *_RECALL_SYNONYMS.get(token, ())):
+            if candidate not in seen:
+                seen.add(candidate)
+                expanded.append(candidate)
+    return expanded
 
 
 def _fact_match_tokens(text: str) -> Set[str]:
@@ -1288,23 +1324,37 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
     if not query_tokens and not query_cjk:
         return 0.0
     content_tokens = set(_recall_tokens(content_lower))
+    # Structured MEMORIA contexts often encode keys as snake_case
+    # (telemetry_api_latency_ms). Split separators so natural-language
+    # queries get full lexical credit for the same fact.
+    expanded_content_tokens = set(content_tokens)
+    for token in list(content_tokens):
+        expanded_content_tokens.update(
+            part for part in re.split(r"[_:/.-]+", token)
+            if len(part) >= 3 and part not in _FACT_MATCH_STOPWORDS and not part.isdigit()
+        )
+    content_tokens = expanded_content_tokens
     if not content_tokens and not query_cjk:
         return 0.0
 
     exact = sum(1 for token in query_tokens if token in content_tokens)
-    partial = 0
+    partial = 0.0
     for token in query_tokens:
         if token in content_tokens:
+            continue
+        synonyms = _RECALL_SYNONYMS.get(token, ())
+        if synonyms and any(syn in content_tokens for syn in synonyms):
+            partial += 0.75
             continue
         if len(token) >= 4 and any(
             token in ctoken or ctoken in token
             for ctoken in content_tokens
             if len(ctoken) >= 4
         ):
-            partial += 1
+            partial += 0.4
 
     full_match = 1.0 if query_lower and query_lower in content_lower else 0.0
-    score = (exact + 0.4 * partial + full_match) / max(len(query_tokens), 1)
+    score = (exact + partial + full_match) / max(len(query_tokens), 1)
 
     if score == 0.0:
         query_cjk = {
@@ -1504,7 +1554,7 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
 def _fts_query_terms(query: str) -> List[str]:
     """FTS-safe meaningful terms for natural-language recall queries."""
     terms = []
-    for term in _recall_tokens(query):
+    for term in _expanded_query_tokens(_recall_tokens(query)):
         term = term.replace('"', '""').strip()
         if term:
             terms.append(f'"{term}"')
@@ -1925,7 +1975,7 @@ class BeamMemory:
             # Populates memoria_facts, memoria_timelines, memoria_kg for the
             # structured retrieval router. Runs silently on every remember()
             # so the MEMORIA tables stay current regardless of extract=True.
-            self.extract_and_store_facts(content, message_idx=0)
+            self.extract_and_store_facts(content, message_idx=0, source_memory_id=existing_id)
             # Phase 3-4: Extract graph and consolidate veracity for dedup update
             self._ingest_graph_and_veracity(existing_id, content, source, veracity)
             self._emit_event("MEMORY_UPDATED", existing_id, content=content,
@@ -1978,7 +2028,7 @@ class BeamMemory:
         # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
         # Populates memoria_facts, memoria_timelines, memoria_kg for the
         # structured retrieval router. Runs on every remember() call.
-        self.extract_and_store_facts(content, message_idx=0)
+        self.extract_and_store_facts(content, message_idx=0, source_memory_id=memory_id)
 
         # Phase 3-4: Extract graph and consolidate veracity for new memory
         self._ingest_graph_and_veracity(memory_id, content, source, veracity)
@@ -2231,7 +2281,7 @@ class BeamMemory:
                 if extract:
                     _extract_and_store_facts(self, memory_id, row_content, item_source)
                 # Phase 2: MEMORIA regex-based extraction for every batch row.
-                self.extract_and_store_facts(row_content, message_idx=0)
+                self.extract_and_store_facts(row_content, message_idx=0, source_memory_id=memory_id)
                 # MEMORY_ADDED parity with remember() -- streaming
                 # observers + DeltaSync see batch rows the same way
                 # they see single-row writes.
@@ -2861,7 +2911,8 @@ class BeamMemory:
         }
     }
 
-    def extract_and_store_facts(self, content: str, message_idx: int = 0) -> dict:
+    def extract_and_store_facts(self, content: str, message_idx: int = 0,
+                                source_memory_id: Optional[str] = None) -> dict:
         """Extract structured facts from a message and store in facts/timelines/kg tables.
         Uses regex patterns matching the BEAM benchmark oracles.
         Language-aware: detects language and uses language-specific patterns.
@@ -2935,7 +2986,8 @@ class BeamMemory:
                 if not key.endswith('_pct'):
                     key = f"{prefix}_pct" if prefix else 'pct'
             self._insert_fact(session, message_idx, 'metric', key, val,
-                              self._context_snippet(content, m.start()), 0.65)
+                              self._context_snippet(content, m.start()), 0.65,
+                              source_memory_id=source_memory_id)
             counts["metric"] += 1
 
         # ISO Dates — require event context within 100 chars to avoid
@@ -2949,11 +3001,11 @@ class BeamMemory:
             _has_event_context = any(kw in _ctx_lower for kw in _EVENT_KEYWORDS)
             if not _has_event_context:
                 # Still store as a fact (date mention), but skip timeline entry
-                self._insert_fact(session, message_idx, 'date', 'iso_date', dt, ctx, 0.5)
+                self._insert_fact(session, message_idx, 'date', 'iso_date', dt, ctx, 0.5, source_memory_id=source_memory_id)
                 counts["date"] += 1
             else:
-                self._insert_fact(session, message_idx, 'date', 'iso_date', dt, ctx, 0.7)
-                self._insert_timeline(session, dt, message_idx, ctx[:120], 'iso_date')
+                self._insert_fact(session, message_idx, 'date', 'iso_date', dt, ctx, 0.7, source_memory_id=source_memory_id)
+                self._insert_timeline(session, dt, message_idx, ctx[:120], 'iso_date', source_memory_id=source_memory_id)
                 counts["date"] += 1
                 counts["timeline"] += 1
 
@@ -2961,7 +3013,7 @@ class BeamMemory:
         for m in _re.finditer(pat['named_months'], content, _re.IGNORECASE):
             dt = m.group(1).strip()
             ctx = self._context_snippet(content, m.start())
-            self._insert_fact(session, message_idx, 'date', 'named_date', dt, ctx, 0.7)
+            self._insert_fact(session, message_idx, 'date', 'named_date', dt, ctx, 0.7, source_memory_id=source_memory_id)
             counts["date"] += 1
 
         # Version strings — two patterns:
@@ -2971,7 +3023,8 @@ class BeamMemory:
             ver = m.group(2)
             key = f"{name.lower().replace(' ', '_')}_version"
             self._insert_fact(session, message_idx, 'version', key, ver,
-                              self._context_snippet(content, m.start()), 0.7)
+                              self._context_snippet(content, m.start()), 0.7,
+                              source_memory_id=source_memory_id)
             counts["version"] += 1
         # Pattern B: "PostgreSQL version 14.2", "Python version 3.11" (explicit 'version' word)
         _seen_versions = set()  # dedup across patterns
@@ -2985,7 +3038,8 @@ class BeamMemory:
             if ver not in _seen_versions:
                 _seen_versions.add(ver)
                 self._insert_fact(session, message_idx, 'version', key, ver,
-                                  self._context_snippet(content, m.start()), 0.7)
+                                  self._context_snippet(content, m.start()), 0.7,
+                                  source_memory_id=source_memory_id)
                 counts["version"] += 1
 
         # Negations (critical for CR) — language-aware
@@ -3004,20 +3058,20 @@ class BeamMemory:
                     if len(parts) > 1:
                         obj = parts[-1].strip()
                         break
-            self._insert_kg(session, 'user', 'negation', obj[:80], message_idx, 0.75)
+            self._insert_kg(session, 'user', 'negation', obj[:80], message_idx, 0.75, source_memory_id=source_memory_id)
             counts["negation"] += 1
 
         # Decisions — language-aware
         for m in _re.finditer(pat['decision'], content, _re.IGNORECASE):
             decision = m.group(1).strip()
-            self._insert_kg(session, 'user', 'decision', decision, message_idx, 0.65)
+            self._insert_kg(session, 'user', 'decision', decision, message_idx, 0.65, source_memory_id=source_memory_id)
             counts["decision"] += 1
 
         # Entity-action pairs (MR support) — language-aware
         for m in _re.finditer(pat['entity'], content, _re.IGNORECASE):
             entity = m.group(1).strip()
             action = m.group(2).strip()
-            self._insert_kg(session, entity, 'requires', action, message_idx, 0.65)
+            self._insert_kg(session, entity, 'requires', action, message_idx, 0.65, source_memory_id=source_memory_id)
             counts["decision"] += 1
 
         # Sequence markers (EO support) — language-aware
@@ -3025,7 +3079,8 @@ class BeamMemory:
             seq = m.group(1).strip()
             first_word = seq.split()[0].lower()
             self._insert_fact(session, message_idx, 'sequence', first_word, seq[:120],
-                              self._context_snippet(content, m.start()), 0.6)
+                              self._context_snippet(content, m.start()), 0.6,
+                              source_memory_id=source_memory_id)
             counts["sequence"] += 1
 
         # Instructions (IF support): language-aware
@@ -3043,9 +3098,9 @@ class BeamMemory:
             if _re.match(r'^(?:should|sollte)\s+(?:i|we|it|they|he|she|the|ich|wir|es|man|der|die|das)\b', instr, _re.IGNORECASE):
                 continue
             self.conn.execute(
-                "INSERT INTO memoria_instructions (session_id, message_idx, instruction, topic, context_snippet) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (session, message_idx, instr[:200], topic, self._context_snippet(content, m.start())))
+                "INSERT INTO memoria_instructions (session_id, message_idx, instruction, topic, context_snippet, source_memory_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session, message_idx, instr[:200], topic, self._context_snippet(content, m.start()), source_memory_id))
             counts["instruction"] = counts.get("instruction", 0) + 1
 
         # Preferences (PF support): evolving user tastes — language-aware
@@ -3068,9 +3123,9 @@ class BeamMemory:
             if existing:
                 evolution = f"was: {existing[0][:120]}"
             self.conn.execute(
-                "INSERT INTO memoria_preferences (session_id, message_idx, preference, topic, evolution, context_snippet) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (session, message_idx, pref[:200], topic, evolution, self._context_snippet(content, m.start())))
+                "INSERT INTO memoria_preferences (session_id, message_idx, preference, topic, evolution, context_snippet, source_memory_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (session, message_idx, pref[:200], topic, evolution, self._context_snippet(content, m.start()), source_memory_id))
             counts["preference"] = counts.get("preference", 0) + 1
 
         self.conn.commit()
@@ -3078,16 +3133,17 @@ class BeamMemory:
         return counts
 
     def _insert_fact(self, session: str, msg_idx: int, ftype: str,
-                     key: str, value: str, ctx: str, importance: float):
+                     key: str, value: str, ctx: str, importance: float,
+                     source_memory_id: Optional[str] = None):
         # Dates all share generic keys (e.g. "named_date", "iso_date").
         # Versioning would create false evolution chains when different
         # events happen on different dates. Skip versioning for dates.
         if ftype == 'date':
             self.conn.execute(
                 "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
-                "context_snippet, importance, valid_from_msg_idx) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (session, msg_idx, ftype, key, value, ctx, importance, msg_idx))
+                "context_snippet, importance, valid_from_msg_idx, source_memory_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session, msg_idx, ftype, key, value, ctx, importance, msg_idx, source_memory_id))
             return
 
         # Check if this key already has a fact with a different value
@@ -3113,30 +3169,32 @@ class BeamMemory:
             self.conn.execute(
                 "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
                 "context_snippet, importance, version_id, previous_value, updated_msg_idx, "
-                "valid_from_msg_idx) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "valid_from_msg_idx, source_memory_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (session, msg_idx, ftype, key, value, ctx, importance,
-                 new_version, existing[1], msg_idx, msg_idx))
+                 new_version, existing[1], msg_idx, msg_idx, source_memory_id))
         else:
             self.conn.execute(
                 "INSERT INTO memoria_facts (session_id, message_idx, fact_type, key, value, "
-                "context_snippet, importance, valid_from_msg_idx) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (session, msg_idx, ftype, key, value, ctx, importance, msg_idx))
+                "context_snippet, importance, valid_from_msg_idx, source_memory_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session, msg_idx, ftype, key, value, ctx, importance, msg_idx, source_memory_id))
 
     def _insert_timeline(self, session: str, date: str, msg_idx: int,
-                         desc: str, source: str = 'extraction'):
+                         desc: str, source: str = 'extraction',
+                         source_memory_id: Optional[str] = None):
         self.conn.execute(
-            "INSERT INTO memoria_timelines (session_id, date, message_idx, description, source) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (session, date, msg_idx, desc, source))
+            "INSERT INTO memoria_timelines (session_id, date, message_idx, description, source, source_memory_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session, date, msg_idx, desc, source, source_memory_id))
 
     def _insert_kg(self, session: str, subject: str, predicate: str,
-                   obj: str, msg_idx: int, confidence: float = 0.7):
+                   obj: str, msg_idx: int, confidence: float = 0.7,
+                   source_memory_id: Optional[str] = None):
         self.conn.execute(
-            "INSERT INTO memoria_kg (session_id, subject, predicate, object, message_idx, confidence) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (session, subject, predicate, obj, msg_idx, confidence))
+            "INSERT INTO memoria_kg (session_id, subject, predicate, object, message_idx, confidence, source_memory_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (session, subject, predicate, obj, msg_idx, confidence, source_memory_id))
 
     @staticmethod
     def _context_snippet(content: str, pos: int, width: int = 60) -> str:
@@ -3251,7 +3309,7 @@ class BeamMemory:
         numbers = _re.findall(r'\b(\d+)\b', query)
         for num in numbers[:3]:
             rows = cursor.execute(
-                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id FROM memoria_facts "
+                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id FROM memoria_facts "
                 "WHERE value LIKE ? AND session_id = ? LIMIT ?",
                 (f'%{num}%', self.session_id, top_k)
             ).fetchall()
@@ -3259,7 +3317,7 @@ class BeamMemory:
                 fk = (row[1], row[2])
                 if fk not in seen:
                     seen.add(fk)
-                    facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id'], row)))
+                    facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id', 'source_memory_id'], row)))
 
         # -- Pass 2: Capitalized/key terms in query → search key + value --
         terms = _re.findall(r'\b[A-Z][a-z]+(?:[-][A-Z][a-z]+)*\b', query)
@@ -3270,7 +3328,7 @@ class BeamMemory:
         terms = [t for t in terms if t not in stop_words]
         for term in terms[:5]:
             rows = cursor.execute(
-                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id FROM memoria_facts "
+                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id FROM memoria_facts "
                 "WHERE (key LIKE ? OR value LIKE ?) AND session_id = ? LIMIT ?",
                 (f'%{term}%', f'%{term}%', self.session_id, top_k)
             ).fetchall()
@@ -3278,7 +3336,7 @@ class BeamMemory:
                 fk = (row[1], row[2])
                 if fk not in seen:
                     seen.add(fk)
-                    facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id'], row)))
+                    facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id', 'source_memory_id'], row)))
 
         # -- Pass 3: Synonym/keyword mapping --
         # Maps common question words to (fact_type, [unit_hints]).
@@ -3304,13 +3362,13 @@ class BeamMemory:
                     if unit_hints:
                         for unit in unit_hints:
                             rows = cursor.execute(
-                                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id FROM memoria_facts "
+                                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id FROM memoria_facts "
                                 "WHERE fact_type = ? AND key LIKE ? AND session_id = ? LIMIT ?",
                                 (ftype, f'%{unit}%', self.session_id, top_k)
                             ).fetchall()
                     else:
                         rows = cursor.execute(
-                            "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id FROM memoria_facts "
+                            "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id FROM memoria_facts "
                             "WHERE fact_type = ? AND session_id = ? LIMIT ?",
                             (ftype, self.session_id, top_k)
                         ).fetchall()
@@ -3318,7 +3376,7 @@ class BeamMemory:
                         fk = (row[1], row[2])
                         if fk not in seen:
                             seen.add(fk)
-                            facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id'], row)))
+                            facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id', 'source_memory_id'], row)))
                     if facts:
                         break
 
@@ -3338,7 +3396,7 @@ class BeamMemory:
                        if w not in q_stop]
             for word in q_words[:5]:
                 rows = cursor.execute(
-                    "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id FROM memoria_facts "
+                    "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id FROM memoria_facts "
                     "WHERE context_snippet LIKE ? AND session_id = ? LIMIT ?",
                     (f'%{word}%', self.session_id, top_k)
                 ).fetchall()
@@ -3346,7 +3404,7 @@ class BeamMemory:
                     fk = (row[1], row[2])
                     if fk not in seen:
                         seen.add(fk)
-                        facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id'], row)))
+                        facts.append(dict(zip(['type', 'key', 'value', 'context', 'previous_value', 'updated_msg_idx', 'version_id', 'source_memory_id'], row)))
                 if facts:
                     break
 
@@ -3381,7 +3439,11 @@ class BeamMemory:
             return {
                 "context": "\n".join(ctx_lines),
                 "facts": latest[:top_k],
-                "source": "memoria_facts"
+                "source": "memoria_facts",
+                "source_memory_ids": [
+                    f["source_memory_id"] for f in latest[:top_k]
+                    if f.get("source_memory_id")
+                ],
             }
         return {"context": "", "facts": [], "source": "fallback"}
 
@@ -3826,7 +3888,11 @@ class BeamMemory:
             if wm_ranks and row["id"] in wm_ranks:
                 normalized = 1.0 - ((wm_ranks[row["id"]] - min_rank) / rng)
                 lexical = _lexical_relevance(query_words, row["content"], query_lower)
-                relevance = min(normalized, lexical) if lexical > 0 else 0.0
+                # FTS rank is a candidate-order signal, not a hard relevance
+                # ceiling. Multi-fact queries can legitimately need several
+                # different rows; using min(normalized, lexical) dropped lower
+                # ranked but strongly lexical rows from the top-k entirely.
+                relevance = (0.75 * lexical + 0.25 * normalized) if lexical > 0 else 0.0
             else:
                 relevance = _lexical_relevance(query_words, row["content"], query_lower)
             if relevance >= 0.15 or (wm_ranks and len(query_words) <= 1 and relevance > 0):
@@ -3835,7 +3901,7 @@ class BeamMemory:
                 # keyword_share = (1 - importance_weight) * 0.6, recency_share = (1 - importance_weight) * 0.4
                 kw_share = (1.0 - iw) * 0.6
                 rc_share = (1.0 - iw) * 0.4
-                base_score = relevance * kw_share + row["importance"] * iw
+                base_score = relevance * kw_share + row["importance"] * iw + (relevance ** 2) * 0.08
                 # Blend vector similarity into working memory score (weighted toward keyword precision)
                 vec_sim = wm_vec_sims.get(row["id"], 0.0)
                 if vec_sim > 0:
@@ -4366,7 +4432,7 @@ class BeamMemory:
                     # Phase 4: configurable scoring for episodic fallback
                     kw_share = (1.0 - iw) * 0.6
                     rc_share = (1.0 - iw) * 0.4
-                    base_score = relevance * kw_share + row["importance"] * iw
+                    base_score = relevance * kw_share + row["importance"] * iw + (relevance ** 2) * 0.08
                     score = base_score * (rc_share + (1.0 - rc_share) * decay)
 
                     # Phase 5: Graph + fact + binary bonuses for fallback.
@@ -4540,9 +4606,57 @@ class BeamMemory:
                         "timestamp": "",
                         "session_id": self.session_id,
                     })
+                    _source_ids = [
+                        sid for sid in _memoria_result.get("source_memory_ids", [])
+                        if sid
+                    ]
+                    if _source_ids:
+                        _ph = ",".join("?" * len(_source_ids))
+                        _src_rows = self.conn.execute(
+                            f"SELECT id, content, source, timestamp, importance, scope, veracity "
+                            f"FROM working_memory WHERE id IN ({_ph})",
+                            _source_ids,
+                        ).fetchall()
+                        for _row in _src_rows:
+                            results.append({
+                                "id": f"memoria_source_{_row['id']}",
+                                "content": _row["content"][:500],
+                                "source": _row["source"],
+                                "timestamp": _row["timestamp"],
+                                "tier": "memoria_source",
+                                "score": round(min(0.59, 0.2 + _memoria_relevance * 0.8), 4),
+                                "fts_score": 0.0,
+                                "dense_score": 0.0,
+                                "keyword_score": round(_memoria_relevance, 4),
+                                "importance": _row["importance"],
+                                "scope": _row["scope"] if "scope" in _row.keys() else "session",
+                                "veracity": _row["veracity"] if "veracity" in _row.keys() else "unknown",
+                                "source_memory_id": _row["id"],
+                            })
                     results.sort(key=lambda x: x["score"], reverse=True)
         except Exception:
             pass  # MEMORIA retrieval is best-effort
+
+        if len(query_words) >= 4 and len(results) > top_k:
+            # Multi-aspect questions often need several rows, not five variants
+            # of one aspect. Greedily prefer rows that add not-yet-covered exact
+            # query terms while keeping the underlying score as the base signal.
+            selected = []
+            covered: Set[str] = set()
+            pool = list(results)
+            q_word_set = set(query_words)
+            while pool and len(selected) < top_k:
+                best_idx = max(
+                    range(len(pool)),
+                    key=lambda i: (
+                        pool[i].get("score", 0.0)
+                        + 0.06 * len(set(_recall_tokens(pool[i].get("content", "").lower())) & q_word_set - covered)
+                    ),
+                )
+                picked = pool.pop(best_idx)
+                selected.append(picked)
+                covered.update(set(_recall_tokens(picked.get("content", "").lower())) & q_word_set)
+            results = selected + pool
 
         final_results = results[:top_k]
 

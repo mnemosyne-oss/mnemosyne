@@ -80,6 +80,84 @@ class TestRecallPrecisionRegressions(unittest.TestCase):
         self.assertTrue(results)
         self.assertNotIn("[MEMORIA", results[0]["content"])
 
+    def test_multi_fact_query_keeps_separate_aspects_in_top_results(self):
+        self.beam.remember(
+            "Ava profile URL is https://example.test/ava for her professional page.",
+            source="imported_fixture",
+            importance=0.6,
+            scope="global",
+            veracity="imported",
+        )
+        self.beam.remember(
+            "Ava rejects AI hype positioning and wants grounded software builder wording.",
+            source="imported_fixture",
+            importance=0.6,
+            scope="global",
+            veracity="imported",
+        )
+        for n in range(10):
+            self.beam.remember(
+                f"Ava profile checklist item {n}: professional photo headline about section skills portfolio connections completed.",
+                source="imported_fixture",
+                importance=0.8,
+                scope="global",
+                veracity="imported",
+            )
+
+        results = self.beam.recall(
+            "What is Ava profile URL and professional branding preference?",
+            top_k=5,
+        )
+        joined = "\n".join(r["content"] for r in results).lower()
+        self.assertIn("https://example.test/ava", joined)
+        self.assertIn("grounded software builder", joined)
+
+    def test_current_state_query_prefers_newer_correction_over_stale_history(self):
+        old_id = self.beam.remember(
+            "Project Atlas deployment target was legacy-cluster and should use Model-Old for background work.",
+            source="imported_fixture",
+            importance=0.7,
+            scope="global",
+            veracity="imported",
+        )
+        new_id = self.beam.remember(
+            "Current Project Atlas deployment target is stable-cluster and should use Model-New for background work.",
+            source="imported_fixture",
+            importance=0.7,
+            scope="global",
+            veracity="imported",
+        )
+        self.beam.conn.execute(
+            "UPDATE working_memory SET timestamp = ? WHERE id = ?",
+            ("2025-01-01T00:00:00", old_id),
+        )
+        self.beam.conn.execute(
+            "UPDATE working_memory SET timestamp = ? WHERE id = ?",
+            ("2026-05-24T00:00:00", new_id),
+        )
+        self.beam.conn.commit()
+
+        results = self.beam.recall(
+            "What should Project Atlas deployment use now?",
+            top_k=3,
+        )
+        self.assertTrue(results)
+        self.assertIn("stable-cluster", results[0]["content"])
+
+    def test_memoria_result_carries_source_memory_and_supplements_raw_row(self):
+        source_id = self.beam.remember(
+            "Telemetry API latency is 240ms after the cache migration.",
+            source="imported_fixture",
+            importance=0.6,
+            scope="global",
+            veracity="imported",
+        )
+        memoria = self.beam.memoria_retrieve("What is the Telemetry API latency?", top_k=3)
+        self.assertIn(source_id, memoria.get("source_memory_ids", []))
+
+        results = self.beam.recall("What is the Telemetry API latency?", top_k=5)
+        self.assertTrue(any(r.get("source_memory_id") == source_id for r in results if r.get("tier") == "memoria_source"))
+
 
 class FakeEmbeddings:
     @staticmethod

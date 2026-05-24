@@ -582,6 +582,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
         self._auto_sleep_threshold = 50
         self._auto_sleep_enabled = os.environ.get("MNEMOSYNE_AUTO_SLEEP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
         self._ignore_patterns: List[str] = []  # Regex patterns to filter from memory
+        self._autosave_assistant = os.environ.get("MNEMOSYNE_AUTOSAVE_ASSISTANT", "").strip().lower() in ("1", "true", "yes", "on")
         self._skip_contexts = {"cron", "flush", "subagent", "background", "skill_loop"}  # Agent contexts to skip
         # Profile memory isolation: when enabled, each Hermes profile gets its own
         # Mnemosyne bank (separate SQLite DB). Default OFF for backward compatibility.
@@ -718,10 +719,14 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
     def _should_filter(self, content: str) -> bool:
         """Check if content matches any ignore pattern. Returns True if it should be skipped."""
-        if not self._ignore_patterns:
-            return False
         import re
-        for pattern in self._ignore_patterns:
+        default_patterns = [
+            r"^\s*(?:i['’]?ll|i will|let me)\s+(?:check|run|test|verify|look|inspect|search)\b",
+            r"\b(?:run|running)\s+(?:the\s+)?tests?\s+(?:now|next)\b",
+            r"\b(?:report back|update you|keep you posted)\b",
+            r"\b(?:build|tests?)\s+(?:finishes|finish|passes|fails)\b",
+        ]
+        for pattern in [*default_patterns, *self._ignore_patterns]:
             try:
                 if re.search(pattern, content, re.IGNORECASE):
                     return True
@@ -1035,7 +1040,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 )
                 # Check for identity-significant signals in user content
                 self._capture_identity_signals(user_content)
-            if assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
+            if self._autosave_assistant and assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
                 self._beam.remember(
                     content=f"[ASSISTANT] {assistant_content[:800]}",
                     source="conversation",

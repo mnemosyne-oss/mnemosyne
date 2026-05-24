@@ -160,6 +160,34 @@ def test_on_session_end_no_op_without_beam():
     provider.on_session_end(messages=[])
 
 
+def test_sync_turn_does_not_autosave_assistant_by_default():
+    beam = MagicMock()
+    provider = MnemosyneMemoryProvider()
+    provider._beam = beam
+
+    provider.sync_turn(
+        "remember that durable user preference",
+        "I will check this and run tests next.",
+    )
+
+    stored = [call.kwargs["content"] for call in beam.remember.call_args_list]
+    assert any(content.startswith("[USER]") for content in stored)
+    assert not any(content.startswith("[ASSISTANT]") for content in stored)
+
+
+def test_sync_turn_filters_transient_user_progress_chatter():
+    beam = MagicMock()
+    provider = MnemosyneMemoryProvider()
+    provider._beam = beam
+
+    provider.sync_turn(
+        "I'll run the tests now and report back after the build finishes.",
+        "",
+    )
+
+    beam.remember.assert_not_called()
+
+
 def test_on_session_end_logs_when_sleep_raises_in_daemon_thread(caplog):
     """Codex finding 3: exceptions from beam.sleep() now happen in the daemon
     thread; the wrapper must catch them and log at DEBUG instead of letting
