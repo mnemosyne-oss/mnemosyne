@@ -59,6 +59,13 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
         _thread_local.conn.row_factory = sqlite3.Row
         _thread_local.conn.execute("PRAGMA journal_mode=WAL")
         _thread_local.conn.execute("PRAGMA busy_timeout=5000")
+        # Load sqlite-vec extension for vector search (matches beam._get_connection)
+        try:
+            import sqlite_vec
+            _thread_local.conn.enable_load_extension(True)
+            sqlite_vec.load(_thread_local.conn)
+        except Exception:
+            pass
         _thread_local.db_path = str(path)
     return _thread_local.conn
 
