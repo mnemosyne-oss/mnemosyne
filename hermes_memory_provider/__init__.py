@@ -994,6 +994,33 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 recall_kwargs["author_id"] = author_id
             results = self._beam.recall(**recall_kwargs)
             if not results:
+                # Broad prefetch queries can name several independent aspects
+                # (for example "animals nature sky ocean"). The core recall
+                # gate correctly abstains when each row only matches one term,
+                # but prefetch still needs the scoped context that matches any
+                # individual aspect. Retry per meaningful token while preserving
+                # the same session/author scoping kwargs.
+                try:
+                    from mnemosyne.core.beam import _recall_tokens as _prefetch_tokens
+                    tokens = _prefetch_tokens(query)
+                except Exception:
+                    tokens = [t for t in query.lower().split() if len(t) >= 3]
+                if len(tokens) > 1:
+                    by_id: Dict[str, Dict[str, Any]] = {}
+                    for token in tokens[:8]:
+                        token_kwargs = dict(recall_kwargs)
+                        token_kwargs["query"] = token
+                        token_kwargs["top_k"] = 2
+                        for row in self._beam.recall(**token_kwargs):
+                            key = str(row.get("id") or row.get("content", ""))
+                            if key and key not in by_id:
+                                by_id[key] = row
+                    results = sorted(
+                        by_id.values(),
+                        key=lambda r: r.get("score", 0),
+                        reverse=True,
+                    )[: recall_kwargs["top_k"]]
+            if not results:
                 return ""
             # Filter out low-relevance results to prevent context pollution
             # Only include memories with score above threshold or high importance

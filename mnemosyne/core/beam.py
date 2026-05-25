@@ -4667,7 +4667,11 @@ class BeamMemory:
             selected = []
             covered: Set[str] = set()
             pool = list(results)
-            q_word_set = set(query_words)
+            # Diversity should account for the same bounded synonym expansion
+            # used by candidate generation/relevance. Otherwise rows matching
+            # a related wording (for example branding -> positioning/grounded)
+            # can lose to duplicates that only repeat exact query terms.
+            q_word_set = set(_expanded_query_tokens(query_words))
             while pool and len(selected) < top_k:
                 best_idx = max(
                     range(len(pool)),
