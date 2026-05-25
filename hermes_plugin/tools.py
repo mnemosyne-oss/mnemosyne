@@ -57,6 +57,11 @@ REMEMBER_SCHEMA = {
             "channel_id": {
                 "type": "string",
                 "description": "Channel/group this belongs to (e.g., 'fluxspeak-team')."
+            },
+            "bank": {
+                "type": "string",
+                "description": "Memory bank to store in. Use to isolate memories into separate banks (e.g., 'work', 'personal'). Defaults to 'default'.",
+                "default": "default"
             }
         },
         "required": ["content"]
@@ -116,6 +121,11 @@ RECALL_SCHEMA = {
             "channel_id": {
                 "type": "string",
                 "description": "Filter by channel/group (e.g., 'fluxspeak-team')."
+            },
+            "bank": {
+                "type": "string",
+                "description": "Memory bank to search in. Use to search isolated banks (e.g., 'work', 'personal'). Defaults to 'default'.",
+                "default": "default"
             }
         },
         "required": ["query"],
@@ -127,7 +137,13 @@ STATS_SCHEMA = {
     "description": "Get Mnemosyne memory statistics including BEAM tiers",
     "parameters": {
         "type": "object",
-        "properties": {}
+        "properties": {
+            "bank": {
+                "type": "string",
+                "description": "Memory bank to get stats for (e.g., 'work', 'personal'). Defaults to 'default'.",
+                "default": "default"
+            }
+        }
     }
 }
 
@@ -177,6 +193,11 @@ SLEEP_SCHEMA = {
                 "type": "boolean",
                 "description": "If true, consolidate eligible old working memories across all sessions instead of only the current session",
                 "default": False
+            },
+            "bank": {
+                "type": "string",
+                "description": "Memory bank to consolidate (e.g., 'work', 'personal'). Defaults to 'default'.",
+                "default": "default"
             }
         }
     }
@@ -225,6 +246,11 @@ SCRATCHPAD_WRITE_SCHEMA = {
             "content": {
                 "type": "string",
                 "description": "Content to write"
+            },
+            "bank": {
+                "type": "string",
+                "description": "Memory bank to write scratchpad to (e.g., 'work', 'personal'). Defaults to 'default'.",
+                "default": "default"
             }
         },
         "required": ["content"]
@@ -376,8 +402,9 @@ def mnemosyne_remember(args: dict, **kwargs) -> str:
             return json.dumps({"error": "Content is required"})
 
         extract = args.get("extract", False)
+        bank = args.get("bank", "default")
 
-        mem = _get_memory()
+        mem = _get_memory(bank=bank)
         memory_id = mem.remember(
             content, source=source, importance=importance,
             valid_until=valid_until, scope=scope,
@@ -426,7 +453,7 @@ def mnemosyne_recall(args: dict, **kwargs) -> str:
             if weight_key in args:
                 recall_kwargs[weight_key] = args[weight_key]
 
-        mem = _get_memory()
+        mem = _get_memory(bank=args.get("bank", "default"))
         results = mem.recall(query, **recall_kwargs)
 
         return json.dumps({
@@ -444,7 +471,7 @@ def mnemosyne_recall(args: dict, **kwargs) -> str:
 def mnemosyne_stats(args: dict, **kwargs) -> str:
     """Get memory statistics"""
     try:
-        mem = _get_memory()
+        mem = _get_memory(bank=args.get("bank", "default"))
         stats = mem.get_stats()
 
         return json.dumps(stats)
@@ -582,7 +609,8 @@ def mnemosyne_sleep(args: dict, **kwargs) -> str:
     try:
         dry_run = args.get("dry_run", False)
         all_sessions = args.get("all_sessions", False)
-        mem = _get_memory()
+        bank = args.get("bank", "default")
+        mem = _get_memory(bank=bank)
         if all_sessions and hasattr(mem, "sleep_all_sessions"):
             result = mem.sleep_all_sessions(dry_run=dry_run)
         else:
@@ -598,7 +626,8 @@ def mnemosyne_scratchpad_write(args: dict, **kwargs) -> str:
         content = args.get("content", "").strip()
         if not content:
             return json.dumps({"error": "Content is required"})
-        mem = _get_memory()
+        bank = args.get("bank", "default")
+        mem = _get_memory(bank=bank)
         pad_id = mem.scratchpad_write(content)
         return json.dumps({"status": "written", "id": pad_id})
     except Exception as e:
@@ -608,7 +637,7 @@ def mnemosyne_scratchpad_write(args: dict, **kwargs) -> str:
 def mnemosyne_scratchpad_read(args: dict, **kwargs) -> str:
     """Read scratchpad"""
     try:
-        mem = _get_memory()
+        mem = _get_memory(bank=args.get("bank", "default"))
         entries = mem.scratchpad_read()
         return json.dumps({"entries_count": len(entries), "entries": entries})
     except Exception as e:
@@ -618,7 +647,7 @@ def mnemosyne_scratchpad_read(args: dict, **kwargs) -> str:
 def mnemosyne_scratchpad_clear(args: dict, **kwargs) -> str:
     """Clear scratchpad"""
     try:
-        mem = _get_memory()
+        mem = _get_memory(bank=args.get("bank", "default"))
         mem.scratchpad_clear()
         return json.dumps({"status": "cleared"})
     except Exception as e:

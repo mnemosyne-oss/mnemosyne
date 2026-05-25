@@ -39,8 +39,8 @@ _current_session_id = None
 _triple_store = None
 
 
-def _get_memory(session_id: str = None):
-    """Get or create global memory instance. Recreates if session_id changes.
+def _get_memory(session_id: str = None, bank: str = None):
+    """Get or create global memory instance. Recreates if session_id or bank changes.
 
     Identity is resolved from environment variables set by the Hermes plugin
     provider (e.g., MNEMOSYNE_AUTHOR_ID from user context).
@@ -48,13 +48,17 @@ def _get_memory(session_id: str = None):
     global _memory_instance, _current_session_id, _triple_store
     if session_id is None:
         session_id = os.environ.get("HERMES_SESSION_ID", "hermes_default")
-    if _memory_instance is None or _current_session_id != session_id:
+    if bank is None:
+        bank = os.environ.get("MNEMOSYNE_BANK", "default")
+    cache_key = f"{session_id}|{bank}"
+    if _memory_instance is None or _current_session_id != cache_key:
         # Build into a local first so a Mnemosyne(...) failure (DB locked,
         # embedding init error, etc.) does not poison global state — leaving
         # _current_session_id ahead of _memory_instance would make the next
         # call return the stale instance silently.
         new_memory = Mnemosyne(
             session_id=session_id,
+            bank=bank,
             author_id=os.environ.get("MNEMOSYNE_AUTHOR_ID"),
             author_type=os.environ.get("MNEMOSYNE_AUTHOR_TYPE"),
             channel_id=os.environ.get("MNEMOSYNE_CHANNEL_ID")

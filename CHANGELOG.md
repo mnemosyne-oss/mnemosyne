@@ -25,8 +25,10 @@ and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemos
 - **Proactive memory linking** (coe0718, #146). Zero-LLM graph edge creation
   at ingestion via content similarity (FTS5) and entity overlap strategies.
   Gated behind `MNEMOSYNE_PROACTIVE_LINKING=1`.
-- **LLM-based episodic consolidation.** Compresses working memories into
-  episodic summaries via cheap flash models when API key available.
+- **Benchmark LLM consolidation.** The evaluation harness now routes
+  `beam.sleep()` summarization through OpenRouter with a cheap flash model
+  instead of AAAK compression. The pipeline itself is unchanged — this is
+  a benchmark config change only.
 
 ### Changed
 

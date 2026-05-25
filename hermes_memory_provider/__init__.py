@@ -868,7 +868,13 @@ class MnemosyneMemoryProvider(MemoryProvider):
             self._deactivate_in_module()
             return
 
-        self._session_id = f"hermes_{session_id}"
+        # Derive a stable per-thread session scope from gateway_session_key when
+        # available.  Each Telegram topic gets its own stable session so memories
+        # stay isolated per-thread while scope='global' memories still surface
+        # everywhere.  Falls back to the Hermes agent session_id for CLI and
+        # non-gateway use (no behavior change for those paths).
+        stable_scope = kwargs.get("gateway_session_key") or session_id
+        self._session_id = f"hermes_{stable_scope}"
 
         try:
             if self._profile_isolation_enabled:
@@ -967,11 +973,21 @@ class MnemosyneMemoryProvider(MemoryProvider):
         try:
             import os
             author_id = self._beam.author_id or os.environ.get("MNEMOSYNE_AUTHOR_ID")
-            results = self._beam.recall(
-                query, top_k=8, 
+            recall_kwargs: Dict[str, Any] = dict(
+                query=query, top_k=8,
                 temporal_weight=0.2, temporal_halflife=48,
-                author_id=author_id,
             )
+            # Only pass author_id when explicitly non-empty.  Passing an empty
+            # falsy author_id is harmless (no (1=1) bypass), but passing a real
+            # non-empty one triggers the (1=1) clause in beam.recall() that
+            # SKIPS session/channel filtering entirely -- which would defeat
+            # the gateway_session_key thread isolation above.  Multi-agent
+            # deployments that NEED author_id filtering can set it and accept
+            # the wider scope; the common case (single-user, per-thread
+            # sessions) should never bypass session scoping.
+            if author_id:
+                recall_kwargs["author_id"] = author_id
+            results = self._beam.recall(**recall_kwargs)
             if not results:
                 return ""
             # Filter out low-relevance results to prevent context pollution
