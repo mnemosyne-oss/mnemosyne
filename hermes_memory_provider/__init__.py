@@ -568,6 +568,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
         self._surface_beam: Optional[Any] = None
         self._shared_surface_bank = "surface"
         self._shared_surface_path: Optional[Path] = None
+        self._audit: Optional[Any] = None
         # C27: capture init exception so downstream methods can surface it
         # instead of silently no-op'ing. `_beam is None AND _init_error is None`
         # means a deliberate skip (subagent/cron/skill_loop context, or pre-init);
@@ -619,6 +620,28 @@ class MnemosyneMemoryProvider(MemoryProvider):
             self._is_active_in_module = False
             _active_provider_count = max(0, _active_provider_count - 1)
             _provider_active = (_active_provider_count > 0)
+
+    def _init_audit_log(self) -> None:
+        """Initialize audit log co-located with the active provider DB."""
+        try:
+            from hermes_memory_provider.audit import AuditLog
+            db_path = getattr(self._beam, "db_path", None)
+            if db_path:
+                self._audit = AuditLog(Path(db_path))
+                logger.debug("Audit log initialized: %s", db_path)
+        except Exception as exc:
+            logger.debug("Audit log init skipped: %s", exc)
+
+    def _audit_event(self, action: str, **kwargs) -> None:
+        """Record an audit event. Never raises, never blocks."""
+        if self._audit is None:
+            return
+        kwargs.setdefault("profile", getattr(self, "_agent_identity", None) or "")
+        kwargs.setdefault("session_id", self._session_id)
+        try:
+            self._audit.record(action, **kwargs)
+        except Exception:
+            pass
 
     def _init_error_reason(self) -> str:
         """Return a human-readable failure reason for tool responses.
@@ -915,6 +938,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
         # choice (codex review #1).
         if self._beam is not None:
             self._activate_in_module()
+            self._init_audit_log()
 
         # Register the Hermes auxiliary LLM backend so Mnemosyne can route
         # consolidation and fact extraction through Hermes' authenticated
@@ -1182,6 +1206,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
             metadata=metadata,
             veracity=veracity,
         )
+        self._audit_event(
+            "remember", memory_id=memory_id, bank="private",
+            scope=scope, source_tool="mnemosyne_remember",
+        )
         return json.dumps({
             "status": "stored",
             "memory_id": memory_id,
@@ -1289,6 +1317,11 @@ class MnemosyneMemoryProvider(MemoryProvider):
             memory_id=stable_id,
             veracity=veracity,
         )
+        self._audit_event(
+            "shared_remember", memory_id=memory_id, bank="surface",
+            scope="global", source_tool="mnemosyne_shared_remember",
+            metadata={"kind": kind, "existing": bool(existing_id)},
+        )
         return json.dumps({
             "status": "existing_shared" if existing_id else "stored_shared",
             "memory_id": memory_id,
@@ -1322,6 +1355,11 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if not memory_id:
             return json.dumps({"error": "memory_id is required"})
         ok = self._surface_beam.forget_working(memory_id)
+        if ok:
+            self._audit_event(
+                "shared_forget", memory_id=memory_id, bank="surface",
+                source_tool="mnemosyne_shared_forget",
+            )
         return json.dumps({"status": "deleted" if ok else "not_found", "memory_id": memory_id, "shared_db": str(self._shared_surface_path or "")})
 
     def _handle_shared_stats(self, args: Dict[str, Any]) -> str:
@@ -1339,6 +1377,11 @@ class MnemosyneMemoryProvider(MemoryProvider):
             result = self._beam.sleep(dry_run=dry_run)
         working = self._beam.get_working_stats()
         episodic = self._beam.get_episodic_stats()
+        if not dry_run:
+            self._audit_event(
+                "sleep", bank="private", source_tool="mnemosyne_sleep",
+                metadata={"all_sessions": all_sessions, "status": result.get("status")},
+            )
         return json.dumps({"status": result.get("status", "consolidated"), "result": result, "working": working, "episodic": episodic})
 
     def _handle_stats(self, args: Dict[str, Any]) -> str:
@@ -1353,6 +1396,11 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if not memory_id:
             return json.dumps({"error": "memory_id is required"})
         self._beam.invalidate(memory_id, replacement_id=replacement_id if replacement_id else None)
+        self._audit_event(
+            "invalidate", memory_id=memory_id, bank="private",
+            source_tool="mnemosyne_invalidate",
+            metadata={"replacement_id": replacement_id} if replacement_id else None,
+        )
         return json.dumps({"status": "invalidated", "memory_id": memory_id})
 
     def _handle_get(self, args: Dict[str, Any]) -> str:
@@ -1426,6 +1474,11 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if not memory_id:
             return json.dumps({"error": "memory_id is required"})
         ok = self._beam.forget_working(memory_id)
+        if ok:
+            self._audit_event(
+                "forget", memory_id=memory_id, bank="private",
+                source_tool="mnemosyne_forget",
+            )
         return json.dumps({
             "status": "deleted" if ok else "not_found",
             "memory_id": memory_id,
@@ -1475,6 +1528,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
                          "(for cross-provider import) is required",
             })
         stats = mem.import_from_file(input_path, force=force)
+        self._audit_event(
+            "import", bank="private", source_tool="mnemosyne_import",
+            metadata={"input_path": input_path, "force": force, "stats": stats},
+        )
         return json.dumps({"status": "imported", "stats": stats})
 
     def _handle_diagnose(self, args: Dict[str, Any]) -> str:
