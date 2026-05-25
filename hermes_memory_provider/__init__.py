@@ -1480,6 +1480,38 @@ class MnemosyneMemoryProvider(MemoryProvider):
     def _handle_diagnose(self, args: Dict[str, Any]) -> str:
         from mnemosyne.diagnose import run_diagnostics
         result = run_diagnostics()
+
+        # run_diagnostics() reports Mnemosyne's legacy/default DB path. When
+        # Hermes profile isolation is enabled, the active provider may use a
+        # profile bank instead (mnemosyne/data/banks/<profile>/mnemosyne.db).
+        # Surface the active provider DB too so operators do not mistake the
+        # diagnostic default path for the live memory bank.
+        active_db = None
+        try:
+            if self._beam is not None:
+                active_db = getattr(self._beam, "db_path", None)
+        except Exception:
+            active_db = None
+
+        if active_db:
+            result["active_provider_db_path"] = str(active_db)
+            result["profile_isolation_enabled"] = bool(self._profile_isolation_enabled)
+            result.setdefault("key_findings", []).append(
+                f"Active Hermes Mnemosyne provider DB: {active_db}"
+            )
+            try:
+                import sqlite3
+                con = sqlite3.connect(str(active_db))
+                cur = con.cursor()
+                result["active_provider_counts"] = {
+                    "working_memory": cur.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0],
+                    "episodic_memory": cur.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0],
+                    "facts": cur.execute("SELECT COUNT(*) FROM facts").fetchone()[0],
+                }
+                con.close()
+            except Exception as exc:
+                result["active_provider_counts_error"] = str(exc)
+
         return json.dumps(result, indent=2, default=str)
 
     def _handle_graph_query(self, args: Dict[str, Any]) -> str:
