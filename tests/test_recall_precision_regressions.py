@@ -6,7 +6,11 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from mnemosyne.core.beam import BeamMemory
+from mnemosyne.core.beam import (
+    BeamMemory,
+    _expanded_query_tokens,
+    _lexical_relevance,
+)
 from mnemosyne.core.importers import hindsight as hindsight_importer
 
 
@@ -149,6 +153,61 @@ class TestRecallPrecisionRegressions(unittest.TestCase):
             top_k=5,
         )
         joined = "\n".join(r["content"] for r in results).lower()
+        self.assertIn("https://example.test/ava", joined)
+        self.assertIn("grounded software builder", joined)
+
+    def test_synonym_expansion_is_bounded_and_deduplicated(self):
+        expanded = _expanded_query_tokens([
+            "professional",
+            "branding",
+            "preference",
+            "branding",
+        ])
+
+        self.assertEqual(expanded.count("branding"), 1)
+        self.assertLess(expanded.index("branding"), expanded.index("positioning"))
+        self.assertIn("software", expanded)
+        self.assertIn("grounded", expanded)
+
+    def test_synonym_relevance_matches_related_preference_wording(self):
+        score = _lexical_relevance(
+            ["professional", "branding", "preference"],
+            "Ava rejects AI hype positioning and wants grounded software builder wording.",
+            "professional branding preference",
+        )
+
+        self.assertGreaterEqual(score, 0.7)
+
+    def test_diversity_pass_promotes_uncovered_query_aspects(self):
+        self.beam.remember(
+            "Ava profile URL is https://example.test/ava for her professional page.",
+            source="imported_fixture",
+            importance=0.6,
+            scope="global",
+            veracity="imported",
+        )
+        self.beam.remember(
+            "Ava rejects AI hype positioning and wants grounded software builder wording.",
+            source="imported_fixture",
+            importance=0.6,
+            scope="global",
+            veracity="imported",
+        )
+        for n in range(8):
+            self.beam.remember(
+                f"Ava profile checklist duplicate {n}: professional profile photo headline about section portfolio links.",
+                source="imported_fixture",
+                importance=0.9,
+                scope="global",
+                veracity="imported",
+            )
+
+        results = self.beam.recall(
+            "What is Ava profile URL and professional branding preference?",
+            top_k=2,
+        )
+        joined = "\n".join(r["content"] for r in results).lower()
+
         self.assertIn("https://example.test/ava", joined)
         self.assertIn("grounded software builder", joined)
 
