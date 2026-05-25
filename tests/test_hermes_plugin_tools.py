@@ -50,7 +50,7 @@ def test_mnemosyne_recall_forwards_scoring_weights_to_mem(monkeypatch):
             captured.update(kwargs)
             return []
 
-    monkeypatch.setattr(plugin_tools, "_get_memory", lambda: _StubMem())
+    monkeypatch.setattr(plugin_tools, "_get_memory", lambda **kw: _StubMem())
 
     response = plugin_tools.mnemosyne_recall({
         "query": "anything",
@@ -85,7 +85,7 @@ def test_mnemosyne_recall_omits_weights_when_caller_does_not_supply(monkeypatch)
             captured.update(kwargs)
             return []
 
-    monkeypatch.setattr(plugin_tools, "_get_memory", lambda: _StubMem())
+    monkeypatch.setattr(plugin_tools, "_get_memory", lambda **kw: _StubMem())
 
     plugin_tools.mnemosyne_recall({"query": "anything", "top_k": 3})
 
