@@ -10,6 +10,7 @@
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/AxDSan/mnemosyne/actions/workflows/ci.yml/badge.svg)](https://github.com/AxDSan/mnemosyne/actions/workflows/ci.yml)
 [![BEAM](https://img.shields.io/badge/BEAM-ICLR%202026-purple.svg)](https://beam-benchmark.github.io/)
+[![Community](https://img.shields.io/badge/Community-100%25-brightgreen)](CODE_OF_CONDUCT.md)
 [![Discord](https://badgen.net/discord/online-members/29ZszXTgY3)](https://discord.gg/Cgzpw9x3R)
 
 Mnemosyne is a local-first memory system for the [Hermes Agent](https://github.com/NousResearch/hermes-agent) framework. It stores conversations, preferences, and knowledge in SQLite with native vector search (sqlite-vec) and full-text search (FTS5) -- no external databases, no API keys, no network calls.
