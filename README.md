@@ -1,6 +1,6 @@
 # Mnemosyne
 
-![Mnemosyne](/assets/mnemosyne.jpg)
+<img src="/assets/mnemosyne.jpg" alt="Mnemosyne" width="40%">
 
 > Native, zero-cloud memory for AI agents. SQLite-backed. Sub-millisecond. Fully private.
 
