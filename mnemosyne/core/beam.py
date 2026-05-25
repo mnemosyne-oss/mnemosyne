@@ -1915,6 +1915,24 @@ class BeamMemory:
         self.conn.commit()
         self._trim_working_memory()
 
+        # Generate vector embedding for working memory hybrid search
+        if _embeddings.available():
+            try:
+                vec = _embeddings.embed([content])
+                if vec is not None and len(vec) > 0:
+                    model = _embeddings._DEFAULT_MODEL
+                    emb_json = _embeddings.serialize(vec[0])
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+                        (memory_id, emb_json, model)
+                    )
+                    self.conn.commit()
+            except Exception as exc:
+                logger.warning(
+                    "remember: embedding storage failed (%s): %s",
+                    type(exc).__name__, exc,
+                )
+
         # Auto-generate temporal triple
         self._add_temporal_triple(memory_id, timestamp, source, content)
 
