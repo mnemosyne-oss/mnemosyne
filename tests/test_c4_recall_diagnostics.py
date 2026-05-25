@@ -199,10 +199,13 @@ class TestBeamRecallInstrumentation:
         # WM fallback should NOT have fired (FTS produced hits).
         assert snap["totals"]["calls_using_wm_fallback"] == 0
 
-    def test_wm_fallback_fires_when_query_matches_nothing(self, temp_db):
+    def test_wm_fallback_fires_when_query_matches_nothing(self, temp_db, monkeypatch):
         """When neither FTS nor vec finds anything for the query, the
         substring/recency fallback fires. Operators see this via
         `calls_using_wm_fallback` and `wm_fallback`'s hit count."""
+        monkeypatch.setattr(
+            "mnemosyne.core.beam._embeddings.available", lambda: False
+        )
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         # Seed content that won't match the query at all.
         beam.remember("totally unrelated content here", source="x", importance=0.5)
@@ -266,8 +269,11 @@ class TestBeamRecallInstrumentation:
         assert snap["totals"]["calls"] == 1
         assert snap["totals"]["calls_truly_empty"] == 1
 
-    def test_multiple_recall_calls_accumulate(self, temp_db):
+    def test_multiple_recall_calls_accumulate(self, temp_db, monkeypatch):
         """Per-recall counters accumulate correctly across calls."""
+        monkeypatch.setattr(
+            "mnemosyne.core.beam._embeddings.available", lambda: False
+        )
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         beam.remember("Alice prefers Vim", source="pref", importance=0.7)
 
@@ -282,12 +288,15 @@ class TestBeamRecallInstrumentation:
         assert snap["by_tier"]["wm_fts"]["calls_with_hits"] == 2
 
     def test_fallback_rate_metric_useful_for_experiment_monitoring(
-        self, temp_db
+        self, temp_db, monkeypatch
     ):
         """Operators monitoring a BEAM experiment use the fallback
         rate to know if recall is dominated by fallback noise. Test:
         a corpus with no matching content + N queries produces a
         100% wm-fallback rate; a matching corpus produces 0%."""
+        monkeypatch.setattr(
+            "mnemosyne.core.beam._embeddings.available", lambda: False
+        )
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         beam.remember("indexable content with marker zzzqqq", source="t")
 
