@@ -92,23 +92,26 @@ def run_diagnostics() -> Dict:
     except Exception as e:
         log("package", "mnemosyne_version", "ERROR", str(e))
 
-    # --- Core dependencies ---
+    # --- Dependencies ---
+    # Keep local-LLM backends optional. Mnemosyne can run healthy with host/remote
+    # LLM extraction and dense retrieval only; reporting ctransformers as a hard
+    # failure makes small Hermes installs look broken when they are not.
     deps = {
-        "fastembed": "fastembed",
-        "sqlite_vec": "sqlite_vec",
-        "numpy": "numpy",
-        "ctransformers": "ctransformers",
-        "huggingface_hub": "huggingface_hub",
+        "fastembed": ("fastembed", True),
+        "sqlite_vec": ("sqlite_vec", True),
+        "numpy": ("numpy", True),
+        "huggingface_hub": ("huggingface_hub", True),
+        "ctransformers": ("ctransformers", False),
     }
-    for name, module in deps.items():
+    for name, (module, required) in deps.items():
         try:
             mod = __import__(module)
             ver = getattr(mod, "__version__", "unknown")
             log("deps", name, "OK", f"version={ver}")
         except ImportError:
-            log("deps", name, "MISSING")
+            log("deps", name, "MISSING" if required else "OPTIONAL_MISSING")
         except Exception as e:
-            log("deps", name, "ERROR", str(e))
+            log("deps", name, "ERROR" if required else "OPTIONAL_ERROR", str(e))
 
     # --- Mnemosyne core components ---
     try:
@@ -169,6 +172,7 @@ def run_diagnostics() -> Dict:
         "checks_total": len(entries),
         "checks_passed": sum(1 for e in entries if e["status"] in ("OK", "YES", "set")),
         "checks_failed": sum(1 for e in entries if e["status"] in ("MISSING", "NO", "ERROR")),
+        "checks_optional_missing": sum(1 for e in entries if e["status"] in ("OPTIONAL_MISSING", "OPTIONAL_ERROR")),
         "key_findings": [],
         "fixable": [],
         "entries": entries,
