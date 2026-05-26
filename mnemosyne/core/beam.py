@@ -389,7 +389,19 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
     plain sqlite3.Connection.
     """
     path = Path(db_path) if db_path else _default_db_path()
-    if not hasattr(_thread_local, 'conn') or _thread_local.conn is None or getattr(_thread_local, 'db_path', None) != str(path):
+    needs_reconnect = (
+        not hasattr(_thread_local, 'conn')
+        or _thread_local.conn is None
+        or getattr(_thread_local, 'db_path', None) != str(path)
+    )
+    if not needs_reconnect:
+        # Verify the cached connection is still alive
+        try:
+            _thread_local.conn.execute("SELECT 1")
+        except Exception:
+            needs_reconnect = True
+    
+    if needs_reconnect:
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(
             str(path),

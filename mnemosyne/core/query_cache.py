@@ -66,6 +66,10 @@ class QueryCache:
         # Tier 4: Expanded query cache
         self._tier4: Dict[str, List[Dict]] = {}
         
+        # Thread safety
+        self._lock = threading.Lock()
+        self._insert_times: Dict[str, float] = {}  # normalized -> insert time for TTL
+        
         # Stats
         self.hits = 0
         self.misses = 0
@@ -99,16 +103,32 @@ class QueryCache:
         """)
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_hits ON query_cache(hit_count DESC)")
         self._conn.commit()
+        
+        # Load existing cache entries from SQLite into memory
+        try:
+            cursor = self._conn.cursor()
+            cursor.execute("SELECT normalized, results_json FROM query_cache")
+            for row in cursor.fetchall():
+                try:
+                    results = json.loads(row["results_json"])
+                    self._tier1[row["normalized"]] = results
+                    self._tier4[row["normalized"]] = results
+                except Exception:
+                    pass
+        except Exception:
+            pass
     
     def invalidate(self):
         """Invalidate all cached queries. Call after any remember() operation."""
-        self._cache_version += 1
-        self._tier1.clear()
-        self._tier2_3.clear()
-        self._tier4.clear()
-        if self._conn:
-            self._conn.execute("DELETE FROM query_cache")
-            self._conn.commit()
+        with self._lock:
+            self._cache_version += 1
+            self._tier1.clear()
+            self._tier2_3.clear()
+            self._tier4.clear()
+            self._insert_times.clear()
+            if self._conn:
+                self._conn.execute("DELETE FROM query_cache")
+                self._conn.commit()
     
     def _normalize(self, query: str) -> str:
         """Normalize query for cache key (consistent hashing)."""
@@ -157,104 +177,124 @@ class QueryCache:
         """
         normalized = self._normalize(query)
         
-        # Tier 1: Exact normalized match
-        if normalized in self._tier1:
-            self.hits += 1
-            self.tier1_hits += 1
-            return self._tier1[normalized]
-        
-        # Check Tier 2-3 if embedding is provided
-        if embedding:
-            best_score = 0.0
-            best_key = None
+        with self._lock:
+            # Enforce TTL
+            now = time.time()
+            if normalized in self._insert_times:
+                age = now - self._insert_times[normalized]
+                if age > self.ttl_seconds:
+                    # Expired — remove from all tiers
+                    self._tier1.pop(normalized, None)
+                    self._tier2_3.pop(normalized, None)
+                    self._tier4.pop(normalized, None)
+                    self._insert_times.pop(normalized, None)
+                    self.misses += 1
+                    return None
             
-            for cached_key, (cached_emb, cached_results, _) in self._tier2_3.items():
-                cosine = self._cosine_similarity(embedding, cached_emb)
+            # Tier 1: Exact normalized match
+            if normalized in self._tier1:
+                self.hits += 1
+                self.tier1_hits += 1
+                return self._tier1[normalized]
+            
+            # Check Tier 2-3 if embedding is provided
+            if embedding:
+                best_score = 0.0
+                best_key = None
                 
-                # Tier 2: High confidence embedding match
-                if cosine >= 0.88:
-                    best_score = cosine
-                    best_key = cached_key
-                    break  # High enough, take it
-                
-                # Tier 3: Composite match
-                if cosine >= 0.78:
-                    jaccard = self._jaccard_words(query, cached_key)
-                    if jaccard >= 0.15 and cosine > best_score:
+                for cached_key, (cached_emb, cached_results, _) in list(self._tier2_3.items()):
+                    # TTL check for tier 2-3 entries
+                    if cached_key in self._insert_times:
+                        if now - self._insert_times[cached_key] > self.ttl_seconds:
+                            continue
+                    
+                    cosine = self._cosine_similarity(embedding, cached_emb)
+                    
+                    # Tier 2: High confidence embedding match
+                    if cosine >= 0.88:
                         best_score = cosine
                         best_key = cached_key
+                        break  # High enough, take it
+                    
+                    # Tier 3: Composite match
+                    if cosine >= 0.78:
+                        jaccard = self._jaccard_words(query, cached_key)
+                        if jaccard >= 0.15 and cosine > best_score:
+                            best_score = cosine
+                            best_key = cached_key
+                
+                if best_key:
+                    self.hits += 1
+                    if best_score >= 0.88:
+                        self.tier2_hits += 1
+                    else:
+                        self.tier3_hits += 1
+                    return self._tier2_3[best_key][1]
             
-            if best_key:
-                self.hits += 1
-                if best_score >= 0.88:
-                    self.tier2_hits += 1
-                else:
-                    self.tier3_hits += 1
-                return self._tier2_3[best_key][1]
-        
-        # Tier 4: Try synonym-expanded version (best-effort)
-        # This is checked when no exact/embedding match found
-        # Simple: check if normalized query is a subset of any cached
-        query_words = set(normalized.split())
-        for cached_key, results in self._tier4.items():
-            cached_words = set(cached_key.split())
-            overlap = len(query_words & cached_words)
-            if overlap >= len(query_words) * 0.7 and overlap >= 2:
-                self.hits += 1
-                self.tier4_hits += 1
-                return results
-        
-        self.misses += 1
-        return None
+            # Tier 4: Try synonym-expanded version (best-effort)
+            query_words = set(normalized.split())
+            for cached_key, results in list(self._tier4.items()):
+                # TTL check
+                if cached_key in self._insert_times:
+                    if now - self._insert_times[cached_key] > self.ttl_seconds:
+                        continue
+                cached_words = set(cached_key.split())
+                overlap = len(query_words & cached_words)
+                if overlap >= len(query_words) * 0.7 and overlap >= 2:
+                    self.hits += 1
+                    self.tier4_hits += 1
+                    return results
+            
+            self.misses += 1
+            return None
     
     def put(self, query: str, results: List[Dict], embedding: List[float] = None):
         """
         Store results in all applicable cache tiers.
-        
-        Args:
-            query: The search query
-            results: Recall results to cache
-            embedding: Query embedding (for Tier 2-3)
         """
         normalized = self._normalize(query)
         
-        # Tier 1
-        self._tier1[normalized] = results
-        
-        # Tier 2-3
-        if embedding:
-            self._tier2_3[normalized] = (embedding, results, time.time())
-        
-        # Tier 4
-        self._tier4[normalized] = results
-        
-        # SQLite backing
-        if self._conn:
-            try:
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO query_cache (normalized, embedding_json, results_json) VALUES (?, ?, ?)",
-                    (normalized, json.dumps(embedding) if embedding else None, json.dumps(results))
-                )
-                self._conn.commit()
-            except Exception:
-                pass
-        
-        # Evict if over max_size
-        self._evict_if_needed()
+        with self._lock:
+            # Tier 1
+            self._tier1[normalized] = results
+            self._insert_times[normalized] = time.time()
+            
+            # Tier 2-3
+            if embedding:
+                self._tier2_3[normalized] = (embedding, results, time.time())
+            
+            # Tier 4
+            self._tier4[normalized] = results
+            
+            # SQLite backing
+            if self._conn:
+                try:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO query_cache (normalized, embedding_json, results_json) VALUES (?, ?, ?)",
+                        (normalized, json.dumps(embedding) if embedding else None, json.dumps(results))
+                    )
+                    self._conn.commit()
+                except Exception:
+                    pass
+            
+            # Evict if over max_size
+            self._evict_if_needed()
     
     def _evict_if_needed(self):
         """LRU eviction if cache exceeds max_size."""
         total = len(self._tier1)
         if total > self.max_size:
-            # Remove oldest from tier2_3 (which tracks timestamps)
+            # Sort by insert time (oldest first)
             sorted_keys = sorted(
-                self._tier2_3.keys(),
-                key=lambda k: self._tier2_3[k][2] if len(self._tier2_3[k]) > 2 else 0
+                self._insert_times.keys(),
+                key=lambda k: self._insert_times.get(k, 0)
             )
-            for key in sorted_keys[:total - self.max_size]:
-                self._tier2_3.pop(key, None)
+            to_remove = sorted_keys[:total - self.max_size]
+            for key in to_remove:
                 self._tier1.pop(key, None)
+                self._tier2_3.pop(key, None)
                 self._tier4.pop(key, None)
+                self._insert_times.pop(key, None)
     
     @property
     def hit_rate(self) -> float:

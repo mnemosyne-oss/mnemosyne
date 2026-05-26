@@ -69,7 +69,8 @@ STOP_WORDS = {
     "through", "during", "before", "after", "above", "below",
     "between", "under", "and", "but", "or", "nor", "not",
     "so", "than", "too", "very", "just", "about", "also",
-    "really", "actually", "basically", "simply",
+    "really", "actually", "basically", "simply", "if", "then",
+    "else", "while", "because", "though", "although",
 }
 
 

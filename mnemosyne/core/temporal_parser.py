@@ -88,10 +88,10 @@ def _resolve_relative_day(
     
     elif qualifier == "last":
         # Last Monday = Monday of the PREVIOUS week
-        diff = (current_wd - target_wd) % 7
-        if diff == 0:
-            diff = 7  # Today is target day, go back one full week
-        return (reference - timedelta(days=diff + 7)).date()
+        # Formula: days_since_last = ((current_wd - target_wd + 7) % 7) + 7
+        # From Monday: 0+7=7 days. From Tuesday: 1+7=8 days. From Sunday: 6+7=13 days.
+        diff = ((current_wd - target_wd + 7) % 7) + 7
+        return (reference - timedelta(days=diff)).date()
     
     elif qualifier == "next":
         # Next Monday = the upcoming Monday
@@ -126,13 +126,17 @@ def parse_nl_date(
     # ISO format: 2026-05-20
     m = re.search(r'\b(\d{4})-(\d{2})-(\d{2})\b', text)
     if m:
-        d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        week_num = d.isocalendar()[1]
-        return (
-            d,
-            "day",
-            [d.strftime("%Y-%m-%d"), f"week-{week_num}-{d.year}", d.strftime("%A").lower()]
-        )
+        try:
+            d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            d = None  # Invalid date like 2026-02-29
+        if d is not None:
+            week_num = d.isocalendar()[1]
+            return (
+                d,
+                "day",
+                [d.strftime("%Y-%m-%d"), f"week-{week_num}-{d.year}", d.strftime("%A").lower()]
+            )
     
     # US/EU format: 05/20/2026 or 20/05/2026
     m = re.search(r'\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b', text)
