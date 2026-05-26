@@ -2009,6 +2009,11 @@ class BeamMemory:
 
         self._emit_event("MEMORY_ADDED", memory_id, content=content,
                          source=source, importance=importance, metadata=metadata)
+        
+        # Invalidate enhanced recall cache on new memory
+        if hasattr(self, '_query_cache') and self._query_cache is not None:
+            self._query_cache.invalidate()
+        
         return memory_id
 
     def remember_batch(self, items: List[Dict],
@@ -4755,6 +4760,8 @@ class BeamMemory:
         # 8. Associative retrieval via graph traversal
         if use_associative and self.episodic_graph is not None:
             try:
+                # Exclude IDs already in main results
+                existing_ids = {r["id"] for r in results}
                 assoc_ids = set()
                 assoc_results = []
                 for r in results[:5]:  # Top 5 starting points
@@ -4762,13 +4769,23 @@ class BeamMemory:
                         r["id"], depth=associative_depth
                     )
                     for rel in related:
-                        if rel["memory_id"] not in assoc_ids:
-                            assoc_ids.add(rel["memory_id"])
+                        mid = rel["memory_id"]
+                        if mid not in existing_ids and mid not in assoc_ids:
+                            assoc_ids.add(mid)
                             assoc_results.append({
-                                "id": rel["memory_id"],
+                                "id": mid,
+                                "content": f"[Associative: {rel.get('edge_type', 'related')}]",
                                 "source": "associative",
                                 "score": round(rel.get("weight", 0.3), 4),
                                 "tier": "associative",
+                                "timestamp": "",
+                                "importance": 0.3,
+                                "keyword_score": 0.0,
+                                "dense_score": 0.0,
+                                "fts_score": 0.0,
+                                "recall_count": 0,
+                                "last_recalled": None,
+                                "recency_decay": 0.0,
                                 "associative": True,
                                 "connecting_edge": rel.get("edge_type", "related"),
                                 "assoc_depth": rel.get("depth", 1),
