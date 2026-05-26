@@ -26,19 +26,36 @@ from typing import Optional, Union
 # Per-memory-type Weibull parameters (k=shape, eta=scale in hours)
 # Higher eta = slower decay, lower k = more long-term retention
 WEIBULL_PARAMS = {
-    "profile":    {"k": 0.3, "eta": 8760.0},  # ~1 year scale, very slow decay
-    "preference": {"k": 0.4, "eta": 4380.0},  # ~6 months, slow decay
-    "setup":      {"k": 0.6, "eta": 2160.0},  # ~3 months, moderate decay
-    "fact":       {"k": 0.8, "eta": 720.0},   # ~1 month, near-exponential
-    "learning":   {"k": 0.7, "eta": 1440.0},  # ~2 months
-    "pattern":    {"k": 0.6, "eta": 1680.0},  # ~2.3 months
-    "project":    {"k": 0.85, "eta": 1080.0}, # ~45 days
-    "goal":       {"k": 0.9, "eta": 720.0},   # ~1 month
-    "entity":     {"k": 0.5, "eta": 4380.0},  # ~6 months, slow
-    "event":      {"k": 1.2, "eta": 168.0},   # ~1 week, fast decay
-    "issue":      {"k": 1.1, "eta": 336.0},   # ~2 weeks, medium-fast
-    "request":    {"k": 1.5, "eta": 72.0},    # ~3 days, fastest
-    "general":    {"k": 1.0, "eta": 168.0},   # ~1 week, exponential (default)
+    # --- Long-term stable memories ---
+    "profile":      {"k": 0.3, "eta": 8760.0},   # ~1 year scale, very slow decay
+    "preference":   {"k": 0.4, "eta": 4380.0},   # ~6 months, slow decay
+    "relationship": {"k": 0.35, "eta": 8760.0},  # ~1 year, people knowledge
+    "learning":     {"k": 0.7, "eta": 1440.0},   # ~2 months
+    
+    # --- Medium-term working knowledge ---
+    "fact":         {"k": 0.8, "eta": 720.0},    # ~1 month, near-exponential
+    "entity":       {"k": 0.5, "eta": 4380.0},   # ~6 months, slow
+    "setup":        {"k": 0.6, "eta": 2160.0},   # ~3 months, moderate decay
+    "pattern":      {"k": 0.6, "eta": 1680.0},   # ~2.3 months
+    "context":      {"k": 0.85, "eta": 360.0},   # ~15 days, session context
+    "observation":  {"k": 0.9, "eta": 480.0},    # ~20 days
+    "artifact":     {"k": 0.75, "eta": 2160.0},  # ~3 months, code/docs/files
+    
+    # --- Decaying / time-sensitive ---
+    "project":      {"k": 0.85, "eta": 1080.0},  # ~45 days
+    "goal":         {"k": 0.9, "eta": 720.0},    # ~1 month
+    "decision":     {"k": 1.0, "eta": 336.0},    # ~2 weeks
+    "commitment":   {"k": 1.0, "eta": 240.0},    # ~10 days, deadlines
+    
+    # --- Fast-decaying ---
+    "event":        {"k": 1.2, "eta": 168.0},    # ~1 week, fast decay
+    "instruction":  {"k": 0.9, "eta": 480.0},    # ~20 days, how-to knowledge
+    "error":        {"k": 1.1, "eta": 336.0},    # ~2 weeks, medium-fast
+    "issue":        {"k": 1.1, "eta": 336.0},    # ~2 weeks, medium-fast
+    "request":      {"k": 1.5, "eta": 72.0},     # ~3 days, fastest
+    
+    # --- Default ---
+    "general":      {"k": 1.0, "eta": 168.0},    # ~1 week, exponential
 }
 
 
@@ -118,6 +135,8 @@ def weibull_boost(
     # Use Weibull if memory_type has params and no explicit halflife override
     if halflife_hours is not None:
         # Simple exponential fallback
+        if halflife_hours <= 0:
+            return 0.0
         return math.exp(-age_hours / halflife_hours)
     
     params = WEIBULL_PARAMS.get(memory_type)

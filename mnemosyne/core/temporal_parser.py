@@ -307,9 +307,15 @@ def parse_nl_date(
             delta_args["days"] = num * 365
         
         if direction in ("ago", "back", "before", "earlier"):
-            d = (reference - timedelta(**delta_args)).date()
+            try:
+                d = (reference - timedelta(**delta_args)).date()
+            except (OverflowError, ValueError):
+                return None  # Extreme values like 999999 days
         else:
-            d = (reference + timedelta(**delta_args)).date()
+            try:
+                d = (reference + timedelta(**delta_args)).date()
+            except (OverflowError, ValueError):
+                return None
         
         return (d, "day" if unit in ("day", "hour") else "week",
                 [str(d), f"{num}-{unit}s-ago"])
@@ -331,7 +337,10 @@ def parse_nl_date(
         elif unit == "month": delta_args["days"] = num * 30
         elif unit == "year": delta_args["days"] = num * 365
         
-        d = (reference + timedelta(**delta_args)).date()
+        try:
+            d = (reference + timedelta(**delta_args)).date()
+        except (OverflowError, ValueError):
+            return None
         return (d, "day" if unit in ("day", "hour") else "week",
                 [str(d), f"in-{num}-{unit}s"])
     
