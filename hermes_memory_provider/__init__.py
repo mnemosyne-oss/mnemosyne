@@ -568,6 +568,12 @@ class MnemosyneMemoryProvider(MemoryProvider):
         self._surface_beam: Optional[Any] = None
         self._shared_surface_bank = "surface"
         self._shared_surface_path: Optional[Path] = None
+        # When true, mnemosyne_recall merges shared-surface results into the
+        # private bank's recall response. Each result is tagged with `bank`
+        # ("private" or "surface") so callers can distinguish provenance.
+        # Default false preserves existing behavior for deployments that have
+        # not opted in.
+        self._shared_surface_read = False
         # C27: capture init exception so downstream methods can surface it
         # instead of silently no-op'ing. `_beam is None AND _init_error is None`
         # means a deliberate skip (subagent/cron/skill_loop context, or pre-init);
@@ -716,6 +722,15 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if shared_surface_path:
             self._shared_surface_path = Path(str(shared_surface_path)).expanduser()
 
+        shared_surface_read = kwargs.get("shared_surface_read")
+        if shared_surface_read is None:
+            shared_surface_read = self._read_config_key("shared_surface_read")
+        if shared_surface_read is not None:
+            if isinstance(shared_surface_read, str):
+                self._shared_surface_read = shared_surface_read.lower() in ("true", "1", "yes", "on")
+            else:
+                self._shared_surface_read = bool(shared_surface_read)
+
     def _should_filter(self, content: str) -> bool:
         """Check if content matches any ignore pattern. Returns True if it should be skipped."""
         if not self._ignore_patterns:
@@ -750,6 +765,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
             {"key": "ignore_patterns", "description": "Regex patterns to filter from memory storage (one per line in config, or comma-separated). Memories matching any pattern are skipped.", "default": []},
             {"key": "profile_isolation", "description": "Enable per-profile memory isolation via Mnemosyne banks. Each Hermes profile gets its own SQLite database under mnemosyne/data/banks/<profile>/. Default false for backward compatibility.", "default": False},
             {"key": "shared_surface_path", "description": "SQLite path for shared surface memories. Default is <mnemosyne>/data/shared/mnemosyne.db.", "default": "data/shared/mnemosyne.db"},
+            {"key": "shared_surface_read", "description": "When true, mnemosyne_recall merges shared-surface results into private bank recall, tagging each result with its bank ('private' or 'surface'). Default false.", "default": False},
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -1233,7 +1249,39 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 recall_kwargs[weight_key] = args[weight_key]
 
         results = self._beam.recall(query, **recall_kwargs)
-        return json.dumps({"query": query, "count": len(results), "temporal_weight": temporal_weight, "results": results})
+        # Tag private results with their bank so callers can distinguish from
+        # shared-surface entries when surface read is enabled.
+        for r in results:
+            r.setdefault("bank", "private")
+
+        # Optionally merge shared-surface results. Each surface result keeps
+        # its own score (computed by the surface beam) and is tagged
+        # bank="surface" / shared_surface=True. We merge the two ranked lists
+        # by score (when present) and truncate to top_k overall.
+        if self._shared_surface_read:
+            try:
+                self._ensure_surface_beam()
+            except Exception as exc:
+                logger.warning("Mnemosyne shared surface read failed: %s", exc)
+            if self._surface_beam is not None:
+                try:
+                    surface_results = self._surface_beam.recall(query, top_k=top_k)
+                    for r in surface_results:
+                        r["shared_surface"] = True
+                        r["bank"] = self._shared_surface_bank
+                    combined = list(results) + list(surface_results)
+                    combined.sort(key=lambda x: x.get("score") or 0.0, reverse=True)
+                    results = combined[:top_k]
+                except Exception as exc:
+                    logger.warning("Mnemosyne shared surface recall failed: %s", exc)
+
+        return json.dumps({
+            "query": query,
+            "count": len(results),
+            "temporal_weight": temporal_weight,
+            "shared_surface_read": self._shared_surface_read,
+            "results": results,
+        })
 
     @staticmethod
     def _surface_hash(content: str) -> str:
