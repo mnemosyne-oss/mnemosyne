@@ -4739,11 +4739,32 @@ class BeamMemory:
         if use_weibull and weibull_boost is not None:
             temporal_weight = kwargs.get("temporal_weight", 0.0)
             if temporal_weight == 0.0:
+                # Bulk-fetch memory_types from DB (recall() doesn't include them in results)
+                memory_types = {}
+                wm_ids = [r["id"] for r in results if r.get("tier") == "working"]
+                em_ids = [r["id"] for r in results if r.get("tier") == "episodic"]
+                if wm_ids:
+                    placeholders = ",".join("?" * len(wm_ids))
+                    rows = self.conn.execute(
+                        f"SELECT id, memory_type FROM working_memory WHERE id IN ({placeholders})",
+                        wm_ids
+                    ).fetchall()
+                    for row in rows:
+                        memory_types[row["id"]] = row["memory_type"]
+                if em_ids:
+                    placeholders = ",".join("?" * len(em_ids))
+                    rows = self.conn.execute(
+                        f"SELECT id, memory_type FROM episodic_memory WHERE id IN ({placeholders})",
+                        em_ids
+                    ).fetchall()
+                    for row in rows:
+                        memory_types[row["id"]] = row["memory_type"]
+                
                 # Apply Weibull to scores
                 from datetime import datetime as _dt
                 now = _dt.now()
                 for r in results:
-                    memory_type = r.get("memory_type", "general")
+                    memory_type = memory_types.get(r["id"], r.get("memory_type", "general"))
                     if not memory_type or memory_type == "unknown":
                         memory_type = "general"
                     wb = weibull_boost(
@@ -4753,6 +4774,7 @@ class BeamMemory:
                     # Blend Weibull boost into score: 70% original + 30% temporal
                     r["score"] = round(r["score"] * 0.7 + wb * 0.3, 4)
                     r["weibull_boost"] = round(wb, 4)
+                    r["memory_type"] = memory_type
 
         # 6. MMR diversity re-ranking
         if use_mmr and mmr_rerank is not None and len(results) > 1:
