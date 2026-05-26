@@ -295,6 +295,52 @@ INVALIDATE_SCHEMA = {
     },
 }
 
+VALIDATE_SCHEMA = {
+    "name": "mnemosyne_validate",
+    "description": (
+        "Attest, update, or invalidate a memory the caller did not necessarily author. "
+        "Supports collaborative ownership: any agent can validate any memory in either "
+        "the private bank or the shared surface. The original author is preserved; "
+        "validator + validated_at are updated to record the most recent attester. "
+        "A 3-entry ring buffer keeps lightweight history. "
+        "Actions: 'attest' (confirm correctness), 'update' (replace content), "
+        "'invalidate' (mark superseded), 'delete' (remove)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "ID of memory to validate."},
+            "action": {
+                "type": "string",
+                "enum": ["attest", "update", "invalidate", "delete"],
+                "description": "What kind of validation to record.",
+            },
+            "validator": {
+                "type": "string",
+                "description": "Agent identifier performing the validation. Defaults to the caller's agent_identity if not set.",
+                "default": "",
+            },
+            "new_content": {
+                "type": "string",
+                "description": "New content (only used with action='update').",
+                "default": "",
+            },
+            "note": {
+                "type": "string",
+                "description": "Optional reason or evidence for this validation.",
+                "default": "",
+            },
+            "bank": {
+                "type": "string",
+                "enum": ["private", "surface"],
+                "description": "Which bank holds the memory. Default 'private'.",
+                "default": "private",
+            },
+        },
+        "required": ["memory_id", "action"],
+    },
+}
+
 GET_SCHEMA = {
     "name": "mnemosyne_get",
     "description": (
@@ -522,7 +568,7 @@ GRAPH_LINK_SCHEMA = {
 ALL_TOOL_SCHEMAS = [
     REMEMBER_SCHEMA, RECALL_SCHEMA, SHARED_REMEMBER_SCHEMA, SHARED_RECALL_SCHEMA,
     SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
-    INVALIDATE_SCHEMA, GET_SCHEMA, TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA,
+    INVALIDATE_SCHEMA, VALIDATE_SCHEMA, GET_SCHEMA, TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA,
     SCRATCHPAD_WRITE_SCHEMA, SCRATCHPAD_READ_SCHEMA, SCRATCHPAD_CLEAR_SCHEMA,
     EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,
@@ -1133,6 +1179,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 return self._handle_stats(args)
             elif tool_name == "mnemosyne_invalidate":
                 return self._handle_invalidate(args)
+            elif tool_name == "mnemosyne_validate":
+                return self._handle_validate(args)
             elif tool_name == "mnemosyne_get":
                 return self._handle_get(args)
             elif tool_name == "mnemosyne_triple_add":
@@ -1370,6 +1418,124 @@ class MnemosyneMemoryProvider(MemoryProvider):
             return json.dumps({"error": "memory_id is required"})
         self._beam.invalidate(memory_id, replacement_id=replacement_id if replacement_id else None)
         return json.dumps({"status": "invalidated", "memory_id": memory_id})
+
+    def _handle_validate(self, args: Dict[str, Any]) -> str:
+        """Collaborative attestation: any agent can attest, update, invalidate,
+        or delete any memory in either bank. Original author_id is preserved.
+        validator/validated_at/validation_count on the live row capture the
+        most recent attester. memory_validations table holds last 3 entries
+        (trim trigger maintains the ring buffer).
+        """
+        memory_id = args.get("memory_id", "")
+        action = args.get("action", "")
+        bank = args.get("bank", "private")
+        validator = args.get("validator") or self._agent_identity or "unknown"
+        new_content = args.get("new_content", "")
+        note = args.get("note", "")
+
+        if not memory_id:
+            return json.dumps({"error": "memory_id is required"})
+        if action not in ("attest", "update", "invalidate", "delete"):
+            return json.dumps({"error": f"unknown action: {action}"})
+        if bank not in ("private", "surface"):
+            return json.dumps({"error": f"unknown bank: {bank}"})
+        if action == "update" and not new_content:
+            return json.dumps({"error": "new_content is required for action='update'"})
+
+        # Pick the right beam (private vs surface)
+        if bank == "surface":
+            err = self._require_surface_beam()
+            if err:
+                return json.dumps({"error": err})
+            target_beam = self._surface_beam
+        else:
+            if not self._beam:
+                return json.dumps({"error": "private beam not initialized"})
+            target_beam = self._beam
+
+        conn = target_beam.conn
+
+        # Verify the memory exists in this bank
+        existing = conn.execute(
+            "SELECT id, author_id, content FROM working_memory WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        if not existing:
+            return json.dumps({
+                "error": "memory_not_found",
+                "memory_id": memory_id,
+                "bank": bank,
+            })
+
+        author_id = existing[1]
+        prev_content = existing[2]
+
+        # Apply the action atomically
+        try:
+            if action == "delete":
+                conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
+            elif action == "update":
+                conn.execute(
+                    "UPDATE working_memory SET content = ?, validator = ?, "
+                    "validated_at = CURRENT_TIMESTAMP, "
+                    "validation_count = COALESCE(validation_count, 0) + 1 "
+                    "WHERE id = ?",
+                    (new_content, validator, memory_id),
+                )
+            elif action == "invalidate":
+                conn.execute(
+                    "UPDATE working_memory SET valid_until = CURRENT_TIMESTAMP, "
+                    "validator = ?, validated_at = CURRENT_TIMESTAMP, "
+                    "validation_count = COALESCE(validation_count, 0) + 1 "
+                    "WHERE id = ?",
+                    (validator, memory_id),
+                )
+            else:  # attest
+                conn.execute(
+                    "UPDATE working_memory SET validator = ?, "
+                    "validated_at = CURRENT_TIMESTAMP, "
+                    "validation_count = COALESCE(validation_count, 0) + 1 "
+                    "WHERE id = ?",
+                    (validator, memory_id),
+                )
+
+            # Append to ring buffer (trigger trims to last 3 per memory_id)
+            conn.execute(
+                "INSERT INTO memory_validations "
+                "(memory_id, validator, action, new_content, note) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (memory_id, validator, action,
+                 new_content if action == "update" else None,
+                 note or None),
+            )
+            conn.commit()
+        except Exception as exc:
+            return json.dumps({
+                "error": "validation_failed",
+                "reason": str(exc),
+                "memory_id": memory_id,
+            })
+
+        # Audit log if available
+        try:
+            if hasattr(self, "_audit_event"):
+                self._audit_event(
+                    action=f"validate_{action}",
+                    memory_id=memory_id,
+                    bank=bank,
+                    source_tool="mnemosyne_validate",
+                )
+        except Exception:
+            logger.debug("Mnemosyne audit event failed for validate", exc_info=True)
+
+        return json.dumps({
+            "status": f"validation_{action}",
+            "memory_id": memory_id,
+            "bank": bank,
+            "validator": validator,
+            "author_id": author_id,
+            "previous_content": prev_content[:200] if prev_content else None,
+        })
 
     def _handle_get(self, args: Dict[str, Any]) -> str:
         memory_id = args.get("memory_id", "")

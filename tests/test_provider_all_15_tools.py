@@ -52,7 +52,7 @@ class TestToolRegistration:
     def test_all_tools_registered(self, tmp_path):
         provider = _provider(tmp_path)
         names = _tool_names(provider)
-        assert len(names) == 22, f"Expected 22 tools, got {len(names)}"
+        assert len(names) == 23, f"Expected 23 tools, got {len(names)}"
 
     def test_new_8_tools_present(self, tmp_path):
         provider = _provider(tmp_path)
@@ -67,6 +67,11 @@ class TestToolRegistration:
         for tool in ("remember", "recall", "sleep", "stats",
                      "invalidate", "triple_add", "triple_query"):
             assert f"mnemosyne_{tool}" in names
+
+    def test_validate_tool_present(self, tmp_path):
+        provider = _provider(tmp_path)
+        names = _tool_names(provider)
+        assert "mnemosyne_validate" in names
 
     def test_shared_surface_tools_present(self, tmp_path):
         provider = _provider(tmp_path)

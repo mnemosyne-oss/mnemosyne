@@ -796,6 +796,49 @@ def init_beam(db_path: Path = None):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_em_author ON episodic_memory(author_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_em_channel ON episodic_memory(channel_id)")
 
+    # --- Migration: collaborative attestation (v2.7) ---
+    # author_id captures the original writer; validator/validated_at capture
+    # the most recent agent that attested or updated the memory. Together they
+    # let multiple agents collaborate on shared facts without losing origin.
+    _add_column_if_missing(conn, "working_memory", "validator", "TEXT DEFAULT NULL")
+    _add_column_if_missing(conn, "working_memory", "validated_at", "TIMESTAMP DEFAULT NULL")
+    _add_column_if_missing(conn, "working_memory", "validation_count", "INTEGER DEFAULT 0")
+    _add_column_if_missing(conn, "episodic_memory", "validator", "TEXT DEFAULT NULL")
+    _add_column_if_missing(conn, "episodic_memory", "validated_at", "TIMESTAMP DEFAULT NULL")
+    _add_column_if_missing(conn, "episodic_memory", "validation_count", "INTEGER DEFAULT 0")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_wm_validator ON working_memory(validator)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_wm_validated_at ON working_memory(validated_at)")
+
+    # Ring-buffer log capped at 3 entries per memory (lightweight history).
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS memory_validations (
+            validation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id TEXT NOT NULL,
+            validator TEXT NOT NULL,
+            validated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            action TEXT NOT NULL,
+            new_content TEXT,
+            note TEXT
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_validations_memory ON memory_validations(memory_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_validations_validator ON memory_validations(validator)")
+    # Trim each memory's validation history to the most recent 3 entries.
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS trim_validations_to_3
+        AFTER INSERT ON memory_validations
+        BEGIN
+            DELETE FROM memory_validations
+            WHERE memory_id = NEW.memory_id
+              AND validation_id NOT IN (
+                  SELECT validation_id FROM memory_validations
+                  WHERE memory_id = NEW.memory_id
+                  ORDER BY validation_id DESC
+                  LIMIT 3
+              );
+        END
+    """)
+
     # --- FACTS (LLM-extracted structured knowledge) ---
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS facts (
