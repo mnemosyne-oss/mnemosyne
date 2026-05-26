@@ -1937,6 +1937,11 @@ class BeamMemory:
             self._ingest_graph_and_veracity(existing_id, content, source, veracity)
             self._emit_event("MEMORY_UPDATED", existing_id, content=content,
                              source=source, importance=importance, metadata=metadata)
+            
+            # Invalidate enhanced recall cache on memory update
+            if hasattr(self, '_query_cache') and self._query_cache is not None:
+                self._query_cache.invalidate()
+            
             return existing_id
 
         memory_id = memory_id or _generate_id(content)

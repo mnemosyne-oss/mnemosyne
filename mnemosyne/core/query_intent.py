@@ -62,8 +62,8 @@ INTENT_PATTERNS = [
     # ENTITY — seeking info about a person/place/thing
     ("entity", [
         r"\b(tell\s+me\s+about|what\s+do\s+you\s+know\s+about)\b",
-        r"\b(who\s+is|what\s+does)\s+[A-Z][a-z]+\b",
-        r"\b(about|regarding|concerning)\s+[A-Z][a-z]+\b",
+        r"\b(who\s+is|what\s+does)\s+[a-z]+\b",
+        r"\b(about|regarding|concerning)\s+[a-z]+\b",
     ]),
     
     # PREFERENCE — likes, dislikes, preferences
@@ -111,7 +111,7 @@ def classify_intent(query: str) -> QueryIntent:
     for category, patterns in INTENT_PATTERNS:
         matches = 0
         for pattern in patterns:
-            if re.search(pattern, query_lower, re.IGNORECASE):
+            if re.search(pattern, query_lower):
                 matches += 1
                 all_signals.append(category)
         

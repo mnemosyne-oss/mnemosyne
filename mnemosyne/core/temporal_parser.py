@@ -39,7 +39,7 @@ DAY_MAP = {
 
 MONTH_MAP = {
     "january": 1, "february": 2, "march": 3, "april": 4,
-    "may": 4, "june": 6, "july": 7, "august": 8,
+    "may": 5, "june": 6, "july": 7, "august": 8,
     "september": 9, "october": 10, "november": 11, "december": 12,
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
@@ -141,20 +141,23 @@ def parse_nl_date(
     # US/EU format: 05/20/2026 or 20/05/2026
     m = re.search(r'\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b', text)
     if m:
-        a, b, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if y < 100:
-            y += 2000
-        # Heuristic: if first number > 12, it's day/month/year (EU)
-        if a > 12:
-            d = date(y, b, a)
-        else:
-            d = date(y, a, b)
-        week_num = d.isocalendar()[1]
-        return (
-            d,
-            "day",
-            [d.strftime("%Y-%m-%d"), f"week-{week_num}-{d.year}", d.strftime("%A").lower()]
-        )
+        try:
+            a, b, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if y < 100:
+                y += 2000
+            # Heuristic: if first number > 12, it's day/month/year (EU)
+            if a > 12:
+                d = date(y, b, a)
+            else:
+                d = date(y, a, b)
+            week_num = d.isocalendar()[1]
+            return (
+                d,
+                "day",
+                [d.strftime("%Y-%m-%d"), f"week-{week_num}-{d.year}", d.strftime("%A").lower()]
+            )
+        except ValueError:
+            pass  # Invalid date, fall through
     
     # Named month + day: "May 20, 2026" or "May 20"
     m = re.search(
@@ -165,16 +168,19 @@ def parse_nl_date(
         text_lower
     )
     if m:
-        month = MONTH_MAP.get(m.group(1), 1)
-        day_num = int(m.group(2))
-        year = int(m.group(3)) if m.group(3) else reference.year
-        d = date(year, month, day_num)
-        week_num = d.isocalendar()[1]
-        return (
-            d,
-            "day",
-            [d.strftime("%Y-%m-%d"), f"week-{week_num}-{d.year}", d.strftime("%A").lower()]
-        )
+        try:
+            month = MONTH_MAP.get(m.group(1), 1)
+            day_num = int(m.group(2))
+            year = int(m.group(3)) if m.group(3) else reference.year
+            d = date(year, month, day_num)
+            week_num = d.isocalendar()[1]
+            return (
+                d,
+                "day",
+                [d.strftime("%Y-%m-%d"), f"week-{week_num}-{d.year}", d.strftime("%A").lower()]
+            )
+        except ValueError:
+            pass  # Invalid date like Feb 30, fall through
     
     # ---- Relative dates ----
     if re.search(r'\btoday\b', text_lower):

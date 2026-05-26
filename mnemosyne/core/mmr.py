@@ -38,21 +38,6 @@ def _jaccard_similarity(text_a: str, text_b: str) -> float:
     return len(intersection) / len(union)
 
 
-def _cosine_similarity_from_words(text_a: str, text_b: str) -> float:
-    """
-    Approximate cosine similarity using word overlap.
-    Fast approximation — full embedding cosine is too expensive for MMR.
-    """
-    words_a = set(text_a.lower().split())
-    words_b = set(text_b.lower().split())
-    
-    if not words_a or not words_b:
-        return 0.0
-    
-    intersection = words_a & words_b
-    return len(intersection) / (math.sqrt(len(words_a)) * math.sqrt(len(words_b)))
-
-
 def mmr_rerank(
     results: List[Dict],
     lambda_param: float = 0.7,

@@ -281,10 +281,22 @@ class QueryCache:
             self._evict_if_needed()
     
     def _evict_if_needed(self):
-        """LRU eviction if cache exceeds max_size."""
+        """LRU eviction if cache exceeds max_size. Also cleans TTL-expired entries."""
+        # First, clean up any TTL-expired entries
+        now = time.time()
+        expired = [
+            k for k, t in list(self._insert_times.items())
+            if now - t > self.ttl_seconds
+        ]
+        for key in expired:
+            self._tier1.pop(key, None)
+            self._tier2_3.pop(key, None)
+            self._tier4.pop(key, None)
+            self._insert_times.pop(key, None)
+        
+        # Then evict oldest if still over max_size
         total = len(self._tier1)
         if total > self.max_size:
-            # Sort by insert time (oldest first)
             sorted_keys = sorted(
                 self._insert_times.keys(),
                 key=lambda k: self._insert_times.get(k, 0)
@@ -295,6 +307,19 @@ class QueryCache:
                 self._tier2_3.pop(key, None)
                 self._tier4.pop(key, None)
                 self._insert_times.pop(key, None)
+    
+    def close(self):
+        """Close the SQLite connection and release resources."""
+        if self._conn:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+    
+    def __del__(self):
+        """Ensure connection is closed on garbage collection."""
+        self.close()
     
     @property
     def hit_rate(self) -> float:
