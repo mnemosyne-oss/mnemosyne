@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Comprehensive test suite for Mnemosyne Temporal Upgrade.
-Tests all Noxem-ported features with dummy data only.
+Tests all enhanced recall features with dummy data only.
 No real user data is used at any point.
 
 Run: MNEMOSYNE_ENHANCED_RECALL=1 python3 test_temporal_upgrade.py

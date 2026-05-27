@@ -12,7 +12,7 @@ them to concrete dates. Supports:
 - Named times: "morning", "afternoon", "evening"
 - Vague: "recently", "lately", "a while ago"
 
-Port of noxem-server's temporal-extraction.mjs to Python.
+Port of memory system's temporal-extraction.mjs to Python.
 
 Usage:
     from mnemosyne.core.temporal_parser import extract_temporal, parse_nl_date

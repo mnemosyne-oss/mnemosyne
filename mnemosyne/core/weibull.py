@@ -9,7 +9,7 @@ The Weibull distribution provides:
 - Constant hazard rate (k = 1): exponential, same as current behavior (general facts)
 - Increasing hazard rate (k > 1): memories decay faster over time (events, requests)
 
-Noxem compatibility: mirrors the per-type eta/k parameters from noxem-server's
+Memory system compatibility: mirrors the per-type eta/k parameters from memory system's
 Weibull decay system.
 
 Usage:

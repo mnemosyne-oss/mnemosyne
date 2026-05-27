@@ -102,7 +102,7 @@ except ImportError:
             return norm
         return "unknown"
 
-# Enhanced recall modules (Phase 5 — Noxem feature ports, gated by MNEMOSYNE_ENHANCED_RECALL=1)
+# Enhanced recall modules (Phase 5 — Memory enhancement ports, gated by MNEMOSYNE_ENHANCED_RECALL=1)
 try:
     from mnemosyne.core.weibull import weibull_boost
 except ImportError:
@@ -870,7 +870,7 @@ def init_beam(db_path: Path = None):
     except (sqlite3.OperationalError, RuntimeError):
         pass  # sqlite-vec not available
 
-    # --- Temporal architecture migration (Phase 5 — Noxem feature port) ---
+    # --- Temporal architecture migration (Phase 5 — temporal extraction) ---
     _add_column_if_missing(conn, "working_memory", "event_date", "TEXT DEFAULT NULL")
     _add_column_if_missing(conn, "working_memory", "event_date_precision", "TEXT DEFAULT 'unknown'")
     _add_column_if_missing(conn, "working_memory", "temporal_tags", "TEXT DEFAULT '[]'")
@@ -1979,7 +1979,7 @@ class BeamMemory:
         # Auto-generate temporal triple
         self._add_temporal_triple(memory_id, timestamp, source, content)
 
-        # --- Temporal extraction (Phase 5 — Noxem port) ---
+        # --- Temporal extraction (Phase 5 — temporal extraction) ---
         if extract_temporal is not None:
             try:
                 temporal_info = extract_temporal(content)
@@ -4681,7 +4681,7 @@ class BeamMemory:
                         mmr_lambda: float = 0.7,
                         **kwargs) -> List[Dict]:
         """
-        Enhanced recall with all Noxem-ported features.
+        Enhanced recall with all enhanced recall features.
 
         Wraps the existing recall() pipeline and adds:
         - Query intent classification → adjusted vec/fts/importance weights
