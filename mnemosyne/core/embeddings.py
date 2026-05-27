@@ -54,6 +54,16 @@ def _is_api_model(model_name: str) -> bool:
     base_url = os.environ.get("OPENROUTER_BASE_URL", "")
     if base_url and "openrouter.ai" not in base_url:
         return True
+    # Explicit opt-in for non-OpenAI embedding models hosted on OpenRouter
+    # (qwen/qwen3-embedding-*, baai/bge-*, jina-embeddings-*, nvidia/*-embed-*, etc.).
+    # Distinct from the substring/prefix checks above because the default fastembed
+    # model id (BAAI/bge-small-en-v1.5) shares the same vendor-prefix shape as those
+    # OpenRouter models — pure name-pattern matching would silently break fastembed
+    # users that also have OPENROUTER_API_KEY set for chat. Requiring an explicit
+    # env flag keeps local-first behavior the default while giving a clean opt-in
+    # for OpenRouter-hosted embedding models.
+    if os.environ.get("MNEMOSYNE_EMBEDDINGS_VIA_API", "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
     return False
 
 
