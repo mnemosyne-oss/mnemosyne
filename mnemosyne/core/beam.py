@@ -82,9 +82,6 @@ except ImportError:
     }
 
     # Surface degraded mode at import time so operators see ONE signal
-    # in startup logs that the canonical helper isn't available. Without
-    # this, the fallback silently clamps every bad label with no audit
-    # trail across the run.
     logger.warning(
         "mnemosyne.core.veracity_consolidation unavailable; using fallback "
         "clamp_veracity. Non-canonical veracity labels will be clamped "
@@ -93,29 +90,46 @@ except ImportError:
     )
 
     def aggregate_veracity(source_veracities) -> str:
-        """Fallback aggregator when veracity_consolidation is unavailable.
-        Returns 'unknown' unconditionally so consolidation doesn't crash."""
         return "unknown"
 
     def clamp_veracity(raw, *, context: str = "veracity") -> str:
-        """Fallback when veracity_consolidation is unavailable.
-        Mirrors the canonical helper's API and clamps non-canonical
-        labels to 'unknown'. Does NOT log per-call warnings -- the
-        import-time warning above is the audit signal. Operators
-        should fix the import to restore full observability.
-        """
         if raw is None:
             return "unknown"
         norm = str(raw).strip().lower()
         if not norm:
             return "unknown"
-        # Without the canonical allowlist available, fall back to the
-        # known-safe set inline. Drift between this literal and the
-        # canonical set is bounded by the fact that this branch
-        # only fires when the import is broken.
         if norm in {"stated", "inferred", "tool", "imported", "unknown"}:
             return norm
         return "unknown"
+
+# Enhanced recall modules (Phase 5 — Noxem feature ports, gated by MNEMOSYNE_ENHANCED_RECALL=1)
+try:
+    from mnemosyne.core.weibull import weibull_boost
+except ImportError:
+    weibull_boost = None
+try:
+    from mnemosyne.core.query_intent import classify_intent, adjust_weights
+except ImportError:
+    classify_intent = None
+    adjust_weights = None
+try:
+    from mnemosyne.core.synonyms import expand_query, normalize_query
+except ImportError:
+    expand_query = None
+    normalize_query = None
+try:
+    from mnemosyne.core.mmr import mmr_rerank
+except ImportError:
+    mmr_rerank = None
+try:
+    from mnemosyne.core.query_cache import QueryCache
+except ImportError:
+    QueryCache = None
+try:
+    from mnemosyne.core.temporal_parser import extract_temporal, parse_nl_date
+except ImportError:
+    extract_temporal = None
+    parse_nl_date = None
 
 # ------------------------------------------------------------------
 # Trust tier derivation from ingestion source (plugin-first architecture)
@@ -375,7 +389,19 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
     plain sqlite3.Connection.
     """
     path = Path(db_path) if db_path else _default_db_path()
-    if not hasattr(_thread_local, 'conn') or _thread_local.conn is None or getattr(_thread_local, 'db_path', None) != str(path):
+    needs_reconnect = (
+        not hasattr(_thread_local, 'conn')
+        or _thread_local.conn is None
+        or getattr(_thread_local, 'db_path', None) != str(path)
+    )
+    if not needs_reconnect:
+        # Verify the cached connection is still alive
+        try:
+            _thread_local.conn.execute("SELECT 1")
+        except Exception:
+            needs_reconnect = True
+    
+    if needs_reconnect:
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(
             str(path),
@@ -843,6 +869,18 @@ def init_beam(db_path: Path = None):
         """)
     except (sqlite3.OperationalError, RuntimeError):
         pass  # sqlite-vec not available
+
+    # --- Temporal architecture migration (Phase 5 — Noxem feature port) ---
+    _add_column_if_missing(conn, "working_memory", "event_date", "TEXT DEFAULT NULL")
+    _add_column_if_missing(conn, "working_memory", "event_date_precision", "TEXT DEFAULT 'unknown'")
+    _add_column_if_missing(conn, "working_memory", "temporal_tags", "TEXT DEFAULT '[]'")
+    _add_column_if_missing(conn, "working_memory", "corrected_by", "INTEGER DEFAULT NULL")
+    _add_column_if_missing(conn, "episodic_memory", "event_date", "TEXT DEFAULT NULL")
+    _add_column_if_missing(conn, "episodic_memory", "event_date_precision", "TEXT DEFAULT 'unknown'")
+    _add_column_if_missing(conn, "episodic_memory", "temporal_tags", "TEXT DEFAULT '[]'")
+    _add_column_if_missing(conn, "episodic_memory", "corrected_by", "INTEGER DEFAULT NULL")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_wm_event_date ON working_memory(event_date)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_em_event_date ON episodic_memory(event_date)")
 
 
 class _BeamConnection(sqlite3.Connection):
@@ -1899,6 +1937,11 @@ class BeamMemory:
             self._ingest_graph_and_veracity(existing_id, content, source, veracity)
             self._emit_event("MEMORY_UPDATED", existing_id, content=content,
                              source=source, importance=importance, metadata=metadata)
+            
+            # Invalidate enhanced recall cache on memory update
+            if hasattr(self, '_query_cache') and self._query_cache is not None:
+                self._query_cache.invalidate()
+            
             return existing_id
 
         memory_id = memory_id or _generate_id(content)
@@ -1936,6 +1979,23 @@ class BeamMemory:
         # Auto-generate temporal triple
         self._add_temporal_triple(memory_id, timestamp, source, content)
 
+        # --- Temporal extraction (Phase 5 — Noxem port) ---
+        if extract_temporal is not None:
+            try:
+                temporal_info = extract_temporal(content)
+                if temporal_info and temporal_info.get("event_date"):
+                    import json as _json_tmp
+                    cursor.execute(
+                        "UPDATE working_memory SET event_date=?, event_date_precision=?, temporal_tags=? WHERE id=?",
+                        (temporal_info["event_date"],
+                         temporal_info["event_date_precision"],
+                         _json_tmp.dumps(temporal_info["temporal_tags"]),
+                         memory_id)
+                    )
+                    self.conn.commit()
+            except Exception:
+                pass  # Temporal extraction is best-effort
+
         # --- Entity extraction ---
         if extract_entities:
             _extract_and_store_entities(self, memory_id, content)
@@ -1954,6 +2014,11 @@ class BeamMemory:
 
         self._emit_event("MEMORY_ADDED", memory_id, content=content,
                          source=source, importance=importance, metadata=metadata)
+        
+        # Invalidate enhanced recall cache on new memory
+        if hasattr(self, '_query_cache') and self._query_cache is not None:
+            self._query_cache.invalidate()
+        
         return memory_id
 
     def remember_batch(self, items: List[Dict],
@@ -4604,6 +4669,164 @@ class BeamMemory:
         _recall_diag.record_call(truly_empty=_truly_empty)
 
         return final_results
+
+    def recall_enhanced(self, query: str, top_k: int = 40, *,
+                        use_cache: bool = True,
+                        use_weibull: bool = True,
+                        use_mmr: bool = True,
+                        use_intent: bool = True,
+                        use_synonyms: bool = True,
+                        use_associative: bool = False,
+                        associative_depth: int = 1,
+                        mmr_lambda: float = 0.7,
+                        **kwargs) -> List[Dict]:
+        """
+        Enhanced recall with all Noxem-ported features.
+
+        Wraps the existing recall() pipeline and adds:
+        - Query intent classification → adjusted vec/fts/importance weights
+        - Synonym expansion → broader FTS5/vector matching
+        - Weibull decay → per-memory-type temporal scoring
+        - MMR re-ranking → diversity optimization
+        - Query cache → 5-tier semantic caching
+        - Associative retrieval → graph-traversal for related memories
+
+        Feature-gated by MNEMOSYNE_ENHANCED_RECALL=1 for backward compatibility.
+        Without the flag, falls through to original recall() unchanged.
+        """
+        import os as _os
+        if _os.environ.get("MNEMOSYNE_ENHANCED_RECALL", "0") != "1":
+            return self.recall(query, top_k=top_k, **kwargs)
+
+        import json as _json
+
+        original_query = query
+        expanded_query = query
+
+        # 1. Query intent classification
+        if use_intent and classify_intent is not None:
+            intent = classify_intent(query)
+            if intent.category != "general" and adjust_weights is not None:
+                vw, fw, iw = adjust_weights(
+                    base_vec=kwargs.pop("vec_weight", 0.5),
+                    base_fts=kwargs.pop("fts_weight", 0.3),
+                    base_importance=kwargs.pop("importance_weight", 0.2),
+                    intent=intent,
+                )
+                kwargs["vec_weight"] = vw
+                kwargs["fts_weight"] = fw
+                kwargs["importance_weight"] = iw
+
+        # 2. Synonym expansion
+        if use_synonyms and expand_query is not None:
+            expanded_query = expand_query(query)
+
+        # 3. Query cache check (Tier 1-4)
+        cached = None
+        if use_cache and QueryCache is not None:
+            if not hasattr(self, '_query_cache'):
+                cache_db = self.db_path.parent / "query_cache.db"
+                self._query_cache = QueryCache(db_path=cache_db)
+            cached = self._query_cache.get(original_query)
+
+        if cached is not None:
+            return cached[:top_k]
+
+        # 4. Run base recall with expanded query
+        results = self.recall(expanded_query, top_k=top_k * 2, **kwargs)
+
+        # 5. Weibull re-scoring (if not already using temporal_weight)
+        if use_weibull and weibull_boost is not None:
+            temporal_weight = kwargs.get("temporal_weight", 0.0)
+            if temporal_weight == 0.0:
+                # Bulk-fetch memory_types from DB (recall() doesn't include them in results)
+                memory_types = {}
+                wm_ids = [r["id"] for r in results if r.get("tier") == "working"]
+                em_ids = [r["id"] for r in results if r.get("tier") == "episodic"]
+                if wm_ids:
+                    placeholders = ",".join("?" * len(wm_ids))
+                    rows = self.conn.execute(
+                        f"SELECT id, memory_type FROM working_memory WHERE id IN ({placeholders})",
+                        wm_ids
+                    ).fetchall()
+                    for row in rows:
+                        memory_types[row["id"]] = row["memory_type"]
+                if em_ids:
+                    placeholders = ",".join("?" * len(em_ids))
+                    rows = self.conn.execute(
+                        f"SELECT id, memory_type FROM episodic_memory WHERE id IN ({placeholders})",
+                        em_ids
+                    ).fetchall()
+                    for row in rows:
+                        memory_types[row["id"]] = row["memory_type"]
+                
+                # Apply Weibull to scores
+                from datetime import datetime as _dt
+                now = _dt.now()
+                for r in results:
+                    memory_type = memory_types.get(r["id"], r.get("memory_type", "general"))
+                    if not memory_type or memory_type == "unknown":
+                        memory_type = "general"
+                    wb = weibull_boost(
+                        r.get("timestamp"), now,
+                        memory_type=memory_type,
+                    )
+                    # Blend Weibull boost into score: 70% original + 30% temporal
+                    r["score"] = round(r["score"] * 0.7 + wb * 0.3, 4)
+                    r["weibull_boost"] = round(wb, 4)
+                    r["memory_type"] = memory_type
+
+        # 6. MMR diversity re-ranking
+        if use_mmr and mmr_rerank is not None and len(results) > 1:
+            results = mmr_rerank(results, lambda_param=mmr_lambda, top_k=top_k * 2)
+
+        # 7. Sort by score and take top results
+        results.sort(key=lambda x: x.get("score", 0), reverse=True)
+        results = results[:top_k]
+
+        # 8. Associative retrieval via graph traversal
+        if use_associative and self.episodic_graph is not None:
+            try:
+                # Exclude IDs already in main results
+                existing_ids = {r["id"] for r in results}
+                assoc_ids = set()
+                assoc_results = []
+                for r in results[:5]:  # Top 5 starting points
+                    related = self.episodic_graph.find_related_memories(
+                        r["id"], depth=associative_depth
+                    )
+                    for rel in related:
+                        mid = rel["memory_id"]
+                        if mid not in existing_ids and mid not in assoc_ids:
+                            assoc_ids.add(mid)
+                            assoc_results.append({
+                                "id": mid,
+                                "content": f"[Associative: {rel.get('edge_type', 'related')}]",
+                                "source": "associative",
+                                "score": round(rel.get("weight", 0.3), 4),
+                                "tier": "associative",
+                                "timestamp": "",
+                                "importance": 0.3,
+                                "keyword_score": 0.0,
+                                "dense_score": 0.0,
+                                "fts_score": 0.0,
+                                "recall_count": 0,
+                                "last_recalled": None,
+                                "recency_decay": 0.0,
+                                "associative": True,
+                                "connecting_edge": rel.get("edge_type", "related"),
+                                "assoc_depth": rel.get("depth", 1),
+                            })
+                # Append associative results
+                results.extend(assoc_results[:5])
+            except Exception:
+                pass  # Associative retrieval is best-effort
+
+        # 9. Cache results
+        if use_cache and hasattr(self, '_query_cache') and self._query_cache is not None:
+            self._query_cache.put(original_query, results)
+
+        return results
 
     def _dedup_cross_tier_summary_links(
         self,
