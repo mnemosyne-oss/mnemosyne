@@ -21,7 +21,7 @@ DEFAULT_MODEL_FILE = "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
 MODEL_CACHE_DIR = Path.home() / ".hermes" / "mnemosyne" / "models"
 
 LLM_ENABLED = os.environ.get("MNEMOSYNE_LLM_ENABLED", "true").lower() in ("1", "true", "yes")
-LLM_MAX_TOKENS = int(os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "2048"))
+LLM_MAX_TOKENS=int(os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "2048") or "2048")
 LLM_N_THREADS = int(os.environ.get("MNEMOSYNE_LLM_N_THREADS", "4"))
 LLM_N_CTX = int(os.environ.get("MNEMOSYNE_LLM_N_CTX", "2048"))
 
@@ -248,7 +248,7 @@ def _build_prompt(memories: List[str], source: str = "") -> str:
     if source:
         header += f" Source: {source}."
 
-    prompt = f"{header}\n\n{_memory_lines(memories)}\n\nSummary:"
+    prompt = f"/no_think\n{header}\n\n{_memory_lines(memories)}\n\nSummary:"
     return prompt
 
 
