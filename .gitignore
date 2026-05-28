@@ -76,3 +76,4 @@ DEVOPS_PLAN_*
 .hermes/
 results/
 [bank]/
+.codegraph/
