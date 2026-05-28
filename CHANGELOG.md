@@ -3,7 +3,31 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Simple Versioning](https://github.com/AxDSan/mnemosyne) (MAJOR.MINOR).
+and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
+
+## [3.1.2] — 2026-05-28
+
+### Fixed
+
+- **Irrelevant context injection in recall.** Three root-cause fixes for
+  [#198](https://github.com/AxDSan/mnemosyne/issues/198):
+  - Strict fact matching is now the default. Set `MNEMOSYNE_LENIENT_FACT_MATCH=1`
+    to opt back into permissive matching (which matched any query word against any
+    stored fact, dragging in unrelated memories with a false +20% score boost).
+  - Entity prefix similarity (`similarity()` in `entities.py`) now requires a
+    minimum 30% length ratio. Short prefixes like "her" no longer match "Hermes" at
+    0.828.
+  - Single-token strict fact queries (5+ chars, stopword-filtered) now match.
+    Queries like "hermes", "python", "react" were silently rejected.
+- `.codegraph/` no longer accidentally tracked in git.
+
+### Changed
+
+- `MNEMOSYNE_STRICT_FACT_MATCH` env var removed. Use `MNEMOSYNE_LENIENT_FACT_MATCH=1`
+  to opt back into permissive fact matching.
+- `RELEASING.md` added with official SemVer release policy.
+- `.githooks/pre-push` hook validates tags match `__version__` and SemVer format.
+- Git hooks path set to `.githooks` (run `git config core.hooksPath .githooks` on clones).
 
 ## [3.1.1] — 2026-05-28
 
