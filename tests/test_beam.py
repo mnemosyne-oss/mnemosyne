@@ -64,7 +64,7 @@ class TestFactAnnotationMatching:
         assert result == {"target"}
 
     def test_legacy_fact_match_preserved_when_flag_off(self, monkeypatch):
-        monkeypatch.delenv("MNEMOSYNE_STRICT_FACT_MATCH", raising=False)
+        monkeypatch.setenv("MNEMOSYNE_LENIENT_FACT_MATCH", "1")
         beam = _FakeBeam([
             {"memory_id": "legacy", "value": "The user likes coffee."},
         ])
@@ -72,6 +72,18 @@ class TestFactAnnotationMatching:
         result = set(_find_memories_by_fact(beam, "where is the dashboard"))
 
         assert result == {"legacy"}
+
+
+    def test_strict_fact_match_default(self):
+        """With no env var, strict matching is on by default — common stopwords
+        like 'where is the' should NOT match. Only significant tokens apply."""
+        beam = _FakeBeam([
+            {"memory_id": "a", "value": "The user likes coffee."},
+        ])
+
+        result = set(_find_memories_by_fact(beam, "where is the dashboard"))
+
+        assert result == set()
 
 
 class TestBeamSchema:

@@ -70,7 +70,7 @@ def test_end_to_end_extract_recall():
         )
 
         # Now recall with a query that matches the facts
-        results = mem.recall("what does the user like", top_k=5)
+        results = mem.recall("does the user like coffee", top_k=5)  # "coffee" (6 chars) passes strict match
 
         # Should find the memory via fact matching
         assert len(results) > 0, "Recall should find results"

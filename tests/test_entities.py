@@ -206,10 +206,10 @@ class TestEdgeCases(unittest.TestCase):
 
     def test_similarity_with_empty(self):
         self.assertEqual(similarity("", ""), 1.0)
-        # Empty vs non-empty: prefix match path — shorter is empty (len 0),
-        # longer is "abc" (len 3), so 0.7 + (0/3)*0.3 = 0.7
-        self.assertEqual(similarity("abc", ""), 0.7)
-        self.assertEqual(similarity("", "abc"), 0.7)
+        # Empty vs non-empty: prefix match with length ratio 0.0 < 0.3 guard
+        # returns 0.0 (an empty string is NOT 70% similar to any entity)
+        self.assertEqual(similarity("abc", ""), 0.0)
+        self.assertEqual(similarity("", "abc"), 0.0)
 
     def test_levenshtein_with_none(self):
         # Should handle None gracefully or raise TypeError
