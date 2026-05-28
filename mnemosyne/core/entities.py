@@ -118,6 +118,10 @@ def similarity(s1: str, s2: str) -> float:
     if s1_lower.startswith(s2_lower) or s2_lower.startswith(s1_lower):
         longer = max(len(s1_lower), len(s2_lower))
         shorter = min(len(s1_lower), len(s2_lower))
+        # Require at least 30% length ratio to avoid short prefix noise
+        # (e.g. "her" prefix-matching "Hermes" with only 3/7 ratio)
+        if shorter / longer < 0.3:
+            return 0.0
         return 0.7 + (shorter / longer) * 0.3  # 0.7 base + scaled bonus
 
     # Substring match: 'Mr. Smith' contains 'Smith'

@@ -1545,8 +1545,12 @@ def _strict_fact_matches(query: str, fact_text: str) -> bool:
     # Allow a single highly distinctive exact token, but not arbitrary words.
     if len(overlap) == 1:
         token = next(iter(overlap))
-        has_structure = any(c in token for c in (".", "/", ":", "-", "_"))
-        return len(token) >= 8 and has_structure
+        # Long structured tokens (paths/domains/identifiers) are very distinctive
+        if len(token) >= 8 and any(c in token for c in (".", "/", ":", "-", "_")):
+            return True
+        # Medium tokens (5+ chars) that passed the stopword filter are significant
+        # enough for single-token fact queries like "hermes", "python", "react"
+        return len(token) >= 5
 
     return False
 
@@ -1568,7 +1572,7 @@ def _find_memories_by_fact(beam: "BeamMemory", query: str) -> List[str]:
 
         query_lower = query.lower()
         query_words = set(query_lower.split())
-        strict_fact_match = _env_truthy("MNEMOSYNE_STRICT_FACT_MATCH")
+        strict_fact_match = not _env_truthy("MNEMOSYNE_LENIENT_FACT_MATCH")
 
         # Simple keyword matching against fact text
         memory_ids: Set[str] = set()
