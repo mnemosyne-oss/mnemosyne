@@ -2,6 +2,13 @@
 
 Mnemosyne is designed to work with zero configuration. All settings have sensible defaults and are overridden via environment variables.
 
+## Custom Embedding Endpoint
+
+|| Variable | Default | Description |
+||---|---|---|
+|| `MNEMOSYNE_EMBEDDING_API_URL` | `${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}` | Preferred name for custom embedding API endpoint. Falls back to `OPENROUTER_BASE_URL`. |
+|| `MNEMOSYNE_EMBEDDING_API_KEY` | `${OPENROUTER_API_KEY:-${OPENAI_API_KEY:-}}` | Preferred name for embedding API key. Falls back to `OPENROUTER_API_KEY`, then `OPENAI_API_KEY`. |
+
 ## Data Directory
 
 ```bash
