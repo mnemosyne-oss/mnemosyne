@@ -25,6 +25,7 @@ setup(
     description="The Universal Memory Layer for Any AI Agent — Zero-Dependency, Sub-Millisecond, Fully Private",
     long_description=long_description,
     long_description_content_type="text/markdown",
+    license="MIT",
     url="https://github.com/AxDSan/mnemosyne",
     packages=find_packages(),
     classifiers=[
@@ -32,7 +33,6 @@ setup(
         "Intended Audience :: Developers",
         "Topic :: Software Development :: Libraries :: Python Modules",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
-        "License :: OSI Approved :: MIT License",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
