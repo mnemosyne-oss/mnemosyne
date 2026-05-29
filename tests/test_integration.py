@@ -235,7 +235,7 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(result.memory_type, MemoryType.DECISION)
         
         # 2. Store binary vector
-        embedding = np.random.randn(384).astype(np.float32)
+        embedding = np.random.randn(EMBEDDING_DIM).astype(np.float32)
         self.store.store_vector("mem_001", embedding)
         
         # 3. Extract gist and facts
