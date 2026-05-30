@@ -1667,6 +1667,14 @@ def _vec_insert(conn: sqlite3.Connection, rowid: int, embedding: List[float]):
             "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, ?)",
             (rowid, emb_json)
         )
+    # Ensure the insert is committed even when the caller's connection
+    # has _defer_commit=True (_BeamConnection). Without this, inserts
+    # sit in the deferred transaction and disappear if the caller
+    # later rolls back or the connection is reused in a different context.
+    if isinstance(conn, _BeamConnection):
+        conn._real_commit()
+    else:
+        conn.commit()
 
 
 def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -> List[Dict]:
