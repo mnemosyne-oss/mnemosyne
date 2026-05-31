@@ -53,28 +53,16 @@ def _calculate_cost(input_tokens: int, output_tokens: int, model: str) -> float:
     return input_cost + output_cost
 
 
-def _call_conflict_llm(prompt: str) -> Optional[str]:
-    """Call either host-provided LLM completion or direct remote endpoint."""
-    # 1. Try host LLM backend first if enabled
-    if os.environ.get("MNEMOSYNE_HOST_LLM_ENABLED", "false").lower() in ("1", "true", "yes"):
-        if get_host_llm_backend() is not None:
-            try:
-                # Max 512 output tokens for JSON structured result
-                return call_host_llm(
-                    prompt,
-                    max_tokens=512,
-                    temperature=0.0,
-                    provider=os.environ.get("MNEMOSYNE_HOST_LLM_PROVIDER", "").strip() or None,
-                    model=os.environ.get("MNEMOSYNE_HOST_LLM_MODEL", "").strip() or None,
-                )
-            except Exception as exc:
-                logger.warning("Conflict detection: host LLM call failed (%s): %s", type(exc).__name__, exc)
-
-    # 2. Fall back to remote endpoint
+def _call_conflict_llm_with_retry(prompt: str) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
+    """
+    Call OpenAI-compatible completions endpoint with exponential backoff retry logic.
+    Returns: Tuple[content_str, prompt_tokens, completion_tokens] or None
+    """
     if not CONFLICT_LLM_BASE_URL:
         logger.warning("Conflict detection: no LLM completion endpoint configured.")
         return None
 
+    import time
     import json
     try:
         import httpx
@@ -95,30 +83,53 @@ def _call_conflict_llm(prompt: str) -> Optional[str]:
         "response_format": {"type": "json_object"} if "gemini" in CONFLICT_LLM_MODEL.lower() or "gpt" in CONFLICT_LLM_MODEL.lower() else None
     }
 
-    try:
-        if has_httpx:
-            with httpx.Client(timeout=15.0) as client:
-                response = client.post(url, json=payload, headers=headers)
-                response.raise_for_status()
-                data = response.json()
-        else:
-            import urllib.request
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode(),
-                headers=headers,
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=15.0) as resp:
-                data = json.loads(resp.read().decode())
+    max_retries = 2
+    backoff_factor = 2.0
+    initial_delay = 1.0
 
-        choices = data.get("choices", [])
-        if choices and choices[0].get("message", {}).get("content"):
-            return choices[0]["message"]["content"]
-        return None
-    except Exception as exc:
-        logger.warning("Conflict detection: remote LLM completion failed (%s): %s", type(exc).__name__, exc)
-        return None
+    for attempt in range(max_retries + 1):
+        try:
+            if has_httpx:
+                with httpx.Client(timeout=15.0) as client:
+                    response = client.post(url, json=payload, headers=headers)
+                    response.raise_for_status()
+                    data = response.json()
+            else:
+                import urllib.request
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode(),
+                    headers=headers,
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=15.0) as resp:
+                    data = json.loads(resp.read().decode())
+
+            choices = data.get("choices", [])
+            if choices and choices[0].get("message", {}).get("content"):
+                content = choices[0]["message"]["content"]
+                
+                # Extract actual token counts if provided by the API
+                usage = data.get("usage", {})
+                prompt_tokens = usage.get("prompt_tokens")
+                completion_tokens = usage.get("completion_tokens")
+                
+                return content, prompt_tokens, completion_tokens
+            
+            logger.warning("Conflict detection: empty response from LLM on attempt %d", attempt + 1)
+        except Exception as exc:
+            logger.warning(
+                "Conflict detection: LLM call failed on attempt %d (%s): %s",
+                attempt + 1, type(exc).__name__, exc
+            )
+            if attempt < max_retries:
+                sleep_time = initial_delay * (backoff_factor ** attempt)
+                logger.info("Conflict detection: retrying in %0.1fs...", sleep_time)
+                time.sleep(sleep_time)
+            else:
+                logger.error("Conflict detection: all retries exhausted. Call failed.")
+    
+    return None
 
 
 def validate_conflict_pair(
@@ -151,9 +162,11 @@ You must respond ONLY with a valid JSON object matching this schema:
   "reason": "Brief explanation"
 }}
 """
-    raw_response = _call_conflict_llm(prompt)
-    if not raw_response:
+    result = _call_conflict_llm_with_retry(prompt)
+    if not result:
         return False, 0.0, None
+
+    raw_response, actual_prompt_tokens, actual_completion_tokens = result
 
     # Strip markdown code blocks if any
     clean_json = raw_response.strip()
@@ -168,14 +181,18 @@ You must respond ONLY with a valid JSON object matching this schema:
         confidence = float(data.get("confidence", 0.0))
         correct_fact = data.get("correct_fact")
 
-        # Estimate and log costs
-        input_t = _estimate_tokens(prompt)
-        output_t = _estimate_tokens(raw_response)
+        # Estimate fallback tokens if actual ones are not provided by the API
+        input_t = actual_prompt_tokens if actual_prompt_tokens is not None else _estimate_tokens(prompt)
+        output_t = actual_completion_tokens if actual_completion_tokens is not None else _estimate_tokens(raw_response)
+        
         est_cost = _calculate_cost(input_t, output_t, CONFLICT_LLM_MODEL)
 
         logger.info(
-            "Conflict LLM validation completed. Model: %s. Conflict detected: %s. Estimated Cost: $%0.6f",
-            CONFLICT_LLM_MODEL, is_conflict, est_cost
+            "Conflict LLM validation completed. Model: %s. Conflict detected: %s. Actual usage: Input=%s, Output=%s. Cost: $%0.6f",
+            CONFLICT_LLM_MODEL, is_conflict, 
+            actual_prompt_tokens if actual_prompt_tokens is not None else "Estimated",
+            actual_completion_tokens if actual_completion_tokens is not None else "Estimated",
+            est_cost
         )
         
         # Write to core cost logs
@@ -195,3 +212,4 @@ You must respond ONLY with a valid JSON object matching this schema:
     except Exception as exc:
         logger.warning("Conflict detection: failed to parse LLM JSON output (%s): %s", type(exc).__name__, exc)
         return False, 0.0, None
+
