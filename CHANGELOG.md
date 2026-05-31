@@ -7,6 +7,14 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+### Added
+
+- **`sync_roles` config for role-based autosave filtering.** `sync_turn()` now
+  checks `memory.mnemosyne.sync_roles` before persisting conversation turns.
+  Default `["user", "assistant"]` preserves existing behavior. Set to `["user"]`
+  to save only user turns, or `[]` to disable conversation autosave while keeping
+  explicit `mnemosyne_remember` calls working. Unknown roles are warned and ignored.
+
 ### Fixed
 
 - **Hardcoded embedding dimension in `binary_vectors.py`.** `EMBEDDING_DIM` was

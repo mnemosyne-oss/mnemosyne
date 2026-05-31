@@ -20,7 +20,7 @@ import os
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from datetime import datetime
 
 # Ensure mnemosyne core is importable from this directory
@@ -635,6 +635,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
         self._auto_sleep_threshold = 50
         self._auto_sleep_enabled = os.environ.get("MNEMOSYNE_AUTO_SLEEP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
         self._ignore_patterns: List[str] = []  # Regex patterns to filter from memory
+        self._sync_roles: Set[str] = {"user", "assistant"}  # Roles to autosave in sync_turn
         self._skip_contexts = {"cron", "flush", "subagent", "background", "skill_loop"}  # Agent contexts to skip
         # Allow override via MNEMOSYNE_SKIP_CONTEXTS env var.
         # Set to empty string to skip nothing (enable all contexts).
@@ -809,6 +810,25 @@ class MnemosyneMemoryProvider(MemoryProvider):
             elif isinstance(_skip_raw, (list, tuple, set)):
                 self._skip_contexts = set(str(s).strip() for s in _skip_raw if str(s).strip())
 
+        # sync_roles: which conversation roles to autosave in sync_turn().
+        # Default ["user", "assistant"] preserves existing behavior.
+        # Set to ["user"] to save only user turns, [] to disable autosave.
+        _sync_raw = kwargs.get("sync_roles")
+        if _sync_raw is None:
+            _sync_raw = self._read_config_key("sync_roles")
+        if _sync_raw is not None:
+            _valid_roles = {"user", "assistant"}
+            if isinstance(_sync_raw, str):
+                _parsed_roles = {r.strip() for r in _sync_raw.split(",") if r.strip()}
+            elif isinstance(_sync_raw, (list, tuple, set)):
+                _parsed_roles = {str(r).strip() for r in _sync_raw if str(r).strip()}
+            else:
+                _parsed_roles = set()
+            _unknown = _parsed_roles - _valid_roles
+            if _unknown:
+                logger.warning("Mnemosyne: unknown sync_roles ignored: %s", sorted(_unknown))
+            self._sync_roles = _parsed_roles & _valid_roles
+
         shared_surface_read = kwargs.get("shared_surface_read")
         if shared_surface_read is None:
             shared_surface_read = self._read_config_key("shared_surface_read")
@@ -854,6 +874,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
             {"key": "shared_surface_path", "description": "SQLite path for shared surface memories. Default is <mnemosyne>/data/shared/mnemosyne.db.", "default": "data/shared/mnemosyne.db"},
             {"key": "shared_surface_read", "description": "When true, mnemosyne_recall merges shared-surface results into private bank recall, tagging each result with its bank ('private' or 'surface'). Default false.", "default": False},
             {"key": "skip_contexts", "description": "Agent contexts where Mnemosyne should skip initialization. Comma-separated list. Defaults to 'cron,flush,subagent,background,skill_loop'. Set to empty string to enable all contexts. Also configurable via MNEMOSYNE_SKIP_CONTEXTS env var.", "default": "cron,flush,subagent,background,skill_loop"},
+            {"key": "sync_roles", "description": "Conversation roles to autosave in sync_turn(). List of role names: 'user', 'assistant'. Default ['user', 'assistant'] saves both. Set to ['user'] for user turns only, or [] to disable conversation autosave entirely. Does not affect explicit mnemosyne_remember calls.", "default": ["user", "assistant"]},
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -1131,16 +1152,15 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if not self._beam or self._agent_context in self._skip_contexts:
             return
         try:
-            if user_content and len(user_content) > 5 and not self._should_filter(user_content):
+            if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
                 self._beam.remember(
                     content=f"[USER] {user_content[:500]}",
                     source="conversation",
                     importance=0.3,
                     extract_entities=True,
                 )
-                # Check for identity-significant signals in user content
                 self._capture_identity_signals(user_content)
-            if assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
+            if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
                 self._beam.remember(
                     content=f"[ASSISTANT] {assistant_content[:800]}",
                     source="conversation",
