@@ -609,6 +609,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
     # it's not re-parsed on every _maybe_auto_sleep call.
     _AUTO_SLEEP_TIMEOUT_SECONDS = _parse_env_float("MNEMOSYNE_AUTO_SLEEP_TIMEOUT", 5)
 
+    _VALID_SYNC_ROLES: frozenset = frozenset({"user", "assistant"})
+
     def __init__(self):
         self._beam: Optional[Any] = None
         self._surface_beam: Optional[Any] = None
@@ -635,7 +637,11 @@ class MnemosyneMemoryProvider(MemoryProvider):
         self._auto_sleep_threshold = 50
         self._auto_sleep_enabled = os.environ.get("MNEMOSYNE_AUTO_SLEEP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
         self._ignore_patterns: List[str] = []  # Regex patterns to filter from memory
-        self._sync_roles: Set[str] = {"user", "assistant"}  # Roles to autosave in sync_turn
+        self._sync_roles: Set[str] = self._VALID_SYNC_ROLES.copy()
+        _sync_env = os.environ.get("MNEMOSYNE_SYNC_ROLES")
+        if _sync_env is not None:
+            _parsed_roles = {r.strip().lower() for r in _sync_env.split(",") if r.strip()}
+            self._sync_roles = _parsed_roles & self._VALID_SYNC_ROLES
         self._skip_contexts = {"cron", "flush", "subagent", "background", "skill_loop"}  # Agent contexts to skip
         # Allow override via MNEMOSYNE_SKIP_CONTEXTS env var.
         # Set to empty string to skip nothing (enable all contexts).
@@ -817,17 +823,24 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if _sync_raw is None:
             _sync_raw = self._read_config_key("sync_roles")
         if _sync_raw is not None:
-            _valid_roles = {"user", "assistant"}
             if isinstance(_sync_raw, str):
-                _parsed_roles = {r.strip() for r in _sync_raw.split(",") if r.strip()}
+                _parsed_roles = {r.strip().lower() for r in _sync_raw.split(",") if r.strip()}
             elif isinstance(_sync_raw, (list, tuple, set)):
-                _parsed_roles = {str(r).strip() for r in _sync_raw if str(r).strip()}
+                _parsed_roles = {str(r).strip().lower() for r in _sync_raw if str(r).strip()}
             else:
-                _parsed_roles = set()
-            _unknown = _parsed_roles - _valid_roles
-            if _unknown:
-                logger.warning("Mnemosyne: unknown sync_roles ignored: %s", sorted(_unknown))
-            self._sync_roles = _parsed_roles & _valid_roles
+                logger.warning("Mnemosyne: invalid sync_roles type %s (%r); keeping %s",
+                               type(_sync_raw).__name__, _sync_raw, sorted(self._sync_roles))
+                _sync_raw = None
+            if _sync_raw is not None:
+                _unknown = _parsed_roles - self._VALID_SYNC_ROLES
+                if _unknown:
+                    logger.warning("Mnemosyne: unknown sync_roles ignored: %s", sorted(_unknown))
+                _valid = _parsed_roles & self._VALID_SYNC_ROLES
+                if _parsed_roles and not _valid:
+                    logger.warning("Mnemosyne: no valid sync_roles in %r; keeping %s",
+                                   _parsed_roles, sorted(self._sync_roles))
+                else:
+                    self._sync_roles = _valid
 
         shared_surface_read = kwargs.get("shared_surface_read")
         if shared_surface_read is None:
@@ -874,7 +887,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
             {"key": "shared_surface_path", "description": "SQLite path for shared surface memories. Default is <mnemosyne>/data/shared/mnemosyne.db.", "default": "data/shared/mnemosyne.db"},
             {"key": "shared_surface_read", "description": "When true, mnemosyne_recall merges shared-surface results into private bank recall, tagging each result with its bank ('private' or 'surface'). Default false.", "default": False},
             {"key": "skip_contexts", "description": "Agent contexts where Mnemosyne should skip initialization. Comma-separated list. Defaults to 'cron,flush,subagent,background,skill_loop'. Set to empty string to enable all contexts. Also configurable via MNEMOSYNE_SKIP_CONTEXTS env var.", "default": "cron,flush,subagent,background,skill_loop"},
-            {"key": "sync_roles", "description": "Conversation roles to autosave in sync_turn(). List of role names: 'user', 'assistant'. Default ['user', 'assistant'] saves both. Set to ['user'] for user turns only, or [] to disable conversation autosave entirely. Does not affect explicit mnemosyne_remember calls.", "default": ["user", "assistant"]},
+            {"key": "sync_roles", "description": "Conversation roles to autosave in sync_turn(). List of role names: 'user', 'assistant'. Default ['user', 'assistant'] saves both. Set to ['user'] for user turns only, or [] to disable conversation autosave entirely. Does not affect explicit mnemosyne_remember calls. Identity signal capture is gated by user sync — excluding 'user' also disables identity extraction. Also configurable via MNEMOSYNE_SYNC_ROLES env var.", "default": ["user", "assistant"]},
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:

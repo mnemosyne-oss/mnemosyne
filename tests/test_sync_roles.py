@@ -3,7 +3,7 @@
 import pytest
 import os
 import tempfile
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 
 class TestSyncRoles:
@@ -95,6 +95,30 @@ class TestSyncRoles:
         ]
         assert len(identity_calls) == 0
 
+    def test_assistant_only_disables_identity_capture(self, provider):
+        """sync_roles=['assistant'] disables identity capture (derived from user content)."""
+        provider._sync_roles = {"assistant"}
+        provider._beam.remember = MagicMock()
+        provider.sync_turn("I feel like an imposter at work", "That is understandable.")
+
+        identity_calls = [
+            c for c in provider._beam.remember.call_args_list
+            if c.kwargs.get("source") == "identity"
+        ]
+        assert len(identity_calls) == 0
+
+    def test_user_only_preserves_identity_capture(self, provider):
+        """sync_roles=['user'] still captures identity signals."""
+        provider._sync_roles = {"user"}
+        provider._beam.remember = MagicMock()
+        provider.sync_turn("I feel like an imposter at work", "That is understandable.")
+
+        identity_calls = [
+            c for c in provider._beam.remember.call_args_list
+            if c.kwargs.get("source") == "identity"
+        ]
+        assert len(identity_calls) >= 1
+
     def test_ignore_patterns_still_apply(self, provider):
         """sync_roles does not bypass ignore_patterns filtering."""
         provider._sync_roles = {"user", "assistant"}
@@ -163,3 +187,40 @@ class TestSyncRolesConfig:
         provider._apply_provider_config({})
         assert provider._sync_roles == default
         assert provider._sync_roles == {"user", "assistant"}
+
+    def test_case_insensitive(self, provider):
+        provider._apply_provider_config({"sync_roles": ["User", "ASSISTANT"]})
+        assert provider._sync_roles == {"user", "assistant"}
+
+    @pytest.mark.parametrize("value", [True, False, 42, 3.14, {"user": True}])
+    def test_invalid_type_preserves_default(self, provider, value):
+        provider._apply_provider_config({"sync_roles": value})
+        assert provider._sync_roles == {"user", "assistant"}
+
+    def test_unknown_only_preserves_default(self, provider):
+        """Non-empty input with zero valid roles preserves default (typo safety)."""
+        provider._apply_provider_config({"sync_roles": ["users", "system"]})
+        assert provider._sync_roles == {"user", "assistant"}
+
+
+class TestSyncRolesEnvVar:
+    """Verify MNEMOSYNE_SYNC_ROLES env var support."""
+
+    def test_env_var_user_only(self):
+        from hermes_memory_provider import MnemosyneMemoryProvider
+        with patch.dict(os.environ, {"MNEMOSYNE_SYNC_ROLES": "user"}):
+            provider = MnemosyneMemoryProvider()
+            assert provider._sync_roles == {"user"}
+
+    def test_env_var_empty_disables(self):
+        from hermes_memory_provider import MnemosyneMemoryProvider
+        with patch.dict(os.environ, {"MNEMOSYNE_SYNC_ROLES": ""}):
+            provider = MnemosyneMemoryProvider()
+            assert provider._sync_roles == set()
+
+    def test_env_var_not_set_uses_default(self):
+        from hermes_memory_provider import MnemosyneMemoryProvider
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MNEMOSYNE_SYNC_ROLES", None)
+            provider = MnemosyneMemoryProvider()
+            assert provider._sync_roles == {"user", "assistant"}
