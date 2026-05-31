@@ -6572,10 +6572,30 @@ class BeamMemory:
             # --- Phase 1: heuristic conflict detection (no LLM) ---
             if len(items) >= 2:
                 conflicts = self._detect_conflicts(items)
-                for older_id, newer_id in conflicts:
-                    if not dry_run:
-                        self.invalidate(older_id, replacement_id=newer_id)
-                conflicts_resolved += len(conflicts)
+                from mnemosyne.core.llm_conflict_detector import (
+                    LLM_CONFLICT_DETECTION_ENABLED,
+                    validate_conflict_pair,
+                )
+                if LLM_CONFLICT_DETECTION_ENABLED:
+                    content_map = {item["id"]: item["content"] for item in items}
+                    for older_id, newer_id in conflicts:
+                        older_content = content_map.get(older_id, "")
+                        newer_content = content_map.get(newer_id, "")
+                        is_conflict, confidence, correct_fact = validate_conflict_pair(
+                            older_content,
+                            newer_content,
+                            session_id=self.session_id,
+                            db_path=self.db_path,
+                        )
+                        if is_conflict:
+                            if not dry_run:
+                                self.invalidate(older_id, replacement_id=newer_id)
+                            conflicts_resolved += 1
+                else:
+                    for older_id, newer_id in conflicts:
+                        if not dry_run:
+                            self.invalidate(older_id, replacement_id=newer_id)
+                    conflicts_resolved += len(conflicts)
 
             # --- Try LLM summarization (chunked to fit context) ---
             summary = None
