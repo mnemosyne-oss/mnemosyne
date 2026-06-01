@@ -91,6 +91,40 @@ def _format_prefetch_content(content: str, limit: int) -> str:
     return f"{cut}..."
 
 
+def _sync_turn_user_limit() -> int:
+    """Return the per-turn user content truncation limit.
+
+    ``0`` means no truncation. Defaults to 500 characters for backward
+    compatibility. Set ``MNEMOSYNE_SYNC_TURN_USER_LIMIT`` to override.
+    """
+    raw = os.environ.get("MNEMOSYNE_SYNC_TURN_USER_LIMIT", "500").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid MNEMOSYNE_SYNC_TURN_USER_LIMIT=%r; using default 500",
+            raw,
+        )
+        return 500
+
+
+def _sync_turn_assistant_limit() -> int:
+    """Return the per-turn assistant content truncation limit.
+
+    ``0`` means no truncation. Defaults to 800 characters for backward
+    compatibility. Set ``MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT`` to override.
+    """
+    raw = os.environ.get("MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT", "800").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT=%r; using default 800",
+            raw,
+        )
+        return 800
+
+
 # ---------------------------------------------------------------------------
 from .tools import ALL_TOOL_SCHEMAS
 
@@ -652,8 +686,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
             return
         try:
             if user_content and len(user_content) > 5 and not self._should_filter(user_content):
+                user_limit = _sync_turn_user_limit()
+                uc = user_content[:user_limit] if user_limit > 0 else user_content
                 self._beam.remember(
-                    content=f"[USER] {user_content[:500]}",
+                    content=f"[USER] {uc}",
                     source="conversation",
                     importance=0.3,
                     extract_entities=True,
@@ -661,8 +697,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 # Check for identity-significant signals in user content
                 self._capture_identity_signals(user_content)
             if assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
+                assistant_limit = _sync_turn_assistant_limit()
+                ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
                 self._beam.remember(
-                    content=f"[ASSISTANT] {assistant_content[:800]}",
+                    content=f"[ASSISTANT] {ac}",
                     source="conversation",
                     importance=0.2,
                     extract_entities=True,
@@ -802,10 +840,14 @@ class MnemosyneMemoryProvider(MemoryProvider):
         content = args.get("content", "")
         importance = float(args.get("importance", 0.5))
         source = args.get("source", "user")
-        scope = args.get("scope", "session")
-        valid_until = args.get("valid_until", None) or None
-        extract_entities = bool(args.get("extract_entities", False))
         extract = bool(args.get("extract", False))
+        extract_entities = bool(args.get("extract_entities", False))
+        # When extract=true and scope is not explicitly passed by the caller,
+        # auto-default to global. Facts extracted via LLM are identity-significant
+        # and should survive session boundaries. If the caller explicitly passed
+        # scope (even as "session"), respect that choice.
+        scope = args.get("scope", "global" if extract else "session")
+        valid_until = args.get("valid_until", None) or None
         metadata = args.get("metadata") or None
         # Trust-boundary clamp — see VERACITY_ALLOWED in
         # mnemosyne/core/veracity_consolidation.py for the canonical set.

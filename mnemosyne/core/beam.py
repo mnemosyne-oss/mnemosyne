@@ -5243,6 +5243,33 @@ class BeamMemory:
         _truly_empty = (len(final_results) == 0) and (_total_kept == 0)
         _recall_diag.record_call(truly_empty=_truly_empty)
 
+        # [Fact Recall Integration] Optionally merge LLM-extracted facts
+        # into the standard recall output. Gated behind
+        # MNEMOSYNE_FACT_RECALL_ENABLED=1 for backward compatibility.
+        # Facts carry no session/scope bound and are ranked by confidence.
+        if os.environ.get("MNEMOSYNE_FACT_RECALL_ENABLED", "0") == "1":
+            try:
+                fact_rows = self.fact_recall(query, top_k=max(top_k, 10))
+                for fr in fact_rows:
+                    # Dedup against existing results by content hash
+                    content_hash = hashlib.md5(fr["content"].encode()).hexdigest()
+                    if content_hash in {hashlib.md5(r["content"].encode()).hexdigest() for r in final_results}:
+                        continue
+                    final_results.append({
+                        "id": f"cf_{fr['fact_id']}",
+                        "content": fr["content"],
+                        "score": fr["score"] * 0.9,  # slight discount vs direct memory
+                        "source": "fact_recall",
+                        "tier": "fact",
+                        "fact": {"subject": fr["subject"], "predicate": fr["predicate"]},
+                    })
+                # Re-sort by score descending
+                final_results.sort(key=lambda x: x["score"], reverse=True)
+                # Re-apply top_k cap
+                final_results = final_results[:top_k]
+            except Exception:
+                logger.debug("fact recall integration failed (non-fatal)", exc_info=True)
+
         return final_results
 
     def recall_enhanced(self, query: str, top_k: int = 40, *,
@@ -5943,17 +5970,20 @@ class BeamMemory:
         return d
 
     def fact_recall(self, query: str, top_k: int = 30) -> List[Dict]:
-        """Search the facts table (LLM-extracted structured knowledge).
+        """Search both the facts table and consolidated_facts for structured knowledge.
 
         Returns facts as list of dicts with: content, score, fact_id, subject, predicate.
 
-        Falls back gracefully if facts table is empty or sqlite-vec unavailable.
+        Falls back gracefully if facts tables are empty or sqlite-vec unavailable.
+        Also queries consolidated_facts (sleep-consolidated LLM fact triples) when
+        the veracity consolidator is available — covers the polyphonic fact voice
+        source without requiring MNEMOSYNE_POLYPHONIC_RECALL=1.
         """
         cursor = self.conn.cursor()
         results = []
         query_lower = query.lower()
 
-        # Try FTS5 search first
+        # --- Source 1: raw facts table (FTS5 + LIKE fallback) ---
         try:
             fts_rows = cursor.execute(
                 "SELECT rowid, rank FROM fts_facts WHERE fts_facts MATCH ? ORDER BY rank, rowid LIMIT ?",
@@ -5963,7 +5993,6 @@ class BeamMemory:
             fts_rows = []
 
         if not fts_rows:
-            # Fallback: simple LIKE scan
             for word in query_lower.split()[:6]:
                 if len(word) < 3:
                     continue
@@ -5978,48 +6007,71 @@ class BeamMemory:
                     if row["rowid"] not in {r["rowid"] for r in fts_rows}:
                         fts_rows.append({"rowid": row["rowid"], "rank": 0})
 
-        if not fts_rows:
-            return []
+        if fts_rows:
+            fact_ids = [r["rowid"] for r in fts_rows[:top_k]]
+            placeholders = ",".join("?" * len(fact_ids))
+            try:
+                cursor.execute(f"""
+                    SELECT fact_id, subject, predicate, object,
+                           timestamp, confidence
+                    FROM facts
+                    WHERE rowid IN ({placeholders})
+                    ORDER BY confidence DESC
+                    LIMIT ?
+                """, (*fact_ids, top_k))
+                fact_rows = cursor.fetchall()
+            except Exception:
+                fact_rows = []
 
-        # Get full rows for matched fact IDs
-        fact_ids = [r["rowid"] for r in fts_rows[:top_k]]
-        placeholders = ",".join("?" * len(fact_ids))
+            for raw_row in fact_rows:
+                row = dict(raw_row)
+                confidence = row.get("confidence")
+                subject = row.get("subject")
+                predicate = row.get("predicate")
+                obj = row.get("object")
+                fact_text = obj if obj else f"{subject} {predicate} {obj}"
+                results.append({
+                    "content": fact_text,
+                    "score": confidence if confidence is not None else 0.5,
+                    "fact_id": row["fact_id"],
+                    "subject": subject if subject is not None else "",
+                    "predicate": predicate if predicate is not None else "",
+                })
 
+        # --- Source 2: consolidated_facts (sleep-consolidated LLM triples) ---
         try:
-            cursor.execute(f"""
-                SELECT fact_id, subject, predicate, object,
-                       timestamp, confidence
-                FROM facts
-                WHERE rowid IN ({placeholders})
-                ORDER BY confidence DESC
-                LIMIT ?
-            """, (*fact_ids, top_k))
-            fact_rows = cursor.fetchall()
+            # Import lazily so the consolidator module is only loaded on-demand
+            from mnemosyne.core.veracity_consolidation import VeracityConsolidator
+            consolidator = VeracityConsolidator(self.conn)
+            seen_subjects: set = set()
+            for word in query_lower.split()[:6]:
+                if len(word) < 3:
+                    continue
+                subj = word.capitalize()
+                if subj in seen_subjects:
+                    continue
+                seen_subjects.add(subj)
+                cfacts = consolidator.get_consolidated_facts(
+                    subject=subj, min_confidence=0.3
+                )
+                for cf in cfacts:
+                    fact_text = f"{cf.subject} {cf.predicate} {cf.object}"
+                    # Dedup against existing facts results
+                    if any(r.get("content") == fact_text for r in results):
+                        continue
+                    results.append({
+                        "content": fact_text,
+                        "score": cf.confidence * 0.85,
+                        "fact_id": cf.id,
+                        "subject": cf.subject,
+                        "predicate": cf.predicate,
+                    })
         except Exception:
-            return []
+            pass  # consolidated_facts search is best-effort
 
-        for raw_row in fact_rows:
-            # sqlite3.Row supports bracket access but not .get(); convert to
-            # dict so the column-with-default reads below work. Without this
-            # conversion fact_recall crashes the moment the facts table
-            # contains rows -- a latent bug that was masked while the
-            # Mnemosyne.remember(extract=True) wrapper never populated the
-            # table (see C12.a).
-            row = dict(raw_row)
-            confidence = row.get("confidence")
-            subject = row.get("subject")
-            predicate = row.get("predicate")
-            obj = row.get("object")
-            fact_text = obj if obj else f"{subject} {predicate} {obj}"
-            results.append({
-                "content": fact_text,
-                "score": confidence if confidence is not None else 0.5,
-                "fact_id": row["fact_id"],
-                "subject": subject if subject is not None else "",
-                "predicate": predicate if predicate is not None else "",
-            })
-
-        return results
+        # Sort by score descending and respect top_k
+        results.sort(key=lambda x: x["score"], reverse=True)
+        return results[:top_k]
 
     def get_episodic_stats(self, author_id: str = None, author_type: str = None,
                            channel_id: str = None) -> Dict:

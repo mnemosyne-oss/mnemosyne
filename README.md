@@ -286,8 +286,23 @@ results = beam.recall("editor preferences", top_k=5)
 
 | `MNEMOSYNE_EMBEDDING_API_URL` | `${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}` | Preferred name for custom embedding API endpoint (OpenAI-compatible). Falls back to `OPENROUTER_BASE_URL`. |
 | `MNEMOSYNE_EMBEDDING_API_KEY` | `${OPENROUTER_API_KEY:-${OPENAI_API_KEY:-}}` | Preferred name for embedding API key. Falls back to `OPENROUTER_API_KEY`, then `OPENAI_API_KEY`. |
+| `MNEMOSYNE_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model. Swap for multilingual: `BAAI/bge-m3`, `intfloat/multilingual-e5-base`, etc. |
 
 Full reference: [docs/configuration.md](docs/configuration.md)
+
+### Language Support
+
+Default embeddings are English-optimized (`bge-small-en-v1.5`). For **non-English or multilingual** recall, swap the model:
+
+```bash
+# Multilingual (100+ languages)
+export MNEMOSYNE_EMBEDDING_MODEL=BAAI/bge-m3
+
+# Or Chinese, German, etc.
+export MNEMOSYNE_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
+```
+
+See [docs/configuration.md#custom-embedding-models](docs/configuration.md#custom-embedding-models) for tradeoffs (RAM, speed, dimension changes).
 
 ---
 
