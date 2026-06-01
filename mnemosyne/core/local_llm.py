@@ -37,6 +37,14 @@ LLM_BASE_URL = os.environ.get("MNEMOSYNE_LLM_BASE_URL", "").rstrip("/")
 LLM_API_KEY = os.environ.get("MNEMOSYNE_LLM_API_KEY", "")
 LLM_REMOTE_MODEL = os.environ.get("MNEMOSYNE_LLM_MODEL", "")
 
+# Retryable errors only: 404/400 (model-not-found), 5xx, connection. Not 401/403/429.
+LLM_FALLBACK_MODELS = [
+    m.strip() for m in os.environ.get("MNEMOSYNE_LLM_FALLBACK_MODELS", "").split(",")
+    if m.strip()
+]
+LLM_FALLBACK_BASE_URL = os.environ.get("MNEMOSYNE_LLM_FALLBACK_BASE_URL", "").rstrip("/") or LLM_BASE_URL
+LLM_FALLBACK_API_KEY = os.environ.get("MNEMOSYNE_LLM_FALLBACK_API_KEY", "") or LLM_API_KEY
+
 # Host LLM adapter (Hermes or another agent). Disabled by default to preserve
 # existing standalone behavior. When MNEMOSYNE_HOST_LLM_ENABLED=true and a
 # backend is registered via mnemosyne.core.llm_backends.set_host_llm_backend(),
@@ -428,15 +436,47 @@ def llm_available() -> bool:
     return bool(_llm_available)
 
 
-def _call_remote_llm(prompt: str, temperature: float = 0.3) -> Optional[str]:
-    """Call an OpenAI-compatible remote endpoint for summarization.
+def _is_retryable_status(status_code: int) -> bool:
+    """Return True if an HTTP status is worth retrying against a fallback model.
 
-    ``temperature`` defaults to 0.3 (paraphrase-safe for consolidation);
-    callers that need deterministic output (e.g., fact extraction) can
-    pass ``temperature=0.0``.
+    404/400: the requested model is missing or unrecognized on this endpoint —
+    another model name on the same host may exist. 5xx: transient server-side
+    failure. 401/403/429 are NOT retryable: a bad key or rate limit won't be
+    fixed by swapping model names.
     """
-    if not LLM_BASE_URL:
-        return None
+    if status_code in (401, 403, 429):
+        return False
+    if status_code in (404, 400) or 500 <= status_code < 600:
+        return True
+    return False
+
+
+def _call_remote_llm_with_model(
+    prompt: str,
+    model: str,
+    temperature: float = 0.3,
+    *,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    timeout: float = 60.0,
+) -> "tuple[Optional[str], Optional[int], Optional[Exception]]":
+    """Call an OpenAI-compatible endpoint with a specific model name.
+
+    Returns ``(text, status, exc)``:
+
+    - ``(text, None, None)`` on success (text may be None for an empty body).
+    - ``(None, status, exc)`` on HTTP/network failure. ``status`` is the HTTP
+      status code when available, else None. ``exc`` is the underlying exception
+      (HTTPStatusError, ConnectError, TimeoutException, etc.) or None.
+    - ``(None, None, exc)`` for non-HTTP failures (JSON decode, malformed body).
+
+    Callers (see ``_call_remote_llm``) use ``status`` to decide whether to
+    retry against ``LLM_FALLBACK_MODELS``.
+    """
+    base_url = (base_url or LLM_BASE_URL).rstrip("/")
+    if not base_url:
+        return (None, None, RuntimeError("MNEMOSYNE_LLM_BASE_URL is empty"))
+    api_key = api_key if api_key is not None else LLM_API_KEY
 
     import json
 
@@ -446,15 +486,13 @@ def _call_remote_llm(prompt: str, temperature: float = 0.3) -> Optional[str]:
     except ImportError:
         has_httpx = False
 
-    url = f"{LLM_BASE_URL}/chat/completions"
+    url = f"{base_url}/chat/completions"
     headers = {"Content-Type": "application/json"}
-    if LLM_API_KEY:
-        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
-
-    model = LLM_REMOTE_MODEL or "local"
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     payload = {
-        "model": model,
+        "model": model or "local",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": LLM_MAX_TOKENS,
         "temperature": temperature,
@@ -463,27 +501,76 @@ def _call_remote_llm(prompt: str, temperature: float = 0.3) -> Optional[str]:
 
     try:
         if has_httpx:
-            with httpx.Client(timeout=60.0) as client:
+            with httpx.Client(timeout=timeout) as client:
                 response = client.post(url, json=payload, headers=headers)
-                response.raise_for_status()
-                data = response.json()
+                status = response.status_code
+                if status >= 400:
+                    try:
+                        response.raise_for_status()
+                    except Exception as exc:
+                        return (None, status, exc)
+                try:
+                    data = response.json()
+                except Exception as exc:
+                    return (None, status, exc)
         else:
             import urllib.request
+            import urllib.error
             req = urllib.request.Request(
                 url,
                 data=json.dumps(payload).encode(),
                 headers=headers,
                 method="POST"
             )
-            with urllib.request.urlopen(req, timeout=60.0) as resp:
-                data = json.loads(resp.read().decode())
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    status = getattr(resp, "status", 200)
+                    data = json.loads(resp.read().decode())
+            except urllib.error.HTTPError as exc:
+                return (None, exc.code, exc)
+            except Exception as exc:
+                return (None, None, exc)
 
-        choices = data.get("choices", [])
+        choices = data.get("choices", []) if isinstance(data, dict) else []
         if choices and choices[0].get("message", {}).get("content"):
-            return choices[0]["message"]["content"]
+            return (choices[0]["message"]["content"], status, None)
+        return (None, status, None)
+    except Exception as exc:
+        return (None, None, exc)
+
+
+def _call_remote_llm(prompt: str, temperature: float = 0.3) -> Optional[str]:
+    """Call an OpenAI-compatible remote endpoint for summarization.
+
+    ``temperature`` defaults to 0.3 (paraphrase-safe for consolidation);
+    callers that need deterministic output (e.g., fact extraction) can
+    pass ``temperature=0.0``.
+
+    Tries the primary ``LLM_REMOTE_MODEL`` first; on a retryable error
+    (see ``_is_retryable_status``), iterates ``LLM_FALLBACK_MODELS`` in
+    order. Returns the first successful response, or ``None`` if every
+    model fails (caller falls through to local GGUF / None).
+    """
+    if not LLM_BASE_URL:
         return None
-    except Exception:
-        return None
+
+    primary = LLM_REMOTE_MODEL or "local"
+    candidates: List[tuple[str, str, str]] = [(primary, LLM_BASE_URL, LLM_API_KEY)]
+    for fb in LLM_FALLBACK_MODELS:
+        if fb and fb != primary:
+            candidates.append((fb, LLM_FALLBACK_BASE_URL or LLM_BASE_URL, LLM_FALLBACK_API_KEY or LLM_API_KEY))
+
+    for model, base_url, api_key in candidates:
+        text, status, exc = _call_remote_llm_with_model(
+            prompt, model, temperature, base_url=base_url, api_key=api_key
+        )
+        if text:
+            return text
+        if status is None:
+            continue
+        if not _is_retryable_status(status):
+            return None
+    return None
 
 
 def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:

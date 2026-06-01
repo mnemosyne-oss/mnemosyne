@@ -37,8 +37,11 @@ class TestRemoteLLM:
 
         # Mock httpx by patching the import inside _call_remote_llm
         mock_client = MagicMock()
-        mock_client.post.return_value.raise_for_status = lambda: None
-        mock_client.post.return_value.json.return_value = mock_response
+        mock_response_obj = MagicMock()
+        mock_response_obj.status_code = 200
+        mock_response_obj.raise_for_status = lambda: None
+        mock_response_obj.json.return_value = mock_response
+        mock_client.post.return_value = mock_response_obj
         mock_client.__enter__ = lambda s: s
         mock_client.__exit__ = lambda *args: None
 
@@ -318,3 +321,194 @@ class TestHostAwareChunking:
         set_host_llm_backend(None)
         local_budget = local_llm._prompt_token_budget()
         assert local_budget < host_budget
+
+
+class TestRemoteLLMFallback:
+    """Tests for the LLM_FALLBACK_MODELS chain in _call_remote_llm()."""
+
+    def _ok(self, text="ok"):
+        return (text, 200, None)
+
+    def _err(self, status):
+        return (None, status, RuntimeError(f"http {status}"))
+
+    def _connerr(self):
+        return (None, None, ConnectionError("boom"))
+
+    def test_is_retryable_status(self):
+        assert local_llm._is_retryable_status(404) is True
+        assert local_llm._is_retryable_status(400) is True
+        assert local_llm._is_retryable_status(500) is True
+        assert local_llm._is_retryable_status(502) is True
+        assert local_llm._is_retryable_status(503) is True
+        assert local_llm._is_retryable_status(401) is False
+        assert local_llm._is_retryable_status(403) is False
+        assert local_llm._is_retryable_status(429) is False
+        assert local_llm._is_retryable_status(200) is False
+
+    def test_primary_success_skips_fallback(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://x/v1")
+        monkeypatch.setattr(local_llm, "LLM_REMOTE_MODEL", "primary")
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_MODELS", ["fb1", "fb2"])
+
+        with patch.object(
+            local_llm, "_call_remote_llm_with_model", return_value=self._ok("primary-out")
+        ) as m:
+            assert local_llm._call_remote_llm("p") == "primary-out"
+            assert m.call_count == 1
+            assert m.call_args.args[1] == "primary"
+
+    def test_404_triggers_fallback(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://x/v1")
+        monkeypatch.setattr(local_llm, "LLM_REMOTE_MODEL", "primary")
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_MODELS", ["fb1"])
+
+        with patch.object(
+            local_llm,
+            "_call_remote_llm_with_model",
+            side_effect=[self._err(404), self._ok("fb-out")],
+        ) as m:
+            assert local_llm._call_remote_llm("p") == "fb-out"
+            assert m.call_count == 2
+            assert m.call_args_list[0].args[1] == "primary"
+            assert m.call_args_list[1].args[1] == "fb1"
+
+    def test_5xx_triggers_fallback(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://x/v1")
+        monkeypatch.setattr(local_llm, "LLM_REMOTE_MODEL", "primary")
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_MODELS", ["fb1"])
+
+        with patch.object(
+            local_llm,
+            "_call_remote_llm_with_model",
+            side_effect=[self._err(502), self._ok("fb-out")],
+        ):
+            assert local_llm._call_remote_llm("p") == "fb-out"
+
+    def test_401_does_not_trigger_fallback(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://x/v1")
+        monkeypatch.setattr(local_llm, "LLM_REMOTE_MODEL", "primary")
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_MODELS", ["fb1", "fb2"])
+
+        with patch.object(
+            local_llm, "_call_remote_llm_with_model", return_value=self._err(401)
+        ) as m:
+            assert local_llm._call_remote_llm("p") is None
+            assert m.call_count == 1
+
+    def test_429_does_not_trigger_fallback(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://x/v1")
+        monkeypatch.setattr(local_llm, "LLM_REMOTE_MODEL", "primary")
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_MODELS", ["fb1"])
+
+        with patch.object(
+            local_llm, "_call_remote_llm_with_model", return_value=self._err(429)
+        ) as m:
+            assert local_llm._call_remote_llm("p") is None
+            assert m.call_count == 1
+
+    def test_connection_error_triggers_fallback(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://x/v1")
+        monkeypatch.setattr(local_llm, "LLM_REMOTE_MODEL", "primary")
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_MODELS", ["fb1"])
+
+        with patch.object(
+            local_llm,
+            "_call_remote_llm_with_model",
+            side_effect=[self._connerr(), self._ok("fb-out")],
+        ):
+            assert local_llm._call_remote_llm("p") == "fb-out"
+
+    def test_iterates_all_fallbacks_until_success(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://x/v1")
+        monkeypatch.setattr(local_llm, "LLM_REMOTE_MODEL", "primary")
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_MODELS", ["fb1", "fb2", "fb3"])
+
+        with patch.object(
+            local_llm,
+            "_call_remote_llm_with_model",
+            side_effect=[
+                self._err(404),
+                self._err(503),
+                self._ok("fb2-out"),
+            ],
+        ) as m:
+            assert local_llm._call_remote_llm("p") == "fb2-out"
+            assert m.call_count == 3
+
+    def test_returns_none_when_all_fail(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://x/v1")
+        monkeypatch.setattr(local_llm, "LLM_REMOTE_MODEL", "primary")
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_MODELS", ["fb1", "fb2"])
+
+        with patch.object(
+            local_llm,
+            "_call_remote_llm_with_model",
+            side_effect=[
+                self._err(404),
+                self._err(500),
+                self._connerr(),
+            ],
+        ):
+            assert local_llm._call_remote_llm("p") is None
+
+    def test_empty_fallback_list_only_tries_primary(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://x/v1")
+        monkeypatch.setattr(local_llm, "LLM_REMOTE_MODEL", "primary")
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_MODELS", [])
+
+        with patch.object(
+            local_llm, "_call_remote_llm_with_model", return_value=self._ok("p")
+        ) as m:
+            assert local_llm._call_remote_llm("p") == "p"
+            assert m.call_count == 1
+
+    def test_primary_deduped_from_fallback_list(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://x/v1")
+        monkeypatch.setattr(local_llm, "LLM_REMOTE_MODEL", "primary")
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_MODELS", ["primary", "fb1"])
+
+        with patch.object(
+            local_llm, "_call_remote_llm_with_model", return_value=self._err(404)
+        ) as m:
+            assert local_llm._call_remote_llm("p") is None
+            assert m.call_count == 2
+            models = [call.args[1] for call in m.call_args_list]
+            assert models == ["primary", "fb1"]
+
+    def test_fallback_uses_overridden_base_url(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://primary/v1")
+        monkeypatch.setattr(local_llm, "LLM_REMOTE_MODEL", "primary")
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_MODELS", ["fb1"])
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_BASE_URL", "http://fb-host/v1")
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_API_KEY", "fb-key")
+
+        with patch.object(
+            local_llm,
+            "_call_remote_llm_with_model",
+            side_effect=[self._err(404), self._ok("fb-out")],
+        ) as m:
+            assert local_llm._call_remote_llm("p") == "fb-out"
+            primary_call = m.call_args_list[0]
+            assert primary_call.kwargs["base_url"] == "http://primary/v1"
+            fb_call = m.call_args_list[1]
+            assert fb_call.kwargs["base_url"] == "http://fb-host/v1"
+            assert fb_call.kwargs["api_key"] == "fb-key"
+
+    def test_fallback_inherits_primary_url_when_no_override(self, monkeypatch):
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://primary/v1")
+        monkeypatch.setattr(local_llm, "LLM_API_KEY", "primary-key")
+        monkeypatch.setattr(local_llm, "LLM_REMOTE_MODEL", "primary")
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_MODELS", ["fb1"])
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_BASE_URL", "")
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_API_KEY", "")
+
+        with patch.object(
+            local_llm,
+            "_call_remote_llm_with_model",
+            side_effect=[self._err(404), self._ok("fb-out")],
+        ) as m:
+            assert local_llm._call_remote_llm("p") == "fb-out"
+            fb_call = m.call_args_list[1]
+            assert fb_call.kwargs["base_url"] == "http://primary/v1"
+            assert fb_call.kwargs["api_key"] == "primary-key"
