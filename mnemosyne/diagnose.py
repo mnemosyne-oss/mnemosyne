@@ -178,6 +178,7 @@ def run_diagnostics() -> Dict:
     embed_ok = any(e["check"] == "embeddings_available" and e["status"] == "YES" for e in entries)
     vec_ok = any(e["check"] == "sqlite_vec_available" and e["status"] == "YES" for e in entries)
     ep_vec = next((e for e in entries if e["check"] == "episodic_vectors"), None)
+    ep_vec_type = next((e for e in entries if e["check"] == "episodic_vec_type"), None)
 
     if not embed_ok:
         summary["key_findings"].append("fastembed not available - install with: pip install mnemosyne-memory[embeddings]")
@@ -188,7 +189,15 @@ def run_diagnostics() -> Dict:
     if embed_ok and vec_ok and ep_vec and ep_vec["status"] == "0":
         summary["key_findings"].append("Both fastembed and sqlite-vec are available but episodic vectors=0 - memories may not have been consolidated yet. Run: hermes mnemosyne sleep")
     if embed_ok and vec_ok and ep_vec and int(ep_vec["status"]) > 0:
-        summary["key_findings"].append("Semantic search is active with " + ep_vec["status"] + " vectors in episodic memory")
+        vtype = ep_vec_type["status"] if ep_vec_type else "unknown"
+        msg = f"Semantic search is active with {ep_vec['status']} vectors in episodic memory (backend: {vtype})"
+        if vtype in ("binary", "json"):
+            # vec_episodes (the sqlite-vec ANN table) is absent -- usually
+            # because this Python's sqlite3 can't load the sqlite-vec
+            # extension. Recall still works via the binary/JSON fallback;
+            # the ANN index only matters at much larger scale.
+            msg += " - the sqlite-vec ANN index is not in use (extension not loadable); the fallback is fine at small/medium scale"
+        summary["key_findings"].append(msg)
 
     return summary
 

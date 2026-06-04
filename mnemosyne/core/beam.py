@@ -6195,6 +6195,22 @@ class BeamMemory:
         total = cursor.fetchone()[0]
         cursor.execute(f"SELECT timestamp FROM episodic_memory{where_str} ORDER BY timestamp DESC LIMIT 1", params)
         last = cursor.fetchone()
+        # Report the vector coverage that recall *actually* uses, in
+        # priority order. Previously this only counted the sqlite-vec ANN
+        # table (vec_episodes). When the SQLite build can't load the
+        # sqlite-vec extension, that table never exists and the count is
+        # always 0 -- even though semantic recall is fully functional via
+        # the binary-vector voice (episodic_memory.binary_vector) or the
+        # float32 JSON embeddings (memory_embeddings). Reporting 0 there is
+        # misleading and trips a false "episodic vectors=0, run sleep" hint
+        # in diagnose. Fall back to whichever representation is populated.
+        def _filtered(extra_pred: str) -> str:
+            # Append a predicate to the (optional) author/channel filter,
+            # reusing `where_str`/`params` so both filtered and unfiltered
+            # callers stay correct.
+            joiner = " AND" if where_clauses else " WHERE"
+            return f"{where_str}{joiner} {extra_pred}"
+
         vec_count = 0
         vec_type = "none"
         if _vec_available(self.conn):
@@ -6202,7 +6218,30 @@ class BeamMemory:
                 vec_count = cursor.execute("SELECT COUNT(*) FROM vec_episodes").fetchone()[0]
                 vec_type = _effective_vec_type(self.conn)
             except Exception:
-                logger.info("Regex extraction failed, skipping", exc_info=True)
+                logger.info("vec_episodes count failed; falling back to non-ANN vectors", exc_info=True)
+        if vec_count == 0:
+            # Binary-vector voice: packed Hamming vector stored inline.
+            try:
+                vec_count = cursor.execute(
+                    f"SELECT COUNT(*) FROM episodic_memory{_filtered('binary_vector IS NOT NULL')}",
+                    params,
+                ).fetchone()[0]
+                if vec_count:
+                    vec_type = "binary"
+            except Exception:
+                logger.info("binary_vector count failed", exc_info=True)
+        if vec_count == 0:
+            # Float32 JSON embeddings (brute-force cosine fallback).
+            try:
+                vec_count = cursor.execute(
+                    f"SELECT COUNT(*) FROM episodic_memory"
+                    f"{_filtered('id IN (SELECT memory_id FROM memory_embeddings)')}",
+                    params,
+                ).fetchone()[0]
+                if vec_count:
+                    vec_type = "json"
+            except Exception:
+                logger.info("memory_embeddings count failed", exc_info=True)
         return {"total": total, "last": last[0] if last else None, "vectors": vec_count, "vec_type": vec_type}
 
     def get_memoria_stats(self) -> Dict:
