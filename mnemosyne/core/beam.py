@@ -6242,6 +6242,14 @@ class BeamMemory:
                     vec_type = "json"
             except Exception:
                 logger.info("memory_embeddings count failed", exc_info=True)
+        # No usable vectors of any kind -> no backend is serving recall.
+        # Normalize vec_type to "none" so an empty-but-present ANN table
+        # (vec_episodes exists with 0 rows -> _effective_vec_type would say
+        # "int8"/"float32") doesn't report a backend that has nothing to
+        # serve. Keeps the (vectors=0 <-> vec_type="none") contract stable
+        # across environments with and without the sqlite-vec extension.
+        if vec_count == 0:
+            vec_type = "none"
         return {"total": total, "last": last[0] if last else None, "vectors": vec_count, "vec_type": vec_type}
 
     def get_memoria_stats(self) -> Dict:
