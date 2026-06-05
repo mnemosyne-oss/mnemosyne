@@ -3841,6 +3841,30 @@ class BeamMemory:
                                         'how far apart']):  # not TR
                 return 'IE'
 
+        # Preference (PF): user-asking-about-own-tastes questions.
+        # Placed after IE so count-style queries ("how many things do I need")
+        # still route to IE. Placed before Abstention/MR/catch-all because
+        # preference queries are specific. Without this branch, the read
+        # path never reaches _memoria_preference_retrieve — the PF return in
+        # the ability dispatcher (line ~3803) was dead code.
+        if any(w in q for w in [
+            'my preference', 'my preferences',
+            'what do i like', 'what do i prefer', 'what do i hate',
+            'what do i dislike', 'what do i love', 'what do i want',
+            'what do i need', 'what do i tend',
+            'do i like', 'do i prefer', 'do i hate', 'do i dislike',
+            'do i love', 'do i want', 'do i need',
+            'my favorite', 'my favourite', 'my fav',
+            'things i like', 'things i love', 'things i hate',
+            'things i dislike', 'things i prefer', 'things i tend',
+            'things i don', 'things i avoid',
+            'what i like', 'what i love', 'what i hate',
+            'what i dislike', 'what i prefer', 'what i tend',
+            'what i don', 'what i avoid',
+            'preferences',
+        ]):
+            return 'PF'
+
         # Abstention
         if any(w in q for w in ['tell me about my background', 'previous development',
                                 'work experience', 'personal background']):
