@@ -3356,7 +3356,17 @@ class BeamMemory:
             'instruction_false_positives': ['i think you should leave', 'should behave', 'their work style'],
             'instruction_imperative': 'always|never|remember|use|keep|avoid|ensure|check|verify|run|test|build|deploy|push|pull|merge|commit|close|open|update|install|configure|set|enable|disable|add|remove|create|delete|start|stop|restart|reload|reset|try|implement|write|read|switch|move|copy|rename|send|reply|respond',
             'instruction': r'(?:always|never|must|must not|should(?: not)?(?=\s+(?:you|we|i|one)\s+(?:IMPVERBS))|need(?:s)? to(?: not)?|required to|prefer(?: not)? to|want to(?: avoid| ensure| use| keep))\s+([^.,;!?\n]{10,200})',
-            'preference': r'(?:I(?: |\')?(?:like|love|prefer|hate|dislike|enjoy|use|stick with|switched to|moved to|changed to|want|need|tend to|usually|would rather|don\'t like|don\'t want|not a fan of|am okay with|am comfortable with|am used to|am happy with|am tired of|am sick of|prefer not to|try to avoid|find it easier to|find it better to|find it useful to))\s+([^.,;!?\n]{10,200})',
+            'preference': r'(?:'
+                # First person (original) and second person
+                r'(?:I|You|you|YOU)(?: |\')?(?:like|love|prefer|hate|dislike|enjoy|use|stick with|switched to|moved to|changed to|want|need|tend to|usually|would rather|don\'t like|don\'t want|not a fan of|am okay with|am comfortable with|am used to|am happy with|am tired of|am sick of|prefer not to|try to avoid|find it easier to|find it better to|find it useful to)'
+                r'|'
+                # Third-person names with English 3p verbs (family members)
+                r'(?:Nathan|Bob|User|Amy|Zander|Zella)\s+(?:likes?|loves?|prefers?|hates?|dislikes?|enjoys?|uses?|wants?|needs?|tends\s+to|switches?\s+to|changes?\s+to|moves?\s+to)'
+                r'|'
+                # Structural-start verbs (bullet/heading/em-dash clause start)
+                r'(?:(?<=^)|(?<=\n)|(?<=\-\s)|(?<=—\s))(?:Prefers|Likes|Loves|Hates|Dislikes|Wants|Needs|Tends to|Enjoys|Uses)'
+                r')'
+                r'\s+([^.,;!?\n]{10,200})',
             'event_keywords': ['meeting', 'call', 'scheduled', 'happened', 'occurred', 'plan to', 'will be on', 'due on', 'release', 'deadline', 'launched', 'deployed', 'released', 'published', 'posted', 'started', 'began', 'finished', 'completed', 'ended', 'event', 'conference', 'workshop', 'appointment'],
             'named_months': r'((?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?,?\s*(?:\d{4})?)',
         },
