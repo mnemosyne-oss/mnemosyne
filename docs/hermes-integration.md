@@ -6,11 +6,21 @@ Mnemosyne is designed as a native memory backend for the [Hermes Agent Framework
 
 ### Step 1: Install
 
+**pip (recommended):**
+
 ```bash
 pip install mnemosyne-hermes
 ```
 
-Or from source:
+**Debian / Trixie users:** newer Debian releases block bare pip installs. Use a venv:
+
+```bash
+python3 -m venv ~/.hermes-venv
+source ~/.hermes-venv/bin/activate
+pip install mnemosyne-hermes
+```
+
+**Or from source:**
 
 ```bash
 git clone https://github.com/AxDSan/mnemosyne.git
@@ -18,14 +28,26 @@ cd mnemosyne
 pip install -e "integrations/hermes[dev]"
 ```
 
-### Step 2: Activate
+### Step 2: Link the plugin
+
+Hermes discovers plugins by scanning a folder on disk, not by reading pip's metadata. Link the installed package into the plugins directory so Hermes can find it:
+
+```bash
+mkdir -p ~/.hermes/plugins/memory/mnemosyne
+# Adjust the path below to match your Hermes venv Python version
+ln -s ~/.hermes/hermes-agent/venv/lib/python3.11/site-packages/mnemosyne_hermes/* ~/.hermes/plugins/memory/mnemosyne/
+```
+
+If you installed in a custom venv, the path will be at `~/.hermes-venv/lib/python3.11/site-packages/mnemosyne_hermes/` instead.
+
+### Step 3: Activate
 
 ```bash
 hermes config set memory.provider mnemosyne
 hermes memory setup
 ```
 
-### Step 3: Verify
+### Step 4: Verify
 
 ```bash
 hermes memory status       # Should show "Provider: mnemosyne"
