@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
+## [3.6.0] — 2026-06-10
+
+### Added
+
+- **Explicit bank selection via `bank_id` config key** (issue #267). New
+  `memory.mnemosyne.bank_id` config key and `MNEMOSYNE_BANK_ID` env var allow
+  overriding the auto-derived bank name from `agent_identity` / `hermes_home`.
+  Useful when the Hermes profile name cannot be changed (e.g. "default") but a
+  specific bank is needed. Precedence: kwargs > config.yaml > env var.
+  Applied to both `hermes_memory_provider` and `integrations/hermes` implementations.
+
 ## [3.5.0] — 2026-06-10
 
 ### Added

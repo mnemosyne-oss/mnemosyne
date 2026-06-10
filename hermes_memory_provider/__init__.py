@@ -849,6 +849,9 @@ class MnemosyneMemoryProvider(MemoryProvider):
         # Profile memory isolation: when enabled, each Hermes profile gets its own
         # Mnemosyne bank (separate SQLite DB). Default OFF for backward compatibility.
         self._profile_isolation_enabled = False
+        # Explicit bank name override. When set, takes priority over
+        # the auto-derived bank name from agent_identity / hermes_home.
+        self._bank_id: Optional[str] = None
         # Tracked so shutdown() can wait briefly for in-flight consolidation
         # before clearing the host LLM backend, preventing the post-timeout
         # daemon thread from racing with unregister and falling through to
@@ -995,6 +998,19 @@ class MnemosyneMemoryProvider(MemoryProvider):
             else:
                 self._profile_isolation_enabled = bool(profile_isolation)
 
+        # bank_id: explicit bank name override. Takes priority over
+        # the auto-derived bank from agent_identity / hermes_home.
+        # Precedence: kwargs > config.yaml > MNEMOSYNE_BANK_ID env var.
+        bank_id = kwargs.get("bank_id")
+        if bank_id is None:
+            bank_id = self._read_config_key("bank_id")
+        if bank_id is None:
+            bank_id = os.environ.get("MNEMOSYNE_BANK_ID", "").strip() or None
+        if bank_id is not None:
+            sanitized = self._sanitize_bank_name(str(bank_id))
+            if sanitized != "default":
+                self._bank_id = sanitized
+
         shared_surface_path = kwargs.get("shared_surface_path")
         if shared_surface_path is None:
             shared_surface_path = self._read_config_key("shared_surface_path")
@@ -1084,6 +1100,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
             {"key": "shared_surface_read", "description": "When true, mnemosyne_recall merges shared-surface results into private bank recall, tagging each result with its bank ('private' or 'surface'). Default false.", "default": False},
             {"key": "skip_contexts", "description": "Agent contexts where Mnemosyne should skip initialization. Comma-separated list. Defaults to 'cron,flush,subagent,background,skill_loop'. Set to empty string to enable all contexts. Also configurable via MNEMOSYNE_SKIP_CONTEXTS env var.", "default": "cron,flush,subagent,background,skill_loop"},
             {"key": "sync_roles", "description": "Conversation roles to autosave in sync_turn(). List of role names: 'user', 'assistant'. Default ['user', 'assistant'] saves both. Set to ['user'] for user turns only, or [] to disable conversation autosave entirely. Does not affect explicit mnemosyne_remember calls. Identity signal capture is gated by user sync — excluding 'user' also disables identity extraction. Also configurable via MNEMOSYNE_SYNC_ROLES env var.", "default": ["user", "assistant"]},
+            {"key": "bank_id", "description": "Explicit bank name override. When set, takes priority over the auto-derived bank from agent_identity / hermes_home. Also settable via MNEMOSYNE_BANK_ID env var. Useful when the profile name cannot be changed (e.g. 'default') but a specific bank is needed.", "default": None},
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -1144,10 +1161,15 @@ class MnemosyneMemoryProvider(MemoryProvider):
         """Derive a bank name from the active Hermes profile.
 
         Precedence:
-        1. agent_identity (explicit profile name from Hermes)
-        2. hermes_home basename (derived from profile directory)
-        3. Fallback to 'default' (backward-compatible shared DB)
+        1. bank_id explicit override (config key or MNEMOSYNE_BANK_ID env var)
+        2. agent_identity (explicit profile name from Hermes)
+        3. hermes_home basename (derived from profile directory)
+        4. Fallback to 'default' (backward-compatible shared DB)
         """
+        # Explicit override wins
+        if self._bank_id:
+            return self._bank_id
+
         # Try agent_identity first (most reliable)
         identity = getattr(self, "_agent_identity", None) or ""
         if identity and identity.lower() not in ("primary", "default", "none", ""):
