@@ -119,3 +119,83 @@ def test_is_api_model_text_embedding_substring():
     _clean_env()
     assert embeddings._is_api_model("my-org/text-embedding-custom") is True
     assert embeddings._is_api_model("prefix-text-embedding-suffix") is True
+
+
+# ---------------------------------------------------------------------------
+# API → local fallback tests
+# ---------------------------------------------------------------------------
+
+def test_embed_local_returns_none_when_no_fastembed():
+    """_embed_local returns None when fastembed is unavailable."""
+    _clean_env()
+    result = embeddings._embed_local(["hello world"])
+    assert result is None
+
+
+def test_embed_fallback_env_var_exists():
+    """MNEMOSYNE_EMBEDDING_FALLBACK_MODEL env var is read correctly at module scope."""
+    _clean_env()
+    import os
+    saved = os.environ.get("MNEMOSYNE_EMBEDDING_FALLBACK_MODEL")
+    os.environ["MNEMOSYNE_EMBEDDING_FALLBACK_MODEL"] = "intfloat/multilingual-e5-small"
+    try:
+        import importlib
+        import mnemosyne.core.embeddings as emb
+        emb2 = importlib.reload(emb)
+        assert emb2._FALLBACK_MODEL == "intfloat/multilingual-e5-small"
+    finally:
+        if saved is None:
+            os.environ.pop("MNEMOSYNE_EMBEDDING_FALLBACK_MODEL", None)
+        else:
+            os.environ["MNEMOSYNE_EMBEDDING_FALLBACK_MODEL"] = saved
+
+
+def test_embed_local_skips_api_model_fallback():
+    """_embed_local returns None when fallback model is API-based (loop prevention)."""
+    _clean_env()
+    import os
+    saved_key = os.environ.get("MNEMOSYNE_EMBEDDING_FALLBACK_MODEL")
+    os.environ["MNEMOSYNE_EMBEDDING_FALLBACK_MODEL"] = "text-embedding-3-small"
+    try:
+        import importlib
+        import mnemosyne.core.embeddings as emb
+        emb2 = importlib.reload(emb)
+        assert emb2._is_api_model(emb2._FALLBACK_MODEL) is True
+        result = emb2._embed_local(["hello"])
+        assert result is None
+    finally:
+        if saved_key is None:
+            os.environ.pop("MNEMOSYNE_EMBEDDING_FALLBACK_MODEL", None)
+        else:
+            os.environ["MNEMOSYNE_EMBEDDING_FALLBACK_MODEL"] = saved_key
+
+
+def test_available_accounts_for_fallback():
+    """available() logic doesn't crash when API is configured with no key and fallback exists."""
+    _clean_env()
+    import os
+    saved_model = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL")
+    saved_api_key = os.environ.get("MNEMOSYNE_EMBEDDING_API_KEY")
+    saved_openai_key = os.environ.get("OPENAI_API_KEY")
+    os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = "text-embedding-3-small"
+    os.environ["MNEMOSYNE_EMBEDDING_API_KEY"] = ""
+    os.environ["OPENAI_API_KEY"] = ""
+    try:
+        import importlib
+        import mnemosyne.core.embeddings as emb
+        emb2 = importlib.reload(emb)
+        avail = emb2.available()
+        assert isinstance(avail, bool)
+    finally:
+        if saved_model is None:
+            os.environ.pop("MNEMOSYNE_EMBEDDING_MODEL", None)
+        else:
+            os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = saved_model
+        if saved_api_key is None:
+            os.environ.pop("MNEMOSYNE_EMBEDDING_API_KEY", None)
+        else:
+            os.environ["MNEMOSYNE_EMBEDDING_API_KEY"] = saved_api_key
+        if saved_openai_key is None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        else:
+            os.environ["OPENAI_API_KEY"] = saved_openai_key

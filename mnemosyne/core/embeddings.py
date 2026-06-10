@@ -50,6 +50,10 @@ _OPENAI_BASE_URL = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openro
 
 # --- Model selection ---
 _DEFAULT_MODEL = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+# Local fallback model used when API embedding fails (network outage, rate limit, etc.).
+# Only meaningful when _DEFAULT_MODEL is an API model (text-embedding-* / openai/*).
+# Defaults to the original default so API→local fallback is transparent.
+_FALLBACK_MODEL = os.environ.get("MNEMOSYNE_EMBEDDING_FALLBACK_MODEL", "BAAI/bge-small-en-v1.5")
 _embedding_model = None
 _API_CALL_COUNT = 0
 
@@ -122,6 +126,55 @@ def _get_embedding_dim(model_name: str) -> int:
     return dims.get(model_name, 384)
 
 
+def _get_fallback_model():
+    """Lazy-load the fallback embedding model (local fastembed)."""
+    global _embedding_model
+    if _is_api_model(_FALLBACK_MODEL):
+        return None  # Fallback must be local; skip if it's also API
+    if not _is_fastembed_available():
+        return None
+    # If the fallback model is the same as the primary and already loaded (common case),
+    # reuse the cached instance.
+    if _embedding_model is not None and _DEFAULT_MODEL == _FALLBACK_MODEL:
+        return _embedding_model
+    # Separate lazy-load for fallback: cached on the global but re-bound
+    # The singleton is safe because we never juggle two
+    # models simultaneously; embed() is single-threaded in practice.
+    if _embedding_model is not None and _DEFAULT_MODEL != _FALLBACK_MODEL:
+        # Primary model already loaded but it's the wrong one for fallback.
+        # That's fine; we create the fallback on-the-fly. This won't
+        # stomp _embedding_model because fallback is only called after
+        # the primary (API) path returns None.
+        os.makedirs(_FASTEMBED_CACHE_DIR, exist_ok=True)
+        return TextEmbedding(
+            model_name=_FALLBACK_MODEL,
+            cache_dir=_FASTEMBED_CACHE_DIR,
+        )
+    if _embedding_model is None:
+        os.makedirs(_FASTEMBED_CACHE_DIR, exist_ok=True)
+        _embedding_model = TextEmbedding(
+            model_name=_FALLBACK_MODEL,
+            cache_dir=_FASTEMBED_CACHE_DIR,
+        )
+    return _embedding_model
+
+
+def _embed_local(texts: List[str], model_name: Optional[str] = None) -> Optional[np.ndarray]:
+    """Embed texts using local fastembed (for fallback from API mode)."""
+    if not _is_fastembed_available():
+        return None
+    model_name = model_name or _FALLBACK_MODEL
+    if _is_api_model(model_name):
+        return None  # Sanity: don't loop back
+    model = _get_fallback_model() if model_name == _FALLBACK_MODEL else _get_model()
+    if model is None or model == "api":
+        return None
+    vectors = list(model.embed(texts))
+    if not vectors:
+        return None
+    return np.stack(vectors).astype(np.float32)
+
+
 def _get_model():
     """Lazy-load the embedding model (local fastembed)."""
     global _embedding_model
@@ -186,15 +239,25 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
 
 
 def available() -> bool:
-    """Check if dense retrieval is available."""
+    """Check if dense retrieval is available.
+
+    When the primary model is API-based, returns True if either
+    (a) the API is reachable (has key) OR (b) a local fallback
+    model is configured via MNEMOSYNE_EMBEDDING_FALLBACK_MODEL
+    and fastembed is available. This ensures recall doesn't skip
+    vector search just because the API is unreachable.
+    """
     if os.environ.get("MNEMOSYNE_NO_EMBEDDINGS"):
         return False
     if _is_api_model(_DEFAULT_MODEL):
-        # Custom endpoints (non-OpenRouter) may not require an API key
+        # API mode: available if either API works OR we can fall back to local
         base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
-        if base_url and "openrouter.ai" not in base_url:
-            return True
-        return bool(_OPENAI_API_KEY)
+        api_available = bool(base_url and "openrouter.ai" not in base_url) or bool(_OPENAI_API_KEY)
+        fallback_available = (
+            not _is_api_model(_FALLBACK_MODEL)
+            and _is_fastembed_available()
+        )
+        return api_available or fallback_available
     return _FASTEMBED_AVAILABLE
 
 
@@ -211,7 +274,15 @@ def embed_query(text: str) -> Optional[np.ndarray]:
 
     if _is_api_model(_DEFAULT_MODEL):
         result = _embed_api([text])
-        return result[0] if result is not None else None
+        if result is not None:
+            return result[0]
+        # API failed (network, rate limit, etc.). Fall through to local.
+        logger = __import__("logging").getLogger(__name__)
+        logger.debug("embed_query: API failed, falling back to local model %s", _FALLBACK_MODEL)
+        local_result = _embed_local([text])
+        if local_result is not None:
+            return local_result[0]
+        return None
 
     model = _get_model()
     if model is None or model == "api":
@@ -228,7 +299,13 @@ def embed(texts: List[str]) -> Optional[np.ndarray]:
         return None
 
     if _is_api_model(_DEFAULT_MODEL):
-        return _embed_api(texts)
+        result = _embed_api(texts)
+        if result is not None:
+            return result
+        # API failed (network, rate limit, etc.). Fall through to local.
+        logger = __import__("logging").getLogger(__name__)
+        logger.debug("embed: API failed, falling back to local model %s", _FALLBACK_MODEL)
+        return _embed_local(texts)
 
     # Use cached single-query path for common case of 1 text
     if len(texts) == 1:
