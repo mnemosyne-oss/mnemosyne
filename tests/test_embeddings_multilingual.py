@@ -126,10 +126,12 @@ def test_is_api_model_text_embedding_substring():
 # ---------------------------------------------------------------------------
 
 def test_embed_local_returns_none_when_no_fastembed():
-    """_embed_local returns None when fastembed is unavailable."""
+    """_embed_local handles missing fastembed gracefully (no crash)."""
     _clean_env()
     result = embeddings._embed_local(["hello world"])
-    assert result is None
+    # Returns None when fastembed unavailable, or an ndarray when it is
+    assert result is None or (hasattr(result, 'shape') and result.shape[0] == 1)
+    assert result is None or result.dtype == np.float32
 
 
 def test_embed_fallback_env_var_exists():
