@@ -1369,6 +1369,10 @@ _FACT_MATCH_STOPWORDS: Set[str] = {
     "should", "that", "the", "their", "there", "this", "to", "totally", "unrelated",
     "use", "uses", "was", "we", "what", "when", "where", "which", "who", "why",
     "with", "you", "your",
+    # Conversational glue/pronouns. These caused broad requests like "do not reply
+    # to them" to fact-match unrelated policies via overlaps such as "not/they".
+    "again", "into", "not", "please", "somewhere", "supposed", "them", "then",
+    "they", "whatever",
 }
 
 # Unicode-aware recall tokenization.
@@ -1576,11 +1580,16 @@ def _strict_fact_matches(query: str, fact_text: str) -> bool:
     if len(overlap) == 1:
         token = next(iter(overlap))
         # Long structured tokens (paths/domains/identifiers) are very distinctive
+        # even inside a longer query.
         if len(token) >= 8 and any(c in token for c in (".", "/", ":", "-", "_")):
             return True
-        # Medium tokens (5+ chars) that passed the stopword filter are significant
-        # enough for single-token fact queries like "hermes", "python", "react"
-        return len(token) >= 5
+        # Medium tokens (5+ chars) are useful for direct lookup-style fact queries
+        # like "hermes" or "python". They are NOT enough for broad natural-language
+        # queries: one shared word such as "public", "context", or "reply" should
+        # not cause an unrelated high-importance fact to enter recall.
+        if len(query_tokens) <= 2:
+            return len(token) >= 5
+        return False
 
     return False
 

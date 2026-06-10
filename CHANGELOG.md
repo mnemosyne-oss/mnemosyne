@@ -40,6 +40,11 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Fact recall no longer treats one plain shared word as relevance for broad
+  queries.** Single-token fact matches are now limited to lookup-style queries or
+  distinctive structured identifiers, preventing unrelated high-importance facts
+  from surfacing on conversational glue words while preserving direct lookups.
+
 - **Holographic import CLI no longer demands an API key.** Holographic is a local
   SQLite importer (no API key needed) but the generic provider path checked for
   `--api-key` on every non-`hindsight` provider. Added `--db-path` and `--min-trust`

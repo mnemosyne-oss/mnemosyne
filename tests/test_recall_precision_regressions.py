@@ -137,6 +137,85 @@ class TestRecallPrecisionRegressions(unittest.TestCase):
         self.assertIn("database adapter timeout", joined)
         self.assertNotIn("orchid care dashboard", joined)
 
+    def test_fact_recall_requires_more_than_one_plain_token_for_broad_queries(self):
+        """Fact annotations must not leak unrelated rows on one shared plain word."""
+        unrelated_id = self.beam.remember(
+            "Public release notes should describe implementation and validation only.",
+            source="imported_fixture",
+            importance=0.99,
+            scope="global",
+            veracity="stated",
+        )
+        self.beam.annotations.add_many(
+            memory_id=unrelated_id,
+            kind="fact",
+            values=["Public release notes should describe implementation and validation only"],
+            source="imported_fixture",
+        )
+        relevant_id = self.beam.remember(
+            "Runtime context blocks are metadata and should be ignored unless directly requested.",
+            source="imported_fixture",
+            importance=0.2,
+            scope="global",
+            veracity="stated",
+        )
+        self.beam.annotations.add_many(
+            memory_id=relevant_id,
+            kind="fact",
+            values=["Runtime context blocks are metadata and should be ignored unless directly requested"],
+            source="imported_fixture",
+        )
+
+        results = self.beam.recall(
+            "Please fix runtime context so you do not reply to the context block",
+            top_k=5,
+        )
+        joined = "\n".join(r["content"] for r in results).lower()
+        self.assertIn("runtime context blocks", joined)
+        self.assertNotIn("public release notes", joined)
+
+    def test_fact_recall_ignores_pronoun_glue_overlaps_for_broad_queries(self):
+        """Words like not/them/they are not enough to fact-match a row."""
+        unrelated_id = self.beam.remember(
+            "Preserve critical services and data; do not stop or kill them.",
+            source="imported_fixture",
+            importance=0.99,
+            scope="global",
+            veracity="stated",
+        )
+        self.beam.annotations.add_many(
+            memory_id=unrelated_id,
+            kind="fact",
+            values=["Preserve critical services and data; do not stop or kill them"],
+            source="imported_fixture",
+        )
+
+        results = self.beam.recall(
+            "Please add a reminder to not reply to them and treat them as context",
+            top_k=5,
+        )
+        joined = "\n".join(r["content"] for r in results).lower()
+        self.assertNotIn("preserve critical services", joined)
+
+    def test_direct_single_token_fact_lookup_still_works(self):
+        memory_id = self.beam.remember(
+            "HermesBridge is the codename for the localhost memory adapter.",
+            source="imported_fixture",
+            importance=0.6,
+            scope="global",
+            veracity="stated",
+        )
+        self.beam.annotations.add_many(
+            memory_id=memory_id,
+            kind="fact",
+            values=["HermesBridge is the localhost memory adapter codename"],
+            source="imported_fixture",
+        )
+
+        results = self.beam.recall("HermesBridge", top_k=3)
+        self.assertTrue(results)
+        self.assertIn("HermesBridge", results[0]["content"])
+
     def test_memoria_date_or_sequence_fact_does_not_force_top_slot(self):
         results = self.beam.recall("Where is the Orion runner jar and how should it bind?", top_k=5)
         self.assertTrue(results)
