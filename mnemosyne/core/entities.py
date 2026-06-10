@@ -212,9 +212,21 @@ def find_similar_entities(entity: str, known_entities: List[str], threshold: flo
     Returns list of (entity_name, similarity_score) tuples, sorted by score descending.
     """
     matches: List[Tuple[str, float]] = []
+    entity_len = len(entity.strip())
     for known in known_entities:
         if known == entity:
             matches.append((known, 1.0))
+            continue
+        # Cheap upper bound before the O(n*m) levenshtein in similarity():
+        # the edit-distance score is capped at min_len/max_len and the
+        # prefix/substring bonuses at 0.7 + ratio*0.3, so when the length
+        # ratio alone puts every branch below the threshold the pair can
+        # never match. Critical when callers pass long free-text queries
+        # against thousands of short entity names.
+        known_len = len(known.strip())
+        max_len = max(entity_len, known_len, 1)
+        ratio = min(entity_len, known_len) / max_len
+        if ratio < threshold and (0.7 + ratio * 0.3) < threshold:
             continue
         sim = similarity(entity, known)
         if sim >= threshold:
