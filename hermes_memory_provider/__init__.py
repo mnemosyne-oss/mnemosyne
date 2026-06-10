@@ -1331,9 +1331,90 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 block = ""
             if block:
                 blocks.append(block)
+        # Per-contact identity memories must surface on EVERY turn, independent
+        # of the semantic recall query. Routing them through recall is a latent
+        # bug: a short/generic opener ("Hi", a nickname) does not match the
+        # identity text, so it never enters recall's top_k window and the
+        # importance filter never sees it -- the agent then loses track of who
+        # it is talking to. Inject them deterministically at the FRONT, scoped
+        # strictly to the active session_id, deduplicated against whatever
+        # recall already surfaced. No identity rows == no-op (legacy behavior).
+        identity_block = self._prefetch_identity(blocks, profile)
+        if identity_block:
+            blocks.insert(0, identity_block)
         if profile.dedup:
             blocks = _dedup_blocks(blocks)
         return "\n\n".join(b for b in blocks if b)
+
+    def _prefetch_identity(self, existing_blocks: List[str], profile: "PrefetchProfile") -> str:
+        """Render the always-inject identity block for the active session.
+
+        Pulls identity memories straight from the active ``session_id`` (see
+        ``_identity_fichas``) and renders them in the same format as the memory
+        bank, tagged ``[IDENTITY]``. Rows whose content already appears in the
+        blocks recall produced are dropped, so a query that *does* match the
+        identity never yields a duplicate. Returns ``""`` when there is nothing
+        to inject.
+        """
+        rows = self._identity_fichas()
+        if not rows:
+            return ""
+        already = "\n".join(existing_blocks)
+        content_limit = _prefetch_content_char_limit() or profile.content_char_limit
+        lines: List[str] = ["## Mnemosyne Context"]
+        seen: set = set()
+        for r in rows:
+            content = r.get("content", "")
+            if not content or content in seen:
+                continue
+            disp = _format_prefetch_content(content, content_limit)
+            # Dedup against anything recall already surfaced (raw or truncated).
+            if content in already or disp in already:
+                continue
+            seen.add(content)
+            ts = r.get("timestamp", "")[:16] if r.get("timestamp") else ""
+            imp = r.get("importance", 0.95)
+            lines.append(f"  [{ts}] (importance {imp:.2f}) [IDENTITY] {disp}")
+        if len(lines) <= 1:
+            return ""
+        return "\n".join(lines)
+
+    def _identity_fichas(self) -> List[Dict[str, Any]]:
+        """Return ALL identity memories for the ACTIVE session, deterministically.
+
+        Identity memories (source='identity') answer "who am I talking to?" and
+        must be injected on every turn regardless of the user's message. Routing
+        them through semantic recall is a latent bug: a short/generic opener does
+        not match the identity text, so it never enters recall's top_k window and
+        the importance filter never sees it. This pulls them straight from the
+        active session_id with a direct, query-independent SQL read. Strictly
+        session-scoped, so there is zero cross-session leakage.
+        """
+        out: List[Dict[str, Any]] = []
+        beam = self._beam
+        if beam is None:
+            return out
+        try:
+            cur = beam.conn.cursor()
+            cur.execute(
+                "SELECT content, importance, timestamp FROM working_memory "
+                "WHERE source='identity' AND session_id=? "
+                "ORDER BY importance DESC, timestamp DESC",
+                (beam.session_id,),
+            )
+            for content, importance, timestamp in cur.fetchall():
+                if not content:
+                    continue
+                out.append({
+                    "content": content,
+                    "importance": importance if importance is not None else 0.95,
+                    "timestamp": timestamp or "",
+                    "source": "identity",
+                    "_always_inject": True,
+                })
+        except Exception as e:
+            logger.debug("Mnemosyne identity read failed (non-fatal): %s", e)
+        return out
 
     def _prefetch_bank(self, query: str, session_id: str, profile: "PrefetchProfile") -> str:
         """The built-in memory-bank source: hybrid recall with temporal weighting,
