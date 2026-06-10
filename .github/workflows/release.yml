@@ -69,6 +69,7 @@ jobs:
         with:
           files: integrations/hermes/dist/*
           generate_release_notes: true
+          prerelease: true
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
