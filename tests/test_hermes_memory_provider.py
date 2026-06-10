@@ -649,6 +649,68 @@ class TestResolveProfileBank:
         assert provider._resolve_profile_bank() == "my_profile_v2"
 
 
+class TestResolveProfileBankIdOverride:
+    """Tests for bank_id explicit override in _resolve_profile_bank."""
+
+    def test_bank_id_takes_priority_over_identity(self):
+        provider = MnemosyneMemoryProvider()
+        provider._bank_id = "custom"
+        provider._agent_identity = "sphinx"
+        provider._hermes_home = "/home/user/.hermes/profiles/work"
+        assert provider._resolve_profile_bank() == "custom"
+
+    def test_bank_id_takes_priority_over_hermes_home(self):
+        provider = MnemosyneMemoryProvider()
+        provider._bank_id = "custom"
+        provider._agent_identity = ""
+        provider._hermes_home = "/home/user/.hermes/profiles/work"
+        assert provider._resolve_profile_bank() == "custom"
+
+    def test_bank_id_none_falls_through(self):
+        provider = MnemosyneMemoryProvider()
+        provider._bank_id = None
+        provider._agent_identity = "sphinx"
+        assert provider._resolve_profile_bank() == "sphinx"
+
+    def test_bank_id_empty_string_falls_through(self):
+        provider = MnemosyneMemoryProvider()
+        provider._bank_id = ""
+        provider._agent_identity = "sphinx"
+        assert provider._resolve_profile_bank() == "sphinx"
+
+    def test_bank_id_from_apply_provider_config_kwargs(self):
+        provider = MnemosyneMemoryProvider()
+        provider._hermes_home = ""
+        provider._apply_provider_config({"bank_id": "from_kwargs"})
+        assert provider._bank_id == "from_kwargs"
+
+    def test_bank_id_from_env_var(self, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_BANK_ID", "from_env")
+        provider = MnemosyneMemoryProvider()
+        provider._hermes_home = ""
+        provider._apply_provider_config({})
+        assert provider._bank_id == "from_env"
+
+    def test_bank_id_default_is_sanitized(self):
+        provider = MnemosyneMemoryProvider()
+        provider._hermes_home = ""
+        provider._apply_provider_config({"bank_id": "default"})
+        assert provider._bank_id is None
+
+    def test_bank_id_invalid_chars_are_sanitized(self):
+        provider = MnemosyneMemoryProvider()
+        provider._hermes_home = ""
+        provider._apply_provider_config({"bank_id": "my bank/name"})
+        assert provider._bank_id == "my_bank_name"
+
+    def test_bank_id_in_config_schema(self):
+        provider = MnemosyneMemoryProvider()
+        schema = provider.get_config_schema()
+        bank_id_entry = [e for e in schema if e["key"] == "bank_id"]
+        assert len(bank_id_entry) == 1
+        assert bank_id_entry[0]["default"] is None
+
+
 class TestInitializeProfileIsolation:
     """Tests for initialize() with profile_isolation flag."""
 
