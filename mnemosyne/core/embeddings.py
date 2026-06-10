@@ -6,11 +6,14 @@ Falls back to keyword-only if neither is available.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import ssl
 import urllib.request
 from typing import List, Optional
 from functools import lru_cache
+
+logger = logging.getLogger(__name__)
 
 try:
     import numpy as np
@@ -277,7 +280,6 @@ def embed_query(text: str) -> Optional[np.ndarray]:
         if result is not None:
             return result[0]
         # API failed (network, rate limit, etc.). Fall through to local.
-        logger = __import__("logging").getLogger(__name__)
         logger.debug("embed_query: API failed, falling back to local model %s", _FALLBACK_MODEL)
         local_result = _embed_local([text])
         if local_result is not None:
@@ -303,7 +305,6 @@ def embed(texts: List[str]) -> Optional[np.ndarray]:
         if result is not None:
             return result
         # API failed (network, rate limit, etc.). Fall through to local.
-        logger = __import__("logging").getLogger(__name__)
         logger.debug("embed: API failed, falling back to local model %s", _FALLBACK_MODEL)
         return _embed_local(texts)
 
