@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import threading
 from dataclasses import dataclass
@@ -133,7 +134,23 @@ _PREFETCH_FRAGMENT_STOPWORDS = frozenset({
 })
 _PREFETCH_MIN_FRAGMENT_CHARS = 8   # lone tokens shorter than this are dropped
 _PREFETCH_OVERFETCH = 16           # recall more, then filter junk and cap
-_PREFETCH_TOP_K = 8                # final injected count (unchanged behavior)
+_PREFETCH_TOP_K = 5                # final injected count: compact, relevance-first
+
+# Prompt-usefulness filter for automatic memory-context injection. Manual recall
+# tools can stay broad; prefetch is silently injected into every model call, so
+# it should be conservative and favor distilled memories over raw transcript.
+_PREFETCH_RAW_PREFIXES = ("[USER]", "[ASSISTANT]", "[IDENTITY]")
+_PREFETCH_EXCLUDED_PREFIXES = ("[ASSISTANT]",)
+_PREFETCH_RAW_SOURCES = {"conversation"}
+_PREFETCH_DISTILLED_SOURCES = {
+    "preference", "correction", "fact", "identity", "insight", "sleep_consolidation",
+}
+_PREFETCH_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_./:-]*", re.IGNORECASE)
+_PREFETCH_DEDUP_STOPWORDS = _PREFETCH_FRAGMENT_STOPWORDS | frozenset({
+    "about", "after", "before", "because", "could", "from", "have", "into",
+    "like", "more", "need", "needs", "than", "them", "they", "want", "wants",
+    "when", "where", "which", "while", "would", "yourself",
+})
 
 
 def _is_low_quality_prefetch(content: str) -> bool:
@@ -148,37 +165,139 @@ def _is_low_quality_prefetch(content: str) -> bool:
     return False
 
 
+def _strip_prefetch_prefix(content: str) -> str:
+    c = (content or "").strip()
+    upper = c.upper()
+    for prefix in _PREFETCH_RAW_PREFIXES:
+        if upper.startswith(prefix):
+            return c[len(prefix):].strip()
+    return c
+
+
+def _prefetch_tokens(content: str) -> Set[str]:
+    c = _strip_prefetch_prefix(content).lower()
+    tokens: Set[str] = set()
+    for token in _PREFETCH_TOKEN_RE.findall(c):
+        if len(token) <= 2 or token in _PREFETCH_DEDUP_STOPWORDS:
+            continue
+        tokens.add(token)
+    return tokens
+
+
+def _prefetch_topic_signal(row: Dict[str, Any]) -> float:
+    """Best available non-importance relevance signal for a recall row."""
+    signal = max(
+        float(row.get("keyword_score") or 0.0),
+        float(row.get("fts_score") or 0.0),
+        float(row.get("dense_score") or 0.0),
+    )
+    # Fact/entity matches are explicit relevance signals even when recall() did
+    # not fill keyword/FTS scores for that path.
+    if row.get("fact_match") or row.get("entity_match"):
+        signal = max(signal, 0.20)
+    return signal
+
+
+def _prefetch_source_quality(row: Dict[str, Any]) -> float:
+    """Relative usefulness multiplier for injected memory.
+
+    Distilled memories are better prompt context than raw transcript snippets;
+    assistant transcript snippets should not be injected at all by default.
+    """
+    content = (row.get("content") or "").strip()
+    upper = content.upper()
+    source = str(row.get("source") or "").lower()
+
+    if upper.startswith(_PREFETCH_EXCLUDED_PREFIXES):
+        return 0.0
+
+    quality = 1.0
+    if source in _PREFETCH_DISTILLED_SOURCES:
+        quality *= 1.12
+    if source in _PREFETCH_RAW_SOURCES:
+        quality *= 0.72
+    if upper.startswith("[USER]"):
+        quality *= 0.68
+    elif upper.startswith("[IDENTITY]"):
+        quality *= 0.80
+    elif source.startswith("memoria_source"):
+        quality *= 0.90
+    return quality
+
+
+def _prefetch_is_raw(row: Dict[str, Any]) -> bool:
+    content = (row.get("content") or "").strip().upper()
+    source = str(row.get("source") or "").lower()
+    return source in _PREFETCH_RAW_SOURCES or content.startswith("[USER]") or content.startswith("[IDENTITY]")
+
+
+def _prefetch_adjusted_score(row: Dict[str, Any]) -> float:
+    score = float(row.get("score") or 0.0)
+    signal = _prefetch_topic_signal(row)
+    importance = min(max(float(row.get("importance") or 0.0), 0.0), 1.0)
+    return (score * 0.65 + signal * 0.35 + importance * 0.05) * _prefetch_source_quality(row)
+
+
+def _semantic_dedup_prefetch(rows: List[Dict[str, Any]], threshold: float = 0.72) -> List[Dict[str, Any]]:
+    """Collapse near-duplicate memory rows, keeping the best-ranked variant."""
+    kept: List[Dict[str, Any]] = []
+    kept_tokens: List[Set[str]] = []
+    for row in rows:
+        tokens = _prefetch_tokens(row.get("content", ""))
+        if not tokens:
+            continue
+        duplicate = False
+        for existing in kept_tokens:
+            overlap = len(tokens & existing)
+            if not overlap:
+                continue
+            jaccard = overlap / max(len(tokens | existing), 1)
+            containment = overlap / max(min(len(tokens), len(existing)), 1)
+            if jaccard >= threshold or containment >= 0.86:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        kept.append(row)
+        kept_tokens.append(tokens)
+    return kept
+
+
 # ---------------------------------------------------------------------------
 # Prefetch profiles
 #
 # A profile is a named bundle of the prefetch knobs (recall breadth, weights,
-# temporal decay, relevance thresholds, the low-quality filter + dedup toggles,
-# and which registered sources to merge). The built-in `general` profile
-# reproduces the prior hardcoded behavior exactly, so existing deployments see no
-# change. Operators select a profile via MNEMOSYNE_PREFETCH_PROFILE; libraries can
-# register their own with register_profile().
+# temporal decay, relevance thresholds, source quality filtering + dedup toggles,
+# and which registered sources to merge). Operators select a profile via
+# MNEMOSYNE_PREFETCH_PROFILE; libraries can register their own with
+# register_profile().
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class PrefetchProfile:
     name: str
-    top_k: int = 8
+    top_k: int = _PREFETCH_TOP_K
     importance_weight: Optional[float] = None   # None -> recall() default
     vec_weight: Optional[float] = None
     fts_weight: Optional[float] = None
     temporal_weight: float = 0.2
     temporal_halflife: float = 48
-    min_score: float = 0.15
-    min_importance: float = 0.5
+    min_score: float = 0.20
+    min_importance: float = 0.65
+    min_topic_signal: float = 0.08
+    raw_min_topic_signal: float = 0.18
     content_char_limit: int = 0                  # 0 -> use env / untruncated
     drop_low_quality: bool = True
     dedup: bool = True
+    semantic_dedup: bool = True
+    exclude_assistant: bool = True
     sources: Tuple[str, ...] = ("bank",)         # which registered sources to merge
 
 
 _BUILTIN_PROFILES: Dict[str, PrefetchProfile] = {
-    # Exact prior behavior — the default.
+    # Default per-turn injection: compact, relevance-first, and conservative
+    # about raw transcript snippets.
     "general": PrefetchProfile(name="general"),
     # Favor recent, high-importance memories; same filter/dedup defaults.
     "social-chat": PrefetchProfile(
@@ -1419,7 +1538,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
     def _prefetch_bank(self, query: str, session_id: str, profile: "PrefetchProfile") -> str:
         """The built-in memory-bank source: hybrid recall with temporal weighting,
         relevance + low-quality filtering, scoped to author_id when available.
-        Parameterized by *profile*; with ``general`` this is the legacy behavior."""
+        Parameterized by *profile*."""
         try:
             import os
             author_id = self._beam.author_id or os.environ.get("MNEMOSYNE_AUTHOR_ID")
@@ -1430,7 +1549,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 temporal_halflife=profile.temporal_halflife,
             )
             # Pass tuning weights only when the profile sets them, so the default
-            # profile preserves recall()'s own defaults exactly.
+            # profile still lets recall() resolve its own weights.
             if profile.importance_weight is not None:
                 recall_kwargs["importance_weight"] = profile.importance_weight
             if profile.vec_weight is not None:
@@ -1450,15 +1569,29 @@ class MnemosyneMemoryProvider(MemoryProvider):
             results = self._beam.recall(**recall_kwargs)
             if not results:
                 return ""
-            # Filter out low-relevance results to prevent context pollution
-            # Only include memories with score above threshold or high importance
-            filtered = [
-                r for r in results
-                if (r.get("score", 0) >= profile.min_score
-                    or r.get("importance", 0) >= profile.min_importance)
-                and not (profile.drop_low_quality
-                         and _is_low_quality_prefetch(r.get("content", "")))
-            ]
+            # Filter out low-relevance results to prevent context pollution.
+            # Importance alone is not enough for silent injection: a memory must
+            # also have a real topical signal. Raw transcript rows need a
+            # stronger topical signal than distilled facts/preferences.
+            filtered = []
+            for r in results:
+                if profile.drop_low_quality and _is_low_quality_prefetch(r.get("content", "")):
+                    continue
+                if profile.exclude_assistant and _prefetch_source_quality(r) <= 0:
+                    continue
+                signal = _prefetch_topic_signal(r)
+                score = float(r.get("score") or 0.0)
+                importance = float(r.get("importance") or 0.0)
+                required_signal = profile.raw_min_topic_signal if _prefetch_is_raw(r) else profile.min_topic_signal
+                if signal < required_signal:
+                    continue
+                if score < profile.min_score and importance < profile.min_importance:
+                    continue
+                filtered.append(r)
+
+            filtered.sort(key=_prefetch_adjusted_score, reverse=True)
+            if profile.semantic_dedup:
+                filtered = _semantic_dedup_prefetch(filtered)
             # Cap back to the intended injection size after over-fetch+filter.
             filtered = filtered[:profile.top_k]
             if not filtered:
@@ -1470,11 +1603,14 @@ class MnemosyneMemoryProvider(MemoryProvider):
                     r.get("content", ""),
                     content_limit,
                 )
+                content = " ".join(content.split())
                 ts = r.get("timestamp", "")[:16] if r.get("timestamp") else ""
                 imp = r.get("importance", 0.0)
                 trust = r.get("trust_tier", "STATED")
                 trust_tag = f" [{trust}]" if trust != "STATED" else ""
-                lines.append(f"  [{ts}] (importance {imp:.2f}){trust_tag} {content}")
+                source = str(r.get("source") or "").strip()
+                source_tag = f", source {source}" if source and source != "conversation" else ""
+                lines.append(f"  [{ts}] (importance {imp:.2f}{source_tag}){trust_tag} {content}")
             return "\n".join(lines)
         except Exception as e:
             logger.debug("Mnemosyne prefetch failed: %s", e)

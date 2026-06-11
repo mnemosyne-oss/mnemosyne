@@ -19,10 +19,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from datetime import datetime
 
 # Mnemosyne core is installed via pip (mnemosyne-memory>=3.1 dependency).
@@ -91,6 +92,125 @@ def _format_prefetch_content(content: str, limit: int) -> str:
     return f"{cut}..."
 
 
+_PREFETCH_TOP_K = 5
+_PREFETCH_MIN_FRAGMENT_CHARS = 8
+_PREFETCH_FRAGMENT_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "as", "be", "but", "by", "do", "for", "go",
+    "hi", "how", "i", "if", "in", "is", "it", "me", "my", "no", "of", "ok",
+    "on", "or", "so", "the", "to", "u", "we", "what", "why", "yes", "you",
+})
+_PREFETCH_RAW_PREFIXES = ("[USER]", "[ASSISTANT]", "[IDENTITY]")
+_PREFETCH_EXCLUDED_PREFIXES = ("[ASSISTANT]",)
+_PREFETCH_RAW_SOURCES = {"conversation"}
+_PREFETCH_DISTILLED_SOURCES = {
+    "preference", "correction", "fact", "identity", "insight", "sleep_consolidation",
+}
+_PREFETCH_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_./:-]*", re.IGNORECASE)
+_PREFETCH_DEDUP_STOPWORDS = _PREFETCH_FRAGMENT_STOPWORDS | frozenset({
+    "about", "after", "before", "because", "could", "from", "have", "into",
+    "like", "more", "need", "needs", "than", "them", "they", "want", "wants",
+    "when", "where", "which", "while", "would", "yourself",
+})
+
+
+def _is_low_quality_prefetch(content: str) -> bool:
+    c = (content or "").strip()
+    if not c:
+        return True
+    if len(c.split()) <= 1 and (
+        len(c) <= _PREFETCH_MIN_FRAGMENT_CHARS or c.lower() in _PREFETCH_FRAGMENT_STOPWORDS
+    ):
+        return True
+    return False
+
+
+def _strip_prefetch_prefix(content: str) -> str:
+    c = (content or "").strip()
+    upper = c.upper()
+    for prefix in _PREFETCH_RAW_PREFIXES:
+        if upper.startswith(prefix):
+            return c[len(prefix):].strip()
+    return c
+
+
+def _prefetch_tokens(content: str) -> Set[str]:
+    c = _strip_prefetch_prefix(content).lower()
+    tokens: Set[str] = set()
+    for token in _PREFETCH_TOKEN_RE.findall(c):
+        if len(token) <= 2 or token in _PREFETCH_DEDUP_STOPWORDS:
+            continue
+        tokens.add(token)
+    return tokens
+
+
+def _prefetch_topic_signal(row: Dict[str, Any]) -> float:
+    signal = max(
+        float(row.get("keyword_score") or 0.0),
+        float(row.get("fts_score") or 0.0),
+        float(row.get("dense_score") or 0.0),
+    )
+    if row.get("fact_match") or row.get("entity_match"):
+        signal = max(signal, 0.20)
+    return signal
+
+
+def _prefetch_source_quality(row: Dict[str, Any]) -> float:
+    content = (row.get("content") or "").strip()
+    upper = content.upper()
+    source = str(row.get("source") or "").lower()
+    if upper.startswith(_PREFETCH_EXCLUDED_PREFIXES):
+        return 0.0
+    quality = 1.0
+    if source in _PREFETCH_DISTILLED_SOURCES:
+        quality *= 1.12
+    if source in _PREFETCH_RAW_SOURCES:
+        quality *= 0.72
+    if upper.startswith("[USER]"):
+        quality *= 0.68
+    elif upper.startswith("[IDENTITY]"):
+        quality *= 0.80
+    elif source.startswith("memoria_source"):
+        quality *= 0.90
+    return quality
+
+
+def _prefetch_is_raw(row: Dict[str, Any]) -> bool:
+    content = (row.get("content") or "").strip().upper()
+    source = str(row.get("source") or "").lower()
+    return source in _PREFETCH_RAW_SOURCES or content.startswith("[USER]") or content.startswith("[IDENTITY]")
+
+
+def _prefetch_adjusted_score(row: Dict[str, Any]) -> float:
+    score = float(row.get("score") or 0.0)
+    signal = _prefetch_topic_signal(row)
+    importance = min(max(float(row.get("importance") or 0.0), 0.0), 1.0)
+    return (score * 0.65 + signal * 0.35 + importance * 0.05) * _prefetch_source_quality(row)
+
+
+def _semantic_dedup_prefetch(rows: List[Dict[str, Any]], threshold: float = 0.72) -> List[Dict[str, Any]]:
+    kept: List[Dict[str, Any]] = []
+    kept_tokens: List[Set[str]] = []
+    for row in rows:
+        tokens = _prefetch_tokens(row.get("content", ""))
+        if not tokens:
+            continue
+        duplicate = False
+        for existing in kept_tokens:
+            overlap = len(tokens & existing)
+            if not overlap:
+                continue
+            jaccard = overlap / max(len(tokens | existing), 1)
+            containment = overlap / max(min(len(tokens), len(existing)), 1)
+            if jaccard >= threshold or containment >= 0.86:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        kept.append(row)
+        kept_tokens.append(tokens)
+    return kept
+
+
 def _sync_turn_user_limit() -> int:
     """Return the per-turn user content truncation limit.
 
@@ -154,6 +274,8 @@ def _parse_env_float(key: str, default: float) -> float:
 class MnemosyneMemoryProvider(MemoryProvider):
     """Mnemosyne native memory — local SQLite with vector + FTS5 hybrid search."""
 
+    _VALID_SYNC_ROLES: frozenset = frozenset({"user", "assistant"})
+
     # How long on_session_end will wait for sleep/consolidation to finish before
     # giving up and letting the daemon thread continue in the background. Tests
     # may shorten this to keep the suite fast. Override via MNEMOSYNE_SESSION_END_TIMEOUT.
@@ -189,6 +311,11 @@ class MnemosyneMemoryProvider(MemoryProvider):
         self._auto_sleep_threshold = 50
         self._auto_sleep_enabled = os.environ.get("MNEMOSYNE_AUTO_SLEEP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
         self._ignore_patterns: List[str] = []  # Regex patterns to filter from memory
+        self._sync_roles: Set[str] = set(self._VALID_SYNC_ROLES)
+        _sync_env = os.environ.get("MNEMOSYNE_SYNC_ROLES")
+        if _sync_env is not None:
+            _parsed_roles = {r.strip().lower() for r in _sync_env.split(",") if r.strip()}
+            self._sync_roles = _parsed_roles & self._VALID_SYNC_ROLES
         self._skip_contexts = {"cron", "flush", "subagent", "background", "skill_loop"}  # Agent contexts to skip
         # Allow override via MNEMOSYNE_SKIP_CONTEXTS env var.
         # Set to empty string to skip nothing (enable all contexts).
@@ -351,6 +478,21 @@ class MnemosyneMemoryProvider(MemoryProvider):
             shared_surface_path = self._read_config_key("shared_surface_path")
         if shared_surface_path:
             self._shared_surface_path = Path(str(shared_surface_path)).expanduser()
+
+        # sync_roles: controls which turn roles are autosaved. User-only
+        # autosave configurations avoid assistant transcript noise in automatic
+        # memory-context injection.
+        _sync_raw = kwargs.get("sync_roles")
+        if _sync_raw is None:
+            _sync_raw = self._read_config_key("sync_roles")
+        if _sync_raw is not None:
+            if isinstance(_sync_raw, str):
+                parsed = {r.strip().lower() for r in _sync_raw.split(",") if r.strip()}
+            elif isinstance(_sync_raw, (list, tuple, set)):
+                parsed = {str(r).strip().lower() for r in _sync_raw if str(r).strip()}
+            else:
+                parsed = set()
+            self._sync_roles = parsed & self._VALID_SYNC_ROLES
 
         # skip_contexts: kwargs > config.yaml > env var (already set in __init__)
         _skip_raw = kwargs.get("skip_contexts")
@@ -641,7 +783,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
             import os
             author_id = self._beam.author_id or os.environ.get("MNEMOSYNE_AUTHOR_ID")
             recall_kwargs: Dict[str, Any] = dict(
-                query=query, top_k=8,
+                query=query, top_k=max(_PREFETCH_TOP_K * 2, 16),
                 temporal_weight=0.2, temporal_halflife=48,
             )
             # Only pass author_id when explicitly non-empty.  Passing an empty
@@ -657,15 +799,28 @@ class MnemosyneMemoryProvider(MemoryProvider):
             results = self._beam.recall(**recall_kwargs)
             if not results:
                 return ""
-            # Filter out low-relevance results to prevent context pollution
-            # Only include memories with score above threshold or high importance
-            MIN_SCORE_THRESHOLD = 0.15
-            MIN_IMPORTANCE_THRESHOLD = 0.5
-            filtered = [
-                r for r in results
-                if r.get("score", 0) >= MIN_SCORE_THRESHOLD
-                or r.get("importance", 0) >= MIN_IMPORTANCE_THRESHOLD
-            ]
+            # Filter out low-relevance results to prevent context pollution.
+            # Importance alone is not enough for silent injection: a memory must
+            # also have a real topical signal. Raw transcript rows need a
+            # stronger topical signal than distilled facts/preferences.
+            filtered = []
+            for r in results:
+                if _is_low_quality_prefetch(r.get("content", "")):
+                    continue
+                if _prefetch_source_quality(r) <= 0:
+                    continue
+                signal = _prefetch_topic_signal(r)
+                score = float(r.get("score") or 0.0)
+                importance = float(r.get("importance") or 0.0)
+                required_signal = 0.18 if _prefetch_is_raw(r) else 0.08
+                if signal < required_signal:
+                    continue
+                if score < 0.20 and importance < 0.65:
+                    continue
+                filtered.append(r)
+
+            filtered.sort(key=_prefetch_adjusted_score, reverse=True)
+            filtered = _semantic_dedup_prefetch(filtered)[:_PREFETCH_TOP_K]
             if not filtered:
                 return ""
             lines = ["## Mnemosyne Context"]
@@ -675,11 +830,14 @@ class MnemosyneMemoryProvider(MemoryProvider):
                     r.get("content", ""),
                     content_limit,
                 )
+                content = " ".join(content.split())
                 ts = r.get("timestamp", "")[:16] if r.get("timestamp") else ""
                 imp = r.get("importance", 0.0)
                 trust = r.get("trust_tier", "STATED")
                 trust_tag = f" [{trust}]" if trust != "STATED" else ""
-                lines.append(f"  [{ts}] (importance {imp:.2f}){trust_tag} {content}")
+                source = str(r.get("source") or "").strip()
+                source_tag = f", source {source}" if source and source != "conversation" else ""
+                lines.append(f"  [{ts}] (importance {imp:.2f}{source_tag}){trust_tag} {content}")
             return "\n".join(lines)
         except Exception as e:
             logger.debug("Mnemosyne prefetch failed: %s", e)
@@ -693,7 +851,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if not self._beam or self._agent_context in self._skip_contexts:
             return
         try:
-            if user_content and len(user_content) > 5 and not self._should_filter(user_content):
+            if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
                 user_limit = _sync_turn_user_limit()
                 uc = user_content[:user_limit] if user_limit > 0 else user_content
                 self._beam.remember(
@@ -704,7 +862,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 )
                 # Check for identity-significant signals in user content
                 self._capture_identity_signals(user_content)
-            if assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
+            if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
                 assistant_limit = _sync_turn_assistant_limit()
                 ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
                 self._beam.remember(

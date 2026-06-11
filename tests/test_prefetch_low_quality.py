@@ -35,12 +35,12 @@ class FakeBeam:
         return [
             # bare fragments scoring high on keyword match — must be filtered out
             {"content": "what", "timestamp": "2026-05-14T12:00:00Z",
-             "importance": 0.1, "score": 0.63, "trust_tier": "STATED"},
+             "importance": 0.1, "score": 0.63, "keyword_score": 0.63, "trust_tier": "STATED"},
             {"content": "still", "timestamp": "2026-05-14T12:00:00Z",
-             "importance": 0.1, "score": 0.62, "trust_tier": "STATED"},
+             "importance": 0.1, "score": 0.62, "keyword_score": 0.62, "trust_tier": "STATED"},
             # a real, sentence-length memory scoring lower — must survive
             {"content": "Paris is the capital of France", "timestamp": "2026-05-14T12:00:00Z",
-             "importance": 0.6, "score": 0.40, "trust_tier": "STATED"},
+             "importance": 0.6, "score": 0.40, "keyword_score": 0.40, "trust_tier": "STATED"},
         ]
 
 

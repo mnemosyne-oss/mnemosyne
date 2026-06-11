@@ -21,6 +21,8 @@ class FakeBeam:
                 "timestamp": "2026-05-14T12:00:00Z",
                 "importance": 0.9,
                 "score": 0.9,
+                "keyword_score": 0.9,
+                "source": "correction",
                 "trust_tier": "STATED",
             }
         ]
