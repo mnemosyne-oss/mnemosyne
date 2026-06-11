@@ -1846,6 +1846,167 @@ def _cjk_like_search(conn: sqlite3.Connection, query: str, k: int = 20, working:
     return [{result_key: rid, "rank": -score} for rid, score in scored[:k]]
 
 
+# ---------------------------------------------------------------------------
+# Cyrillic FTS5 fallback (Russian)
+#
+# Russian is morphologically rich: a single lemma produces many inflected
+# surface forms (тёмная / тёмную / тёмной, встреча / встречи / встречу).
+# The default unicode61 FTS5 tokenizer has no built-in stemmer for Russian,
+# so direct FTS5 queries match only the exact surface form.
+#
+# When a Russian query produces zero FTS5 results, we fall back to a
+# LIKE-based scan and rank candidates by trigram Jaccard similarity
+# between query and content words. This mirrors _cjk_like_search
+# (issue #168) but with n-gram scoring, which is significantly more
+# discriminative for inflected languages than the single-character
+# coverage used for CJK.
+#
+# NOTE: the regex [а-яёА-ЯЁ] covers Russian and some Cyrillic neighbours
+# (Ukrainian, Bulgarian, etc.) but does NOT include Serbian/Mongolian
+# Cyrillic characters (ђ ћ џ њ љ ө ү). These can be added later if needed.
+#
+# No new dependencies, no schema migration, no FTS5 changes. The fallback
+# activates only when FTS5 returns zero rows AND the query contains
+# Cyrillic characters.
+#
+# Priority: if a query contains both CJK and Cyrillic, the CJK fallback
+# takes precedence (checked first). This is unlikely in practice but
+# documented here for clarity.
+# ---------------------------------------------------------------------------
+
+_CYRILLIC_CHAR_RE = re.compile(r"[а-яёА-ЯЁ]")
+
+
+def _has_cyrillic(text: str) -> bool:
+    """True if text contains at least one Russian/Cyrillic character.
+
+    Matches [а-яёА-ЯЁ] which covers Russian and some neighbours but
+    not Serbian/Mongolian Cyrillic — see module-level note.
+    """
+    return bool(_CYRILLIC_CHAR_RE.search(text))
+
+
+def _ngrams(s: str, n: int = 3) -> set:
+    """Return the set of length-n sliding n-grams of s.
+
+    For strings shorter than n, returns the whole string as a single
+    n-gram to keep the Jaccard math well-defined.
+    """
+    if len(s) < n:
+        return {s}
+    return {s[i:i + n] for i in range(len(s) - n + 1)}
+
+
+def _cyrillic_score(query: str, content: str, n: int = 3) -> float:
+    """Trigram Jaccard score in [0, 1] for Russian/Cyrillic recall.
+
+    For each query word, find the best-matching content word by Jaccard
+    similarity of their character n-gram sets. Return the mean across
+    query words. Words shorter than 3 characters are ignored to avoid
+    noisy matches on stop words and punctuation.
+
+    N-gram sets are computed once per unique word and cached in a dict
+    to avoid redundant recomputation when the same content word is
+    compared against multiple query words.
+    """
+    q_words = [
+        w for w in re.findall(r"[а-яёa-z0-9]+", query.lower()) if len(w) >= 3
+    ]
+    c_words = [
+        w for w in re.findall(r"[а-яёa-z0-9]+", content.lower()) if len(w) >= 3
+    ]
+    if not q_words or not c_words:
+        return 0.0
+    # Cache n-gram sets to avoid recomputing the same word multiple times.
+    ng_cache: dict = {}
+    total = 0.0
+    for qw in q_words:
+        if qw not in ng_cache:
+            ng_cache[qw] = _ngrams(qw, n)
+        q_ng = ng_cache[qw]
+        best = 0.0
+        for cw in c_words:
+            if cw not in ng_cache:
+                ng_cache[cw] = _ngrams(cw, n)
+            c_ng = ng_cache[cw]
+            union = q_ng | c_ng
+            if not union:
+                continue
+            jacc = len(q_ng & c_ng) / len(union)
+            if jacc > best:
+                best = jacc
+        total += best
+    return total / len(q_words)
+
+
+def _cyrillic_like_search(
+    conn: sqlite3.Connection, query: str, k: int = 20, working: bool = False,
+) -> List[Dict]:
+    """LIKE-based FTS5 fallback for Russian/Cyrillic text.
+
+    Candidate generation: scan ``working_memory``/``episodic_memory`` for
+    rows whose content contains any 4+ character word from the query as
+    a substring. Re-rank the candidate set by trigram Jaccard similarity
+    so that inflected forms of the same lemma (тёмная/тёмную/тёмной)
+    receive comparable scores regardless of which surface form appears
+    in the stored text.
+
+    The candidate-generation LIMIT is ``k * 5`` to keep the Python-side
+    scoring bounded; this matches the CJK fallback's behaviour.
+    """
+    if not _has_cyrillic(query):
+        return []
+    if working:
+        table, id_col = "working_memory", "id"
+    else:
+        table, id_col = "episodic_memory", "rowid"
+
+    # SQLite's default LOWER() and LIKE are ASCII-only, so they cannot
+    # case-fold Cyrillic letters (Т ≠ т, Ё ≠ ё). Register a Python
+    # UDF on the connection that performs a real Unicode lower(). It
+    # is safe to register the same name multiple times — SQLite will
+    # overwrite the previous function with the same name and arity.
+    conn.create_function("_py_lower", 1, lambda s: s.lower() if isinstance(s, str) else s)
+
+    # Use a 4-character prefix for LIKE matching. Query words and
+    # stored content are inflected forms of the same lemma (тёмная
+    # vs тёмную), so the 4-char prefix is the most reliable cheap
+    # over-selector that still prunes the candidate set down to a
+    # trigram-scoring-sized slice.
+    q_words = [
+        w for w in re.findall(r"[а-яёa-z0-9]+", query.lower()) if len(w) >= 4
+    ]
+    if not q_words:
+        return []
+
+    conditions = " OR ".join(
+        ["_py_lower(content) LIKE ? ESCAPE '\\'"] * len(q_words)
+    )
+    params = [f"%{w[:4].lower()}%" for w in q_words]
+    try:
+        all_rows = conn.execute(
+            f"SELECT {id_col}, content FROM {table} WHERE {conditions} LIMIT ?",
+            params + [k * 5],
+        ).fetchall()
+    except Exception:
+        return []
+
+    if not all_rows:
+        return []
+
+    scored = []
+    for row in all_rows:
+        rid = row[id_col]
+        content = row["content"]
+        score = _cyrillic_score(query, content)
+        if score > 0:
+            scored.append((rid, score))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    result_key = "id" if working else "rowid"
+    return [{result_key: rid, "rank": -score} for rid, score in scored[:k]]
+
+
 def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]:
     """Search FTS5 episodes and return rowids with ranks.
 
@@ -1859,6 +2020,13 @@ def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]
         # Fall back to LIKE-based CJK search.
         if _has_cjk(query):
             return _cjk_like_search(conn, query, k=k, working=False)
+        # Cyrillic text (Russian) also produces zero FTS terms because
+        # the default unicode61 tokenizer has no built-in stemmer for
+        # inflected Cyrillic surface forms.
+        # NOTE: CJK is checked first — if a query contains both CJK and
+        # Cyrillic (unlikely), the CJK fallback takes precedence.
+        if _has_cyrillic(query):
+            return _cyrillic_like_search(conn, query, k=k, working=False)
         return []
     fts_query = " OR ".join(terms)
     rows = conn.execute(
@@ -1867,6 +2035,8 @@ def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]
     ).fetchall()
     if not rows and _has_cjk(query):
         return _cjk_like_search(conn, query, k=k, working=False)
+    if not rows and _has_cyrillic(query):
+        return _cyrillic_like_search(conn, query, k=k, working=False)
     return [{"rowid": r["rowid"], "rank": r["rank"]} for r in rows]
 
 
@@ -1876,6 +2046,8 @@ def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> Li
     if not terms:
         if _has_cjk(query):
             return _cjk_like_search(conn, query, k=k, working=True)
+        if _has_cyrillic(query):
+            return _cyrillic_like_search(conn, query, k=k, working=True)
         return []
     fts_query = " OR ".join(terms)
     rows = conn.execute(
@@ -1884,6 +2056,8 @@ def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> Li
     ).fetchall()
     if not rows and _has_cjk(query):
         return _cjk_like_search(conn, query, k=k, working=True)
+    if not rows and _has_cyrillic(query):
+        return _cyrillic_like_search(conn, query, k=k, working=True)
     return [{"id": r["id"], "rank": r["rank"]} for r in rows]
 
 
