@@ -222,7 +222,7 @@ def is_installed(*, hermes_home_path: str | Path | None = None) -> bool:
     if not init_file.is_file():
         return False
     try:
-        source = init_file.read_text(errors="replace")[:4096]
+        source = init_file.read_text(errors="replace")
         return "register_memory_provider" in source or "MnemosyneMemoryProvider" in source
     except Exception:
         return False
