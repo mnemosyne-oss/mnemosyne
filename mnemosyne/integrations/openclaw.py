@@ -65,7 +65,7 @@ class MnemosyneProvider(OpenClawMemoryProvider):  # type: ignore
         data_dir = Path(
             config.get("db_path")
             or os.environ.get("MNEMOSYNE_DATA_DIR")
-            or str(Path.home() / ".hermes" / "mnemosyne" / "data")
+            or os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")) + "/mnemosyne/data"
         )
         bank = config.get("bank", "openclaw")
         db_path = str(data_dir / f"{bank}.db")

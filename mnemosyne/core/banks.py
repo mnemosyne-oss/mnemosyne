@@ -28,7 +28,8 @@ from pathlib import Path
 from typing import List, Optional
 
 # On Fly.io and other ephemeral VMs, only ~/.hermes is persisted.
-DEFAULT_DATA_DIR = Path.home() / ".hermes" / "mnemosyne" / "data"
+_DEFAULT_ROOT = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+DEFAULT_DATA_DIR = _DEFAULT_ROOT / "mnemosyne" / "data"
 BANKS_DIR = DEFAULT_DATA_DIR / "banks"
 
 if os.environ.get("MNEMOSYNE_DATA_DIR"):

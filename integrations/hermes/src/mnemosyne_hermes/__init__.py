@@ -1229,11 +1229,12 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
     def _handle_sleep(self, args: Dict[str, Any]) -> str:
         dry_run = bool(args.get("dry_run", False))
+        force = bool(args.get("force", False))
         all_sessions = bool(args.get("all_sessions", False))
         if all_sessions and hasattr(self._beam, "sleep_all_sessions"):
-            result = self._beam.sleep_all_sessions(dry_run=dry_run)
+            result = self._beam.sleep_all_sessions(dry_run=dry_run, force=force)
         else:
-            result = self._beam.sleep(dry_run=dry_run)
+            result = self._beam.sleep(dry_run=dry_run, force=force)
         working = self._beam.get_working_stats()
         episodic = self._beam.get_episodic_stats()
         if not dry_run:

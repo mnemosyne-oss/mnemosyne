@@ -32,7 +32,7 @@ def _resolve_db_path(bank: str = "default") -> str:
     """Resolve the Mnemosyne database path for a given bank."""
     data_dir = Path(
         os.environ.get("MNEMOSYNE_DATA_DIR")
-        or str(Path.home() / ".hermes" / "mnemosyne" / "data")
+        or os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")) + "/mnemosyne/data"
     )
     return str(data_dir / f"{bank}.db")
 

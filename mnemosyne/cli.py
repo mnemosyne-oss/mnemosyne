@@ -143,7 +143,10 @@ def cmd_stats(args):
 def cmd_sleep(args):
     """Run consolidation cycle."""
     mem = _get_memory()
-    result = mem.sleep_all_sessions()
+    force = "--force" in args or "-f" in args
+    all_sessions = "--all-sessions" in args
+    dry_run = "--dry-run" in args
+    result = mem.sleep_all_sessions(dry_run=dry_run, force=force) if all_sessions else mem.sleep(dry_run=dry_run, force=force)
     print(f"Consolidation complete: {result}")
 
 

@@ -151,6 +151,11 @@ SLEEP_SCHEMA = {
                 "description": "If true, report what would be consolidated without writing changes.",
                 "default": False,
             },
+            "force": {
+                "type": "boolean",
+                "description": "If true, skip the age threshold and consolidate all non-consolidated working memories immediately.",
+                "default": False,
+            },
         },
     },
 }

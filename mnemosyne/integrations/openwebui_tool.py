@@ -31,7 +31,7 @@ from mnemosyne.core.memory import Mnemosyne
 DEFAULT_DATA_DIR = Path(
     os.environ.get(
         "MNEMOSYNE_DATA_DIR",
-        Path.home() / ".hermes" / "mnemosyne" / "data",
+        os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")) + "/mnemosyne/data",
     )
 )
 

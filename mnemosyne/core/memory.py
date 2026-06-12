@@ -19,20 +19,20 @@ from datetime import datetime
 from typing import List, Dict, Optional, Any
 from pathlib import Path
 
+import os
+
 from mnemosyne.core import embeddings as _embeddings
 from mnemosyne.core.beam import BeamMemory, init_beam, _get_connection as _beam_get_connection
-
-# Single shared connection per thread (legacy path)
 _thread_local = threading.local()
 
 # Default data directory
 # NOTE: On Fly.io and ephemeral VMs, only ~/.hermes is persisted.
 # This MUST match beam.py's DEFAULT_DATA_DIR to avoid split-brain.
-DEFAULT_DATA_DIR = Path.home() / ".hermes" / "mnemosyne" / "data"
+_DEFAULT_ROOT = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+DEFAULT_DATA_DIR = _DEFAULT_ROOT / "mnemosyne" / "data"
 DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "mnemosyne.db"
 
 # Allow override via environment
-import os
 if os.environ.get("MNEMOSYNE_DATA_DIR"):
     DEFAULT_DATA_DIR = Path(os.environ.get("MNEMOSYNE_DATA_DIR"))
     DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "mnemosyne.db"
@@ -557,13 +557,13 @@ class Mnemosyne:
     # ------------------------------------------------------------------
     # BEAM-specific public methods
     # ------------------------------------------------------------------
-    def sleep(self, dry_run: bool = False) -> Dict:
+    def sleep(self, dry_run: bool = False, force: bool = False) -> Dict:
         """Run consolidation sleep cycle for the current session."""
-        return self.beam.sleep(dry_run=dry_run)
+        return self.beam.sleep(dry_run=dry_run, force=force)
 
-    def sleep_all_sessions(self, dry_run: bool = False) -> Dict:
+    def sleep_all_sessions(self, dry_run: bool = False, force: bool = False) -> Dict:
         """Run consolidation sleep cycle across all sessions with eligible old working memories."""
-        return self.beam.sleep_all_sessions(dry_run=dry_run)
+        return self.beam.sleep_all_sessions(dry_run=dry_run, force=force)
 
     def scratchpad_write(self, content: str) -> str:
         """Write to scratchpad."""
@@ -835,14 +835,14 @@ def update(memory_id: str, content: str = None, importance: float = None, bank: 
     return _get_default(bank).update(memory_id, content, importance)
 
 
-def sleep(dry_run: bool = False, bank: str = None) -> Dict:
+def sleep(dry_run: bool = False, force: bool = False, bank: str = None) -> Dict:
     """Run consolidation sleep cycle for the global instance's current session"""
-    return _get_default(bank).sleep(dry_run=dry_run)
+    return _get_default(bank).sleep(dry_run=dry_run, force=force)
 
 
-def sleep_all_sessions(dry_run: bool = False, bank: str = None) -> Dict:
+def sleep_all_sessions(dry_run: bool = False, force: bool = False, bank: str = None) -> Dict:
     """Run consolidation sleep cycle across all sessions using the global instance"""
-    return _get_default(bank).sleep_all_sessions(dry_run=dry_run)
+    return _get_default(bank).sleep_all_sessions(dry_run=dry_run, force=force)
 
 
 def scratchpad_write(content: str, bank: str = None) -> str:

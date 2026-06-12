@@ -203,15 +203,16 @@ except Exception:
     _SQLITE_VEC_AVAILABLE = False
     sqlite_vec = None
 
-_thread_local = threading.local()
+import os
+import re
 
 # On Fly.io and other ephemeral VMs, only ~/.hermes is persisted.
 # Default to the legacy Hermes path so memories survive restarts.
-DEFAULT_DATA_DIR = Path.home() / ".hermes" / "mnemosyne" / "data"
+_DEFAULT_ROOT = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+DEFAULT_DATA_DIR = _DEFAULT_ROOT / "mnemosyne" / "data"
 DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "mnemosyne.db"
 
-import os
-import re
+_thread_local = threading.local()
 
 def _env_truthy(name: str) -> bool:
     """Parse an env var as truthy. Accepts `1`/`true`/`yes`/`on`
@@ -6871,12 +6872,11 @@ class BeamMemory:
     # ------------------------------------------------------------------
     # Consolidation / Sleep
     # ------------------------------------------------------------------
-    def sleep(self, dry_run: bool = False) -> Dict:
+    def sleep(self, dry_run: bool = False, force: bool = False) -> Dict:
         """
         Consolidate old working_memory for this session into episodic summaries.
         Uses a local lightweight LLM when available; falls back to aaak
         compression if the model is missing or inference fails.
-        Returns summary of what was done.
 
         Post-E3 (additive): the source working_memory rows are NOT
         deleted. Instead they're marked with consolidated_at = NOW
@@ -6886,12 +6886,18 @@ class BeamMemory:
         Note: this method intentionally remains session-scoped. Use
         sleep_all_sessions() for maintenance that consolidates eligible old
         working memories across inactive sessions.
+
+        When force=True, skips the age cutoff and consolidates all
+        non-consolidated working memories immediately regardless of age.
         """
         from mnemosyne.core.aaak import encode as aaak_encode
         from mnemosyne.core import local_llm
 
         cursor = self.conn.cursor()
         cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).isoformat()
+        if force:
+            # Skip age cutoff: consolidate all non-consolidated working memories
+            cutoff = datetime.max.isoformat()
         # COALESCE(session_id, 'default') so a "default"-session beam also
         # consolidates rows with literal NULL session_id (which can land
         # via imports or schema migrations). Without the COALESCE these
@@ -7130,16 +7136,21 @@ class BeamMemory:
             "degradation": degrade_result
         }
 
-    def sleep_all_sessions(self, dry_run: bool = False) -> Dict:
+    def sleep_all_sessions(self, dry_run: bool = False, force: bool = False) -> Dict:
         """
         Consolidate eligible old working memories across all sessions.
 
         This is the maintenance-oriented counterpart to sleep(), which remains
         scoped to self.session_id. It prevents inactive sessions from leaving
         old working_memory rows stranded after they pass the sleep cutoff.
+
+        When force=True, skips the age cutoff and consolidates all
+        non-consolidated working memories across all sessions immediately.
         """
         cursor = self.conn.cursor()
         cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).isoformat()
+        if force:
+            cutoff = datetime.max.isoformat()
         # Mirror sleep()'s filter: only count rows that haven't been
         # consolidated yet, so we don't redo work on every maintenance pass.
         cursor.execute("""

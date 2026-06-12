@@ -334,14 +334,15 @@ def _handle_shared_stats(arguments: Dict[str, Any]) -> Dict[str, Any]:
 def _handle_sleep(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_sleep tool call."""
     dry_run = arguments.get("dry_run", False)
+    force = arguments.get("force", False)
     all_sessions = arguments.get("all_sessions", False)
     bank = _resolve_bank(arguments)
 
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     if all_sessions and hasattr(mem, "sleep_all_sessions"):
-        result = mem.sleep_all_sessions(dry_run=dry_run)
+        result = mem.sleep_all_sessions(dry_run=dry_run, force=force)
     else:
-        result = mem.sleep(dry_run=dry_run)
+        result = mem.sleep(dry_run=dry_run, force=force)
 
     working = _serialize(mem.beam.get_working_stats()) if hasattr(mem, "beam") else {}
     episodic = _serialize(mem.beam.get_episodic_stats()) if hasattr(mem, "beam") else {}
