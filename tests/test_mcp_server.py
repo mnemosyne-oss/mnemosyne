@@ -229,7 +229,7 @@ class TestToolHandlers:
         assert "working" in result
         assert "episodic" in result
         assert result["bank"] == "default"
-        mock_mnemosyne.sleep.assert_called_once_with(dry_run=False)
+        mock_mnemosyne.sleep.assert_called_once_with(dry_run=False, force=False)
 
     def test_handle_scratchpad_read(self, mock_mnemosyne):
         """handle_scratchpad_read returns entries."""
