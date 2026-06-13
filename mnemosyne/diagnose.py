@@ -9,6 +9,7 @@ Never includes memory content, user queries, or API keys.
 Supports --fix mode: auto-installs missing dependencies.
 """
 
+import importlib.metadata
 import json
 import os
 import subprocess
@@ -88,25 +89,42 @@ def run_diagnostics() -> Dict:
     # --- Mnemosyne package ---
     try:
         import mnemosyne
-        log("package", "mnemosyne_version", mnemosyne.__version__)
+        version = getattr(mnemosyne, "__version__", None)
+        if not version:
+            version = importlib.metadata.version("mnemosyne-memory")
+        log("package", "mnemosyne_version", str(version))
     except Exception as e:
         log("package", "mnemosyne_version", "ERROR", str(e))
 
     # --- Core dependencies ---
-    deps = {
+    required_deps = {
         "fastembed": "fastembed",
         "sqlite_vec": "sqlite_vec",
         "numpy": "numpy",
-        "ctransformers": "ctransformers",
         "huggingface_hub": "huggingface_hub",
     }
-    for name, module in deps.items():
+    optional_deps = {
+        # Optional local-GGUF fallback only. Host/remote LLM paths and the
+        # non-LLM fallback work without it, so absence should not fail the
+        # installation health check.
+        "ctransformers": "ctransformers",
+    }
+    for name, module in required_deps.items():
         try:
             mod = __import__(module)
             ver = getattr(mod, "__version__", "unknown")
             log("deps", name, "OK", f"version={ver}")
         except ImportError:
             log("deps", name, "MISSING")
+        except Exception as e:
+            log("deps", name, "ERROR", str(e))
+    for name, module in optional_deps.items():
+        try:
+            mod = __import__(module)
+            ver = getattr(mod, "__version__", "unknown")
+            log("deps", name, "OK", f"version={ver}")
+        except ImportError:
+            log("deps", name, "OPTIONAL", "optional local-GGUF fallback dependency not installed")
         except Exception as e:
             log("deps", name, "ERROR", str(e))
 
@@ -180,10 +198,11 @@ def run_diagnostics() -> Dict:
             f.write(json.dumps(entry) + "\n")
 
     # --- Build summary ---
+    non_failure_statuses = ("OK", "YES", "set", "OPTIONAL")
     summary = {
         "log_path": str(log_path),
         "checks_total": len(entries),
-        "checks_passed": sum(1 for e in entries if e["status"] in ("OK", "YES", "set")),
+        "checks_passed": sum(1 for e in entries if e["status"] in non_failure_statuses),
         "checks_failed": sum(1 for e in entries if e["status"] in ("MISSING", "NO", "ERROR")),
         "key_findings": [],
         "fixable": [],
