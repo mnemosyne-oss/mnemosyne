@@ -752,10 +752,17 @@ class MnemosyneMemoryProvider(MemoryProvider):
             # (working / init-failed-visible / skip-context-silent).
             return (
                 "# Mnemosyne Memory\n"
-                "Active (native local memory). Use mnemosyne_remember to store ANY "
-                "durable fact, preference, identity, or insight. Use mnemosyne_recall to search. "
-                "Use mnemosyne_shared_* tools for manual shared surface CRUD. "
-                "The legacy memory tool is deprecated for durable storage — Mnemosyne is primary."
+                "Active native local memory. Mnemosyne is primary; the legacy memory tool is deprecated for durable storage.\n"
+                "Use mnemosyne_recall for durable facts/preferences before asking the user to repeat old context.\n"
+                "Before writing durable memory, choose the narrowest layer: "
+                "mnemosyne_remember for ordinary facts/preferences/insights; "
+                "mnemosyne_remember_canonical for stable single-source-of-truth identity/profile slots; "
+                "mnemosyne_triple_add for explicit subject-predicate-object or temporal relationships; "
+                "mnemosyne_graph_link/query for relationships between existing memories; "
+                "mnemosyne_validate/invalidate/update/forget for provenance, corrections, stale facts, and cleanup; "
+                "mnemosyne_scratchpad_* for temporary working notes; "
+                "mnemosyne_shared_* only for compact cross-agent stable metadata, never raw conversation.\n"
+                "Prefer compact, declarative, non-imperative memories. Do not save one-off task progress."
             )
         # C27: when init failed (as opposed to a deliberate skip-context),
         # surface the failure in the system prompt so the agent -- and through
