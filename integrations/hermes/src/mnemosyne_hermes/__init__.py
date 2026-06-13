@@ -970,6 +970,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 return self._handle_triple_add(args)
             elif tool_name == "mnemosyne_triple_query":
                 return self._handle_triple_query(args)
+            elif tool_name == "mnemosyne_remember_canonical":
+                return self._handle_remember_canonical(args)
+            elif tool_name == "mnemosyne_recall_canonical":
+                return self._handle_recall_canonical(args)
             elif tool_name == "mnemosyne_scratchpad_write":
                 return self._handle_scratchpad_write(args)
             elif tool_name == "mnemosyne_scratchpad_read":
@@ -1410,6 +1414,90 @@ class MnemosyneMemoryProvider(MemoryProvider):
         results = query_triples(subject=subject, predicate=predicate, object=obj,
                                 db_path=self._beam.db_path)
         return json.dumps({"count": len(results), "results": results})
+
+    def _canonical_owner(self) -> str:
+        """Owner id for canonical reads/writes: the active Hermes profile.
+
+        This is derived from provider state, never from tool arguments, so one
+        profile cannot ask the canonical tool to read or write another profile's
+        single-source-of-truth facts. The default profile maps to "default".
+        """
+        return (getattr(self, "_agent_identity", None) or "").strip() or "default"
+
+    def _handle_remember_canonical(self, args: Dict[str, Any]) -> str:
+        category = (args.get("category") or "").strip()
+        name = (args.get("name") or "").strip()
+        body = (args.get("body") or "").strip()
+        if not category or not name:
+            return json.dumps({"error": "category and name are required"})
+        if not body:
+            return json.dumps({"error": "body is required"})
+        source = args.get("source") or "canonical_tool"
+        try:
+            confidence = float(args.get("confidence", 1.0))
+        except (TypeError, ValueError):
+            confidence = 1.0
+        owner_id = self._canonical_owner()
+        store = getattr(self._beam, "canonical", None)
+        if store is None:
+            from mnemosyne.core.canonical import CanonicalStore
+            store = CanonicalStore(db_path=self._beam.db_path, conn=self._beam.conn)
+            self._beam.canonical = store
+        row = store.remember(
+            owner_id, category, name, body,
+            source=source, confidence=confidence,
+        )
+        status = row.pop("status", "stored")
+        self._audit_event(
+            "remember_canonical", bank="canonical",
+            source_tool="mnemosyne_remember_canonical",
+            metadata={"category": category, "name": name, "status": status,
+                      "version": row.get("version")},
+        )
+        return json.dumps({
+            "status": status,
+            "owner_id": owner_id,
+            "category": category,
+            "name": name,
+            "version": row.get("version"),
+            "body_preview": body[:120],
+        })
+
+    def _handle_recall_canonical(self, args: Dict[str, Any]) -> str:
+        category = (args.get("category") or "").strip()
+        name = (args.get("name") or "").strip()
+        query = (args.get("query") or "").strip()
+        include_history = bool(args.get("include_history", False))
+        try:
+            limit = int(args.get("limit", 10))
+        except (TypeError, ValueError):
+            limit = 10
+        owner_id = self._canonical_owner()
+        store = getattr(self._beam, "canonical", None)
+        if store is None:
+            from mnemosyne.core.canonical import CanonicalStore
+            store = CanonicalStore(db_path=self._beam.db_path, conn=self._beam.conn)
+            self._beam.canonical = store
+
+        if query:
+            results = store.search(owner_id, query, limit=limit)
+            return json.dumps({"mode": "search", "owner_id": owner_id,
+                               "query": query, "count": len(results),
+                               "results": results})
+        if category and name:
+            if include_history:
+                results = store.history(owner_id, category, name)
+                return json.dumps({"mode": "history", "owner_id": owner_id,
+                                   "category": category, "name": name,
+                                   "count": len(results), "results": results})
+            row = store.recall(owner_id, category, name)
+            return json.dumps({"mode": "recall", "owner_id": owner_id,
+                               "category": category, "name": name,
+                               "found": row is not None, "result": row})
+        results = store.list(owner_id, category=category or None)
+        return json.dumps({"mode": "list", "owner_id": owner_id,
+                           "category": category or None,
+                           "count": len(results), "results": results})
 
     def _handle_scratchpad_write(self, args: Dict[str, Any]) -> str:
         content = args.get("content", "").strip()
