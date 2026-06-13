@@ -25,6 +25,7 @@ _lazy_exports = {
     "get": (".core.memory", "get"),
     "forget": (".core.memory", "forget"),
     "update": (".core.memory", "update"),
+    "reclaim_orphans": (".core.memory", "reclaim_orphans"),
 }
 
 

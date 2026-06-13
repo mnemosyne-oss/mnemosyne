@@ -599,6 +599,12 @@ def init_beam(db_path: Path = None):
             (datetime.now().isoformat(),),
         )
 
+    try:
+        cursor.execute("ALTER TABLE working_memory ADD COLUMN consolidation_claimed_at TEXT")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
+
     # Partial index for the sleep eligibility predicate. Sleep scans
     # WHERE session_id = ? AND timestamp < ? AND consolidated_at IS NULL
     # on every cycle; once consolidated rows accumulate the predicate
@@ -608,6 +614,11 @@ def init_beam(db_path: Path = None):
         "CREATE INDEX IF NOT EXISTS idx_wm_unconsolidated "
         "ON working_memory(session_id, timestamp) "
         "WHERE consolidated_at IS NULL"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wm_consolidation_claims "
+        "ON working_memory(consolidation_claimed_at) "
+        "WHERE consolidation_claimed_at IS NOT NULL"
     )
 
     # --- SCRATCHPAD ---
@@ -2442,7 +2453,8 @@ class BeamMemory:
                     memory_type = COALESCE(?, memory_type),
                     veracity = CASE WHEN ? != 'unknown' THEN ? ELSE veracity END,
                     trust_tier = COALESCE(?, trust_tier),
-                    consolidated_at = NULL
+                    consolidated_at = NULL,
+                    consolidation_claimed_at = NULL
                 WHERE id = ? AND session_id = ?
             """, (importance, datetime.now().isoformat(), source,
                   valid_until, scope,
@@ -6938,6 +6950,103 @@ class BeamMemory:
     # ------------------------------------------------------------------
     # Consolidation / Sleep
     # ------------------------------------------------------------------
+    def reclaim_orphans(
+        self,
+        dry_run: bool = False,
+        stale_after_seconds: int = 3600,
+        limit: int = 1000,
+    ) -> Dict:
+        """Clear stale sleep claims that have no episodic summary.
+
+        sleep() claims working rows by setting ``consolidated_at`` before it
+        writes the episodic summary. A process crash in that narrow window can
+        leave rows permanently skipped by later sleep() runs. This maintenance
+        helper finds old claims whose id does not appear in any
+        ``episodic_memory.summary_of`` CSV token and clears the marker so a
+        later sleep pass can summarize them.
+        """
+        stale_after_seconds = max(0, int(stale_after_seconds))
+        limit = max(0, int(limit))
+        cutoff = (datetime.now() - timedelta(seconds=stale_after_seconds)).isoformat()
+        if limit == 0:
+            return {
+                "status": "dry_run" if dry_run else "no_op",
+                "stale_after_seconds": stale_after_seconds,
+                "cutoff": cutoff,
+                "candidates": 0,
+                "reclaimed": 0,
+                "candidate_ids": [],
+            }
+
+        cursor = self.conn.cursor()
+        orphan_query = """
+            SELECT wm.id
+            FROM working_memory wm
+            WHERE wm.consolidated_at IS NOT NULL
+              AND wm.consolidation_claimed_at IS NOT NULL
+              AND wm.consolidation_claimed_at < ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM episodic_memory em
+                  WHERE instr(',' || COALESCE(em.summary_of, '') || ',',
+                              ',' || wm.id || ',') > 0
+              )
+            ORDER BY wm.consolidated_at ASC
+            LIMIT ?
+        """
+        cursor.execute(orphan_query, (cutoff, limit))
+        candidate_ids = [row["id"] for row in cursor.fetchall()]
+        if not candidate_ids:
+            return {
+                "status": "dry_run" if dry_run else "no_op",
+                "stale_after_seconds": stale_after_seconds,
+                "cutoff": cutoff,
+                "candidates": 0,
+                "reclaimed": 0,
+                "candidate_ids": [],
+            }
+
+        if dry_run:
+            return {
+                "status": "dry_run",
+                "stale_after_seconds": stale_after_seconds,
+                "cutoff": cutoff,
+                "candidates": len(candidate_ids),
+                "reclaimed": 0,
+                "candidate_ids": candidate_ids,
+            }
+
+        placeholders = ",".join("?" * len(candidate_ids))
+        cursor.execute(
+            f"""
+            UPDATE working_memory
+            SET consolidated_at = NULL,
+                consolidation_claimed_at = NULL
+            WHERE id IN ({placeholders})
+              AND consolidated_at IS NOT NULL
+              AND consolidation_claimed_at IS NOT NULL
+              AND consolidation_claimed_at < ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM episodic_memory em
+                  WHERE instr(',' || COALESCE(em.summary_of, '') || ',',
+                              ',' || working_memory.id || ',') > 0
+              )
+            """,
+            (*candidate_ids, cutoff),
+        )
+        reclaimed = cursor.rowcount
+        self.conn.commit()
+        logger.info("reclaim_orphans: reclaimed=%d candidates=%d", reclaimed, len(candidate_ids))
+        return {
+            "status": "reclaimed" if reclaimed else "no_op",
+            "stale_after_seconds": stale_after_seconds,
+            "cutoff": cutoff,
+            "candidates": len(candidate_ids),
+            "reclaimed": reclaimed,
+            "candidate_ids": candidate_ids,
+        }
+
     def sleep(self, dry_run: bool = False, force: bool = False) -> Dict:
         """
         Consolidate old working_memory for this session into episodic summaries.
@@ -7008,9 +7117,9 @@ class BeamMemory:
             ids_to_claim = [row["id"] for row in rows]
             placeholders = ",".join("?" * len(ids_to_claim))
             cursor.execute(
-                f"UPDATE working_memory SET consolidated_at = ? "
+                f"UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? "
                 f"WHERE id IN ({placeholders}) AND consolidated_at IS NULL",
-                (now_iso, *ids_to_claim),
+                (now_iso, now_iso, *ids_to_claim),
             )
             claimed_ids = set()
             if cursor.rowcount == len(ids_to_claim):
@@ -7165,6 +7274,12 @@ class BeamMemory:
                         "source": source,
                         "llm_used": llm_succeeded
                     }
+                )
+                group_placeholders = ",".join("?" * len(ids))
+                cursor.execute(
+                    f"UPDATE working_memory SET consolidation_claimed_at = NULL "
+                    f"WHERE id IN ({group_placeholders})",
+                    tuple(ids),
                 )
             consolidated_ids.extend(ids)
             summaries_created += 1
@@ -7428,7 +7543,8 @@ class BeamMemory:
         cursor.execute("""
             SELECT id, content, source, timestamp, session_id, importance,
                    metadata_json, valid_until, superseded_by, scope,
-                   recall_count, last_recalled, created_at, veracity, consolidated_at
+                   recall_count, last_recalled, created_at, veracity,
+                   consolidated_at, consolidation_claimed_at
             FROM working_memory
             ORDER BY session_id, timestamp
         """)
@@ -7520,8 +7636,8 @@ class BeamMemory:
                 INSERT INTO working_memory
                 (id, content, source, timestamp, session_id, importance, metadata_json,
                  valid_until, superseded_by, scope, recall_count, last_recalled, created_at,
-                 veracity, consolidated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 veracity, consolidated_at, consolidation_claimed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 mid, item.get("content"), item.get("source"), item.get("timestamp"),
                 item.get("session_id", "default"), item.get("importance", 0.5),
@@ -7533,6 +7649,7 @@ class BeamMemory:
                 # treated as "not yet consolidated" so the next sleep
                 # cycle on the importing DB processes them normally.
                 item.get("consolidated_at"),
+                item.get("consolidation_claimed_at"),
             ))
         self.conn.commit()
 

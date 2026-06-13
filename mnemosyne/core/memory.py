@@ -565,6 +565,16 @@ class Mnemosyne:
         """Run consolidation sleep cycle across all sessions with eligible old working memories."""
         return self.beam.sleep_all_sessions(dry_run=dry_run, force=force)
 
+    def reclaim_orphans(self, dry_run: bool = False,
+                        stale_after_seconds: int = 3600,
+                        limit: int = 1000) -> Dict:
+        """Clear stale sleep claims that have no episodic summary."""
+        return self.beam.reclaim_orphans(
+            dry_run=dry_run,
+            stale_after_seconds=stale_after_seconds,
+            limit=limit,
+        )
+
     def scratchpad_write(self, content: str) -> str:
         """Write to scratchpad."""
         return self.beam.scratchpad_write(content)
@@ -843,6 +853,16 @@ def sleep(dry_run: bool = False, force: bool = False, bank: str = None) -> Dict:
 def sleep_all_sessions(dry_run: bool = False, force: bool = False, bank: str = None) -> Dict:
     """Run consolidation sleep cycle across all sessions using the global instance"""
     return _get_default(bank).sleep_all_sessions(dry_run=dry_run, force=force)
+
+
+def reclaim_orphans(dry_run: bool = False, stale_after_seconds: int = 3600,
+                    limit: int = 1000, bank: str = None) -> Dict:
+    """Clear stale sleep claims that have no episodic summary using the global instance."""
+    return _get_default(bank).reclaim_orphans(
+        dry_run=dry_run,
+        stale_after_seconds=stale_after_seconds,
+        limit=limit,
+    )
 
 
 def scratchpad_write(content: str, bank: str = None) -> str:
