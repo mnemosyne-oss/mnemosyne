@@ -836,6 +836,12 @@ def init_beam(db_path: Path = None):
         ON episodic_memory(scope, importance) WHERE superseded_by IS NULL""")
     cursor.execute("""CREATE INDEX IF NOT EXISTS idx_wm_session_recall
         ON working_memory(session_id, last_recalled) WHERE valid_until IS NULL""")
+    cursor.execute("""CREATE INDEX IF NOT EXISTS idx_wm_context_session
+        ON working_memory(session_id, importance DESC, timestamp DESC)
+        WHERE superseded_by IS NULL""")
+    cursor.execute("""CREATE INDEX IF NOT EXISTS idx_wm_context_global
+        ON working_memory(scope, importance DESC, timestamp DESC)
+        WHERE superseded_by IS NULL""")
     cursor.execute("""CREATE INDEX IF NOT EXISTS idx_mem_emb_type
         ON memory_embeddings(memory_id, model)""")
 
@@ -3054,19 +3060,40 @@ class BeamMemory:
 
         cursor = self.conn.cursor()
         now = datetime.now().isoformat()
-        cursor.execute("""
-            SELECT id, content, source, timestamp, importance, scope
+        # Keep the original ordering contract (global memories first, then
+        # session-local memories; each group by importance and recency) while
+        # avoiding the previous ``session_id = ? OR scope = 'global'`` query.
+        # Splitting this hot path lets SQLite use simple partial indexes for
+        # each branch instead of scanning working_memory and building a temp
+        # B-tree for the CASE-based ORDER BY.
+        select_cols = "id, content, source, timestamp, importance, scope, last_recalled"
+        common_predicate = "(valid_until IS NULL OR valid_until > ?) AND superseded_by IS NULL"
+
+        cursor.execute(f"""
+            SELECT {select_cols}
             FROM working_memory
-            WHERE (session_id = ? OR scope = 'global')
-              AND (valid_until IS NULL OR valid_until > ?)
-              AND superseded_by IS NULL
-            ORDER BY
-                CASE WHEN scope = 'global' THEN 0 ELSE 1 END,
-                importance DESC,
-                timestamp DESC
+            WHERE scope = 'global'
+              AND {common_predicate}
+            ORDER BY importance DESC, timestamp DESC
             LIMIT ?
-        """, (self.session_id, now, limit))
-        rows = [dict(row) for row in cursor.fetchall()]
+        """, (now, limit))
+        global_rows = [dict(row) for row in cursor.fetchall()]
+
+        session_rows = []
+        if limit < 0 or len(global_rows) < limit:
+            session_limit = limit if limit < 0 else limit - len(global_rows)
+            cursor.execute(f"""
+                SELECT {select_cols}
+                FROM working_memory
+                WHERE session_id = ?
+                  AND (scope IS NULL OR scope != 'global')
+                  AND {common_predicate}
+                ORDER BY importance DESC, timestamp DESC
+                LIMIT ?
+            """, (self.session_id, now, session_limit))
+            session_rows = [dict(row) for row in cursor.fetchall()]
+
+        rows = global_rows + session_rows
         if not rows:
             return rows
 
@@ -3076,15 +3103,7 @@ class BeamMemory:
         now_dt = datetime.now()
         bump_delta = timedelta(hours=WM_BUMP_CAP_HOURS)
         for row in rows:
-            # Read current values for this item
-            cursor.execute(
-                "SELECT last_recalled FROM working_memory WHERE id = ?",
-                (row["id"],)
-            )
-            cur = cursor.fetchone()
-            if cur is None:
-                continue
-            old_ts = cur["last_recalled"]
+            old_ts = row.pop("last_recalled", None)
             if old_ts is None:
                 new_last = now_dt
             else:

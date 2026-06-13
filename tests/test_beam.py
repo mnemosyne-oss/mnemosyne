@@ -102,6 +102,14 @@ class TestBeamSchema:
         assert "fts_episodes" in tables
         conn.close()
 
+    def test_context_indexes_created(self, temp_db):
+        init_beam(temp_db)
+        conn = sqlite3.connect(temp_db)
+        indexes = {r[1] for r in conn.execute("PRAGMA index_list(working_memory)").fetchall()}
+        assert "idx_wm_context_session" in indexes
+        assert "idx_wm_context_global" in indexes
+        conn.close()
+
     def test_vec_type_probe_does_not_rollback_schema_ddl(self, temp_db, monkeypatch):
         """Vector capability probing must not undo unrelated schema DDL.
 
@@ -133,6 +141,112 @@ class TestWorkingMemory:
         ctx = beam.get_context(limit=5)
         assert len(ctx) == 1
         assert ctx[0]["content"] == "Prefers Neovim"
+
+    def test_get_context_keeps_global_first_then_session_order(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        now = datetime.now()
+        rows = [
+            ("session-high", "session high", "conversation", (now - timedelta(minutes=1)).isoformat(), "s1", 0.99, "session"),
+            ("global-low", "global low", "preference", (now - timedelta(minutes=2)).isoformat(), "other", 0.10, "global"),
+            ("global-high", "global high", "preference", now.isoformat(), "other", 0.80, "global"),
+            ("session-low", "session low", "conversation", (now - timedelta(minutes=3)).isoformat(), "s1", 0.10, "session"),
+            ("other-session", "other session", "conversation", now.isoformat(), "s2", 1.00, "session"),
+        ]
+        beam.conn.executemany(
+            """
+            INSERT INTO working_memory
+                (id, content, source, timestamp, session_id, importance, scope)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        beam.conn.commit()
+
+        ctx = beam.get_context(limit=4)
+        assert [row["id"] for row in ctx] == [
+            "global-high",
+            "global-low",
+            "session-high",
+            "session-low",
+        ]
+        assert all("last_recalled" not in row for row in ctx)
+
+    def test_get_context_limit_minus_one_preserves_unbounded_sqlite_limit(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        now = datetime.now().isoformat()
+        for i in range(3):
+            beam.conn.execute(
+                """
+                INSERT INTO working_memory
+                    (id, content, source, timestamp, session_id, importance, scope)
+                VALUES (?, ?, 'conversation', ?, 's1', ?, 'session')
+                """,
+                (f"m{i}", f"memory {i}", now, i / 10),
+            )
+        beam.conn.commit()
+
+        ctx = beam.get_context(limit=-1)
+        assert len(ctx) == 3
+
+    def test_get_context_query_shapes_use_context_indexes(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        now = datetime.now().isoformat()
+        for i in range(20):
+            beam.conn.execute(
+                """
+                INSERT INTO working_memory
+                    (id, content, source, timestamp, session_id, importance, scope)
+                VALUES (?, ?, 'conversation', ?, ?, ?, ?)
+                """,
+                (
+                    f"m{i}",
+                    f"memory {i}",
+                    now,
+                    "s1" if i % 2 else "s2",
+                    i / 20,
+                    "global" if i % 5 == 0 else "session",
+                ),
+            )
+        beam.conn.commit()
+
+        global_plan = "\n".join(
+            row[3]
+            for row in beam.conn.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT id, content, source, timestamp, importance, scope, last_recalled
+                FROM working_memory
+                WHERE scope = 'global'
+                  AND (valid_until IS NULL OR valid_until > ?)
+                  AND superseded_by IS NULL
+                ORDER BY importance DESC, timestamp DESC
+                LIMIT ?
+                """,
+                (now, 10),
+            ).fetchall()
+        )
+        session_plan = "\n".join(
+            row[3]
+            for row in beam.conn.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT id, content, source, timestamp, importance, scope, last_recalled
+                FROM working_memory
+                WHERE session_id = ?
+                  AND (scope IS NULL OR scope != 'global')
+                  AND (valid_until IS NULL OR valid_until > ?)
+                  AND superseded_by IS NULL
+                ORDER BY importance DESC, timestamp DESC
+                LIMIT ?
+                """,
+                ("s1", now, 10),
+            ).fetchall()
+        )
+
+        assert "idx_wm_context_global" in global_plan
+        assert "idx_wm_context_session" in session_plan
+        assert "USE TEMP B-TREE" not in global_plan
+        assert "USE TEMP B-TREE" not in session_plan
 
     def test_trim_old_memories(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
