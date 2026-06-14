@@ -178,6 +178,86 @@ def test_vec_working_backfill_from_memory_embeddings_is_idempotent(temp_db):
     assert beam_module._backfill_vec_working_from_memory_embeddings(beam.conn) == 0
 
 
+def test_wm_vec_search_prefers_vec_working_without_decoding_fallback(temp_db, monkeypatch):
+    np = pytest.importorskip("numpy")
+    beam = BeamMemory(session_id="vec-working-search", db_path=temp_db)
+    _require_vec_working(beam.conn)
+    now = datetime.now().isoformat()
+    memory_id = "sqlite-hit"
+    embedding = _unit_embedding()
+
+    beam.conn.execute(
+        """
+        INSERT INTO working_memory
+            (id, content, source, timestamp, session_id, scope, channel_id, importance)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (memory_id, "sqlite vector hit", "chat", now, "vec-working-search", "session", "chan-a", 0.5),
+    )
+    rowid = beam.conn.execute("SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)).fetchone()["rowid"]
+    beam_module._vec_table_insert(beam.conn, "vec_working", rowid, embedding)
+    # Poison the compatibility store: the sqlite-vec path should satisfy the
+    # query without decoding memory_embeddings JSON at all.
+    beam.conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        (memory_id, "not-json", "test"),
+    )
+    beam.conn.commit()
+
+    def fail_json_loads(_value):
+        raise AssertionError("memory_embeddings fallback should not be decoded")
+
+    monkeypatch.setattr(beam_module.json, "loads", fail_json_loads)
+
+    results = _wm_vec_search(
+        beam.conn,
+        np.array(embedding, dtype=np.float32),
+        k=5,
+        where_sql=(
+            "(valid_until IS NULL OR valid_until > ?) AND superseded_by IS NULL "
+            "AND (session_id = ? OR scope = 'global') AND source = ? AND channel_id = ?"
+        ),
+        where_params=(now, "vec-working-search", "chat", "chan-a"),
+    )
+
+    assert [r["id"] for r in results] == [memory_id]
+    assert results[0]["sim"] > 0.0
+
+
+def test_wm_vec_search_falls_back_when_vec_working_missing_row(temp_db):
+    np = pytest.importorskip("numpy")
+    beam = BeamMemory(session_id="vec-working-fallback", db_path=temp_db)
+    _require_vec_working(beam.conn)
+    now = datetime.now().isoformat()
+    memory_id = "fallback-hit"
+    embedding = _unit_embedding()
+
+    beam.conn.execute(
+        """
+        INSERT INTO working_memory
+            (id, content, source, timestamp, session_id, scope, importance)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (memory_id, "fallback vector hit", "chat", now, "vec-working-fallback", "session", 0.5),
+    )
+    beam.conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        (memory_id, beam_module._embeddings.serialize(embedding), "test"),
+    )
+    beam.conn.commit()
+
+    results = _wm_vec_search(
+        beam.conn,
+        np.array(embedding, dtype=np.float32),
+        k=5,
+        where_sql="(valid_until IS NULL OR valid_until > ?) AND superseded_by IS NULL AND (session_id = ? OR scope = 'global')",
+        where_params=(now, "vec-working-fallback"),
+    )
+
+    assert [r["id"] for r in results] == [memory_id]
+    assert results[0]["sim"] == pytest.approx(1.0)
+
+
 
 class TestFactAnnotationMatching:
     def test_strict_fact_match_ignores_stopword_only_matches(self, monkeypatch):

@@ -2237,17 +2237,98 @@ def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> Li
 def _wm_vec_search(conn: sqlite3.Connection, query_embedding, k: int = 20,
                    *, where_sql: Optional[str] = None,
                    where_params: Tuple[Any, ...] = ()) -> List[Dict]:
-    """Vector search against working_memory via memory_embeddings table.
-    Returns list of dicts with 'id' (memory_id) and 'sim' (cosine similarity)."""
+    """Vector search against working_memory.
+
+    Prefer the dedicated sqlite-vec ``vec_working`` table when available.
+    Fall back to the compatibility ``memory_embeddings`` JSON scan for older
+    databases, unavailable sqlite-vec builds, or rows not yet backfilled.
+    Returns list of dicts with 'id' (memory_id) and 'sim' (cosine similarity).
+    """
     if np is None:
         return []
+    if where_sql is None:
+        where_sql = "wm.superseded_by IS NULL AND (wm.valid_until IS NULL OR wm.valid_until > ?)"
+        where_params = (datetime.now().isoformat(),)
+
+    sqlite_results = _wm_vec_search_sqlite(conn, query_embedding, k=k,
+                                           where_sql=where_sql,
+                                           where_params=where_params)
+    if sqlite_results:
+        return sqlite_results
+    return _wm_vec_search_fallback(conn, query_embedding, k=k,
+                                   where_sql=where_sql,
+                                   where_params=where_params)
+
+
+def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20,
+                          *, where_sql: str,
+                          where_params: Tuple[Any, ...] = ()) -> List[Dict]:
+    """Search working-memory vectors via the dedicated sqlite-vec table."""
+    if not _wm_vec_available(conn):
+        return []
+    query_norm = np.linalg.norm(query_embedding)
+    if query_norm == 0:
+        return []
+    vec_type = _effective_vec_type(conn)
+    emb_arr = np.array(query_embedding, dtype=np.float32)
+    if query_norm > 0:
+        emb_arr = emb_arr / query_norm
+    emb_json = json.dumps(emb_arr.tolist())
+    k = int(k)
+    try:
+        if vec_type == "bit":
+            rows = conn.execute(f"""
+                SELECT wm.id, vw.distance
+                FROM vec_working vw
+                JOIN working_memory wm ON wm.rowid = vw.rowid
+                WHERE vw.embedding MATCH vec_quantize_binary(?)
+                  AND {where_sql}
+                ORDER BY vw.distance
+                LIMIT {k}
+            """, (emb_json, *where_params)).fetchall()
+        elif vec_type == "int8":
+            rows = conn.execute(f"""
+                SELECT wm.id, vw.distance
+                FROM vec_working vw
+                JOIN working_memory wm ON wm.rowid = vw.rowid
+                WHERE vw.embedding MATCH vec_quantize_int8(?, "unit")
+                  AND k={k}
+                  AND {where_sql}
+                ORDER BY vw.distance
+            """, (emb_json, *where_params)).fetchall()
+        else:
+            rows = conn.execute(f"""
+                SELECT wm.id, vw.distance
+                FROM vec_working vw
+                JOIN working_memory wm ON wm.rowid = vw.rowid
+                WHERE vw.embedding MATCH ?
+                  AND {where_sql}
+                ORDER BY vw.distance
+                LIMIT {k}
+            """, (emb_json, *where_params)).fetchall()
+    except Exception:
+        return []
+    results = []
+    for row in rows:
+        distance = float(row["distance"])
+        # Keep the existing caller contract: larger sim is better and roughly
+        # cosine-like. sqlite-vec reports a distance whose raw scale differs
+        # by backend/vector type; divide by dimensionality before bounding so
+        # the vector voice remains comparable to the memory_embeddings cosine
+        # fallback instead of collapsing to ~0 on high-dimensional vectors.
+        sim = max(0.0, min(1.0, 1.0 - (max(distance, 0.0) / (2.0 * EMBEDDING_DIM))))
+        results.append({"id": row["id"], "sim": sim})
+    return results[:k]
+
+
+def _wm_vec_search_fallback(conn: sqlite3.Connection, query_embedding, k: int = 20,
+                            *, where_sql: str,
+                            where_params: Tuple[Any, ...] = ()) -> List[Dict]:
+    """Compatibility vector search using memory_embeddings + numpy cosine."""
     cursor = conn.cursor()
     try:
         # BEAM mode: scan up to 500K rows for broad vector recall on large benchmark datasets
         _vec_limit = 500000 if _BEAM_MODE else 50000
-        if where_sql is None:
-            where_sql = "wm.superseded_by IS NULL AND (wm.valid_until IS NULL OR wm.valid_until > ?)"
-            where_params = (datetime.now().isoformat(),)
         cursor.execute(f"""
             SELECT wm.id, me.embedding_json
             FROM memory_embeddings me
