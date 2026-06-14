@@ -22,6 +22,18 @@ from typing import List, Dict, Optional, Any, Tuple, Union
 logger = logging.getLogger(__name__)
 
 
+def _parse_sync_timestamp(value: str) -> datetime:
+    """Parse sync timestamps consistently across supported Python versions.
+
+    Python 3.10's ``datetime.fromisoformat`` does not accept a trailing
+    ``Z`` UTC designator, while newer versions do. Normalize it so conflict
+    detection behaves the same on every CI Python.
+    """
+    if isinstance(value, str) and value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    return datetime.fromisoformat(value)
+
+
 # ---------------------------------------------------------------------------
 # SyncEvent dataclass
 # ---------------------------------------------------------------------------
@@ -423,8 +435,8 @@ class ConflictResolution:
             for lev in local_for_mid:
                 for rev in remote_for_mid:
                     try:
-                        lts = datetime.fromisoformat(lev.timestamp)
-                        rts = datetime.fromisoformat(rev.timestamp)
+                        lts = _parse_sync_timestamp(lev.timestamp)
+                        rts = _parse_sync_timestamp(rev.timestamp)
                     except (ValueError, TypeError):
                         continue
 
@@ -436,7 +448,7 @@ class ConflictResolution:
                         for rev2 in remote_for_mid:
                             if rev2.event_id != rev.event_id:
                                 try:
-                                    rts2 = datetime.fromisoformat(rev2.timestamp)
+                                    rts2 = _parse_sync_timestamp(rev2.timestamp)
                                     if abs((lts - rts2).total_seconds()) <= window_seconds:
                                         group.append(rev2)
                                 except (ValueError, TypeError):
