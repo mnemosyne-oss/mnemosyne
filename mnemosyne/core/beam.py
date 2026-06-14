@@ -2025,6 +2025,124 @@ def repair_vec_working(conn: sqlite3.Connection, *, dry_run: bool = False) -> Di
     return result
 
 
+def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
+                    dry_run: bool = False, progress=None) -> Dict[str, Any]:
+    """Rebuild every vector representation from source text with the ACTIVE
+    embedding model, recreating the sqlite-vec tables at the active dimension.
+
+    Use after changing the embedding model (e.g. via ``MNEMOSYNE_EMBEDDING_MODEL``):
+    the stored vectors are otherwise frozen at the previous model/dimension, so a
+    differently-sized query vector makes sqlite-vec recall raise a dimension error,
+    while the float-JSON and binary voices score against the wrong dimension and
+    silently degrade. It re-embeds ``working_memory`` and ``episodic_memory`` and
+    refreshes every store, reusing the same write helpers the normal store path
+    uses so encodings stay consistent.
+
+    Covered stores: ``memory_embeddings`` (working float JSON) + ``vec_working``,
+    ``episodic_memory.binary_vector`` + ``vec_episodes``, and ``vec_facts`` (no
+    writer yet — recreated empty so its declared dimension can't mismatch a query).
+
+    Synchronous and blocking — re-embedding a large DB can take minutes; run it
+    offline (with any provider/gateway stopped). Idempotent.
+
+    ``dry_run`` returns the plan (model, dim, per-store counts) without writing.
+    ``progress`` is an optional ``callable(store, done, total)`` for reporting.
+    """
+    target_dim = int(_embeddings.EMBEDDING_DIM)
+    vec_type = _effective_vec_type(conn)
+    vec_ok = _vec_available(conn)
+
+    def _count(sql: str) -> int:
+        try:
+            return int(conn.execute(sql).fetchone()[0])
+        except Exception:
+            return 0
+
+    wm_total = _count("SELECT COUNT(*) FROM working_memory "
+                      "WHERE content IS NOT NULL AND length(content) > 0")
+    ep_total = _count("SELECT COUNT(*) FROM episodic_memory "
+                      "WHERE content IS NOT NULL AND length(content) > 0")
+
+    plan: Dict[str, Any] = {
+        "model": _embeddings._DEFAULT_MODEL,
+        "dim": target_dim,
+        "vec_type": vec_type,
+        "sqlite_vec": vec_ok,
+        "working_memory": wm_total,
+        "episodic_memory": ep_total,
+    }
+    if dry_run:
+        plan["dry_run"] = True
+        return plan
+
+    if not _embeddings.available():
+        raise RuntimeError("Embedding model unavailable; cannot reindex vectors.")
+
+    # 1) Recreate the sqlite-vec tables at the active dimension. vec_facts has no
+    #    writer yet but is recreated so its declared dim can't mismatch a query.
+    if vec_ok:
+        for table in ("vec_episodes", "vec_working", "vec_facts"):
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+            conn.execute(
+                f"CREATE VIRTUAL TABLE {table} USING vec0(embedding {vec_type}[{target_dim}])"
+            )
+        conn.commit()
+
+    # 2) Working memory -> memory_embeddings (+ vec_working), via the shared write
+    #    helper so the float-JSON and sqlite-vec stores stay consistent.
+    wm_done = 0
+    wm_rows = conn.execute(
+        "SELECT id, content FROM working_memory "
+        "WHERE content IS NOT NULL AND length(content) > 0"
+    ).fetchall()
+    for start in range(0, len(wm_rows), batch_size):
+        chunk = wm_rows[start:start + batch_size]
+        vecs = _embeddings.embed([r["content"] for r in chunk])
+        if vecs is None:
+            break
+        for r, vec in zip(chunk, vecs):
+            _store_working_embedding(conn, r["id"], np.asarray(vec).tolist(), commit_vec=False)
+            wm_done += 1
+        conn.commit()
+        if progress:
+            progress("working_memory", wm_done, wm_total)
+
+    # 3) Episodic memory -> vec_episodes + binary_vector (mirrors the episodic
+    #    store path).
+    ep_done = 0
+    ep_rows = conn.execute(
+        "SELECT rowid, content FROM episodic_memory "
+        "WHERE content IS NOT NULL AND length(content) > 0"
+    ).fetchall()
+    for start in range(0, len(ep_rows), batch_size):
+        chunk = ep_rows[start:start + batch_size]
+        vecs = _embeddings.embed([r["content"] for r in chunk])
+        if vecs is None:
+            break
+        for r, vec in zip(chunk, vecs):
+            arr = np.asarray(vec)
+            rowid = int(r["rowid"])
+            if vec_ok:
+                _vec_table_insert(conn, "vec_episodes", rowid, arr.tolist(), commit=False)
+            if _mib is not None:
+                try:
+                    conn.execute(
+                        "UPDATE episodic_memory SET binary_vector = ? WHERE rowid = ?",
+                        (_mib(arr), rowid),
+                    )
+                except Exception:
+                    pass
+            ep_done += 1
+        conn.commit()
+        if progress:
+            progress("episodic_memory", ep_done, ep_total)
+
+    plan["status"] = "reindexed"
+    plan["working_memory_reindexed"] = wm_done
+    plan["episodic_memory_reindexed"] = ep_done
+    return plan
+
+
 def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -> List[Dict]:
     """Search sqlite-vec and return rowids with distances.
 

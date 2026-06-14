@@ -565,6 +565,15 @@ class Mnemosyne:
         """Run consolidation sleep cycle across all sessions with eligible old working memories."""
         return self.beam.sleep_all_sessions(dry_run=dry_run, force=force)
 
+    def reindex_vectors(self, *, batch_size: int = 64, dry_run: bool = False, progress=None) -> Dict:
+        """Rebuild all vector representations from source text with the active model.
+
+        Run after changing the embedding model (and dimension). Synchronous and
+        blocking — run offline. See ``mnemosyne.core.beam.reindex_vectors``.
+        """
+        from mnemosyne.core.beam import reindex_vectors as _reindex
+        return _reindex(self.beam.conn, batch_size=batch_size, dry_run=dry_run, progress=progress)
+
     def reclaim_orphans(self, dry_run: bool = False,
                         stale_after_seconds: int = 3600,
                         limit: int = 1000) -> Dict:

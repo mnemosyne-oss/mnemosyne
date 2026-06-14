@@ -585,6 +585,81 @@ def cmd_bank(args):
         _fail(str(e))
 
 
+def cmd_reindex(args):
+    """Rebuild vector indexes from source text with the active embedding model.
+
+    Usage: mnemosyne reindex [--model NAME] [--dry-run] [--yes] [--no-backup]
+
+    Use after changing the embedding model/dimension. Synchronous and blocking —
+    re-embeds working + episodic memory, so it can take minutes on a large DB.
+    Run it with any provider/gateway stopped.
+    """
+    dry_run = "--dry-run" in args
+    assume_yes = "--yes" in args or "-y" in args
+    no_backup = "--no-backup" in args
+
+    # --model has to win before the embedding module is imported: it freezes the
+    # model + dimension from the env at import time.
+    if "--model" in args:
+        try:
+            os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = args[args.index("--model") + 1]
+        except IndexError:
+            _usage("Usage: mnemosyne reindex [--model NAME] [--dry-run] [--yes] [--no-backup]")
+
+    from mnemosyne.core import embeddings as _emb
+
+    mem = _get_memory()
+
+    if dry_run:
+        plan = mem.reindex_vectors(dry_run=True)
+        print("Reindex plan (dry run -- nothing written):")
+        for key in ("model", "dim", "vec_type", "sqlite_vec",
+                    "working_memory", "episodic_memory"):
+            if key in plan:
+                print(f"  {key}: {plan[key]}")
+        return
+
+    print(
+        f"Reindex will re-embed working + episodic memory with "
+        f"'{_emb._DEFAULT_MODEL}' (dim {_emb.EMBEDDING_DIM}) and rebuild the sqlite-vec "
+        f"tables. This is synchronous and may take several minutes on a large DB -- "
+        f"run it with any provider/gateway stopped."
+    )
+    if not assume_yes:
+        try:
+            resp = input("Proceed? [y/N] ").strip().lower()
+        except EOFError:
+            resp = "n"
+        if resp not in ("y", "yes"):
+            print("Aborted.")
+            return
+
+    if not no_backup:
+        try:
+            from mnemosyne.dr.recovery import create_backup
+            backup = create_backup()
+            print(f"Backup created: {backup['backup_path']}")
+        except Exception as e:
+            _fail(f"Backup failed (use --no-backup to skip): {e}")
+
+    import time
+    started = time.time()
+
+    def _progress(store, done, total):
+        print(f"  {store}: {done}/{total}", flush=True)
+
+    try:
+        result = mem.reindex_vectors(progress=_progress)
+    except Exception as e:
+        _fail(str(e))
+
+    print(f"Reindex complete in {time.time() - started:.1f}s:")
+    print(f"  model: {result['model']} (dim {result['dim']})")
+    print(f"  working_memory reindexed: {result.get('working_memory_reindexed', 0)}")
+    print(f"  episodic_memory reindexed: {result.get('episodic_memory_reindexed', 0)}")
+    print(f"  sqlite-vec tables recreated at dim {result['dim']}")
+
+
 COMMANDS = {
     "store": cmd_store,
     "remember": cmd_store,
@@ -604,6 +679,7 @@ COMMANDS = {
     "import-hindsight": cmd_import_hindsight,
     "mcp": cmd_mcp,
     "bank": cmd_bank,
+    "reindex": cmd_reindex,
     "backup": cmd_backup,
     "restore": cmd_restore,
     "verify": cmd_verify,
@@ -633,6 +709,8 @@ def run_cli():
         print("  import <file.json>                     Import memories")
         print("  import-hindsight <file|url> [bank]     Import Hindsight memories")
         print("  bank list|create|delete [name]         Manage memory banks")
+        print("  reindex [--model NAME] [--dry-run] [--yes] [--no-backup]")
+        print("                                      Rebuild vector indexes with the active model")
         print("  backup [output_dir]                    Create database backup")
         print("  restore <backup.db.gz>                 Restore from backup")
         print("  verify [db_path] [--quick]             Verify database integrity")
