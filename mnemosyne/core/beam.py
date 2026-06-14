@@ -6076,34 +6076,48 @@ class BeamMemory:
                         fts_rows.append({"rowid": row["rowid"], "rank": 0})
 
         if fts_rows:
-            fact_ids = [r["rowid"] for r in fts_rows[:top_k]]
-            placeholders = ",".join("?" * len(fact_ids))
+            # Keep the FTS relevance ORDER and each fact's rank position so the
+            # score can reflect how well the fact matches the *query*, not just how
+            # confident we are it is true. (Previously the rows were re-ordered by
+            # confidence and the FTS rank was discarded, so every fact for a query
+            # scored at its stored confidence and outranked relevance-scored
+            # memories in the merged result.)
+            ranked_ids = [r["rowid"] for r in fts_rows[:top_k]]
+            rank_pos = {rid: i for i, rid in enumerate(ranked_ids)}
+            placeholders = ",".join("?" * len(ranked_ids))
             try:
                 cursor.execute(f"""
-                    SELECT fact_id, subject, predicate, object,
+                    SELECT rowid, fact_id, subject, predicate, object,
                            timestamp, confidence
                     FROM facts
                     WHERE rowid IN ({placeholders})
-                    ORDER BY confidence DESC
-                    LIMIT ?
-                """, (*fact_ids, top_k))
+                """, (*ranked_ids,))
                 fact_rows = cursor.fetchall()
             except Exception:
                 fact_rows = []
 
+            n = max(len(ranked_ids), 1)
             for raw_row in fact_rows:
                 row = dict(raw_row)
                 confidence = row.get("confidence")
-                subject = row.get("subject")
-                predicate = row.get("predicate")
-                obj = row.get("object")
-                fact_text = obj if obj else f"{subject} {predicate} {obj}"
+                confidence = confidence if confidence is not None else 0.5
+                subject = row.get("subject") or ""
+                predicate = row.get("predicate") or ""
+                obj = row.get("object") or ""
+                # Full subject-predicate-object triple: a bare object is
+                # meaningless once merged into general recall output.
+                fact_text = " ".join(p for p in (subject, predicate, obj) if p).strip() or obj
+                # Relevance from the FTS rank position (top hit -> ~1.0, decaying),
+                # combined with confidence. Replaces the flat per-fact confidence
+                # that made every hit score identically.
+                pos = rank_pos.get(row["rowid"], n - 1)
+                relevance = 1.0 - (pos / n)
                 results.append({
                     "content": fact_text,
-                    "score": confidence if confidence is not None else 0.5,
+                    "score": relevance * confidence,
                     "fact_id": row["fact_id"],
-                    "subject": subject if subject is not None else "",
-                    "predicate": predicate if predicate is not None else "",
+                    "subject": subject,
+                    "predicate": predicate,
                 })
 
         # --- Source 2: consolidated_facts (sleep-consolidated LLM triples) ---
