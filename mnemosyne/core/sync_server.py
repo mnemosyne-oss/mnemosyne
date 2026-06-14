@@ -9,6 +9,7 @@ Provides endpoints for peer-to-peer memory synchronization:
 - GET  /sync/status — server sync statistics
 """
 
+import importlib
 import json
 import logging
 import os
@@ -17,6 +18,13 @@ import threading
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional, Dict, Any, Callable
+
+# Full-suite tests and embedded hosts can leave sys.modules["logging"] in a
+# partially shadowed state. Recover the stdlib module instead of failing at
+# import time; sync serving should not depend on global module-cache hygiene.
+if not hasattr(logging, "getLogger"):
+    sys.modules.pop("logging", None)
+    logging = importlib.import_module("logging")
 
 logger = logging.getLogger(__name__)
 

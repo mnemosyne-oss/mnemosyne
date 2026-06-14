@@ -108,6 +108,77 @@ def test_wm_vec_search_pushes_recall_filters_before_vector_decode(temp_db, monke
     assert decoded == ["[1.0, 0.0, 0.0]"]
 
 
+def _unit_embedding():
+    np = pytest.importorskip("numpy")
+    return np.array([1.0] + [0.0] * (beam_module.EMBEDDING_DIM - 1), dtype=np.float32)
+
+
+def _require_vec_working(conn):
+    pytest.importorskip("sqlite_vec")
+    if not beam_module._wm_vec_available(conn):
+        pytest.skip("sqlite-vec vec_working table unavailable")
+
+
+def test_remember_update_and_forget_maintain_vec_working(temp_db, monkeypatch):
+    beam = BeamMemory(session_id="vec-working-session", db_path=temp_db)
+    _require_vec_working(beam.conn)
+
+    np = pytest.importorskip("numpy")
+    vectors = [_unit_embedding(), np.array([0.0, 1.0] + [0.0] * (beam_module.EMBEDDING_DIM - 2), dtype=np.float32)]
+    calls = []
+
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
+
+    def fake_embed(contents):
+        calls.extend(contents)
+        return [vectors[min(len(calls) - 1, len(vectors) - 1)]]
+
+    monkeypatch.setattr(beam_module._embeddings, "embed", fake_embed)
+
+    memory_id = beam.remember("vec working initial", source="test", scope="session")
+    rowid = beam.conn.execute("SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)).fetchone()["rowid"]
+
+    assert beam.conn.execute("SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?", (memory_id,)).fetchone()[0] == 1
+    assert beam.conn.execute("SELECT COUNT(*) FROM vec_working WHERE rowid = ?", (rowid,)).fetchone()[0] == 1
+
+    assert beam.update_working(memory_id, content="vec working updated") is True
+    assert beam.conn.execute("SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?", (memory_id,)).fetchone()[0] == 1
+    assert beam.conn.execute("SELECT COUNT(*) FROM vec_working WHERE rowid = ?", (rowid,)).fetchone()[0] == 1
+
+    assert beam.forget_working(memory_id) is True
+    assert beam.conn.execute("SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?", (memory_id,)).fetchone()[0] == 0
+    assert beam.conn.execute("SELECT COUNT(*) FROM vec_working WHERE rowid = ?", (rowid,)).fetchone()[0] == 0
+
+
+def test_vec_working_backfill_from_memory_embeddings_is_idempotent(temp_db):
+    beam = BeamMemory(session_id="vec-working-backfill", db_path=temp_db)
+    _require_vec_working(beam.conn)
+    now = datetime.now().isoformat()
+    memory_id = "manual-wm"
+    embedding = _unit_embedding()
+
+    beam.conn.execute(
+        """
+        INSERT INTO working_memory
+            (id, content, source, timestamp, session_id, scope, importance)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (memory_id, "manual working memory", "test", now, "vec-working-backfill", "session", 0.5),
+    )
+    beam.conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        (memory_id, beam_module._embeddings.serialize(embedding), "test"),
+    )
+    beam.conn.commit()
+    rowid = beam.conn.execute("SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)).fetchone()["rowid"]
+
+    assert beam.conn.execute("SELECT COUNT(*) FROM vec_working WHERE rowid = ?", (rowid,)).fetchone()[0] == 0
+    assert beam_module._backfill_vec_working_from_memory_embeddings(beam.conn) == 1
+    assert beam.conn.execute("SELECT COUNT(*) FROM vec_working WHERE rowid = ?", (rowid,)).fetchone()[0] == 1
+    assert beam_module._backfill_vec_working_from_memory_embeddings(beam.conn) == 0
+
+
+
 class TestFactAnnotationMatching:
     def test_strict_fact_match_ignores_stopword_only_matches(self, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_STRICT_FACT_MATCH", "1")

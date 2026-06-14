@@ -674,11 +674,16 @@ def init_beam(db_path: Path = None):
     # Detect supported vector type
     effective_vec_type = _detect_vec_type(conn)
 
-    # --- sqlite-vec VIRTUAL TABLE ---
+    # --- sqlite-vec VIRTUAL TABLES ---
     if _SQLITE_VEC_AVAILABLE:
         try:
             cursor.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
+                    embedding {effective_vec_type}[{EMBEDDING_DIM}]
+                )
+            """)
+            cursor.execute(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS vec_working USING vec0(
                     embedding {effective_vec_type}[{EMBEDDING_DIM}]
                 )
             """)
@@ -893,6 +898,14 @@ def init_beam(db_path: Path = None):
         WHERE superseded_by IS NULL""")
     cursor.execute("""CREATE INDEX IF NOT EXISTS idx_mem_emb_type
         ON memory_embeddings(memory_id, model)""")
+    try:
+        _backfill_vec_working_from_memory_embeddings(conn)
+    except NameError:
+        # During unusual import/bootstrap paths the helper may not be bound yet;
+        # normal BeamMemory construction can backfill on the next init call.
+        pass
+    except Exception:
+        logger.info("vec_working backfill skipped during init", exc_info=True)
 
     # --- Migration: multi-agent identity layer (v2.1) ---
     _add_column_if_missing(conn, "working_memory", "author_id", "TEXT DEFAULT NULL")
@@ -1273,13 +1286,24 @@ def _temporal_boost(memory_timestamp_str: str, query_time: datetime,
 
 
 def _vec_available(conn: sqlite3.Connection) -> bool:
+    return _vec_table_available(conn, "vec_episodes")
+
+
+def _vec_table_available(conn: sqlite3.Connection, table: str) -> bool:
+    """Return whether a sqlite-vec virtual table is usable."""
     if not _SQLITE_VEC_AVAILABLE:
         return False
+    if table not in {"vec_episodes", "vec_working", "vec_facts"}:
+        return False
     try:
-        conn.execute("SELECT 1 FROM vec_episodes LIMIT 0")
+        conn.execute(f"SELECT 1 FROM {table} LIMIT 0")
         return True
     except Exception:
         return False
+
+
+def _wm_vec_available(conn: sqlite3.Connection) -> bool:
+    return _vec_table_available(conn, "vec_working")
 
 
 def _extract_and_store_entities(beam: "BeamMemory", memory_id: str, content: str):
@@ -1752,14 +1776,21 @@ def _effective_vec_type(conn: sqlite3.Connection) -> str:
 
 
 def _vec_insert(conn: sqlite3.Connection, rowid: int, embedding: List[float]):
-    """Insert embedding into sqlite-vec table with quantization via SQL functions.
+    """Insert embedding into the episodic sqlite-vec table."""
+    _vec_table_insert(conn, "vec_episodes", rowid, embedding)
+
+
+def _vec_table_insert(conn: sqlite3.Connection, table: str, rowid: int, embedding: List[float], *, commit: bool = True):
+    """Insert embedding into a sqlite-vec table with quantization via SQL functions.
 
     Manually normalizes the embedding to unit length before quantization.
     ``vec_quantize_int8(x, 'unit')`` in sqlite-vec 0.1.9 fails to normalize
     1024-dim vectors (works for 3-dim, silently passes through unnormalized
-    vectors at high dimensions).  Pre-normalizing works around the bug until
+    vectors at high dimensions). Pre-normalizing works around the bug until
     upstream sqlite-vec ships a fix.
     """
+    if table not in {"vec_episodes", "vec_working", "vec_facts"}:
+        raise ValueError(f"unsupported sqlite-vec table: {table}")
     vec_type = _effective_vec_type(conn)
     # Normalize to unit length before quantization
     # (sqlite-vec 0.1.9 'unit' param fails at 1024-dim)
@@ -1769,29 +1800,107 @@ def _vec_insert(conn: sqlite3.Connection, rowid: int, embedding: List[float]):
     if norm > 0:
         emb_arr = emb_arr / norm
     emb_json = json.dumps(emb_arr.tolist())
+    # vec0 has no stable UPSERT path; delete first to make refresh idempotent.
+    conn.execute(f"DELETE FROM {table} WHERE rowid = ?", (rowid,))
     if vec_type == "bit":
         conn.execute(
-            "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, vec_quantize_binary(?))",
+            f"INSERT INTO {table}(rowid, embedding) VALUES (?, vec_quantize_binary(?))",
             (rowid, emb_json)
         )
     elif vec_type == "int8":
         conn.execute(
-            "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, vec_quantize_int8(?, 'unit'))",
+            f"INSERT INTO {table}(rowid, embedding) VALUES (?, vec_quantize_int8(?, 'unit'))",
             (rowid, emb_json)
         )
     else:
         conn.execute(
-            "INSERT INTO vec_episodes(rowid, embedding) VALUES (?, ?)",
+            f"INSERT INTO {table}(rowid, embedding) VALUES (?, ?)",
             (rowid, emb_json)
         )
     # Ensure the insert is committed even when the caller's connection
     # has _defer_commit=True (_BeamConnection). Without this, inserts
     # sit in the deferred transaction and disappear if the caller
     # later rolls back or the connection is reused in a different context.
-    if isinstance(conn, _BeamConnection):
-        conn._real_commit()
-    else:
-        conn.commit()
+    if commit:
+        if isinstance(conn, _BeamConnection):
+            conn._real_commit()
+        else:
+            conn.commit()
+
+
+def _wm_rowid(conn: sqlite3.Connection, memory_id: str) -> Optional[int]:
+    row = conn.execute("SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)).fetchone()
+    return int(row["rowid"]) if row else None
+
+
+def _wm_vec_upsert(conn: sqlite3.Connection, memory_id: str, embedding: List[float], *, commit: bool = True) -> None:
+    """Best-effort refresh of vec_working for a working-memory row."""
+    if not _wm_vec_available(conn):
+        return
+    rowid = _wm_rowid(conn, memory_id)
+    if rowid is None:
+        return
+    _vec_table_insert(conn, "vec_working", rowid, embedding, commit=commit)
+
+
+def _wm_vec_delete(conn: sqlite3.Connection, memory_id: str) -> None:
+    """Best-effort delete of vec_working row for a working-memory id."""
+    if not _wm_vec_available(conn):
+        return
+    rowid = _wm_rowid(conn, memory_id)
+    if rowid is None:
+        return
+    conn.execute("DELETE FROM vec_working WHERE rowid = ?", (rowid,))
+
+
+def _store_working_embedding(conn: sqlite3.Connection, memory_id: str, embedding: List[float], *, commit_vec: bool = True) -> None:
+    """Store working-memory embedding in fallback and sqlite-vec stores.
+
+    ``memory_embeddings`` remains the compatibility/fallback store. When the
+    dedicated sqlite-vec table is available, ``vec_working`` mirrors the same
+    vector keyed by ``working_memory.rowid``.
+    """
+    emb_for_json = np.array(embedding, dtype=np.float32) if np is not None else embedding
+    emb_json = _embeddings.serialize(emb_for_json)
+    conn.execute(
+        "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        (memory_id, emb_json, _embeddings._DEFAULT_MODEL)
+    )
+    try:
+        _wm_vec_upsert(conn, memory_id, embedding, commit=commit_vec)
+    except Exception as exc:
+        logger.warning(
+            "vec_working upsert failed for '%s' (%s): %s",
+            memory_id, type(exc).__name__, exc,
+        )
+
+
+def _backfill_vec_working_from_memory_embeddings(conn: sqlite3.Connection) -> int:
+    """Idempotently mirror fallback working embeddings into vec_working."""
+    if not _wm_vec_available(conn) or np is None:
+        return 0
+    try:
+        rows = conn.execute("""
+            SELECT wm.id, wm.rowid, me.embedding_json
+            FROM working_memory wm
+            JOIN memory_embeddings me ON me.memory_id = wm.id
+            LEFT JOIN vec_working vw ON vw.rowid = wm.rowid
+            WHERE vw.rowid IS NULL
+        """).fetchall()
+    except Exception:
+        return 0
+    inserted = 0
+    for row in rows:
+        try:
+            embedding = json.loads(row["embedding_json"])
+            _vec_table_insert(conn, "vec_working", int(row["rowid"]), embedding)
+            inserted += 1
+        except Exception as exc:
+            logger.warning(
+                "vec_working backfill skipped '%s' (%s): %s",
+                row["id"], type(exc).__name__, exc,
+            )
+    return inserted
 
 
 def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -> List[Dict]:
@@ -2559,11 +2668,7 @@ class BeamMemory:
             try:
                 vec = _embeddings.embed([content])
                 if vec is not None and len(vec) == 1:
-                    emb_json = _embeddings.serialize(vec[0])
-                    cursor.execute(
-                        "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
-                        (memory_id, emb_json, _embeddings._DEFAULT_MODEL)
-                    )
+                    _store_working_embedding(self.conn, memory_id, vec[0])
             except Exception as exc:
                 logger.warning(
                     "remember: embedding storage failed for '%s' (%s): %s",
@@ -2809,13 +2914,8 @@ class BeamMemory:
                         len(vectors), len(contents),
                     )
                 else:
-                    model = _embeddings._DEFAULT_MODEL
                     for i, memory_id in enumerate(ids):
-                        emb_json = _embeddings.serialize(vectors[i])
-                        cursor.execute(
-                            "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
-                            (memory_id, emb_json, model)
-                        )
+                        _store_working_embedding(self.conn, memory_id, vectors[i], commit_vec=False)
             except Exception as exc:
                 # M3 review fix: include exception type name so operators
                 # can distinguish sqlite3.OperationalError from RuntimeError
@@ -3396,14 +3496,7 @@ class BeamMemory:
             try:
                 vec = _embeddings.embed([content])
                 if vec is not None and len(vec) > 0:
-                    model = _embeddings._DEFAULT_MODEL
-                    emb_json = _embeddings.serialize(vec[0])
-                    cursor.execute(
-                        "INSERT OR REPLACE INTO memory_embeddings"
-                        " (memory_id, embedding_json, model)"
-                        " VALUES (?, ?, ?)",
-                        (memory_id, emb_json, model),
-                    )
+                    _store_working_embedding(self.conn, memory_id, vec[0])
             except Exception as exc:
                 logger.warning(
                     "update_working: embedding refresh failed for %s"
@@ -3490,6 +3583,12 @@ class BeamMemory:
         # silently include.
         cursor = self.conn.cursor()
         try:
+            authorized_row = cursor.execute(
+                "SELECT rowid FROM working_memory WHERE id = ? AND (session_id = ? OR scope = 'global')",
+                (memory_id, self.session_id),
+            ).fetchone()
+            if authorized_row is not None and _wm_vec_available(self.conn):
+                cursor.execute("DELETE FROM vec_working WHERE rowid = ?", (int(authorized_row["rowid"]),))
             cursor.execute(
                 "DELETE FROM working_memory WHERE id = ? AND (session_id = ? OR scope = 'global')",
                 (memory_id, self.session_id),
@@ -3499,6 +3598,7 @@ class BeamMemory:
                 cursor.execute(
                     "DELETE FROM annotations WHERE memory_id = ?", (memory_id,)
                 )
+                cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
             self.conn.commit()
         except Exception:
             self.conn.rollback()
@@ -7690,6 +7790,18 @@ class BeamMemory:
                 stats["working_memory"]["skipped"] += 1
                 continue
             if exists and force:
+                existing_row = cursor.execute(
+                    "SELECT rowid FROM working_memory WHERE id = ?", (mid,)
+                ).fetchone()
+                if existing_row is not None and _wm_vec_available(self.conn):
+                    try:
+                        cursor.execute("DELETE FROM vec_working WHERE rowid = ?", (int(existing_row["rowid"]),))
+                    except sqlite3.Error as cleanup_exc:
+                        logger.warning(
+                            "import_from_dict: vec_working cleanup failed for rowid=%s: %s; continuing",
+                            existing_row["rowid"], cleanup_exc,
+                        )
+                cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (mid,))
                 cursor.execute("DELETE FROM working_memory WHERE id = ?", (mid,))
                 stats["working_memory"]["overwritten"] += 1
             else:
@@ -7719,6 +7831,10 @@ class BeamMemory:
                 item.get("consolidation_claimed_at"),
             ))
         self.conn.commit()
+        try:
+            _backfill_vec_working_from_memory_embeddings(self.conn)
+        except Exception:
+            logger.info("vec_working backfill skipped after working import", exc_info=True)
 
         # -- Episodic memory --
         # Capture sqlite-vec availability once before the loop. Reused

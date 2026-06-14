@@ -1,7 +1,8 @@
 """Memory audit log for Mnemosyne provider.
 
 Records memory mutation events in a SQLite table co-located with the
-active provider DB. Non-blocking, fire-and-forget — audit failures
+active provider DB. Uses memory_audit_events to avoid colliding with
+the sync engine's memory_events event-log table. Non-blocking, fire-and-forget — audit failures
 never break memory operations.
 """
 
@@ -17,7 +18,7 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 _CREATE_TABLE = """
-CREATE TABLE IF NOT EXISTS memory_events (
+CREATE TABLE IF NOT EXISTS memory_audit_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp REAL NOT NULL,
     action TEXT NOT NULL,
@@ -34,13 +35,13 @@ CREATE TABLE IF NOT EXISTS memory_events (
 """
 
 _INSERT = """
-INSERT INTO memory_events
+INSERT INTO memory_audit_events
     (timestamp, action, memory_id, bank, scope, profile, session_id, source_tool, tokens_used, reason, metadata_json)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _MIGRATE_TOKENS = """
-ALTER TABLE memory_events ADD COLUMN tokens_used INTEGER
+ALTER TABLE memory_audit_events ADD COLUMN tokens_used INTEGER
 """
 
 
@@ -113,7 +114,7 @@ class AuditLog:
             cur = self._conn.execute(
                 "SELECT event_id, timestamp, action, memory_id, bank, scope, "
                 "profile, session_id, source_tool, tokens_used, reason, metadata_json "
-                "FROM memory_events ORDER BY event_id DESC LIMIT ?",
+                "FROM memory_audit_events ORDER BY event_id DESC LIMIT ?",
                 (limit,),
             )
             cols = [d[0] for d in cur.description]
@@ -125,7 +126,7 @@ class AuditLog:
         if self._conn is None:
             return 0
         try:
-            return self._conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]
+            return self._conn.execute("SELECT COUNT(*) FROM memory_audit_events").fetchone()[0]
         except Exception:
             return 0
 
