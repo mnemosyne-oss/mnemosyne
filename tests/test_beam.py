@@ -10,7 +10,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 
 from mnemosyne.core import beam as beam_module
-from mnemosyne.core.beam import BeamMemory, init_beam, _find_memories_by_fact
+from mnemosyne.core.beam import BeamMemory, init_beam, _find_memories_by_fact, _wm_vec_search
 from mnemosyne.core.memory import Mnemosyne
 
 
@@ -55,6 +55,57 @@ def test_recall_computes_query_embedding_once_per_call(temp_db, monkeypatch):
     beam.recall("cache this query", top_k=5)
 
     assert calls == ["cache this query"]
+
+
+def test_wm_vec_search_pushes_recall_filters_before_vector_decode(temp_db, monkeypatch):
+    np = pytest.importorskip("numpy")
+    beam = BeamMemory(session_id="target-session", db_path=temp_db)
+    now = datetime.now().isoformat()
+    conn = beam.conn
+    conn.executemany(
+        """
+        INSERT INTO working_memory
+            (id, content, source, timestamp, session_id, scope, channel_id, author_id, author_type, veracity, memory_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            ("target", "target vector memory", "chat", now, "target-session", "session", "chan-a", "alice", "human", "stated", "preference"),
+            ("other-session", "other session memory", "chat", now, "other-session", "session", "chan-b", "bob", "human", "stated", "preference"),
+            ("other-source", "wrong source memory", "cron", now, "target-session", "session", "chan-a", "alice", "human", "stated", "preference"),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        [
+            ("target", "[1.0, 0.0, 0.0]", "test"),
+            ("other-session", "[1.0, 0.0, 0.0]", "test"),
+            ("other-source", "[1.0, 0.0, 0.0]", "test"),
+        ],
+    )
+    conn.commit()
+
+    decoded = []
+    real_loads = beam_module.json.loads
+
+    def counting_loads(value):
+        decoded.append(value)
+        return real_loads(value)
+
+    monkeypatch.setattr(beam_module.json, "loads", counting_loads)
+
+    results = _wm_vec_search(
+        conn,
+        np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        k=10,
+        where_sql=(
+            "(valid_until IS NULL OR valid_until > ?) AND superseded_by IS NULL "
+            "AND (session_id = ? OR scope = 'global') AND source = ? AND channel_id = ?"
+        ),
+        where_params=(now, "target-session", "chat", "chan-a"),
+    )
+
+    assert [r["id"] for r in results] == ["target"]
+    assert decoded == ["[1.0, 0.0, 0.0]"]
 
 
 class TestFactAnnotationMatching:

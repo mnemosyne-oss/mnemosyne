@@ -26,7 +26,7 @@ import math
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Any, Set, Union
+from typing import List, Dict, Optional, Any, Set, Union, Tuple
 from pathlib import Path
 
 
@@ -2087,7 +2087,9 @@ def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> Li
     return [{"id": r["id"], "rank": r["rank"]} for r in rows]
 
 
-def _wm_vec_search(conn: sqlite3.Connection, query_embedding, k: int = 20) -> List[Dict]:
+def _wm_vec_search(conn: sqlite3.Connection, query_embedding, k: int = 20,
+                   *, where_sql: Optional[str] = None,
+                   where_params: Tuple[Any, ...] = ()) -> List[Dict]:
     """Vector search against working_memory via memory_embeddings table.
     Returns list of dicts with 'id' (memory_id) and 'sim' (cosine similarity)."""
     if np is None:
@@ -2096,14 +2098,16 @@ def _wm_vec_search(conn: sqlite3.Connection, query_embedding, k: int = 20) -> Li
     try:
         # BEAM mode: scan up to 500K rows for broad vector recall on large benchmark datasets
         _vec_limit = 500000 if _BEAM_MODE else 50000
-        cursor.execute("""
+        if where_sql is None:
+            where_sql = "wm.superseded_by IS NULL AND (wm.valid_until IS NULL OR wm.valid_until > ?)"
+            where_params = (datetime.now().isoformat(),)
+        cursor.execute(f"""
             SELECT wm.id, me.embedding_json
             FROM memory_embeddings me
             JOIN working_memory wm ON me.memory_id = wm.id
-            WHERE wm.superseded_by IS NULL
-              AND (wm.valid_until IS NULL OR wm.valid_until > ?)
+            WHERE {where_sql}
             LIMIT ?
-        """, (datetime.now().isoformat(), _vec_limit))
+        """, (*where_params, _vec_limit))
     except Exception:
         return []
     rows = cursor.fetchall()
@@ -4683,32 +4687,9 @@ class BeamMemory:
         wm_ids = {r["id"] for r in wm_fts}
         wm_ranks = {r["id"]: r["rank"] for r in wm_fts}
 
-        # ---- Working memory (vector search) ----
-        wm_vec_sims = {}
-        if embeddings_available:
-            try:
-                emb_result = _get_query_embedding()
-                if emb_result is not None:
-                    wm_vec = _wm_vec_search(self.conn, emb_result,
-                                              k=max(top_k, 20) if _BEAM_MODE else max(top_k * 3, 50))
-                    for vr in wm_vec:
-                        wm_vec_sims[vr["id"]] = vr["sim"]
-                        wm_ids.add(vr["id"])  # Merge vector results with FTS5 results
-            except Exception:
-                logger.info("Regex extraction failed, skipping", exc_info=True)
-        # Track whether the FTS+vec layer produced any candidates
-        # at all (signal source for the truly_empty gate later).
-        if wm_ids:
-            _wm_had_candidates = True
-        # If both FTS and vec produced nothing, the WM fallback at
-        # the else-branch below fires. Recording the fallback signal
-        # uses a boolean (per-call), not a per-row count -- that
-        # avoids double-counting against the kept-row accumulators.
-        _wm_fallback_used = not wm_ids
-        if _wm_fallback_used:
-            _recall_diag.record_fallback_used(wm=True)
-
-        # Build temporal filter clause for working memory
+        # Build temporal/filter clause for working memory before vector search
+        # so _wm_vec_search can push the same recall filters into SQL instead
+        # of scanning broad memory_embeddings rows and filtering later.
         wm_where_clauses = [
             "(valid_until IS NULL OR valid_until > ?)",
             "superseded_by IS NULL"
@@ -4756,6 +4737,33 @@ class BeamMemory:
             wm_params.append(channel_id)
         
         wm_where = " AND ".join(wm_where_clauses)
+
+        # ---- Working memory (vector search) ----
+        wm_vec_sims = {}
+        if embeddings_available:
+            try:
+                emb_result = _get_query_embedding()
+                if emb_result is not None:
+                    wm_vec = _wm_vec_search(self.conn, emb_result,
+                                              k=max(top_k, 20) if _BEAM_MODE else max(top_k * 3, 50),
+                                              where_sql=wm_where,
+                                              where_params=tuple(wm_params))
+                    for vr in wm_vec:
+                        wm_vec_sims[vr["id"]] = vr["sim"]
+                        wm_ids.add(vr["id"])  # Merge vector results with FTS5 results
+            except Exception:
+                logger.info("Regex extraction failed, skipping", exc_info=True)
+        # Track whether the FTS+vec layer produced any candidates
+        # at all (signal source for the truly_empty gate later).
+        if wm_ids:
+            _wm_had_candidates = True
+        # If both FTS and vec produced nothing, the WM fallback at
+        # the else-branch below fires. Recording the fallback signal
+        # uses a boolean (per-call), not a per-row count -- that
+        # avoids double-counting against the kept-row accumulators.
+        _wm_fallback_used = not wm_ids
+        if _wm_fallback_used:
+            _recall_diag.record_fallback_used(wm=True)
 
         if wm_ids:
             placeholders = ",".join("?" * len(wm_ids))
