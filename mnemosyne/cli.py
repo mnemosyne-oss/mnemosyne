@@ -154,11 +154,12 @@ def cmd_diagnose(args):
     """Run PII-safe diagnostics. Use --fix to auto-install missing dependencies."""
     fix_mode = "--fix" in args
     dry_run = "--dry-run" in args
+    repair_vec_working = "--repair-vec-working" in args
     clean_args = [a for a in args if not a.startswith("--")]
 
     try:
         from mnemosyne.diagnose import run_diagnostics, auto_fix
-        result = run_diagnostics()
+        result = run_diagnostics(repair_vec_working=repair_vec_working, dry_run=dry_run)
         print("\nMnemosyne Diagnostics\n")
         print(f"  Checks passed: {result.get('checks_passed', 0)}/{result.get('checks_total', 0)}")
         if result.get("key_findings"):
@@ -168,7 +169,10 @@ def cmd_diagnose(args):
         else:
             print("\n  No issues detected")
 
-        if fix_mode or dry_run:
+        if repair_vec_working:
+            print("\n  vec_working repair requested")
+
+        if fix_mode or (dry_run and not repair_vec_working):
             print("\n--- Auto-fix ---")
             fix_result = auto_fix(result.get("entries", []), dry_run=dry_run)
             if fix_result["fixed"]:
@@ -624,7 +628,7 @@ def run_cli():
         print("  delete <id>                            Delete a memory")
         print("  stats                                  Show statistics")
         print("  sleep                                  Run consolidation")
-        print("  diagnose [--fix] [--dry-run]           Run diagnostics (--fix auto-installs deps)")
+        print("  diagnose [--fix] [--dry-run] [--repair-vec-working]  Run diagnostics / optional repairs")
         print("  export [--include-sync-events] [file.json]    Export memories")
         print("  import <file.json>                     Import memories")
         print("  import-hindsight <file|url> [bank]     Import Hindsight memories")

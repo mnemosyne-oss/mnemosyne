@@ -258,6 +258,80 @@ def test_wm_vec_search_falls_back_when_vec_working_missing_row(temp_db):
     assert results[0]["sim"] == pytest.approx(1.0)
 
 
+def test_vec_working_coverage_reports_missing_and_repair_fills_gap(temp_db):
+    beam = BeamMemory(session_id="vec-working-coverage", db_path=temp_db)
+    _require_vec_working(beam.conn)
+    now = datetime.now().isoformat()
+    memory_id = "coverage-gap"
+    embedding = _unit_embedding()
+
+    beam.conn.execute(
+        """
+        INSERT INTO working_memory
+            (id, content, source, timestamp, session_id, scope, importance)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (memory_id, "coverage vector gap", "test", now, "vec-working-coverage", "session", 0.5),
+    )
+    beam.conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        (memory_id, beam_module._embeddings.serialize(embedding), "test"),
+    )
+    beam.conn.commit()
+
+    before = beam_module.vec_working_coverage(beam.conn)
+    assert before["vec_working_available"] is True
+    assert before["working_memory_rows"] == 1
+    assert before["working_embedding_rows"] == 1
+    assert before["vec_working_rows"] == 0
+    assert before["missing_vec_working_rows"] == 1
+    assert before["status"] == "partial"
+
+    dry_run = beam_module.repair_vec_working(beam.conn, dry_run=True)
+    assert dry_run["status"] == "dry_run"
+    assert dry_run["inserted"] == 0
+    assert dry_run["after"]["missing_vec_working_rows"] == 1
+
+    repaired = beam_module.repair_vec_working(beam.conn)
+    assert repaired["status"] == "repaired"
+    assert repaired["inserted"] == 1
+    assert repaired["after"]["missing_vec_working_rows"] == 0
+    assert repaired["after"]["vec_working_rows"] == 1
+    assert repaired["after"]["status"] == "complete"
+
+    second = beam_module.repair_vec_working(beam.conn)
+    assert second["inserted"] == 0
+    assert second["after"]["status"] == "complete"
+
+
+def test_vec_working_coverage_reports_fallback_only_when_table_unavailable(temp_db, monkeypatch):
+    beam = BeamMemory(session_id="vec-working-unavailable", db_path=temp_db)
+    now = datetime.now().isoformat()
+    beam.conn.execute(
+        """
+        INSERT INTO working_memory
+            (id, content, source, timestamp, session_id, scope, importance)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("fallback-only", "fallback only vector", "test", now, "vec-working-unavailable", "session", 0.5),
+    )
+    beam.conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        ("fallback-only", beam_module._embeddings.serialize(_unit_embedding()), "test"),
+    )
+    beam.conn.commit()
+    monkeypatch.setattr(beam_module, "_wm_vec_available", lambda _conn: False)
+
+    coverage = beam_module.vec_working_coverage(beam.conn)
+    assert coverage["vec_working_available"] is False
+    assert coverage["working_embedding_rows"] == 1
+    assert coverage["status"] == "fallback_only"
+
+    repair = beam_module.repair_vec_working(beam.conn)
+    assert repair["status"] == "skipped"
+    assert repair["reason"] == "vec_working unavailable"
+
+
 
 class TestFactAnnotationMatching:
     def test_strict_fact_match_ignores_stopword_only_matches(self, monkeypatch):

@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from mnemosyne.core import beam as beam_module
 from mnemosyne.core.beam import BeamMemory
 from hermes_memory_provider import MnemosyneMemoryProvider
 
@@ -25,7 +28,7 @@ def test_diagnose_reports_active_provider_db_path_and_counts(tmp_path, monkeypat
     legacy_path = tmp_path / "legacy" / "mnemosyne.db"
     monkeypatch.setattr(
         "mnemosyne.diagnose.run_diagnostics",
-        lambda: {
+        lambda **_kwargs: {
             "checks_total": 1,
             "checks_passed": 1,
             "key_findings": [],
@@ -58,7 +61,7 @@ def test_diagnose_without_active_beam_keeps_base_diagnostics(monkeypatch):
     provider = MnemosyneMemoryProvider()
     monkeypatch.setattr(
         "mnemosyne.diagnose.run_diagnostics",
-        lambda: {"checks_total": 1, "key_findings": ["base finding"]},
+        lambda **_kwargs: {"checks_total": 1, "key_findings": ["base finding"]},
     )
 
     result = json.loads(provider._handle_diagnose({}))
@@ -72,7 +75,7 @@ def test_diagnose_reports_count_error_without_failing(tmp_path, monkeypatch):
     provider._beam.conn.commit()
     monkeypatch.setattr(
         "mnemosyne.diagnose.run_diagnostics",
-        lambda: {"checks_total": 1, "key_findings": []},
+        lambda **_kwargs: {"checks_total": 1, "key_findings": []},
     )
 
     result = json.loads(provider._handle_diagnose({}))
@@ -80,3 +83,43 @@ def test_diagnose_reports_count_error_without_failing(tmp_path, monkeypatch):
     assert result["active_provider_db_path"] == str(db_path)
     assert "active_provider_counts_error" in result
     assert "no such table: facts" in result["active_provider_counts_error"]
+
+
+
+def test_diagnose_can_repair_active_provider_vec_working_gap(tmp_path, monkeypatch):
+    provider, _db_path = _provider_with_beam(tmp_path)
+    np = pytest.importorskip("numpy")
+    np  # keep importorskip side effect explicit
+    pytest.importorskip("sqlite_vec")
+    if not beam_module._wm_vec_available(provider._beam.conn):
+        pytest.skip("sqlite-vec vec_working table unavailable")
+    now = "2026-01-01T00:00:00"
+    memory_id = "active-gap"
+    embedding = np.array([1.0] + [0.0] * (beam_module.EMBEDDING_DIM - 1), dtype=np.float32)
+    provider._beam.conn.execute(
+        """
+        INSERT INTO working_memory
+            (id, content, source, timestamp, session_id, scope, importance)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (memory_id, "active provider vector gap", "test", now, "diagnose-test", "session", 0.5),
+    )
+    provider._beam.conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        (memory_id, beam_module._embeddings.serialize(embedding), "test"),
+    )
+    provider._beam.conn.commit()
+    monkeypatch.setattr(
+        "mnemosyne.diagnose.run_diagnostics",
+        lambda **_kwargs: {"checks_total": 1, "key_findings": [], "entries": []},
+    )
+
+    dry_run = json.loads(provider._handle_diagnose({"repair_vec_working": True, "dry_run": True}))
+    assert dry_run["active_provider_vec_working_repair"]["status"] == "dry_run"
+    assert dry_run["active_provider_vec_working"]["missing_vec_working_rows"] == 1
+
+    repaired = json.loads(provider._handle_diagnose({"repair_vec_working": True}))
+    assert repaired["active_provider_vec_working_repair"]["status"] == "repaired"
+    assert repaired["active_provider_vec_working_repair"]["inserted"] == 1
+    assert repaired["active_provider_vec_working"]["missing_vec_working_rows"] == 0
+    assert repaired["active_provider_vec_working"]["status"] == "complete"

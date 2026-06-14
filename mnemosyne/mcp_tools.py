@@ -753,7 +753,10 @@ def _handle_import(arguments: Dict[str, Any]) -> Dict[str, Any]:
 def _handle_diagnose(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_diagnose tool call."""
     from mnemosyne.diagnose import run_diagnostics
-    result = run_diagnostics()
+    result = run_diagnostics(
+        repair_vec_working=bool(arguments.get("repair_vec_working", False)),
+        dry_run=bool(arguments.get("dry_run", False)),
+    )
     db_path = None
     try:
         mem = _create_instance()

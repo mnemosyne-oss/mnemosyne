@@ -1903,6 +1903,128 @@ def _backfill_vec_working_from_memory_embeddings(conn: sqlite3.Connection) -> in
     return inserted
 
 
+def vec_working_coverage(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Return PII-safe coverage counters for the working-memory vector table.
+
+    This is intentionally count-only: no memory IDs, content, embeddings, or
+    queries are exposed. It helps operators verify old DBs after upgrading to
+    the dedicated ``vec_working`` sqlite-vec table without requiring a manual
+    DB conversion.
+    """
+    coverage: Dict[str, Any] = {
+        "sqlite_vec_package_available": bool(_SQLITE_VEC_AVAILABLE),
+        "vec_working_available": False,
+        "vec_type": "none",
+        "working_memory_rows": 0,
+        "working_embedding_rows": 0,
+        "vec_working_rows": 0,
+        "missing_vec_working_rows": 0,
+        "orphan_vec_working_rows": 0,
+        "status": "unavailable",
+    }
+    try:
+        coverage["working_memory_rows"] = int(
+            conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0]
+        )
+    except Exception as exc:
+        coverage["status"] = "error"
+        coverage["error"] = f"working_memory count failed: {type(exc).__name__}: {exc}"
+        return coverage
+
+    try:
+        coverage["working_embedding_rows"] = int(conn.execute("""
+            SELECT COUNT(*)
+            FROM working_memory wm
+            JOIN memory_embeddings me ON me.memory_id = wm.id
+        """).fetchone()[0])
+    except Exception as exc:
+        coverage["memory_embeddings_error"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        coverage["vec_working_available"] = bool(_wm_vec_available(conn))
+    except Exception as exc:
+        coverage["vec_working_error"] = f"{type(exc).__name__}: {exc}"
+        coverage["vec_working_available"] = False
+
+    if not coverage["vec_working_available"]:
+        if coverage["working_memory_rows"] == 0:
+            coverage["status"] = "empty"
+        elif coverage["working_embedding_rows"] > 0:
+            coverage["status"] = "fallback_only"
+        else:
+            coverage["status"] = "no_vectors"
+        return coverage
+
+    try:
+        coverage["vec_type"] = _effective_vec_type(conn)
+    except Exception:
+        coverage["vec_type"] = "unknown"
+
+    try:
+        coverage["vec_working_rows"] = int(
+            conn.execute("SELECT COUNT(*) FROM vec_working").fetchone()[0]
+        )
+    except Exception as exc:
+        coverage["vec_working_rows_error"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        coverage["missing_vec_working_rows"] = int(conn.execute("""
+            SELECT COUNT(*)
+            FROM working_memory wm
+            JOIN memory_embeddings me ON me.memory_id = wm.id
+            LEFT JOIN vec_working vw ON vw.rowid = wm.rowid
+            WHERE vw.rowid IS NULL
+        """).fetchone()[0])
+    except Exception as exc:
+        coverage["missing_vec_working_rows_error"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        coverage["orphan_vec_working_rows"] = int(conn.execute("""
+            SELECT COUNT(*)
+            FROM vec_working vw
+            LEFT JOIN working_memory wm ON wm.rowid = vw.rowid
+            WHERE wm.rowid IS NULL
+        """).fetchone()[0])
+    except Exception as exc:
+        coverage["orphan_vec_working_rows_error"] = f"{type(exc).__name__}: {exc}"
+
+    if coverage["working_embedding_rows"] == 0:
+        coverage["status"] = "no_vectors" if coverage["working_memory_rows"] else "empty"
+    elif coverage["missing_vec_working_rows"] == 0:
+        coverage["status"] = "complete"
+    else:
+        coverage["status"] = "partial"
+    return coverage
+
+
+def repair_vec_working(conn: sqlite3.Connection, *, dry_run: bool = False) -> Dict[str, Any]:
+    """Backfill missing vec_working rows from memory_embeddings.
+
+    The operation is idempotent and preserves ``memory_embeddings`` as the
+    compatibility store. ``dry_run`` reports the current gap without writing.
+    """
+    before = vec_working_coverage(conn)
+    result: Dict[str, Any] = {"before": before, "dry_run": dry_run, "inserted": 0}
+    if dry_run:
+        result["status"] = "dry_run"
+        result["after"] = before
+        return result
+    if not before.get("vec_working_available"):
+        result["status"] = "skipped"
+        result["reason"] = "vec_working unavailable"
+        result["after"] = before
+        return result
+    try:
+        result["inserted"] = _backfill_vec_working_from_memory_embeddings(conn)
+        conn.commit()
+        result["status"] = "repaired"
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    result["after"] = vec_working_coverage(conn)
+    return result
+
+
 def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -> List[Dict]:
     """Search sqlite-vec and return rowids with distances.
 

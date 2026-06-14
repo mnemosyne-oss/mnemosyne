@@ -840,8 +840,22 @@ IMPORT_SCHEMA = {
 
 DIAGNOSE_SCHEMA = {
     "name": "mnemosyne_diagnose",
-    "description": "Run PII-safe diagnostics on Mnemosyne installation. Checks dependencies, database state, and vector search readiness. Never includes memory content or API keys.",
-    "parameters": {"type": "object", "properties": {}},
+    "description": "Run PII-safe diagnostics on Mnemosyne installation. Checks dependencies, database state, vector search readiness, and optional vec_working migration coverage. Never includes memory content or API keys.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "repair_vec_working": {
+                "type": "boolean",
+                "description": "If true, idempotently backfill missing vec_working rows from memory_embeddings.",
+                "default": False,
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": "If true with repair_vec_working, report what would be repaired without writing.",
+                "default": False,
+            },
+        },
+    },
 }
 
 GRAPH_QUERY_SCHEMA = {
@@ -2411,7 +2425,9 @@ class MnemosyneMemoryProvider(MemoryProvider):
 
     def _handle_diagnose(self, args: Dict[str, Any]) -> str:
         from mnemosyne.diagnose import run_diagnostics
-        result = run_diagnostics()
+        repair_requested = bool(args.get("repair_vec_working", False))
+        dry_run = bool(args.get("dry_run", False))
+        result = run_diagnostics(repair_vec_working=repair_requested, dry_run=dry_run)
 
         # run_diagnostics() reports Mnemosyne's legacy/default DB path. When
         # Hermes profile isolation is enabled, the active provider may use a
@@ -2441,6 +2457,19 @@ class MnemosyneMemoryProvider(MemoryProvider):
                     "facts": cur.execute("SELECT COUNT(*) FROM facts").fetchone()[0],
                 }
                 con.close()
+                try:
+                    from mnemosyne.core.beam import repair_vec_working as _repair_vec_working, vec_working_coverage
+                    if repair_requested and self._beam is not None:
+                        result["active_provider_vec_working_repair"] = _repair_vec_working(
+                            self._beam.conn, dry_run=dry_run
+                        )
+                        result["active_provider_vec_working"] = result[
+                            "active_provider_vec_working_repair"
+                        ].get("after", {})
+                    elif self._beam is not None:
+                        result["active_provider_vec_working"] = vec_working_coverage(self._beam.conn)
+                except Exception as exc:
+                    result["active_provider_vec_working_error"] = str(exc)
             except Exception as exc:
                 result["active_provider_counts_error"] = str(exc)
 

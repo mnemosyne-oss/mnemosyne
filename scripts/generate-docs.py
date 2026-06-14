@@ -30,7 +30,7 @@ ALL_TOOL_SCHEMAS = [
     {"name": "mnemosyne_invalidate", "description": "Mark a memory as expired/superseded", "params": {"memory_id": "string", "replacement_id": "string="}},
     {"name": "mnemosyne_import", "description": "Import memories from JSON file or provider (Hindsight, Mem0)", "params": {"input_path": "string=", "provider": "string=", "api_key": "string=", "user_id": "string=", "agent_id": "string=", "base_url": "string=", "dry_run": "bool=false", "channel_id": "string=", "force": "bool=false"}},
     {"name": "mnemosyne_export", "description": "Export all memories to a JSON file", "params": {"output_path": "string"}},
-    {"name": "mnemosyne_diagnose", "description": "PII-safe diagnostics: deps, DB state, vector readiness", "params": {}},
+    {"name": "mnemosyne_diagnose", "description": "PII-safe diagnostics: deps, DB state, vector readiness, vec_working coverage", "params": {"repair_vec_working": "bool=false", "dry_run": "bool=false"}},
     {"name": "mnemosyne_stats", "description": "Memory statistics: working count, episodic count, BEAM tiers", "params": {}},
     {"name": "mnemosyne_sleep", "description": "Run consolidation cycle (compress old working memories)", "params": {"all_sessions": "bool=false", "dry_run": "bool=false"}},
     {"name": "mnemosyne_triple_add", "description": "Add a fact triple to the knowledge graph", "params": {"subject": "string", "predicate": "string", "object": "string", "valid_from": "string="}},

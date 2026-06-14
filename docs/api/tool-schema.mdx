@@ -106,9 +106,12 @@ Export all memories to a JSON file
 | `output_path` | `string` | yes |
 
 ### 10. `mnemosyne_diagnose`
-PII-safe diagnostics: deps, DB state, vector readiness
+PII-safe diagnostics: deps, DB state, vector readiness, vec_working coverage
 
-*No parameters*
+| Parameter | Type | Required |
+|-----------|------|----------|
+| `repair_vec_working` | `bool` | no (default: false) |
+| `dry_run` | `bool` | no (default: false) |
 
 ### 11. `mnemosyne_stats`
 Memory statistics: working count, episodic count, BEAM tiers

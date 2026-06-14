@@ -438,8 +438,22 @@ IMPORT_SCHEMA = {
 
 DIAGNOSE_SCHEMA = {
     "name": "mnemosyne_diagnose",
-    "description": "Run PII-safe diagnostics on Mnemosyne installation. Checks dependencies, database state, and vector search readiness. Never includes memory content or API keys.",
-    "parameters": {"type": "object", "properties": {}},
+    "description": "Run PII-safe diagnostics on Mnemosyne installation. Checks dependencies, database state, vector search readiness, and optional vec_working migration coverage. Never includes memory content or API keys.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "repair_vec_working": {
+                "type": "boolean",
+                "description": "If true, idempotently backfill missing vec_working rows from memory_embeddings.",
+                "default": False,
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": "If true with repair_vec_working, report what would be repaired without writing.",
+                "default": False,
+            },
+        },
+    },
 }
 
 GRAPH_QUERY_SCHEMA = {
