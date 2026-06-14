@@ -88,21 +88,21 @@ By default, the main database lives at `~/.hermes/mnemosyne/data/mnemosyne.db`. 
 | `consolidation_log` | History of sleep cycle operations |
 | `triples` | Temporal knowledge graph |
 | `memories` | Legacy table (backward compatibility) |
-| `memory_embeddings` | Legacy embeddings (backward compatibility) |
+| `memory_embeddings` | JSON embedding fallback when sqlite-vec is unavailable |
 
 ### Extensions
 
 - **sqlite-vec** — native vector similarity search (HNSW-style) in SQLite
 - **FTS5** — full-text search, built into SQLite 3.35+
 
-Both extensions are optional. Without sqlite-vec, Mnemosyne falls back to keyword-only retrieval. FTS5 is available on any modern SQLite build.
+FTS5 is available on any modern SQLite build. When sqlite-vec is unavailable but embeddings are still available, Mnemosyne falls back to JSON vectors in `memory_embeddings` plus NumPy cosine scoring. If no embedding provider is available, recall falls back to lexical/keyword retrieval.
 
 ## Hybrid Search Pipeline
 
 ```
 Query string
     │
-    ├─── Vector search (sqlite-vec, top_k × 3)
+    ├─── Vector search (sqlite-vec, or memory_embeddings + NumPy fallback)
     │         Semantic similarity via cosine distance
     │
     ├─── FTS5 search (top_k × 3)

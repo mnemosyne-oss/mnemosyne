@@ -42,6 +42,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Operating System :: OS Independent",
 ]
 
@@ -64,6 +65,8 @@ Documentation = "https://github.com/AxDSan/mnemosyne/blob/main/docs/README.md"
 mnemosyne-install = "mnemosyne.install:install"
 mnemosyne-uninstall = "mnemosyne.install:uninstall"
 mnemosyne = "mnemosyne.cli:run_cli"
+mnemosyne-browser = "mnemosyne.integrations.memory_browser:main"
+mnemosyne-auto-save = "mnemosyne.integrations.auto_save_openwebui:main"
 
 [tool.setuptools.packages.find]
 exclude = ["tests*", "benchmark*", "scripts*", "docs*", "assets*"]
