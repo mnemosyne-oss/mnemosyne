@@ -4625,6 +4625,27 @@ class BeamMemory:
         # ---- Configurable hybrid scoring setup (Phase 4) ----
         vw, fw, iw = _normalize_weights(vec_weight, fts_weight, importance_weight)
 
+        # Query embeddings are used by several recall subpaths. Compute the
+        # vector at most once per recall() call, then reuse it for working
+        # memory vector search, binary-vector scoring, and episodic vector
+        # search.
+        embeddings_available = _embeddings.available()
+        query_embedding = None
+        query_embedding_computed = False
+
+        def _get_query_embedding():
+            nonlocal query_embedding, query_embedding_computed
+            if not embeddings_available:
+                return None
+            if not query_embedding_computed:
+                query_embedding_computed = True
+                try:
+                    query_embedding = _embeddings.embed_query(query)
+                except Exception:
+                    logger.info("Query embedding failed, skipping vector recall paths", exc_info=True)
+                    query_embedding = None
+            return query_embedding
+
         # ---- Temporal scoring setup ----
         parsed_query_time = _parse_query_time(query_time)
         if temporal_halflife is not None:
@@ -4664,9 +4685,9 @@ class BeamMemory:
 
         # ---- Working memory (vector search) ----
         wm_vec_sims = {}
-        if _embeddings.available():
+        if embeddings_available:
             try:
-                emb_result = _embeddings.embed_query(query)
+                emb_result = _get_query_embedding()
                 if emb_result is not None:
                     wm_vec = _wm_vec_search(self.conn, emb_result,
                                               k=max(top_k, 20) if _BEAM_MODE else max(top_k * 3, 50))
@@ -5103,8 +5124,8 @@ class BeamMemory:
         # ---- Pre-compute query binary vector (Phase 5 binary voice) ----
         query_bv = None
         query_emb_for_bv = None
-        if _embeddings.available() and _mib is not None:
-            emb_result = _embeddings.embed_query(query)
+        if embeddings_available and _mib is not None:
+            emb_result = _get_query_embedding()
             if emb_result is not None:
                 query_emb_for_bv = emb_result
                 query_bv = _mib(emb_result)
@@ -5112,8 +5133,8 @@ class BeamMemory:
         # ---- Episodic memory (vec + FTS5 hybrid) ----
         vec_results = {}
         max_distance = 0.0
-        if _embeddings.available():
-            emb_result = _embeddings.embed_query(query)
+        if embeddings_available:
+            emb_result = _get_query_embedding()
             if emb_result is not None:
                 if _vec_available(self.conn):
                     vec_rows = _vec_search(self.conn, emb_result.tolist(), k=max(top_k * 3, 20))

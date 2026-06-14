@@ -35,6 +35,28 @@ class _FakeBeam:
         self.annotations = _FakeAnnotations(rows)
 
 
+def test_recall_computes_query_embedding_once_per_call(temp_db, monkeypatch):
+    np = pytest.importorskip("numpy")
+    beam = BeamMemory(session_id="embed-cache-test", db_path=temp_db)
+    calls = []
+
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
+
+    def fake_embed_query(query):
+        calls.append(query)
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+    monkeypatch.setattr(beam_module._embeddings, "embed_query", fake_embed_query)
+    monkeypatch.setattr(beam_module, "_wm_vec_search", lambda conn, emb, k=20: [])
+    monkeypatch.setattr(beam_module, "_vec_available", lambda conn: False)
+    monkeypatch.setattr(beam_module, "_in_memory_vec_search", lambda conn, emb, k=20: [])
+    monkeypatch.setattr(beam_module, "_mib", lambda emb: b"\x00")
+
+    beam.recall("cache this query", top_k=5)
+
+    assert calls == ["cache this query"]
+
+
 class TestFactAnnotationMatching:
     def test_strict_fact_match_ignores_stopword_only_matches(self, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_STRICT_FACT_MATCH", "1")
