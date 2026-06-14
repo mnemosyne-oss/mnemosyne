@@ -1,0 +1,58 @@
+# Mnemosyne Sync - Self-Hosted VPS Deployment
+#
+# Runs a Mnemosyne sync server behind a Caddy reverse proxy with
+# automatic HTTPS. Memory data persists in a named volume.
+#
+# Usage:
+#   1. Set MNEMOSYNE_SYNC_API_KEY in a .env file (or export it)
+#   2. Edit Caddyfile with your domain
+#   3. docker compose up -d
+#
+# Security: the sync server binds to localhost inside the network;
+# only Caddy is exposed publicly, and it terminates TLS.
+
+version: "3.8"
+
+services:
+  mnemosyne-sync:
+    image: python:3.12-slim
+    container_name: mnemosyne-sync
+    restart: unless-stopped
+    expose:
+      - "8765"
+    volumes:
+      - mnemosyne-data:/data
+    environment:
+      - MNEMOSYNE_DATA_DIR=/data
+      - MNEMOSYNE_SYNC_API_KEY=${MNEMOSYNE_SYNC_API_KEY:?set MNEMOSYNE_SYNC_API_KEY in .env}
+    command: >
+      sh -c "pip install --quiet 'mnemosyne-memory[embeddings,sync]' &&
+             mnemosyne sync-serve
+               --host 0.0.0.0
+               --port 8765
+               --api-key \"$$MNEMOSYNE_SYNC_API_KEY\""
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/sync/status', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: mnemosyne-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - mnemosyne-sync
+
+volumes:
+  mnemosyne-data:
+  caddy-data:
+  caddy-config:

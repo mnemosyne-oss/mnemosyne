@@ -32,9 +32,11 @@
   - [BEAM Direct Access](#advanced-beam-direct-access)
 - [Architecture](#architecture)
 - [Why Mnemosyne?](#why-mnemosyne)
+- [Security & Privacy Model](#security--privacy-model)
 - [Configuration](#configuration)
   - [Environment Variables](#environment-variables)
 - [Hermes Plugin (23 tools)](#hermes-plugin-23-tools)
+- [Mnemosyne Sync](#mnemosyne-sync)
 - [Contributing](#contributing)
 - [Support](#support)
 - [License](#license)
@@ -51,7 +53,7 @@
 | **Windsurf** | MCP | Add to `.windsurf/mcp_config.json` |
 | **OpenWebUI** | Native @tool | Drop bridge file into `data/tools/` |
 | **OpenClaw** | Native provider | `pip install mnemosyne-memory[openclaw]` |
-| **Hermes Agent** | MCP + Plugin | Native — ships enabled |
+| **Hermes Agent** | MCP + Plugin | Native -- ships enabled |
 | **Any MCP client** | MCP (stdio/SSE) | One config line |
 | **Any Python agent** | Direct SDK | `import mnemosyne` |
 
@@ -154,6 +156,11 @@ mnemosyne sleep                         # Run consolidation
 # Export / import
 mnemosyne export --output backup.json
 mnemosyne import --input backup.json
+
+# Sync (bidirectional memory sync between instances)
+mnemosyne sync --remote https://my-vps:8765
+mnemosyne sync --remote https://my-vps:8765 --encrypt
+mnemosyne sync serve --port 8765 --api-key "sk-..."
 ```
 
 ---
@@ -223,36 +230,36 @@ results = beam.recall("editor preferences", top_k=5)
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                    Any AI Agent                            │
-│  (Hermes · Claude Code · Cursor · Codex · OpenWebUI · MCP) │
-└────────────────────────┬───────────────────────────────────┘
-                         │ MCP / SDK / Plugin
-┌────────────────────────▼───────────────────────────────────┐
-│                      Mnemosyne BEAM                         │
-│  ┌────────────┐  ┌──────────────┐  ┌────────────────────┐   │
-│  │ Working    │  │ Episodic     │  │ TripleStore         │   │
-│  │ Memory     │──▶│ Memory       │  │ (Temporal KG)      │   │
-│  │ (hot ctx)  │  │ (long-term)  │  └────────────────────┘   │
-│  └────────────┘  └──────┬───────┘                           │
-│                         │                                    │
-│              ┌──────────▼──────────┐                        │
-│              │     SQLite DB       │                        │
-│              │  (single file)      │                        │
-│              │  sqlite-vec + FTS5  │                        │
-│              │  MIB binary vectors │                        │
-│              └─────────────────────┘                        │
-└─────────────────────────────────────────────────────────────┘
++------------------------------------------------------------+
+|                    Any AI Agent                            |
+|  (Hermes - Claude Code - Cursor - Codex - OpenWebUI - MCP) |
++------------------------+-----------------------------------+
+                         | MCP / SDK / Plugin
++------------------------v-----------------------------------+
+|                      Mnemosyne BEAM                         |
+|  +------------+  +--------------+  +--------------------+   |
+|  | Working    |  | Episodic     |  | TripleStore         |   |
+|  | Memory     |->| Memory       |  | (Temporal KG)      |   |
+|  | (hot ctx)  |  | (long-term)  |  +--------------------+   |
+|  +------------+  +------+-------+                           |
+|                         |                                    |
+|              +----------v----------+                        |
+|              |     SQLite DB       |                        |
+|              |  (single file)      |                        |
+|              |  sqlite-vec + FTS5  |                        |
+|              |  MIB binary vectors |                        |
+|              +---------------------+                        |
++-------------------------------------------------------------+
 ```
 
 **BEAM** (Bilevel Episodic-Associative Memory):
-- **Working memory** — Hot context, auto-injected before LLM calls, TTL-based eviction
-- **Episodic memory** — Long-term storage with sqlite-vec + FTS5 hybrid search
-- **TripleStore** — Temporal knowledge graph with version chains
+- **Working memory** -- Hot context, auto-injected before LLM calls, TTL-based eviction
+- **Episodic memory** -- Long-term storage with sqlite-vec + FTS5 hybrid search
+- **TripleStore** -- Temporal knowledge graph with version chains
 
 **Hybrid scoring:** 50% vector similarity + 30% FTS5 rank + 20% importance, all inside SQLite.
 
-**Binary vectors:** Information-theoretic binarization (MIB) compresses 384-dim float32 embeddings into 48 bytes — 32x reduction. Hamming distance entirely within SQLite. No ANN indices, no external vector DB.
+**Binary vectors:** Information-theoretic binarization (MIB) compresses 384-dim float32 embeddings into 48 bytes -- 32x reduction. Hamming distance entirely within SQLite. No ANN indices, no external vector DB.
 
 ---
 
@@ -271,6 +278,29 @@ results = beam.recall("editor preferences", top_k=5)
 | **Integration template** | ✅ Published | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | **Memory architecture** | BEAM (3-tier) | Session + facts | OS-virtual context | Peer + reasoning | 5-layer stack | Episodic + semantic | Vector store only |
 | **Purpose** | Full memory system | Memory API | Agent runtime | Managed memory | Consumer + agent | Research memory | Vector database |
+
+---
+
+## Security & Privacy Model
+
+> **You are solely responsible for the content stored in Mnemosyne.**
+> Mnemosyne Sync supports optional client-side encryption. When disabled, memory content travels over TLS and is stored according to your infrastructure's security settings.
+
+| Feature | Mnemosyne | Detail |
+|---------|-----------|--------|
+| **Local-first by default** | ✅ | No data ever leaves your machine unless you enable sync |
+| **No telemetry** | ✅ | Zero tracking, zero analytics, zero cloud dependency |
+| **Optional sync** | ✅ | Bidirectional delta sync between desktop and VPS |
+| **Client-side encryption (sync)** | ✅ | XChaCha20-Poly1305 authenticated encryption. Key never leaves your machine. |
+| **BYOK / data-at-rest** | ✅ | Via OS keychain, env vars, or passphrase-derived keys |
+| **Self-hostable** | ✅ | Docker, bare metal, Fly.io -- you control the infrastructure |
+| **TLS enforcement** | ✅ | HTTPS required in production. Dev `--insecure` flag isolated. |
+
+When client-side encryption is enabled, the remote sync server sees **only metadata** (event IDs, timestamps, operation types, device IDs). Memory content, importance scores, source fields, and vector embeddings are all encrypted before transmission. The server cannot read your memories.
+
+**Full documentation:** [docs/security.md](docs/security.md) / [docs/sync.md](docs/sync.md)
+
+**Comparison:** Mnemosyne is the only memory system with client-side encryption of sync payloads as a core feature. Zep offers BYOK for data-at-rest but manages the key server-side. Every other system (Mem0, Letta, Honcho, Supermemory) relies solely on self-hosting and TLS for privacy.
 
 ---
 
@@ -315,7 +345,7 @@ See [docs/configuration.md#custom-embedding-models](docs/configuration.md#custom
 
 ## Hermes Plugin (23 tools)
 
-When used with Hermes Agent, Mnemosyne exposes **23 tools** for full memory lifecycle management — 3 lifecycle hooks (`pre_llm_call`, `on_session_start`, `post_tool_call`) for automatic context injection, plus MCP support.
+When used with Hermes Agent, Mnemosyne exposes **23 tools** for full memory lifecycle management -- 3 lifecycle hooks (`pre_llm_call`, `on_session_start`, `post_tool_call`) for automatic context injection, plus MCP support.
 
 > **For the full Hermes setup guide, see [docs/hermes-integration.md](docs/hermes-integration.md).** That is the canonical, most up-to-date reference.
 
@@ -325,8 +355,8 @@ When used with Hermes Agent, Mnemosyne exposes **23 tools** for full memory life
 |---------|-------------|-----|-------------|
 | `mnemosyne-memory` (core) | Low-resource (Raspberry Pi, 1 GB VPS), or when using a remote embedding API | ~50 MB | No local embeddings. Point `MNEMOSYNE_EMBEDDING_API_URL` to an external endpoint. |
 | `mnemosyne-memory[embeddings]` | Mid-range systems with local embedding support | ~800 MB | Adds `fastembed` for local vector generation. Best for single-user desktop agents. |
-| `mnemosyne-memory[all]` | Full-featured — local embeddings + local LLM consolidation | ~1.5 GB | Adds `sentence-transformers` + local LLM deps (`ctransformers`). Maximum capability. |
-| `mnemosyne-hermes` | Hermes Agent users — always pair with one of the above | Same as base | Wraps core library with plugin manifest + entry points. Run `hermes config set memory.provider mnemosyne` after install. |
+| `mnemosyne-memory[all]` | Full-featured -- local embeddings + local LLM consolidation | ~1.5 GB | Adds `sentence-transformers` + local LLM deps (`ctransformers`). Maximum capability. |
+| `mnemosyne-hermes` | Hermes Agent users -- always pair with one of the above | Same as base | Wraps core library with plugin manifest + entry points. Run `hermes config set memory.provider mnemosyne` after install. |
 
 **Hardware guidance:** Core alone runs on a Raspberry Pi 4 (4 GB) with ~300 MB free for LLM. `[embeddings]` needs at least 2 GB free RAM. `[all]` recommends 8 GB+.
 
@@ -337,7 +367,7 @@ hermes config set memory.provider mnemosyne
 hermes memory setup
 ```
 
-Then disable Hermes' built-in MEMORY.md/USER.md system so Mnemosyne is the sole memory provider. Do NOT use `hermes tools disable memory` — that also kills all 23 Mnemosyne-registered tools.
+Then disable Hermes' built-in MEMORY.md/USER.md system so Mnemosyne is the sole memory provider. Do NOT use `hermes tools disable memory` -- that also kills all 23 Mnemosyne-registered tools.
 
 Edit `~/.hermes/config.yaml`:
 
@@ -352,7 +382,7 @@ See [docs/hermes-integration.md](docs/hermes-integration.md) for the full setup 
 ### Tool categories
 
 | Category | Tools |
-|---|---|
+|----------|-------|
 | **Core memory** (9) | `remember`, `recall`, `sleep`, `stats`, `get`, `update`, `forget`, `invalidate`, `validate` |
 | **Knowledge graph** (4) | `triple_add`, `triple_query`, `graph_query`, `graph_link` |
 | **Multi-agent surface** (4) | `shared_remember`, `shared_recall`, `shared_forget`, `shared_stats` |
@@ -365,11 +395,44 @@ All 23 tools surface through the `mnemosyne-hermes` package, which wraps the `mn
 
 ---
 
+## Mnemosyne Sync
+
+Bidirectional, delta-based memory sync between Mnemosyne instances. Designed for desktop-to-VPS sync, team collaboration, and backup.
+
+**Key features:**
+- Delta/change-based protocol -- only transfers changes since last sync
+- Bidirectional, push-only, or pull-only modes
+- Optional client-side payload encryption (XChaCha20-Poly1305)
+- API key and JWT authentication
+- Timeline + importance conflict resolution
+- Append-only event log for auditability
+
+```bash
+# Start a sync server on your VPS
+mnemosyne sync serve --port 8765 --api-key "your-secret-key"
+
+# On your local machine, sync bidirectionally
+mnemosyne sync --remote https://my-vps:8765
+
+# With client-side encryption
+export MNEMOSYNE_SYNC_KEY=$(mnemosyne sync generate-key)
+mnemosyne sync --remote https://my-vps:8765 --encrypt
+
+# Check sync status
+mnemosyne sync status --remote https://my-vps:8765
+```
+
+**When encryption is enabled**, the remote server sees only metadata (event IDs, timestamps, operation types). Memory content is encrypted before leaving your machine and can only be decrypted with your key.
+
+**Full documentation:** [docs/sync.md](docs/sync.md) / [docs/security.md](docs/security.md)
+
+---
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
-Full docs: [`docs/`](docs/README.md) · Changelog: [`CHANGELOG.md`](CHANGELOG.md) · Releases: [GitHub Releases](https://github.com/AxDSan/mnemosyne/releases) · Integrations: [docs/integrations/](docs/integrations/README.md)
+Full docs: [`docs/`](docs/README.md) . Changelog: [`CHANGELOG.md`](CHANGELOG.md) . Releases: [GitHub Releases](https://github.com/AxDSan/mnemosyne/releases) . Integrations: [docs/integrations/](docs/integrations/README.md)
 
 ---
 
@@ -377,12 +440,12 @@ Full docs: [`docs/`](docs/README.md) · Changelog: [`CHANGELOG.md`](CHANGELOG.md
 
 <div align="center">
 
-**Discord:** [Join the Mnemosyne community](https://discord.gg/Cgzpw9x3R) · **Issues:** [GitHub Issues](https://github.com/AxDSan/mnemosyne/issues)
+**Discord:** [Join the Mnemosyne community](https://discord.gg/Cgzpw9x3R) . **Issues:** [GitHub Issues](https://github.com/AxDSan/mnemosyne/issues)
 
 <a href="https://github.com/sponsors/AxDSan"><img src="https://img.shields.io/badge/%F0%9F%92%96_GitHub_Sponsors-30363D?style=for-the-badge&logo=github&logoColor=white" alt="GitHub Sponsors"/></a>
 <a href="https://ko-fi.com/axdsan"><img src="https://img.shields.io/badge/%E2%98%95_Ko-fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white" alt="Ko-fi"/></a>
 
-⭐ **Star the repo if you find it useful!**
+**Star the repo if you find it useful!**
 
 </div>
 
@@ -390,12 +453,12 @@ Full docs: [`docs/`](docs/README.md) · Changelog: [`CHANGELOG.md`](CHANGELOG.md
 
 ## License
 
-MIT License — See [LICENSE](LICENSE)
+MIT License -- See [LICENSE](LICENSE)
 
 Copyright (c) 2026 Abdias J
 
 ---
 
 <p align="center">
-  <em>"The faintest ink is more powerful than the strongest memory." — Hermes Trismegistus</em>
+  <em>"The faintest ink is more powerful than the strongest memory." -- Hermes Trismegistus</em>
 </p>

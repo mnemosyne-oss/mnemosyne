@@ -1,0 +1,54 @@
+# Mnemosyne Sync on Fly.io
+#
+# Deploys a sync server with a persistent volume for the memory DB.
+#
+# Setup:
+#   fly launch --no-deploy --copy-config
+#   fly volumes create mnemosyne_data --size 1 --region <your-region>
+#   fly secrets set MNEMOSYNE_SYNC_API_KEY="$(mnemosyne sync-generate-key)"
+#   fly deploy
+#
+# Fly provides automatic HTTPS via force_https, so client connections
+# are TLS-encrypted end to end. Enable client-side encryption on top
+# with `mnemosyne sync --remote https://<app>.fly.dev --encrypt`.
+
+app = "mnemosyne-sync"
+primary_region = "iad"
+
+[build]
+  image = "python:3.12-slim"
+
+[env]
+  MNEMOSYNE_DATA_DIR = "/data"
+
+[http_service]
+  internal_port = 8765
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "60s"
+  method = "GET"
+  path = "/sync/status"
+
+[mounts]
+  source = "mnemosyne_data"
+  destination = "/data"
+
+# The process command installs deps then starts the server.
+# MNEMOSYNE_SYNC_API_KEY is injected via `fly secrets`.
+[processes]
+  app = "sh -c 'pip install --quiet mnemosyne-memory[embeddings,sync] && mnemosyne sync-serve --host 0.0.0.0 --port 8765 --api-key \"$MNEMOSYNE_SYNC_API_KEY\"'"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"

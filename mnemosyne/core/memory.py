@@ -591,26 +591,42 @@ class Mnemosyne:
         """Get consolidation history."""
         return self.beam.get_consolidation_log(limit=limit)
 
-    def export_to_file(self, output_path: str) -> Dict:
+    def export_to_file(
+        self, output_path: str, include_sync_events: bool = False
+    ) -> Dict:
         """
-        Export all Mnemosyne data (legacy + BEAM + triples + annotations) to
-        a JSON file. Returns export metadata.
+        Export all Mnemosyne data (legacy + BEAM + triples + annotations +
+        optional sync events) to a JSON file. Returns export metadata.
 
-        Schema version 1.1 (post-E6) adds an `annotations` section alongside
-        the existing `triples` section. Imports of 1.0 backups still work —
-        they simply restore zero annotations, and the auto-migrate hook will
-        relocate any annotation-flavored triples rows on next BeamMemory init.
+        Schema version 1.2 (post-sync) adds an optional ``sync_events``
+        section alongside memory data.  Previous versions (1.0, 1.1) are
+        still importable.
         """
         from mnemosyne.core.triples import TripleStore
         from mnemosyne.core.annotations import AnnotationStore
         import json as _json
 
+        # Build export metadata with device_id when available
+        meta = {
+            "version": "1.2" if include_sync_events else "1.1",
+            "export_date": datetime.now().isoformat(),
+            "source_db": str(self.db_path),
+        }
+
+        # Try to include the device_id from sync_meta for traceability
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT value FROM sync_meta WHERE key = 'device_id'"
+            )
+            row = cursor.fetchone()
+            if row and row[0]:
+                meta["device_id"] = row[0]
+        except Exception:
+            pass
+
         export = {
-            "mnemosyne_export": {
-                "version": "1.1",
-                "export_date": datetime.now().isoformat(),
-                "source_db": str(self.db_path),
-            }
+            "mnemosyne_export": meta,
         }
 
         # BEAM data
@@ -649,6 +665,21 @@ class Mnemosyne:
         annotations = AnnotationStore(db_path=self.db_path)
         export["annotations"] = annotations.export_all()
 
+        # Sync events (optional, schema 1.2)
+        if include_sync_events:
+            try:
+                cursor.execute("""
+                    SELECT event_id, memory_id, operation, timestamp,
+                           device_id, payload, parent_event_ids,
+                           importance, expiry, event_hash, synced_at
+                    FROM memory_events
+                    ORDER BY timestamp ASC
+                """)
+                export["sync_events"] = [dict(row) for row in cursor.fetchall()]
+            except Exception:
+                # memory_events table may not exist if sync was never used
+                export["sync_events"] = []
+
         with open(output_path, "w", encoding="utf-8") as f:
             _json.dump(export, f, indent=2, ensure_ascii=False, default=str)
 
@@ -661,6 +692,7 @@ class Mnemosyne:
             "legacy_memories_count": len(export["legacy_memories"]),
             "triples_count": len(export["triples"]),
             "annotations_count": len(export["annotations"]),
+            "sync_events_count": len(export.get("sync_events", [])),
         }
 
     def import_from_file(self, input_path: str, force: bool = False) -> Dict:
@@ -670,10 +702,9 @@ class Mnemosyne:
         Set force=True to overwrite.
         Returns import statistics.
 
-        Accepts both schema version 1.0 (pre-E6) and 1.1 (post-E6). When a
-        1.0 backup is imported, the `annotations` section is treated as empty
-        and any annotation-flavored rows in the imported `triples` will be
-        relocated by the auto-migrate hook on the next BeamMemory init.
+        Accepts schema versions 1.0 (pre-E6), 1.1 (post-E6), and 1.2
+        (post-sync).  When a 1.2 export includes ``sync_events``, those
+        events are imported with idempotency based on ``event_hash``.
         """
         from mnemosyne.core.triples import TripleStore
         from mnemosyne.core.annotations import AnnotationStore
@@ -685,13 +716,19 @@ class Mnemosyne:
         if not isinstance(data, dict):
             raise ValueError("Import file must contain a Mnemosyne export object")
 
-        # Validate — accept the two known schema versions.
+        # Validate — accept known schema versions.
         meta = data.get("mnemosyne_export", {})
         version = meta.get("version")
-        if version not in ("1.0", "1.1"):
+        if version not in ("1.0", "1.1", "1.2"):
             raise ValueError(f"Unsupported export version: {version}")
 
-        stats = {"beam": {}, "legacy": {}, "triples": {}, "annotations": {}}
+        stats = {
+            "beam": {},
+            "legacy": {},
+            "triples": {},
+            "annotations": {},
+            "sync_events": {},
+        }
 
         # BEAM import
         beam_stats = self.beam.import_from_dict(data, force=force)
@@ -748,6 +785,67 @@ class Mnemosyne:
         annotations = AnnotationStore(db_path=self.db_path)
         a_stats = annotations.import_all(data.get("annotations", []), force=force)
         stats["annotations"] = a_stats
+
+        # Sync events (schema 1.2 — idempotent by event_hash)
+        sync_raw = data.get("sync_events")
+        if sync_raw:
+            se_stats = {"inserted": 0, "skipped": 0, "overwritten": 0}
+            # Collect known event_hashes for dedup
+            cursor.execute(
+                "SELECT event_hash FROM memory_events WHERE event_hash IS NOT NULL"
+            )
+            known_hashes = {row[0] for row in cursor.fetchall()}
+            for item in sync_raw:
+                event_hash = item.get("event_hash")
+                event_id = item.get("event_id")
+
+                # Deduplicate by event_hash (primary idempotency key)
+                if event_hash and event_hash in known_hashes:
+                    se_stats["skipped"] += 1
+                    continue
+
+                # Check for event_id collision
+                cursor.execute(
+                    "SELECT 1 FROM memory_events WHERE event_id = ?",
+                    (event_id,),
+                )
+                exists = cursor.fetchone() is not None
+                if exists:
+                    if force:
+                        cursor.execute(
+                            "DELETE FROM memory_events WHERE event_id = ?",
+                            (event_id,),
+                        )
+                        se_stats["overwritten"] += 1
+                    else:
+                        se_stats["skipped"] += 1
+                        continue
+
+                se_stats["inserted"] += 1
+                cursor.execute(
+                    """INSERT OR IGNORE INTO memory_events (
+                        event_id, memory_id, operation, timestamp, device_id,
+                        payload, parent_event_ids, importance, expiry,
+                        event_hash, synced_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        event_id,
+                        item.get("memory_id", ""),
+                        item.get("operation", ""),
+                        item.get("timestamp", ""),
+                        item.get("device_id", ""),
+                        item.get("payload"),
+                        item.get("parent_event_ids", "[]"),
+                        item.get("importance", 0.5),
+                        item.get("expiry"),
+                        event_hash,
+                        item.get("synced_at"),
+                    ),
+                )
+                if event_hash:
+                    known_hashes.add(event_hash)
+            self.conn.commit()
+            stats["sync_events"] = se_stats
 
         return stats
 

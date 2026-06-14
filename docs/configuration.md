@@ -247,6 +247,23 @@ pip install mnemosyne-memory[all]
 
 Without `fastembed`, Mnemosyne falls back to keyword-only retrieval (FTS5). It works, but semantic search and benchmark scores require it.
 
+## Sync Configuration
+
+These environment variables configure the Mnemosyne Sync subsystem.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MNEMOSYNE_SYNC_API_KEY` | *(none)* | API key for authenticating sync requests |
+| `MNEMOSYNE_SYNC_JWT` | *(none)* | JWT token for JWT-based sync auth |
+| `MNEMOSYNE_SYNC_KEY` | *(none)* | Base64-encoded 32-byte encryption key for client-side payload encryption |
+| `MNEMOSYNE_SYNC_KEY_SOURCE` | `env` | Where to read the encryption key: `env`, `keyring`, `prompt`, `file` |
+| `MNEMOSYNE_SYNC_KEY_FILE` | *(none)* | Path to a file containing the base64-encoded encryption key |
+| `MNEMOSYNE_SYNC_PASSPHRASE` | *(none)* | Passphrase for key derivation (PBKDF2/Argon2id) |
+| `MNEMOSYNE_SYNC_SERVER_PORT` | `8765` | Default port for `mnemosyne sync serve` |
+| `MNEMOSYNE_SYNC_INSECURE` | `false` | Allow plain HTTP connections (dev only) |
+
+See [docs/sync.md](sync.md) for full usage and [docs/security.md](security.md) for the security model.
+
 ## Example Configuration
 
 ```bash

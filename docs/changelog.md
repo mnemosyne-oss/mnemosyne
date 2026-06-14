@@ -4,6 +4,21 @@ See [CHANGELOG.md](../CHANGELOG.md) in the repository root for the full version 
 
 ## Recent Releases
 
+### 3.6 - Mnemosyne Sync (June 2026)
+
+- **Bidirectional delta sync:** New `mnemosyne sync` CLI for synchronizing memory between Mnemosyne instances (desktop to VPS, local to remote)
+- **Append-only event log:** New `memory_events` table with all 11 fields (event_id, memory_id, operation, timestamp, device_id, payload, parent_event_ids, importance, expiry, event_hash, synced_at)
+- **SyncEngine:** Event-log-based sync orchestrator with pull_changes/push_changes protocol, cursor-based pagination, and idempotent deduplication
+- **HTTP sync server:** stdlib-only server (no FastAPI deps) with POST /sync/pull, POST /sync/push, GET /sync/status
+- **CLI commands:** `mnemosyne sync`, `mnemosyne sync-serve`, `mnemosyne sync-status`, `mnemosyne sync-generate-key`
+- **Authentication:** API key (Bearer) and JWT support on sync endpoints
+- **Conflict resolution:** v1 strategy (timestamp->importance->device_id), 5-second detection window
+- **Client-side encryption (optional):** XChaCha20-Poly1305 via Fernet/PyNaCl fallback, key derivation via Argon2id->PBKDF2
+- **Full memory pipeline integration:** Incoming sync events route through `remember()` for FTS5, embeddings, entity extraction
+- **Security docs:** [docs/security.md](docs/security.md) with threat model, liability disclaimers, comparison table
+- **Sync docs:** [docs/sync.md](docs/sync.md) with protocol reference, deployment examples (Docker Compose, Caddy, Nginx, Fly.io, SSH tunnel)
+- **Zero hard deps added:** `[sync]` extra pulls in cryptography; server uses stdlib only
+
 ### 2.4 — Hindsight Importer + Host LLM Adapter (May 2026)
 
 - **Import FROM Hindsight:** New `HindsightImporter` for migrating Hindsight memories into Mnemosyne

@@ -633,6 +633,44 @@ def init_beam(db_path: Path = None):
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sp_session ON scratchpad(session_id)")
 
+    # --- MEMORY EVENTS (sync table) ---
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS memory_events (
+            event_id TEXT PRIMARY KEY,
+            memory_id TEXT NOT NULL,
+            operation TEXT NOT NULL CHECK(operation IN ('CREATE','UPDATE','DELETE','CONSOLIDATE')),
+            timestamp TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            payload TEXT,
+            parent_event_ids TEXT DEFAULT '[]',
+            importance REAL DEFAULT 0.5,
+            expiry TEXT,
+            event_hash TEXT,
+            synced_at TEXT
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_timestamp ON memory_events(timestamp)")
+    try:
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_memory_id ON memory_events(memory_id)")
+    except sqlite3.OperationalError:
+        pass  # Column may not exist in older schema
+    try:
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_device_id ON memory_events(device_id)")
+    except sqlite3.OperationalError:
+        pass  # Column may not exist in older schema
+
+    # Memory events ALTER TABLE migrations (safe add columns for existing DBs)
+    for col, ddl in {
+        "event_hash": "event_hash TEXT",
+        "synced_at": "synced_at TEXT",
+        "parent_event_ids": "parent_event_ids TEXT DEFAULT '[]'",
+        "expiry": "expiry TEXT",
+    }.items():
+        try:
+            cursor.execute(f"ALTER TABLE memory_events ADD COLUMN {ddl}")
+        except sqlite3.OperationalError:
+            pass
+
     # Detect supported vector type
     effective_vec_type = _detect_vec_type(conn)
 

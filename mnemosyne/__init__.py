@@ -26,6 +26,11 @@ _lazy_exports = {
     "forget": (".core.memory", "forget"),
     "update": (".core.memory", "update"),
     "reclaim_orphans": (".core.memory", "reclaim_orphans"),
+    "SyncEngine": (".core.sync", "SyncEngine"),
+    "SyncEvent": (".core.sync", "SyncEvent"),
+    "SyncEncryption": (".core.sync", "SyncEncryption"),
+    "ConflictResolution": (".core.sync", "ConflictResolution"),
+    "run_sync_server": (".core.sync_server", "run_sync_server"),
 }
 
 

@@ -261,7 +261,7 @@ Both systems are fully offline after initial setup. The difference is weight: Mn
 | Gap | Severity | Workaround |
 |---|---|---|
 | No automatic entity normalization | Medium | `extract_entities=True` captures entities; fuzzy matching helps but doesn't resolve coreference |
-| No cross-machine network API | Medium for multi-agent setups | Export/import JSON; same-machine sharing via shared SQLite file. **Can now import FROM Hindsight directly** — migrate without data loss |
+|| No cross-machine network API | Medium for multi-agent setups | Export/import JSON; same-machine sharing via shared SQLite file. **Can now import FROM Hindsight directly** -- migrate without data loss. **Sync (v3.6.0)** enables bidirectional desktop-to-VPS with optional client-side encryption. |
 | No cross-encoder reranking | Low for most queries | Hybrid scoring with configurable weights covers common cases |
 | No automatic conflict detection | Medium | Manual `invalidate(memory_id, replacement_id=new_id)` |
 | No multi-tenancy / access control | High for SaaS use cases | Use per-bank SQLite isolation for domain separation |

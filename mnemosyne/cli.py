@@ -185,19 +185,29 @@ def cmd_diagnose(args):
 
 
 def cmd_export(args):
-    """Export memories to JSON."""
-    output_path = args[0] if args else os.path.join(DATA_DIR, "mnemosyne_export.json")
+    """Export memories to JSON.
+
+    Supports --include-sync-events to include the sync event log
+    alongside memory data (schema v1.2).
+    """
+    include_sync = "--include-sync-events" in args
+    # Filter out flag args to get positional arguments
+    pos_args = [a for a in args if not a.startswith("--")]
+    output_path = pos_args[0] if pos_args else os.path.join(DATA_DIR, "mnemosyne_export.json")
     mem = _get_memory()
-    result = mem.export_to_file(output_path)
+    result = mem.export_to_file(output_path, include_sync_events=include_sync)
     print(
         f"Exported "
         f"{result.get('working_memory_count', 0)} working, "
         f"{result.get('episodic_memory_count', 0)} episodic, "
         f"{result.get('legacy_memories_count', 0)} legacy, "
         f"{result.get('triples_count', 0)} triples, "
-        f"{result.get('annotations_count', 0)} annotations "
-        f"to {output_path}"
+        f"{result.get('annotations_count', 0)} annotations"
     )
+    sync_count = result.get("sync_events_count", 0)
+    if sync_count:
+        print(f"  + {sync_count} sync events")
+    print(f"  to {output_path}")
 
 
 def cmd_import(args):
@@ -248,9 +258,16 @@ def cmd_import(args):
         f"{beam_stats.get('episodic_memory', {}).get('inserted', 0)} episodic, "
         f"{result.get('legacy', {}).get('inserted', 0)} legacy, "
         f"{_format_store_stats(result.get('triples', {}), 'triples')}, "
-        f"{_format_store_stats(result.get('annotations', {}), 'annotations')} "
-        f"from {args[0]}"
+        f"{_format_store_stats(result.get('annotations', {}), 'annotations')}"
     )
+    # Sync events import stats (silently populated for v1.2 exports)
+    se_stats = result.get("sync_events", {})
+    if se_stats and se_stats.get("inserted", 0):
+        print(
+            f"        "
+            f"{_format_store_stats(se_stats, 'sync events')}"
+        )
+    print(f"        from {args[0]}")
 
 
 def cmd_import_hindsight(args):
@@ -278,6 +295,180 @@ def cmd_mcp(args):
     except ImportError:
         print("MCP not available. Install with: pip install mnemosyne-memory[mcp]")
         sys.exit(1)
+
+
+def cmd_sync(args):
+    """Sync memories with a remote Mnemosyne instance."""
+    import argparse
+    parser = argparse.ArgumentParser(prog="mnemosyne sync")
+    parser.add_argument("--remote", required=True, help="Remote sync server URL (e.g. http://192.168.1.50:8765)")
+    parser.add_argument("--mode", choices=["push", "pull", "bidirectional"], default="bidirectional",
+                        help="Sync direction (default: bidirectional)")
+    parser.add_argument("--encrypt", help="Encryption key (base64) or path to key file")
+    parser.add_argument("--api-key", help="API key for remote server auth")
+    parser.add_argument("--insecure", action="store_true", help="Skip TLS verification (not implemented in stdlib impl)")
+    parser.add_argument("--interval", type=float, default=0, help="Sync interval in seconds (repeat mode)")
+
+    # Parse known flags from args; remaining are for internal use
+    parsed, _ = parser.parse_known_args(args)
+
+    mem = _get_memory()
+    from mnemosyne.core.sync import SyncEngine, SyncEncryption
+
+    encryption = None
+    if parsed.encrypt:
+        encryption = SyncEncryption.from_config(parsed.encrypt)
+
+    engine = SyncEngine(mem, encryption=encryption)
+
+    if parsed.interval > 0:
+        # Repeating sync
+        import time
+        cycle = 0
+        print(f"Starting repeating sync every {parsed.interval}s to {parsed.remote}")
+        try:
+            while True:
+                cycle += 1
+                print(f"\n--- Sync cycle {cycle} ---")
+                result = engine.sync_with(
+                    remote_url=parsed.remote,
+                    mode=parsed.mode,
+                    api_key=parsed.api_key,
+                )
+                _print_sync_result(result)
+                time.sleep(parsed.interval)
+        except KeyboardInterrupt:
+            print("\nSync stopped.")
+    else:
+        result = engine.sync_with(
+            remote_url=parsed.remote,
+            mode=parsed.mode,
+            api_key=parsed.api_key,
+        )
+        _print_sync_result(result)
+
+
+def _print_sync_result(result: dict) -> None:
+    """Print sync results to console."""
+    print(f"\nSync to {result.get('remote', '?')}")
+    print(f"  Mode: {result.get('mode', '?')}")
+
+    push = result.get("push")
+    if push is not None:
+        print(f"  Push:")
+        print(f"    Accepted:   {push.get('accepted', 0)}")
+        print(f"    Duplicates: {push.get('duplicates', 0)}")
+        print(f"    Conflicts:  {push.get('conflicts', 0)}")
+
+    pull = result.get("pull")
+    if pull is not None:
+        print(f"  Pull:")
+        print(f"    Events fetched: {pull.get('events_fetched', 0)}")
+        print(f"    Accepted:       {pull.get('accepted', 0)}")
+        print(f"    Duplicates:     {pull.get('duplicates', 0)}")
+        print(f"    Conflicts:      {pull.get('conflicts', 0)}")
+
+    errors = result.get("errors", [])
+    if errors:
+        print(f"  Errors ({len(errors)}):")
+        for err in errors:
+            print(f"    - {err}")
+
+
+def cmd_sync_serve(args):
+    """Start the Mnemosyne sync HTTP server."""
+    import argparse
+    parser = argparse.ArgumentParser(prog="mnemosyne sync-serve")
+    parser.add_argument("--port", type=int, default=8765, help="Server port (default: 8765)")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    parser.add_argument("--api-key", help="API key for bearer-token auth")
+    parser.add_argument("--jwt-secret", help="JWT secret for token auth")
+    parser.add_argument("--tls-cert", help="TLS certificate file path")
+    parser.add_argument("--tls-key", help="TLS key file path")
+    parser.add_argument("--device-id", help="Custom device identifier")
+
+    parsed = parser.parse_args(args)
+
+    mem = _get_memory()
+    from mnemosyne.core.sync import SyncEngine as _SyncEngine
+    from mnemosyne.core.sync_server import run_sync_server as _run_server
+
+    _run_server(
+        host=parsed.host,
+        port=parsed.port,
+        beam_instance=mem,
+        device_id=parsed.device_id,
+        api_key=parsed.api_key,
+        jwt_secret=parsed.jwt_secret,
+        tls_cert=parsed.tls_cert,
+        tls_key=parsed.tls_key,
+    )
+
+
+def cmd_sync_status(args):
+    """Show sync status and statistics."""
+    import argparse
+    parser = argparse.ArgumentParser(prog="mnemosyne sync-status")
+    parser.add_argument("--remote", help="Remote sync server URL to check")
+    parser.add_argument("--api-key", help="API key for remote server auth")
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+
+    parsed = parser.parse_args(args)
+
+    mem = _get_memory()
+    from mnemosyne.core.sync import SyncEngine
+
+    engine = SyncEngine(mem)
+
+    # Log a heartbeat event so we have data to show
+    status = engine.get_status(remote_url=parsed.remote if parsed.remote else None)
+
+    if parsed.json:
+        print(json.dumps(status, indent=2, default=str))
+        return
+
+    print("\nMnemosyne Sync Status\n")
+    print(f"  Device ID:        {status.get('device_id', 'N/A')}")
+    print(f"  Total events:     {status.get('total_events', 0)}")
+    print(f"  Unique devices:   {status.get('device_count', 0)}")
+    print(f"  Last event:       {status.get('last_event_time', 'N/A')}")
+
+    if status.get('last_sync'):
+        print(f"  Last sync:        {status.get('last_sync')}")
+
+    print(f"  Synced events:    {status.get('synced_events', 0)}")
+
+    op_breakdown = status.get("operation_breakdown", {})
+    if op_breakdown:
+        print(f"\n  Operations breakdown:")
+        for op, cnt in sorted(op_breakdown.items(), key=lambda x: -x[1]):
+            print(f"    {op}: {cnt}")
+
+    # Security: show encryption status
+    pending = status.get('total_events', 0) - status.get('synced_events', 0)
+    if pending:
+        print(f"\n  Pending push:     {pending} events")
+
+    if "remote" in status:
+        print(f"\n  Remote:           {status.get('remote')}")
+        remote_st = status.get("remote_status", {})
+        if remote_st:
+            pull_info = remote_st.get("pull", {})
+            if pull_info:
+                print(f"  Remote events:    {pull_info.get('events_fetched', 'N/A')}")
+            errors = remote_st.get("errors", [])
+            if errors:
+                print(f"  Remote errors:")
+                for err in errors:
+                    print(f"    - {err}")
+
+
+def cmd_sync_generate_key(args):
+    """Generate a random encryption key for sync."""
+    from mnemosyne.core.sync import SyncEncryption as _Enc
+    key = _Enc.generate_key()
+    print(key)
+    print(f"\nStore this key securely. It is the only way to decrypt synced payloads.", file=sys.stderr)
 
 
 def cmd_backup(args):
@@ -413,6 +604,11 @@ COMMANDS = {
     "restore": cmd_restore,
     "verify": cmd_verify,
     "backups": cmd_backups_list,
+    "sync": cmd_sync,
+    "sync-serve": cmd_sync_serve,
+    "sync-server": cmd_sync_serve,
+    "sync-status": cmd_sync_status,
+    "sync-generate-key": cmd_sync_generate_key,
 }
 
 
@@ -429,7 +625,7 @@ def run_cli():
         print("  stats                                  Show statistics")
         print("  sleep                                  Run consolidation")
         print("  diagnose [--fix] [--dry-run]           Run diagnostics (--fix auto-installs deps)")
-        print("  export [file.json]                     Export memories")
+        print("  export [--include-sync-events] [file.json]    Export memories")
         print("  import <file.json>                     Import memories")
         print("  import-hindsight <file|url> [bank]     Import Hindsight memories")
         print("  bank list|create|delete [name]         Manage memory banks")
@@ -438,6 +634,13 @@ def run_cli():
         print("  verify [db_path] [--quick]             Verify database integrity")
         print("  backups [backup_dir]                   List available backups")
         print("  mcp [--transport sse] [--port 8080]    Start MCP server")
+        print("  sync --remote <url> [--mode push|pull|bidirectional]")
+        print("                                      Sync with remote server")
+        print("  sync-serve [--port 8765] [--host 0.0.0.0]")
+        print("                                      Start sync server")
+        print("  sync-status [--remote <url>] [--json]")
+        print("                                      Show sync status")
+        print("  sync-generate-key                    Generate encryption key")
         return
 
     command = sys.argv[1]

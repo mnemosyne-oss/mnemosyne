@@ -1,0 +1,29 @@
+# Mnemosyne Sync - Caddy reverse proxy with automatic HTTPS
+#
+# Replace memory.example.com with your actual domain. Caddy will
+# automatically provision and renew a Let's Encrypt certificate.
+#
+# This terminates TLS at the edge and proxies plaintext to the
+# sync server on the internal Docker network. The sync server is
+# never exposed directly to the internet.
+
+memory.example.com {
+    reverse_proxy mnemosyne-sync:8765
+
+    # Optional: basic rate limiting and request size cap
+    request_body {
+        max_size 50MB
+    }
+
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000;"
+        X-Content-Type-Options "nosniff"
+        -Server
+    }
+
+    log {
+        output stdout
+        format console
+    }
+}
