@@ -7,6 +7,12 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+### Added
+
+- **Sleep orphan-claim recovery** (issue #293). Added `reclaim_orphans()`
+  to clear stale consolidation claims when `sleep()` was interrupted after
+  claiming working-memory rows but before writing an episodic summary.
+
 ### Changed
 
 - **Lower prefetch noise from raw conversation turns.** sync_turn() now writes
@@ -14,6 +20,12 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   (was 0.2). This increases the bar for raw conversation turns to surface in
   prefetch recall, reducing irrelevant context pollution. Both provider copies
   (hermes_memory_provider and mnemosyne_hermes) updated identically.
+- **Faster working-memory context retrieval** (issue #291, PR #296).
+  `get_context()` now uses split global/session queries and targeted indexes
+  instead of a broad `OR`/temporary-sort query shape.
+- **Lower recall overhead** (issue #292, PRs #298 and #299). `recall()` now
+  computes the query embedding once per call and pushes working-memory filters
+  into vector candidate selection before JSON vector decode / NumPy scoring.
 
 ## [3.7.0] — 2026-06-13
 

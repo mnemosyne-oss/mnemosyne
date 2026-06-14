@@ -67,10 +67,10 @@ setup(
     },
     extras_require={
         "llm": ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20"],
-        "embeddings": ["fastembed>=0.3.0"],
+        "embeddings": ["fastembed>=0.3.0", "sqlite-vec>=0.1.0"],
         "mcp": ["mcp>=1.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'"],
         "openclaw": ["openclaw>=0.1.0; python_version >= '3.10'"],
-        "all": ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20", "fastembed>=0.3.0", "mcp>=1.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'", "openclaw>=0.1.0; python_version >= '3.10'"],
+        "all": ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20", "fastembed>=0.3.0", "sqlite-vec>=0.1.0", "mcp>=1.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'"],
         "dev": ["pytest>=7.0", "build", "twine"],
     },
     entry_points={
