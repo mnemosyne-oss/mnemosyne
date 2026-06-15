@@ -261,6 +261,11 @@ def _parser() -> argparse.ArgumentParser:
         help="Replace an existing Mnemosyne plugin directory.",
     )
     install.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes.",
+    )
+    install.add_argument(
         "--no-bootstrap",
         action="store_true",
         help="Skip auto-installing mnemosyne-hermes into Hermes' venv.",
@@ -294,6 +299,18 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 1
+
+            # Dry-run: just show what would happen
+            hermes_python = _find_hermes_python()
+            target = plugin_target_dir(args.hermes_home)
+            if getattr(args, "dry_run", False):
+                print(f"  Plugin target dir: {target}")
+                print(f"  Hermes Python: {hermes_python or 'not found'}")
+                print(f"  Currently installed: {'yes' if is_installed(hermes_home_path=args.hermes_home) else 'no'}")
+                print(f"  Will force: {bool(getattr(args, 'force', False))}")
+                if hermes_python:
+                    print(f"  Will bootstrap: {not getattr(args, 'no_bootstrap', False)}")
+                return 0
 
             # Find Hermes' Python and validate deps there too
             hermes_python = _find_hermes_python()
@@ -339,13 +356,37 @@ def main(argv: list[str] | None = None) -> int:
 
         if command == "status":
             target = plugin_target_dir(args.hermes_home)
-            if is_installed(hermes_home_path=args.hermes_home):
-                print(f"Installed. Symlink at {target}")
-                print(f"  -> {os.readlink(str(target))}")
-                print(f"  Core library: {'OK' if check_mnemosyne_core() else 'MISSING'}")
-                return 0
-            print(f"Not installed (expected symlink at {target})")
-            return 1
+            installed = is_installed(hermes_home_path=args.hermes_home)
+            hermes_python = _find_hermes_python()
+            print(f"Status for mnemosyne-hermes plugin")
+            print(f"  Plugin symlink: {target}")
+            if installed:
+                try:
+                    link = os.readlink(str(target))
+                    print(f"  Target: {link}")
+                except Exception:
+                    print(f"  Type: directory (not symlink)")
+            else:
+                print(f"  NOT installed (no symlink at {target})")
+            print(f"  Core library: {'OK' if check_mnemosyne_core() else 'MISSING'}")
+            print(f"  This Python: {sys.executable} ({sys.version.split()[0]})")
+            if hermes_python:
+                try:
+                    import subprocess as _sp
+                    _r = _sp.run([str(hermes_python), "--version"], capture_output=True, text=True, timeout=5)
+                    _ver = _r.stdout.strip() or _r.stderr.strip()
+                    print(f"  Hermes' Python: {hermes_python} ({_ver})")
+                    if hermes_python.resolve() != Path(sys.executable).resolve():
+                        print(f"  ⚠ Python version MISMATCH! Install and Hermes use different Python versions.")
+                        print(f"  → Run: {_ver.split()[1]}" if " " in _ver else "")
+                except Exception:
+                    print(f"  Hermes' Python: {hermes_python} (unable to check version)")
+            else:
+                print(f"  Hermes' Python: not found")
+            if installed and hermes_python and hermes_python.resolve() != Path(sys.executable).resolve():
+                print(f"  → Her Python vs install Python mismatch means the symlink exists but Hermes")
+                print(f"     may not be able to import mnemosyne core. Run with --dry-run to diagnose.")
+            return 0 if installed else 1
 
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)

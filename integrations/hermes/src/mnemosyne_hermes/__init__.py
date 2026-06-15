@@ -1803,8 +1803,45 @@ class MnemosyneMemoryProvider(MemoryProvider):
 # ---------------------------------------------------------------------------
 
 def register_memory_provider(ctx):
-    """Called by Hermes memory provider discovery system."""
-    provider = MnemosyneMemoryProvider()
+    """Called by Hermes memory provider discovery system.
+
+    If construction fails, prints diagnostic info to stderr so users
+    can determine WHY even though Hermes logs the error at DEBUG level.
+    """
+    import sys as _sys
+    try:
+        provider = MnemosyneMemoryProvider()
+    except Exception as _exc:
+        print(
+            f"[mnemosyne-hermes] ERROR: MnemosyneMemoryProvider() failed: {_exc}",
+            file=_sys.stderr,
+        )
+        print(
+            f"[mnemosyne-hermes]   Python: {_sys.version!r}",
+            file=_sys.stderr,
+        )
+        # Try to detect Hermes' Python for version mismatch diagnostics
+        try:
+            from .install import _find_hermes_python
+            _hp = _find_hermes_python()
+            if _hp and _hp.resolve() != Path(_sys.executable).resolve():
+                import subprocess as _sp
+                _r = _sp.run(
+                    [str(_hp), "--version"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                _ver = _r.stdout.strip() or _r.stderr.strip()
+                print(
+                    f"[mnemosyne-hermes]   Hermes' Python: {_hp} ({_ver})",
+                    file=_sys.stderr,
+                )
+                print(
+                    f"[mnemosyne-hermes]   FIX: Run: {_hp} -m pip install -U 'mnemosyne-hermes[all]'",
+                    file=_sys.stderr,
+                )
+        except Exception:
+            pass
+        raise
     ctx.register_memory_provider(provider)
 
 
