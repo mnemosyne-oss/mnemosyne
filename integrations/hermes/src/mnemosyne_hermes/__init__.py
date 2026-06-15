@@ -328,6 +328,9 @@ class MnemosyneMemoryProvider(MemoryProvider):
         # Profile memory isolation: when enabled, each Hermes profile gets its own
         # Mnemosyne bank (separate SQLite DB). Default OFF for backward compatibility.
         self._profile_isolation_enabled = False
+        # Default scope for remember() calls when not explicitly specified.
+        # "session" (default) scopes to current session; "global" persists across sessions.
+        self._default_scope = "session"
         # Tracked so shutdown() can wait briefly for in-flight consolidation
         # before clearing the host LLM backend, preventing the post-timeout
         # daemon thread from racing with unregister and falling through to
@@ -517,6 +520,19 @@ class MnemosyneMemoryProvider(MemoryProvider):
             else:
                 self._shared_surface_read = bool(shared_surface_read)
 
+        # default_scope: overrides the scope argument for remember() calls when
+        # scope is not explicitly set by the caller. "session" (default) limits
+        # memories to the current session; "global" persists across sessions.
+        default_scope = kwargs.get("default_scope")
+        if default_scope is None:
+            default_scope = self._read_config_key("default_scope")
+        if default_scope is not None:
+            scope_str = str(default_scope).lower().strip()
+            if scope_str in ("session", "global"):
+                self._default_scope = scope_str
+            else:
+                logger.warning("Mnemosyne: invalid default_scope=%r, must be 'session' or 'global'", default_scope)
+
     def _should_filter(self, content: str) -> bool:
         """Check if content matches any ignore pattern. Returns True if it should be skipped."""
         if not self._ignore_patterns:
@@ -553,6 +569,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
             {"key": "shared_surface_path", "description": "SQLite path for shared surface memories. Default is <mnemosyne>/data/shared/mnemosyne.db.", "default": "data/shared/mnemosyne.db"},
             {"key": "shared_surface_read", "description": "When true, mnemosyne_recall merges shared-surface results into private bank recall, tagging each result with its bank ('private' or 'surface'). Default false.", "default": False},
             {"key": "skip_contexts", "description": "Agent contexts where Mnemosyne should skip initialization. Comma-separated list. Defaults to 'cron,flush,subagent,background,skill_loop'. Set to empty string to enable all contexts. Also configurable via MNEMOSYNE_SKIP_CONTEXTS env var.", "default": "cron,flush,subagent,background,skill_loop"},
+            {"key": "default_scope", "description": "Default scope for remember() calls when not explicitly specified. 'session' (default) limits memories to the current session. 'global' persists memories across sessions.", "choices": ["session", "global"], "default": "session"},
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -868,6 +885,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
                     content=f"[USER] {uc}",
                     source="conversation",
                     importance=0.5,
+                    scope=self._default_scope,
                     extract_entities=True,
                 )
                 # Check for identity-significant signals in user content
@@ -879,6 +897,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
                     content=f"[ASSISTANT] {ac}",
                     source="conversation",
                     importance=0.15,
+                    scope=self._default_scope,
                     extract_entities=True,
                 )
             self._turn_count += 1
@@ -1024,9 +1043,11 @@ class MnemosyneMemoryProvider(MemoryProvider):
         extract_entities = bool(args.get("extract_entities", False))
         # When extract=true and scope is not explicitly passed by the caller,
         # auto-default to global. Facts extracted via LLM are identity-significant
-        # and should survive session boundaries. If the caller explicitly passed
-        # scope (even as "session"), respect that choice.
-        scope = args.get("scope", "global" if extract else "session")
+        # and should survive session boundaries. When extract=false, fall back
+        # to the configured default_scope (user-configurable via default_scope
+        # in config.yaml). If the caller explicitly passed scope, respect that
+        # choice.
+        scope = args.get("scope", "global" if extract else self._default_scope)
         valid_until = args.get("valid_until", None) or None
         metadata = args.get("metadata") or None
         # Trust-boundary clamp — see VERACITY_ALLOWED in

@@ -160,6 +160,18 @@ def _resolve_bank(arguments: Dict[str, Any]) -> str:
     return arguments.get("bank") or os.environ.get("MNEMOSYNE_MCP_BANK") or "default"
 
 
+def _resolve_default_scope() -> str:
+    """Resolve default scope for remember() calls.
+    
+    Precedence: MNEMOSYNE_DEFAULT_SCOPE env var, falling back to 'session'.
+    Only 'session' and 'global' are accepted; unrecognized values fall through
+    to the hardcoded default."""
+    raw = os.environ.get("MNEMOSYNE_DEFAULT_SCOPE", "").strip().lower()
+    if raw in ("session", "global"):
+        return raw
+    return "session"
+
+
 def _serialize(obj):
     """Recursively convert non-serializable objects (datetime, etc.) to strings."""
     if hasattr(obj, "isoformat"):
@@ -183,7 +195,7 @@ def _handle_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
     metadata = arguments.get("metadata", {})
     extract_entities = arguments.get("extract_entities", False)
     extract = arguments.get("extract", False)
-    scope = arguments.get("scope", "session")
+    scope = arguments.get("scope", _resolve_default_scope())
     valid_until = arguments.get("valid_until") or None
     bank = _resolve_bank(arguments)
 
