@@ -220,6 +220,111 @@ def uninstall_plugin(*, hermes_home_path: str | Path | None = None) -> Path:
     return target
 
 
+def cleanup_plugin(
+    *,
+    hermes_home_path: str | Path | None = None,
+    dry_run: bool = False,
+) -> list[str]:
+    """Remove all traces of mnemosyne from Hermes' plugin directory.
+
+    Safe to run -- never touches the database or memory files.
+
+    Returns a list of actions taken (or would be taken with dry_run=True).
+    """
+    base = Path(hermes_home_path).expanduser() if hermes_home_path else hermes_home()
+    actions: list[str] = []
+
+    # 1. Current plugin symlink/dir
+    target = plugin_target_dir(hermes_home_path)
+    if target.is_symlink() or target.exists():
+        if dry_run:
+            actions.append(f"Would remove: {target}")
+        else:
+            if target.is_symlink():
+                target.unlink()
+            else:
+                shutil.rmtree(target)
+            actions.append(f"Removed: {target}")
+
+    # 2. Old hermes-mnemosyne directory (deploy script era)
+    old_dir = base / "plugins" / "hermes-mnemosyne"
+    if old_dir.is_symlink() or old_dir.exists():
+        if dry_run:
+            actions.append(f"Would remove: {old_dir}")
+        else:
+            if old_dir.is_symlink() or os.path.islink(str(old_dir)):
+                old_dir.unlink()
+            else:
+                shutil.rmtree(old_dir)
+            actions.append(f"Removed: {old_dir}")
+
+    # 3. Reset config if it points to mnemosyne
+    config_path = base / "config.yaml"
+    if config_path.is_file():
+        try:
+            config_text = config_path.read_text(encoding="utf-8")
+            if "memory.provider: mnemosyne" in config_text or "memory:\n  provider: mnemosyne" in config_text:
+                if dry_run:
+                    actions.append("Would reset config: memory.provider from 'mnemosyne' to unset")
+                else:
+                    # Simple line-based replacement to remove the provider setting
+                    import re as _re
+                    new_text = _re.sub(
+                        r"^memory:\n\s+provider: mnemosyne",
+                        "memory:\n  # provider: mnemosyne (unset by cleanup)",
+                        config_text,
+                        flags=_re.MULTILINE,
+                    )
+                    # Also handle inline form
+                    new_text = new_text.replace("memory.provider: mnemosyne", "# memory.provider: mnemosyne (unset by cleanup)")
+                    if new_text != config_text:
+                        config_path.write_text(new_text, encoding="utf-8")
+                        actions.append("Reset config: memory.provider from 'mnemosyne' to unset")
+        except Exception:
+            pass
+
+    return actions
+
+
+def _do_upgrade(*, force: bool = True, hermes_home_path: str | Path | None = None) -> bool:
+    """Run pipx upgrade mnemosyne-hermes then install --force."""
+    import subprocess as _sp
+
+    print("  Upgrading mnemosyne-hermes via pipx...")
+    try:
+        result = _sp.run(
+            ["pipx", "upgrade", "mnemosyne-hermes"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip()[:300]
+            if "not installed" in stderr:
+                print("  ⚠ mnemosyne-hermes not installed via pipx. Install it first:")
+                print("     pipx install mnemosyne-hermes")
+                return False
+            print(f"  ⚠ pipx upgrade failed: {stderr}")
+            # Continue anyway -- maybe the user installed via pip directly
+            print("  Continuing with re-install...")
+        else:
+            out = result.stdout.strip()[:200]
+            if out:
+                print(f"  {out}")
+    except FileNotFoundError:
+        print("  ⚠ pipx not found. Install it: pip install pipx")
+        return False
+
+    # Now re-install the plugin symlink
+    print("  Re-installing plugin symlink...")
+    try:
+        target = install_plugin(hermes_home_path=hermes_home_path, force=force)
+        print(f"  Installed. Symlink at {target}")
+        print(f"    -> {os.readlink(str(target))}")
+        return True
+    except Exception as exc:
+        print(f"  ⚠ Re-install failed: {exc}")
+        return False
+
+
 def is_installed(*, hermes_home_path: str | Path | None = None) -> bool:
     """Return whether the Mnemosyne provider symlink exists for Hermes discovery.
 
@@ -270,7 +375,7 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip auto-installing mnemosyne-hermes into Hermes' venv.",
     )
-
+    subparsers = subparsers
     subparsers.add_parser(
         "uninstall",
         help="Remove Mnemosyne from Hermes' memory provider plugin directory.",
@@ -278,6 +383,24 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "status",
         help="Show whether Mnemosyne is installed for Hermes memory discovery.",
+    )
+    cleanup = subparsers.add_parser(
+        "cleanup",
+        help="Remove all traces of Mnemosyne from Hermes plugin directory (safe, never touches database).",
+    )
+    cleanup.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be cleaned without removing anything.",
+    )
+    upgrade = subparsers.add_parser(
+        "upgrade",
+        help="Upgrade mnemosyne-hermes via pipx and re-install the plugin symlink.",
+    )
+    upgrade.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without making changes.",
     )
     return parser
 
@@ -387,6 +510,36 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  → Her Python vs install Python mismatch means the symlink exists but Hermes")
                 print(f"     may not be able to import mnemosyne core. Run with --dry-run to diagnose.")
             return 0 if installed else 1
+
+        if command == "cleanup":
+            dry_run = getattr(args, "dry_run", False)
+            mode = " (dry-run)" if dry_run else ""
+            print(f"Cleaning up mnemosyne-hermes plugin{mode}...")
+            actions = cleanup_plugin(
+                hermes_home_path=args.hermes_home,
+                dry_run=dry_run,
+            )
+            if not actions:
+                print("  Nothing to clean up.")
+            for a in actions:
+                print(f"  {a}")
+            return 0
+
+        if command == "upgrade":
+            dry_run = getattr(args, "dry_run", False)
+            if dry_run:
+                print("  Would run: pipx upgrade mnemosyne-hermes")
+                print("  Would run: mnemosyne-hermes install --force")
+                t = plugin_target_dir(args.hermes_home)
+                print(f"  Plugin symlink target: {t}")
+                return 0
+            print("Upgrading mnemosyne-hermes...")
+            ok = _do_upgrade(hermes_home_path=args.hermes_home)
+            if ok:
+                print("Done. Next steps:")
+                print("  hermes config set memory.provider mnemosyne")
+                print("  hermes memory status")
+            return 0 if ok else 1
 
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
