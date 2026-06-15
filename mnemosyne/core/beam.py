@@ -1926,7 +1926,7 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
     k = int(k)
     if vec_type == "bit":
         rows = conn.execute(
-            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_binary(?) ORDER BY distance LIMIT {k}",
+            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_binary(?) AND k={k} ORDER BY distance",
             (emb_json,)
         ).fetchall()
     elif vec_type == "int8":
@@ -1936,7 +1936,7 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
         ).fetchall()
     else:
         rows = conn.execute(
-            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH ? ORDER BY distance LIMIT {k}",
+            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH ? AND k={k} ORDER BY distance",
             (emb_json,)
         ).fetchall()
     return [{"rowid": r["rowid"], "distance": r["distance"]} for r in rows]
@@ -2282,9 +2282,9 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
                 FROM vec_working vw
                 JOIN working_memory wm ON wm.rowid = vw.rowid
                 WHERE vw.embedding MATCH vec_quantize_binary(?)
+                  AND k={k}
                   AND {where_sql}
                 ORDER BY vw.distance
-                LIMIT {k}
             """, (emb_json, *where_params)).fetchall()
         elif vec_type == "int8":
             rows = conn.execute(f"""
@@ -2302,9 +2302,9 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
                 FROM vec_working vw
                 JOIN working_memory wm ON wm.rowid = vw.rowid
                 WHERE vw.embedding MATCH ?
+                  AND k={k}
                   AND {where_sql}
                 ORDER BY vw.distance
-                LIMIT {k}
             """, (emb_json, *where_params)).fetchall()
     except Exception:
         return []

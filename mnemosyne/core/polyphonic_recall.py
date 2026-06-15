@@ -277,19 +277,19 @@ class PolyphonicRecallEngine:
                         rank_sql = (
                             "SELECT rowid, distance FROM vec_episodes "
                             "WHERE embedding MATCH vec_quantize_binary(?) "
-                            f"ORDER BY distance LIMIT {k_inline}"
+                            f"AND k={k_inline} ORDER BY distance"
                         )
                     elif vec_type == "int8":
                         rank_sql = (
                             "SELECT rowid, distance FROM vec_episodes "
                             "WHERE embedding MATCH vec_quantize_int8(?, 'unit') "
-                            f"ORDER BY distance LIMIT {k_inline}"
+                            f"AND k={k_inline} ORDER BY distance"
                         )
                     else:
                         rank_sql = (
                             "SELECT rowid, distance FROM vec_episodes "
-                            "WHERE embedding MATCH ? "
-                            f"ORDER BY distance LIMIT {k_inline}"
+                            f"WHERE embedding MATCH ? AND k={k_inline} "
+                            "ORDER BY distance"
                         )
                     vec_rows = conn.execute(rank_sql, (emb_json,)).fetchall()
                     if vec_rows:
