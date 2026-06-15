@@ -23,8 +23,16 @@ def _safe_count(db, table):
         return 0
 
 
+def _expected_data_dir() -> Path:
+    if data_dir := os.environ.get("MNEMOSYNE_DATA_DIR"):
+        return Path(data_dir)
+    if hermes_home := os.environ.get("HERMES_HOME"):
+        return Path(hermes_home).expanduser() / "mnemosyne" / "data"
+    return Path.home() / ".hermes" / "mnemosyne" / "data"
+
+
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "mnemosyne-stats.py"
-DB_PATH = Path.home() / ".hermes" / "mnemosyne" / "data" / "mnemosyne.db"
+DB_PATH = _expected_data_dir() / "mnemosyne.db"
 SNAP_DIR = Path.home() / ".hermes" / "mnemosyne" / "stats"
 WIKI_PATH = Path.home() / "wiki"
 
@@ -119,12 +127,15 @@ def test_json_mode_uses_mnemosyne_data_dir(tmp_path):
     assert payload["working_memory"]["total"] == 1
 
 
-def test_json_mode_empty_mnemosyne_data_dir_falls_back_to_default(tmp_path):
+def test_json_mode_uses_hermes_home_when_data_dir_unset(tmp_path):
     home = tmp_path / "home"
+    hermes_home = tmp_path / "hermes-home"
+    hermes_db = hermes_home / "mnemosyne" / "data" / "mnemosyne.db"
     default_db = home / ".hermes" / "mnemosyne" / "data" / "mnemosyne.db"
     env = os.environ.copy()
     env["HOME"] = str(home)
-    env["MNEMOSYNE_DATA_DIR"] = ""
+    env["HERMES_HOME"] = str(hermes_home)
+    env.pop("MNEMOSYNE_DATA_DIR", None)
     env["MNEMOSYNE_NO_EMBEDDINGS"] = "1"
 
     store = subprocess.run(
@@ -136,7 +147,8 @@ def test_json_mode_empty_mnemosyne_data_dir_falls_back_to_default(tmp_path):
         timeout=30,
     )
     assert store.returncode == 0, store.stderr
-    assert default_db.exists()
+    assert hermes_db.exists()
+    assert not default_db.exists()
 
     stats = subprocess.run(
         [sys.executable, str(SCRIPT), "--json"],

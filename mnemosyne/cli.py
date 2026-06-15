@@ -12,10 +12,21 @@ import json
 from pathlib import Path
 from typing import NoReturn
 
-# Data directory - respects MNEMOSYNE_DATA_DIR env var
-DATA_DIR = os.environ.get("MNEMOSYNE_DATA_DIR") or str(
-    Path.home() / ".hermes" / "mnemosyne" / "data"
-)
+def _default_data_dir() -> str:
+    """Resolve the default data directory used by the CLI.
+
+    Keep the standalone CLI aligned with Hermes integrations:
+    MNEMOSYNE_DATA_DIR wins, then HERMES_HOME/mnemosyne/data, then the
+    historical ~/.hermes/mnemosyne/data fallback.
+    """
+    if data_dir := os.environ.get("MNEMOSYNE_DATA_DIR"):
+        return data_dir
+    if hermes_home := os.environ.get("HERMES_HOME"):
+        return str(Path(hermes_home).expanduser() / "mnemosyne" / "data")
+    return str(Path.home() / ".hermes" / "mnemosyne" / "data")
+
+
+DATA_DIR = _default_data_dir()
 os.makedirs(DATA_DIR, exist_ok=True)
 
 

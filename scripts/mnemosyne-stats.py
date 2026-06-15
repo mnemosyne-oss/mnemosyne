@@ -18,10 +18,15 @@ import sqlite3, sys, json
 from pathlib import Path
 from datetime import datetime
 
-DB_PATH = Path(
-    os.environ.get("MNEMOSYNE_DATA_DIR")
-    or Path.home() / ".hermes" / "mnemosyne" / "data"
-) / "mnemosyne.db"
+def _default_data_dir() -> Path:
+    if data_dir := os.environ.get("MNEMOSYNE_DATA_DIR"):
+        return Path(data_dir)
+    if hermes_home := os.environ.get("HERMES_HOME"):
+        return Path(hermes_home).expanduser() / "mnemosyne" / "data"
+    return Path.home() / ".hermes" / "mnemosyne" / "data"
+
+
+DB_PATH = _default_data_dir() / "mnemosyne.db"
 WIKI_PATH = Path.home() / "wiki"
 SNAPSHOT_DIR = Path.home() / ".hermes" / "mnemosyne" / "stats"
 W = 60
