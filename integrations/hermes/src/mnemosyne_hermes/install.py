@@ -405,6 +405,66 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def run_install(
+    *,
+    force: bool = False,
+    hermes_home_path: str | Path | None = None,
+    no_bootstrap: bool = False,
+) -> int:
+    """Core install logic — check deps, bootstrap Hermes venv if needed, create symlink.
+
+    Returns 0 on success, 1 on failure.
+    Can be called from the CLI ``install`` subcommand or programmatically
+    (e.g., from ``upgrade.py`` after upgrading the pip package).
+    """
+    # Check core library first (installer's own Python)
+    core_ok = check_mnemosyne_core()
+    if not core_ok:
+        print(
+            "  mnemosyne-memory NOT found in this Python. Install it first:\n"
+            "    pip install mnemosyne-hermes[all]",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Find Hermes' Python and validate deps there too
+    hermes_python = _find_hermes_python()
+    if hermes_python and hermes_python.resolve() != Path(sys.executable).resolve():
+        hermes_core = check_mnemosyne_core_for_hermes_python(hermes_python)
+        if hermes_core is None:
+            print(f"\n  ⚠ Hermes' Python at {hermes_python} can't import mnemosyne core.")
+            print(f"     mnemosyne-hermes is installed in YOUR Python ({sys.executable}),")
+            print(f"     but Hermes runs from a different venv.\n")
+            if not no_bootstrap:
+                print("  → Attempting auto-bootstrap...")
+                if _bootstrap_hermes_venv(hermes_python):
+                    print("     ✓ Hermes venv now has mnemosyne-hermes installed.\n")
+                else:
+                    print("\n  Install it manually:\n"
+                          f"    uv pip install --python {hermes_python} -U 'mnemosyne-hermes[all]'\n"
+                          "  Then re-run: mnemosyne-hermes install")
+                    return 1
+            else:
+                print("  → Skipping auto-bootstrap (--no-bootstrap).\n"
+                      "    Install manually:\n"
+                      f"      uv pip install --python {hermes_python} -U 'mnemosyne-hermes[all]'\n"
+                      "    Then re-run: mnemosyne-hermes install")
+                return 1
+        else:
+            print(f"  Hermes' Python: mnemosyne-memory {hermes_core} OK")
+
+    target = install_plugin(
+        hermes_home_path=hermes_home_path,
+        force=force,
+    )
+    print(f"Installed. Symlink at {target}")
+    print(f"  -> {os.readlink(str(target))}")
+    print("Done. Next steps:")
+    print("  hermes config set memory.provider mnemosyne")
+    print("  hermes memory status")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the mnemosyne-hermes installer CLI."""
     parser = _parser()
@@ -413,16 +473,6 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if command == "install":
-            # Check core library first (installer's own Python)
-            core_ok = check_mnemosyne_core()
-            if not core_ok:
-                print(
-                    "  mnemosyne-memory NOT found in this Python. Install it first:\n"
-                    "    pip install mnemosyne-hermes[all]",
-                    file=sys.stderr,
-                )
-                return 1
-
             # Dry-run: just show what would happen
             hermes_python = _find_hermes_python()
             target = plugin_target_dir(args.hermes_home)
@@ -435,42 +485,11 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  Will bootstrap: {not getattr(args, 'no_bootstrap', False)}")
                 return 0
 
-            # Find Hermes' Python and validate deps there too
-            hermes_python = _find_hermes_python()
-            if hermes_python and hermes_python.resolve() != Path(sys.executable).resolve():
-                hermes_core = check_mnemosyne_core_for_hermes_python(hermes_python)
-                if hermes_core is None:
-                    print(f"\n  ⚠ Hermes' Python at {hermes_python} can't import mnemosyne core.")
-                    print(f"     mnemosyne-hermes is installed in YOUR Python ({sys.executable}),")
-                    print(f"     but Hermes runs from a different venv.\n")
-                    if not getattr(args, "no_bootstrap", False):
-                        print("  → Attempting auto-bootstrap...")
-                        if _bootstrap_hermes_venv(hermes_python):
-                            print("     ✓ Hermes venv now has mnemosyne-hermes installed.\n")
-                        else:
-                            print("\n  Install it manually:\n"
-                                  f"    uv pip install --python {hermes_python} -U 'mnemosyne-hermes[all]'\n"
-                                  "  Then re-run: mnemosyne-hermes install")
-                            return 1
-                    else:
-                        print("  → Skipping auto-bootstrap (--no-bootstrap).\n"
-                              "    Install manually:\n"
-                              f"      uv pip install --python {hermes_python} -U 'mnemosyne-hermes[all]'\n"
-                              "    Then re-run: mnemosyne-hermes install")
-                        return 1
-                else:
-                    print(f"  Hermes' Python: mnemosyne-memory {hermes_core} OK")
-
-            target = install_plugin(
-                hermes_home_path=args.hermes_home,
+            return run_install(
                 force=getattr(args, "force", False),
+                hermes_home_path=args.hermes_home,
+                no_bootstrap=getattr(args, "no_bootstrap", False),
             )
-            print(f"Installed. Symlink at {target}")
-            print(f"  -> {os.readlink(str(target))}")
-            print("Done. Next steps:")
-            print("  hermes config set memory.provider mnemosyne")
-            print("  hermes memory status")
-            return 0
 
         if command == "uninstall":
             target = uninstall_plugin(hermes_home_path=args.hermes_home)
@@ -526,20 +545,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if command == "upgrade":
-            dry_run = getattr(args, "dry_run", False)
-            if dry_run:
-                print("  Would run: pipx upgrade mnemosyne-hermes")
-                print("  Would run: mnemosyne-hermes install --force")
-                t = plugin_target_dir(args.hermes_home)
-                print(f"  Plugin symlink target: {t}")
-                return 0
-            print("Upgrading mnemosyne-hermes...")
-            ok = _do_upgrade(hermes_home_path=args.hermes_home)
-            if ok:
-                print("Done. Next steps:")
-                print("  hermes config set memory.provider mnemosyne")
-                print("  hermes memory status")
-            return 0 if ok else 1
+            from mnemosyne_hermes.upgrade import upgrade_command
+            return upgrade_command(args)
 
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
