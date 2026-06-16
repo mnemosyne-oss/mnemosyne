@@ -605,19 +605,22 @@ class Mnemosyne:
     ) -> Dict:
         """
         Export all Mnemosyne data (legacy + BEAM + triples + annotations +
-        optional sync events) to a JSON file. Returns export metadata.
+        canonical facts + optional sync events) to a JSON file. Returns export
+        metadata.
 
-        Schema version 1.2 (post-sync) adds an optional ``sync_events``
-        section alongside memory data.  Previous versions (1.0, 1.1) are
-        still importable.
+        Schema version 1.3 adds the always-present ``canonical_facts`` section.
+        1.2 (post-sync) adds an optional ``sync_events`` section. Previous
+        versions (1.0, 1.1, 1.2) are still importable; ``sync_events`` presence
+        is keyed off the section itself on import, not the version number.
         """
         from mnemosyne.core.triples import TripleStore
         from mnemosyne.core.annotations import AnnotationStore
+        from mnemosyne.core.canonical import CanonicalStore
         import json as _json
 
         # Build export metadata with device_id when available
         meta = {
-            "version": "1.2" if include_sync_events else "1.1",
+            "version": "1.3",
             "export_date": datetime.now().isoformat(),
             "source_db": str(self.db_path),
         }
@@ -674,6 +677,14 @@ class Mnemosyne:
         annotations = AnnotationStore(db_path=self.db_path)
         export["annotations"] = annotations.export_all()
 
+        # Canonical facts: owner-scoped single-source-of-truth identity, with
+        # history. These are AUTHORED (not derived), so omitting them made a
+        # JSON restore silently lossy. CanonicalStore already exposes
+        # export_all/import_all (same contract as triples/annotations); they
+        # were simply never wired into the file export.
+        canonical = CanonicalStore(db_path=self.db_path)
+        export["canonical_facts"] = canonical.export_all()
+
         # Sync events (optional, schema 1.2)
         if include_sync_events:
             try:
@@ -701,6 +712,7 @@ class Mnemosyne:
             "legacy_memories_count": len(export["legacy_memories"]),
             "triples_count": len(export["triples"]),
             "annotations_count": len(export["annotations"]),
+            "canonical_facts_count": len(export["canonical_facts"]),
             "sync_events_count": len(export.get("sync_events", [])),
         }
 
@@ -711,12 +723,14 @@ class Mnemosyne:
         Set force=True to overwrite.
         Returns import statistics.
 
-        Accepts schema versions 1.0 (pre-E6), 1.1 (post-E6), and 1.2
-        (post-sync).  When a 1.2 export includes ``sync_events``, those
-        events are imported with idempotency based on ``event_hash``.
+        Accepts schema versions 1.0 (pre-E6), 1.1 (post-E6), 1.2 (post-sync),
+        and 1.3 (canonical_facts).  When an export includes ``sync_events``,
+        those events are imported with idempotency based on ``event_hash``.
+        Sections absent from older exports are treated as no-ops.
         """
         from mnemosyne.core.triples import TripleStore
         from mnemosyne.core.annotations import AnnotationStore
+        from mnemosyne.core.canonical import CanonicalStore
         import json as _json
 
         with open(input_path, "r", encoding="utf-8") as f:
@@ -728,7 +742,7 @@ class Mnemosyne:
         # Validate — accept known schema versions.
         meta = data.get("mnemosyne_export", {})
         version = meta.get("version")
-        if version not in ("1.0", "1.1", "1.2"):
+        if version not in ("1.0", "1.1", "1.2", "1.3"):
             raise ValueError(f"Unsupported export version: {version}")
 
         stats = {
@@ -736,6 +750,7 @@ class Mnemosyne:
             "legacy": {},
             "triples": {},
             "annotations": {},
+            "canonical": {},
             "sync_events": {},
         }
 
@@ -794,6 +809,13 @@ class Mnemosyne:
         annotations = AnnotationStore(db_path=self.db_path)
         a_stats = annotations.import_all(data.get("annotations", []), force=force)
         stats["annotations"] = a_stats
+
+        # Canonical facts (schema 1.3). Absent from <=1.2 backups -> get([]) is
+        # a no-op, so older exports import unchanged. import_all is idempotent
+        # and honors force, matching triples/annotations.
+        canonical = CanonicalStore(db_path=self.db_path)
+        c_stats = canonical.import_all(data.get("canonical_facts", []), force=force)
+        stats["canonical"] = c_stats
 
         # Sync events (schema 1.2 — idempotent by event_hash)
         sync_raw = data.get("sync_events")
