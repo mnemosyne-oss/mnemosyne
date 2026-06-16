@@ -482,6 +482,34 @@ def _detect_vec_type(conn: sqlite3.Connection) -> str:
     return "float32"
 
 
+def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
+    """Return the embedding dimension already declared by a sqlite-vec table in
+    this database, or ``None`` if no ``vec0`` table exists yet.
+
+    A ``vec0`` virtual table fixes its dimension at creation time, encoded in its
+    DDL as ``embedding <type>[<dim>]``. When a store already holds vectors, that
+    declared dimension -- not the process's configured ``EMBEDDING_DIM`` -- is the
+    source of truth for what the stored data actually is. Reads only
+    ``sqlite_master`` (no extension required) so it is safe to call before the
+    sqlite-vec tables are (re)created.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('vec_episodes', 'vec_working', 'vec_facts')"
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    for row in rows:
+        sql = row[0] if row else None
+        if not sql:
+            continue
+        match = re.search(r"\[(\d+)\]", sql)
+        if match:
+            return int(match.group(1))
+    return None
+
+
 def init_beam(db_path: Path = None):
     """Initialize BEAM schema."""
     conn = _get_connection(db_path)
@@ -675,20 +703,48 @@ def init_beam(db_path: Path = None):
     effective_vec_type = _detect_vec_type(conn)
 
     # --- sqlite-vec VIRTUAL TABLES ---
+    # Guard against a dimension mismatch: the dimension of a vec0 table is fixed
+    # at creation time, so if this database already stores vectors at one
+    # dimension and the process is configured (EMBEDDING_DIM, from
+    # MNEMOSYNE_EMBEDDING_DIM or the embedding model) for a different one, creating
+    # a new vec0 table at the configured dimension is silently wrong: every insert
+    # of a real (existing-dimension) vector then fails, and recall reads an
+    # empty/incompatible index. This bites most often when a store written by one
+    # model/dimension is later opened by a process that resolved a different
+    # EMBEDDING_DIM -- e.g. an invocation that did not inherit the same
+    # environment as the writer. Refuse to create mismatched tables, leave any
+    # existing ones untouched, and surface one actionable error instead of
+    # per-row insert noise; recall falls back to the float-JSON voice meanwhile.
+    vec_dim_mismatch = False
     if _SQLITE_VEC_AVAILABLE:
-        try:
-            cursor.execute(f"""
-                CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
-                    embedding {effective_vec_type}[{EMBEDDING_DIM}]
-                )
-            """)
-            cursor.execute(f"""
-                CREATE VIRTUAL TABLE IF NOT EXISTS vec_working USING vec0(
-                    embedding {effective_vec_type}[{EMBEDDING_DIM}]
-                )
-            """)
-        except sqlite3.OperationalError:
-            pass  # May already exist or extension not loadable
+        existing_dim = _existing_vec_dim(conn)
+        if existing_dim is not None and existing_dim != EMBEDDING_DIM:
+            vec_dim_mismatch = True
+            logger.error(
+                "Embedding dimension mismatch: this database stores %d-dimensional "
+                "vectors, but the process is configured for %d "
+                "(MNEMOSYNE_EMBEDDING_DIM / embedding model). Not creating "
+                "sqlite-vec tables at the wrong dimension. Set "
+                "MNEMOSYNE_EMBEDDING_DIM / MNEMOSYNE_EMBEDDING_MODEL to match the "
+                "stored data, or run `mnemosyne reindex` to rebuild all vectors at "
+                "the configured dimension.",
+                existing_dim,
+                EMBEDDING_DIM,
+            )
+        else:
+            try:
+                cursor.execute(f"""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
+                        embedding {effective_vec_type}[{EMBEDDING_DIM}]
+                    )
+                """)
+                cursor.execute(f"""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS vec_working USING vec0(
+                        embedding {effective_vec_type}[{EMBEDDING_DIM}]
+                    )
+                """)
+            except sqlite3.OperationalError:
+                pass  # May already exist or extension not loadable
 
     # --- FTS5 VIRTUAL TABLE for episodic ---
     cursor.execute("""
@@ -898,14 +954,15 @@ def init_beam(db_path: Path = None):
         WHERE superseded_by IS NULL""")
     cursor.execute("""CREATE INDEX IF NOT EXISTS idx_mem_emb_type
         ON memory_embeddings(memory_id, model)""")
-    try:
-        _backfill_vec_working_from_memory_embeddings(conn)
-    except NameError:
-        # During unusual import/bootstrap paths the helper may not be bound yet;
-        # normal BeamMemory construction can backfill on the next init call.
-        pass
-    except Exception:
-        logger.info("vec_working backfill skipped during init", exc_info=True)
+    if not vec_dim_mismatch:
+        try:
+            _backfill_vec_working_from_memory_embeddings(conn)
+        except NameError:
+            # During unusual import/bootstrap paths the helper may not be bound yet;
+            # normal BeamMemory construction can backfill on the next init call.
+            pass
+        except Exception:
+            logger.info("vec_working backfill skipped during init", exc_info=True)
 
     # --- Migration: multi-agent identity layer (v2.1) ---
     _add_column_if_missing(conn, "working_memory", "author_id", "TEXT DEFAULT NULL")
@@ -1003,15 +1060,18 @@ def init_beam(db_path: Path = None):
         END
     """)
 
-    # Vector table for facts (sqlite-vec)
-    try:
-        cursor.execute(f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(
-                embedding {effective_vec_type}[{EMBEDDING_DIM}]
-            )
-        """)
-    except (sqlite3.OperationalError, RuntimeError):
-        pass  # sqlite-vec not available
+    # Vector table for facts (sqlite-vec). Skipped on a dimension mismatch for the
+    # same reason as vec_episodes / vec_working above (see the guard in the
+    # sqlite-vec VIRTUAL TABLES block).
+    if not vec_dim_mismatch:
+        try:
+            cursor.execute(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(
+                    embedding {effective_vec_type}[{EMBEDDING_DIM}]
+                )
+            """)
+        except (sqlite3.OperationalError, RuntimeError):
+            pass  # sqlite-vec not available
 
     # --- Temporal architecture migration ---
     _add_column_if_missing(conn, "working_memory", "event_date", "TEXT DEFAULT NULL")
