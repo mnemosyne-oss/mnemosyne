@@ -687,7 +687,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 # directory creation, canonical path resolution, and isolates
                 # memories per Hermes profile.
                 bank_name = self._resolve_profile_bank()
-                from mnemosyne import Mnemosyne
+                from mnemosyne.core.memory import Mnemosyne
                 mem = Mnemosyne(
                     session_id=self._session_id,
                     bank=bank_name,
