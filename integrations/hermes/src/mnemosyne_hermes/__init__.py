@@ -275,6 +275,43 @@ def _parse_env_float(key: str, default: float) -> float:
         return default
 
 
+def _coerce_bool(value: Any, default: bool) -> bool:
+    """Coerce config/env values to bool while preserving a safe default."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    raw = str(value).strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _parse_env_bool(key: str, default: bool) -> bool:
+    """Read a boolean env var, falling back to default on missing/invalid values."""
+    return _coerce_bool(os.environ.get(key), default)
+
+
+def _coerce_optional_int(value: Any, default: Optional[int]) -> Optional[int]:
+    """Coerce config/env values to a non-negative int; negative means unlimited."""
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else None
+
+
+def _parse_env_optional_int(key: str, default: Optional[int]) -> Optional[int]:
+    """Read a non-negative int env var; negative values disable the cap."""
+    return _coerce_optional_int(os.environ.get(key), default)
+
+
 class MnemosyneMemoryProvider(MemoryProvider):
     """Mnemosyne native memory — local SQLite with vector + FTS5 hybrid search."""
 
@@ -314,6 +351,14 @@ class MnemosyneMemoryProvider(MemoryProvider):
         self._turn_count = 0
         self._auto_sleep_threshold = 50
         self._auto_sleep_enabled = os.environ.get("MNEMOSYNE_AUTO_SLEEP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+        # Reflection/sleep guardrails. "Reflection" maps to Mnemosyne's
+        # sleep/consolidation path in the Hermes provider. Cron skipping is
+        # default-on per issue #337; max_calls_per_session defaults to 3 and
+        # can be disabled with a negative value.
+        self._reflect_disabled_for_cron = _parse_env_bool("MNEMOSYNE_REFLECT_DISABLED_FOR_CRON", True)
+        self._reflect_max_calls_per_session = _parse_env_optional_int("MNEMOSYNE_REFLECT_MAX_CALLS_PER_SESSION", 3)
+        self._reflect_calls_this_session = 0
+        self._reflect_budget_lock = threading.Lock()
         self._ignore_patterns: List[str] = []  # Regex patterns to filter from memory
         self._sync_roles: Set[str] = set(self._VALID_SYNC_ROLES)
         _sync_env = os.environ.get("MNEMOSYNE_SYNC_ROLES")
@@ -457,6 +502,30 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 logger.warning("Mnemosyne: invalid sleep_threshold=%r, keeping %d",
                                sleep_threshold, self._auto_sleep_threshold)
 
+        # reflect guardrails: prefer kwargs, then memory.mnemosyne.reflect,
+        # then flat memory.mnemosyne keys, then env/defaults set in __init__.
+        reflect_cfg = kwargs.get("reflect")
+        if reflect_cfg is None:
+            reflect_cfg = self._read_config_key("reflect")
+        if not isinstance(reflect_cfg, dict):
+            reflect_cfg = {}
+
+        disabled_for_cron = kwargs.get("disabled_for_cron", kwargs.get("reflect_disabled_for_cron"))
+        if disabled_for_cron is None:
+            disabled_for_cron = reflect_cfg.get("disabled_for_cron")
+        if disabled_for_cron is None:
+            disabled_for_cron = self._read_config_key("reflect_disabled_for_cron")
+        if disabled_for_cron is not None:
+            self._reflect_disabled_for_cron = _coerce_bool(disabled_for_cron, self._reflect_disabled_for_cron)
+
+        max_calls = kwargs.get("max_calls_per_session", kwargs.get("reflect_max_calls_per_session"))
+        if max_calls is None:
+            max_calls = reflect_cfg.get("max_calls_per_session")
+        if max_calls is None:
+            max_calls = self._read_config_key("reflect_max_calls_per_session")
+        if max_calls is not None:
+            self._reflect_max_calls_per_session = _coerce_optional_int(max_calls, self._reflect_max_calls_per_session)
+
         # vector_type: pass through to BeamMemory if supported, log if not yet wired
         vector_type = kwargs.get("vector_type") or self._read_config_key("vector_type")
         if vector_type and vector_type not in ("float32", "int8", "bit"):
@@ -562,10 +631,37 @@ class MnemosyneMemoryProvider(MemoryProvider):
         except Exception:
             return None
 
+    def _reflection_skip_response(self, reason: str, trigger: str) -> Dict[str, Any]:
+        """Structured skip payload for reflection/sleep guardrails."""
+        return {
+            "status": "skipped",
+            "reason": reason,
+            "trigger": trigger,
+            "reflect": {
+                "calls_used": self._reflect_calls_this_session,
+                "max_calls_per_session": self._reflect_max_calls_per_session,
+                "disabled_for_cron": self._reflect_disabled_for_cron,
+                "agent_context": self._agent_context,
+            },
+        }
+
+    def _reserve_reflection_budget(self, trigger: str) -> Optional[Dict[str, Any]]:
+        """Return a structured skip payload, or reserve one reflection call."""
+        context = (self._agent_context or "").strip().lower()
+        with self._reflect_budget_lock:
+            if self._reflect_disabled_for_cron and context == "cron":
+                return self._reflection_skip_response("reflect_disabled_for_cron", trigger)
+            max_calls = self._reflect_max_calls_per_session
+            if max_calls is not None and self._reflect_calls_this_session >= max_calls:
+                return self._reflection_skip_response("reflect_budget_exhausted", trigger)
+            self._reflect_calls_this_session += 1
+        return None
+
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
             {"key": "auto_sleep", "description": "Auto-run sleep() when working memory exceeds threshold. Set true to enable. Backward-compatible with MNEMOSYNE_AUTO_SLEEP_ENABLED env var.", "default": False},
             {"key": "sleep_threshold", "description": "Working memory count before auto-sleep triggers", "default": 50},
+            {"key": "reflect", "description": "Reflection/sleep guardrails. Supports disabled_for_cron (default true) and max_calls_per_session (default 3; negative disables cap). Env: MNEMOSYNE_REFLECT_DISABLED_FOR_CRON, MNEMOSYNE_REFLECT_MAX_CALLS_PER_SESSION.", "default": {"disabled_for_cron": True, "max_calls_per_session": 3}},
             {"key": "vector_type", "description": "Vector storage type (note: not yet wired to BeamMemory at runtime; reserved for future use)", "choices": ["float32", "int8", "bit"], "default": "int8"},
             {"key": "ignore_patterns", "description": "Regex patterns to filter from memory storage (one per line in config, or comma-separated). Memories matching any pattern are skipped.", "default": []},
             {"key": "profile_isolation", "description": "Enable per-profile memory isolation via Mnemosyne banks. Each Hermes profile gets its own SQLite database under mnemosyne/data/banks/<profile>/. Default false for backward compatibility.", "default": False},
@@ -955,6 +1051,11 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 if eligible == 0:
                     return
 
+                skip = self._reserve_reflection_budget("auto_sleep")
+                if skip is not None:
+                    logger.info("Mnemosyne auto-sleep skipped: %s", json.dumps(skip))
+                    return
+
                 logger.info("Mnemosyne auto-sleep: working=%d, eligible=%d > threshold=%d", working, eligible, self._auto_sleep_threshold)
                 sleep_fn = self._beam.sleep_all_sessions if hasattr(self._beam, "sleep_all_sessions") else self._beam.sleep
                 sleep_thread = threading.Thread(target=sleep_fn, daemon=True)
@@ -970,6 +1071,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
         return list(ALL_TOOL_SCHEMAS)
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        if tool_name == "mnemosyne_sleep" and self._reflect_disabled_for_cron and (self._agent_context or "").strip().lower() == "cron":
+            return json.dumps(self._reflection_skip_response("reflect_disabled_for_cron", "tool"))
         if not self._beam:
             # C27: structured response carries the actual failure reason
             # instead of a generic "not initialized" string. Status field
@@ -1276,6 +1379,9 @@ class MnemosyneMemoryProvider(MemoryProvider):
         return json.dumps({"provider": "mnemosyne_shared", "shared_db": str(self._shared_surface_path or ""), "working": self._surface_beam.get_working_stats(), "episodic": self._surface_beam.get_episodic_stats()})
 
     def _handle_sleep(self, args: Dict[str, Any]) -> str:
+        skip = self._reserve_reflection_budget("tool")
+        if skip is not None:
+            return json.dumps(skip)
         dry_run = bool(args.get("dry_run", False))
         force = bool(args.get("force", False))
         all_sessions = bool(args.get("all_sessions", False))
@@ -1747,6 +1853,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if not self._beam:
             return
         try:
+            skip = self._reserve_reflection_budget("session_end")
+            if skip is not None:
+                logger.info("Mnemosyne session-end sleep skipped: %s", json.dumps(skip))
+                return
             logger.info("Mnemosyne session end — running consolidation")
             timeout = self.SESSION_END_SLEEP_TIMEOUT_SECONDS
             beam = self._beam
