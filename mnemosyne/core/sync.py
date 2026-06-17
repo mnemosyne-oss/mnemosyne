@@ -934,9 +934,27 @@ class SyncEngine:
             # Filter out losing events, keep winners
             incoming = [ev for ev in incoming if ev.event_id not in resolved_ids]
 
+        # --- TEMP CI DIAGNOSTIC (remove before merge) ---
+        _dbg = len(events) <= 2
+        if _dbg:
+            import sys as _sys
+            print(
+                f"[SYNCDBG-pre] events_in={len(events)} incoming={len(incoming)} "
+                f"known_hashes={len(known_hashes)} "
+                f"in_ids={[getattr(e,'event_id','?') for e in incoming]} "
+                f"in_mids={[getattr(e,'memory_id','?') for e in incoming]} "
+                f"beam={type(self._beam).__name__} has_remember={hasattr(self._beam,'remember')} "
+                f"db={getattr(self._beam,'db_path','?')} conn={id(self.conn)} "
+                f"raw_events_len={len(events)}",
+                file=_sys.stderr,
+            )
+        _dbg_iters = 0
+        # --- END TEMP DIAGNOSTIC ---
+
         # Apply memory mutations through the full Mnemosyne pipeline
         # (FTS5 indexing, embeddings, entity extraction, callbacks).
         for ev in incoming:
+            _dbg_iters += 1
             try:
                 payload_dict: Optional[dict] = None
                 if ev.payload:
@@ -1042,6 +1060,26 @@ class SyncEngine:
                 logger.warning("Failed to apply event %s: %s", ev.event_id, exc)
 
         self.conn.commit()
+
+        # --- TEMP CI DIAGNOSTIC (remove before merge) ---
+        if _dbg:
+            import sys as _sys
+            try:
+                _ec = self.conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]
+            except Exception as _e:
+                _ec = f"err:{_e}"
+            try:
+                _wc = self.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0]
+            except Exception as _e:
+                _wc = f"err:{_e}"
+            print(
+                f"[SYNCDBG-post] iters={_dbg_iters} accepted={stats['accepted']} "
+                f"dups={stats['duplicates']} conflicts={stats['conflicts']} "
+                f"errors={stats['errors']} details={stats['details']} "
+                f"memory_events_rows={_ec} working_memory_rows={_wc}",
+                file=_sys.stderr,
+            )
+        # --- END TEMP DIAGNOSTIC ---
 
         return stats
 
