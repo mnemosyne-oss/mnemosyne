@@ -1004,29 +1004,29 @@ class SyncEngine:
                                     memory_id=ev.memory_id,
                                 )
                                 stats["accepted"] += 1
+                            else:
+                                # Fallback: direct DeltaSync
+                                delta_item: Dict[str, Any] = {"id": ev.memory_id}
+                                for key in ("content", "importance", "source", "memory_type", "veracity"):
+                                    if payload_dict and key in payload_dict:
+                                        delta_item[key] = payload_dict[key]
+                                if self._delta_sync is not None:
+                                    apply_stats = self._delta_sync.apply_delta(
+                                        peer_id=ev.device_id,
+                                        delta=[delta_item],
+                                        table="working_memory",
+                                    )
+                                    if apply_stats.get("inserted") or apply_stats.get("updated"):
+                                        stats["accepted"] += 1
+                                    else:
+                                        stats["details"].append(
+                                            f"event {ev.event_id}: no rows affected"
+                                        )
+                                else:
+                                    stats["accepted"] += 1
                         except KeyboardInterrupt:
                             stats["interrupted"] = True
                             break
-                        else:
-                            # Fallback: direct DeltaSync
-                            delta_item: Dict[str, Any] = {"id": ev.memory_id}
-                            for key in ("content", "importance", "source", "memory_type", "veracity"):
-                                if payload_dict and key in payload_dict:
-                                    delta_item[key] = payload_dict[key]
-                            if self._delta_sync is not None:
-                                apply_stats = self._delta_sync.apply_delta(
-                                    peer_id=ev.device_id,
-                                    delta=[delta_item],
-                                    table="working_memory",
-                                )
-                                if apply_stats.get("inserted") or apply_stats.get("updated"):
-                                    stats["accepted"] += 1
-                                else:
-                                    stats["details"].append(
-                                        f"event {ev.event_id}: no rows affected"
-                                    )
-                            else:
-                                stats["accepted"] += 1
                     else:
                         # No content — just log the event
                         stats["accepted"] += 1
