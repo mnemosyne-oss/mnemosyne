@@ -94,23 +94,47 @@ def test_shutdown_swallows_unregister_failure(monkeypatch):
 # on_session_end() bounded daemon thread (decision A6)
 # ---------------------------------------------------------------------------
 
-def _make_provider_with_blocking_sleep(sleep_duration: float, timeout: float = 0.5):
-    """Build a provider whose _beam.sleep() blocks for `sleep_duration` seconds.
+def _make_provider_with_blocking_sleep(sleep_duration: float, timeout: float = 0.5, monkeypatch=None):
+    """Build a provider whose isolated BeamMemory blocks for `sleep_duration` seconds.
 
     The provider's join timeout is shortened to keep the test suite fast.
+    Now mocks _get_beam_class so the isolated BeamMemory in the daemon thread
+    gets the blocking sleep behavior.
     """
     beam = MagicMock()
-    beam.sleep.side_effect = lambda: time.sleep(sleep_duration)
+    beam.session_id = "hermes_test123"
+    beam.db_path = "/tmp/test.db"
+    beam.author_id = "agent_1"
+    beam.author_type = "hermes"
+    beam.channel_id = "test:channel"
+
+    created_beams = []
+    def fake_beam_class(**kwargs):
+        b = MagicMock()
+        b.sleep.side_effect = lambda: time.sleep(sleep_duration)
+        created_beams.append(b)
+        return b
+
+    if monkeypatch is not None:
+        monkeypatch.setattr(
+            "hermes_memory_provider._get_beam_class",
+            lambda: fake_beam_class,
+        )
+
     provider = MnemosyneMemoryProvider()
     provider._beam = beam
     provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = timeout
-    return provider, beam
+    if monkeypatch is not None:
+        monkeypatch.setattr(provider, "_reserve_reflection_budget", lambda name: None)
+    return provider, beam, created_beams
 
 
-def test_on_session_end_returns_within_timeout_when_sleep_blocks():
+def test_on_session_end_returns_within_timeout_when_sleep_blocks(monkeypatch):
     """A6 contract: blocking sleep must not block on_session_end past the join cap."""
     # Production timeout is 15s; test uses 0.5s for speed and a 5s outer ceiling.
-    provider, beam = _make_provider_with_blocking_sleep(sleep_duration=5.0, timeout=0.5)
+    provider, beam, created_beams = _make_provider_with_blocking_sleep(
+        sleep_duration=5.0, timeout=0.5, monkeypatch=monkeypatch,
+    )
 
     start = time.monotonic()
     provider.on_session_end(messages=[])
@@ -119,11 +143,14 @@ def test_on_session_end_returns_within_timeout_when_sleep_blocks():
     # 0.5s join cap + slack. A regression making on_session_end synchronous
     # would take ~5s here.
     assert elapsed < 2.0, f"on_session_end took {elapsed:.2f}s, expected <2s"
-    beam.sleep.assert_called_once()
+    assert created_beams, "isolated beam should have been created"
+    created_beams[0].sleep.assert_called_once()
 
 
-def test_on_session_end_logs_warning_on_timeout(caplog):
-    provider, _ = _make_provider_with_blocking_sleep(sleep_duration=5.0, timeout=0.5)
+def test_on_session_end_logs_warning_on_timeout(caplog, monkeypatch):
+    provider, _, created_beams = _make_provider_with_blocking_sleep(
+        sleep_duration=5.0, timeout=0.5, monkeypatch=monkeypatch,
+    )
     with caplog.at_level("WARNING", logger="hermes_memory_provider"):
         provider.on_session_end(messages=[])
     msgs = [r.getMessage() for r in caplog.records]
@@ -140,16 +167,34 @@ def test_session_end_timeout_default_matches_design(monkeypatch):
     assert hmp.MnemosyneMemoryProvider.SESSION_END_SLEEP_TIMEOUT_SECONDS == 15
 
 
-def test_on_session_end_completes_when_sleep_is_fast():
+def test_on_session_end_completes_when_sleep_is_fast(monkeypatch):
     """Fast sleep must be allowed to finish; no warning emitted."""
     beam = MagicMock()
-    # No-op sleep returns immediately.
-    beam.sleep.return_value = None
+    beam.session_id = "hermes_test123"
+    beam.db_path = "/tmp/test.db"
+    beam.author_id = "agent_1"
+    beam.author_type = "hermes"
+    beam.channel_id = "test:channel"
+
+    created_beams = []
+    def fake_beam_class(**kwargs):
+        b = MagicMock()
+        b.sleep.return_value = None
+        created_beams.append(b)
+        return b
+
+    monkeypatch.setattr(
+        "hermes_memory_provider._get_beam_class",
+        lambda: fake_beam_class,
+    )
+
     provider = MnemosyneMemoryProvider()
     provider._beam = beam
+    monkeypatch.setattr(provider, "_reserve_reflection_budget", lambda name: None)
 
     provider.on_session_end(messages=[])
-    beam.sleep.assert_called_once()
+    assert created_beams, "isolated beam should have been created"
+    created_beams[0].sleep.assert_called_once()
 
 
 def test_on_session_end_no_op_without_beam():
@@ -160,15 +205,31 @@ def test_on_session_end_no_op_without_beam():
     provider.on_session_end(messages=[])
 
 
-def test_on_session_end_logs_when_sleep_raises_in_daemon_thread(caplog):
+def test_on_session_end_logs_when_sleep_raises_in_daemon_thread(caplog, monkeypatch):
     """Codex finding 3: exceptions from beam.sleep() now happen in the daemon
     thread; the wrapper must catch them and log at DEBUG instead of letting
     the traceback escape uncaught."""
     beam = MagicMock()
-    beam.sleep.side_effect = RuntimeError("synthetic explosion")
+    beam.session_id = "hermes_test123"
+    beam.db_path = "/tmp/test.db"
+    beam.author_id = "agent_1"
+    beam.author_type = "hermes"
+    beam.channel_id = "test:channel"
+
+    def fake_beam_class(**kwargs):
+        b = MagicMock()
+        b.sleep.side_effect = RuntimeError("synthetic explosion")
+        return b
+
+    monkeypatch.setattr(
+        "hermes_memory_provider._get_beam_class",
+        lambda: fake_beam_class,
+    )
+
     provider = MnemosyneMemoryProvider()
     provider._beam = beam
     provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 1.0  # plenty of time for the raise to happen
+    monkeypatch.setattr(provider, "_reserve_reflection_budget", lambda name: None)
 
     with caplog.at_level("DEBUG", logger="hermes_memory_provider"):
         provider.on_session_end(messages=[])
@@ -179,7 +240,7 @@ def test_on_session_end_logs_when_sleep_raises_in_daemon_thread(caplog):
     assert any("session-end sleep failed" in m and "synthetic explosion" in m for m in msgs), msgs
 
 
-def test_shutdown_drains_in_flight_session_end_thread(caplog):
+def test_shutdown_drains_in_flight_session_end_thread(caplog, monkeypatch):
     """Codex finding 4: shutdown() must briefly wait for an in-flight
     session_end thread before clearing the host backend, otherwise the
     daemon thread's late host call sees backend=None and degrades to remote."""
@@ -188,19 +249,36 @@ def test_shutdown_drains_in_flight_session_end_thread(caplog):
     # Make the session_end thread block for ~0.4s — longer than the
     # session_end timeout (0.1s) but well within the shutdown drain.
     beam = MagicMock()
+    beam.session_id = "hermes_test123"
+    beam.db_path = "/tmp/test.db"
+    beam.author_id = "agent_1"
+    beam.author_type = "hermes"
+    beam.channel_id = "test:channel"
+
     sleep_started = []
     sleep_finished = []
 
-    def slow_sleep():
-        sleep_started.append(True)
-        time.sleep(0.4)
-        sleep_finished.append(True)
+    def fake_beam_class(**kwargs):
+        b = MagicMock()
 
-    beam.sleep.side_effect = slow_sleep
+        def slow_sleep():
+            sleep_started.append(True)
+            time.sleep(0.4)
+            sleep_finished.append(True)
+
+        b.sleep.side_effect = slow_sleep
+        return b
+
+    monkeypatch.setattr(
+        "hermes_memory_provider._get_beam_class",
+        lambda: fake_beam_class,
+    )
+
     provider = MnemosyneMemoryProvider()
     provider._beam = beam
     provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 0.1
     provider.SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 1.0
+    monkeypatch.setattr(provider, "_reserve_reflection_budget", lambda name: None)
 
     # Start session_end (returns after 0.1s; daemon keeps running)
     provider.on_session_end(messages=[])
@@ -220,17 +298,33 @@ def test_shutdown_drains_in_flight_session_end_thread(caplog):
     assert get_host_llm_backend() is None  # cleared after drain
 
 
-def test_shutdown_proceeds_when_drain_times_out(caplog):
+def test_shutdown_proceeds_when_drain_times_out(caplog, monkeypatch):
     """If the drain takes longer than SHUTDOWN_DRAIN_TIMEOUT_SECONDS, shutdown
     proceeds (we don't want shutdown to block indefinitely either)."""
     from hermes_memory_provider import hermes_llm_adapter
 
     beam = MagicMock()
-    beam.sleep.side_effect = lambda: time.sleep(5.0)
+    beam.session_id = "hermes_test123"
+    beam.db_path = "/tmp/test.db"
+    beam.author_id = "agent_1"
+    beam.author_type = "hermes"
+    beam.channel_id = "test:channel"
+
+    def fake_beam_class(**kwargs):
+        b = MagicMock()
+        b.sleep.side_effect = lambda: time.sleep(5.0)
+        return b
+
+    monkeypatch.setattr(
+        "hermes_memory_provider._get_beam_class",
+        lambda: fake_beam_class,
+    )
+
     provider = MnemosyneMemoryProvider()
     provider._beam = beam
     provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 0.05
     provider.SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 0.2
+    monkeypatch.setattr(provider, "_reserve_reflection_budget", lambda name: None)
 
     provider.on_session_end(messages=[])
     hermes_llm_adapter.register_hermes_host_llm()
@@ -736,3 +830,233 @@ class TestInitializeProfileIsolation:
         )
         kwargs = mnemosyne.Mnemosyne.call_args.kwargs
         assert kwargs["bank"] == "work"
+
+
+# ---------------------------------------------------------------------------
+# _maybe_auto_sleep() — session-scoped sleep + isolated BeamMemory (issue #342)
+# ---------------------------------------------------------------------------
+
+class TestMaybeAutoSleep:
+    """Verify _maybe_auto_sleep uses session-scoped sleep with isolated connection."""
+
+    def _make_provider(self, monkeypatch, beam_mock=None):
+        """Helper: create a provider with a mocked beam."""
+        if beam_mock is None:
+            beam_mock = MagicMock()
+            beam_mock.session_id = "hermes_test123"
+            beam_mock.db_path = "/tmp/test.db"
+            beam_mock.author_id = "agent_1"
+            beam_mock.author_type = "hermes"
+            beam_mock.channel_id = "test:channel"
+        provider = MnemosyneMemoryProvider()
+        provider._beam = beam_mock
+        provider._auto_sleep_threshold = 10
+        provider._AUTO_SLEEP_TIMEOUT_SECONDS = 5
+        return provider
+
+    def test_auto_sleep_uses_session_scoped_sleep_not_sleep_all_sessions(self, monkeypatch):
+        """_maybe_auto_sleep must call beam.sleep(), NOT sleep_all_sessions()."""
+        beam_mock = MagicMock()
+        beam_mock.session_id = "hermes_test123"
+        beam_mock.db_path = "/tmp/test.db"
+        beam_mock.author_id = "agent_1"
+        beam_mock.author_type = "hermes"
+        beam_mock.channel_id = "test:channel"
+        beam_mock.get_working_stats.return_value = {"total": 50}
+        beam_mock._count_unconsolidated_before.return_value = 5
+
+        # Track what BeamMemory instances get created
+        created_beams = []
+        def fake_beam_class(**kwargs):
+            beam = MagicMock()
+            beam._kwargs = kwargs
+            created_beams.append(beam)
+            return beam
+
+        monkeypatch.setattr(
+            "hermes_memory_provider._get_beam_class",
+            lambda: fake_beam_class,
+        )
+
+        provider = self._make_provider(monkeypatch, beam_mock)
+        # Stub reflection budget so it doesn't skip
+        monkeypatch.setattr(provider, "_reserve_reflection_budget", lambda name: None)
+
+        provider._maybe_auto_sleep()
+
+        # Should NOT have called sleep_all_sessions on the original beam
+        beam_mock.sleep_all_sessions.assert_not_called()
+        beam_mock.sleep.assert_not_called()
+
+        # Should have created a NEW BeamMemory and called sleep() on it
+        assert len(created_beams) == 1
+        created_beams[0].sleep.assert_called_once()
+
+    def test_auto_sleep_creates_isolated_beam_with_correct_kwargs(self, monkeypatch):
+        """Isolated BeamMemory must receive the original beam's connection params."""
+        beam_mock = MagicMock()
+        beam_mock.session_id = "hermes_test123"
+        beam_mock.db_path = "/tmp/test.db"
+        beam_mock.author_id = "agent_1"
+        beam_mock.author_type = "hermes"
+        beam_mock.channel_id = "test:channel"
+        beam_mock.get_working_stats.return_value = {"total": 50}
+        beam_mock._count_unconsolidated_before.return_value = 5
+
+        captured_kwargs = {}
+        def fake_beam_class(**kwargs):
+            captured_kwargs.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr(
+            "hermes_memory_provider._get_beam_class",
+            lambda: fake_beam_class,
+        )
+
+        provider = self._make_provider(monkeypatch, beam_mock)
+        monkeypatch.setattr(provider, "_reserve_reflection_budget", lambda name: None)
+
+        provider._maybe_auto_sleep()
+
+        assert captured_kwargs["session_id"] == "hermes_test123"
+        assert captured_kwargs["db_path"] == "/tmp/test.db"
+        assert captured_kwargs["author_id"] == "agent_1"
+        assert captured_kwargs["author_type"] == "hermes"
+        assert captured_kwargs["channel_id"] == "test:channel"
+
+    def test_auto_sleep_skips_when_below_threshold(self, monkeypatch):
+        """No sleep when working count is below threshold."""
+        beam_mock = MagicMock()
+        beam_mock.get_working_stats.return_value = {"total": 5}
+
+        provider = self._make_provider(monkeypatch, beam_mock)
+        provider._auto_sleep_threshold = 10
+
+        provider._maybe_auto_sleep()
+
+        beam_mock.sleep.assert_not_called()
+
+    def test_auto_sleep_skips_when_reflection_budget_says_skip(self, monkeypatch):
+        """No sleep when reflection budget returns a skip reason."""
+        beam_mock = MagicMock()
+        beam_mock.get_working_stats.return_value = {"total": 50}
+        beam_mock._count_unconsolidated_before.return_value = 5
+
+        provider = self._make_provider(monkeypatch, beam_mock)
+        monkeypatch.setattr(
+            provider,
+            "_reserve_reflection_budget",
+            lambda name: {"reason": "budget_exhausted"},
+        )
+
+        provider._maybe_auto_sleep()
+
+        beam_mock.sleep.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# on_session_end() — isolated BeamMemory in daemon thread (issue #342)
+# ---------------------------------------------------------------------------
+
+class TestOnSessionEnd:
+    """Verify on_session_end creates isolated BeamMemory for daemon thread."""
+
+    def test_on_session_end_creates_isolated_beam(self, monkeypatch):
+        """on_session_end must create a NEW BeamMemory, not reuse self._beam."""
+        beam_mock = MagicMock()
+        beam_mock.session_id = "hermes_test123"
+        beam_mock.db_path = "/tmp/test.db"
+        beam_mock.author_id = "agent_1"
+        beam_mock.author_type = "hermes"
+        beam_mock.channel_id = "test:channel"
+
+        created_beams = []
+        def fake_beam_class(**kwargs):
+            beam = MagicMock()
+            beam._kwargs = kwargs
+            created_beams.append(beam)
+            return beam
+
+        monkeypatch.setattr(
+            "hermes_memory_provider._get_beam_class",
+            lambda: fake_beam_class,
+        )
+
+        provider = MnemosyneMemoryProvider()
+        provider._beam = beam_mock
+        provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 5
+        monkeypatch.setattr(provider, "_reserve_reflection_budget", lambda name: None)
+
+        provider.on_session_end(messages=[])
+
+        # Should NOT call sleep on the original beam
+        beam_mock.sleep.assert_not_called()
+
+        # Should have created isolated BeamMemory
+        assert len(created_beams) == 1
+        created_beams[0].sleep.assert_called_once()
+
+    def test_on_session_end_isolated_beam_receives_correct_kwargs(self, monkeypatch):
+        """Isolated BeamMemory must receive the original beam's connection params."""
+        beam_mock = MagicMock()
+        beam_mock.session_id = "hermes_test123"
+        beam_mock.db_path = "/tmp/test.db"
+        beam_mock.author_id = "agent_1"
+        beam_mock.author_type = "hermes"
+        beam_mock.channel_id = "test:channel"
+
+        captured_kwargs = {}
+        def fake_beam_class(**kwargs):
+            captured_kwargs.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr(
+            "hermes_memory_provider._get_beam_class",
+            lambda: fake_beam_class,
+        )
+
+        provider = MnemosyneMemoryProvider()
+        provider._beam = beam_mock
+        provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 5
+        monkeypatch.setattr(provider, "_reserve_reflection_budget", lambda name: None)
+
+        provider.on_session_end(messages=[])
+
+        assert captured_kwargs["session_id"] == "hermes_test123"
+        assert captured_kwargs["db_path"] == "/tmp/test.db"
+        assert captured_kwargs["author_id"] == "agent_1"
+        assert captured_kwargs["author_type"] == "hermes"
+        assert captured_kwargs["channel_id"] == "test:channel"
+
+    def test_on_session_end_noop_when_no_beam(self, monkeypatch):
+        """on_session_end must return early if _beam is None."""
+        provider = MnemosyneMemoryProvider()
+        provider._beam = None
+
+        # Must not raise
+        provider.on_session_end(messages=[])
+
+    def test_on_session_end_survives_beam_constructor_failure(self, monkeypatch):
+        """on_session_end must not crash if BeamMemory constructor fails."""
+        beam_mock = MagicMock()
+        beam_mock.session_id = "hermes_test123"
+        beam_mock.db_path = "/tmp/test.db"
+        beam_mock.author_id = "agent_1"
+        beam_mock.author_type = "hermes"
+        beam_mock.channel_id = "test:channel"
+
+        def boom(**kwargs):
+            raise RuntimeError("db locked")
+
+        monkeypatch.setattr(
+            "hermes_memory_provider._get_beam_class",
+            lambda: boom,
+        )
+
+        provider = MnemosyneMemoryProvider()
+        provider._beam = beam_mock
+        provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 5
+        monkeypatch.setattr(provider, "_reserve_reflection_budget", lambda name: None)
+
+        # Must not raise
+        provider.on_session_end(messages=[])

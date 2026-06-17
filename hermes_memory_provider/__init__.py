@@ -1849,10 +1849,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
             working = stats.get("total", 0)
             if working > self._auto_sleep_threshold:
                 # Cheap eligibility check: are there any unconsolidated
-                # working memories old enough to consolidate? Avoids
-                # spinning up a full sleep pass just to find nothing
-                # eligible (common with longer TTLs after a prior
-                # auto-sleep already consolidated everything).
+                # working memories old enough to consolidate?
                 cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).isoformat()
                 eligible = self._beam._count_unconsolidated_before(cutoff)
                 if eligible == 0:
@@ -1864,8 +1861,27 @@ class MnemosyneMemoryProvider(MemoryProvider):
                     return
 
                 logger.info("Mnemosyne auto-sleep: working=%d, eligible=%d > threshold=%d", working, eligible, self._auto_sleep_threshold)
-                sleep_fn = self._beam.sleep_all_sessions if hasattr(self._beam, "sleep_all_sessions") else self._beam.sleep
-                sleep_thread = threading.Thread(target=sleep_fn, daemon=True)
+                # Use session-scoped sleep to avoid timeout on large databases.
+                # Create a SEPARATE BeamMemory instance for the daemon thread
+                # so it gets its own SQLite connection via _thread_local.
+                # Reusing self._beam.conn from a daemon thread races with the
+                # main thread's sync_turn() writes, causing episodic INSERT
+                # failures (commit rolled back by concurrent main-thread writes).
+                beam_ref = self._beam
+                def _sleep_isolated():
+                    try:
+                        BeamClass = _get_beam_class()
+                        sleep_beam = BeamClass(
+                            session_id=beam_ref.session_id,
+                            db_path=beam_ref.db_path,
+                            author_id=beam_ref.author_id,
+                            author_type=beam_ref.author_type,
+                            channel_id=beam_ref.channel_id,
+                        )
+                        sleep_beam.sleep()
+                    except Exception as inner:
+                        logger.debug("Mnemosyne auto-sleep worker failed: %s", inner)
+                sleep_thread = threading.Thread(target=_sleep_isolated, daemon=True)
                 sleep_thread.start()
                 sleep_thread.join(timeout=self._AUTO_SLEEP_TIMEOUT_SECONDS)
                 if sleep_thread.is_alive():
@@ -2689,14 +2705,25 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 return
             logger.info("Mnemosyne session end — running consolidation")
             timeout = self.SESSION_END_SLEEP_TIMEOUT_SECONDS
-            beam = self._beam
+            beam_ref = self._beam
 
             def _sleep_with_logging():
                 # Wrap the target so exceptions get logged at the same
                 # severity the previous synchronous version used, instead
                 # of bubbling out as an uncaught daemon-thread traceback.
+                # Create a SEPARATE BeamMemory so the thread gets its own
+                # SQLite connection via _thread_local, avoiding races with
+                # the main thread's writes.
                 try:
-                    beam.sleep()
+                    BeamClass = _get_beam_class()
+                    sleep_beam = BeamClass(
+                        session_id=beam_ref.session_id,
+                        db_path=beam_ref.db_path,
+                        author_id=beam_ref.author_id,
+                        author_type=beam_ref.author_type,
+                        channel_id=beam_ref.channel_id,
+                    )
+                    sleep_beam.sleep()
                 except Exception as inner:
                     logger.debug("Mnemosyne session-end sleep failed: %s", inner)
 

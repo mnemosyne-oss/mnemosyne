@@ -57,6 +57,16 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **auto-sleep uses `sleep_all_sessions()` causing timeout** (issue #342, PR by
+  @ruangraung). `_maybe_auto_sleep()` called `sleep_all_sessions()` which loops
+  ALL sessions instead of just the current one, always exceeding the timeout on
+  databases with many sessions. Now uses session-scoped `beam.sleep()`.
+- **daemon thread SQLite connection race** (issue #342, PR by @ruangraung). Both
+  `_maybe_auto_sleep()` and `on_session_end()` ran `beam.sleep()` in daemon
+  threads but reused `self._beam.conn` (the same SQLite connection as the main
+  thread). Concurrent writes caused silent episodic INSERT failures. Now creates
+  isolated `BeamMemory` instances in daemon threads so each gets its own
+  connection via `_thread_local`.
 - **fact_recall ranking by query relevance** (issue #309, PR by @Milgauss).
   fact_recall() now preserves FTS rank order (was re-ordering by stored
   confidence, collapsing all facts from the same path to one score), uses

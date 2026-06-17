@@ -55,6 +55,9 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# Test artifacts
+MagicMock/
+
 # Devops plans (private — not for public repo)
 DEVOPS.md
 DEVOPS_PLAN_*
