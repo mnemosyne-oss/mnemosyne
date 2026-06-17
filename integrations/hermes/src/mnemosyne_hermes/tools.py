@@ -1,11 +1,22 @@
 """Tool schemas exposed by the Mnemosyne memory provider.
 
-28 tools: remember, recall, shared_remember, shared_recall, shared_forget,
+32 tools: remember, recall, shared_remember, shared_recall, shared_forget,
 shared_stats, sleep, stats, invalidate, validate, get, triple_add, triple_query,
 triple_end, remember_canonical, recall_canonical, scratchpad_write, scratchpad_read,
 scratchpad_clear, export, update, forget, import, diagnose, graph_query, graph_link,
-sync_push, sync_pull, sync_status.
+sync_push, sync_pull, sync_status, persona_promote, persona_demote, persona_list,
+persona_reinforce.
 """
+
+# Import persona schemas from the dedicated module so tools.py stays focused
+# on the high-frequency schemas (remember/recall/etc.) while persona lives
+# in its own file.
+from .persona_tools import (
+    PERSONA_PROMOTE_SCHEMA,
+    PERSONA_DEMOTE_SCHEMA,
+    PERSONA_LIST_SCHEMA,
+    PERSONA_REINFORCE_SCHEMA,
+)
 
 REMEMBER_SCHEMA = {
     "name": "mnemosyne_remember",
@@ -567,4 +578,5 @@ ALL_TOOL_SCHEMAS = [
     EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,
     SYNC_PUSH_SCHEMA, SYNC_PULL_SCHEMA, SYNC_STATUS_SCHEMA,
-]
+    PERSONA_PROMOTE_SCHEMA, PERSONA_DEMOTE_SCHEMA, PERSONA_LIST_SCHEMA, PERSONA_REINFORCE_SCHEMA,
+]  # noqa: E501

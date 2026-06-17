@@ -7,6 +7,36 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+## [3.10.0] — 2026-06-18
+
+### Added
+
+- **L3 persona layer** — always-on behavioral rules tier that survives past
+  the 24-hour working-memory TTL. New `memoria_persona` SQLite table with
+  tiered retention (`permanent` / `long_term` / `working`). New tools:
+  `mnemosyne_persona_promote`, `mnemosyne_persona_demote`,
+  `mnemosyne_persona_list`, `mnemosyne_persona_reinforce`.
+- **Rule-based persona extractor** (no LLM by default). Reads working_memory
+  and episodic_memory, filters by source/importance, deduplicates by topic,
+  renders Markdown grouped by topic. Deterministic and zero-cost.
+- **Auto-injection into system prompt** via `persona.md`. Reads
+  `~/.hermes/memory/persona.md` and includes it in the
+  `system_prompt_block()` of the hermes provider. Feature-gated by
+  `MNEMOSYNE_PERSONA_ENABLED=true` (default OFF). Mtime-cached for hot-path
+  efficiency. Token cap enforced (`MNEMOSYNE_PERSONA_TOKEN_CAP`, default 1500).
+- **5 trigger conditions** for persona regeneration (matches Hy-Memory
+  PersonaTrigger pattern): explicit request, cold start, recovery,
+  threshold (default 50 new memories), daily sync window.
+
+### Design notes
+
+- Schema migration is additive; existing tables untouched.
+- Tool count: 28 -> 32.
+- No breaking changes to existing `mnemosyne_remember` / `mnemosyne_recall`
+  behavior.
+- Default OFF to preserve opt-in upgrade story; turn on with
+  `MNEMOSYNE_PERSONA_ENABLED=true` after upgrading.
+
 ## [3.9.0] — 2026-06-18
 
 ### Added

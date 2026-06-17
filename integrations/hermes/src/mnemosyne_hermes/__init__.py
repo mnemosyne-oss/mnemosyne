@@ -869,7 +869,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
             # (matches the auto-capture for identity-significant feelings
             # added in that PR), and keep C27's three-branch structure
             # (working / init-failed-visible / skip-context-silent).
-            return (
+            base = (
                 "# Mnemosyne Memory\n"
                 "Active native local memory. Mnemosyne is primary; the legacy memory tool is deprecated for durable storage.\n"
                 "Use mnemosyne_recall for durable facts/preferences before asking the user to repeat old context.\n"
@@ -888,6 +888,14 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 "answer directly. Use session_search only when the injected Mnemosyne "
                 "context is missing, stale, or insufficient."
             )
+            # L3 persona injection (v3.10.0): always-on behavioral rules.
+            # Feature-gated by MNEMOSYNE_PERSONA_ENABLED -- default OFF to
+            # preserve opt-in upgrade story. Reads persona.md atomically,
+            # caches by mtime to avoid re-reads on every prompt build.
+            persona_block = self._persona_block()
+            if persona_block:
+                base += "\n\n# L3 Persona (Active Behavioral Rules)\n" + persona_block
+            return base
         # C27: when init failed (as opposed to a deliberate skip-context),
         # surface the failure in the system prompt so the agent -- and through
         # it the user -- can see that memory is unavailable rather than
@@ -1910,6 +1918,47 @@ class MnemosyneMemoryProvider(MemoryProvider):
     # MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT.
     SHUTDOWN_DRAIN_TIMEOUT_SECONDS = _parse_env_float("MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT", 2)
 
+    # L3 persona file injection (v3.10.0). Default OFF -- opt-in via
+    # MNEMOSYNE_PERSONA_ENABLED=true. When OFF, no file IO happens.
+    PERSONA_ENABLED = _parse_env_bool("MNEMOSYNE_PERSONA_ENABLED", False)
+    PERSONA_FILE = Path(
+        os.environ.get(
+            "MNEMOSYNE_PERSONA_FILE",
+            str(Path.home() / ".hermes" / "memory" / "persona.md"),
+        )
+    )
+    PERSONA_TOKEN_CAP = int(os.environ.get("MNEMOSYNE_PERSONA_TOKEN_CAP", "1500"))
+    _persona_cache: Dict[str, Any] = {"mtime": None, "content": None}
+
+    def _persona_block(self) -> str:
+        """Read persona.md if feature enabled and file exists. Cached by mtime."""
+        if not self.PERSONA_ENABLED:
+            return ""
+        try:
+            if not self.PERSONA_FILE.exists():
+                # Clear cache when file vanishes
+                self._persona_cache = {"mtime": None, "content": None}
+                return ""
+            mtime = self.PERSONA_FILE.stat().st_mtime
+            if self._persona_cache.get("mtime") == mtime and self._persona_cache.get("content") is not None:
+                return self._persona_cache["content"]
+            raw = self.PERSONA_FILE.read_text()
+            # Rough token cap (~1 token / 0.75 words).
+            words = raw.split()
+            max_words = int(self.PERSONA_TOKEN_CAP * 0.75)
+            if len(words) > max_words:
+                # Truncate at section boundary if possible
+                truncated = " ".join(words[:max_words])
+                last_section = truncated.rfind("\n## ")
+                if last_section > 0:
+                    truncated = truncated[:last_section]
+                raw = truncated + "\n... (truncated, see persona file for full content)"
+            self._persona_cache = {"mtime": mtime, "content": raw}
+            return raw
+        except Exception as exc:
+            logger.debug("persona_block read failed: %s", exc)
+            return ""
+
     def shutdown(self) -> None:
         # If session_end's daemon thread is still consolidating when shutdown
         # arrives, briefly wait for it. Otherwise clearing the host backend
@@ -2010,7 +2059,7 @@ def register(ctx):
         handler_fn=mnemosyne_command,
     )
 
-    # Register all tools (25 memory + 3 sync) so the agent can call them.
+    # Register all tools (29 memory + 3 sync + 4 persona) so the agent can call them.
     # Note: when loaded via memory provider discovery (plugins/memory/),
     # the ctx is a _ProviderCollector whose register_tool() is a no-op --
     # tools are surfaced through get_tool_schemas() via the memory manager
@@ -2021,9 +2070,12 @@ def register(ctx):
     _provider = MnemosyneMemoryProvider()
     for _schema in ALL_TOOL_SCHEMAS:
         _name = _schema["name"]
-        # Sync tools route through SyncAdapter, memory tools through main provider
+        # Sync tools route through SyncAdapter, persona tools through PersonaAdapter,
+        # memory tools through main provider.
         if _name.startswith("mnemosyne_sync_"):
             _handler = _get_sync_handler(_name)
+        elif _name.startswith("mnemosyne_persona_"):
+            _handler = _get_persona_handler(_name)
         else:
             _handler = partial(_provider.handle_tool_call, _name)
         ctx.register_tool(
@@ -2052,4 +2104,32 @@ def _get_sync_handler(tool_name: str):
                     "error": "Sync adapter unavailable. Install mnemosyne-memory[sync].",
                 })
         return _sync_adapter.handle_tool_call(tool_name, args)
+    return _handler
+
+
+# Lazy-init persona adapter for the L3 persona layer (v3.10.0).
+# Shares the active provider's BeamMemory connection when possible.
+_persona_adapter: Optional[Any] = None
+
+def _get_persona_handler(tool_name: str):
+    """Return a handler fn that lazy-inits PersonaAdapter on first use."""
+    def _handler(args: dict) -> str:
+        global _persona_adapter
+        if _persona_adapter is None:
+            try:
+                from mnemosyne_hermes.persona_adapter import PersonaAdapter as PA
+                # Try to bind to the active provider's beam instance.
+                beam = None
+                try:
+                    if _provider is not None and getattr(_provider, '_beam', None) is not None:
+                        beam = _provider._beam
+                except Exception:
+                    beam = None
+                _persona_adapter = PA(beam_instance=beam)
+            except Exception as exc:
+                return json.dumps({
+                    "status": "error",
+                    "error": f"Persona adapter unavailable: {exc}",
+                })
+        return _persona_adapter.handle_tool_call(tool_name, args)
     return _handler
