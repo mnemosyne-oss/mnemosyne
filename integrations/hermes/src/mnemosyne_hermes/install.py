@@ -8,8 +8,17 @@ import os
 import shutil
 import subprocess
 import sys
+from enum import Enum
 from pathlib import Path
 from typing import Optional
+
+
+class PluginState(Enum):
+    """Possible states of the Hermes plugin symlink."""
+    OK = "ok"
+    BROKEN_SYMLINK = "broken_symlink"
+    MISSING = "missing"
+
 
 PLUGIN_NAME = "mnemosyne"
 
@@ -344,6 +353,33 @@ def is_installed(*, hermes_home_path: str | Path | None = None) -> bool:
         return False
 
 
+def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
+    """Return the current state of the Hermes plugin installation.
+
+    Distinguishes between:
+    - OK: symlink exists and points to a valid plugin
+    - BROKEN_SYMLINK: symlink exists but target is missing (venv rebuild, etc.)
+    - MISSING: no symlink at all
+    """
+    target = plugin_target_dir(hermes_home_path)
+
+    if target.is_symlink():
+        try:
+            real_target = target.resolve(strict=True)
+            if real_target.exists():
+                if is_installed(hermes_home_path=hermes_home_path):
+                    return PluginState.OK
+        except (FileNotFoundError, RuntimeError):
+            pass
+        return PluginState.BROKEN_SYMLINK
+
+    if target.exists():
+        if is_installed(hermes_home_path=hermes_home_path):
+            return PluginState.OK
+
+    return PluginState.MISSING
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mnemosyne-hermes",
@@ -502,14 +538,20 @@ def main(argv: list[str] | None = None) -> int:
             hermes_python = _find_hermes_python()
             print(f"Status for mnemosyne-hermes plugin")
             print(f"  Plugin symlink: {target}")
-            if installed:
+            state = plugin_state(hermes_home_path=args.hermes_home)
+            if state == PluginState.OK:
                 try:
                     link = os.readlink(str(target))
                     print(f"  Target: {link}")
+                    print(f"  Plugin:    installed ✓")
                 except Exception:
                     print(f"  Type: directory (not symlink)")
+                    print(f"  Plugin:    installed ✓")
+            elif state == PluginState.BROKEN_SYMLINK:
+                print(f"  Plugin:    broken symlink (target missing) ✗")
+                print(f"  → Run: mnemosyne-hermes install --force")
             else:
-                print(f"  NOT installed (no symlink at {target})")
+                print(f"  Plugin:    NOT installed ✗")
             print(f"  Core library: {'OK' if check_mnemosyne_core() else 'MISSING'}")
             print(f"  This Python: {sys.executable} ({sys.version.split()[0]})")
             if hermes_python:
