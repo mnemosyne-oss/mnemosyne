@@ -263,7 +263,10 @@ TRIPLE_ADD_SCHEMA = {
     "name": "mnemosyne_triple_add",
     "description": (
         "Add a temporal fact triple (subject, predicate, object) to the knowledge graph. "
-        "Example: ('user', 'prefers', 'neovim'). Use for structured relationships."
+        "Example: ('user', 'prefers', 'neovim'). Use for structured relationships. "
+        "By default a new triple supersedes any prior fact with the same subject+predicate; "
+        "set supersede=false for multi-valued facts that should coexist "
+        "(e.g. ('user','speaks','English') and ('user','speaks','Spanish'))."
     ),
     "parameters": {
         "type": "object",
@@ -272,20 +275,48 @@ TRIPLE_ADD_SCHEMA = {
             "predicate": {"type": "string"},
             "object": {"type": "string"},
             "valid_from": {"type": "string", "description": "ISO date YYYY-MM-DD", "default": ""},
+            "valid_until": {"type": "string", "description": "Optional ISO expiry date YYYY-MM-DD.", "default": ""},
+            "source": {"type": "string", "description": "Provenance label.", "default": ""},
+            "confidence": {"type": "number", "description": "0.0-1.0 (default 1.0).", "default": 1.0},
+            "supersede": {"type": "boolean", "description": "If false, do not close prior same subject+predicate triples (multi-valued).", "default": True},
         },
         "required": ["subject", "predicate", "object"],
     },
 }
 
+TRIPLE_END_SCHEMA = {
+    "name": "mnemosyne_triple_end",
+    "description": (
+        "Expire a fact in the knowledge graph WITHOUT replacing it (e.g. a relationship "
+        "that simply ended). Closes all open triples for subject+predicate, or only the one "
+        "matching object when given. Use mnemosyne_triple_add instead when a new value replaces the old."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "subject": {"type": "string"},
+            "predicate": {"type": "string"},
+            "object": {"type": "string", "description": "Optional: end only this exact triple; omit to end all open subject+predicate triples.", "default": ""},
+            "valid_until": {"type": "string", "description": "ISO date YYYY-MM-DD the fact ended (default: today).", "default": ""},
+        },
+        "required": ["subject", "predicate"],
+    },
+}
+
+
 TRIPLE_QUERY_SCHEMA = {
     "name": "mnemosyne_triple_query",
-    "description": "Query the temporal knowledge graph for facts matching subject/predicate/object patterns.",
+    "description": (
+        "Query the temporal knowledge graph for facts matching subject/predicate/object patterns. "
+        "Subject match is case-insensitive. Pass as_of to query facts valid on a past date."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
             "subject": {"type": "string", "default": ""},
             "predicate": {"type": "string", "default": ""},
             "object": {"type": "string", "default": ""},
+            "as_of": {"type": "string", "description": "ISO date YYYY-MM-DD; query facts valid as of this date (default: today).", "default": ""},
         },
     },
 }
@@ -573,6 +604,7 @@ ALL_TOOL_SCHEMAS = [
     REMEMBER_SCHEMA, RECALL_SCHEMA, SHARED_REMEMBER_SCHEMA, SHARED_RECALL_SCHEMA,
     SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
     INVALIDATE_SCHEMA, VALIDATE_SCHEMA, GET_SCHEMA, TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA,
+    TRIPLE_END_SCHEMA,
     REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA,
     SCRATCHPAD_WRITE_SCHEMA, SCRATCHPAD_READ_SCHEMA, SCRATCHPAD_CLEAR_SCHEMA,
     EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,

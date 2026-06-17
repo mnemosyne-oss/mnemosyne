@@ -103,6 +103,40 @@ def _prefetch_content_char_limit() -> int:
         return 0
 
 
+
+def _sync_turn_user_limit() -> int:
+    """Return the per-turn user content truncation limit.
+
+    ``0`` means no truncation. Defaults to 500 characters for backward
+    compatibility. Set ``MNEMOSYNE_SYNC_TURN_USER_LIMIT`` to override.
+    """
+    raw = os.environ.get("MNEMOSYNE_SYNC_TURN_USER_LIMIT", "500").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid MNEMOSYNE_SYNC_TURN_USER_LIMIT=%r; using default 500",
+            raw,
+        )
+        return 500
+
+
+def _sync_turn_assistant_limit() -> int:
+    """Return the per-turn assistant content truncation limit.
+
+    ``0`` means no truncation. Defaults to 800 characters for backward
+    compatibility. Set ``MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT`` to override.
+    """
+    raw = os.environ.get("MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT", "800").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT=%r; using default 800",
+            raw,
+        )
+        return 800
+
 def _format_prefetch_content(content: str, limit: int) -> str:
     """Format recalled memory content for prompt injection.
 
@@ -529,6 +563,11 @@ SLEEP_SCHEMA = {
                 "description": "If true, report what would be consolidated without writing changes.",
                 "default": False,
             },
+            "force": {
+                "type": "boolean",
+                "description": "If true, skip the age threshold and consolidate all non-consolidated working memories immediately.",
+                "default": False,
+            },
         },
     },
 }
@@ -546,7 +585,7 @@ INVALIDATE_SCHEMA = {
     "name": "mnemosyne_invalidate",
     "description": (
         "Mark a memory as expired or superseded. Provide memory_id from recall results. "
-        "Optionally provide replacement_id to chain old → new."
+        "Optionally provide replacement_id to chain old to new."
     ),
     "parameters": {
         "type": "object",
@@ -917,6 +956,11 @@ GRAPH_LINK_SCHEMA = {
     },
 }
 
+try:
+    from hermes_memory_provider.sync_adapter import ALL_SYNC_TOOL_SCHEMAS
+except Exception:  # pragma: no cover - sync extras are optional at import time
+    ALL_SYNC_TOOL_SCHEMAS = []
+
 ALL_TOOL_SCHEMAS = [
     REMEMBER_SCHEMA, RECALL_SCHEMA, SHARED_REMEMBER_SCHEMA, SHARED_RECALL_SCHEMA,
     SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
@@ -926,6 +970,7 @@ ALL_TOOL_SCHEMAS = [
     SCRATCHPAD_WRITE_SCHEMA, SCRATCHPAD_READ_SCHEMA, SCRATCHPAD_CLEAR_SCHEMA,
     EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,
+    *ALL_SYNC_TOOL_SCHEMAS,
 ]
 
 
@@ -1790,8 +1835,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
             return
         try:
             if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
+                user_limit = _sync_turn_user_limit()
+                uc = user_content[:user_limit] if user_limit > 0 else user_content
                 self._beam.remember(
-                    content=f"[USER] {user_content[:500]}",
+                    content=f"[USER] {uc}",
                     source="conversation",
                     importance=0.5,
                     scope=self._default_scope,
@@ -1799,8 +1846,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 )
                 self._capture_identity_signals(user_content)
             if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
+                assistant_limit = _sync_turn_assistant_limit()
+                ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
                 self._beam.remember(
-                    content=f"[ASSISTANT] {assistant_content[:800]}",
+                    content=f"[ASSISTANT] {ac}",
                     source="conversation",
                     importance=0.15,
                     scope=self._default_scope,
@@ -1948,11 +1997,24 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 return self._handle_graph_query(args)
             elif tool_name == "mnemosyne_graph_link":
                 return self._handle_graph_link(args)
+            elif tool_name.startswith("mnemosyne_sync_"):
+                return self._handle_sync_tool(tool_name, args)
             else:
                 return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
         except Exception as e:
             logger.error("Mnemosyne tool %s failed: %s", tool_name, e)
             return json.dumps({"error": f"Mnemosyne tool '{tool_name}' failed: {e}"})
+
+    def _handle_sync_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
+        try:
+            adapter = getattr(self, "_sync_adapter", None)
+            if adapter is None:
+                from hermes_memory_provider.sync_adapter import SyncAdapter
+                adapter = SyncAdapter(self._beam, {})
+                self._sync_adapter = adapter
+            return adapter.handle_tool_call(tool_name, args)
+        except Exception as exc:
+            return json.dumps({"status": "error", "error": f"Sync adapter unavailable: {exc}"})
 
     def _handle_remember(self, args: Dict[str, Any]) -> str:
         # Import at call-site so the provider module loads even when
@@ -2186,11 +2248,12 @@ class MnemosyneMemoryProvider(MemoryProvider):
         if skip is not None:
             return json.dumps(skip)
         dry_run = bool(args.get("dry_run", False))
+        force = bool(args.get("force", False))
         all_sessions = bool(args.get("all_sessions", False))
         if all_sessions and hasattr(self._beam, "sleep_all_sessions"):
-            result = self._beam.sleep_all_sessions(dry_run=dry_run)
+            result = self._beam.sleep_all_sessions(dry_run=dry_run, force=force)
         else:
-            result = self._beam.sleep(dry_run=dry_run)
+            result = self._beam.sleep(dry_run=dry_run, force=force)
         working = self._beam.get_working_stats()
         episodic = self._beam.get_episodic_stats()
         if not dry_run:

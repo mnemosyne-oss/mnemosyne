@@ -668,6 +668,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
             {"key": "shared_surface_path", "description": "SQLite path for shared surface memories. Default is <mnemosyne>/data/shared/mnemosyne.db.", "default": "data/shared/mnemosyne.db"},
             {"key": "shared_surface_read", "description": "When true, mnemosyne_recall merges shared-surface results into private bank recall, tagging each result with its bank ('private' or 'surface'). Default false.", "default": False},
             {"key": "skip_contexts", "description": "Agent contexts where Mnemosyne should skip initialization. Comma-separated list. Defaults to 'cron,flush,subagent,background,skill_loop'. Set to empty string to enable all contexts. Also configurable via MNEMOSYNE_SKIP_CONTEXTS env var.", "default": "cron,flush,subagent,background,skill_loop"},
+            {"key": "sync_roles", "description": "Conversation roles to autosave in sync_turn(). List of role names: 'user', 'assistant'. Default ['user', 'assistant'] saves both. Set to ['user'] for user turns only, or [] to disable conversation autosave entirely. Does not affect explicit mnemosyne_remember calls. Identity signal capture is gated by user sync — excluding 'user' also disables identity extraction. Also configurable via MNEMOSYNE_SYNC_ROLES env var.", "default": ["user", "assistant"]},
             {"key": "default_scope", "description": "Default scope for remember() calls when not explicitly specified. 'session' (default) limits memories to the current session. 'global' persists memories across sessions.", "choices": ["session", "global"], "default": "session"},
         ]
 
@@ -1128,6 +1129,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 return self._handle_triple_add(args)
             elif tool_name == "mnemosyne_triple_query":
                 return self._handle_triple_query(args)
+            elif tool_name == "mnemosyne_triple_end":
+                return self._handle_triple_end(args)
             elif tool_name == "mnemosyne_remember_canonical":
                 return self._handle_remember_canonical(args)
             elif tool_name == "mnemosyne_recall_canonical":
@@ -1152,11 +1155,24 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 return self._handle_graph_query(args)
             elif tool_name == "mnemosyne_graph_link":
                 return self._handle_graph_link(args)
+            elif tool_name.startswith("mnemosyne_sync_"):
+                return self._handle_sync_tool(tool_name, args)
             else:
                 return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
         except Exception as e:
             logger.error("Mnemosyne tool %s failed: %s", tool_name, e)
             return json.dumps({"error": f"Mnemosyne tool '{tool_name}' failed: {e}"})
+
+    def _handle_sync_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
+        try:
+            adapter = getattr(self, "_provider_sync_adapter", None)
+            if adapter is None:
+                from mnemosyne_hermes.sync_adapter import SyncAdapter
+                adapter = SyncAdapter(self._beam, {})
+                self._provider_sync_adapter = adapter
+            return adapter.handle_tool_call(tool_name, args)
+        except Exception as exc:
+            return json.dumps({"status": "error", "error": f"Sync adapter unavailable: {exc}"})
 
     def _handle_remember(self, args: Dict[str, Any]) -> str:
         # Import at call-site so the provider module loads even when
@@ -1564,18 +1580,38 @@ class MnemosyneMemoryProvider(MemoryProvider):
         valid_from = args.get("valid_from", None) or None
         if not all([subject, predicate, obj]):
             return json.dumps({"error": "subject, predicate, and object are required"})
+        valid_until = args.get("valid_until", None) or None
+        source = args.get("source", "") or "inferred"
+        confidence = args.get("confidence", 1.0)
+        supersede = args.get("supersede", True)
         add_triple, _ = _get_triple_module()
         triple_id = add_triple(subject, predicate, obj, valid_from=valid_from,
+                               valid_until=valid_until, source=source,
+                               confidence=confidence, supersede=supersede,
                                db_path=self._beam.db_path)
         return json.dumps({"status": "stored", "triple_id": triple_id})
+
+    def _handle_triple_end(self, args: Dict[str, Any]) -> str:
+        subject = args.get("subject", "")
+        predicate = args.get("predicate", "")
+        if not all([subject, predicate]):
+            return json.dumps({"error": "subject and predicate are required"})
+        obj = args.get("object", "") or None
+        valid_until = args.get("valid_until", None) or None
+        from mnemosyne.core.triples import end_triple
+        n = end_triple(subject, predicate, object=obj, valid_until=valid_until,
+                       db_path=self._beam.db_path)
+        return json.dumps({"status": "ended", "count": n})
+
 
     def _handle_triple_query(self, args: Dict[str, Any]) -> str:
         subject = args.get("subject", "") or None
         predicate = args.get("predicate", "") or None
         obj = args.get("object", "") or None
+        as_of = args.get("as_of", "") or None
         _, query_triples = _get_triple_module()
         results = query_triples(subject=subject, predicate=predicate, object=obj,
-                                db_path=self._beam.db_path)
+                                as_of=as_of, db_path=self._beam.db_path)
         return json.dumps({"count": len(results), "results": results})
 
     def _canonical_owner(self) -> str:

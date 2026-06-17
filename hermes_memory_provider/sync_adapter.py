@@ -48,8 +48,8 @@ SYNC_PUSH_SCHEMA = {
     "description": (
         "Push local memory changes to a remote Mnemosyne sync server. "
         "Only events created since the last sync are sent. Requires a "
-        "configured remote sync server (configured in Mnemosyne settings "
-        "or via MNEMOSYNE_SYNC_REMOTE env var)."
+        "configured remote sync server (configured via config.yaml or "
+        "MNEMOSYNE_SYNC_REMOTE env var)."
     ),
     "parameters": {
         "type": "object",
@@ -61,9 +61,9 @@ SYNC_PUSH_SCHEMA = {
 SYNC_PULL_SCHEMA = {
     "name": "mnemosyne_sync_pull",
     "description": (
-        "Pull remote memory changes from a configured Mnemosyne sync server. "
-        "Applies incoming events to the local store. New or conflicting "
-        "memories are resolved with timestamp + importance rules."
+        "Pull remote memory changes from the configured Mnemosyne sync server. "
+        "Applies incoming events locally with timestamp + importance conflict "
+        "resolution."
     ),
     "parameters": {
         "type": "object",
@@ -75,8 +75,8 @@ SYNC_PULL_SCHEMA = {
 SYNC_STATUS_SCHEMA = {
     "name": "mnemosyne_sync_status",
     "description": (
-        "Show Mnemosyne sync status: device identity, last sync cursor, "
-        "event count, remote URL, and encryption state."
+        "Show Mnemosyne sync status: device ID, last cursor, event count, "
+        "remote URL, and encryption state."
     ),
     "parameters": {
         "type": "object",
