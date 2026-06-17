@@ -11,6 +11,7 @@ Mnemosyne's BEAM architecture.
 import json
 import hashlib
 import logging
+import sys
 import uuid
 import os
 import base64
@@ -934,27 +935,19 @@ class SyncEngine:
             # Filter out losing events, keep winners
             incoming = [ev for ev in incoming if ev.event_id not in resolved_ids]
 
-        # --- TEMP CI DIAGNOSTIC (remove before merge) ---
-        _dbg = len(events) <= 2
-        if _dbg:
-            import sys as _sys
-            print(
-                f"[SYNCDBG-pre] events_in={len(events)} incoming={len(incoming)} "
-                f"known_hashes={len(known_hashes)} "
-                f"in_ids={[getattr(e,'event_id','?') for e in incoming]} "
-                f"in_mids={[getattr(e,'memory_id','?') for e in incoming]} "
-                f"beam={type(self._beam).__name__} has_remember={hasattr(self._beam,'remember')} "
-                f"db={getattr(self._beam,'db_path','?')} conn={id(self.conn)} "
-                f"raw_events_len={len(events)}",
-                file=_sys.stderr,
-            )
-        _dbg_iters = 0
-        # --- END TEMP DIAGNOSTIC ---
-
         # Apply memory mutations through the full Mnemosyne pipeline
         # (FTS5 indexing, embeddings, entity extraction, callbacks).
-        for ev in incoming:
-            _dbg_iters += 1
+        _total = len(incoming)
+        _progress_interval = max(1, _total // 50) if _total > 100 else 100
+        for idx, ev in enumerate(incoming):
+            try:
+                if _total > 100 and idx > 0 and idx % _progress_interval == 0:
+                    pct = int(idx / _total * 100)
+                    sys.stderr.write(f"\r  Progress: {idx}/{_total} ({pct}%)  \r")
+                    sys.stderr.flush()
+            except KeyboardInterrupt:
+                stats["interrupted"] = True
+                break
             try:
                 payload_dict: Optional[dict] = None
                 if ev.payload:
@@ -1001,35 +994,39 @@ class SyncEngine:
                 elif ev.operation in ("CREATE", "UPDATE", "CONSOLIDATE"):
                     if content:
                         # Route through remember() for full pipeline
-                        if self._beam is not None and hasattr(self._beam, "remember"):
-                            self._beam.remember(
-                                content=content,
-                                source=source,
-                                importance=importance,
-                                metadata=metadata,
-                                memory_id=ev.memory_id,
-                            )
-                            stats["accepted"] += 1
-                        else:
-                            # Fallback: direct DeltaSync
-                            delta_item: Dict[str, Any] = {"id": ev.memory_id}
-                            for key in ("content", "importance", "source", "memory_type", "veracity"):
-                                if payload_dict and key in payload_dict:
-                                    delta_item[key] = payload_dict[key]
-                            if self._delta_sync is not None:
-                                apply_stats = self._delta_sync.apply_delta(
-                                    peer_id=ev.device_id,
-                                    delta=[delta_item],
-                                    table="working_memory",
+                        try:
+                            if self._beam is not None and hasattr(self._beam, "remember"):
+                                self._beam.remember(
+                                    content=content,
+                                    source=source,
+                                    importance=importance,
+                                    metadata=metadata,
+                                    memory_id=ev.memory_id,
                                 )
-                                if apply_stats.get("inserted") or apply_stats.get("updated"):
-                                    stats["accepted"] += 1
-                                else:
-                                    stats["details"].append(
-                                        f"event {ev.event_id}: no rows affected"
-                                    )
-                            else:
                                 stats["accepted"] += 1
+                            else:
+                                # Fallback: direct DeltaSync
+                                delta_item: Dict[str, Any] = {"id": ev.memory_id}
+                                for key in ("content", "importance", "source", "memory_type", "veracity"):
+                                    if payload_dict and key in payload_dict:
+                                        delta_item[key] = payload_dict[key]
+                                if self._delta_sync is not None:
+                                    apply_stats = self._delta_sync.apply_delta(
+                                        peer_id=ev.device_id,
+                                        delta=[delta_item],
+                                        table="working_memory",
+                                    )
+                                    if apply_stats.get("inserted") or apply_stats.get("updated"):
+                                        stats["accepted"] += 1
+                                    else:
+                                        stats["details"].append(
+                                            f"event {ev.event_id}: no rows affected"
+                                        )
+                                else:
+                                    stats["accepted"] += 1
+                        except KeyboardInterrupt:
+                            stats["interrupted"] = True
+                            break
                     else:
                         # No content — just log the event
                         stats["accepted"] += 1
@@ -1060,26 +1057,6 @@ class SyncEngine:
                 logger.warning("Failed to apply event %s: %s", ev.event_id, exc)
 
         self.conn.commit()
-
-        # --- TEMP CI DIAGNOSTIC (remove before merge) ---
-        if _dbg:
-            import sys as _sys
-            try:
-                _ec = self.conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]
-            except Exception as _e:
-                _ec = f"err:{_e}"
-            try:
-                _wc = self.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0]
-            except Exception as _e:
-                _wc = f"err:{_e}"
-            print(
-                f"[SYNCDBG-post] iters={_dbg_iters} accepted={stats['accepted']} "
-                f"dups={stats['duplicates']} conflicts={stats['conflicts']} "
-                f"errors={stats['errors']} details={stats['details']} "
-                f"memory_events_rows={_ec} working_memory_rows={_wc}",
-                file=_sys.stderr,
-            )
-        # --- END TEMP DIAGNOSTIC ---
 
         return stats
 
@@ -1194,6 +1171,8 @@ class SyncEngine:
                     "conflicts": push_result.get("conflicts", 0),
                     "errors": push_result.get("errors", 0),
                 }
+                if push_result.get("interrupted"):
+                    result["interrupted"] = True
                 # Persist cursor so next sync picks up where we left off
                 if pull_resp.get("next_cursor"):
                     self._meta_set(
