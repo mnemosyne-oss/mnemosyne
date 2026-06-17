@@ -1066,7 +1066,7 @@ class TestExportImport:
             assert export_stats["annotations_count"] >= 3
             with open(export_path) as f:
                 payload = _json.load(f)
-            assert payload["mnemosyne_export"]["version"] == "1.1"
+            assert payload["mnemosyne_export"]["version"] == "1.3"
             assert "annotations" in payload
             assert len(payload["annotations"]) >= 3
 
