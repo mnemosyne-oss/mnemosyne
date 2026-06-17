@@ -59,9 +59,14 @@ def collect():
             wm["by_source"][r[0] or "?"] = {"count": r[1], "imp": round(r[2] or 0, 3), "recall": round(r[3] or 0, 1)}
         for r in q(db, "SELECT scope, COUNT(*), AVG(importance) FROM working_memory GROUP BY scope"):
             wm["by_scope"][r[0] or "?"] = {"count": r[1], "imp": round(r[2] or 0, 3)}
-        for lo, hi in [(0,.2),(.2,.4),(.4,.6),(.6,.8),(.8,1.01)]:
+        # Buckets cover [0, 1.0]; clamp at upper bound to absorb any
+        # historical overflow rows (importance was unconstrained REAL pre-v3.9.0).
+        # Use a large upper bound to include historical data anomalies.
+        for lo, hi in [(0,.2),(.2,.4),(.4,.6),(.6,.8),(.8,1000.0)]:
             c = q(db, "SELECT COUNT(*) FROM working_memory WHERE importance>=? AND importance<?", (lo,hi))
             wm["importance_dist"][f"{lo:.1f}-{hi:.1f}"] = c[0][0]
+        # Override last bucket label so it stays user-readable as "0.8-1.0".
+        wm["importance_dist"]["0.8-1.0"] = wm["importance_dist"].pop("0.8-1000.0")
         for lo, hi, lbl in [(0,1,"never"),(1,5,"low"),(5,10,"med"),(10,50,"high"),(50,99999,"vhigh")]:
             c = q(db, "SELECT COUNT(*) FROM working_memory WHERE recall_count>=? AND recall_count<?", (lo,hi))
             wm["recall_dist"][lbl] = c[0][0]

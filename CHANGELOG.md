@@ -7,6 +7,8 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+## [3.9.0] — 2026-06-18
+
 ### Added
 
 - **Synchronous memory reindex** (issue #308, PR by @Milgauss). New `mnemosyne
