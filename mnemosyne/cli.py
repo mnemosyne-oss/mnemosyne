@@ -365,6 +365,8 @@ def cmd_sync(args):
 
 def _print_sync_result(result: dict) -> None:
     """Print sync results to console."""
+    if result.get("interrupted"):
+        print("\n  Interrupted by user.")
     print(f"\nSync to {result.get('remote', '?')}")
     print(f"  Mode: {result.get('mode', '?')}")
 

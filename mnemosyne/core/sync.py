@@ -11,6 +11,7 @@ Mnemosyne's BEAM architecture.
 import json
 import hashlib
 import logging
+import sys
 import uuid
 import os
 import base64
@@ -936,7 +937,17 @@ class SyncEngine:
 
         # Apply memory mutations through the full Mnemosyne pipeline
         # (FTS5 indexing, embeddings, entity extraction, callbacks).
-        for ev in incoming:
+        _total = len(incoming)
+        _progress_interval = max(1, _total // 50) if _total > 100 else 100
+        for idx, ev in enumerate(incoming):
+            try:
+                if _total > 100 and idx > 0 and idx % _progress_interval == 0:
+                    pct = int(idx / _total * 100)
+                    sys.stderr.write(f"\r  Progress: {idx}/{_total} ({pct}%)  \r")
+                    sys.stderr.flush()
+            except KeyboardInterrupt:
+                stats["interrupted"] = True
+                break
             try:
                 payload_dict: Optional[dict] = None
                 if ev.payload:
@@ -983,15 +994,19 @@ class SyncEngine:
                 elif ev.operation in ("CREATE", "UPDATE", "CONSOLIDATE"):
                     if content:
                         # Route through remember() for full pipeline
-                        if self._beam is not None and hasattr(self._beam, "remember"):
-                            self._beam.remember(
-                                content=content,
-                                source=source,
-                                importance=importance,
-                                metadata=metadata,
-                                memory_id=ev.memory_id,
-                            )
-                            stats["accepted"] += 1
+                        try:
+                            if self._beam is not None and hasattr(self._beam, "remember"):
+                                self._beam.remember(
+                                    content=content,
+                                    source=source,
+                                    importance=importance,
+                                    metadata=metadata,
+                                    memory_id=ev.memory_id,
+                                )
+                                stats["accepted"] += 1
+                        except KeyboardInterrupt:
+                            stats["interrupted"] = True
+                            break
                         else:
                             # Fallback: direct DeltaSync
                             delta_item: Dict[str, Any] = {"id": ev.memory_id}
@@ -1156,6 +1171,8 @@ class SyncEngine:
                     "conflicts": push_result.get("conflicts", 0),
                     "errors": push_result.get("errors", 0),
                 }
+                if push_result.get("interrupted"):
+                    result["interrupted"] = True
                 # Persist cursor so next sync picks up where we left off
                 if pull_resp.get("next_cursor"):
                     self._meta_set(
