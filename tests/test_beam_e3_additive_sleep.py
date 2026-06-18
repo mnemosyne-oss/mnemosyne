@@ -571,6 +571,29 @@ class TestE3AdditiveSleep:
         conn.close()
         assert marker is None
 
+    def test_sleep_all_sessions_force_consolidates_fresh_rows(self, temp_db, monkeypatch):
+        monkeypatch.setattr(
+            "mnemosyne.core.local_llm.llm_available", lambda: False
+        )
+        beam = BeamMemory(session_id="maintenance", db_path=temp_db)
+        _seed_old_wm(temp_db, "s1", n=1, ts_offset_hours=0)
+
+        result = beam.sleep_all_sessions(dry_run=False, force=True)
+
+        assert result["sessions_consolidated"] == 1
+        assert result["items_consolidated"] == 1
+        conn = sqlite3.connect(str(temp_db))
+        summary_of = conn.execute(
+            "SELECT summary_of FROM episodic_memory WHERE source = 'sleep_consolidation'"
+        ).fetchone()[0]
+        final = conn.execute(
+            "SELECT consolidated_at, consolidation_claimed_at FROM working_memory WHERE id = 'e3-s1-0'"
+        ).fetchone()
+        conn.close()
+        assert summary_of == "e3-s1-0"
+        assert final[0] is not None
+        assert final[1] is None
+
     def test_manual_reclaim_then_sleep_all_sessions_consolidates_orphan(self, temp_db, monkeypatch):
         monkeypatch.setattr(
             "mnemosyne.core.local_llm.llm_available", lambda: False

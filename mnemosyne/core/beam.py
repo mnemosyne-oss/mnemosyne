@@ -8009,7 +8009,7 @@ class BeamMemory:
                     author_id=self.author_id,
                     author_type=self.author_type,
                 )
-                result = beam.sleep(dry_run=dry_run)
+                result = beam.sleep(dry_run=dry_run, force=force)
                 result = dict(result)
                 result["session_id"] = session_id
                 result["eligible"] = row["eligible"] if hasattr(row, "keys") else row[1]
