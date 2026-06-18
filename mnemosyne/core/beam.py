@@ -901,6 +901,28 @@ def init_beam(db_path: Path = None):
     for table in ('memoria_timelines', 'memoria_instructions', 'memoria_preferences', 'memoria_kg'):
         _add_column_if_missing(conn, table, 'source_memory_id', 'TEXT')
 
+    # --- L3 Persona (v3.10.0) ---
+    # Always-on persona tier with explicit retention classification.
+    # Tier values: 'permanent' (manual, never evicted), 'long_term' (default,
+    # reinforcement-driven decay), 'working' (transient).
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS memoria_persona (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT DEFAULT 'default',
+            tier TEXT NOT NULL CHECK(tier IN ('permanent','long_term','working')),
+            topic TEXT NOT NULL,
+            content TEXT NOT NULL,
+            confidence REAL DEFAULT 0.7,
+            source_memory_id TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_reinforced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            reinforcement_count INTEGER DEFAULT 0,
+            promotion_reason TEXT
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_persona_session_tier ON memoria_persona(session_id, tier)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_persona_tier_topic ON memoria_persona(tier, topic)")
+
     # --- Consolidation Log ---
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS consolidation_log (

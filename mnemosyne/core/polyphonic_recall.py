@@ -417,7 +417,7 @@ class PolyphonicRecallEngine:
                         # also produces [0, 1] scores) compares apples
                         # to apples. /review (4-source) caught the
                         # raw-cosine-vs-bit-Hamming inversion bug.
-                        sim = (cos_sim + 1.0) / 2.0
+                        sim = min(1.0, max(0.0, (cos_sim + 1.0) / 2.0))
                         existing = by_id.get(memory_id)
                         if existing is None or sim > existing.score:
                             by_id[memory_id] = RecallResult(
@@ -467,7 +467,7 @@ class PolyphonicRecallEngine:
                     cos_sim = float(np.dot(query_unit, vec / vec_norm))
                     # Normalize cosine to [0, 1] -- same rationale as EM
                     # numpy path above (cross-path dedup parity).
-                    sim = (cos_sim + 1.0) / 2.0
+                    sim = min(1.0, max(0.0, (cos_sim + 1.0) / 2.0))
                     existing = by_id.get(memory_id)
                     if existing is None or sim > existing.score:
                         by_id[memory_id] = RecallResult(
