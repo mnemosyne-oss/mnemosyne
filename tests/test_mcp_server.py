@@ -87,6 +87,7 @@ class TestToolSchemas:
         assert "limit" in schema["properties"]
         # bank is not in the schema - handled via MCP server env var MNEMOSYNE_MCP_BANK
         assert "temporal_weight" in schema["properties"]
+        assert schema["properties"]["explain"]["type"] == "boolean"
 
     def test_destructive_tools_exist(self):
         """Destructive tools are now exposed (Phase 7+)."""
@@ -200,6 +201,29 @@ class TestToolHandlers:
         assert result["count"] == 1
         assert len(result["results"]) == 1
         mock_mnemosyne.recall.assert_called_once()
+        assert mock_mnemosyne.recall.call_args.kwargs["explain"] is False
+
+    def test_handle_recall_explain_unwraps_payload(self, mock_mnemosyne):
+        mock_mnemosyne.recall.return_value = {
+            "query": "test query",
+            "top_k": 5,
+            "results": [{"id": "mem1", "content": "Test content", "score": 0.95}],
+            "explain": {"stages": [], "candidates": []},
+        }
+        with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
+            result = handle_tool_call("mnemosyne_recall", {
+                "query": "test query",
+                "top_k": 5,
+                "explain": True,
+                "bank": "default",
+            })
+
+        assert result["status"] == "ok"
+        assert result["query"] == "test query"
+        assert result["top_k"] == 5
+        assert result["count"] == 1
+        assert "explain" in result
+        assert mock_mnemosyne.recall.call_args.kwargs["explain"] is True
 
     def test_handle_recall_forwards_scoring_weights(self, mock_mnemosyne):
         """Schema-advertised recall weights should be forwarded to Mnemosyne.recall()."""

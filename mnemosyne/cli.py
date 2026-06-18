@@ -85,12 +85,38 @@ def cmd_store(args):
 def cmd_recall(args):
     """Search memories."""
     if not args:
-        _usage("Usage: mnemosyne recall <query> [top_k]")
-    query = args[0]
-    top_k = _parse_int(args[1], "top_k") if len(args) > 1 else 5
+        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json]")
+
+    explain = False
+    json_output = False
+    positionals = []
+    for arg in args:
+        if arg == "--explain":
+            explain = True
+        elif arg == "--json":
+            json_output = True
+        else:
+            positionals.append(arg)
+
+    if not positionals:
+        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json]")
+    query = positionals[0]
+    top_k = _parse_int(positionals[1], "top_k") if len(positionals) > 1 else 5
 
     mem = _get_memory()
-    results = mem.recall(query, top_k=top_k)
+    payload = mem.recall(query, top_k=top_k, explain=explain)
+    if explain:
+        results = payload.get("results", [])
+    else:
+        results = payload
+
+    if json_output:
+        if explain:
+            print(json.dumps(payload, ensure_ascii=False, default=str))
+        else:
+            print(json.dumps({"query": query, "top_k": top_k, "results": results}, ensure_ascii=False, default=str))
+        return
+
     print(f"\nResults for: {query}\n")
     for r in results:
         content = r.get("content", "")

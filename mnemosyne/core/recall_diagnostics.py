@@ -34,7 +34,7 @@ import logging
 import threading
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,89 @@ logger = logging.getLogger(__name__)
 # to know what fraction of their recall traffic actually comes from
 # the FTS/vec primary path vs. the substring/recency fallback.
 RECALL_TIERS = ("wm_fts", "wm_vec", "wm_fallback", "em_fts", "em_vec", "em_fallback")
+
+
+class RecallExplainTrace:
+    """Per-query recall explanation recorder.
+
+    This is intentionally opt-in and local to one recall() call. It is not
+    connected to the process-global counters above, so explain=False keeps the
+    existing hot path free of per-candidate allocations.
+    """
+
+    def __init__(self, *, query: str, top_k: int, engine: str, filters: Dict[str, Any], weights: Dict[str, Any]) -> None:
+        self.query = query
+        self.top_k = top_k
+        self.engine = engine
+        self.filters = {k: v for k, v in filters.items() if v is not None}
+        self.weights = weights
+        self.embedding = {"available": False, "computed": False}
+        self.stages: List[Dict[str, Any]] = []
+        self.candidates: List[Dict[str, Any]] = []
+        self.truncated_count = 0
+
+    def set_embedding(self, *, available: bool, computed: bool) -> None:
+        self.embedding = {"available": bool(available), "computed": bool(computed)}
+
+    def add_stage(self, name: str, *, raw_count: int, after_filter_count: int, kept_count: int, fallback_used: bool = False) -> None:
+        self.stages.append({
+            "name": name,
+            "raw_count": int(raw_count),
+            "after_filter_count": int(after_filter_count),
+            "kept_count": int(kept_count),
+            "fallback_used": bool(fallback_used),
+        })
+
+    @staticmethod
+    def _source_path(result: Dict[str, Any]) -> str:
+        tier = result.get("tier") or "unknown"
+        if tier == "working":
+            if result.get("fts_score", 0.0) > 0:
+                return "wm_fts"
+            if result.get("dense_score", 0.0) > 0:
+                return "wm_vec"
+            return "wm_fallback"
+        if tier == "episodic":
+            if result.get("fts_score", 0.0) > 0:
+                return "em_fts"
+            if result.get("dense_score", 0.0) > 0:
+                return "em_vec"
+            return "em_fallback"
+        return str(tier)
+
+    def add_ranked_candidates(self, ranked_results: List[Dict[str, Any]], final_results: List[Dict[str, Any]], *, preview_chars: int = 120, max_candidates: int = 50) -> None:
+        final_ids = {r.get("id") for r in final_results}
+        self.truncated_count = max(0, len(ranked_results) - len(final_results))
+        for rank, result in enumerate(ranked_results[:max_candidates], start=1):
+            kept = result.get("id") in final_ids
+            content = str(result.get("content") or "")
+            self.candidates.append({
+                "id": result.get("id") if kept else None,
+                "tier": result.get("tier"),
+                "source_path": self._source_path(result),
+                "rank": rank,
+                "kept": kept,
+                "drop_reason": None if kept else "top_k_truncated",
+                "scores": {
+                    "keyword": result.get("keyword_score", 0.0),
+                    "fts": result.get("fts_score", 0.0),
+                    "dense": result.get("dense_score", 0.0),
+                    "importance": result.get("importance", 0.0),
+                    "recency_decay": result.get("recency_decay", 0.0),
+                    "final": result.get("score", 0.0),
+                },
+                "content_preview": content[:preview_chars] if kept else None,
+            })
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "filters": self.filters,
+            "weights": self.weights,
+            "embedding": self.embedding,
+            "stages": self.stages,
+            "candidates": self.candidates,
+            "truncation": {"top_k": self.top_k, "dropped_count": self.truncated_count},
+        }
 
 
 @dataclass

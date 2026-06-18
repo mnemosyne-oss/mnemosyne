@@ -89,6 +89,11 @@ RECALL_SCHEMA = {
                 "type": "number",
                 "description": "Importance score weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_IMPORTANCE_WEIGHT env var or built-in default 0.2.",
             },
+            "explain": {
+                "type": "boolean",
+                "description": "If true, return a structured per-query recall explain trace. Default false.",
+                "default": False,
+            },
         },
         "required": ["query"],
     },

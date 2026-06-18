@@ -16,6 +16,54 @@ from hermes_memory_provider import MnemosyneMemoryProvider
 from mnemosyne.core.llm_backends import get_host_llm_backend
 
 
+class _RecallBeam:
+    def __init__(self):
+        self.kwargs = None
+
+    def recall(self, query, **kwargs):
+        self.kwargs = kwargs
+        if kwargs.get("explain"):
+            return {
+                "query": query,
+                "top_k": kwargs.get("top_k"),
+                "results": [{"id": "m1", "content": "Alice", "score": 1.0}],
+                "explain": {"stages": [], "candidates": []},
+            }
+        return [{"id": "m1", "content": "Alice", "score": 1.0}]
+
+
+def _provider_with_recall_beam():
+    provider = MnemosyneMemoryProvider()
+    provider._beam = _RecallBeam()
+    provider._shared_surface_read = False
+    return provider
+
+
+def test_recall_schema_exposes_explain_flag():
+    schema = next(s for s in MnemosyneMemoryProvider().get_tool_schemas() if s["name"] == "mnemosyne_recall")
+    assert schema["parameters"]["properties"]["explain"]["type"] == "boolean"
+
+
+def test_handle_recall_explain_forwards_and_unwraps_payload():
+    provider = _provider_with_recall_beam()
+
+    payload = json.loads(provider._handle_recall({"query": "Alice", "explain": True}))
+
+    assert provider._beam.kwargs["explain"] is True
+    assert payload["results"][0]["bank"] == "private"
+    assert "explain" in payload
+
+
+def test_handle_recall_normal_shape_unchanged():
+    provider = _provider_with_recall_beam()
+
+    payload = json.loads(provider._handle_recall({"query": "Alice"}))
+
+    assert provider._beam.kwargs["explain"] is False
+    assert "explain" not in payload
+    assert payload["results"][0]["bank"] == "private"
+
+
 # ---------------------------------------------------------------------------
 # initialize() registration
 # ---------------------------------------------------------------------------

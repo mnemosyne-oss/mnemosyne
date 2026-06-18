@@ -396,7 +396,8 @@ class Mnemosyne:
                temporal_halflife: Optional[float] = None,
                vec_weight: float = None,
                fts_weight: float = None,
-               importance_weight: float = None) -> List[Dict]:
+               importance_weight: float = None,
+               explain: bool = False) -> List[Dict]:
         """
         Search memories with hybrid relevance scoring.
         Uses BEAM episodic + working memory retrieval (sqlite-vec + FTS5).
@@ -415,7 +416,8 @@ class Mnemosyne:
                                 temporal_halflife=temporal_halflife,
                                 vec_weight=vec_weight,
                                 fts_weight=fts_weight,
-                                importance_weight=importance_weight)
+                                importance_weight=importance_weight,
+                                explain=explain)
 
     def _emit_wrapper(self, event_type: str, memory_id: str, **kwargs) -> None:
         """Emit a streaming event through the Mnemosyne wrapper layer."""
@@ -934,6 +936,7 @@ def recall(query: str, top_k: int = 5, *,
            vec_weight: float = None,
            fts_weight: float = None,
            importance_weight: float = None,
+           explain: bool = False,
            bank: str = None) -> List[Dict]:
     """Search memories using the global instance with temporal filtering and scoring"""
     return _get_default(bank).recall(query, top_k,
@@ -944,7 +947,8 @@ def recall(query: str, top_k: int = 5, *,
                                      temporal_halflife=temporal_halflife,
                                      vec_weight=vec_weight,
                                      fts_weight=fts_weight,
-                                     importance_weight=importance_weight)
+                                     importance_weight=importance_weight,
+                                     explain=explain)
 
 
 def get_context(limit: int = 10, bank: str = None) -> List[Dict]:

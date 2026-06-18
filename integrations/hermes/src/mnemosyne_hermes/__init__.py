@@ -1217,6 +1217,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
         temporal_weight = float(args.get("temporal_weight", 0.0))
         query_time = args.get("query_time") or None
         temporal_halflife_hours = float(args.get("temporal_halflife", 24))
+        explain = bool(args.get("explain", False))
         if not query:
             return json.dumps({"error": "query is required"})
 
@@ -1230,12 +1231,20 @@ class MnemosyneMemoryProvider(MemoryProvider):
             "temporal_weight": temporal_weight,
             "query_time": query_time,
             "temporal_halflife": temporal_halflife_hours,
+            "explain": explain,
         }
         for weight_key in ("vec_weight", "fts_weight", "importance_weight"):
             if weight_key in args:
                 recall_kwargs[weight_key] = args[weight_key]
 
-        results = self._beam.recall(query, **recall_kwargs)
+        recall_payload = self._beam.recall(query, **recall_kwargs)
+        explain_payload = None
+        if explain:
+            explain_payload = recall_payload.get("explain", {})
+            results = recall_payload.get("results", [])
+        else:
+            results = recall_payload
+
         # Tag private results with their bank so callers can distinguish from
         # shared-surface entries when surface read is enabled.
         for r in results:
@@ -1259,16 +1268,21 @@ class MnemosyneMemoryProvider(MemoryProvider):
                     combined = list(results) + list(surface_results)
                     combined.sort(key=lambda x: x.get("score") or 0.0, reverse=True)
                     results = combined[:top_k]
+                    if explain_payload is not None:
+                        explain_payload.setdefault("provider", {})["shared_surface_untraced"] = len(surface_results)
                 except Exception as exc:
                     logger.warning("Mnemosyne shared surface recall failed: %s", exc)
 
-        return json.dumps({
+        response = {
             "query": query,
             "count": len(results),
             "temporal_weight": temporal_weight,
             "shared_surface_read": self._shared_surface_read,
             "results": results,
-        })
+        }
+        if explain_payload is not None:
+            response["explain"] = explain_payload
+        return json.dumps(response)
 
     @staticmethod
     def _surface_hash(content: str) -> str:

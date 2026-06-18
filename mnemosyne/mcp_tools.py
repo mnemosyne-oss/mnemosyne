@@ -37,7 +37,10 @@ from mnemosyne.core.beam import BeamMemory
 try:
     from mnemosyne_hermes.tools import ALL_TOOL_SCHEMAS
 except ImportError:
-    ALL_TOOL_SCHEMAS = []
+    try:
+        from hermes_memory_provider import ALL_TOOL_SCHEMAS
+    except ImportError:
+        ALL_TOOL_SCHEMAS = []
 
 # ---------------------------------------------------------------------------
 # Tool Definitions
@@ -230,9 +233,10 @@ def _handle_recall(arguments: Dict[str, Any]) -> Dict[str, Any]:
     vec_weight = arguments.get("vec_weight")
     fts_weight = arguments.get("fts_weight")
     importance_weight = arguments.get("importance_weight")
+    explain = bool(arguments.get("explain", False))
 
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
-    results = mem.recall(
+    recall_payload = mem.recall(
         query=query,
         top_k=top_k,
         temporal_weight=temporal_weight,
@@ -241,7 +245,14 @@ def _handle_recall(arguments: Dict[str, Any]) -> Dict[str, Any]:
         vec_weight=vec_weight,
         fts_weight=fts_weight,
         importance_weight=importance_weight,
+        explain=explain,
     )
+    if explain:
+        results = recall_payload.get("results", [])
+        explain_payload = recall_payload.get("explain", {})
+    else:
+        results = recall_payload
+        explain_payload = None
 
     serializable = []
     for r in results:
@@ -252,12 +263,15 @@ def _handle_recall(arguments: Dict[str, Any]) -> Dict[str, Any]:
                     item[key] = item[key].isoformat()
         serializable.append(item)
 
-    return {
+    response = {
         "status": "ok",
         "count": len(serializable),
         "results": serializable,
         "bank": bank
     }
+    if explain_payload is not None:
+        response.update({"query": query, "top_k": top_k, "explain": explain_payload})
+    return response
 
 
 def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:

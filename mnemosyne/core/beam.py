@@ -5134,7 +5134,8 @@ class BeamMemory:
                temporal_halflife: Optional[float] = None,
                vec_weight: float = None,
                fts_weight: float = None,
-               importance_weight: float = None) -> List[Dict]:
+               importance_weight: float = None,
+               explain: bool = False) -> List[Dict]:
         """
         Hybrid recall across working_memory + episodic_memory.
         Uses sqlite-vec + FTS5 for episodic, FTS5 for working.
@@ -5193,7 +5194,7 @@ class BeamMemory:
         # contract as the linear path. /review found that omitting
         # them under flag=ON was a data-isolation regression (P1).
         if os.environ.get("MNEMOSYNE_POLYPHONIC_RECALL", "0") == "1":
-            return self._recall_polyphonic(
+            poly_results = self._recall_polyphonic(
                 query, top_k,
                 from_date=from_date, to_date=to_date,
                 source=source, topic=topic,
@@ -5201,6 +5202,18 @@ class BeamMemory:
                 channel_id=channel_id,
                 veracity=veracity, memory_type=memory_type,
             )
+            if explain:
+                return {
+                    "query": query,
+                    "top_k": top_k,
+                    "engine": "polyphonic",
+                    "results": poly_results,
+                    "explain": {
+                        "unsupported": True,
+                        "reason": "polyphonic recall explain is not implemented in v1; inspect per-result voice_scores instead.",
+                    },
+                }
+            return poly_results
 
         results = []
         query_lower = query.lower()
@@ -5208,6 +5221,26 @@ class BeamMemory:
 
         # ---- Configurable hybrid scoring setup (Phase 4) ----
         vw, fw, iw = _normalize_weights(vec_weight, fts_weight, importance_weight)
+        _explain_trace = None
+        if explain:
+            from mnemosyne.core.recall_diagnostics import RecallExplainTrace
+            _explain_trace = RecallExplainTrace(
+                query=query,
+                top_k=top_k,
+                engine="linear",
+                filters={
+                    "from_date": from_date,
+                    "to_date": to_date,
+                    "source": source,
+                    "topic": topic,
+                    "author_id": author_id,
+                    "author_type": author_type,
+                    "channel_id": channel_id,
+                    "veracity": veracity,
+                    "memory_type": memory_type,
+                },
+                weights={"vec": vw, "fts": fw, "importance": iw, "temporal": temporal_weight},
+            )
 
         # Query embeddings are used by several recall subpaths. Compute the
         # vector at most once per recall() call, then reuse it for working
@@ -5263,6 +5296,7 @@ class BeamMemory:
             wm_fts = _fts_search_working(self.conn, query, k=max(top_k * 3, 50))
         except Exception:
             wm_fts = []
+        _wm_fts_raw_count = len(wm_fts)
 
         wm_ids = {r["id"] for r in wm_fts}
         wm_ranks = {r["id"]: r["rank"] for r in wm_fts}
@@ -5370,6 +5404,8 @@ class BeamMemory:
             # scoring loop above. record_fallback_used was already
             # called when wm_ids was empty.
 
+        _wm_after_filter_count = len(rows)
+
         # Precompute min_rank/rng for wm_ranks normalization
         if wm_ranks:
             min_rank = min(wm_ranks.values())
@@ -5465,6 +5501,15 @@ class BeamMemory:
             # fallback scanned candidate rows, even if the stricter relevance
             # gate abstained from returning them.
             _wm_fallback_kept = len(rows)
+
+        if _explain_trace is not None:
+            _explain_trace.add_stage(
+                "wm_fallback" if _wm_fallback_used else "wm_primary",
+                raw_count=_wm_fts_raw_count + len(wm_vec_sims),
+                after_filter_count=_wm_after_filter_count,
+                kept_count=_wm_fts_kept + _wm_vec_kept + _wm_fallback_kept,
+                fallback_used=_wm_fallback_used,
+            )
 
         # ---- Entity-aware recall ----
         entity_memory_ids = _find_memories_by_entity(self, query)
@@ -5737,6 +5782,7 @@ class BeamMemory:
 
         fts_results = {}
         fts_rows = _fts_search(self.conn, query, k=max(top_k * 3, 20))
+        _em_fts_raw_count = len(fts_rows)
         if fts_rows:
             min_rank = min(r["rank"] for r in fts_rows)
             max_rank = max(r["rank"] for r in fts_rows)
@@ -5812,7 +5858,10 @@ class BeamMemory:
                 WHERE rowid IN ({placeholders})
                   AND {em_where}
             """, (*tuple(episodic_rowids), *em_params))
-        for row in cursor.fetchall():
+            _em_candidate_rows = cursor.fetchall()
+        else:
+            _em_candidate_rows = []
+        for row in _em_candidate_rows:
             rid = row["rowid"]
             sim = vec_results.get(rid, 0.0)
             fts = fts_results.get(rid, 0.0)
@@ -5921,6 +5970,15 @@ class BeamMemory:
                 "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None
             })
 
+        if _explain_trace is not None and episodic_rowids:
+            _explain_trace.add_stage(
+                "em_primary",
+                raw_count=_em_fts_raw_count + len(vec_results),
+                after_filter_count=len(_em_candidate_rows),
+                kept_count=_em_fts_kept + _em_vec_kept,
+                fallback_used=False,
+            )
+
         # Fallback: if no episodic matches from vec/FTS, scan recent episodic entries
         if not episodic_rowids:
             _em_fallback_used = True
@@ -6024,6 +6082,15 @@ class BeamMemory:
                         "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
                         "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None
                     })
+
+            if _explain_trace is not None:
+                _explain_trace.add_stage(
+                    "em_fallback",
+                    raw_count=len(_em_fallback_rows),
+                    after_filter_count=len(_em_fallback_rows),
+                    kept_count=_em_fallback_kept,
+                    fallback_used=True,
+                )
 
         # --- Tiered degradation weighting: apply tier multiplier to episodic scores ---
         weight_map = {1: TIER1_WEIGHT, 2: TIER2_WEIGHT, 3: TIER3_WEIGHT}
@@ -6176,6 +6243,7 @@ class BeamMemory:
                 covered.update(set(_recall_tokens(picked.get("content", "").lower())) & q_word_set)
             results = selected + pool
 
+        _ranked_results_for_explain = list(results) if _explain_trace is not None else None
         final_results = results[:top_k]
 
         # --- Recall tracking: increment counts + set last_recalled ---
@@ -6268,6 +6336,20 @@ class BeamMemory:
                 final_results = final_results[:top_k]
             except Exception:
                 logger.debug("fact recall integration failed (non-fatal)", exc_info=True)
+
+        if _explain_trace is not None:
+            _explain_trace.set_embedding(
+                available=embeddings_available,
+                computed=query_embedding_computed,
+            )
+            _explain_trace.add_ranked_candidates(_ranked_results_for_explain or [], final_results)
+            return {
+                "query": query,
+                "top_k": top_k,
+                "engine": "linear",
+                "results": final_results,
+                "explain": _explain_trace.to_dict(),
+            }
 
         return final_results
 

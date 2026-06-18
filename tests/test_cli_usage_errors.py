@@ -1,5 +1,6 @@
 """CLI usage error regression tests."""
 
+import json
 import os
 import subprocess
 import sys
@@ -55,3 +56,17 @@ def test_help_exits_successfully(tmp_path):
     assert result.returncode == 0
     assert "Usage: mnemosyne <command> [args]" in result.stdout
     assert "Traceback" not in result.stderr
+
+
+def test_recall_explain_json_outputs_parseable_payload(tmp_path):
+    store = run_cli(["store", "Alice prefers Vim", "cli", "0.8"], tmp_path)
+    assert store.returncode == 0, store.stderr
+
+    result = run_cli(["recall", "Alice", "--explain", "--json"], tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["query"] == "Alice"
+    assert payload["top_k"] == 5
+    assert isinstance(payload["results"], list)
+    assert "explain" in payload
