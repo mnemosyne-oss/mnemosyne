@@ -78,6 +78,28 @@ def _remove_link(link_path: Path) -> None:
         shutil.rmtree(link_path)
 
 
+def _make_link(target: Path, source: Path) -> tuple[bool, str]:
+    """Create a symlink (POSIX) or junction (Windows) from target to source.
+
+    Returns (ok, message). The caller must remove any existing path at
+    ``target`` first.
+    """
+    if _is_windows():
+        import subprocess
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(target), str(source)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return False, f"Failed to create junction: {result.stderr.strip()}"
+        return True, f"Junction: {target} -> {source}"
+    try:
+        target.symlink_to(source, target_is_directory=True)
+    except OSError as e:
+        return False, f"Failed to create symlink: {e}"
+    return True, f"Symlinked: {target} -> {source}"
+
+
 def _ensure_link() -> bool:
     """Create the plugin link from ~/.hermes/plugins/mnemosyne -> hermes_memory_provider.
 
@@ -125,20 +147,182 @@ def _ensure_link() -> bool:
         _remove_link(target)
         print(f"🔄 Removed existing {target}")
 
-    if _is_windows():
-        import subprocess
-        result = subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(target), str(source)],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            print(f"❌ Failed to create junction: {result.stderr.strip()}")
-            return False
-        print(f"✅ Junction: {target} -> {source}")
-    else:
-        target.symlink_to(source, target_is_directory=True)
-        print(f"✅ Symlinked: {target} -> {source}")
+    ok, msg = _make_link(target, source)
+    if not ok:
+        print(f"❌ {msg}")
+        return False
+    print(f"✅ {msg}")
     return True
+
+
+def _config_selects_mnemosyne(text: str) -> bool:
+    """Return True when a profile config selects ``memory.provider: mnemosyne``.
+
+    Prefers a real YAML parse, which ignores comments and tolerates arbitrary
+    whitespace. The line-anchored regex is used **only** when PyYAML is genuinely
+    unavailable (``ImportError``), so the core package keeps working without a
+    hard YAML dependency. Malformed YAML is treated as "not opted in" rather than
+    falling through to the looser regex.
+    """
+    try:
+        import yaml
+    except ImportError:
+        import re
+        return re.search(
+            r"^\s*provider\s*:\s*mnemosyne\s*(#.*)?$", text, re.MULTILINE
+        ) is not None
+    try:
+        cfg = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return False
+    if isinstance(cfg, dict):
+        memory = cfg.get("memory")
+        if isinstance(memory, dict):
+            return memory.get("provider") == "mnemosyne"
+    return False
+
+
+def _iter_mnemosyne_profiles() -> list[Path]:
+    """Return profile dirs under <hermes_home>/profiles/* that opt into Mnemosyne.
+
+    A profile opts in when its ``config.yaml`` parses to
+    ``memory.provider == "mnemosyne"`` (see ``_config_selects_mnemosyne``).
+    Symlinked profile entries are skipped (the installer must not follow a
+    profile symlink and write under its target). Profiles without a
+    ``config.yaml`` are skipped. Returns an empty list when no ``profiles/``
+    directory exists (the default, no-profile install).
+    """
+    hermes_home = _get_hermes_home()
+    if not hermes_home:
+        return []
+    profiles_dir = hermes_home / "profiles"
+    if not profiles_dir.is_dir():
+        return []
+    selected: list[Path] = []
+    for child in sorted(profiles_dir.iterdir()):
+        if child.is_symlink():
+            continue
+        if not child.is_dir():
+            continue
+        config_path = child / "config.yaml"
+        if not config_path.is_file():
+            continue
+        try:
+            text = config_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if _config_selects_mnemosyne(text):
+            selected.append(child)
+    return selected
+
+
+def _link_profile(profile_home: Path, source: Path, *, force: bool = False) -> bool:
+    """Link ``profile_home/plugins/mnemosyne`` to source. Idempotent.
+
+    A link already pointing at ``source`` is left untouched. A stale or broken
+    symlink is replaced. A real (non-symlink) path is left in place and reported
+    unless ``force`` is set — the installer never silently deletes user data.
+    Returns True on success.
+    """
+    plugins_dir = profile_home / "plugins"
+    plugins_dir.mkdir(parents=True, exist_ok=True)
+    target = plugins_dir / "mnemosyne"
+
+    if target.is_symlink():
+        try:
+            if target.resolve() == source.resolve():
+                print(f"✅ Profile {profile_home.name}: already linked")
+                return True
+        except OSError:
+            pass
+        _remove_link(target)  # stale/broken symlink — safe to replace
+    elif target.exists():
+        if not force:
+            print(f"⏭️  Profile {profile_home.name}: {target} exists (not a link), skipped")
+            return False
+        _remove_link(target)
+
+    ok, msg = _make_link(target, source)
+    print(f"{'✅' if ok else '❌'} Profile {profile_home.name}: {msg}")
+    return ok
+
+
+def _link_all_profiles() -> None:
+    """Link Mnemosyne into every opted-in profile. No-op without profiles.
+
+    A failure on one profile is reported and does not abort the remaining
+    profiles.
+    """
+    profiles = _iter_mnemosyne_profiles()
+    if not profiles:
+        return
+    source = _get_mnemosyne_root() / "hermes_memory_provider"
+    print()
+    print(f"🔗 Linking {len(profiles)} profile(s)...")
+    for profile_home in profiles:
+        try:
+            _link_profile(profile_home, source)
+        except OSError as e:
+            print(f"❌ Profile {profile_home.name}: {e}")
+
+
+def _unlink_all_profiles() -> None:
+    """Remove the per-profile plugin links created by ``_link_all_profiles``.
+
+    Scans every profile directory by *link*, not by config opt-in: a profile's
+    ``plugins/mnemosyne`` is removed when it is a symlink resolving to the
+    provider source, regardless of what (or whether) the profile's
+    ``config.yaml`` currently selects. This still never touches a real directory
+    or a link pointing elsewhere. Symlinked profile entries are skipped.
+    """
+    hermes_home = _get_hermes_home()
+    if not hermes_home:
+        return
+    profiles_dir = hermes_home / "profiles"
+    if not profiles_dir.is_dir():
+        return
+    source = _get_mnemosyne_root() / "hermes_memory_provider"
+    for child in sorted(profiles_dir.iterdir()):
+        if child.is_symlink():
+            continue
+        target = child / "plugins" / "mnemosyne"
+        if not target.is_symlink():
+            continue
+        try:
+            if target.resolve() == source.resolve():
+                _remove_link(target)
+                print(f"Removed profile link: {target}")
+        except OSError:
+            continue
+
+
+def _verify_links() -> bool:
+    """Print PASS/FAIL for each home that should have a resolvable plugin link.
+
+    Checks the default home plus every opted-in profile. Returns True only
+    when every checked link resolves to the provider source.
+    """
+    source = _get_mnemosyne_root() / "hermes_memory_provider"
+    hermes_home = _get_hermes_home()
+    homes: list[Path] = []
+    if hermes_home:
+        homes.append(hermes_home)
+    homes.extend(_iter_mnemosyne_profiles())
+
+    all_ok = True
+    print()
+    print("🔍 Verifying plugin links...")
+    for home in homes:
+        target = home / "plugins" / "mnemosyne"
+        ok = target.is_symlink() or target.exists()
+        if ok:
+            try:
+                ok = target.resolve() == source.resolve()
+            except OSError:
+                ok = False
+        all_ok = all_ok and ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {home.name or home}: {target}")
+    return all_ok
 
 
 def _configure_hermes() -> bool:
@@ -217,19 +401,23 @@ def install():
     print("=" * 40)
     print()
 
-    # Step 1: Link (symlink on POSIX, junction on Windows)
+    # Step 1: Link default home (symlink on POSIX, junction on Windows)
     if not _ensure_link():
         print()
         print("❌ Install failed at symlink step.")
         sys.exit(1)
 
-    # Step 2: Configure
+    # Step 1b: Link any named profiles that opt into Mnemosyne
+    _link_all_profiles()
+
+    # Step 2: Configure (default home only — profile configs stay the user's)
     _configure_hermes()
 
     # Step 3: Verify
     print()
     print("🔍 Verifying...")
     _verify()
+    _verify_links()
 
     print()
     print("✅ Mnemosyne is ready!")
@@ -260,6 +448,9 @@ def uninstall():
         print(f"Removed {target}")
     else:
         print("ℹ️  Mnemosyne plugin not found in Hermes.")
+
+    # Remove any per-profile links created at install time
+    _unlink_all_profiles()
 
     # Reset config
     config_path = hermes_home / "config.yaml"
