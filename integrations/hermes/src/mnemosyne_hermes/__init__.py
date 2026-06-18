@@ -1157,6 +1157,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 return self._handle_graph_link(args)
             elif tool_name.startswith("mnemosyne_sync_"):
                 return self._handle_sync_tool(tool_name, args)
+            elif tool_name.startswith("mnemosyne_persona_"):
+                return self._handle_persona_tool(tool_name, args)
             else:
                 return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
         except Exception as e:
@@ -1173,6 +1175,17 @@ class MnemosyneMemoryProvider(MemoryProvider):
             return adapter.handle_tool_call(tool_name, args)
         except Exception as exc:
             return json.dumps({"status": "error", "error": f"Sync adapter unavailable: {exc}"})
+
+    def _handle_persona_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
+        try:
+            adapter = getattr(self, "_provider_persona_adapter", None)
+            if adapter is None:
+                from mnemosyne_hermes.persona_adapter import PersonaAdapter
+                adapter = PersonaAdapter(self._beam, {})
+                self._provider_persona_adapter = adapter
+            return adapter.handle_tool_call(tool_name, args)
+        except Exception as exc:
+            return json.dumps({"status": "error", "error": f"Persona adapter unavailable: {exc}"})
 
     def _handle_remember(self, args: Dict[str, Any]) -> str:
         # Import at call-site so the provider module loads even when

@@ -58,6 +58,7 @@ def test_provider_tool_sets_match(provider_modules):
 
     assert tool_sets["hermes_memory_provider"] == tool_sets["mnemosyne_hermes"]
     assert "mnemosyne_sync_push" in tool_sets["hermes_memory_provider"]
+    assert "mnemosyne_persona_list" in tool_sets["hermes_memory_provider"]
     assert "mnemosyne_triple_end" in tool_sets["hermes_memory_provider"]
 
 
@@ -167,3 +168,34 @@ def test_provider_sync_turn_zero_limit_means_untruncated(monkeypatch, provider_m
         "[USER] user-content",
         "[ASSISTANT] assistant-content",
     ]
+
+
+def test_provider_persona_tool_dispatch_matches(tmp_path, provider_modules):
+    from mnemosyne.core.beam import BeamMemory
+
+    observed = {}
+    for name, module in provider_modules.items():
+        db_path = tmp_path / f"{name}.db"
+        beam = BeamMemory(session_id=f"persona-{name}", db_path=str(db_path))
+        beam.conn.execute(
+            "INSERT INTO memoria_persona (tier, topic, content, confidence) "
+            "VALUES (?, ?, ?, ?)",
+            ("long_term", "test", f"persona rule for {name}", 0.9),
+        )
+        beam.conn.commit()
+
+        provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+        provider._beam = beam
+        result = json.loads(provider.handle_tool_call("mnemosyne_persona_list", {}))
+        observed[name] = {
+            "status": result.get("status"),
+            "count": result.get("count"),
+            "topics": [row.get("topic") for row in result.get("personas", [])],
+        }
+
+    assert observed["hermes_memory_provider"] == observed["mnemosyne_hermes"]
+    assert observed["hermes_memory_provider"] == {
+        "status": "ok",
+        "count": 1,
+        "topics": ["test"],
+    }

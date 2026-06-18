@@ -961,6 +961,22 @@ try:
 except Exception:  # pragma: no cover - sync extras are optional at import time
     ALL_SYNC_TOOL_SCHEMAS = []
 
+try:
+    from hermes_memory_provider.persona_tools import (
+        PERSONA_PROMOTE_SCHEMA,
+        PERSONA_DEMOTE_SCHEMA,
+        PERSONA_LIST_SCHEMA,
+        PERSONA_REINFORCE_SCHEMA,
+    )
+    ALL_PERSONA_TOOL_SCHEMAS = [
+        PERSONA_PROMOTE_SCHEMA,
+        PERSONA_DEMOTE_SCHEMA,
+        PERSONA_LIST_SCHEMA,
+        PERSONA_REINFORCE_SCHEMA,
+    ]
+except Exception:  # pragma: no cover - persona extras are optional at import time
+    ALL_PERSONA_TOOL_SCHEMAS = []
+
 ALL_TOOL_SCHEMAS = [
     REMEMBER_SCHEMA, RECALL_SCHEMA, SHARED_REMEMBER_SCHEMA, SHARED_RECALL_SCHEMA,
     SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
@@ -971,6 +987,7 @@ ALL_TOOL_SCHEMAS = [
     EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,
     *ALL_SYNC_TOOL_SCHEMAS,
+    *ALL_PERSONA_TOOL_SCHEMAS,
 ]
 
 
@@ -1999,6 +2016,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 return self._handle_graph_link(args)
             elif tool_name.startswith("mnemosyne_sync_"):
                 return self._handle_sync_tool(tool_name, args)
+            elif tool_name.startswith("mnemosyne_persona_"):
+                return self._handle_persona_tool(tool_name, args)
             else:
                 return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
         except Exception as e:
@@ -2014,7 +2033,24 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 self._sync_adapter = adapter
             return adapter.handle_tool_call(tool_name, args)
         except Exception as exc:
-            return json.dumps({"status": "error", "error": f"Sync adapter unavailable: {exc}"})
+            return json.dumps({
+                "status": "error",
+                "error": f"Sync adapter unavailable: {exc}",
+            })
+
+    def _handle_persona_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
+        try:
+            adapter = getattr(self, "_persona_adapter", None)
+            if adapter is None:
+                from hermes_memory_provider.persona_adapter import PersonaAdapter
+                adapter = PersonaAdapter(self._beam, {})
+                self._persona_adapter = adapter
+            return adapter.handle_tool_call(tool_name, args)
+        except Exception as exc:
+            return json.dumps({
+                "status": "error",
+                "error": f"Persona adapter unavailable: {exc}",
+            })
 
     def _handle_remember(self, args: Dict[str, Any]) -> str:
         # Import at call-site so the provider module loads even when
