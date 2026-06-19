@@ -6,8 +6,14 @@ Available via: hermes mnemosyne <subcommand>
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
+
+_BANK_HELP = (
+    "Mnemosyne bank to operate on. Defaults to the active Hermes profile's bank "
+    "when profile_isolation is enabled, otherwise the shared default bank."
+)
 
 
 def register_cli(subparser):
@@ -16,15 +22,18 @@ def register_cli(subparser):
 
     stats_cmd = mn_cmds.add_parser("stats", help="Show memory statistics")
     stats_cmd.add_argument("--global", "-g", action="store_true", help="Show global stats across all sessions")
+    stats_cmd.add_argument("--bank", type=str, help=_BANK_HELP)
 
     sleep_cmd = mn_cmds.add_parser("sleep", help="Run consolidation cycle")
     sleep_cmd.add_argument("--all-sessions", action="store_true", help="Consolidate eligible old working memories across all sessions")
     sleep_cmd.add_argument("--dry-run", action="store_true", help="Report what would be consolidated without writing changes")
+    sleep_cmd.add_argument("--bank", type=str, help=_BANK_HELP)
     mn_cmds.add_parser("version", help="Show Mnemosyne version")
 
     inspect_cmd = mn_cmds.add_parser("inspect", help="Search memories")
     inspect_cmd.add_argument("query", nargs="?", default="", help="Search query")
     inspect_cmd.add_argument("--limit", type=int, default=10, help="Max results")
+    inspect_cmd.add_argument("--bank", type=str, help=_BANK_HELP)
 
     mn_cmds.add_parser("clear", help="Clear scratchpad")
 
@@ -34,6 +43,7 @@ def register_cli(subparser):
 
     export_cmd = mn_cmds.add_parser("export", help="Export all memories to a JSON file")
     export_cmd.add_argument("--output", "-o", type=str, required=True, help="Output JSON file path")
+    export_cmd.add_argument("--bank", type=str, help=_BANK_HELP)
 
     import_cmd = mn_cmds.add_parser("import", help="Import memories from a JSON file or another provider")
     import_cmd.add_argument("--input", "-i", type=str, help="Input JSON file path (for file imports)")
@@ -58,6 +68,60 @@ def register_cli(subparser):
     subparser.set_defaults(func=mnemosyne_command)
 
 
+def _profile_isolation_enabled(hermes_home: str) -> bool:
+    """True when ``memory.mnemosyne.profile_isolation`` is set in config.yaml."""
+    try:
+        import yaml
+        with open(os.path.join(hermes_home, "config.yaml")) as f:
+            cfg = yaml.safe_load(f) or {}
+        val = (cfg.get("memory", {}) or {}).get("mnemosyne", {}).get("profile_isolation", False)
+    except Exception:
+        return False
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "yes", "on")
+    return bool(val)
+
+
+def _resolve_cli_bank(args, cmd):
+    """Resolve which Mnemosyne bank the CLI beam should bind to.
+
+    Under ``profile_isolation`` the provider writes to a per-profile bank
+    (``<data_dir>/banks/<profile>/mnemosyne.db``), but the CLI historically
+    always bound to the default/legacy bank — so ``stats`` and friends reported
+    empty state even when the profile bank held data. Resolve the same bank the
+    provider would, so the CLI operates on what the agent actually wrote.
+
+    Precedence:
+      1. explicit ``--bank`` (ignored for ``import``, whose ``--bank`` names the
+         *source* provider bank, not the Mnemosyne target)
+      2. the active Hermes profile bank, when ``profile_isolation`` is enabled
+         (mirrors the provider's HERMES_HOME-basename fallback)
+      3. ``None`` -> default/legacy bank (unchanged behavior)
+
+    Never raises: any failure falls back to ``None`` (the default bank).
+    """
+    try:
+        from . import MnemosyneMemoryProvider
+        sanitize = MnemosyneMemoryProvider._sanitize_bank_name
+
+        if cmd != "import":
+            explicit = getattr(args, "bank", None)
+            if explicit:
+                bank = sanitize(explicit)
+                return bank if bank != "default" else None
+
+        hermes_home = os.environ.get("HERMES_HOME", "")
+        if not hermes_home or not _profile_isolation_enabled(hermes_home):
+            return None
+        basename = Path(hermes_home).name
+        if not basename or basename.lower() in (".hermes", "hermes", "default", ""):
+            return None
+        bank = sanitize(basename)
+        return bank if bank != "default" else None
+    except Exception:
+        return None
+
+
 def mnemosyne_command(args):
     """Dispatch ``hermes mnemosyne <subcommand>``."""
     cmd = getattr(args, "mnemosyne_cmd", None)
@@ -72,9 +136,16 @@ def mnemosyne_command(args):
     except Exception:
         pass
 
+    bank = _resolve_cli_bank(args, cmd)
     try:
-        from mnemosyne.core.beam import BeamMemory
-        beam = BeamMemory(session_id="hermes_default")
+        if bank:
+            # Bank-aware beam (Mnemosyne routes the bank to its own SQLite DB),
+            # mirroring how the provider builds its beam under profile_isolation.
+            from mnemosyne.core.memory import Mnemosyne
+            beam = Mnemosyne(session_id="hermes_default", bank=bank).beam
+        else:
+            from mnemosyne.core.beam import BeamMemory
+            beam = BeamMemory(session_id="hermes_default")
     except Exception as e:
         print(f"Error: Mnemosyne not available: {e}")
         return 1
