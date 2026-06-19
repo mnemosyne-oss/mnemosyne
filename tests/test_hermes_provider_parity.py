@@ -22,14 +22,28 @@ def _drop_modules(prefix: str) -> None:
 
 def _import_module(package: str, import_root: Path):
     _drop_modules(package)
-    sys.path.insert(0, str(import_root))
+    saved_mnemosyne_modules = {
+        name: module for name, module in sys.modules.items()
+        if name == "mnemosyne" or name.startswith("mnemosyne.")
+    }
+    _drop_modules("mnemosyne")
+    inserted = [str(import_root)]
+    if import_root != PROJECT_ROOT:
+        inserted.append(str(PROJECT_ROOT))
+    for path in reversed(inserted):
+        sys.path.insert(0, path)
     try:
         return importlib.import_module(package)
     finally:
-        try:
-            sys.path.remove(str(import_root))
-        except ValueError:
-            pass
+        for path in inserted:
+            try:
+                sys.path.remove(path)
+            except ValueError:
+                pass
+        for name in list(sys.modules):
+            if name == "mnemosyne" or name.startswith("mnemosyne."):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_mnemosyne_modules)
 
 
 @pytest.fixture(scope="module")
@@ -47,6 +61,31 @@ def _tool_schemas(module):
 def _config_schema(module):
     provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
     return {entry["key"]: entry for entry in provider.get_config_schema()}
+
+
+def _write_mnemosyne_config(hermes_home: Path, tools) -> None:
+    if tools is None:
+        body = "memory:\n  provider: mnemosyne\n  mnemosyne: {}\n"
+    else:
+        rendered_tools = "\n".join(f"      - {tool}" for tool in tools)
+        body = (
+            "memory:\n"
+            "  provider: mnemosyne\n"
+            "  mnemosyne:\n"
+            "    tools:\n"
+            f"{rendered_tools}\n"
+        )
+    (hermes_home / "config.yaml").write_text(body)
+
+
+def _schema_names(provider) -> list[str]:
+    return [schema["name"] for schema in provider.get_tool_schemas()]
+
+
+def _provider_for_config(module, hermes_home: Path):
+    provider = module.MnemosyneMemoryProvider()
+    provider._hermes_home = str(hermes_home)
+    return provider
 
 
 def _json_stable(value):
@@ -77,6 +116,63 @@ def test_provider_config_defaults_match(provider_modules):
     assert root_config["sync_roles"]["default"] == ["user", "assistant"]
     assert root_config["default_scope"]["choices"] == ["session", "global"]
     assert root_config["default_scope"]["default"] == "session"
+    assert root_config["tools"]["default"] is None
+
+
+def test_tool_whitelist_omitted_exposes_all_tools(tmp_path, provider_modules):
+    _write_mnemosyne_config(tmp_path, None)
+
+    observed = {}
+    for name, module in provider_modules.items():
+        provider = _provider_for_config(module, tmp_path)
+        observed[name] = _schema_names(provider)
+
+    all_tools = list(_tool_schemas(provider_modules["hermes_memory_provider"]))
+    assert observed["hermes_memory_provider"] == all_tools
+    assert observed["mnemosyne_hermes"] == all_tools
+
+
+def test_tool_whitelist_filters_schemas_before_routing(tmp_path, provider_modules):
+    allowed = ["mnemosyne_remember", "mnemosyne_recall", "mnemosyne_sleep"]
+    _write_mnemosyne_config(tmp_path, allowed)
+
+    observed = {}
+    for name, module in provider_modules.items():
+        provider = _provider_for_config(module, tmp_path)
+        observed[name] = _schema_names(provider)
+        assert provider.has_tool("mnemosyne_remember") is True
+        assert provider.has_tool("mnemosyne_forget") is False
+        rejected = json.loads(provider.handle_tool_call("mnemosyne_forget", {"memory_id": "x"}))
+        assert rejected == {"error": "Unknown Mnemosyne tool: mnemosyne_forget"}
+
+    assert observed["hermes_memory_provider"] == allowed
+    assert observed["mnemosyne_hermes"] == allowed
+    assert "mnemosyne_forget" not in observed["hermes_memory_provider"]
+    # Hermes builds its tool routing map from exposed schemas; filtered-out
+    # names must therefore be absent from that registration surface.
+    assert "mnemosyne_forget" not in set(observed["mnemosyne_hermes"])
+
+
+def test_tool_whitelist_empty_list_exposes_no_tools(tmp_path, provider_modules):
+    (tmp_path / "config.yaml").write_text(
+        "memory:\n"
+        "  provider: mnemosyne\n"
+        "  mnemosyne:\n"
+        "    tools: []\n"
+    )
+
+    for module in provider_modules.values():
+        provider = _provider_for_config(module, tmp_path)
+        assert provider.get_tool_schemas() == []
+
+
+def test_tool_whitelist_unknown_name_fails_loudly(tmp_path, provider_modules):
+    _write_mnemosyne_config(tmp_path, ["mnemosyne_remember", "mnemosyne_not_real"])
+
+    for module in provider_modules.values():
+        provider = _provider_for_config(module, tmp_path)
+        with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+            provider.get_tool_schemas()
 
 
 @pytest.mark.parametrize(
@@ -170,28 +266,52 @@ def test_provider_sync_turn_zero_limit_means_untruncated(monkeypatch, provider_m
     ]
 
 
+def _save_mnemosyne_modules():
+    return {
+        name: module for name, module in sys.modules.items()
+        if name == "mnemosyne" or name.startswith("mnemosyne.")
+    }
+
+
+def _restore_mnemosyne_modules(saved_modules):
+    for name in list(sys.modules):
+        if name == "mnemosyne" or name.startswith("mnemosyne."):
+            sys.modules.pop(name, None)
+    sys.modules.update(saved_modules)
+
+
 def test_provider_persona_tool_dispatch_matches(tmp_path, provider_modules):
-    from mnemosyne.core.beam import BeamMemory
+    saved_mnemosyne_modules = _save_mnemosyne_modules()
+    _drop_modules("mnemosyne")
+    sys.path.insert(0, str(PROJECT_ROOT))
+    try:
+        from mnemosyne.core.beam import BeamMemory
 
-    observed = {}
-    for name, module in provider_modules.items():
-        db_path = tmp_path / f"{name}.db"
-        beam = BeamMemory(session_id=f"persona-{name}", db_path=str(db_path))
-        beam.conn.execute(
-            "INSERT INTO memoria_persona (tier, topic, content, confidence) "
-            "VALUES (?, ?, ?, ?)",
-            ("long_term", "test", f"persona rule for {name}", 0.9),
-        )
-        beam.conn.commit()
+        observed = {}
+        for name, module in provider_modules.items():
+            db_path = tmp_path / f"{name}.db"
+            beam = BeamMemory(session_id=f"persona-{name}", db_path=str(db_path))
+            beam.conn.execute(
+                "INSERT INTO memoria_persona (tier, topic, content, confidence) "
+                "VALUES (?, ?, ?, ?)",
+                ("long_term", "test", f"persona rule for {name}", 0.9),
+            )
+            beam.conn.commit()
 
-        provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
-        provider._beam = beam
-        result = json.loads(provider.handle_tool_call("mnemosyne_persona_list", {}))
-        observed[name] = {
-            "status": result.get("status"),
-            "count": result.get("count"),
-            "topics": [row.get("topic") for row in result.get("personas", [])],
-        }
+            provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+            provider._beam = beam
+            result = json.loads(provider.handle_tool_call("mnemosyne_persona_list", {}))
+            observed[name] = {
+                "status": result.get("status"),
+                "count": result.get("count"),
+                "topics": [row.get("topic") for row in result.get("personas", [])],
+            }
+    finally:
+        try:
+            sys.path.remove(str(PROJECT_ROOT))
+        except ValueError:
+            pass
+        _restore_mnemosyne_modules(saved_mnemosyne_modules)
 
     assert observed["hermes_memory_provider"] == observed["mnemosyne_hermes"]
     assert observed["hermes_memory_provider"] == {
