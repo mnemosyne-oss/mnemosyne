@@ -41,11 +41,20 @@ def _is_fastembed_available() -> bool:
 # Use _is_fastembed_available() in new code — it re-evaluates on each call.
 _FASTEMBED_AVAILABLE = _is_fastembed_available()
 # Allow CI / scripted environments to redirect the fastembed cache to a
-# stable path that can be restored by actions/cache. Defaults to the
-# user-local ~/.hermes/cache/fastembed directory.
+# stable path that can be restored by actions/cache. Defaults to
+# <HERMES_HOME>/cache/fastembed, falling back to ~/.hermes/cache/fastembed
+# when HERMES_HOME is unset. Respecting HERMES_HOME keeps the cache co-located
+# with the rest of Hermes' state (config, db, logs) instead of leaking a
+# separate ~/.hermes directory when a user relocates HERMES_HOME (e.g. to
+# ~/.config/hermes). Matches the HERMES_HOME handling already used elsewhere
+# in the package (see mcp_tools.py).
 _FASTEMBED_CACHE_DIR = os.environ.get(
     "MNEMOSYNE_FASTEMBED_CACHE_DIR",
-    os.path.join(os.path.expanduser("~/.hermes"), "cache", "fastembed"),
+    os.path.join(
+        os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+        "cache",
+        "fastembed",
+    ),
 )
 
 # --- OpenAI-compatible API ---
