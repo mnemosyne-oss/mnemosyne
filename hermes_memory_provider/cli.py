@@ -79,7 +79,7 @@ def mnemosyne_command(args):
         try:
             from .hermes_llm_adapter import register_hermes_host_llm
         except ImportError:
-            from mnemosyne_hermes.hermes_llm_adapter import register_hermes_host_llm
+            from hermes_memory_provider.hermes_llm_adapter import register_hermes_host_llm
         register_hermes_host_llm()
     except Exception:
         pass
