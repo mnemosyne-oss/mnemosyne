@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -12,12 +13,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-
-class PluginState(Enum):
-    """Possible states of the Hermes plugin symlink."""
-    OK = "ok"
-    BROKEN_SYMLINK = "broken_symlink"
-    MISSING = "missing"
 
 
 PLUGIN_NAME = "mnemosyne"
@@ -32,6 +27,11 @@ class PluginState:
     target: Path
     message: str
     link_target: Path | None = None
+    mode: str = "missing"
+    wrapper_python: Path | None = None
+    wrapper_site_packages: Path | None = None
+    wrapper_import_ok: bool | None = None
+    wrapper_import_error: str | None = None
 
 
 def hermes_home() -> Path:
@@ -67,13 +67,72 @@ def _provider_init_is_valid(init_file: Path) -> bool:
         return False
 
 
-def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
-    """Return detailed state for Hermes' Mnemosyne plugin discovery path.
+def _extract_wrapper_metadata(init_file: Path) -> tuple[Path | None, Path | None]:
+    """Return (python, site-packages) metadata from a generated wrapper shim."""
+    try:
+        source = init_file.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None, None
 
-    This distinguishes a genuinely missing install from the common broken
-    symlink case that happens after a Hermes venv/image rebuild removes the
-    package directory the symlink pointed at.
-    """
+    def _match(name: str) -> Path | None:
+        match = re.search(rf"^{name}\s*=\s*(['\"])(.*?)\1", source, flags=re.MULTILINE)
+        if not match:
+            return None
+        value = match.group(2).strip()
+        return Path(value).expanduser() if value else None
+
+    return _match("_PYTHON"), _match("_SITE")
+
+
+def _site_packages_for_python(python: Path) -> Path:
+    """Ask an interpreter for its purelib/site-packages path."""
+    result = subprocess.run(
+        [str(python), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"Could not resolve site-packages for {python}: {stderr}")
+    site = Path(result.stdout.strip()).expanduser()
+    if not site:
+        raise RuntimeError(f"Could not resolve site-packages for {python}")
+    return site
+
+
+def _check_wrapper_import(site_packages: Path, python: Path | None = None) -> tuple[bool, str | None]:
+    """Return whether mnemosyne_hermes imports from the wrapper target."""
+    if not site_packages.exists():
+        return False, f"site-packages target missing: {site_packages}"
+    if python is not None and not python.is_file():
+        return False, f"wrapper Python missing: {python}"
+    runner = python or Path(sys.executable)
+    code = (
+        "import sys; "
+        f"sys.path.insert(0, {str(site_packages)!r}); "
+        "import mnemosyne_hermes; "
+        "print(getattr(mnemosyne_hermes, '__version__', 'unknown'))"
+    )
+    result = subprocess.run(
+        [str(runner), "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode == 0:
+        return True, None
+    return False, (result.stderr.strip() or result.stdout.strip() or "import failed")[:500]
+
+
+def _copy_plugin_yaml(target: Path) -> None:
+    source_yaml = _resolve_package_dir() / "plugin.yaml"
+    if source_yaml.is_file():
+        shutil.copy2(source_yaml, target / "plugin.yaml")
+
+
+def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
+    """Return detailed state for Hermes' Mnemosyne plugin discovery path."""
     target = plugin_target_dir(hermes_home_path)
 
     if target.is_symlink():
@@ -88,6 +147,7 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
                 installed=False,
                 target=target,
                 link_target=link_target,
+                mode="symlink",
                 message=(
                     "Plugin symlink exists but target is missing "
                     "(likely after a Hermes venv rebuild, Docker image update, "
@@ -109,6 +169,7 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
             status="missing_init",
             installed=False,
             target=target,
+            mode="symlink" if target.is_symlink() else "directory",
             message=f"Plugin path exists but has no __init__.py: {target}",
         )
 
@@ -117,6 +178,7 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
             status="invalid_provider",
             installed=False,
             target=target,
+            mode="symlink" if target.is_symlink() else "directory",
             message=(
                 "Plugin path exists but does not look like a Mnemosyne provider "
                 "(__init__.py lacks provider markers)."
@@ -124,20 +186,53 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
         )
 
     link_target = None
+    mode = "wrapper"
+    wrapper_python = None
+    wrapper_site = None
+    wrapper_import_ok = None
+    wrapper_import_error = None
+
     if target.is_symlink():
+        mode = "symlink"
         raw_link = os.readlink(str(target))
         link_target = Path(raw_link)
         if not link_target.is_absolute():
             link_target = target.parent / link_target
+        link_target = link_target.expanduser()
+    else:
+        wrapper_python, wrapper_site = _extract_wrapper_metadata(init_file)
+        if wrapper_site is None:
+            mode = "directory"
+        else:
+            wrapper_import_ok, wrapper_import_error = _check_wrapper_import(
+                wrapper_site,
+                wrapper_python,
+            )
+            if not wrapper_import_ok:
+                return PluginState(
+                    status="stale_wrapper",
+                    installed=False,
+                    target=target,
+                    mode="wrapper",
+                    wrapper_python=wrapper_python,
+                    wrapper_site_packages=wrapper_site,
+                    wrapper_import_ok=wrapper_import_ok,
+                    wrapper_import_error=wrapper_import_error,
+                    message="Wrapper plugin exists but its target package cannot be imported.",
+                )
 
     return PluginState(
         status="installed",
         installed=True,
         target=target,
         link_target=link_target,
+        mode=mode,
+        wrapper_python=wrapper_python,
+        wrapper_site_packages=wrapper_site,
+        wrapper_import_ok=wrapper_import_ok,
+        wrapper_import_error=wrapper_import_error,
         message="Plugin is installed and discoverable.",
     )
-
 
 def _find_hermes_python() -> Optional[Path]:
     """Try to find Hermes' python executable for dep validation.
@@ -245,43 +340,16 @@ def check_mnemosyne_core_for_hermes_python(hermes_python: Path) -> Optional[str]
         return None
 
 
-def install_plugin(
-    *,
-    hermes_home_path: str | Path | None = None,
-    force: bool = False,
-) -> Path:
-    """Install the Mnemosyne provider into Hermes' user plugin directory.
-
-    Creates a symlink from ``$HERMES_HOME/plugins/mnemosyne/`` to the
-    installed ``mnemosyne_hermes`` package directory. Hermes discovers
-    memory providers by scanning ``$HERMES_HOME/plugins/<name>/`` for
-    directories whose ``__init__.py`` contains ``register_memory_provider``
-    or ``MemoryProvider``.
-
-    The symlink approach means all relative imports (cli, tools, audit)
-    resolve correctly through the real package, and ``hermes update`` /
-    ``pipx upgrade mnemosyne-hermes`` automatically refreshes the target.
-    """
-    source = _resolve_package_dir()
-    if not source.is_dir():
-        raise FileNotFoundError(
-            f"mnemosyne_hermes package not found at {source}"
-        )
-
-    base = Path(hermes_home_path).expanduser() if hermes_home_path else hermes_home()
-    target = plugin_target_dir(hermes_home_path)
-
-    # Migrate from old hermes-mnemosyne directory (deploy script era)
+def _prepare_plugin_target(base: Path, target: Path, *, force: bool) -> None:
+    """Migrate legacy plugin names and remove an existing target when forced."""
     old_plugin_dir = base / "plugins" / "hermes-mnemosyne"
     if old_plugin_dir.is_symlink() or old_plugin_dir.exists():
         if old_plugin_dir.is_symlink() or os.path.islink(str(old_plugin_dir)):
             old_plugin_dir.unlink()
         else:
             shutil.rmtree(old_plugin_dir)
-        logger = print
-        logger(f"  Removed old plugin directory: {old_plugin_dir}")
+        print(f"  Removed old plugin directory: {old_plugin_dir}")
 
-    # Also migrate config from old provider name
     config_path = base / "config.yaml"
     if config_path.is_file():
         try:
@@ -298,7 +366,6 @@ def install_plugin(
             raise FileExistsError(
                 f"{target} already exists. Re-run with --force to replace it."
             )
-        # Remove existing link or directory cleanly
         if target.is_symlink():
             target.unlink()
         elif target.is_dir():
@@ -307,9 +374,76 @@ def install_plugin(
             target.unlink()
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    os.symlink(str(source), str(target))
-    return target
 
+
+def _write_wrapper_plugin(target: Path, *, python: Path, site_packages: Path) -> None:
+    """Create a persistent Hermes plugin shim that imports from a selected env."""
+    target.mkdir(parents=True, exist_ok=False)
+    init_source = f"""\"\"\"Persistent Mnemosyne Hermes plugin wrapper.
+
+Generated by ``mnemosyne-hermes install --mode wrapper``. The wrapper keeps the
+Hermes discovery directory stable while importing the real ``mnemosyne_hermes``
+package from the selected Python environment.
+\"\"\"
+from __future__ import annotations
+
+import sys as _sys
+
+# Metadata used by ``mnemosyne-hermes status``.
+_PYTHON = {str(python)!r}
+_SITE = {str(site_packages)!r}
+
+if _SITE not in _sys.path:
+    _sys.path.insert(0, _SITE)
+
+# Hermes discovery marker: register_memory_provider / MnemosyneMemoryProvider
+from mnemosyne_hermes import *  # noqa: F401,F403,E402
+"""
+    (target / "__init__.py").write_text(init_source, encoding="utf-8")
+    _copy_plugin_yaml(target)
+
+
+def install_plugin(
+    *,
+    hermes_home_path: str | Path | None = None,
+    force: bool = False,
+    mode: str = "symlink",
+    python: str | Path | None = None,
+) -> Path:
+    """Install the Mnemosyne provider into Hermes' user plugin directory.
+
+    ``mode='symlink'`` keeps the historical behavior. ``mode='wrapper'``
+    creates a real persistent plugin directory containing a tiny shim that adds
+    the selected interpreter's site-packages path to ``sys.path`` and imports
+    ``mnemosyne_hermes`` from there.
+    """
+    if mode not in {"symlink", "wrapper"}:
+        raise ValueError("mode must be 'symlink' or 'wrapper'")
+
+    source = _resolve_package_dir()
+    if not source.is_dir():
+        raise FileNotFoundError(f"mnemosyne_hermes package not found at {source}")
+
+    base = Path(hermes_home_path).expanduser() if hermes_home_path else hermes_home()
+    target = plugin_target_dir(hermes_home_path)
+    _prepare_plugin_target(base, target, force=force)
+
+    if mode == "symlink":
+        os.symlink(str(source), str(target))
+        return target
+
+    wrapper_python = Path(python).expanduser() if python else Path(sys.executable)
+    if not wrapper_python.is_file():
+        raise FileNotFoundError(f"Python interpreter not found: {wrapper_python}")
+    site_packages = _site_packages_for_python(wrapper_python)
+    import_ok, import_error = _check_wrapper_import(site_packages, wrapper_python)
+    if not import_ok:
+        raise RuntimeError(
+            "Selected Python environment cannot import mnemosyne_hermes: "
+            f"{import_error}"
+        )
+    _write_wrapper_plugin(target, python=wrapper_python, site_packages=site_packages)
+    return target
 
 def uninstall_plugin(*, hermes_home_path: str | Path | None = None) -> Path:
     """Remove the Mnemosyne provider symlink from Hermes' user plugin directory."""
@@ -431,32 +565,6 @@ def is_installed(*, hermes_home_path: str | Path | None = None) -> bool:
     return plugin_state(hermes_home_path=hermes_home_path).installed
 
 
-def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
-    """Return the current state of the Hermes plugin installation.
-
-    Distinguishes between:
-    - OK: symlink exists and points to a valid plugin
-    - BROKEN_SYMLINK: symlink exists but target is missing (venv rebuild, etc.)
-    - MISSING: no symlink at all
-    """
-    target = plugin_target_dir(hermes_home_path)
-
-    if target.is_symlink():
-        try:
-            real_target = target.resolve(strict=True)
-            if real_target.exists():
-                if is_installed(hermes_home_path=hermes_home_path):
-                    return PluginState.OK
-        except (FileNotFoundError, RuntimeError):
-            pass
-        return PluginState.BROKEN_SYMLINK
-
-    if target.exists():
-        if is_installed(hermes_home_path=hermes_home_path):
-            return PluginState.OK
-
-    return PluginState.MISSING
-
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -488,6 +596,17 @@ def _parser() -> argparse.ArgumentParser:
         "--no-bootstrap",
         action="store_true",
         help="Skip auto-installing mnemosyne-hermes into Hermes' venv.",
+    )
+    install.add_argument(
+        "--mode",
+        choices=("symlink", "wrapper"),
+        default="symlink",
+        help="Install mode: symlink (default) or persistent wrapper shim.",
+    )
+    install.add_argument(
+        "--python",
+        dest="python",
+        help="Python interpreter whose site-packages the wrapper should import from.",
     )
     subparsers = subparsers
     subparsers.add_parser(
@@ -524,6 +643,8 @@ def run_install(
     force: bool = False,
     hermes_home_path: str | Path | None = None,
     no_bootstrap: bool = False,
+    mode: str = "symlink",
+    python: str | Path | None = None,
 ) -> int:
     """Core install logic — check deps, bootstrap Hermes venv if needed, create symlink.
 
@@ -541,8 +662,9 @@ def run_install(
         )
         return 1
 
-    # Find Hermes' Python and validate deps there too
-    hermes_python = _find_hermes_python()
+    # Symlink installs need Hermes' own Python to contain the package. Wrapper
+    # installs validate the explicitly selected interpreter in install_plugin().
+    hermes_python = _find_hermes_python() if mode == "symlink" else None
     if hermes_python and hermes_python.resolve() != Path(sys.executable).resolve():
         hermes_core = check_mnemosyne_core_for_hermes_python(hermes_python)
         if hermes_core is None:
@@ -570,9 +692,19 @@ def run_install(
     target = install_plugin(
         hermes_home_path=hermes_home_path,
         force=force,
+        mode=mode,
+        python=python,
     )
-    print(f"Installed. Symlink at {target}")
-    print(f"  -> {os.readlink(str(target))}")
+    if mode == "wrapper":
+        state = plugin_state(hermes_home_path=hermes_home_path)
+        print(f"Installed. Wrapper directory at {target}")
+        if state.wrapper_python:
+            print(f"  Python: {state.wrapper_python}")
+        if state.wrapper_site_packages:
+            print(f"  Site-packages: {state.wrapper_site_packages}")
+    else:
+        print(f"Installed. Symlink at {target}")
+        print(f"  -> {os.readlink(str(target))}")
     print("Done. Next steps:")
     print("  hermes config set memory.provider mnemosyne")
     print("  hermes memory status")
@@ -594,6 +726,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  Plugin target dir: {target}")
                 print(f"  Hermes Python: {hermes_python or 'not found'}")
                 print(f"  Currently installed: {'yes' if is_installed(hermes_home_path=args.hermes_home) else 'no'}")
+                print(f"  Install mode: {getattr(args, 'mode', 'symlink')}")
+                if getattr(args, "mode", "symlink") == "wrapper":
+                    wrapper_python = Path(getattr(args, "python", None) or sys.executable).expanduser()
+                    print(f"  Wrapper Python: {wrapper_python}")
+                    if wrapper_python.is_file():
+                        print(f"  Wrapper site-packages: {_site_packages_for_python(wrapper_python)}")
                 print(f"  Will force: {bool(getattr(args, 'force', False))}")
                 if hermes_python:
                     print(f"  Will bootstrap: {not getattr(args, 'no_bootstrap', False)}")
@@ -603,6 +741,8 @@ def main(argv: list[str] | None = None) -> int:
                 force=getattr(args, "force", False),
                 hermes_home_path=args.hermes_home,
                 no_bootstrap=getattr(args, "no_bootstrap", False),
+                mode=getattr(args, "mode", "symlink"),
+                python=getattr(args, "python", None),
             )
 
         if command == "uninstall":
@@ -616,23 +756,33 @@ def main(argv: list[str] | None = None) -> int:
             installed = state.installed
             hermes_python = _find_hermes_python()
             print(f"Status for mnemosyne-hermes plugin")
-            print(f"  Plugin symlink: {target}")
+            print(f"  Plugin path: {target}")
             print(f"  State: {state.status}")
+            print(f"  Mode: {state.mode}")
             if installed:
-                if state.link_target is not None:
+                if state.mode == "symlink" and state.link_target is not None:
                     print(f"  Target: {state.link_target}")
+                elif state.mode == "wrapper":
+                    print(f"  Wrapper Python: {state.wrapper_python}")
+                    print(f"  Wrapper site-packages: {state.wrapper_site_packages}")
+                    print(f"  Wrapper import: {'OK' if state.wrapper_import_ok else 'not checked'}")
                 else:
                     print(f"  Type: directory (not symlink)")
-                    print(f"  Plugin:    installed ✓")
+                print(f"  Plugin:    installed ✓")
             elif state.status == "broken_symlink":
                 print(f"  Plugin:    broken symlink (target missing) ✗")
+                print(f"  Broken target: {state.link_target}")
                 print(f"  → Run: mnemosyne-hermes install --force")
+            elif state.status == "stale_wrapper":
+                print(f"  Plugin:    stale wrapper target ✗")
+                print(f"  Wrapper Python: {state.wrapper_python}")
+                print(f"  Wrapper site-packages: {state.wrapper_site_packages}")
+                print(f"  Import error: {state.wrapper_import_error}")
+                print(f"  → Re-run: mnemosyne-hermes install --mode wrapper --force --python <venv>/bin/python")
             else:
                 print(f"  NOT installed: {state.message}")
                 if state.link_target is not None:
                     print(f"  Broken target: {state.link_target}")
-                if state.status == "broken_symlink":
-                    print("  → Re-run: mnemosyne-hermes install --force")
             print(f"  Core library: {'OK' if check_mnemosyne_core() else 'MISSING'}")
             print(f"  This Python: {sys.executable} ({sys.version.split()[0]})")
             if hermes_python:
@@ -641,15 +791,15 @@ def main(argv: list[str] | None = None) -> int:
                     _r = _sp.run([str(hermes_python), "--version"], capture_output=True, text=True, timeout=5)
                     _ver = _r.stdout.strip() or _r.stderr.strip()
                     print(f"  Hermes' Python: {hermes_python} ({_ver})")
-                    if hermes_python.resolve() != Path(sys.executable).resolve():
+                    if state.mode == "symlink" and hermes_python.resolve() != Path(sys.executable).resolve():
                         print(f"  ⚠ Python version MISMATCH! Install and Hermes use different Python versions.")
                         print(f"  → Run: {_ver.split()[1]}" if " " in _ver else "")
                 except Exception:
                     print(f"  Hermes' Python: {hermes_python} (unable to check version)")
             else:
                 print(f"  Hermes' Python: not found")
-            if installed and hermes_python and hermes_python.resolve() != Path(sys.executable).resolve():
-                print(f"  → Her Python vs install Python mismatch means the symlink exists but Hermes")
+            if installed and state.mode == "symlink" and hermes_python and hermes_python.resolve() != Path(sys.executable).resolve():
+                print(f"  → Hermes Python vs install Python mismatch means the symlink exists but Hermes")
                 print(f"     may not be able to import mnemosyne core. Run with --dry-run to diagnose.")
             return 0 if installed else 1
 
