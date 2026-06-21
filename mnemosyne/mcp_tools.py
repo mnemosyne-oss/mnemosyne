@@ -30,17 +30,7 @@ except ImportError:
 from mnemosyne.core.memory import Mnemosyne
 from mnemosyne.core.beam import BeamMemory
 
-# ---------------------------------------------------------------------------
-# Tool Schemas (imported from the canonical Hermes provider definition)
-# ---------------------------------------------------------------------------
-
-try:
-    from mnemosyne_hermes.tools import ALL_TOOL_SCHEMAS
-except ImportError:
-    try:
-        from hermes_memory_provider import ALL_TOOL_SCHEMAS
-    except ImportError:
-        ALL_TOOL_SCHEMAS = []
+from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
 
 # ---------------------------------------------------------------------------
 # Tool Definitions
