@@ -7,6 +7,13 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+### Fixed
+
+- **hermes integration:** `hermes mnemosyne <stats|sleep|inspect|export>` are now
+  bank-aware under `profile_isolation` — they resolve the active profile bank (or an
+  explicit `--bank`) instead of always reading the default bank, which reported empty
+  state when the profile bank held the data. (#362, #363)
+
 ## [3.10.0] — 2026-06-18
 
 ### Added
