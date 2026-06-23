@@ -7,6 +7,12 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+### Added
+
+- Hermes Mnemosyne providers can now restrict exposed tools with the optional
+  `memory.mnemosyne.tools` allowlist while preserving memory context/prefetch
+  behavior.
+
 ## [3.10.1] — 2026-06-22
 
 ### Security
