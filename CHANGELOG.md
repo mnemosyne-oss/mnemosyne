@@ -7,6 +7,15 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+### Added
+
+- **Hermes wrapper install mode for read-only / Docker deployments.**
+  `mnemosyne-hermes install --mode wrapper --python <path>` now creates a
+  stable `$HERMES_HOME/plugins/mnemosyne/` shim that imports from the selected
+  Python environment instead of symlinking into a rebuildable Hermes venv.
+  `mnemosyne-hermes status` reports wrapper mode, target interpreter, import
+  health, and stale/broken targets.
+
 ## [3.10.1] — 2026-06-22
 
 ### Security
