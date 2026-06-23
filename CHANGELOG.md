@@ -7,6 +7,16 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Respect `HERMES_HOME` for the fastembed cache default.** The default ONNX
+  model cache path now resolves to `<HERMES_HOME>/cache/fastembed` (falling back
+  to `~/.hermes/cache/fastembed` when `HERMES_HOME` is unset), instead of always
+  writing to `~/.hermes`. Keeps the cache co-located with the rest of Hermes'
+  state for users on a relocated layout (e.g. `~/.config/hermes`). No-op for
+  default installs; matches the `HERMES_HOME` handling already used elsewhere in
+  the package. `MNEMOSYNE_FASTEMBED_CACHE_DIR` still overrides.
+
 ## [3.10.1] — 2026-06-22
 
 ### Security
