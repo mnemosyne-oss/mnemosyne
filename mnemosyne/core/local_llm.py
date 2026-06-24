@@ -36,6 +36,7 @@ if _env_repo and _env_file:
 LLM_BASE_URL = os.environ.get("MNEMOSYNE_LLM_BASE_URL", "").rstrip("/")
 LLM_API_KEY = os.environ.get("MNEMOSYNE_LLM_API_KEY", "")
 LLM_REMOTE_MODEL = os.environ.get("MNEMOSYNE_LLM_MODEL", "")
+LLM_TIMEOUT = float(os.environ.get("MNEMOSYNE_LLM_TIMEOUT", "60"))
 
 # Retryable errors only: 404/400 (model-not-found), 5xx, connection. Not 401/403/429.
 LLM_FALLBACK_MODELS = [
@@ -461,7 +462,7 @@ def _call_remote_llm_with_model(
     *,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
-    timeout: float = 60.0,
+    timeout: float = LLM_TIMEOUT,
 ) -> "tuple[Optional[str], Optional[int], Optional[Exception]]":
     """Call an OpenAI-compatible endpoint with a specific model name.
 
