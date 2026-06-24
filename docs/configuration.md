@@ -135,6 +135,7 @@ Use a remote model instead of the local MiniCPM5-1B GGUF:
 | `MNEMOSYNE_LLM_BASE_URL` | *(none)* | OpenAI-compatible API base URL (e.g. `http://localhost:8080/v1`) |
 | `MNEMOSYNE_LLM_API_KEY` | *(none)* | API key for authenticated endpoints |
 | `MNEMOSYNE_LLM_MODEL` | *(none)* | Model identifier sent in requests |
+| `MNEMOSYNE_LLM_TIMEOUT` | `60` | HTTP timeout in seconds for remote LLM calls. Increase for slow proxies or models with long generation times (e.g. `300` for reasoning models routed through local proxies). |
 
 When `MNEMOSYNE_LLM_BASE_URL` is set, Mnemosyne uses the remote endpoint for consolidation. Falls back to local ctransformers if the remote is unreachable, then to AAAK encoding.
 
