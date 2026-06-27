@@ -9,6 +9,13 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Named Hermes profiles now get the plugin link** (issue #365). `mnemosyne-install`
+  and `mnemosyne-hermes install` now scan `~/.hermes/profiles/*/config.yaml` for
+  `memory.provider: mnemosyne` and create (or remove, on uninstall) the plugin
+  symlink in each matching profile's `plugins/` directory. Previously the link was
+  only created under the default `~/.hermes/`, so the provider silently failed to
+  load for users with named profiles.
+
 - **Host LLM backend registration in skip-context sessions.**
   `register_hermes_host_llm()` was called at the end of
   `MnemosyneMemoryProvider.initialize()`, after the skip-context early
