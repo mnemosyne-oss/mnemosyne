@@ -1,0 +1,17 @@
+# Core maintainers
+*       @AxDSan
+
+# Documentation
+docs/*  @AxDSan
+*.md    @AxDSan
+
+# CI/CD
+.github/workflows/*  @AxDSan
+
+# Release process (maintainer approval required)
+.github/workflows/release.yml  @AxDSan
+
+# Core memory provider
+hermes_memory_provider/  @AxDSan @dplush
+mnemosyne/               @AxDSan @dplush
+tests/                   @AxDSan @dplush
