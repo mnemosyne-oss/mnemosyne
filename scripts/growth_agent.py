@@ -35,6 +35,26 @@ TOPICS = [
     "tip",         # Quick usage tip
 ]
 
+
+# ── Duplicate detection ────────────────────────────────────────────────────
+
+def load_posted_texts() -> set:
+    """Load all previously posted texts from snapshots to avoid duplicates."""
+    posted = set()
+    snap_dir = Path.home() / ".hermes" / "mnemosyne" / "growth"
+    if not snap_dir.exists():
+        return posted
+    for f in sorted(snap_dir.glob("run_*.json")):
+        try:
+            d = json.loads(f.read_text())
+            if d.get("posted") and d.get("text"):
+                posted.add(d["text"].strip())
+        except (json.JSONDecodeError, OSError):
+            continue
+    return posted
+
+POSTED_TEXTS = set()  # populated on first call to generate_post
+
 def run_cmd(cmd: list, timeout: int = 30) -> tuple[int, str]:
     """Run a command and return (exit_code, stdout+stderr)."""
     try:
@@ -168,7 +188,11 @@ def generate_tip_post(stats: dict, release: Optional[str]) -> str:
     return random.choice(tips)
 
 def generate_post(topic: str, stats: dict, release: Optional[str]) -> str:
-    """Route to the right content generator."""
+    """Generate content, avoiding text that was already posted."""
+    global POSTED_TEXTS
+    if not POSTED_TEXTS:
+        POSTED_TEXTS.update(load_posted_texts())
+
     generators = {
         "stats": generate_stats_post,
         "feature": generate_feature_post,
@@ -176,8 +200,27 @@ def generate_post(topic: str, stats: dict, release: Optional[str]) -> str:
         "benchmark": generate_feature_post,  # reuses feature for now
         "tip": generate_tip_post,
     }
+
+    # Try the requested topic first
     gen = generators.get(topic, generate_stats_post)
-    return gen(stats, release)
+    text = gen(stats, release)
+    if text.strip() not in POSTED_TEXTS:
+        return text
+
+    # If duplicate, try other topics in random order
+    import random as _rnd
+    topics = [t for t in generators if t != topic]
+    _rnd.shuffle(topics)
+    for alt_topic in topics:
+        alt_gen = generators[alt_topic]
+        alt_text = alt_gen(stats, release)
+        if alt_text.strip() not in POSTED_TEXTS:
+            return alt_text
+
+    # Last resort: append date to make unique
+    from datetime import datetime
+    date_str = datetime.now(timezone.utc).strftime("%b %d, %Y")
+    return f"{text.strip()}\n\n— {date_str}"
 
 def post_to_x(text: str) -> bool:
     """Post to X using clix."""

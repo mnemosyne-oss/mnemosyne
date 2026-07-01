@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
+## [Unreleased]
+
+## [3.11.1] — 2026-07-01
+
+### Fixed
+
+- **Polyphonic recall to_date filter excludes the bound day.** The
+  polyphonic path compared ISO timestamps against bare `to_date` with raw
+  lexical `>`, so `2026-06-29T10:30:00 > 2026-06-29` evaluated True and the
+  entire bound day was dropped. Now appends `T23:59:59` to the bound,
+  matching the linear path. (#390, reported by @NodeGuy)
+
+- **MCP remember handler silently drops veracity.** `_handle_remember()`
+  accepted veracity in the tool schema but never extracted it from arguments
+  or passed it to `mem.remember()`. Every MCP remember call stored
+  `veracity: "unknown"` regardless of what was passed. Now properly forwards
+  the veracity argument. (#386, reported by @freeformz)
+
+- **mnemosyne-hermes CLI crashes on fresh install.** The 0.3.0 release had
+  two bugs: the CLI entry point was broken by a function rename in
+  install.py, and eager imports from `mnemosyne.core` crashed when core
+  wasn't in the pipx venv. Fixed by restoring the entry point and converting
+  to lazy imports. (#388, reported by @SeaXen, fixed by @dplush in #391)
+
 ## [3.11.0] — 2026-06-30
 
 ### Added
@@ -1147,4 +1171,5 @@ endpoint.
 [3.9.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.9.0
 [3.10.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.10.0
 [3.10.1]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.10.1
+[3.11.1]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.11.1
 [3.11.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.11.0

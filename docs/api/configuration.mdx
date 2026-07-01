@@ -1,6 +1,6 @@
 ---
 title: "Configuration"
-version: 3.7.0
+version: 3.11.0
 generated_at: "auto"
 ---
 
@@ -93,11 +93,13 @@ Mnemosyne is configured entirely through environment variables. No config files,
 | `MNEMOSYNE_VOICE_TEMPORAL` | `1` | A/B toggle: polyphonic temporal voice (Phase 3c) |
 | `MNEMOSYNE_BEAM_MODE` | `false` | Enable BEAM mode (polyphonic recall engine extension) |
 | `MNEMOSYNE_USE_CAVEMAN` | `false` | Use caveman/AAAK encoding fallback for consolidation |
-| `MNEMOSYNE_SYNC_ROLES` | `user,assistant` | Conversation roles to sync into memory |
+| `MNEMOSYNE_SYNC_ROLES` | `user` | Conversation roles to sync into memory; default user-only to avoid assistant transcript noise |
 | `MNEMOSYNE_SKIP_CONTEXTS` | `cron,flush,subagent,background,skill_loop` | Comma-separated context names to skip |
 | `MNEMOSYNE_SYNC_TURN_USER_LIMIT` | `500` | Max chars of user content synced per turn (0=no limit) |
 | `MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT` | `800` | Max chars of assistant content synced per turn (0=no limit) |
 | `MNEMOSYNE_PREFETCH_CONTENT_CHARS` | `0` | Truncate prefetched content to N chars (0=no truncation) |
+| `MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS` | `user,owner,assistant,agent,system,profile,identity,default` | Comma/space-separated local owner/system words that should not by themselves make canonical facts relevant |
+| `MNEMOSYNE_RECALL_EXTRA_STOPWORDS` | *(required)* | Comma/space-separated extra lexical stopwords for local recall corpora |
 | `MNEMOSYNE_PREFETCH_PROFILE` | `general` | Prefetch profile name (general, coding, etc.) |
 | `MNEMOSYNE_MCP_TOKEN` | *(required)* | Bearer token for MCP server auth (required for remote deployment) |
 | `MNEMOSYNE_MCP_BANK` | `default` | Default MCP bank name for tool operations |
