@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 # but keep imports lazy so installer/status CLI commands still work in broken
 # or partially-installed environments.
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 logger = logging.getLogger(__name__)
 

@@ -32,7 +32,11 @@ def test_main_help_exits_successfully(capsys):
 
 
 def test_package_version_matches_distribution_metadata():
-    assert mnemosyne_hermes.__version__ == importlib.metadata.version("mnemosyne-hermes")
+    dist_version = importlib.metadata.version("mnemosyne-hermes")
+
+    assert mnemosyne_hermes.__version__ == dist_version, (
+        "mnemosyne_hermes.__version__ must stay in sync with package metadata"
+    )
 
 
 def test_package_and_install_module_import_without_mnemosyne_core():
