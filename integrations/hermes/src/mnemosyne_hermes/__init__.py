@@ -26,12 +26,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from datetime import datetime, timedelta
 
-# Mnemosyne core is installed via pip (mnemosyne-memory>=3.1 dependency).
-# No path hacks needed — standard imports work.
-from mnemosyne.core.episodic_graph import GraphEdge
-from mnemosyne.core.beam import WORKING_MEMORY_TTL_HOURS
+# Mnemosyne core is installed via pip (mnemosyne-memory>=3.1 dependency),
+# but keep imports lazy so installer/status CLI commands still work in broken
+# or partially-installed environments.
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +52,16 @@ _provider_lock = threading.Lock()
 def _get_beam_class():
     from mnemosyne.core.beam import BeamMemory
     return BeamMemory
+
+
+def _get_working_memory_ttl_hours() -> int:
+    from mnemosyne.core.beam import WORKING_MEMORY_TTL_HOURS
+    return WORKING_MEMORY_TTL_HOURS
+
+
+def _get_graph_edge_class():
+    from mnemosyne.core.episodic_graph import GraphEdge
+    return GraphEdge
 
 
 def _get_triple_module():
@@ -1206,7 +1215,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 # spinning up a full sleep pass just to find nothing
                 # eligible (common with longer TTLs after a prior
                 # auto-sleep already consolidated everything).
-                cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).isoformat()
+                cutoff = (datetime.now() - timedelta(hours=_get_working_memory_ttl_hours() // 2)).isoformat()
                 eligible = self._beam._count_unconsolidated_before(cutoff)
                 if eligible == 0:
                     return
@@ -2233,6 +2242,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
             })
         if self._beam.episodic_graph is None:
             return json.dumps({"error": "Episodic graph not available"})
+        GraphEdge = _get_graph_edge_class()
         edge = GraphEdge(
             source=source_id,
             target=target_id,
