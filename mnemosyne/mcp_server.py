@@ -131,9 +131,8 @@ def _build_sse_app(host: str = "127.0.0.1"):
     try:
         from mcp.server.sse import SseServerTransport
         from starlette.applications import Starlette
-        from starlette.routing import Route
+        from starlette.routing import Mount, Route
         from starlette.middleware import Middleware
-        from starlette.middleware.base import BaseHTTPMiddleware
         from starlette.responses import JSONResponse
     except ImportError:
         raise RuntimeError(
@@ -143,7 +142,10 @@ def _build_sse_app(host: str = "127.0.0.1"):
 
     require_auth, token = _resolve_sse_auth(host)
 
-    transport = SseServerTransport("/messages")
+    # Trailing slash required: SseServerTransport emits POST URIs as
+    # /messages/ and Starlette Mount path-prefix matching needs it to
+    # agree. Route("/messages") would 404 on every client POST.
+    transport = SseServerTransport("/messages/")
     server = Server("mnemosyne")
 
     @server.list_tools()
@@ -165,31 +167,54 @@ def _build_sse_app(host: str = "127.0.0.1"):
             await server.run(streams[0], streams[1], server.create_initialization_options())
         return JSONResponse({})
 
-    async def handle_messages(request):
-        await transport.handle_post_message(request.scope, request.receive, request._send)
-        return JSONResponse({"status": "ok"}, status_code=202)
-
     middleware = []
     if require_auth:
         expected = token
 
-        class _BearerTokenMiddleware(BaseHTTPMiddleware):
-            async def dispatch(self, request, call_next):
-                header = request.headers.get("authorization", "")
+        class _BearerTokenMiddleware:
+            """Pure-ASGI bearer auth middleware.
+
+            BaseHTTPMiddleware buffers the full response body before
+            forwarding it to the client. SseServerTransport writes
+            directly to the raw ASGI send callable, so
+            BaseHTTPMiddleware raises:
+              AssertionError: Unexpected message: http.response.start
+            on every SSE connect, terminating the stream immediately.
+
+            This pure-ASGI implementation forwards scope/receive/send
+            untouched after auth so SSE frames are never buffered.
+            """
+
+            def __init__(self, app):
+                self.app = app
+
+            async def __call__(self, scope, receive, send):
+                if scope.get("type") != "http":
+                    await self.app(scope, receive, send)
+                    return
+                header = ""
+                for k, v in scope.get("headers", []):
+                    if k == b"authorization":
+                        header = v.decode("latin-1")
+                        break
                 if not header.startswith("Bearer "):
-                    return JSONResponse(
+                    resp = JSONResponse(
                         {"error": "missing bearer token"},
                         status_code=401,
                         headers={"WWW-Authenticate": "Bearer"},
                     )
+                    await resp(scope, receive, send)
+                    return
                 presented = header[len("Bearer "):].strip()
                 if not hmac.compare_digest(presented, expected):
-                    return JSONResponse(
+                    resp = JSONResponse(
                         {"error": "invalid bearer token"},
                         status_code=401,
                         headers={"WWW-Authenticate": "Bearer"},
                     )
-                return await call_next(request)
+                    await resp(scope, receive, send)
+                    return
+                await self.app(scope, receive, send)
 
         middleware.append(Middleware(_BearerTokenMiddleware))
         logger.info(
@@ -205,8 +230,12 @@ def _build_sse_app(host: str = "127.0.0.1"):
 
     starlette_app = Starlette(
         routes=[
-            Route("/sse", endpoint=handle_sse),
-            Route("/messages", endpoint=handle_messages, methods=["POST"]),
+            Route("/sse", endpoint=handle_sse, methods=["GET"]),
+            # transport.handle_post_message is an ASGI callable, not a
+            # request-response endpoint. Mount (not Route) is required so
+            # Starlette passes scope/receive/send directly without wrapping
+            # the response. The trailing slash must match the transport path.
+            Mount("/messages/", app=transport.handle_post_message),
         ],
         middleware=middleware,
     )
