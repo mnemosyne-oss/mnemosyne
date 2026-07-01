@@ -82,6 +82,23 @@ def _profile_isolation_enabled(hermes_home: str) -> bool:
     return bool(val)
 
 
+def _get_provider_class():
+    """Return MnemosyneMemoryProvider, tolerating standalone plugin loads.
+
+    Hermes may load plugin CLI modules directly from a file path using
+    ``importlib.util.spec_from_file_location()``. In that context the module
+    has no parent package, so relative imports raise ``ImportError``. Fall
+    back to the absolute import — which works as long as the package is on
+    ``sys.path`` (true for both pip installs and Hermes-managed plugin
+    symlinks).
+    """
+    try:
+        from . import MnemosyneMemoryProvider
+    except ImportError:
+        from mnemosyne_hermes import MnemosyneMemoryProvider
+    return MnemosyneMemoryProvider
+
+
 def _resolve_cli_bank(args, cmd):
     """Resolve which Mnemosyne bank the CLI beam should bind to.
 
@@ -101,7 +118,7 @@ def _resolve_cli_bank(args, cmd):
     Never raises: any failure falls back to ``None`` (the default bank).
     """
     try:
-        from . import MnemosyneMemoryProvider
+        MnemosyneMemoryProvider = _get_provider_class()
         sanitize = MnemosyneMemoryProvider._sanitize_bank_name
 
         if cmd != "import":
