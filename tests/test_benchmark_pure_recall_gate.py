@@ -1,6 +1,6 @@
 """Regression tests for E7/E8/E9 — `MNEMOSYNE_BENCHMARK_PURE_RECALL` gate.
 
-`tools/evaluate_beam_end_to_end.py` historically shipped four bypass
+`_benchmarks/evaluate_beam_end_to_end.py` historically shipped four bypass
 paths that let the harness answer benchmark questions WITHOUT going
 through Mnemosyne recall:
 

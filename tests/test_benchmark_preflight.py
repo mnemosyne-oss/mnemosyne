@@ -1,6 +1,6 @@
 """Preflight regression tests for the BEAM benchmark harness.
 
-Pre-fix, `tools/evaluate_beam_end_to_end.py` ran with harness oracles
+Pre-fix, `_benchmarks/evaluate_beam_end_to_end.py` ran with harness oracles
 (TR timeline, CR injection, IE/KU `_context_facts`, RECENT CONVERSATION
 raw-message injection) by default -- without pure-recall mode the
 oracles produce answers that bypass `BeamMemory.recall()`, contaminating
@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_HARNESS = _REPO_ROOT / "tools" / "evaluate_beam_end_to_end.py"
+_HARNESS = _REPO_ROOT / "_benchmarks" / "evaluate_beam_end_to_end.py"
 
 
 @pytest.fixture

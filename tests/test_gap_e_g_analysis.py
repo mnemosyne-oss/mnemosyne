@@ -151,7 +151,7 @@ class TestPairedOutcomesJSONL:
 
     def test_harness_help_shows_config_id_flag(self):
         """`--config-id` flag is exposed."""
-        harness = _REPO_ROOT / "tools" / "evaluate_beam_end_to_end.py"
+        harness = _REPO_ROOT / "_benchmarks" / "evaluate_beam_end_to_end.py"
         result = subprocess.run(
             [sys.executable, str(harness), "--help"],
             capture_output=True, text=True, timeout=30,

@@ -1,6 +1,6 @@
 """LLM client for fact extraction via OpenRouter.
 
-Reuses the same patterns as tools/evaluate_beam_end_to_end.py LLMClient.
+Reuses the same patterns as _benchmarks/evaluate_beam_end_to_end.py LLMClient.
 100% open source (MIT).
 """
 

@@ -1,6 +1,6 @@
 """Regression tests for E1 — additive BEAM benchmark adapter.
 
-Pre-E1: `tools/evaluate_beam_end_to_end.py::ingest_conversation` ran a
+Pre-E1: `_benchmarks/evaluate_beam_end_to_end.py::ingest_conversation` ran a
 destructive batch-summary pattern. Per BATCH_SIZE=500 messages it:
   1. SELECTed all working_memory rows for the session
   2. Built a synthetic summary: "Batch N: first_3_msg_contents[:100chars]"
@@ -78,7 +78,7 @@ def _import_benchmark_adapter():
     """Lazy import so module-load failures don't kill the whole test
     suite (the tool has optional deps like requests)."""
     import importlib.util
-    tool_path = _REPO_ROOT / "tools" / "evaluate_beam_end_to_end.py"
+    tool_path = _REPO_ROOT / "_benchmarks" / "evaluate_beam_end_to_end.py"
     spec = importlib.util.spec_from_file_location(
         "_e1_benchmark_adapter", tool_path
     )
@@ -308,7 +308,7 @@ class TestE1AdditiveBenchmarkIngest:
         # Patch BATCH_SIZE down to 5 so we exercise the multi-batch path
         # without ingesting hundreds of messages in a unit test.
         import importlib.util
-        tool_path = _REPO_ROOT / "tools" / "evaluate_beam_end_to_end.py"
+        tool_path = _REPO_ROOT / "_benchmarks" / "evaluate_beam_end_to_end.py"
         spec = importlib.util.spec_from_file_location("_e1_multibatch", tool_path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)

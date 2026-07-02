@@ -238,7 +238,7 @@ class TestRecallProvenanceInResultDict:
         `evaluate_conversation()` includes `recall_provenance`. A
         future refactor that drops the field would break post-hoc
         attribution analysis."""
-        harness_src = (_REPO_ROOT / "tools" / "evaluate_beam_end_to_end.py").read_text()
+        harness_src = (_REPO_ROOT / "_benchmarks" / "evaluate_beam_end_to_end.py").read_text()
         # The field is added to the per-question result dict
         assert '"recall_provenance": recall_provenance,' in harness_src, (
             "evaluate_conversation no longer writes recall_provenance "

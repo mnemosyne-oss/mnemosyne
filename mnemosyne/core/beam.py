@@ -228,7 +228,7 @@ def _env_truthy(name: str) -> bool:
     `_env_disabled` when the feature is default-ON and an env var
     opts it off.
 
-    Mirrors the helper of the same name in `tools/evaluate_beam_end_to_end.py`
+    Mirrors the helper of the same name in `_benchmarks/evaluate_beam_end_to_end.py`
     for env-parsing consistency across the codebase.
     """
     val = os.environ.get(name, "").strip().lower()
