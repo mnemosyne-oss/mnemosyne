@@ -142,8 +142,11 @@ def test_tool_whitelist_filters_schemas_before_routing(tmp_path, provider_module
         observed[name] = _schema_names(provider)
         assert provider.has_tool("mnemosyne_remember") is True
         assert provider.has_tool("mnemosyne_forget") is False
+        assert provider.has_tool("mnemosyne_batch") is False
         rejected = json.loads(provider.handle_tool_call("mnemosyne_forget", {"memory_id": "x"}))
         assert rejected == {"error": "Unknown Mnemosyne tool: mnemosyne_forget"}
+        rejected_batch = json.loads(provider.handle_tool_call("mnemosyne_batch", {"operations": []}))
+        assert rejected_batch == {"error": "Unknown Mnemosyne tool: mnemosyne_batch"}
 
     assert observed["hermes_memory_provider"] == allowed
     assert observed["mnemosyne_hermes"] == allowed
@@ -318,4 +321,45 @@ def test_provider_persona_tool_dispatch_matches(tmp_path, provider_modules):
         "status": "ok",
         "count": 1,
         "topics": ["test"],
+    }
+
+
+def test_provider_batch_dispatch_matches(tmp_path, provider_modules):
+    saved_mnemosyne_modules = _save_mnemosyne_modules()
+    _drop_modules("mnemosyne")
+    sys.path.insert(0, str(PROJECT_ROOT))
+    try:
+        from mnemosyne.core.beam import BeamMemory
+
+        observed = {}
+        for name, module in provider_modules.items():
+            db_path = tmp_path / f"{name}-batch.db"
+            beam = BeamMemory(session_id=f"batch-{name}", db_path=str(db_path))
+            provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+            provider._beam = beam
+            provider._default_scope = "session"
+            provider._audit_event = lambda *args, **kwargs: None
+
+            result = json.loads(provider.handle_tool_call("mnemosyne_batch", {
+                "operations": [
+                    {"action": "remember", "content": f"batch parity {name}"},
+                ],
+            }))
+            observed[name] = {
+                "status": result.get("status"),
+                "operations_count": result.get("operations_count"),
+                "result_statuses": [row.get("status") for row in result.get("results", [])],
+            }
+    finally:
+        try:
+            sys.path.remove(str(PROJECT_ROOT))
+        except ValueError:
+            pass
+        _restore_mnemosyne_modules(saved_mnemosyne_modules)
+
+    assert observed["hermes_memory_provider"] == observed["mnemosyne_hermes"]
+    assert observed["hermes_memory_provider"] == {
+        "status": "ok",
+        "operations_count": 1,
+        "result_statuses": ["stored"],
     }

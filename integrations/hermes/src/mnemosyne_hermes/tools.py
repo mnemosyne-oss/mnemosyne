@@ -477,6 +477,45 @@ FORGET_SCHEMA = {
     },
 }
 
+BATCH_SCHEMA = {
+    "name": "mnemosyne_batch",
+    "description": (
+        "Apply multiple Mnemosyne memory mutations atomically in one tool call. "
+        "Supported v1 actions: remember, update, forget, invalidate. "
+        "All operations are validated before mutation; on failure the whole batch rolls back. "
+        "Destructive actions require exact memory IDs. Recall/search/canonical/persona/shared-surface operations are not included in v1."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "operations": {
+                "type": "array",
+                "description": "Ordered mutation operations to apply atomically.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["remember", "update", "forget", "invalidate"]},
+                        "content": {"type": "string"},
+                        "memory_id": {"type": "string"},
+                        "importance": {"type": "number"},
+                        "source": {"type": "string"},
+                        "scope": {"type": "string"},
+                        "valid_until": {"type": "string"},
+                        "metadata": {"type": "object"},
+                        "extract_entities": {"type": "boolean"},
+                        "extract": {"type": "boolean"},
+                        "veracity": {"type": "string"},
+                        "replacement_id": {"type": "string"},
+                    },
+                    "required": ["action"],
+                },
+            },
+            "dry_run": {"type": "boolean", "default": False},
+        },
+        "required": ["operations"],
+    },
+}
+
 IMPORT_SCHEMA = {
     "name": "mnemosyne_import",
     "description": "Import Mnemosyne memories from a JSON file or another memory provider (Hindsight, Mem0). Idempotent by default.",
@@ -717,7 +756,7 @@ ALL_TOOL_SCHEMAS = [
     TRIPLE_END_SCHEMA,
     REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA, MODEL_CARD_SCHEMA,
     MODEL_REFRESH_SCHEMA, SCRATCHPAD_WRITE_SCHEMA, SCRATCHPAD_READ_SCHEMA, SCRATCHPAD_CLEAR_SCHEMA,
-    EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
+    EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, BATCH_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
     RECALL_DIAGNOSTICS_SCHEMA,
     TASK_PROGRESS_SCHEMA,
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,

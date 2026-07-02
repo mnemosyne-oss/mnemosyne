@@ -31,6 +31,13 @@ from mnemosyne.core.memory import Mnemosyne
 from mnemosyne.core.beam import BeamMemory
 
 from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
+from mnemosyne.batch_tool import (
+    BatchValidationError,
+    apply_beam_batch,
+    batch_validation_error_payload,
+    dry_run_batch,
+    validate_batch_operations,
+)
 
 # ---------------------------------------------------------------------------
 # Tool Definitions
@@ -210,6 +217,33 @@ def _handle_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
         "content_preview": content[:100],
         "bank": bank
     }
+
+
+def _handle_batch(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_batch tool call."""
+    try:
+        normalized = validate_batch_operations(arguments.get("operations"))
+    except BatchValidationError as exc:
+        return batch_validation_error_payload(exc)
+
+    if bool(arguments.get("dry_run", False)):
+        return dry_run_batch(normalized)
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(
+        author_id=arguments.get("author_id"),
+        author_type=arguments.get("author_type"),
+        channel_id=arguments.get("channel_id"),
+        bank=bank,
+    )
+    result = apply_beam_batch(
+        mem.beam,
+        normalized,
+        default_scope=_resolve_default_scope(),
+        remember_source_default="mcp",
+    )
+    result["bank"] = bank
+    return result
 
 
 def _handle_recall(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -847,6 +881,7 @@ def _handle_graph_link(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 _TOOL_HANDLERS = {
     "mnemosyne_remember": _handle_remember,
+    "mnemosyne_batch": _handle_batch,
     "mnemosyne_recall": _handle_recall,
     "mnemosyne_shared_remember": _handle_shared_remember,
     "mnemosyne_shared_recall": _handle_shared_recall,

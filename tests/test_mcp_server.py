@@ -28,6 +28,7 @@ class TestToolSchemas:
         assert "mnemosyne_remember_canonical" in names
         assert "mnemosyne_recall_canonical" in names
         assert "mnemosyne_remember" in names
+        assert "mnemosyne_batch" in names
         assert "mnemosyne_recall" in names
         assert "mnemosyne_sleep" in names
         assert "mnemosyne_scratchpad_read" in names
@@ -97,6 +98,12 @@ class TestToolSchemas:
         assert "mnemosyne_invalidate" in names
         assert "mnemosyne_export" in names
         assert "mnemosyne_import" in names
+
+    def test_batch_schema_has_operations(self):
+        batch_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_batch")
+        schema = batch_tool["inputSchema"]
+        assert "operations" in schema["required"]
+        assert schema["properties"]["operations"]["type"] == "array"
 
 
 class TestToolHandlers:
@@ -201,6 +208,40 @@ class TestToolHandlers:
         assert result["status"] == "stored"
         assert result["bank"] == "personal"
         assert create_instance.call_args.kwargs["bank"] == "personal"
+
+    def test_handle_batch_multiple_remember(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        result = handle_tool_call("mnemosyne_batch", {
+            "operations": [
+                {"action": "remember", "content": "mcp batch one"},
+                {"action": "remember", "content": "mcp batch two"},
+            ],
+        })
+
+        assert result["status"] == "ok"
+        assert [item["status"] for item in result["results"]] == ["stored", "stored"]
+
+    def test_handle_batch_failure_rolls_back(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        result = handle_tool_call("mnemosyne_batch", {
+            "operations": [
+                {"action": "remember", "content": "mcp rollback"},
+                {"action": "update", "memory_id": "missing", "content": "x"},
+            ],
+        })
+
+        assert result["status"] == "error"
+        assert result["failed_index"] == 1
+        mem = _create_instance(bank="default")
+        row = mem.beam.conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE content = ?",
+            ("mcp rollback",),
+        ).fetchone()
+        assert row[0] == 0
 
     def test_handle_recall_uses_mcp_bank_env_default(self, mock_mnemosyne, monkeypatch):
         """MCP recall should use the server default bank when omitted."""
