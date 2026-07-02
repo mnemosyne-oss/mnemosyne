@@ -304,6 +304,7 @@ class Mnemosyne:
                  valid_until: str = None, scope: str = "session",
                  extract_entities: bool = False,
                  extract: bool = False,
+                 veracity: str = "unknown",
                  trust_tier: str = None) -> str:
         """
         Store a memory directly to SQLite.
@@ -352,6 +353,7 @@ class Mnemosyne:
             importance=importance, metadata=metadata,
             valid_until=valid_until, scope=scope,
             extract_entities=extract_entities, extract=extract,
+            veracity=veracity,
             trust_tier=trust_tier,
         )
         timestamp = datetime.now().isoformat()

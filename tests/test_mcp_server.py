@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 # Test tool schemas
 from mnemosyne.mcp_tools import (
-    TOOLS, get_tool_definitions, handle_tool_call,
+    TOOLS, get_tool_definitions, handle_tool_call, _create_instance,
 )
 
 
@@ -137,6 +137,35 @@ class TestToolHandlers:
         assert result["memory_id"] == "test-memory-id-123"
         assert result["bank"] == "default"
         mock_mnemosyne.remember.assert_called_once()
+
+    def test_handle_remember_forwards_veracity(self, tmp_path, monkeypatch):
+        """Regression: MCP remember must forward veracity to Mnemosyne.remember.
+
+        #386 wired veracity into _handle_remember() but Mnemosyne.remember()
+        never got the parameter, so every real MCP remember raised
+        `TypeError: remember() got an unexpected keyword argument 'veracity'`.
+        The mocked handler tests above miss it because a MagicMock swallows any
+        kwarg -- this test drives a real instance so the signature is exercised.
+        """
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        result = handle_tool_call("mnemosyne_remember", {
+            "content": "veracity plumbing regression",
+            "source": "test",
+            "scope": "global",
+            "veracity": "tool",
+        })
+        assert result["status"] == "stored"
+
+        # veracity must persist to the beam working_memory row, not be dropped.
+        mem = _create_instance(bank="default")
+        row = mem.beam.conn.execute(
+            "SELECT veracity FROM working_memory WHERE id = ?",
+            (result["memory_id"],),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "tool"
 
     def test_handle_remember_uses_mcp_bank_env_default(self, mock_mnemosyne, monkeypatch):
         """MCP server bank default applies when tool call omits bank."""
