@@ -9,7 +9,7 @@ from pathlib import Path
 # Ensure we use the local mnemosyne
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from tools.evaluate_beam_end_to_end import (
+from _benchmarks.evaluate_beam_end_to_end import (
     LLMClient, evaluate_conversation, load_beam_dataset,
     ingest_conversation, init_beam, BeamMemory, compute_ability_scores,
     print_sota_report, DEFAULT_TOP_K

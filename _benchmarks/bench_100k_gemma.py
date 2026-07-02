@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 os.environ['MNEMOSYNE_LLM_N_CTX'] = '8192'
 
-from tools.evaluate_beam_end_to_end import load_beam_dataset
+from _benchmarks.evaluate_beam_end_to_end import load_beam_dataset
 from mnemosyne.core.beam import BeamMemory, init_beam
 from llama_cpp import Llama
 

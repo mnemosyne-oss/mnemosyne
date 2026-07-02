@@ -173,7 +173,7 @@ class TestC31EnvTruthyParser:
         " 1 ", "  true  ", "\ton\t",  # whitespace
     ])
     def test_env_truthy_accepts_value(self, value, monkeypatch):
-        from tools.evaluate_beam_end_to_end import _env_truthy
+        from _benchmarks.evaluate_beam_end_to_end import _env_truthy
 
         monkeypatch.setenv("TEST_ENV_VAR", value)
         assert _env_truthy("TEST_ENV_VAR") is True
@@ -185,13 +185,13 @@ class TestC31EnvTruthyParser:
         "garbage", "maybe", "2", "y",  # non-canonical
     ])
     def test_env_truthy_rejects_value(self, value, monkeypatch):
-        from tools.evaluate_beam_end_to_end import _env_truthy
+        from _benchmarks.evaluate_beam_end_to_end import _env_truthy
 
         monkeypatch.setenv("TEST_ENV_VAR", value)
         assert _env_truthy("TEST_ENV_VAR") is False
 
     def test_env_truthy_unset_variable_is_false(self, monkeypatch):
-        from tools.evaluate_beam_end_to_end import _env_truthy
+        from _benchmarks.evaluate_beam_end_to_end import _env_truthy
         monkeypatch.delenv("TEST_ENV_VAR", raising=False)
         assert _env_truthy("TEST_ENV_VAR") is False
 
@@ -203,7 +203,7 @@ class TestC31EnvTruthyParser:
         beam._context_facts = {"favorite color blue": ["blue"]}
         fake_llm = MagicMock()
         fake_llm.chat = MagicMock(return_value="LLM-FALLBACK")
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         msgs = [{"role": "user", "content": f"row {i}"} for i in range(5)]
         answer_with_memory(
@@ -220,7 +220,7 @@ class TestC31EnvTruthyParser:
         beam._context_facts = {"favorite color blue": ["blue"]}
         fake_llm = MagicMock()
         fake_llm.chat = MagicMock(return_value="LLM-FALLBACK")
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         answer_with_memory(
             llm=fake_llm, beam=beam,

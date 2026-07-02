@@ -4,7 +4,7 @@ import sys, os, tempfile, json, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from tools.evaluate_beam_end_to_end import load_beam_dataset, init_beam, ingest_conversation
+from _benchmarks.evaluate_beam_end_to_end import load_beam_dataset, init_beam, ingest_conversation
 from mnemosyne.core.beam import BeamMemory
 
 # LLM for judging relevance

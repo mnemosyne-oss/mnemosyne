@@ -4,7 +4,7 @@ import sys, os, tempfile, time, json
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from tools.evaluate_beam_end_to_end import load_beam_dataset
+from _benchmarks.evaluate_beam_end_to_end import load_beam_dataset
 from mnemosyne.core.beam import BeamMemory, init_beam
 
 def score_answer(predicted: str, expected: list) -> float:

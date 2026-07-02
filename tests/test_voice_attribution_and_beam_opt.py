@@ -88,7 +88,7 @@ class TestAnswerWithMemoryReturnMemoriesKwarg:
         """Default -- back-compat with all existing callers."""
         monkeypatch.setenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", "1")
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         result = answer_with_memory(
             llm=fake_llm, beam=beam,
@@ -101,7 +101,7 @@ class TestAnswerWithMemoryReturnMemoriesKwarg:
     def test_return_memories_true_returns_tuple(self, temp_db, fake_llm, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", "1")
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         result = answer_with_memory(
             llm=fake_llm, beam=beam,
@@ -121,7 +121,7 @@ class TestAnswerWithMemoryReturnMemoriesKwarg:
         should be empty but the field still present (schema parity)."""
         monkeypatch.delenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", raising=False)
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         # TR-shaped fixture that triggers the bypass
         msgs = [
@@ -148,7 +148,7 @@ class TestSummarizeRecallMemories:
     dicts into a compact provenance object."""
 
     def test_empty_memories_returns_minimal_shape(self):
-        from tools.evaluate_beam_end_to_end import _summarize_recall_memories
+        from _benchmarks.evaluate_beam_end_to_end import _summarize_recall_memories
         out = _summarize_recall_memories([])
         assert out == {
             "engine": "unknown",
@@ -159,7 +159,7 @@ class TestSummarizeRecallMemories:
         }
 
     def test_polyphonic_engine_identified_by_keyset(self):
-        from tools.evaluate_beam_end_to_end import _summarize_recall_memories
+        from _benchmarks.evaluate_beam_end_to_end import _summarize_recall_memories
         memories = [
             {"voice_scores": {"vector": 0.5, "graph": 0.2}, "tier": "episodic"},
             {"voice_scores": {"vector": 0.4}, "tier": "working"},
@@ -175,7 +175,7 @@ class TestSummarizeRecallMemories:
         assert out["top_result_tier"] == "episodic"
 
     def test_linear_engine_identified_by_keyset(self):
-        from tools.evaluate_beam_end_to_end import _summarize_recall_memories
+        from _benchmarks.evaluate_beam_end_to_end import _summarize_recall_memories
         memories = [
             {"voice_scores": {"vec": 0.7, "fts": 0.3, "keyword": 0.0,
                               "importance": 0.5, "recency_decay": 0.9},
@@ -188,7 +188,7 @@ class TestSummarizeRecallMemories:
         assert out["top_result_tier"] == "working"
 
     def test_unknown_engine_for_voice_keys_outside_known_sets(self):
-        from tools.evaluate_beam_end_to_end import _summarize_recall_memories
+        from _benchmarks.evaluate_beam_end_to_end import _summarize_recall_memories
         # All memories have voice_scores but with unrecognized keys
         memories = [{"voice_scores": {"made_up_voice": 0.5}, "tier": "working"}]
         out = _summarize_recall_memories(memories)
@@ -199,7 +199,7 @@ class TestSummarizeRecallMemories:
     def test_handles_missing_voice_scores_field(self):
         """Some memory dicts might not have voice_scores at all
         (e.g., bypass-path placeholders). Helper should tolerate."""
-        from tools.evaluate_beam_end_to_end import _summarize_recall_memories
+        from _benchmarks.evaluate_beam_end_to_end import _summarize_recall_memories
         memories = [
             {"tier": "working"},  # no voice_scores
             {"voice_scores": {"vector": 0.5}, "tier": "episodic"},
@@ -212,7 +212,7 @@ class TestSummarizeRecallMemories:
     def test_handles_non_numeric_voice_value(self):
         """Defensive: malformed voice_score values are skipped, not
         crash."""
-        from tools.evaluate_beam_end_to_end import _summarize_recall_memories
+        from _benchmarks.evaluate_beam_end_to_end import _summarize_recall_memories
         memories = [
             {"voice_scores": {"vector": 0.5, "graph": None}, "tier": "working"},
             {"voice_scores": {"vector": "not-a-number"}, "tier": "working"},

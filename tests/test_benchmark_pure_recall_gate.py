@@ -87,7 +87,7 @@ class TestDefaultModeBehaviorUnchanged:
         """IE question with a matching `_context_facts` entry returns
         the value directly — bypass is active."""
         monkeypatch.delenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", raising=False)
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         ans = answer_with_memory(
             llm=fake_llm,
@@ -106,7 +106,7 @@ class TestDefaultModeBehaviorUnchanged:
         includes the RECENT CONVERSATION section by default."""
         monkeypatch.delenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", raising=False)
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         msgs = _build_msgs(20)
         answer_with_memory(
@@ -139,7 +139,7 @@ class TestPureRecallModeDisablesBypasses:
         """IE question with matching `_context_facts` should NOT short-
         circuit in pure-recall mode — the LLM gets called instead."""
         monkeypatch.setenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", "1")
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         ans = answer_with_memory(
             llm=fake_llm,
@@ -182,7 +182,7 @@ class TestPureRecallModeDisablesBypasses:
         the LLM. Verifies the bypass works end-to-end."""
         monkeypatch.delenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", raising=False)
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         ans = answer_with_memory(
             llm=fake_llm, beam=beam,
@@ -205,7 +205,7 @@ class TestPureRecallModeDisablesBypasses:
         optimization that applies in all modes, not gated by pure-recall."""
         monkeypatch.setenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", "1")
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         ans = answer_with_memory(
             llm=fake_llm, beam=beam,
@@ -227,7 +227,7 @@ class TestPureRecallModeDisablesBypasses:
         may appear in any message."""
         monkeypatch.delenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", raising=False)
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         answer_with_memory(
             llm=fake_llm, beam=beam,
@@ -262,7 +262,7 @@ class TestPureRecallModeDisablesBypasses:
         output into the prompt — pure recall means recall alone."""
         monkeypatch.setenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", "1")
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         answer_with_memory(
             llm=fake_llm, beam=beam,
@@ -284,7 +284,7 @@ class TestPureRecallModeDisablesBypasses:
         sees only what each arm's recall returned."""
         monkeypatch.setenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", "1")
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         msgs = _build_msgs(20)
         answer_with_memory(
@@ -309,7 +309,7 @@ class TestPureRecallEnvValueParsing:
     @pytest.mark.parametrize("value", ["1", "true", "TRUE", "True", "yes", "YES"])
     def test_truthy_values_enable_gate(self, value, beam_with_context_facts, fake_llm, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", value)
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         answer_with_memory(
             llm=fake_llm,
@@ -325,7 +325,7 @@ class TestPureRecallEnvValueParsing:
     @pytest.mark.parametrize("value", ["0", "false", "no", "", "anything-else"])
     def test_falsy_values_preserve_default(self, value, beam_with_context_facts, fake_llm, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", value)
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         ans = answer_with_memory(
             llm=fake_llm,
@@ -354,7 +354,7 @@ class TestPureRecallPrecedenceOverFullContext:
         monkeypatch.setenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", "1")
         monkeypatch.setenv("FULL_CONTEXT_MODE", "1")
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         msgs = _build_msgs(20)
         answer_with_memory(
@@ -379,7 +379,7 @@ class TestPureRecallPrecedenceOverFullContext:
         monkeypatch.delenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", raising=False)
         monkeypatch.setenv("FULL_CONTEXT_MODE", "1")
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        from tools.evaluate_beam_end_to_end import answer_with_memory
+        from _benchmarks.evaluate_beam_end_to_end import answer_with_memory
 
         msgs = _build_msgs(5)
         answer_with_memory(
@@ -409,7 +409,7 @@ class TestPureRecallActuallyRoutesThroughRecall:
     ):
         monkeypatch.setenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", "1")
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        import tools.evaluate_beam_end_to_end as harness
+        import _benchmarks.evaluate_beam_end_to_end as harness
 
         spy = MagicMock(return_value=[])
         monkeypatch.setattr(harness, "_multi_strategy_recall", spy)
@@ -431,7 +431,7 @@ class TestPureRecallActuallyRoutesThroughRecall:
         pipeline."""
         monkeypatch.setenv("MNEMOSYNE_BENCHMARK_PURE_RECALL", "1")
         beam = BeamMemory(session_id="s1", db_path=temp_db)
-        import tools.evaluate_beam_end_to_end as harness
+        import _benchmarks.evaluate_beam_end_to_end as harness
 
         spy = MagicMock(return_value=[])
         monkeypatch.setattr(harness, "_multi_strategy_recall", spy)
