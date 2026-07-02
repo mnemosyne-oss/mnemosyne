@@ -17,7 +17,7 @@ LLM: Nvidia API (deepseek-ai/deepseek-v4-pro) via OpenAI-compatible endpoint.
 
 Usage:
   cd /root/.hermes/projects/mnemosyne
-  .venv/bin/python tools/evaluate_beam_end_to_end.py --sample 5 --scales 100K,500K,1M,10M
+  .venv/bin/python _benchmarks/evaluate_beam_end_to_end.py --sample 5 --scales 100K,500K,1M,10M
 
 --sample N: conversations per scale (default 3, use 0 for all)
 --scales: comma-separated (default 100K,500K,1M,10M)

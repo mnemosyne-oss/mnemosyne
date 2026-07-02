@@ -72,7 +72,7 @@ mnemosyne-browser = "mnemosyne.integrations.memory_browser:main"
 mnemosyne-auto-save = "mnemosyne.integrations.auto_save_openwebui:main"
 
 [tool.setuptools.packages.find]
-exclude = ["tests*", "benchmark*", "scripts*", "docs*", "assets*"]
+exclude = ["tests*", "benchmark*", "_benchmarks*", "scripts*", "docs*", "assets*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "mnemosyne.__version__"}

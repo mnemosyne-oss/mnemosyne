@@ -1,6 +1,6 @@
 # BEAM Benchmark -- Output Files and Analysis Guide
 
-**Audience:** anyone (human or AI assistant) reading the result files produced by `tools/evaluate_beam_end_to_end.py` and computing per-phase / per-arm comparisons.
+**Audience:** anyone (human or AI assistant) reading the result files produced by `_benchmarks/evaluate_beam_end_to_end.py` and computing per-phase / per-arm comparisons.
 
 This doc is intentionally self-contained: file paths, schemas with field types, example records, and worked analyses. An AI assistant pointed at this doc plus the result files should be able to compute paired bootstrap CIs without external context.
 
@@ -10,7 +10,7 @@ For the test-infrastructure overview (env vars, pure-recall mode, etc.) see [ben
 
 ## Where the files live
 
-After `tools/evaluate_beam_end_to_end.py` runs to completion, three files exist under `results/`:
+After `_benchmarks/evaluate_beam_end_to_end.py` runs to completion, three files exist under `results/`:
 
 ```
 results/

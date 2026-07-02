@@ -23,7 +23,7 @@ echo "Scales: $1"
 echo "Sample: $2"
 echo "=========================="
 
-.venv/bin/python tools/evaluate_beam_end_to_end.py \
+.venv/bin/python _benchmarks/evaluate_beam_end_to_end.py \
   --scales "$1" \
   --sample "$2" \
   --mode end_to_end \

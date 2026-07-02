@@ -7,7 +7,7 @@ per-call cost so reviewers can confirm the ring-buffer trigger doesn't
 impose surprise overhead at scale.
 
 Usage:
-    python tools/bench_validation.py [--ops N]
+    python _benchmarks/bench_validation.py [--ops N]
 """
 from __future__ import annotations
 

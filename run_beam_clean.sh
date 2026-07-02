@@ -22,7 +22,7 @@ exec env -i \
     MNEMOSYNE_LLM_API_KEY="$OPENROUTER_KEY" \
     MNEMOSYNE_LLM_MODEL="deepseek/deepseek-v4-flash" \
     MNEMOSYNE_LLM_MAX_TOKENS=512 \
-    .venv/bin/python -u tools/evaluate_beam_end_to_end.py \
+    .venv/bin/python -u _benchmarks/evaluate_beam_end_to_end.py \
         --scales 100K --sample 3 \
         --model "deepseek/deepseek-v4-flash" \
         --judge-model "deepseek/deepseek-v4-flash" 2>&1

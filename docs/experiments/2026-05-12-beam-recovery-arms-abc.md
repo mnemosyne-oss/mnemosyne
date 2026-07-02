@@ -28,9 +28,9 @@ pip install 'mnemosyne-memory[embeddings]'   # fastembed (≥0.3.0) -- recall ve
 pip install 'mnemosyne-memory[llm]'          # llama-cpp-python -- sleep summarization (else AAAK fallback)
 
 # Benchmark-only -- NOT in pyproject yet:
-pip install datasets                          # HuggingFace BEAM dataset loader (tools/evaluate_beam_end_to_end.py:183)
+pip install datasets                          # HuggingFace BEAM dataset loader (_benchmarks/evaluate_beam_end_to_end.py:183)
 pip install sqlite-vec                        # vec_episodes ANN backend (linear path + polyphonic post-#80)
-pip install numpy                             # tools/evaluate_beam_end_to_end.py:54 import is unconditional
+pip install numpy                             # _benchmarks/evaluate_beam_end_to_end.py:54 import is unconditional
 ```
 
 `numpy` and `datasets` are runtime requirements of the benchmark harness but not declared as installable extras of the package -- install them in the same venv. Recommend tracking these in a `requirements-benchmark.txt` (see Implementation Gaps §6 below).
@@ -43,7 +43,7 @@ pip install numpy                             # tools/evaluate_beam_end_to_end.p
 | `HF_TOKEN` (optional) | If BEAM dataset turns gated; currently public at `Mohammadta/BEAM` | HuggingFace |
 | `OPENROUTER_BASE_URL` (optional) | API base URL override; default `https://openrouter.ai/api/v1` | env-only |
 
-The harness falls back to reading `OPENROUTER_API_KEY` from `/tmp/opencode_key.txt` or `/tmp/openrouter_key.txt` if the env isn't set (`tools/evaluate_beam_end_to_end.py:60-71`).
+The harness falls back to reading `OPENROUTER_API_KEY` from `/tmp/opencode_key.txt` or `/tmp/openrouter_key.txt` if the env isn't set (`_benchmarks/evaluate_beam_end_to_end.py:60-71`).
 
 ### Compute / resource budget
 
@@ -212,7 +212,7 @@ See §6 above. Without these, phases 0, 1, 3a-3d, 3-LIN-*, and 4 cannot be run c
 
 ### Gap C -- Harness preflight assertions (~80 LOC) -- ✅ closed in this PR
 
-Add to `tools/evaluate_beam_end_to_end.py:main()` near argument parsing:
+Add to `_benchmarks/evaluate_beam_end_to_end.py:main()` near argument parsing:
 
 1. **Pure-recall guard:** `sys.exit(1)` with explanatory message if `MNEMOSYNE_BENCHMARK_PURE_RECALL` is not truthy AND `--pure-recall` was not passed AND a new `--allow-harness-oracles` opt-out wasn't passed (existing benchmark workflows might legitimately want the legacy mode for ceiling tests; require explicit opt-in to be sure).
 2. **Env-var dump:** at run start, snapshot every env var matching `^MNEMOSYNE_|^FULL_CONTEXT_MODE$|^OPENROUTER_BASE_URL$` into the results JSON under `config.env`.

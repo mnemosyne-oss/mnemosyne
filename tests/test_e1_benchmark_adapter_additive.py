@@ -34,7 +34,7 @@ from pathlib import Path
 
 import pytest
 
-# Add tools/ to path so we can import the benchmark adapter directly.
+# Add _benchmarks/ to path so we can import the benchmark adapter directly.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT))
 

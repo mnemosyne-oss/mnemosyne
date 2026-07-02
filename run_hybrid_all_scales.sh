@@ -17,7 +17,7 @@ for scale in 100K 500K 1M 10M; do
     FULL_CONTEXT_MODE=1 \
     MNEMOSYNE_BEAM_OPTIMIZATIONS=1 \
     MNEMOSYNE_EMBEDDING_MODEL=openai/text-embedding-3-large \
-        .venv/bin/python tools/evaluate_beam_end_to_end.py \
+        .venv/bin/python _benchmarks/evaluate_beam_end_to_end.py \
         --sample "$SAMPLE" \
         --scales "$scale" \
         --model openai/gpt-4.1 \

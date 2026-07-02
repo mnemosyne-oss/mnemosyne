@@ -40,7 +40,7 @@ pip install sqlite-vec                         # ANN backend for vec_episodes vi
 pip install numpy                              # benchmark harness requires it unconditionally
 ```
 
-The benchmark harness (`tools/evaluate_beam_end_to_end.py`) imports `numpy` and `datasets` unconditionally. Neither is declared as an installable extra of the package. Track these in your local venv setup or via `requirements-benchmark.txt`.
+The benchmark harness (`_benchmarks/evaluate_beam_end_to_end.py`) imports `numpy` and `datasets` unconditionally. Neither is declared as an installable extra of the package. Track these in your local venv setup or via `requirements-benchmark.txt`.
 
 ### Environment variables required for any benchmark run
 
@@ -292,7 +292,7 @@ Example:
 MNEMOSYNE_VOICE_FACT=0 \
 MNEMOSYNE_POLYPHONIC_RECALL=1 \
 MNEMOSYNE_BENCHMARK_PURE_RECALL=1 \
-python tools/evaluate_beam_end_to_end.py --scales 100K --sample 3
+python _benchmarks/evaluate_beam_end_to_end.py --scales 100K --sample 3
 ```
 
 Pin each toggle in your `.env` or shell environment across an A/B run. The harness preflight snapshots all `MNEMOSYNE_*` env vars into the results JSON under `metadata.config.env` so you can verify the configuration retroactively.

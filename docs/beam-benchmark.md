@@ -90,7 +90,7 @@ pip install mnemosyne-memory[all]
 pip install datasets numpy  # benchmark deps
 
 export OPENROUTER_API_KEY="your-key"
-python tools/evaluate_beam_end_to_end.py --sample 5 --scales 100K
+python _benchmarks/evaluate_beam_end_to_end.py --sample 5 --scales 100K
 ```
 
 ### Scales
@@ -108,7 +108,7 @@ python tools/evaluate_beam_end_to_end.py --sample 5 --scales 100K
 Any OpenRouter model works. For reproducing published results:
 
 ```bash
-python tools/evaluate_beam_end_to_end.py \
+python _benchmarks/evaluate_beam_end_to_end.py \
   --model "meta-llama/llama-3.3-70b-instruct" \
   --judge-model "deepseek/deepseek-v4-flash" \
   --sample 0 --scales 100K
@@ -119,7 +119,7 @@ python tools/evaluate_beam_end_to_end.py \
 Measures retrieval quality only (no LLM answering). Useful for isolating Mnemosyne's recall from the LLM's intelligence:
 
 ```bash
-python tools/evaluate_beam_end_to_end.py --pure-recall --sample 5 --scales 100K
+python _benchmarks/evaluate_beam_end_to_end.py --pure-recall --sample 5 --scales 100K
 ```
 
 See [benchmarking.md](benchmarking.md) for the full env-var reference, diagnostic tools, and A/B experiment methodology. See [benchmark-results-analysis.md](benchmark-results-analysis.md) for output file schemas and statistical analysis.

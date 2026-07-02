@@ -6,7 +6,7 @@ forget, invalidate, shared_remember, shared_forget). This script measures
 the per-call latency cost so reviewers can see exactly what the overhead is.
 
 Usage:
-    python tools/bench_audit_log.py [--ops N]
+    python _benchmarks/bench_audit_log.py [--ops N]
 """
 from __future__ import annotations
 

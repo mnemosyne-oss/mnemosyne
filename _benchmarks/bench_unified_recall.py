@@ -6,7 +6,7 @@ behavior) vs True (new merged-bank behavior). Uses an isolated tmp DB so it
 runs deterministically regardless of host environment.
 
 Usage:
-    python tools/bench_unified_recall.py [--memories N] [--queries Q]
+    python _benchmarks/bench_unified_recall.py [--memories N] [--queries Q]
 
 Reports p50/p95 latency for both configs and the delta. The merged-bank path
 adds a single shared-surface beam.recall() call plus a Python sort over the
