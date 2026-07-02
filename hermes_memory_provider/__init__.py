@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -1198,6 +1199,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
     # it's not re-parsed on every _maybe_auto_sleep call.
     _AUTO_SLEEP_TIMEOUT_SECONDS = _parse_env_float("MNEMOSYNE_AUTO_SLEEP_TIMEOUT", 5)
 
+    _SYNC_TURN_SLOW_THRESHOLD_SECONDS = _parse_env_float("MNEMOSYNE_SYNC_TURN_SLOW_THRESHOLD", 5)
+
     _VALID_SYNC_ROLES: frozenset = frozenset({"user", "assistant"})
 
     def __init__(self):
@@ -1223,6 +1226,22 @@ class MnemosyneMemoryProvider(MemoryProvider):
         self._platform = "cli"
         self._agent_context = "primary"
         self._turn_count = 0
+        self._sync_turn_lock = threading.Lock()
+        self._sync_turn_telemetry: Dict[str, Any] = {
+            "pending_queue_length": 0,
+            "max_queue_length": 0,
+            "completed": 0,
+            "failed": 0,
+            # Reserved for a future bounded async queue; v1 keeps sync_turn
+            # inline but exposes stable diagnostic keys.
+            "merged": 0,
+            "dropped": 0,
+            "slow_sync_count": 0,
+            "last_duration_ms": None,
+            "max_duration_ms": 0.0,
+            "last_error": None,
+            "in_flight": 0,
+        }
         self._auto_sleep_threshold = 50
         self._auto_sleep_enabled = os.environ.get("MNEMOSYNE_AUTO_SLEEP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
         # Reflection/sleep guardrails.  "reflection" maps to Mnemosyne's
@@ -2083,10 +2102,55 @@ class MnemosyneMemoryProvider(MemoryProvider):
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         pass
 
+    def _ensure_sync_turn_telemetry(self) -> None:
+        """Initialize sync_turn telemetry for tests that construct via __new__."""
+        if not hasattr(self, "_sync_turn_lock"):
+            self._sync_turn_lock = threading.Lock()
+        if not hasattr(self, "_sync_turn_telemetry"):
+            self._sync_turn_telemetry = {
+                "pending_queue_length": 0,
+                "max_queue_length": 0,
+                "completed": 0,
+                "failed": 0,
+                # Reserved for a future bounded async queue; v1 keeps sync_turn
+                # inline but exposes stable diagnostic keys.
+                "merged": 0,
+                "dropped": 0,
+                "slow_sync_count": 0,
+                "last_duration_ms": None,
+                "max_duration_ms": 0.0,
+                "last_error": None,
+                "in_flight": 0,
+            }
+
+    def _sync_turn_diagnostics(self) -> Dict[str, Any]:
+        """Return a PII-safe snapshot of sync_turn telemetry."""
+        self._ensure_sync_turn_telemetry()
+        with self._sync_turn_lock:
+            return dict(self._sync_turn_telemetry)
+
+    @staticmethod
+    def _sanitize_sync_turn_error(exc: BaseException) -> str:
+        """Bound error detail without including user/assistant content."""
+        return f"{type(exc).__name__}: <redacted>"
+
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Persist the turn to Mnemosyne episodic memory."""
         if not self._beam or self._agent_context in self._skip_contexts:
             return
+        started = time.perf_counter()
+        self._ensure_sync_turn_telemetry()
+        with self._sync_turn_lock:
+            self._sync_turn_telemetry["in_flight"] += 1
+            in_flight = int(self._sync_turn_telemetry["in_flight"])
+            # v1 does not introduce a separate async queue yet. Expose the
+            # current in-flight sync work through the queue-shaped diagnostic
+            # fields so operators can see backlog pressure without raw content.
+            self._sync_turn_telemetry["pending_queue_length"] = in_flight
+            self._sync_turn_telemetry["max_queue_length"] = max(
+                int(self._sync_turn_telemetry.get("max_queue_length") or 0),
+                in_flight,
+            )
         try:
             if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
                 user_limit = _sync_turn_user_limit()
@@ -2112,8 +2176,36 @@ class MnemosyneMemoryProvider(MemoryProvider):
             self._turn_count += 1
             if self._auto_sleep_enabled and self._turn_count % 10 == 0:
                 self._maybe_auto_sleep()
+            with self._sync_turn_lock:
+                self._sync_turn_telemetry["completed"] += 1
+                self._sync_turn_telemetry["last_error"] = None
         except Exception as e:
-            logger.debug("Mnemosyne sync_turn failed: %s", e)
+            with self._sync_turn_lock:
+                self._sync_turn_telemetry["failed"] += 1
+                self._sync_turn_telemetry["last_error"] = self._sanitize_sync_turn_error(e)
+            logger.debug("Mnemosyne sync_turn failed: %s", self._sanitize_sync_turn_error(e))
+        finally:
+            duration_ms = (time.perf_counter() - started) * 1000.0
+            slow = duration_ms >= (self._SYNC_TURN_SLOW_THRESHOLD_SECONDS * 1000.0)
+            with self._sync_turn_lock:
+                self._sync_turn_telemetry["in_flight"] = max(0, self._sync_turn_telemetry["in_flight"] - 1)
+                self._sync_turn_telemetry["pending_queue_length"] = int(self._sync_turn_telemetry["in_flight"])
+                self._sync_turn_telemetry["last_duration_ms"] = duration_ms
+                self._sync_turn_telemetry["max_duration_ms"] = max(
+                    float(self._sync_turn_telemetry.get("max_duration_ms") or 0.0),
+                    duration_ms,
+                )
+                if slow:
+                    self._sync_turn_telemetry["slow_sync_count"] += 1
+                snapshot = dict(self._sync_turn_telemetry)
+            if slow:
+                logger.warning(
+                    "Mnemosyne sync_turn slow: duration_ms=%.1f completed=%s failed=%s pending_queue_length=%s",
+                    duration_ms,
+                    snapshot["completed"],
+                    snapshot["failed"],
+                    snapshot["pending_queue_length"],
+                )
 
     # Identity-significant expressions the user may voice about themselves or
     # their relationship to their work. When a match is found, the memory is
@@ -3101,6 +3193,8 @@ class MnemosyneMemoryProvider(MemoryProvider):
         repair_requested = bool(args.get("repair_vec_working", False))
         dry_run = bool(args.get("dry_run", False))
         result = run_diagnostics(repair_vec_working=repair_requested, dry_run=dry_run)
+        if self._beam is not None:
+            result["sync_turn"] = self._sync_turn_diagnostics()
 
         # run_diagnostics() reports Mnemosyne's legacy/default DB path. When
         # Hermes profile isolation is enabled, the active provider may use a
