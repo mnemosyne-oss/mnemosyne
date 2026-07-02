@@ -177,6 +177,35 @@ class TestBankManager:
             delete_bank("mod_test", data_dir)
             assert not bank_exists("mod_test", data_dir)
 
+    def test_module_level_remember_forwards_veracity(self):
+        """Module-level remember() should preserve veracity like Mnemosyne.remember()."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir)
+            old_data_dir = os.environ.get("MNEMOSYNE_DATA_DIR")
+            os.environ["MNEMOSYNE_DATA_DIR"] = str(data_dir)
+            try:
+                set_bank("default")
+                memory_id = remember(
+                    "module-level veracity passthrough",
+                    source="test",
+                    veracity="tool",
+                )
+
+                mem = Mnemosyne()
+                row = mem.beam.conn.execute(
+                    "SELECT veracity FROM working_memory WHERE id = ?",
+                    (memory_id,),
+                ).fetchone()
+
+                assert row is not None
+                assert row[0] == "tool"
+            finally:
+                set_bank("default")
+                if old_data_dir is None:
+                    os.environ.pop("MNEMOSYNE_DATA_DIR", None)
+                else:
+                    os.environ["MNEMOSYNE_DATA_DIR"] = old_data_dir
+
 
 # ============================================================================
 # Mnemosyne bank integration tests

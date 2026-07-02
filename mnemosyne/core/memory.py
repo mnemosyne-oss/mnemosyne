@@ -924,12 +924,14 @@ def remember(content: str, source: str = "conversation",
              scope: str = "session", valid_until: str = None,
              extract_entities: bool = False,
              extract: bool = False, bank: str = None,
-             trust_tier: str = None) -> str:
+             trust_tier: str = None,
+             veracity: str = "unknown") -> str:
     """Store a memory using the global instance"""
     return _get_default(bank).remember(content, source, importance, metadata,
                                        scope=scope, valid_until=valid_until,
                                        extract_entities=extract_entities,
-                                       extract=extract, trust_tier=trust_tier)
+                                       extract=extract, trust_tier=trust_tier,
+                                       veracity=veracity)
 
 
 def recall(query: str, top_k: int = 5, *,
