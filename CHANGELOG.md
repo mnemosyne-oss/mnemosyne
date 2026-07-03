@@ -7,6 +7,21 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+### Fixed
+
+- **CLI memory commands honor `MNEMOSYNE_BANK`.** `mnemosyne store`
+  and other `_get_memory()`-backed CLI commands now write to the selected
+  bank database instead of always using the default database.
+
+- **`mnemosyne bank list` no longer reports a phantom default bank.**
+  The CLI suppresses `default` when `<DATA_DIR>/mnemosyne.db` does not
+  exist, while preserving the core `BankManager` virtual-default contract.
+
+- **Existing 3.11.0-era banks can be migrated to the 3.11.1 sync schema.**
+  Added an explicit `mnemosyne migrate [--bank <name>]` command that
+  idempotently ensures `memory_events` and `sync_meta` exist.
+
+
 ### Changed
 
 - **Default prompt context excludes consolidated working-memory rows.**

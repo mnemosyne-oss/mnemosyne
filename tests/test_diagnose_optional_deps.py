@@ -61,6 +61,10 @@ def test_diagnose_reports_memory_orphans_without_mutating_rows(tmp_path, monkeyp
     init_db(db_path)
     beam = BeamMemory(session_id="diagnose-orphans", db_path=db_path)
     conn = beam.conn
+    # Build an intentionally inconsistent legacy fixture so diagnostics can
+    # verify orphan reporting without mutating rows. Modern connections may
+    # enable foreign-key enforcement, so disable it for this fixture setup.
+    conn.execute("PRAGMA foreign_keys = OFF")
 
     conn.execute(
         "INSERT INTO working_memory (id, content, source) VALUES (?, ?, ?)",
