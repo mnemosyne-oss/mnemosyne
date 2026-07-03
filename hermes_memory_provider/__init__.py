@@ -1853,7 +1853,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
             # (matches the auto-capture for identity-significant feelings
             # added in that PR), and keep C27's three-branch structure
             # (working / init-failed-visible / skip-context-silent).
-            return (
+            base = (
                 "# Mnemosyne Memory\n"
                 "Active (native local memory). Use mnemosyne_remember to store ANY "
                 "durable fact, preference, identity, or insight. Use mnemosyne_recall to search. "
@@ -1865,6 +1865,10 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 "answer directly. Use session_search only when the injected Mnemosyne "
                 "context is missing, stale, or insufficient."
             )
+            persona_block = self._persona_block()
+            if persona_block:
+                base += "\n\n# L3 Persona (Active Behavioral Rules)\n" + persona_block
+            return base
         # C27: when init failed (as opposed to a deliberate skip-context),
         # surface the failure in the system prompt so the agent -- and through
         # it the user -- can see that memory is unavailable rather than
@@ -3437,6 +3441,47 @@ class MnemosyneMemoryProvider(MemoryProvider):
     # contract). Tests may shorten this to keep the suite fast. Override via
     # MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT.
     SHUTDOWN_DRAIN_TIMEOUT_SECONDS = _parse_env_float("MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT", 2)
+
+    # L3 persona file injection. Default OFF -- opt in via
+    # MNEMOSYNE_PERSONA_ENABLED=true. When OFF, no file IO happens.
+    PERSONA_ENABLED = _parse_env_bool("MNEMOSYNE_PERSONA_ENABLED", False)
+    PERSONA_FILE = Path(
+        os.environ.get(
+            "MNEMOSYNE_PERSONA_FILE",
+            str(Path.home() / ".hermes" / "memory" / "persona.md"),
+        )
+    )
+    PERSONA_TOKEN_CAP = int(os.environ.get("MNEMOSYNE_PERSONA_TOKEN_CAP", "1500"))
+    _persona_cache: Dict[str, Any] = {"mtime": None, "content": None}
+
+    def _persona_block(self) -> str:
+        """Read persona.md if feature enabled and file exists. Cached by mtime."""
+        if not self.PERSONA_ENABLED:
+            return ""
+        try:
+            if not self.PERSONA_FILE.exists():
+                self._persona_cache = {"mtime": None, "content": None}
+                return ""
+            mtime = self.PERSONA_FILE.stat().st_mtime
+            if (
+                self._persona_cache.get("mtime") == mtime
+                and self._persona_cache.get("content") is not None
+            ):
+                return self._persona_cache["content"]
+            raw = self.PERSONA_FILE.read_text()
+            words = raw.split()
+            max_words = int(self.PERSONA_TOKEN_CAP * 0.75)
+            if len(words) > max_words:
+                truncated = " ".join(words[:max_words])
+                last_section = truncated.rfind("\n## ")
+                if last_section > 0:
+                    truncated = truncated[:last_section]
+                raw = truncated + "\n... (truncated, see persona file for full content)"
+            self._persona_cache = {"mtime": mtime, "content": raw}
+            return raw
+        except Exception as exc:
+            logger.debug("persona_block read failed: %s", exc)
+            return ""
 
     def shutdown(self) -> None:
         # If session_end's daemon thread is still consolidating when shutdown

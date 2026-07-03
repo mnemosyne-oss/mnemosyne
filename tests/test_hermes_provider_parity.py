@@ -640,8 +640,51 @@ def test_sync_adapter_pull_tolerates_null_next_cursor(sync_modules):
         "next_cursor": "",
     }
 
+def _prompt_provider(module):
+    provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+    provider._beam = object()
+    provider._init_error = None
+    if hasattr(provider, "_persona_cache"):
+        provider._persona_cache = {"mtime": None, "content": None}
+    return provider
 
 
+def test_provider_persona_prompt_injection_matches(tmp_path, provider_modules):
+    persona_file = tmp_path / "persona.md"
+    persona_file.write_text(
+        "# Persona\n\n"
+        "## privacy\n"
+        "- expected persona/privacy rule [importance: 0.90]\n"
+    )
+
+    observed = {}
+    for name, module in provider_modules.items():
+        provider = _prompt_provider(module)
+        # Class-level env defaults are read at import time; set the attrs
+        # directly so both already-imported provider surfaces see this file.
+        provider.PERSONA_ENABLED = True
+        provider.PERSONA_FILE = persona_file
+        observed[name] = provider.system_prompt_block()
+
+    for block in observed.values():
+        assert "# Mnemosyne Memory" in block
+        assert "# L3 Persona (Active Behavioral Rules)" in block
+        assert "expected persona/privacy rule" in block
+
+
+def test_provider_persona_prompt_silent_when_disabled_or_missing(tmp_path, provider_modules):
+    missing_file = tmp_path / "missing-persona.md"
+
+    for module in provider_modules.values():
+        provider = _prompt_provider(module)
+        provider.PERSONA_ENABLED = False
+        provider.PERSONA_FILE = missing_file
+        assert "# L3 Persona" not in provider.system_prompt_block()
+
+        provider = _prompt_provider(module)
+        provider.PERSONA_ENABLED = True
+        provider.PERSONA_FILE = missing_file
+        assert "# L3 Persona" not in provider.system_prompt_block()
 def _save_mnemosyne_modules():
     return {
         name: module for name, module in sys.modules.items()
