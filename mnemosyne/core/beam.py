@@ -1643,6 +1643,26 @@ def _minimum_recall_relevance(query_tokens: List[str]) -> float:
     return 0.15
 
 
+_CURRENT_STATE_QUERY_TOKENS = {"current", "currently", "latest", "now", "newer"}
+_CURRENT_STATE_CONTENT_TOKENS = {"current", "currently", "latest", "newer", "updated"}
+
+
+def _current_state_recency_bonus(query_tokens: List[str], content: str) -> float:
+    """Small tie-breaker for "what is true now/currently" queries.
+
+    Hybrid lexical scoring can leave stale and corrected facts nearly tied when
+    both share the same subject/action terms. Only add a bounded bonus when the
+    query asks for current state and the row itself carries an explicit
+    current-state marker; this keeps ordinary recall ranking unchanged.
+    """
+    if not (_CURRENT_STATE_QUERY_TOKENS & set(query_tokens)):
+        return 0.0
+    content_tokens = set(_recall_tokens(content))
+    if _CURRENT_STATE_CONTENT_TOKENS & content_tokens:
+        return 0.04
+    return 0.0
+
+
 def _fact_match_tokens(text: str) -> Set[str]:
     """Return meaningful tokens for strict fact matching."""
     return set(_recall_tokens(text))
@@ -5518,6 +5538,7 @@ class BeamMemory:
                 if vec_sim > 0:
                     base_score = base_score * 0.80 + vec_sim * 0.20
                 score = base_score * (rc_share + (1.0 - rc_share) * decay)
+                score += _current_state_recency_bonus(query_words, row["content"])
                 # Temporal boost (Phase 3)
                 if temporal_weight > 0.0:
                     t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
@@ -5601,6 +5622,7 @@ class BeamMemory:
                 else:
                     decay = _recency_decay(row["timestamp"])
                     score = (0.6 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
+                    score += _current_state_recency_bonus(query_words, row["content"])
                     # Temporal boost (Phase 3)
                     if temporal_weight > 0.0:
                         t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
@@ -5662,6 +5684,7 @@ class BeamMemory:
                 else:
                     decay = _recency_decay(row["timestamp"])
                     score = (0.6 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
+                    score += _current_state_recency_bonus(query_words, row["content"])
                     # Temporal boost (Phase 3)
                     if temporal_weight > 0.0:
                         t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
@@ -5722,6 +5745,7 @@ class BeamMemory:
                 else:
                     decay = _recency_decay(row["timestamp"])
                     score = (0.5 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
+                    score += _current_state_recency_bonus(query_words, row["content"])
                     # Temporal boost (Phase 3)
                     if temporal_weight > 0.0:
                         t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
@@ -5782,6 +5806,7 @@ class BeamMemory:
                 else:
                     decay = _recency_decay(row["timestamp"])
                     score = (0.5 + row["importance"] * 0.2) * (0.7 + 0.3 * decay)
+                    score += _current_state_recency_bonus(query_words, row["content"])
                     # Temporal boost (Phase 3)
                     if temporal_weight > 0.0:
                         t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
@@ -5999,6 +6024,7 @@ class BeamMemory:
                 binary_bonus = 0.0
 
             score = max(base_score, lexical * 0.8) * (0.7 + 0.3 * decay)
+            score += _current_state_recency_bonus(query_words, row["content"])
             score += graph_bonus + fact_bonus + binary_bonus  # Phase 5: polyphonic bonuses
             # Temporal boost (Phase 3)
             if temporal_weight > 0.0:
@@ -6073,6 +6099,7 @@ class BeamMemory:
                     rc_share = (1.0 - iw) * 0.4
                     base_score = relevance * kw_share + row["importance"] * iw + (relevance ** 2) * 0.08
                     score = base_score * (rc_share + (1.0 - rc_share) * decay)
+                    score += _current_state_recency_bonus(query_words, row["content"])
 
                     # Phase 5: Graph + fact + binary bonuses for fallback.
                     # Gated by the same toggles as the main loop above
