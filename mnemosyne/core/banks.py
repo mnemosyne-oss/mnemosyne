@@ -96,6 +96,7 @@ class BankManager:
         Raises:
             ValueError: If trying to delete 'default' without force=True.
         """
+        self._validate_name(name)
         if name == "default" and not force:
             raise ValueError("Cannot delete 'default' bank without force=True")
         bank_dir = self.banks_dir / name
@@ -116,6 +117,7 @@ class BankManager:
 
     def bank_exists(self, name: str) -> bool:
         """Check if a bank exists."""
+        self._validate_name(name)
         if name == "default":
             return True
         return (self.banks_dir / name).is_dir()
@@ -127,8 +129,9 @@ class BankManager:
         The 'default' bank uses the legacy path (data_dir/mnemosyne.db).
         All other banks use banks_dir/<name>/mnemosyne.db.
         """
-        if name == "default" or not name:
+        if name == "default":
             return self.data_dir / "mnemosyne.db"
+        self._validate_name(name)
         return self.banks_dir / name / "mnemosyne.db"
 
     def rename_bank(self, old_name: str, new_name: str) -> Path:
@@ -145,6 +148,7 @@ class BankManager:
         Raises:
             ValueError: If old_name doesn't exist or new_name is taken.
         """
+        self._validate_name(old_name)
         if old_name == "default":
             raise ValueError("Cannot rename 'default' bank")
         self._validate_name(new_name)

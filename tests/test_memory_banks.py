@@ -62,6 +62,41 @@ class TestBankManager:
             with pytest.raises(ValueError):
                 mgr.create_bank("bank.with.dots")
 
+    @pytest.mark.parametrize(
+        ("name", "error"),
+        [
+            ("", "Bank name cannot be empty"),
+            ("../outside", "Invalid bank name"),
+            ("bank/with/slashes", "Invalid bank name"),
+            ("bank.with.dots", "Invalid bank name"),
+        ],
+    )
+    def test_path_based_operations_reject_invalid_bank_names(self, name, error):
+        """Path-based bank operations must not resolve invalid names."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir()
+            outside = Path(tmpdir) / "outside"
+            outside.mkdir()
+            sentinel = outside / "keep.txt"
+            sentinel.write_text("do not delete")
+
+            mgr = BankManager(data_dir)
+
+            with pytest.raises(ValueError, match=error):
+                mgr.delete_bank(name, force=True)
+            with pytest.raises(ValueError, match=error):
+                mgr.bank_exists(name)
+            with pytest.raises(ValueError, match=error):
+                mgr.get_bank_db_path(name)
+            with pytest.raises(ValueError, match=error):
+                mgr.get_bank_stats(name)
+            with pytest.raises(ValueError, match=error):
+                mgr.rename_bank(name, "safe_name")
+
+            assert sentinel.exists()
+            assert outside.exists()
+
     def test_list_banks_includes_default(self):
         """list_banks() should always include 'default'."""
         with tempfile.TemporaryDirectory() as tmpdir:
