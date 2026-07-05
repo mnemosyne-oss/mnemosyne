@@ -364,7 +364,10 @@ When used with Hermes Agent, Mnemosyne exposes **23 tools** for full memory life
 
 **Install (Hermes users):**
 ```bash
-pip install mnemosyne-hermes
+source ~/.hermes/hermes-agent/venv/bin/activate
+python -m ensurepip --upgrade
+python -m pip install --upgrade pip
+python -m pip install mnemosyne-hermes
 hermes config set memory.provider mnemosyne
 hermes memory setup
 ```
