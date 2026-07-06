@@ -297,8 +297,12 @@ class _FakeSyncEngine:
 
 
 class _FakeSyncEncryption:
-    def __init__(self, key):
-        self.key = key
+    def __init__(self, key_source):
+        self.key_source = key_source
+
+    @classmethod
+    def from_config(cls, key_source=None, **_kwargs):
+        return cls(key_source)
 
 
 class _UnexpectedBeam:
@@ -307,7 +311,7 @@ class _UnexpectedBeam:
         self.kwargs = kwargs
 
 
-def test_sync_adapter_uses_provider_beam_for_both_surfaces(monkeypatch, sync_modules):
+def _install_fake_sync_modules(monkeypatch):
     import types
 
     fake_sync = types.ModuleType("mnemosyne.core.sync")
@@ -318,11 +322,36 @@ def test_sync_adapter_uses_provider_beam_for_both_surfaces(monkeypatch, sync_mod
     monkeypatch.setitem(sys.modules, "mnemosyne.core.sync", fake_sync)
     monkeypatch.setitem(sys.modules, "mnemosyne.core.beam", fake_beam)
 
+
+def test_sync_adapter_uses_provider_beam_for_both_surfaces(monkeypatch, sync_modules):
+    _install_fake_sync_modules(monkeypatch)
+
     provider_beam = object()
     for module in sync_modules.values():
         adapter = module.SyncAdapter(provider_beam, {})
         assert adapter.is_ready is True
         assert adapter._engine.beam_instance is provider_beam
+
+
+def test_sync_adapter_config_resolution_matches(monkeypatch, sync_modules):
+    _install_fake_sync_modules(monkeypatch)
+    monkeypatch.delenv("MNEMOSYNE_SYNC_REMOTE", raising=False)
+    monkeypatch.setenv("MNEMOSYNE_SYNC_HOST", "sync.example")
+    monkeypatch.setenv("MNEMOSYNE_SYNC_PORT", "443")
+
+    observed = {}
+    for name, module in sync_modules.items():
+        adapter = module.SyncAdapter(object(), {"encrypt": True, "key": "encoded-key"})
+        observed[name] = {
+            "remote": adapter.remote,
+            "encryption_key_source": adapter._engine.encryption.key_source,
+        }
+
+    assert observed["mnemosyne_hermes"] == observed["hermes_memory_provider"]
+    assert observed["hermes_memory_provider"] == {
+        "remote": "https://sync.example:443",
+        "encryption_key_source": "encoded-key",
+    }
 
 
 class _ToolEngine:
@@ -352,7 +381,7 @@ class _ToolEngine:
         return (3,)
 
 
-def _adapter_with_tool_engine(module):
+def _adapter_with_tool_engine(module, *, next_cursor: str | None = "remote-cursor"):
     adapter = module.SyncAdapter.__new__(module.SyncAdapter)
     adapter._engine = _ToolEngine()
     adapter._error = None
@@ -368,7 +397,7 @@ def _adapter_with_tool_engine(module):
             "duplicates": 1,
             "conflicts": 1,
             "events": [{"id": "remote-1"}, {"id": "remote-2"}],
-            "next_cursor": "remote-cursor",
+            "next_cursor": next_cursor,
         }
 
     adapter._http_post = fake_post
@@ -402,6 +431,23 @@ def test_sync_adapter_tool_results_match(sync_modules):
         "conflicts": 1,
         "next_cursor": "remote-cursor",
     }
+
+
+def test_sync_adapter_pull_tolerates_null_next_cursor(sync_modules):
+    observed = {}
+    for name, module in sync_modules.items():
+        adapter = _adapter_with_tool_engine(module, next_cursor=None)
+        observed[name] = json.loads(adapter.handle_tool_call("mnemosyne_sync_pull", {}))
+
+    assert observed["mnemosyne_hermes"] == observed["hermes_memory_provider"]
+    assert observed["hermes_memory_provider"] == {
+        "status": "ok",
+        "pulled": 2,
+        "duplicates": 1,
+        "conflicts": 1,
+        "next_cursor": "",
+    }
+
 
 
 def _save_mnemosyne_modules():
