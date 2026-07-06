@@ -26,7 +26,9 @@
           "importance": {
             "type": "number",
             "description": "Importance 0.0-1.0. Higher surfaces more often. Default 0.5.",
-            "default": 0.5
+            "default": 0.5,
+            "minimum": 0,
+            "maximum": 1
           }
         },
         "required": ["content"]
@@ -48,7 +50,8 @@
           "limit": {
             "type": "integer",
             "description": "Max results to return. Default 5.",
-            "default": 5
+            "default": 5,
+            "minimum": 1
           }
         },
         "required": ["query"]

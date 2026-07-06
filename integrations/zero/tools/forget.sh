@@ -4,7 +4,8 @@
 set -euo pipefail
 
 input="$(cat)"
-id="$(echo "$input" | jq -r '.id // empty')"
+
+id="$(jq -r '.id // empty' <<< "$input")"
 
 if [ -z "$id" ]; then
   echo "Error: id is required"

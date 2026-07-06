@@ -5,9 +5,9 @@ set -euo pipefail
 
 input="$(cat)"
 
-content="$(echo "$input" | jq -r '.content // empty')"
-source_tag="$(echo "$input" | jq -r '.source // "fact"')"
-importance="$(echo "$input" | jq -r '.importance // 0.5')"
+IFS=$'\t' read -r content source_tag importance < <(
+  jq -r '[.content // empty, .source // "fact", .importance // 0.5] | @tsv' <<< "$input"
+)
 
 if [ -z "$content" ]; then
   echo "Error: content is required"

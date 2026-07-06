@@ -3,19 +3,23 @@
 #
 # Zero sends JSON on stdin with: event, tool, toolCallId, sessionId, cwd,
 # status, changedFiles. This hook stores a compact memory of file-editing
-# actions so the agent recalls what it changed in future sessions.
+# actions so the agent recalls it changed in future sessions.
 #
 # Only captures tools that modify files (write, edit, patch, bash with changed
 # files). Read-only tools are skipped to avoid noise.
+#
+# All jq parsing is non-fatal: a malformed payload must never abort the hook
+# before it reaches `exit 0`, because afterTool hooks are advisory and must
+# never block tool execution.
 set -euo pipefail
 
 input="$(cat)"
 
-tool="$(echo "$input" | jq -r '.tool // empty')"
-status="$(echo "$input" | jq -r '.status // empty')"
-changed_files="$(echo "$input" | jq -r '.changedFiles // [] | if length > 0 then .[] else empty end' 2>/dev/null)"
-session_id="$(echo "$input" | jq -r '.sessionId // "unknown"')"
-cwd="$(echo "$input" | jq -r '.cwd // empty')"
+tool="$(echo "$input" | jq -r '.tool // empty' 2>/dev/null || echo '')"
+status="$(echo "$input" | jq -r '.status // empty' 2>/dev/null || echo '')"
+changed_files="$(echo "$input" | jq -r '.changedFiles // [] | if length > 0 then .[] else empty end' 2>/dev/null || echo '')"
+session_id="$(echo "$input" | jq -r '.sessionId // "unknown"' 2>/dev/null || echo 'unknown')"
+cwd="$(echo "$input" | jq -r '.cwd // empty' 2>/dev/null || echo '')"
 
 # Skip if the tool didn't succeed — no point remembering failures.
 if [ "$status" != "ok" ] && [ "$status" != "success" ]; then

@@ -56,7 +56,7 @@ project context.
 
 ## MCP Server (Optional Advanced)
 
-For the full 35-tool Mnemosyne surface (triples, graph traversal, scratchpad,
+For the full Mnemosyne MCP surface (triples, graph traversal, scratchpad,
 sync, canonical facts, persona management), add the Mnemosyne MCP server to
 your Zero config:
 
@@ -74,7 +74,8 @@ your Zero config:
 }
 ```
 
-This exposes `mnemosyne_remember`, `mnemosyne_recall`, `mnemosyne_sleep`,
-`mnemosyne_triple_add`, `mnemosyne_graph_query`, `mnemosyne_scratchpad_*`,
-and 30 more tools. The plugin's 5 shell-based tools cover the common case;
-the MCP server is for power users who want the full surface.
+This exposes the full Mnemosyne tool surface including `mnemosyne_remember`,
+`mnemosyne_recall`, `mnemosyne_sleep`, `mnemosyne_triple_add`,
+`mnemosyne_graph_query`, `mnemosyne_scratchpad_*`, and many more. The plugin's
+5 shell-based tools cover the common case; the MCP server is for power users
+who want the full surface.

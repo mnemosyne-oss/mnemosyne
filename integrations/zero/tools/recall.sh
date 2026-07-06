@@ -5,8 +5,9 @@ set -euo pipefail
 
 input="$(cat)"
 
-query="$(echo "$input" | jq -r '.query // empty')"
-limit="$(echo "$input" | jq -r '.limit // 5')"
+IFS=$'\t' read -r query limit < <(
+  jq -r '[.query // empty, .limit // 5] | @tsv' <<< "$input"
+)
 
 if [ -z "$query" ]; then
   echo "Error: query is required"
