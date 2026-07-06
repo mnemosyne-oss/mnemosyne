@@ -125,6 +125,7 @@ Every platform has its own way of exposing tools. Here's how to find it:
 | Claude Code | MCP config (`claude.json`) | [claude-code-mcp.md](claude-code-mcp.md) |
 | Cursor | MCP config (`.cursor/mcp.json`) | [cursor-mcp.md](cursor-mcp.md) |
 | Hermes | MCP config or plugin | [hermes-mcp.md](hermes-mcp.md) |
+| Zero | Plugin manifest (tools + hooks) | [zero.md](zero.md) |
 | Custom SDK | Direct Python import | Just call `adapter.remember()` |
 
 ## MCP Shortcut

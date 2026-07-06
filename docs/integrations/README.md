@@ -11,6 +11,7 @@ Mnemosyne runs everywhere. Pick your platform:
 | [OpenWebUI](openwebui-tool.md) | Native @tool | Workspace tool config |
 | [Pi](pi.md) | Pi extension + skill | `pi install npm:@mnemosyne-oss/pi-mnemosyne` |
 | [Hermes Agent](hermes-mcp.md) | MCP + Plugin | `~/.hermes/config.yaml` |
+| [Zero](zero.md) | Plugin (tools + hooks) | `.zero/plugins/mnemosyne/` |
 
 ## Quick Start (any MCP client)
 

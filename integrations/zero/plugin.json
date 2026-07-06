@@ -1,0 +1,125 @@
+{
+  "schemaVersion": 1,
+  "id": "mnemosyne",
+  "name": "Mnemosyne Memory",
+  "version": "1.0.0",
+  "description": "Local-first AI memory layer. Gives the agent persistent cross-session memory via the mnemosyne CLI — store, recall, consolidate, and auto-capture file edits.",
+  "enabled": true,
+  "tools": [
+    {
+      "name": "memory_remember",
+      "description": "Store a durable memory that persists across sessions. Use for: user preferences, project facts, environment details, tool quirks, stable conventions. Write declarative facts, not instructions. Returns the memory ID.",
+      "command": "${AGENT_PLUGIN_ROOT}/tools/remember.sh",
+      "args": [],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The memory content to store. Write as a declarative fact ('User prefers concise responses'), not an instruction ('Always respond concisely')."
+          },
+          "source": {
+            "type": "string",
+            "description": "Source tag: preference, fact, insight, identity, task, etc.",
+            "default": "fact"
+          },
+          "importance": {
+            "type": "number",
+            "description": "Importance 0.0-1.0. Higher surfaces more often. Default 0.5.",
+            "default": 0.5
+          }
+        },
+        "required": ["content"]
+      },
+      "permission": "allow"
+    },
+    {
+      "name": "memory_recall",
+      "description": "Search persistent memories by semantic similarity. Use before asking the user to repeat context — checks if a preference, fact, or past decision is already stored. Returns ranked matches.",
+      "command": "${AGENT_PLUGIN_ROOT}/tools/recall.sh",
+      "args": [],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Natural language query to search for."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Max results to return. Default 5.",
+            "default": 5
+          }
+        },
+        "required": ["query"]
+      },
+      "permission": "allow"
+    },
+    {
+      "name": "memory_stats",
+      "description": "Show Mnemosyne memory statistics: working count, episodic count, knowledge triples, and bank info.",
+      "command": "${AGENT_PLUGIN_ROOT}/tools/stats.sh",
+      "args": [],
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "permission": "allow"
+    },
+    {
+      "name": "memory_sleep",
+      "description": "Run memory consolidation: compresses old working memories into episodic summaries. Call after long sessions or when memory feels stale.",
+      "command": "${AGENT_PLUGIN_ROOT}/tools/sleep.sh",
+      "args": [],
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "permission": "allow"
+    },
+    {
+      "name": "memory_forget",
+      "description": "Permanently delete a memory by ID. Use when a fact is stale, wrong, or no longer applies.",
+      "command": "${AGENT_PLUGIN_ROOT}/tools/forget.sh",
+      "args": [],
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The memory ID to delete."
+          }
+        },
+        "required": ["id"]
+      },
+      "permission": "allow"
+    }
+  ],
+  "hooks": [
+    {
+      "name": "auto-capture-edits",
+      "description": "After a file-editing tool runs, stores a memory of what changed so the agent recalls it in future sessions.",
+      "event": "afterTool",
+      "command": "${AGENT_PLUGIN_ROOT}/hooks/after-tool.sh",
+      "args": []
+    }
+  ],
+  "skills": [
+    {
+      "path": "${AGENT_PLUGIN_ROOT}/skills/mnemosyne/SKILL.md"
+    }
+  ],
+  "author": {
+    "name": "Mnemosyne",
+    "url": "https://github.com/mnemosyne-oss/mnemosyne"
+  },
+  "interface": {
+    "displayName": "Mnemosyne Memory",
+    "category": "memory",
+    "brandColor": "#7C3AED",
+    "defaultPrompts": [
+      "What do you remember about my preferences?",
+      "Store this for later: "
+    ]
+  }
+}
