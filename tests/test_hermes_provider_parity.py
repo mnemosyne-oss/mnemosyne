@@ -354,12 +354,27 @@ def test_sync_adapter_config_resolution_matches(monkeypatch, sync_modules):
     }
 
 
+def test_sync_adapter_key_source_file_preserves_path_case(tmp_path, sync_modules):
+    key_file = tmp_path / "MixedCaseSync.key"
+    key_file.write_text("file-key")
+
+    observed = {}
+    for name, module in sync_modules.items():
+        adapter = module.SyncAdapter.__new__(module.SyncAdapter)
+        adapter._config = {"key_source": f"FILE:{key_file}"}
+        observed[name] = adapter._resolve_key()
+
+    assert observed["mnemosyne_hermes"] == observed["hermes_memory_provider"]
+    assert observed["hermes_memory_provider"] == "file-key"
+
+
 class _ToolEngine:
     device_id = "device-1"
 
-    def __init__(self):
+    def __init__(self, *, local_next_cursor: str | None = "local-cursor"):
         self.meta = {"last_sync_cursor": "cursor-previous"}
         self.conn = self
+        self.local_next_cursor = local_next_cursor
 
     def _meta_get(self, key):
         return self.meta.get(key)
@@ -368,7 +383,7 @@ class _ToolEngine:
         self.meta[key] = value
 
     def pull_changes(self, since_cursor=None, limit=500):
-        return {"events": [{"id": "e1"}], "next_cursor": "local-cursor"}
+        return {"events": [{"id": "e1"}], "next_cursor": self.local_next_cursor}
 
     def push_changes(self, events):
         self.pushed_events = events
@@ -381,9 +396,14 @@ class _ToolEngine:
         return (3,)
 
 
-def _adapter_with_tool_engine(module, *, next_cursor: str | None = "remote-cursor"):
+def _adapter_with_tool_engine(
+    module,
+    *,
+    next_cursor: str | None = "remote-cursor",
+    local_next_cursor: str | None = "local-cursor",
+):
     adapter = module.SyncAdapter.__new__(module.SyncAdapter)
-    adapter._engine = _ToolEngine()
+    adapter._engine = _ToolEngine(local_next_cursor=local_next_cursor)
     adapter._error = None
     adapter.remote = "https://sync.example"
     adapter.encrypt_enabled = False
@@ -431,6 +451,23 @@ def test_sync_adapter_tool_results_match(sync_modules):
         "conflicts": 1,
         "next_cursor": "remote-cursor",
     }
+
+
+def test_sync_adapter_push_tolerates_null_next_cursor(sync_modules):
+    observed = {}
+    for name, module in sync_modules.items():
+        adapter = _adapter_with_tool_engine(module, next_cursor=None, local_next_cursor=None)
+        observed[name] = json.loads(adapter.handle_tool_call("mnemosyne_sync_push", {}))
+
+    assert observed["mnemosyne_hermes"] == observed["hermes_memory_provider"]
+    assert observed["hermes_memory_provider"] == {
+        "status": "ok",
+        "pushed": 2,
+        "duplicates": 1,
+        "conflicts": 1,
+        "next_cursor": "",
+    }
+
 
 
 def test_sync_adapter_pull_tolerates_null_next_cursor(sync_modules):
