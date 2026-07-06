@@ -86,6 +86,45 @@ def test_diagnose_reports_count_error_without_failing(tmp_path, monkeypatch):
 
 
 
+def test_diagnose_reports_active_provider_orphans_without_mutating_rows(tmp_path, monkeypatch):
+    provider, _db_path = _provider_with_beam(tmp_path)
+    assert provider._beam is not None
+    conn = provider._beam.conn
+    conn.execute(
+        "INSERT INTO working_memory (id, content, source) VALUES (?, ?, ?)",
+        ("wm-live", "working row", "test"),
+    )
+    conn.execute(
+        "INSERT INTO gists (id, text, memory_id) VALUES (?, ?, ?)",
+        ("gist-orphan", "orphan gist", "missing-memory"),
+    )
+    conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        ("missing-memory", "[0.0]", "test"),
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        "mnemosyne.diagnose.run_diagnostics",
+        lambda **_kwargs: {"checks_total": 1, "key_findings": [], "entries": []},
+    )
+    before_counts = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("working_memory", "gists", "memory_embeddings")
+    }
+
+    result = json.loads(provider._handle_diagnose({}))
+
+    after_counts = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("working_memory", "gists", "memory_embeddings")
+    }
+    assert after_counts == before_counts
+    assert result["active_provider_orphan_diagnostics"]["foreign_keys_enabled"] == 0
+    assert result["active_provider_orphan_diagnostics"]["gists_orphan_memory_id"] == 1
+    assert result["active_provider_orphan_diagnostics"]["memory_embeddings_orphan_memory_id"] == 1
+    assert result["active_provider_orphan_diagnostics"]["orphan_memory_id_overlap"] == 1
+
+
 def test_diagnose_can_repair_active_provider_vec_working_gap(tmp_path, monkeypatch):
     provider, _db_path = _provider_with_beam(tmp_path)
     np = pytest.importorskip("numpy")

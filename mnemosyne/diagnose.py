@@ -62,6 +62,76 @@ def _safe_env(name: str) -> str:
     return "set" if val else "unset"
 
 
+def _memory_orphan_diagnostics(conn) -> Dict[str, int]:
+    """Return read-only memory reference integrity diagnostics."""
+    foreign_keys_enabled = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    live_id_tables = [
+        table
+        for table in ("working_memory", "memories", "episodic_memory")
+        if table in tables
+    ]
+    live_ids = set()
+    for table in live_id_tables:
+        live_ids.update(
+            row[0]
+            for row in conn.execute(f"SELECT id FROM {table} WHERE id IS NOT NULL")
+        )
+
+    diagnostics = {
+        "gists_total": 0,
+        "gists_with_memory_id": 0,
+        "gists_orphan_memory_id": 0,
+        "memory_embeddings_total": 0,
+        "memory_embeddings_orphan_memory_id": 0,
+        "orphan_memory_id_overlap": 0,
+    }
+
+    orphan_gist_ids = set()
+    if "gists" in tables:
+        diagnostics["gists_total"] = int(
+            conn.execute("SELECT COUNT(*) FROM gists").fetchone()[0]
+        )
+        gist_memory_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT memory_id FROM gists WHERE memory_id IS NOT NULL"
+            )
+        ]
+        diagnostics["gists_with_memory_id"] = len(gist_memory_ids)
+        orphan_gist_ids = {mid for mid in gist_memory_ids if mid not in live_ids}
+        diagnostics["gists_orphan_memory_id"] = sum(
+            1 for mid in gist_memory_ids if mid in orphan_gist_ids
+        )
+
+    orphan_embedding_ids = set()
+    if "memory_embeddings" in tables:
+        diagnostics["memory_embeddings_total"] = int(
+            conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0]
+        )
+        embedding_memory_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT memory_id FROM memory_embeddings WHERE memory_id IS NOT NULL"
+            )
+        ]
+        orphan_embedding_ids = {mid for mid in embedding_memory_ids if mid not in live_ids}
+        diagnostics["memory_embeddings_orphan_memory_id"] = sum(
+            1 for mid in embedding_memory_ids if mid in orphan_embedding_ids
+        )
+
+    diagnostics["orphan_memory_id_overlap"] = len(
+        orphan_gist_ids.intersection(orphan_embedding_ids)
+    )
+    diagnostics["foreign_keys_enabled"] = int(foreign_keys_enabled)
+    return diagnostics
+
+
 def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False) -> Dict:
     """
     Run full diagnostic scan and write PII-safe log.
@@ -183,6 +253,18 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False) 
         log("db", "episodic_vectors", str(ep.get("vectors", 0)))
         log("db", "episodic_vec_type", ep.get("vec_type", "none"))
         log("db", "db_path", stats.get("database", "unknown"))
+
+        try:
+            orphan_diag = _memory_orphan_diagnostics(mem.beam.conn)
+            log("db", "foreign_keys_enabled", "YES" if orphan_diag["foreign_keys_enabled"] else "NO")
+            log("db", "gists_total", str(orphan_diag["gists_total"]))
+            log("db", "gists_with_memory_id", str(orphan_diag["gists_with_memory_id"]))
+            log("db", "gists_orphan_memory_id", str(orphan_diag["gists_orphan_memory_id"]))
+            log("db", "memory_embeddings_total", str(orphan_diag["memory_embeddings_total"]))
+            log("db", "memory_embeddings_orphan_memory_id", str(orphan_diag["memory_embeddings_orphan_memory_id"]))
+            log("db", "orphan_memory_id_overlap", str(orphan_diag["orphan_memory_id_overlap"]))
+        except Exception as exc:
+            log("db", "memory_orphan_diagnostics", "ERROR", str(exc))
 
         try:
             from mnemosyne.core.beam import repair_vec_working as _repair_vec_working, vec_working_coverage

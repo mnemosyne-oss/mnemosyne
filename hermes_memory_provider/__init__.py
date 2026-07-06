@@ -3216,14 +3216,18 @@ class MnemosyneMemoryProvider(MemoryProvider):
             )
             try:
                 import sqlite3
+                from mnemosyne.diagnose import _memory_orphan_diagnostics
                 con = sqlite3.connect(str(active_db))
-                cur = con.cursor()
-                result["active_provider_counts"] = {
-                    "working_memory": cur.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0],
-                    "episodic_memory": cur.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0],
-                    "facts": cur.execute("SELECT COUNT(*) FROM facts").fetchone()[0],
-                }
-                con.close()
+                try:
+                    cur = con.cursor()
+                    result["active_provider_counts"] = {
+                        "working_memory": cur.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0],
+                        "episodic_memory": cur.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0],
+                        "facts": cur.execute("SELECT COUNT(*) FROM facts").fetchone()[0],
+                    }
+                    result["active_provider_orphan_diagnostics"] = _memory_orphan_diagnostics(con)
+                finally:
+                    con.close()
                 try:
                     from mnemosyne.core.beam import repair_vec_working as _repair_vec_working, vec_working_coverage
                     if repair_requested and self._beam is not None:
