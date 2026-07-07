@@ -7056,7 +7056,7 @@ class BeamMemory:
         Conditional filters: caller-supplied kwargs.
         """
         # Session scope filter (honors MNEMOSYNE_CROSS_SESSION).
-        if not _CROSS_SESSION:
+        if not _cross_session_enabled():
             row_session = row_dict.get("session_id") if "session_id" in row_dict else None
             row_scope = row_dict.get("scope") or "session"
             if row_scope != "global" and row_session is not None and row_session != self.session_id:
