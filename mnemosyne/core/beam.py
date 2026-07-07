@@ -454,7 +454,14 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
+        # Configurable so deployments with long consolidation write windows
+        # can let tool calls ride them out instead of failing with
+        # "database is locked" after a hardcoded 5s.
+        try:
+            _busy_ms = int(os.environ.get("MNEMOSYNE_BUSY_TIMEOUT_MS", "5000"))
+        except ValueError:
+            _busy_ms = 5000
+        conn.execute(f"PRAGMA busy_timeout={_busy_ms}")
         if _SQLITE_VEC_AVAILABLE:
             try:
                 conn.enable_load_extension(True)
@@ -4148,6 +4155,12 @@ class BeamMemory:
         # Strip closed <think>...</think> blocks that some LLMs emit
         import re as _re
         summary = _re.sub(r"<think>.*?</think>", "", summary, flags=_re.DOTALL).strip()
+        # Compute the embedding BEFORE the INSERT opens the write transaction.
+        # embed() can be a network call (API embeddings, 30s timeout) or a
+        # heavy CPU call; running it after the INSERT held the SQLite write
+        # lock across the whole call, starving every other connection
+        # (busy_timeout default 5s) for the duration of sleep().
+        vec = _embeddings.embed([summary]) if _embeddings.available() else None
         cursor = self.conn.cursor()
         cursor.execute("""
             INSERT INTO episodic_memory
@@ -4159,34 +4172,32 @@ class BeamMemory:
               self.author_id, self.author_type, self.channel_id, ep_type, row_veracity))
         rowid = cursor.lastrowid
 
-        if _embeddings.available():
-            vec = _embeddings.embed([summary])
-            if vec is not None:
-                if _vec_available(self.conn):
-                    try:
-                        _vec_insert(self.conn, rowid, np.asarray(vec[0]).tolist())
-                    except Exception as _vec_exc:
-                        logger.warning(
-                            "vec_episodes insert failed (rowid=%s): %s",
-                            rowid, _vec_exc,
-                        )
-                else:
-                    # Fallback: store in memory_embeddings table for in-memory search
-                    cursor.execute("""
-                        INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
-                        VALUES (?, ?, ?)
-                    """, (memory_id, _embeddings.serialize(np.asarray(vec[0])), _embeddings._DEFAULT_MODEL))
+        if vec is not None:
+            if _vec_available(self.conn):
+                try:
+                    _vec_insert(self.conn, rowid, np.asarray(vec[0]).tolist())
+                except Exception as _vec_exc:
+                    logger.warning(
+                        "vec_episodes insert failed (rowid=%s): %s",
+                        rowid, _vec_exc,
+                    )
+            else:
+                # Fallback: store in memory_embeddings table for in-memory search
+                cursor.execute("""
+                    INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
+                    VALUES (?, ?, ?)
+                """, (memory_id, _embeddings.serialize(np.asarray(vec[0])), _embeddings._DEFAULT_MODEL))
 
-                # Binary vector compression (Phase 2 -- 32x reduction)
-                if _mib is not None:
-                    try:
-                        bv = _mib(np.asarray(vec[0]))
-                        cursor.execute(
-                            "UPDATE episodic_memory SET binary_vector = ? WHERE rowid = ?",
-                            (bv, rowid)
-                        )
-                    except Exception:
-                        pass  # Non-blocking
+            # Binary vector compression (Phase 2 -- 32x reduction)
+            if _mib is not None:
+                try:
+                    bv = _mib(np.asarray(vec[0]))
+                    cursor.execute(
+                        "UPDATE episodic_memory SET binary_vector = ? WHERE rowid = ?",
+                        (bv, rowid)
+                    )
+                except Exception:
+                    pass  # Non-blocking
 
         self.conn.commit()
 
@@ -8112,6 +8123,15 @@ class BeamMemory:
                     f"WHERE id IN ({group_placeholders})",
                     tuple(ids),
                 )
+                # Commit the claim-clear NOW. Leaving this UPDATE uncommitted
+                # opened an implicit write transaction that stayed open across
+                # the NEXT group's LLM calls (validate_conflict_pair /
+                # summarize_memories — remote API seconds-to-minutes, local
+                # GGUF fallback unbounded), holding the SQLite write lock the
+                # whole time and failing every concurrent tool call with
+                # "database is locked". Observed wedging a live instance for
+                # 7+ hours with a frozen 52MB WAL.
+                self.conn.commit()
             consolidated_ids.extend(ids)
             summaries_created += 1
 
