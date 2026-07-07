@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -163,6 +165,25 @@ class TestSleepPromptOverride:
 
 class TestHostLLMBackend:
     """Tests for the host LLM adapter integration in summarize_memories()."""
+
+    def test_host_llm_timeout_can_be_configured_from_env(self):
+        """MNEMOSYNE_HOST_LLM_TIMEOUT overrides the host adapter timeout."""
+        env = os.environ.copy()
+        env["MNEMOSYNE_HOST_LLM_TIMEOUT"] = "120"
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from mnemosyne.core import local_llm; print(local_llm.HOST_LLM_TIMEOUT)",
+            ],
+            capture_output=True,
+            check=True,
+            env=env,
+            text=True,
+        )
+
+        assert result.stdout.strip() == "120.0"
 
     def _enable_host(self, monkeypatch):
         monkeypatch.setattr(local_llm, "LLM_ENABLED", True)

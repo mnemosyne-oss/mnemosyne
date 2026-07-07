@@ -54,7 +54,7 @@ LLM_FALLBACK_API_KEY = os.environ.get("MNEMOSYNE_LLM_FALLBACK_API_KEY", "") or L
 HOST_LLM_ENABLED = os.environ.get("MNEMOSYNE_HOST_LLM_ENABLED", "false").lower() in ("1", "true", "yes")
 HOST_LLM_PROVIDER = os.environ.get("MNEMOSYNE_HOST_LLM_PROVIDER", "").strip() or None
 HOST_LLM_MODEL = os.environ.get("MNEMOSYNE_HOST_LLM_MODEL", "").strip() or None
-HOST_LLM_TIMEOUT = 15.0  # Per-attempt safety cap; not user-facing.
+HOST_LLM_TIMEOUT = float(os.environ.get("MNEMOSYNE_HOST_LLM_TIMEOUT", "15"))  # Configurable via env
 # Host context window: local-model-calibrated LLM_N_CTX (2048) is too small for
 # Codex/GPT-class aux models; use this larger budget when the host is the path.
 HOST_LLM_N_CTX = int(os.environ.get("MNEMOSYNE_HOST_LLM_N_CTX", "32000"))
