@@ -64,6 +64,14 @@ def _get_memory():
     return Mnemosyne(db_path=os.path.join(DATA_DIR, "mnemosyne.db"))
 
 
+def _resolve_default_scope() -> str:
+    """Resolve the default scope for CLI store calls."""
+    raw = os.environ.get("MNEMOSYNE_DEFAULT_SCOPE", "").strip().lower()
+    if raw in ("session", "global"):
+        return raw
+    return "session"
+
+
 def cmd_store(args):
     """Store a new memory."""
     if not args:
@@ -77,6 +85,7 @@ def cmd_store(args):
         content,
         source=source,
         importance=importance,
+        scope=_resolve_default_scope(),
         extract_entities=True,
     )
     print(f"Stored: {memory_id}")
