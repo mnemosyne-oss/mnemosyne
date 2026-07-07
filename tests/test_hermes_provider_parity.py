@@ -178,6 +178,23 @@ def test_tool_whitelist_unknown_name_fails_loudly(tmp_path, provider_modules):
             provider.get_tool_schemas()
 
 
+def test_config_reader_tolerates_null_and_non_mapping_levels(tmp_path):
+    from mnemosyne.hermes_config import read_hermes_config_key
+
+    cases = [
+        "memory:\n",
+        "memory: []\n",
+        "memory:\n  mnemosyne:\n",
+        "memory:\n  mnemosyne: []\n",
+        "[]\n",
+    ]
+    for index, body in enumerate(cases):
+        hermes_home = tmp_path / f"case-{index}"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(body)
+        assert read_hermes_config_key(str(hermes_home), "tools") is None
+
+
 @pytest.mark.parametrize(
     ("env_name", "helper_name", "default", "custom"),
     [
@@ -230,7 +247,25 @@ def _new_provider(module, *, scope="session", roles=("user", "assistant")):
     provider._capture_identity_signals = lambda _content: None
     provider._turn_count = 0
     provider._auto_sleep_enabled = False
+    provider._audit_event = lambda *args, **kwargs: None
     return provider
+
+
+def test_provider_remember_extract_uses_default_scope(provider_modules):
+    observed = {}
+    for name, module in provider_modules.items():
+        provider = _new_provider(module, scope="session")
+        result = json.loads(provider._handle_remember({
+            "content": f"extract scope {name}",
+            "extract": True,
+        }))
+        observed[name] = {
+            "status": result.get("status"),
+            "scope": provider._beam.calls[0]["scope"],
+        }
+
+    assert observed["hermes_memory_provider"] == observed["mnemosyne_hermes"]
+    assert observed["hermes_memory_provider"] == {"status": "stored", "scope": "session"}
 
 
 @pytest.mark.parametrize("scope", ["session", "global"])
@@ -337,6 +372,7 @@ def test_provider_batch_dispatch_matches(tmp_path, provider_modules):
             beam = BeamMemory(session_id=f"batch-{name}", db_path=str(db_path))
             provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
             provider._beam = beam
+            provider._hermes_home = str(tmp_path)
             provider._default_scope = "session"
             provider._audit_event = lambda *args, **kwargs: None
 

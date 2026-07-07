@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from mnemosyne.core.beam import _deferred_commits
 from mnemosyne.core.veracity_consolidation import clamp_veracity
 
+
+logger = logging.getLogger(__name__)
 
 _ALLOWED_BATCH_ACTIONS = {"remember", "update", "forget", "invalidate"}
 _FUZZY_BATCH_FIELDS = {"old_text", "query", "content_match"}
@@ -51,21 +54,35 @@ def validate_batch_operations(operations: Any) -> list[dict[str, Any]]:
                 action,
             )
 
-        if action == "remember":
-            content = op.get("content")
-            if not isinstance(content, str) or not content.strip():
-                raise BatchValidationError("content is required", index, action)
-        elif action == "update":
-            if not _non_empty_string(op.get("memory_id")):
-                raise BatchValidationError("memory_id is required", index, action)
-            if op.get("content") is None and op.get("importance") is None:
-                raise BatchValidationError("content or importance is required", index, action)
-        elif action in {"forget", "invalidate"}:
-            if not _non_empty_string(op.get("memory_id")):
-                raise BatchValidationError("memory_id is required", index, action)
-
+        _VALIDATORS[action](op, index, action)
         normalized.append({"index": index, "action": action, "payload": dict(op)})
     return normalized
+
+
+def _validate_remember(op: dict[str, Any], index: int, action: str) -> None:
+    content = op.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise BatchValidationError("content is required", index, action)
+
+
+def _validate_update(op: dict[str, Any], index: int, action: str) -> None:
+    if not _non_empty_string(op.get("memory_id")):
+        raise BatchValidationError("memory_id is required", index, action)
+    if op.get("content") is None and op.get("importance") is None:
+        raise BatchValidationError("content or importance is required", index, action)
+
+
+def _validate_by_memory_id(op: dict[str, Any], index: int, action: str) -> None:
+    if not _non_empty_string(op.get("memory_id")):
+        raise BatchValidationError("memory_id is required", index, action)
+
+
+_VALIDATORS: dict[str, Callable[[dict[str, Any], int, str], None]] = {
+    "remember": _validate_remember,
+    "update": _validate_update,
+    "forget": _validate_by_memory_id,
+    "invalidate": _validate_by_memory_id,
+}
 
 
 def dry_run_batch(normalized: list[dict[str, Any]]) -> dict[str, Any]:
@@ -111,6 +128,11 @@ def apply_beam_batch(
                     extract_defaults_global=extract_defaults_global,
                 ))
     except Exception as exc:
+        logger.exception(
+            "mnemosyne_batch failed at index=%s action=%s",
+            current.get("index"),
+            current.get("action"),
+        )
         return {
             "status": "error",
             "failed_index": current.get("index"),
@@ -162,7 +184,12 @@ def _apply_one(
 
     memory_id = str(payload["memory_id"]).strip()
     if action == "update":
-        ok = beam.update_working(memory_id, content=payload.get("content"), importance=payload.get("importance"))
+        importance = payload.get("importance")
+        ok = beam.update_working(
+            memory_id,
+            content=payload.get("content"),
+            importance=float(importance) if importance is not None else None,
+        )
         if not ok:
             raise BatchOperationError("memory_not_found")
         audit_events.append(("update", {"memory_id": memory_id, "bank": "private", "source_tool": remember_source_tool}))

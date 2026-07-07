@@ -61,19 +61,40 @@ def test_batch_update_and_invalidate(tmp_path):
 
     result = json.loads(provider.handle_tool_call("mnemosyne_batch", {
         "operations": [
-            {"action": "update", "memory_id": update_id, "content": "batch new"},
+            {"action": "update", "memory_id": update_id, "content": "batch new", "importance": "0.8"},
             {"action": "invalidate", "memory_id": invalidate_id},
         ],
     }))
 
     assert result["status"] == "ok"
     assert [item["status"] for item in result["results"]] == ["updated", "invalidated"]
-    assert provider._beam.get(update_id)["content"] == "batch new"
+    updated = provider._beam.get(update_id)
+    assert updated["content"] == "batch new"
+    assert updated["importance"] == 0.8
     invalidated = provider._beam.conn.execute(
         "SELECT valid_until FROM working_memory WHERE id = ?",
         (invalidate_id,),
     ).fetchone()
     assert invalidated[0]
+
+
+def test_batch_extract_remember_uses_provider_default_scope(tmp_path):
+    provider = _provider(tmp_path)
+    provider._default_scope = "session"
+
+    result = json.loads(provider.handle_tool_call("mnemosyne_batch", {
+        "operations": [
+            {"action": "remember", "content": "scope parity extract", "extract": True},
+        ],
+    }))
+
+    assert result["status"] == "ok"
+    memory_id = result["results"][0]["memory_id"]
+    row = provider._beam.conn.execute(
+        "SELECT scope FROM working_memory WHERE id = ?",
+        (memory_id,),
+    ).fetchone()
+    assert row[0] == "session"
 
 
 def test_batch_failure_rolls_back_earlier_remember(tmp_path):

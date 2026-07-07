@@ -3,4 +3,4 @@ version: 0.3.1
 description: "Native local memory for Hermes - SQLite with vector search, FTS5 hybrid ranking, episodic consolidation, and temporal triples. Zero cloud. Zero latency. Pipx-installable via `pipx install mnemosyne-hermes`."
 author: Abdias J
 pip_dependencies:
-  - mnemosyne-memory>=3.1
+  - mnemosyne-memory>=3.11.1

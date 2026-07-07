@@ -104,6 +104,9 @@ class TestToolSchemas:
         schema = batch_tool["inputSchema"]
         assert "operations" in schema["required"]
         assert schema["properties"]["operations"]["type"] == "array"
+        assert schema["properties"]["operations"]["maxItems"] == 50
+        for context_field in ("bank", "author_id", "author_type", "channel_id"):
+            assert context_field in schema["properties"]
 
 
 class TestToolHandlers:
@@ -222,6 +225,75 @@ class TestToolHandlers:
 
         assert result["status"] == "ok"
         assert [item["status"] for item in result["results"]] == ["stored", "stored"]
+        assert [event["event"] for event in result["audit_events"]] == ["remember", "remember"]
+        mem = _create_instance(bank="default")
+        legacy_count = mem.conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE content IN (?, ?)",
+            ("mcp batch one", "mcp batch two"),
+        ).fetchone()[0]
+        assert legacy_count == 2
+
+    def test_handle_batch_updates_beam_only_memory(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        mem = _create_instance(bank="default")
+        memory_id = mem.beam.remember("beam only before", importance=0.2)
+
+        result = handle_tool_call("mnemosyne_batch", {
+            "operations": [
+                {"action": "update", "memory_id": memory_id, "content": "beam only after", "importance": "0.9"},
+            ],
+        })
+
+        assert result["status"] == "ok"
+        assert result["results"][0]["status"] == "updated"
+        updated = _create_instance(bank="default").beam.get(memory_id)
+        assert updated["content"] == "beam only after"
+        assert updated["importance"] == 0.9
+
+
+    def test_handle_batch_wrapper_update_forget_invalidate_and_scope(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        stored = handle_tool_call("mnemosyne_batch", {
+            "operations": [
+                {"action": "remember", "content": "mcp update target"},
+                {"action": "remember", "content": "mcp forget target"},
+                {"action": "remember", "content": "mcp invalidate target"},
+                {"action": "remember", "content": "mcp extract target", "extract": True},
+            ],
+        })
+        ids = [row["memory_id"] for row in stored["results"]]
+
+        result = handle_tool_call("mnemosyne_batch", {
+            "operations": [
+                {"action": "update", "memory_id": ids[0], "content": "mcp updated", "importance": "0.7"},
+                {"action": "forget", "memory_id": ids[1]},
+                {"action": "invalidate", "memory_id": ids[2]},
+            ],
+        })
+
+        assert result["status"] == "ok"
+        assert [item["status"] for item in result["results"]] == ["updated", "deleted", "invalidated"]
+        assert [event["event"] for event in result["audit_events"]] == ["update", "forget", "invalidate"]
+        mem = _create_instance(bank="default")
+        updated = mem.beam.get(ids[0])
+        assert updated["content"] == "mcp updated"
+        assert updated["importance"] == 0.7
+        assert mem.beam.get(ids[1]) is None
+        invalidated = mem.beam.conn.execute(
+            "SELECT valid_until FROM working_memory WHERE id = ?",
+            (ids[2],),
+        ).fetchone()
+        assert invalidated[0]
+        extract_scope = mem.beam.conn.execute(
+            "SELECT scope FROM working_memory WHERE id = ?",
+            (ids[3],),
+        ).fetchone()
+        assert extract_scope[0] == "session"
+
 
     def test_handle_batch_failure_rolls_back(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))

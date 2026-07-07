@@ -440,6 +440,7 @@ BATCH_SCHEMA = {
         "properties": {
             "operations": {
                 "type": "array",
+                "maxItems": 50,
                 "description": "Ordered mutation operations to apply atomically.",
                 "items": {
                     "type": "object",
@@ -461,6 +462,10 @@ BATCH_SCHEMA = {
                 },
             },
             "dry_run": {"type": "boolean", "default": False},
+            "bank": {"type": "string"},
+            "author_id": {"type": "string"},
+            "author_type": {"type": "string"},
+            "channel_id": {"type": "string"},
         },
         "required": ["operations"],
     },
