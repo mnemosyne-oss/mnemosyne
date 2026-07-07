@@ -73,10 +73,13 @@ def cmd_store(args):
     importance = _parse_float(args[2], "importance") if len(args) > 2 else 0.5
 
     mem = _get_memory()
+    from mnemosyne.mcp_tools import _resolve_default_scope
+
     memory_id = mem.remember(
         content,
         source=source,
         importance=importance,
+        scope=_resolve_default_scope(),
         extract_entities=True,
     )
     print(f"Stored: {memory_id}")

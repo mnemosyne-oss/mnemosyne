@@ -400,8 +400,10 @@ _warn_about_veracity_weight_overrides()
 
 
 # Cross-session recall toggle. When enabled via MNEMOSYNE_CROSS_SESSION=1,
-# the session filter (session_id = ? OR scope = 'global') is replaced with
-# (1=1), making all working and episodic memories visible across sessions.
+# the session filter is replaced with an always-true expression that still
+# consumes the same placeholders as the normal session filter. That keeps the
+# shared call sites' parameter binding unchanged while making all working and
+# episodic memories visible across sessions.
 # Default off preserves backward compatibility.
 _CROSS_SESSION = os.environ.get("MNEMOSYNE_CROSS_SESSION", "0") == "1"
 
@@ -409,11 +411,14 @@ _CROSS_SESSION = os.environ.get("MNEMOSYNE_CROSS_SESSION", "0") == "1"
 def _session_scope_filter(extra_col: str = "") -> str:
     """Return a WHERE clause for session scoping.
 
-    When _CROSS_SESSION is enabled, returns (1=1) to disable filtering.
+    When _CROSS_SESSION is enabled, returns an always-true predicate that
+    preserves the normal placeholder count to match existing caller params.
     Otherwise returns (session_id = ? OR scope = 'global'[ OR col = ?]).
     """
     if _CROSS_SESSION:
-        return "(1=1)"
+        if extra_col:
+            return "(? IS NOT NULL OR ? IS NOT NULL OR 1=1)"
+        return "(? IS NOT NULL OR 1=1)"
     if extra_col:
         return f"(session_id = ? OR scope = 'global' OR {extra_col} = ?)"
     return "(session_id = ? OR scope = 'global')"
