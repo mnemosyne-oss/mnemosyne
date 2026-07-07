@@ -673,18 +673,100 @@ def test_provider_persona_prompt_injection_matches(tmp_path, provider_modules):
 
 
 def test_provider_persona_prompt_silent_when_disabled_or_missing(tmp_path, provider_modules):
+    persona_file = tmp_path / "persona.md"
+    persona_file.write_text("# Persona\n\n- should stay hidden when disabled\n")
     missing_file = tmp_path / "missing-persona.md"
 
     for module in provider_modules.values():
         provider = _prompt_provider(module)
         provider.PERSONA_ENABLED = False
-        provider.PERSONA_FILE = missing_file
-        assert "# L3 Persona" not in provider.system_prompt_block()
+        provider.PERSONA_FILE = persona_file
+        block = provider.system_prompt_block()
+        assert "# L3 Persona" not in block
+        assert "should stay hidden when disabled" not in block
 
         provider = _prompt_provider(module)
         provider.PERSONA_ENABLED = True
         provider.PERSONA_FILE = missing_file
         assert "# L3 Persona" not in provider.system_prompt_block()
+
+
+def test_provider_persona_negative_token_cap_does_not_slice_from_end(tmp_path, provider_modules):
+    persona_file = tmp_path / "persona.md"
+    persona_file.write_text("# Persona\n\n## privacy\n- secret tail should not leak\n")
+
+    for module in provider_modules.values():
+        provider = _prompt_provider(module)
+        provider.PERSONA_ENABLED = True
+        provider.PERSONA_FILE = persona_file
+        provider.PERSONA_TOKEN_CAP = -10
+        block = provider.system_prompt_block()
+        assert "secret tail should not leak" not in block
+        assert "truncated" in block
+
+
+@pytest.mark.parametrize("bad_token_cap", ["", "not-an-int"])
+def test_provider_persona_token_cap_invalid_env_falls_back(monkeypatch, bad_token_cap):
+    monkeypatch.setenv("MNEMOSYNE_PERSONA_TOKEN_CAP", bad_token_cap)
+
+    modules = {
+        "hermes_memory_provider": _import_module("hermes_memory_provider", PROJECT_ROOT),
+        "mnemosyne_hermes": _import_module("mnemosyne_hermes", INTEGRATION_SRC),
+    }
+
+    assert {name: module.MnemosyneMemoryProvider.PERSONA_TOKEN_CAP for name, module in modules.items()} == {
+        "hermes_memory_provider": 1500,
+        "mnemosyne_hermes": 1500,
+    }
+
+
+def test_packaged_provider_import_survives_missing_core_helpers():
+    """Installer/status diagnostics must import even with a broken core install."""
+
+    import importlib.abc
+
+    blocked = {
+        "mnemosyne.batch_tool",
+        "mnemosyne.hermes_config",
+        "mnemosyne.integrations.hermes_persona_prompt",
+    }
+
+    class _BlockCoreHelperImports(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname in blocked:
+                raise ModuleNotFoundError(f"blocked test import: {fullname}")
+            return None
+
+    finder = _BlockCoreHelperImports()
+    saved = {name: module for name, module in sys.modules.items() if name in blocked}
+    for name in blocked:
+        sys.modules.pop(name, None)
+    _drop_modules("mnemosyne_hermes")
+    sys.path.insert(0, str(INTEGRATION_SRC))
+    sys.meta_path.insert(0, finder)
+    try:
+        module = importlib.import_module("mnemosyne_hermes")
+    finally:
+        sys.meta_path.remove(finder)
+        try:
+            sys.path.remove(str(INTEGRATION_SRC))
+        except ValueError:
+            pass
+        for name in blocked:
+            sys.modules.pop(name, None)
+        sys.modules.update(saved)
+
+    try:
+        assert module.read_hermes_config_key(None, "tools") is None
+        with pytest.raises(module.BatchValidationError):
+            module.validate_batch_operations([])
+        provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+        assert provider._with_persona_block("base") == "base"
+    finally:
+        _drop_modules("mnemosyne_hermes")
+        _import_module("mnemosyne_hermes", INTEGRATION_SRC)
+
+
 def _save_mnemosyne_modules():
     return {
         name: module for name, module in sys.modules.items()

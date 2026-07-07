@@ -27,19 +27,79 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from datetime import datetime, timedelta
 
-from .tools import ALL_TOOL_SCHEMAS
-from mnemosyne.batch_tool import (
-    BatchValidationError,
-    apply_beam_batch,
-    batch_validation_error_payload,
-    dry_run_batch,
-    validate_batch_operations,
-)
-from mnemosyne.hermes_config import read_hermes_config_key
-
 # Mnemosyne core is installed via pip (mnemosyne-memory>=3.11.1 dependency),
 # but keep imports lazy so installer/status CLI commands still work in broken
 # or partially-installed environments.
+try:
+    from .tools import ALL_TOOL_SCHEMAS
+except Exception as _tool_schema_import_exc:  # pragma: no cover - broken install diagnostic path
+    logging.getLogger(__name__).warning(
+        "Mnemosyne Hermes tool schemas unavailable (%s); no tools will be exposed until the install is repaired.",
+        _tool_schema_import_exc,
+    )
+    ALL_TOOL_SCHEMAS = []
+
+try:
+    from mnemosyne.batch_tool import (
+        BatchValidationError,
+        apply_beam_batch,
+        batch_validation_error_payload,
+        dry_run_batch,
+        validate_batch_operations,
+    )
+except Exception as _batch_tool_import_exc:  # pragma: no cover - broken install diagnostic path
+    logging.getLogger(__name__).warning(
+        "mnemosyne_batch helpers unavailable (%s); batch tool calls will return an error until mnemosyne-memory is upgraded.",
+        _batch_tool_import_exc,
+    )
+
+    class BatchValidationError(ValueError):
+        """Fallback validation error used when mnemosyne.batch_tool is unavailable."""
+
+    def validate_batch_operations(_operations):
+        raise BatchValidationError("mnemosyne_batch is unavailable; upgrade mnemosyne-memory")
+
+    def batch_validation_error_payload(exc: Exception) -> Dict[str, Any]:
+        return {"status": "error", "error": str(exc)}
+
+    def dry_run_batch(_operations):
+        return {"status": "error", "error": "mnemosyne_batch is unavailable; upgrade mnemosyne-memory"}
+
+    def apply_beam_batch(*_args, **_kwargs):
+        return {"status": "error", "error": "mnemosyne_batch is unavailable; upgrade mnemosyne-memory"}
+
+try:
+    from mnemosyne.hermes_config import read_hermes_config_key
+except Exception as _hermes_config_import_exc:  # pragma: no cover - broken install diagnostic path
+    logging.getLogger(__name__).warning(
+        "Hermes config helper unavailable (%s); memory.mnemosyne config keys will use defaults until mnemosyne-memory is upgraded.",
+        _hermes_config_import_exc,
+    )
+
+    def read_hermes_config_key(_hermes_home: Optional[str], _key: str) -> Any:
+        return None
+
+try:
+    from mnemosyne.integrations.hermes_persona_prompt import HermesPersonaPromptMixin
+except Exception as _persona_import_exc:  # pragma: no cover - graceful import for installer/status diagnostics
+    logging.getLogger(__name__).warning(
+        "L3 persona prompt mixin unavailable (%s); persona injection disabled. "
+        "Upgrade mnemosyne-memory to restore it.",
+        _persona_import_exc,
+    )
+
+    class HermesPersonaPromptMixin:
+        """Fallback used only when mnemosyne core is missing or too old."""
+
+        PERSONA_ENABLED = False
+        PERSONA_FILE = Path.home() / ".hermes" / "memory" / "persona.md"
+        PERSONA_TOKEN_CAP = 1500
+
+        def _persona_block(self) -> str:
+            return ""
+
+        def _with_persona_block(self, base: str) -> str:
+            return base
 
 __version__ = "0.3.1"
 
@@ -417,7 +477,7 @@ def _parse_env_optional_int(key: str, default: Optional[int]) -> Optional[int]:
     return _coerce_optional_int(os.environ.get(key), default)
 
 
-class MnemosyneMemoryProvider(MemoryProvider):
+class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     """Mnemosyne native memory — local SQLite with vector + FTS5 hybrid search."""
 
     _VALID_SYNC_ROLES: frozenset = frozenset({"user", "assistant"})
@@ -1045,14 +1105,7 @@ class MnemosyneMemoryProvider(MemoryProvider):
                 "answer directly. Use session_search only when the injected Mnemosyne "
                 "context is missing, stale, or insufficient."
             )
-            # L3 persona injection (v3.10.0): always-on behavioral rules.
-            # Feature-gated by MNEMOSYNE_PERSONA_ENABLED -- default OFF to
-            # preserve opt-in upgrade story. Reads persona.md atomically,
-            # caches by mtime to avoid re-reads on every prompt build.
-            persona_block = self._persona_block()
-            if persona_block:
-                base += "\n\n# L3 Persona (Active Behavioral Rules)\n" + persona_block
-            return base
+            return self._with_persona_block(base)
         # C27: when init failed (as opposed to a deliberate skip-context),
         # surface the failure in the system prompt so the agent -- and through
         # it the user -- can see that memory is unavailable rather than
@@ -2434,47 +2487,6 @@ class MnemosyneMemoryProvider(MemoryProvider):
     # contract). Tests may shorten this to keep the suite fast. Override via
     # MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT.
     SHUTDOWN_DRAIN_TIMEOUT_SECONDS = _parse_env_float("MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT", 2)
-
-    # L3 persona file injection (v3.10.0). Default OFF -- opt-in via
-    # MNEMOSYNE_PERSONA_ENABLED=true. When OFF, no file IO happens.
-    PERSONA_ENABLED = _parse_env_bool("MNEMOSYNE_PERSONA_ENABLED", False)
-    PERSONA_FILE = Path(
-        os.environ.get(
-            "MNEMOSYNE_PERSONA_FILE",
-            str(Path.home() / ".hermes" / "memory" / "persona.md"),
-        )
-    )
-    PERSONA_TOKEN_CAP = int(os.environ.get("MNEMOSYNE_PERSONA_TOKEN_CAP", "1500"))
-    _persona_cache: Dict[str, Any] = {"mtime": None, "content": None}
-
-    def _persona_block(self) -> str:
-        """Read persona.md if feature enabled and file exists. Cached by mtime."""
-        if not self.PERSONA_ENABLED:
-            return ""
-        try:
-            if not self.PERSONA_FILE.exists():
-                # Clear cache when file vanishes
-                self._persona_cache = {"mtime": None, "content": None}
-                return ""
-            mtime = self.PERSONA_FILE.stat().st_mtime
-            if self._persona_cache.get("mtime") == mtime and self._persona_cache.get("content") is not None:
-                return self._persona_cache["content"]
-            raw = self.PERSONA_FILE.read_text()
-            # Rough token cap (~1 token / 0.75 words).
-            words = raw.split()
-            max_words = int(self.PERSONA_TOKEN_CAP * 0.75)
-            if len(words) > max_words:
-                # Truncate at section boundary if possible
-                truncated = " ".join(words[:max_words])
-                last_section = truncated.rfind("\n## ")
-                if last_section > 0:
-                    truncated = truncated[:last_section]
-                raw = truncated + "\n... (truncated, see persona file for full content)"
-            self._persona_cache = {"mtime": mtime, "content": raw}
-            return raw
-        except Exception as exc:
-            logger.debug("persona_block read failed: %s", exc)
-            return ""
 
     def shutdown(self) -> None:
         # If session_end's daemon thread is still consolidating when shutdown
