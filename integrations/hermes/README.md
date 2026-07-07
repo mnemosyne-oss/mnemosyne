@@ -106,6 +106,12 @@ hermes memory status
 #   Plugin:    installed ✓
 ```
 
+The installer also deploys the bundled `mnemosyne-memory-override` skill to
+`$HERMES_HOME/skills/memory/mnemosyne-memory-override/SKILL.md`. The skill is a
+behavioral guardrail that nudges agents away from the legacy `memory` tool for
+durable facts. Existing user-edited copies are skipped by default; `install
+--force` overwrites the skill only after writing `SKILL.md.bak` next to it.
+
 ### How it works
 
 When you install via pipx, the package registers two entry points:

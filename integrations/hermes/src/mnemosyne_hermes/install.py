@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
+from importlib import resources
 import os
 import re
 import shutil
@@ -16,6 +18,9 @@ from typing import Optional
 
 
 PLUGIN_NAME = "mnemosyne"
+SKILL_NAME = "mnemosyne-memory-override"
+SKILL_CATEGORY = "memory"
+BUNDLED_SKILL_RESOURCE = ("skills", SKILL_NAME, "SKILL.md")
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,26 @@ class PluginState:
     wrapper_site_packages: Path | None = None
     wrapper_import_ok: bool | None = None
     wrapper_import_error: str | None = None
+
+
+@dataclass(frozen=True)
+class SkillState:
+    """Detailed installation state for the bundled Hermes skill."""
+
+    status: str
+    installed: bool
+    target: Path
+    message: str
+
+
+@dataclass(frozen=True)
+class SkillInstallResult:
+    """Result of installing, skipping, or planning the bundled skill."""
+
+    action: str
+    changed: bool
+    target: Path
+    message: str
 
 
 def hermes_home() -> Path:
@@ -61,6 +86,156 @@ def plugin_target_dir(hermes_home_path: str | Path | None = None) -> Path:
     """
     base = Path(hermes_home_path).expanduser() if hermes_home_path else hermes_home()
     return base / "plugins" / PLUGIN_NAME
+
+
+def skill_target_file(hermes_home_path: str | Path | None = None) -> Path:
+    """Return the deterministic install target for the bundled Hermes skill.
+
+    Hermes supports categorized skill directories under ``skills/<category>/<name>/SKILL.md``;
+    keep this memory guardrail in the memory category rather than the package's historical
+    flat source-tree ``skills/*.md`` location.
+    """
+    base = Path(hermes_home_path).expanduser() if hermes_home_path else hermes_home()
+    return base / "skills" / SKILL_CATEGORY / SKILL_NAME / "SKILL.md"
+
+
+def bundled_skill_resource():
+    """Return the importlib resource for the bundled memory override skill."""
+    resource = resources.files("mnemosyne_hermes")
+    for part in BUNDLED_SKILL_RESOURCE:
+        resource = resource.joinpath(part)
+    return resource
+
+
+def bundled_skill_text() -> str:
+    """Read the bundled memory override skill from package data."""
+    source = bundled_skill_resource()
+    if not source.is_file():
+        raise FileNotFoundError(
+            "Bundled Mnemosyne memory override skill is missing from package data: "
+            f"{'/'.join(BUNDLED_SKILL_RESOURCE)}"
+        )
+    return source.read_text(encoding="utf-8")
+
+
+def skill_state(*, hermes_home_path: str | Path | None = None) -> SkillState:
+    """Return state for the bundled Hermes skill install target."""
+    target = skill_target_file(hermes_home_path)
+    if target.is_file():
+        return SkillState(
+            status="installed",
+            installed=True,
+            target=target,
+            message="Bundled memory override skill is installed.",
+        )
+    if target.exists():
+        return SkillState(
+            status="invalid_target",
+            installed=False,
+            target=target,
+            message=f"Skill target exists but is not a file: {target}",
+        )
+    return SkillState(
+        status="missing",
+        installed=False,
+        target=target,
+        message=f"No bundled memory override skill at {target}.",
+    )
+
+
+def _skill_backup_file(target: Path) -> Path:
+    """Return the backup path used before overwriting a user-editable skill."""
+    return target.with_name(f"{target.name}.bak")
+
+
+def _skill_hash_file(target: Path) -> Path:
+    """Return the sidecar path used to track installer-managed skill content."""
+    return target.with_name(f"{target.name}.sha256")
+
+
+def _sha256_text(content: str) -> str:
+    """Return a stable digest for UTF-8 skill content."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _is_managed_skill_copy(target: Path) -> bool:
+    """Return whether target still matches the installer-managed sidecar hash."""
+    if not target.is_file():
+        return False
+    hash_file = _skill_hash_file(target)
+    if not hash_file.is_file():
+        return False
+    try:
+        expected = hash_file.read_text(encoding="utf-8").strip()
+        return expected == _sha256_text(target.read_text(encoding="utf-8"))
+    except OSError:
+        return False
+
+
+def _write_skill_hash(target: Path, content: str) -> None:
+    """Record the digest for installer-managed skill content."""
+    _skill_hash_file(target).write_text(_sha256_text(content) + "\n", encoding="utf-8")
+
+
+def install_bundled_skill(
+    *,
+    hermes_home_path: str | Path | None = None,
+    force: bool = False,
+    dry_run: bool = False,
+) -> SkillInstallResult:
+    """Install the bundled memory override skill into Hermes' skills directory."""
+    target = skill_target_file(hermes_home_path)
+    exists = target.exists()
+    backup = _skill_backup_file(target)
+    content = bundled_skill_text()
+    managed_copy = _is_managed_skill_copy(target)
+    up_to_date = target.is_file() and target.read_text(encoding="utf-8") == content
+
+    if exists and not force and not managed_copy:
+        if up_to_date:
+            _write_skill_hash(target, content)
+            return SkillInstallResult(
+                action="skip",
+                changed=False,
+                target=target,
+                message=f"Skill already exists at {target}; already up to date.",
+            )
+        return SkillInstallResult(
+            action="skip",
+            changed=False,
+            target=target,
+            message=f"Skill already exists at {target}; skipped (use --force to overwrite).",
+        )
+
+    action = "refresh" if exists and managed_copy else ("overwrite" if exists else "install")
+    if dry_run:
+        backup_note = f" Existing file would be backed up to {backup}." if target.is_file() and force else ""
+        return SkillInstallResult(
+            action=action,
+            changed=False,
+            target=target,
+            message=f"Would {action} bundled skill at {target}.{backup_note}",
+        )
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    backup_note = ""
+    if exists and target.is_file() and force:
+        shutil.copy2(target, backup)
+        backup_note = f" Backup written to {backup}."
+    elif exists and not target.is_file():
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+    target.write_text(content, encoding="utf-8")
+    _write_skill_hash(target, content)
+    verb = {"install": "Installed", "overwrite": "Overwrote", "refresh": "Refreshed"}[action]
+    return SkillInstallResult(
+        action=action,
+        changed=True,
+        target=target,
+        message=f"{verb} bundled skill at {target}.{backup_note}",
+    )
 
 
 def _provider_init_is_valid(init_file: Path) -> bool:
@@ -767,7 +942,10 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument(
         "--force",
         action="store_true",
-        help="Replace an existing Mnemosyne plugin directory.",
+        help=(
+            "Replace an existing Mnemosyne plugin directory. Also overwrites the "
+            "bundled memory override skill after writing a SKILL.md.bak backup."
+        ),
     )
     install.add_argument(
         "--dry-run",
@@ -876,6 +1054,10 @@ def run_install(
         mode=mode,
         python=python,
     )
+    skill_result = install_bundled_skill(
+        hermes_home_path=hermes_home_path,
+        force=force,
+    )
     if mode == "wrapper":
         state = plugin_state(hermes_home_path=hermes_home_path)
         print(f"Installed. Wrapper directory at {target}")
@@ -886,6 +1068,7 @@ def run_install(
     else:
         print(f"Installed. Symlink at {target}")
         print(f"  -> {os.readlink(str(target))}")
+    print(f"  Skill: {skill_result.message}")
     print("Done. Next steps:")
     print("  hermes config set memory.provider mnemosyne")
     print("  hermes memory status")
@@ -904,10 +1087,19 @@ def main(argv: list[str] | None = None) -> int:
             hermes_python = _find_hermes_python()
             target = plugin_target_dir(args.hermes_home)
             if getattr(args, "dry_run", False):
+                skill = skill_state(hermes_home_path=args.hermes_home)
+                skill_plan = install_bundled_skill(
+                    hermes_home_path=args.hermes_home,
+                    force=getattr(args, "force", False),
+                    dry_run=True,
+                )
                 print(f"  Plugin target dir: {target}")
                 print(f"  Hermes Python: {hermes_python or 'not found'}")
                 print(f"  Currently installed: {'yes' if is_installed(hermes_home_path=args.hermes_home) else 'no'}")
                 print(f"  Install mode: {getattr(args, 'mode', 'symlink')}")
+                print(f"  Skill target file: {skill.target}")
+                print(f"  Skill state: {skill.status}")
+                print(f"  Skill action: {skill_plan.message}")
                 if getattr(args, "mode", "symlink") == "wrapper":
                     wrapper_python = Path(getattr(args, "python", None) or sys.executable).expanduser()
                     print(f"  Wrapper Python: {wrapper_python}")
@@ -964,6 +1156,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  NOT installed: {state.message}")
                 if state.link_target is not None:
                     print(f"  Broken target: {state.link_target}")
+            skill = skill_state(hermes_home_path=args.hermes_home)
+            print(f"  Skill path: {skill.target}")
+            if skill.installed:
+                print("  Skill:     installed ✓")
+            else:
+                print(f"  Skill:     {skill.status} ✗ ({skill.message})")
             print(f"  Core library: {'OK' if check_mnemosyne_core() else 'MISSING'}")
             print(f"  This Python: {sys.executable} ({sys.version.split()[0]})")
             if hermes_python:

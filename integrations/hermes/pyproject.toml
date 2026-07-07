@@ -52,7 +52,7 @@ Repository = "https://github.com/AxDSan/mnemosyne"
 where = ["src"]
 
 [tool.setuptools.package-data]
-mnemosyne_hermes = ["plugin.yaml"]
+mnemosyne_hermes = ["plugin.yaml", "skills/mnemosyne-memory-override/SKILL.md"]
 
 [tool.ruff]
 line-length = 100

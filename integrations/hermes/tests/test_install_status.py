@@ -1,7 +1,120 @@
+import hashlib
 import sys
 from pathlib import Path
 
 from mnemosyne_hermes import install
+
+
+def _hash_text(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def test_bundled_memory_override_skill_resource_is_discoverable():
+    text = install.bundled_skill_text()
+
+    assert "name: mnemosyne-memory-override" in text
+    assert "The user expects fixes" not in text
+    assert "invalidation/forget" in text
+
+
+def test_install_bundled_skill_copies_when_missing(tmp_path):
+    result = install.install_bundled_skill(hermes_home_path=tmp_path)
+    target = install.skill_target_file(tmp_path)
+
+    assert result.action == "install"
+    assert result.changed is True
+    assert result.target == target
+    assert target.read_text(encoding="utf-8") == install.bundled_skill_text()
+    assert target.with_name("SKILL.md.sha256").is_file()
+
+
+def test_install_bundled_skill_skips_existing_without_force(tmp_path):
+    target = install.skill_target_file(tmp_path)
+    target.parent.mkdir(parents=True)
+    target.write_text("user custom skill\n", encoding="utf-8")
+
+    result = install.install_bundled_skill(hermes_home_path=tmp_path)
+
+    assert result.action == "skip"
+    assert result.changed is False
+    assert target.read_text(encoding="utf-8") == "user custom skill\n"
+
+
+def test_install_bundled_skill_refreshes_managed_copy_without_force(tmp_path):
+    target = install.skill_target_file(tmp_path)
+    target.parent.mkdir(parents=True)
+    target.write_text("old bundled content\n", encoding="utf-8")
+    target.with_name("SKILL.md.sha256").write_text(
+        _hash_text("old bundled content\n") + "\n",
+        encoding="utf-8",
+    )
+
+    result = install.install_bundled_skill(hermes_home_path=tmp_path)
+
+    assert result.action == "refresh"
+    assert result.changed is True
+    assert target.read_text(encoding="utf-8") == install.bundled_skill_text()
+    assert target.with_name("SKILL.md.sha256").read_text(encoding="utf-8").strip() == _hash_text(install.bundled_skill_text())
+    assert not target.with_name("SKILL.md.bak").exists()
+
+
+def test_install_bundled_skill_preserves_user_edited_managed_copy_without_force(tmp_path):
+    target = install.skill_target_file(tmp_path)
+    target.parent.mkdir(parents=True)
+    target.write_text("old bundled content plus user edit\n", encoding="utf-8")
+    target.with_name("SKILL.md.sha256").write_text(
+        _hash_text("old bundled content\n") + "\n",
+        encoding="utf-8",
+    )
+
+    result = install.install_bundled_skill(hermes_home_path=tmp_path)
+
+    assert result.action == "skip"
+    assert result.changed is False
+    assert target.read_text(encoding="utf-8") == "old bundled content plus user edit\n"
+
+
+def test_install_bundled_skill_force_overwrites_existing_with_backup(tmp_path):
+    target = install.skill_target_file(tmp_path)
+    backup = target.with_name("SKILL.md.bak")
+    target.parent.mkdir(parents=True)
+    target.write_text("stale bundled skill\n", encoding="utf-8")
+
+    result = install.install_bundled_skill(hermes_home_path=tmp_path, force=True)
+
+    assert result.action == "overwrite"
+    assert result.changed is True
+    assert "Backup written" in result.message
+    assert target.read_text(encoding="utf-8") == install.bundled_skill_text()
+    assert backup.read_text(encoding="utf-8") == "stale bundled skill\n"
+
+
+def test_install_dry_run_reports_skill_action_without_writing(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(install, "_find_hermes_python", lambda: None)
+
+    rc = install.main(["--hermes-home", str(tmp_path), "install", "--dry-run"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Skill target file:" in out
+    assert "Skill action: Would install bundled skill" in out
+    assert not install.skill_target_file(tmp_path).exists()
+
+
+def test_status_reports_skill_state(tmp_path, capsys, monkeypatch):
+    target = tmp_path / "plugins" / "mnemosyne"
+    target.mkdir(parents=True)
+    (target / "__init__.py").write_text("class MnemosyneMemoryProvider: pass\n")
+    install.install_bundled_skill(hermes_home_path=tmp_path)
+    monkeypatch.setattr(install, "check_mnemosyne_core", lambda: True)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda: None)
+
+    rc = install.main(["--hermes-home", str(tmp_path), "status"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Skill path:" in out
+    assert "Skill:     installed" in out
 
 
 def test_plugin_state_reports_broken_symlink(tmp_path):
