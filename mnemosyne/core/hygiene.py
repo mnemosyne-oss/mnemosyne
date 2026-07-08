@@ -185,10 +185,13 @@ def _score_noise(content: str, importance: float, source: str) -> Tuple[float, L
         score = max(score, 0.5)
         reasons.append("low_importance")
 
-    # 8. Value signals (reduce score)
-    if any(kw in content_lower for kw in _VALUE_KEYWORDS):
-        score = min(score, 0.3)
-        reasons.append("value_keyword_present")
+    # 8. Value signals (reduce score) — BUT skip dampening if secrets
+    # were detected, so secret-bearing content stays high-scored and
+    # surfaces in the audit report instead of being hidden.
+    if not secrets:
+        if any(kw in content_lower for kw in _VALUE_KEYWORDS):
+            score = min(score, 0.3)
+            reasons.append("value_keyword_present")
 
     # 9. Source-based heuristic
     if source in ("heartbeat", "cron", "debug", "terminal"):
@@ -407,11 +410,21 @@ def clean_noise(
                 elif effective_action == "archive":
                     # Archive = set importance to 0 and add metadata flag.
                     # This decays the row out of active retrieval without
-                    # hard delete. Reversible.
+                    # hard delete. Reversible — original importance is
+                    # preserved in metadata so restore_archived can recover
+                    # the exact value instead of guessing.
                     meta = json.loads(original_metadata) if original_metadata else {}
+                    # Fetch and preserve original importance before zeroing.
+                    cursor.execute(
+                        f"SELECT importance FROM {c.table_name} WHERE id = ?",
+                        (c.memory_id,),
+                    )
+                    imp_row = cursor.fetchone()
+                    original_importance = imp_row["importance"] if imp_row else 0.5
                     meta["_archived"] = True
                     meta["_archived_at"] = now
                     meta["_archive_reason"] = c.noise_reasons
+                    meta["_original_importance"] = original_importance
                     cursor.execute(
                         f"UPDATE {c.table_name} SET importance = 0, metadata_json = ? WHERE id = ?",
                         (json.dumps(meta), c.memory_id),
@@ -518,17 +531,31 @@ def restore_archived(
         for entry in entries:
             table = entry["table_name"]
             memory_id = entry["memory_id"]
-            original_meta = entry["original_metadata"] or "{}"
 
-            # Restore: clear archive flags, restore original metadata
-            meta = json.loads(original_meta)
+            # Read the CURRENT row metadata (which has _original_importance
+            # stored during archive), not the audit log's original_metadata
+            # snapshot (which is pre-archive and lacks the saved importance).
+            cursor.execute(
+                f"SELECT metadata_json FROM {table} WHERE id = ?",
+                (memory_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                continue
+            current_meta = row["metadata_json"] or "{}"
+            meta = json.loads(current_meta)
+
+            # Use the preserved _original_importance from metadata if
+            # available; fall back to 0.5 for entries archived before
+            # the importance-preservation fix was deployed.
+            saved_importance = meta.pop("_original_importance", 0.5)
             meta.pop("_archived", None)
             meta.pop("_archived_at", None)
             meta.pop("_archive_reason", None)
 
             cursor.execute(
                 f"UPDATE {table} SET importance = ?, metadata_json = ? WHERE id = ?",
-                (0.5, json.dumps(meta), memory_id),
+                (saved_importance, json.dumps(meta), memory_id),
             )
             if cursor.rowcount > 0:
                 restored += 1

@@ -1,12 +1,12 @@
 """Tests for config system and profiles (issue #430).
 
 Covers:
-- Template coverage: all 74 template-eligible vars present in every template
+- Template coverage: all 68 template-eligible vars present in every template
 - 15 consistency rules: contradictions caught
 - Edge cases: force_local without model, sync_encrypt without key, etc.
 - Config reader: YAML > env > default precedence, hot-reload, set/get
 - Profile apply: dry-run, write, validation
-- Config migrate: env vars → YAML
+- Config migrate: env vars -> YAML
 """
 
 import os
@@ -442,9 +442,12 @@ class TestProfileApply:
 
 class TestProfileCreate:
     def test_create_from_current_config(self, temp_config, monkeypatch):
+        from mnemosyne.core.profiles import USER_PROFILES
         monkeypatch.setenv("MNEMOSYNE_WM_MAX_ITEMS", "7777")
         monkeypatch.setenv("MNEMOSYNE_VEC_TYPE", "int8")
         success = create_profile("custom", description="My custom profile")
         assert success
-        assert "custom" in PROFILES
-        assert PROFILES["custom"]["settings"]["wm_max_items"] == "7777"
+        assert "custom" in USER_PROFILES
+        assert USER_PROFILES["custom"]["settings"]["wm_max_items"] == "7777"
+        # Cleanup so it doesn't leak into other tests
+        USER_PROFILES.pop("custom", None)

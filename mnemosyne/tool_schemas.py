@@ -720,7 +720,10 @@ HYGIENE_AUDIT_SCHEMA = {
             },
             "tables": {
                 "type": "array",
-                "items": {"type": "string"},
+                "items": {
+                    "type": "string",
+                    "enum": ["working_memory", "memories", "episodic_memory", "scratchpad"],
+                },
                 "description": "Tables to scan. Default: working_memory + memories.",
             },
             "bank": {

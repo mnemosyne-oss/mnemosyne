@@ -53,35 +53,53 @@ class TestMatchesPatterns:
 
 class TestDetectSecrets:
     def test_openai_key(self):
+        # nosec - test fixture, not a real secret
         hits = detect_secrets("My key is sk-abc123def456ghi789jkl012mno345pqr678")
         assert "api_key_prefix" in hits
 
     def test_aws_key(self):
+        # nosec - test fixture, not a real secret
         hits = detect_secrets("AWS key: AKIAIOSFODNN7EXAMPLE")
         assert "aws_access_key" in hits
 
     def test_github_token(self):
+        # nosec - test fixture, not a real secret
         hits = detect_secrets("ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789")
         assert "github_token" in hits
 
+    def test_slack_token(self):
+        # nosec - test fixture, not a real secret
+        hits = detect_secrets("xoxb-1234567890-abcdefghij")
+        assert "slack_token" in hits
+
+    def test_google_api_key(self):
+        # nosec - test fixture, not a real secret
+        hits = detect_secrets("AIzaSyA1234567890abcdefghijklmnopqrstuvwxyz_")
+        assert "google_api_key" in hits
+
     def test_jwt(self):
+        # nosec - test fixture, not a real secret
         jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
         hits = detect_secrets(f"token: {jwt}")
         assert "jwt_token" in hits
 
     def test_password_assignment(self):
+        # nosec - test fixture, not a real secret
         hits = detect_secrets("password = hunter2supersecret")
         assert "secret_assignment" in hits
 
     def test_private_key_block(self):
+        # nosec - test fixture, not a real secret
         hits = detect_secrets("-----BEGIN RSA PRIVATE KEY-----\nMIIJKQIBAA")
         assert "private_key_block" in hits
 
     def test_connection_string(self):
+        # nosec - test fixture, not a real secret
         hits = detect_secrets("postgres://user:secretpass@localhost:5432/db")
         assert "connection_string_with_credentials" in hits
 
     def test_env_assignment(self):
+        # nosec - test fixture, not a real secret
         hits = detect_secrets("DB_PASS=supersecret123")
         assert "env_secret_assignment" in hits
 
@@ -90,6 +108,7 @@ class TestDetectSecrets:
         assert hits == []
 
     def test_never_echoes_raw_secret(self):
+        # nosec - test fixture, not a real secret
         raw_secret = "sk-abc123def456ghi789jkl012mno345pqr678"
         hits = detect_secrets(f"My key is {raw_secret}")
         # The hits list contains labels, not the raw secret
@@ -202,8 +221,10 @@ class TestShouldRemember:
         monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "strict")
         should, decision = should_remember("User prefers pytest for testing.")
         assert should is True
+        assert decision.action == "allow"
 
     def test_strict_mode_rejects_secret(self, monkeypatch):
+        # nosec - test fixture
         monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "strict")
         should, decision = should_remember("password = hunter2supersecret")
         assert should is False
@@ -227,8 +248,20 @@ class TestShouldRemember:
         monkeypatch.setenv("MNEMOSYNE_IGNORE_PATTERNS", r"^custom\snoise")
         should, decision = should_remember("custom noise line here")
         assert should is False
+        assert decision.reason == "ignore_pattern_match"
 
     def test_invalid_classifier_mode_defaults_off(self, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "bogus")
         should, decision = should_remember("normal content")
         assert should is True
+        assert decision.action == "allow"
+
+    def test_empty_list_override_disables_patterns(self, monkeypatch):
+        """Passing ignore_patterns=[] should NOT load from env."""
+        monkeypatch.delenv("MNEMOSYNE_WRITE_CLASSIFIER", raising=False)
+        monkeypatch.setenv("MNEMOSYNE_IGNORE_PATTERNS", r"^should_match")
+        # Use content that matches the env pattern but no default noise patterns
+        should, decision = should_remember("should_match this content here", ignore_patterns=[])
+        # With empty list override, env patterns are NOT loaded
+        assert should is True
+        assert decision.action == "allow"

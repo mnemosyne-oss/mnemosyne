@@ -75,29 +75,40 @@ DEFAULT_NOISE_PATTERNS: List[str] = [
 ]
 
 # Secret patterns — API keys, tokens, passwords, private keys.
-# Match common secret shapes without capturing the full value.
+# Each entry is a (label, regex) pair so labels stay attached to their
+# pattern regardless of ordering — avoids the parallel-list desync bug.
 SECRET_PATTERNS: List[str] = [
-    # API key prefixes (well-known services)
     r"(?:sk|pk|rk)-[a-zA-Z0-9]{20,}",  # OpenAI-style
     r"AKIA[0-9A-Z]{16}",  # AWS access key
     r"gh[pousr]_[A-Za-z0-9]{36}",  # GitHub token
     r"xox[baprs]-[A-Za-z0-9-]+",  # Slack token
     r"AIza[0-9A-Za-z_\-]{35}",  # Google API key
     r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+",  # JWT
-    # Generic secret assignments
     r"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)"
-    r"\s*[=:]\s*['\"]?[^\s'\"<>{}]{8,}",
-    # Private key blocks
+    r"\s*[=:]\s*['\"]?[^\s'\"<>{}]{8,}",  # generic assignment
     r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----",
-    # Connection strings with credentials
     r"(?:postgres|mysql|mongodb|redis)://[^:]+:[^@]+@",
-    # .env-style assignments
     r"(?i)^\s*(?:DB_PASS|SECRET_KEY|AUTH_TOKEN|API_SECRET)\s*=",
+]
+
+# Paired (label, regex) structure — the single source of truth.
+SECRET_LABELED_PATTERNS: List[tuple] = [
+    ("api_key_prefix", r"(?:sk|pk|rk)-[a-zA-Z0-9]{20,}"),
+    ("aws_access_key", r"AKIA[0-9A-Z]{16}"),
+    ("github_token", r"gh[pousr]_[A-Za-z0-9]{36}"),
+    ("slack_token", r"xox[baprs]-[A-Za-z0-9-]+"),
+    ("google_api_key", r"AIza[0-9A-Za-z_\-]{35}"),
+    ("jwt_token", r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
+    ("secret_assignment", r"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)"
+                          r"\s*[=:]\s*['\"]?[^\s'\"<>{}]{8,}"),
+    ("private_key_block", r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"),
+    ("connection_string_with_credentials", r"(?:postgres|mysql|mongodb|redis)://[^:]+:[^@]+@"),
+    ("env_secret_assignment", r"(?i)^\s*(?:DB_PASS|SECRET_KEY|AUTH_TOKEN|API_SECRET)\s*="),
 ]
 
 # Compiled pattern cache
 _compiled_noise: Optional[List[re.Pattern]] = None
-_compiled_secrets: Optional[List[re.Pattern]] = None
+_compiled_secrets: Optional[List[tuple]] = None  # list of (label, compiled_regex)
 
 
 def _compile_patterns(patterns: List[str]) -> List[re.Pattern]:
@@ -118,10 +129,16 @@ def _get_compiled_noise() -> List[re.Pattern]:
     return _compiled_noise
 
 
-def _get_compiled_secrets() -> List[re.Pattern]:
+def _get_compiled_secrets() -> List[tuple]:
+    """Return compiled (label, regex) pairs, cached."""
     global _compiled_secrets
     if _compiled_secrets is None:
-        _compiled_secrets = _compile_patterns(SECRET_PATTERNS)
+        _compiled_secrets = []
+        for label, pattern in SECRET_LABELED_PATTERNS:
+            try:
+                _compiled_secrets.append((label, re.compile(pattern, re.IGNORECASE)))
+            except re.error:
+                logger.debug("Invalid secret pattern %r, skipping", pattern)
     return _compiled_secrets
 
 
@@ -158,10 +175,14 @@ class WriteDecision:
 # ---------------------------------------------------------------------------
 
 def _parse_patterns(raw: str) -> List[str]:
-    """Parse a comma- or newline-separated pattern string into a list."""
+    """Parse a newline-separated pattern string into a list.
+
+    Does NOT split on commas — regex patterns like ``a{2,4}`` contain commas
+    as quantifier bounds.  Users separate patterns with newlines.
+    """
     if not raw:
         return []
-    parts = raw.replace(",", "\n").split("\n")
+    parts = raw.split("\n")
     return [p.strip() for p in parts if p.strip()]
 
 
@@ -210,16 +231,8 @@ def detect_secrets(content: str) -> List[str]:
     if not content:
         return []
     hits = []
-    compiled = _get_compiled_secrets()
-    # Map each compiled pattern back to a human-readable label
-    labels = [
-        "api_key_prefix", "aws_access_key", "github_token", "slack_token",
-        "google_api_key", "jwt_token", "secret_assignment", "private_key_block",
-        "connection_string_with_credentials", "env_secret_assignment",
-    ]
-    for i, pat in enumerate(compiled):
-        if pat.search(content):
-            label = labels[i] if i < len(labels) else f"secret_pattern_{i}"
+    for label, compiled_pat in _get_compiled_secrets():
+        if compiled_pat.search(content):
             hits.append(label)
     return hits
 
@@ -258,15 +271,22 @@ def classify_memory_write(
             warnings=[f"Secret-like pattern matched: {', '.join(secret_hits)}"],
         )
 
-    # --- Stage 2: noise pattern matching ---
-    # Merge user-supplied patterns with curated defaults.
-    patterns = list(DEFAULT_NOISE_PATTERNS)
-    if ignore_patterns is not None:
-        patterns.extend(ignore_patterns)
-    else:
-        patterns.extend(_load_ignore_patterns_from_env())
+    # --- Stage 2: noise pattern matching (compiled cache) ---
+    # Use the compiled default noise patterns for speed, plus any
+    # user-supplied patterns from ignore_patterns or env.
+    compiled_noise = _get_compiled_noise()
+    for pat in compiled_noise:
+        if pat.search(content):
+            return WriteDecision(
+                action="reject", target="none",
+                reason="noise_pattern_match",
+                confidence=0.8,
+            )
 
-    if matches_patterns(content, patterns):
+    # User-supplied patterns (from arg or env) — not cached since they
+    # change per-call.
+    user_patterns = ignore_patterns if ignore_patterns is not None else _load_ignore_patterns_from_env()
+    if user_patterns and matches_patterns(content, user_patterns):
         return WriteDecision(
             action="reject", target="none",
             reason="noise_pattern_match",
@@ -321,7 +341,9 @@ def should_remember(
     # When classifier is off, only apply regex ignore_patterns (backward
     # compat with the provider's _should_filter behavior).
     if mode == "off":
-        patterns = ignore_patterns or _load_ignore_patterns_from_env()
+        # Only load from env when ignore_patterns is None (not an empty list,
+        # which is an intentional "disable extra patterns" override).
+        patterns = ignore_patterns if ignore_patterns is not None else _load_ignore_patterns_from_env()
         if patterns and matches_patterns(content, patterns):
             return False, WriteDecision(
                 action="reject", target="none",
@@ -335,12 +357,15 @@ def should_remember(
     if mode == "strict" and decision.action == "reject":
         return False, decision
 
-    # warn mode: always allow, but return the decision with warnings
+    # warn mode: always allow, but return the decision with warnings.
+    # Align target with the new allow state so downstream consumers see
+    # consistent action/target.
     if mode == "warn" and decision.action == "reject":
         decision.warnings.append(
             f"Write allowed in warn mode but classified as reject: {decision.reason}"
         )
         decision.action = "allow"
+        decision.target = "memory"
         return True, decision
 
     return True, decision

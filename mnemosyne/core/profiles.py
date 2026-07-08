@@ -1,7 +1,7 @@
 """
 Mnemosyne configuration profiles — gamified templates.
 
-8 named presets covering all 74 template-eligible env vars. Each template
+8 named presets covering all 68 template-eligible env vars. Each template
 is a complete configuration that can be applied with `mnemosyne profile apply`.
 
 Templates are validated against 15 consistency rules that catch contradictions
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from mnemosyne.core.config import ENV_VAR_MAP, REQUIRES_RESTART, get_config
@@ -540,32 +541,32 @@ def validate_profile(settings: Dict[str, Any]) -> List[str]:
     if _to_bool(settings.get("smart_compress", "1")):
         if not _to_bool(settings.get("llm_enabled", "true")):
             errors.append(
-                f"smart_compress=1 but llm_enabled=false — "
-                f"compression requires LLM for summarization"
+                "smart_compress=1 but llm_enabled=false — "
+                "compression requires LLM for summarization"
             )
 
     # Rule 5: sleep_model_refresh_enabled implies llm_enabled
     if _to_bool(settings.get("sleep_model_refresh_enabled", "false")):
         if not _to_bool(settings.get("llm_enabled", "true")):
             errors.append(
-                f"sleep_model_refresh_enabled=true but llm_enabled=false — "
-                f"model refresh requires LLM"
+                "sleep_model_refresh_enabled=true but llm_enabled=false — "
+                "model refresh requires LLM"
             )
 
     # Rule 6: llm_conflict_detection implies llm_enabled
     if _to_bool(settings.get("llm_conflict_detection", "false")):
         if not _to_bool(settings.get("llm_enabled", "true")):
             errors.append(
-                f"llm_conflict_detection=true but llm_enabled=false — "
-                f"conflict detection requires LLM"
+                "llm_conflict_detection=true but llm_enabled=false — "
+                "conflict detection requires LLM"
             )
 
     # Rule 7: persona_enabled implies llm_enabled
     if _to_bool(settings.get("persona_enabled", "false")):
         if not _to_bool(settings.get("llm_enabled", "true")):
             errors.append(
-                f"persona_enabled=true but llm_enabled=false — "
-                f"persona generation requires LLM"
+                "persona_enabled=true but llm_enabled=false — "
+                "persona generation requires LLM"
             )
 
     # Rule 8: tier3_max_chars > 0 when smart_compress on
@@ -574,7 +575,7 @@ def validate_profile(settings: Dict[str, Any]) -> List[str]:
         if t3mc <= 0:
             errors.append(
                 f"tier3_max_chars={t3mc} with smart_compress=1 — "
-                f"zero chars means silent content deletion"
+                "zero chars means silent content deletion"
             )
 
     # Rules 9-12: vector-dependent features require embeddings
@@ -616,7 +617,7 @@ def list_profiles() -> Dict[str, ProfileMeta]:
 
 def get_profile(name: str) -> Optional[Dict[str, Any]]:
     """Get a profile's settings by name. Returns None if not found."""
-    data = PROFILES.get(name)
+    data = PROFILES.get(name) or USER_PROFILES.get(name)
     if data is None:
         return None
     return dict(data["settings"])
@@ -635,7 +636,8 @@ def apply_profile(name: str, config_path=None, dry_run: bool = False) -> Tuple[b
     """
     profile = get_profile(name)
     if profile is None:
-        return False, [f"Unknown profile: '{name}'. Available: {list(PROFILES.keys())}"]
+        available = list(PROFILES.keys()) + list(USER_PROFILES.keys())
+        return False, [f"Unknown profile: '{name}'. Available: {available}"]
 
     # Validate
     errors = validate_profile(profile)
@@ -645,23 +647,27 @@ def apply_profile(name: str, config_path=None, dry_run: bool = False) -> Tuple[b
     if dry_run:
         return True, []
 
-    # Write to config
+    # Write to config — use set_many for a single read-modify-write
     config = get_config()
     if config_path:
         from mnemosyne.core.config import MnemosyneConfig
         config = MnemosyneConfig(config_path=Path(config_path) if isinstance(config_path, str) else config_path)
 
-    for key, value in profile.items():
-        config.set(key, value)
+    config.set_many(profile)
 
     logger.info("Applied profile '%s' (%d settings)", name, len(profile))
     return True, []
 
 
+# Separate registry for user-created profiles — keeps builtins immutable.
+USER_PROFILES: Dict[str, Dict[str, Any]] = {}
+
+
 def create_profile(name: str, description: str = "", config_path=None) -> bool:
     """Save current config as a named profile.
 
-    Reads the current config values and stores them as a new profile.
+    Reads the current config values and stores them as a new profile
+    in the USER_PROFILES registry (separate from built-in PROFILES).
     """
     config = get_config()
     if config_path:
@@ -680,9 +686,8 @@ def create_profile(name: str, description: str = "", config_path=None) -> bool:
         logger.error("Profile '%s' failed validation: %s", name, errors)
         return False
 
-    # Store in PROFILES dict (in-memory only; persisting to a file would
-    # be a future enhancement)
-    PROFILES[name] = {
+    # Store in USER_PROFILES (separate from built-in PROFILES)
+    USER_PROFILES[name] = {
         "meta": ProfileMeta(
             name=name,
             description=description or "User-created profile",
@@ -701,7 +706,3 @@ def validate_all_profiles() -> Dict[str, List[str]]:
         errors = validate_profile(data["settings"])
         results[name] = errors
     return results
-
-
-# Re-export for convenience
-from pathlib import Path as _Path

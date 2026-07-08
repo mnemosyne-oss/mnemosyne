@@ -700,13 +700,14 @@ def cmd_reindex(args):
 
 
 def cmd_hygiene(args):
-    """hygiene audit|clean — noise detection and safe cleanup (issue #428)."""
-    from mnemosyne.core.hygiene import audit_noise, clean_noise, NoiseCandidate
+    """hygiene audit|clean|restore — noise detection and safe cleanup (issue #428)."""
+    from mnemosyne.core.hygiene import audit_noise, clean_noise, NoiseCandidate, restore_archived
 
     if not args or args[0] in ("--help", "-h"):
-        print("Usage: mnemosyne hygiene audit|clean [options]")
+        print("Usage: mnemosyne hygiene audit|clean|restore [options]")
         print("  audit [--limit N] [--min-score F] [--json]    Scan for noise (dry-run)")
         print("  clean --action delete|archive|flag [--confirm] [--dry-run] <candidates.json>")
+        print("  restore [--limit N]                         Restore archived memories")
         return
 
     sub = args[0]
@@ -778,25 +779,32 @@ def cmd_hygiene(args):
         if not candidates_file:
             _fail("candidates JSON file required: mnemosyne hygiene clean <candidates.json>")
 
-        with open(candidates_file) as f:
-            raw = json.load(f)
+        try:
+            with open(candidates_file) as f:
+                raw = json.load(f)
+        except FileNotFoundError:
+            _fail(f"Candidates file not found: {candidates_file}")
+        except json.JSONDecodeError as e:
+            _fail(f"Invalid JSON in candidates file: {e}")
 
-        candidates = [
-            NoiseCandidate(
-                memory_id=c["memory_id"],
-                table_name=c["table_name"],
-                content_preview=c.get("content_preview", ""),
-                noise_score=c.get("noise_score", 0.0),
-                noise_reasons=c.get("noise_reasons", []),
-                secret_flags=c.get("secret_flags", []),
-                importance=c.get("importance", 0.5),
-                source=c.get("source", ""),
-                timestamp=c.get("timestamp", ""),
-                suggested_action=c.get("suggested_action", "keep"),
-                content_length=c.get("content_length", 0),
-            )
-            for c in raw
-        ]
+        candidates = []
+        for idx, c in enumerate(raw):
+            try:
+                candidates.append(NoiseCandidate(
+                    memory_id=c["memory_id"],
+                    table_name=c["table_name"],
+                    content_preview=c.get("content_preview", ""),
+                    noise_score=c.get("noise_score", 0.0),
+                    noise_reasons=c.get("noise_reasons", []),
+                    secret_flags=c.get("secret_flags", []),
+                    importance=c.get("importance", 0.5),
+                    source=c.get("source", ""),
+                    timestamp=c.get("timestamp", ""),
+                    suggested_action=c.get("suggested_action", "keep"),
+                    content_length=c.get("content_length", 0),
+                ))
+            except KeyError as e:
+                _fail(f"Missing required field {e} in candidate #{idx}")
 
         db_path = Path(DATA_DIR) / "mnemosyne.db"
         if not db_path.exists():
@@ -818,8 +826,25 @@ def cmd_hygiene(args):
             for e in result.errors[:10]:
                 print(f"  {e}")
 
+    elif sub == "restore":
+        restore_limit = 100
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--limit" and i + 1 < len(rest):
+                restore_limit = _parse_int(rest[i + 1], "limit")
+                i += 2
+            else:
+                i += 1
+
+        db_path = Path(DATA_DIR) / "mnemosyne.db"
+        if not db_path.exists():
+            _fail(f"Database not found at {db_path}")
+
+        restored = restore_archived(db_path=db_path, limit=restore_limit)
+        print(f"Restored {restored} archived memories.")
+
     else:
-        _fail(f"Unknown hygiene subcommand: {sub}. Use 'audit' or 'clean'.")
+        _fail(f"Unknown hygiene subcommand: {sub}. Use 'audit', 'clean', or 'restore'.")
 
 
 def cmd_profile(args):
@@ -931,7 +956,7 @@ def cmd_config(args):
         config = get_config()
         val = config.get(key)
         if val is None:
-            print(f"(not set)")
+            print("(not set)")
         else:
             print(f"{key} = {val}")
 

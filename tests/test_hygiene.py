@@ -99,8 +99,19 @@ class TestScoreNoise:
         assert "trivial_keyword" in reasons or "noisy_source" in reasons
 
     def test_secret(self):
+        # nosec - test fixture
         score, reasons = _score_noise("password = hunter2supersecret", 0.5, "")
         assert score >= 0.9
+        assert any("secret" in r for r in reasons)
+
+    def test_secret_with_value_keyword_not_dampened(self):
+        """Secret + value keyword should NOT dampen the score."""
+        # nosec - test fixture
+        # Use content that triggers both the secret pattern (password = ...)
+        # and a value keyword ("prefer") — secret should win.
+        content = "User prefers the password = hunter2supersecret for access"
+        score, reasons = _score_noise(content, 0.5, "")
+        assert score >= 0.9  # secret wins, not dampened
         assert any("secret" in r for r in reasons)
 
     def test_valuable_content(self):
@@ -350,7 +361,7 @@ class TestCleanNoise:
 class TestRestoreArchived:
     def test_restore_recovers_archived_row(self, temp_db):
         db_path, beam = temp_db
-        _insert_row(beam, "working_memory", "n1", "heartbeat", importance=0.5,
+        _insert_row(beam, "working_memory", "n1", "heartbeat", importance=0.8,
                     metadata={"original": "data"})
 
         candidates = [NoiseCandidate(
@@ -371,11 +382,12 @@ class TestRestoreArchived:
         restored = restore_archived(db_path)
         assert restored >= 1
 
-        # Verify restored
+        # Verify restored to ORIGINAL importance (0.8), not hardcoded 0.5
         cursor = conn.execute("SELECT importance, metadata_json FROM working_memory WHERE id = 'n1'")
         row = cursor.fetchone()
-        assert row[0] == 0.5  # importance restored
+        assert row[0] == 0.8  # original importance preserved and restored
         meta = json.loads(row[1])
         assert "_archived" not in meta
+        assert "_original_importance" not in meta  # cleaned up on restore
         assert meta.get("original") == "data"
         conn.close()

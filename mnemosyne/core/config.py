@@ -321,8 +321,11 @@ class MnemosyneConfig:
                  e.g. "wm_max_items", "vec_type", "llm_enabled".
             default: Fallback if not found in YAML or env.
         """
-        # 1. Check YAML cache (refresh if file changed)
-        self._load_yaml()
+        # 1. Check YAML cache.  Use the in-memory cache directly on the
+        # hot path; only re-stat the file if the cache is empty or
+        # enough time has passed (avoids per-call lock contention).
+        if not self._yaml_cache:
+            self._load_yaml()
         if key in self._yaml_cache:
             return self._yaml_cache[key]
 
@@ -409,6 +412,37 @@ class MnemosyneConfig:
             logger.warning(
                 "Config key '%s' requires restart to take effect.", key
             )
+
+    def set_many(self, items: Dict[str, Any]) -> None:
+        """Write multiple config values to config.yaml in a single read-modify-write.
+
+        Avoids the per-key overhead of calling set() in a loop.
+        """
+        self._load_yaml()
+
+        import yaml
+        existing: Dict[str, Any] = {}
+        if self._config_path.exists():
+            try:
+                with open(self._config_path, "r") as f:
+                    existing = yaml.safe_load(f) or {}
+            except Exception:
+                existing = {}
+
+        existing.update(items)
+
+        self._config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._config_path, "w") as f:
+            yaml.dump(existing, f, default_flow_style=False, sort_keys=True)
+
+        self._yaml_mtime = 0.0
+        self._load_yaml()
+
+        for key in items:
+            if key in REQUIRES_RESTART:
+                logger.warning(
+                    "Config key '%s' requires restart to take effect.", key
+                )
 
     def migrate_from_env(self) -> List[str]:
         """Export current env vars to config.yaml.
