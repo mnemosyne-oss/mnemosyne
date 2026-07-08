@@ -517,6 +517,7 @@ class TestWorkingMemory:
                 WHERE scope = 'global'
                   AND (valid_until IS NULL OR valid_until > ?)
                   AND superseded_by IS NULL
+                  AND consolidated_at IS NULL
                 ORDER BY importance DESC, timestamp DESC
                 LIMIT ?
                 """,
@@ -534,6 +535,7 @@ class TestWorkingMemory:
                   AND (scope IS NULL OR scope != 'global')
                   AND (valid_until IS NULL OR valid_until > ?)
                   AND superseded_by IS NULL
+                  AND consolidated_at IS NULL
                 ORDER BY importance DESC, timestamp DESC
                 LIMIT ?
                 """,

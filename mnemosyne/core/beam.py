@@ -3699,7 +3699,14 @@ class BeamMemory:
         # each branch instead of scanning working_memory and building a temp
         # B-tree for the CASE-based ORDER BY.
         select_cols = "id, content, source, timestamp, importance, scope, last_recalled"
-        common_predicate = "(valid_until IS NULL OR valid_until > ?) AND superseded_by IS NULL"
+        include_consolidated = _env_truthy("MNEMOSYNE_CONTEXT_INCLUDE_CONSOLIDATED")
+        predicates = [
+            "(valid_until IS NULL OR valid_until > ?)",
+            "superseded_by IS NULL",
+        ]
+        if not include_consolidated:
+            predicates.append("consolidated_at IS NULL")
+        common_predicate = " AND ".join(predicates)
 
         cursor.execute(f"""
             SELECT {select_cols}

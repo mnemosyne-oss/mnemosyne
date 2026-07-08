@@ -7,6 +7,16 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+### Changed
+
+- **Default prompt context excludes consolidated working-memory rows.**
+  `BeamMemory.get_context()` no longer includes rows where
+  `consolidated_at IS NOT NULL`, preventing already-consolidated originals
+  from competing with hot unconsolidated memories in the context window.
+  Consolidated rows remain fully recallable through `recall()`. Set
+  `MNEMOSYNE_CONTEXT_INCLUDE_CONSOLIDATED=1` to temporarily restore legacy
+  injection behavior (truthy values: `1`, `true`, `yes`, `on`).
+
 ## [3.11.1] — 2026-07-01
 
 ### Fixed
