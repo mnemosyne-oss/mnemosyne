@@ -14,12 +14,15 @@ Now upgraded with BEAM architecture:
 import sqlite3
 import json
 import hashlib
+import logging
 import threading
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 from pathlib import Path
 
 import os
+
+logger = logging.getLogger(__name__)
 
 from mnemosyne.core import embeddings as _embeddings
 from mnemosyne.core.beam import BeamMemory, init_beam, _get_connection as _beam_get_connection
@@ -320,7 +323,22 @@ class Mnemosyne:
             trust_tier: Trust classification for prompt-injection defense.
                 None = use beam default ('STATED'). 'EXTERNAL_WRITE' for MCP
                 tool calls, 'IMPORTED' for bulk imports.
+
+        Returns:
+            memory_id on success, or None if the content was filtered by
+            the write classifier (noise pattern or secret detection).
         """
+        # --- Core-level write filter (issues #406, #428) ---
+        # Placed here so ALL entry points (Hermes provider, MCP server, SDK,
+        # CLI) benefit, not just the Hermes plugin layer.  The provider's
+        # own _should_filter remains as an additional pre-filter for
+        # conversation sync; this is the catch-all at the root.
+        from mnemosyne.core.filters import should_remember
+        should_write, _decision = should_remember(content)
+        if not should_write:
+            logger.debug("Memory write filtered: %s", _decision.reason)
+            return None
+
         # BEAM write first (generates its own ID). Extract flags are passed
         # through so BeamMemory's canonical _extract_and_store_entities and
         # _extract_and_store_facts helpers run — these populate the `facts`

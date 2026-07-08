@@ -693,6 +693,80 @@ PERSONA_REINFORCE_SCHEMA = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Hygiene tools (issue #428)
+# ---------------------------------------------------------------------------
+
+HYGIENE_AUDIT_SCHEMA = {
+    "name": "mnemosyne_hygiene_audit",
+    "description": (
+        "Audit the memory database for noise: terminal spam, command output, "
+        "heartbeats, stack traces, secrets. Returns ranked candidates sorted "
+        "by noise score. Dry-run only — does not modify the database. "
+        "Use mnemosyne_hygiene_clean to act on the results."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {
+                "type": "integer",
+                "description": "Max rows to scan per table (default 200).",
+                "default": 200,
+            },
+            "min_score": {
+                "type": "number",
+                "description": "Minimum noise score to include (0.0-1.0, default 0.3).",
+                "default": 0.3,
+            },
+            "tables": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Tables to scan. Default: working_memory + memories.",
+            },
+            "bank": {
+                "type": "string",
+                "description": "Memory bank to audit (default: 'default').",
+            },
+        },
+    },
+}
+
+HYGIENE_CLEAN_SCHEMA = {
+    "name": "mnemosyne_hygiene_clean",
+    "description": (
+        "Clean noise candidates identified by mnemosyne_hygiene_audit. "
+        "Actions: 'delete' (hard delete), 'archive' (decay importance to 0 + "
+        "flag metadata, reversible), 'flag' (mark for review, no change). "
+        "Requires confirm=true for any modification. Writes a full audit log "
+        "to the hygiene_audit_log table."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "candidates_json": {
+                "type": "string",
+                "description": "JSON array of candidate objects from audit_noise() output.",
+            },
+            "action": {
+                "type": "string",
+                "enum": ["delete", "archive", "flag", "keep"],
+                "description": "Override action for all candidates. If 'keep', uses each candidate's suggested_action.",
+                "default": "keep",
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "Must be true for any modification. If false, performs dry-run only.",
+                "default": False,
+            },
+            "bank": {
+                "type": "string",
+                "description": "Memory bank (default: 'default').",
+            },
+        },
+        "required": ["candidates_json"],
+    },
+}
+
 ALL_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     REMEMBER_SCHEMA, RECALL_SCHEMA,
     SHARED_REMEMBER_SCHEMA, SHARED_RECALL_SCHEMA, SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA,
@@ -705,4 +779,5 @@ ALL_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,
     SYNC_PUSH_SCHEMA, SYNC_PULL_SCHEMA, SYNC_STATUS_SCHEMA,
     PERSONA_PROMOTE_SCHEMA, PERSONA_DEMOTE_SCHEMA, PERSONA_LIST_SCHEMA, PERSONA_REINFORCE_SCHEMA,
+    HYGIENE_AUDIT_SCHEMA, HYGIENE_CLEAN_SCHEMA,
 ]

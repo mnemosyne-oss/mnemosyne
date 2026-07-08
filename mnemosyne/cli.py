@@ -699,6 +699,264 @@ def cmd_reindex(args):
     print(f"  sqlite-vec tables recreated at dim {result['dim']}")
 
 
+def cmd_hygiene(args):
+    """hygiene audit|clean — noise detection and safe cleanup (issue #428)."""
+    from mnemosyne.core.hygiene import audit_noise, clean_noise, NoiseCandidate
+
+    if not args or args[0] in ("--help", "-h"):
+        print("Usage: mnemosyne hygiene audit|clean [options]")
+        print("  audit [--limit N] [--min-score F] [--json]    Scan for noise (dry-run)")
+        print("  clean --action delete|archive|flag [--confirm] [--dry-run] <candidates.json>")
+        return
+
+    sub = args[0]
+    rest = args[1:]
+
+    if sub == "audit":
+        limit = 200
+        min_score = 0.3
+        as_json = False
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--limit" and i + 1 < len(rest):
+                limit = _parse_int(rest[i + 1], "limit")
+                i += 2
+            elif rest[i] == "--min-score" and i + 1 < len(rest):
+                min_score = _parse_float(rest[i + 1], "min-score")
+                i += 2
+            elif rest[i] == "--json":
+                as_json = True
+                i += 1
+            else:
+                i += 1
+
+        db_path = Path(DATA_DIR) / "mnemosyne.db"
+        if not db_path.exists():
+            _fail(f"Database not found at {db_path}")
+
+        report = audit_noise(db_path=db_path, limit=limit, min_score=min_score)
+
+        if as_json:
+            print(json.dumps(report.to_dict(), indent=2))
+        else:
+            print(f"Audited {report.total_scanned} rows across {report.tables_scanned}")
+            print(f"Found {len(report.candidates)} noise candidates")
+            print(f"  with secrets: {report.summary.get('with_secrets', 0)}")
+            for action, count in report.summary.get("by_action", {}).items():
+                print(f"  suggested {action}: {count}")
+            print()
+            for c in report.candidates[:20]:
+                print(f"  [{c.noise_score:.2f}] {c.suggested_action:8} {c.table_name}:{c.memory_id[:12]}")
+                print(f"         {c.content_preview[:80]}")
+                if c.secret_flags:
+                    print(f"         SECRETS: {', '.join(c.secret_flags)}")
+            if len(report.candidates) > 20:
+                print(f"  ... and {len(report.candidates) - 20} more (use --json for full list)")
+
+    elif sub == "clean":
+        action = "keep"
+        confirm = False
+        dry_run = True
+        candidates_file = None
+
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--action" and i + 1 < len(rest):
+                action = rest[i + 1]
+                i += 2
+            elif rest[i] == "--confirm":
+                confirm = True
+                dry_run = False
+                i += 1
+            elif rest[i] == "--dry-run":
+                dry_run = True
+                i += 1
+            else:
+                candidates_file = rest[i]
+                i += 1
+
+        if not candidates_file:
+            _fail("candidates JSON file required: mnemosyne hygiene clean <candidates.json>")
+
+        with open(candidates_file) as f:
+            raw = json.load(f)
+
+        candidates = [
+            NoiseCandidate(
+                memory_id=c["memory_id"],
+                table_name=c["table_name"],
+                content_preview=c.get("content_preview", ""),
+                noise_score=c.get("noise_score", 0.0),
+                noise_reasons=c.get("noise_reasons", []),
+                secret_flags=c.get("secret_flags", []),
+                importance=c.get("importance", 0.5),
+                source=c.get("source", ""),
+                timestamp=c.get("timestamp", ""),
+                suggested_action=c.get("suggested_action", "keep"),
+                content_length=c.get("content_length", 0),
+            )
+            for c in raw
+        ]
+
+        db_path = Path(DATA_DIR) / "mnemosyne.db"
+        if not db_path.exists():
+            _fail(f"Database not found at {db_path}")
+
+        result = clean_noise(
+            db_path=db_path,
+            candidates=candidates,
+            action=action,
+            confirm=confirm,
+            dry_run=dry_run,
+        )
+
+        mode = "DRY RUN" if dry_run else "APPLIED"
+        print(f"[{mode}] deleted={result.deleted} archived={result.archived} "
+              f"flagged={result.flagged} kept={result.kept}")
+        if result.errors:
+            print(f"Errors ({len(result.errors)}):")
+            for e in result.errors[:10]:
+                print(f"  {e}")
+
+    else:
+        _fail(f"Unknown hygiene subcommand: {sub}. Use 'audit' or 'clean'.")
+
+
+def cmd_profile(args):
+    """profile list|apply|show|create — gamified config templates."""
+    from mnemosyne.core.profiles import list_profiles, get_profile, apply_profile, create_profile
+
+    if not args or args[0] in ("--help", "-h"):
+        print("Usage: mnemosyne profile <list|apply|show|create> [options]")
+        print("  list                           Show all available profiles")
+        print("  apply <name> [--dry-run]       Apply a profile to config.yaml")
+        print("  show <name>                    Inspect a profile's settings")
+        print("  create <name> [description]    Save current config as a profile")
+        return
+
+    sub = args[0]
+    rest = args[1:]
+
+    if sub == "list":
+        profiles = list_profiles()
+        print(f"\n{'Name':15s} {'Description'}")
+        print("-" * 70)
+        for name, meta in profiles.items():
+            print(f"{name:15s} {meta.description}")
+            # Rating bars
+            ratings_str = "  "
+            for label, val in meta.ratings.items():
+                bar = "█" * (val // 2) + "░" * (10 - val // 2)
+                ratings_str += f"  {label:15s} {bar} {val:2d}/20"
+            print(ratings_str)
+            print(f"{'':15s} Use case: {meta.use_case}")
+            print()
+
+    elif sub == "apply":
+        if len(rest) < 1:
+            _fail("Profile name required: mnemosyne profile apply <name> [--dry-run]")
+        name = rest[0]
+        dry_run = "--dry-run" in rest
+        config_path_arg = None
+        if "--config" in rest:
+            idx = rest.index("--config")
+            if idx + 1 < len(rest):
+                config_path_arg = rest[idx + 1]
+
+        success, errors = apply_profile(name, config_path=config_path_arg, dry_run=dry_run)
+        if not success:
+            print(f"Failed to apply profile '{name}':", file=sys.stderr)
+            for e in errors:
+                print(f"  {e}", file=sys.stderr)
+            raise SystemExit(1)
+        mode = "DRY RUN" if dry_run else "APPLIED"
+        print(f"[{mode}] Profile '{name}' — {len(get_profile(name))} settings")
+        if not dry_run:
+            print("Run 'mnemosyne config reload' to apply changes to a running process.")
+
+    elif sub == "show":
+        if len(rest) < 1:
+            _fail("Profile name required: mnemosyne profile show <name>")
+        name = rest[0]
+        settings = get_profile(name)
+        if settings is None:
+            _fail(f"Unknown profile: '{name}'. Run 'mnemosyne profile list' for options.")
+        print(f"\nProfile: {name}\n")
+        for key in sorted(settings.keys()):
+            print(f"  {key:45s} = {settings[key]}")
+
+    elif sub == "create":
+        if len(rest) < 1:
+            _fail("Profile name required: mnemosyne profile create <name> [description]")
+        name = rest[0]
+        desc = " ".join(rest[1:]) if len(rest) > 1 else ""
+        success = create_profile(name, description=desc)
+        if success:
+            print(f"Created profile '{name}' from current configuration.")
+        else:
+            _fail(f"Failed to create profile '{name}' — validation failed.")
+
+    else:
+        _fail(f"Unknown profile subcommand: {sub}. Use 'list', 'apply', 'show', or 'create'.")
+
+
+def cmd_config(args):
+    """config reload|get|set|migrate — manage config.yaml."""
+    if not args or args[0] in ("--help", "-h"):
+        print("Usage: mnemosyne config <reload|get|set|migrate> [options]")
+        print("  reload                         Re-read config.yaml (hot-reload)")
+        print("  get <key>                      Read a single config value")
+        print("  set <key> <value>              Write a value to config.yaml")
+        print("  migrate                        Export current env vars to config.yaml")
+        return
+
+    sub = args[0]
+    rest = args[1:]
+    from mnemosyne.core.config import get_config
+
+    if sub == "reload":
+        config = get_config()
+        changed = config.reload()
+        if changed:
+            print(f"Reloaded config.yaml — {len(changed)} key(s) changed:")
+            for key in sorted(changed):
+                print(f"  {key}")
+        else:
+            print("Config unchanged.")
+
+    elif sub == "get":
+        if len(rest) < 1:
+            _fail("Key required: mnemosyne config get <key>")
+        key = rest[0]
+        config = get_config()
+        val = config.get(key)
+        if val is None:
+            print(f"(not set)")
+        else:
+            print(f"{key} = {val}")
+
+    elif sub == "set":
+        if len(rest) < 2:
+            _fail("Key and value required: mnemosyne config set <key> <value>")
+        key = rest[0]
+        value = rest[1]
+        config = get_config()
+        config.set(key, value)
+        print(f"Set {key} = {value}")
+        if key in config.REQUIRES_RESTART:
+            print(f"  ⚠ {key} requires restart to take effect.")
+
+    elif sub == "migrate":
+        config = get_config()
+        migrated = config.migrate_from_env()
+        print(f"Migrated {len(migrated)} env vars to config.yaml:")
+        for key in migrated:
+            print(f"  {key}")
+
+    else:
+        _fail(f"Unknown config subcommand: {sub}. Use 'reload', 'get', 'set', or 'migrate'.")
+
+
 COMMANDS = {
     "store": cmd_store,
     "remember": cmd_store,
@@ -728,6 +986,9 @@ COMMANDS = {
     "sync-server": cmd_sync_serve,
     "sync-status": cmd_sync_status,
     "sync-generate-key": cmd_sync_generate_key,
+    "hygiene": cmd_hygiene,
+    "profile": cmd_profile,
+    "config": cmd_config,
 }
 
 
@@ -762,6 +1023,9 @@ def run_cli():
         print("  sync-status [--remote <url>] [--json]")
         print("                                      Show sync status")
         print("  sync-generate-key                    Generate encryption key")
+        print("  hygiene audit|clean                  Noise audit and safe cleanup")
+        print("  profile list|apply|show|create       Config templates (gamified)")
+        print("  config reload|get|set|migrate         Manage config.yaml")
         return
 
     command = sys.argv[1]

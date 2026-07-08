@@ -842,6 +842,84 @@ def _handle_graph_link(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Hygiene handlers (issue #428)
+# ---------------------------------------------------------------------------
+
+def _handle_hygiene_audit(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_hygiene_audit tool call."""
+    from mnemosyne.core.hygiene import audit_noise
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+
+    limit = arguments.get("limit", 200)
+    min_score = arguments.get("min_score", 0.3)
+    tables = arguments.get("tables") or None
+
+    report = audit_noise(
+        db_path=db_path,
+        limit=limit,
+        tables=tables,
+        min_score=min_score,
+    )
+    return {
+        "status": "audited",
+        "report": report.to_dict(),
+        "bank": bank,
+    }
+
+
+def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_hygiene_clean tool call."""
+    from mnemosyne.core.hygiene import NoiseCandidate, clean_noise
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+
+    candidates_json = arguments.get("candidates_json", "[]")
+    try:
+        raw_candidates = json.loads(candidates_json) if isinstance(candidates_json, str) else candidates_json
+    except json.JSONDecodeError:
+        return {"error": "candidates_json is not valid JSON"}
+
+    candidates = [
+        NoiseCandidate(
+            memory_id=c["memory_id"],
+            table_name=c["table_name"],
+            content_preview=c.get("content_preview", ""),
+            noise_score=c.get("noise_score", 0.0),
+            noise_reasons=c.get("noise_reasons", []),
+            secret_flags=c.get("secret_flags", []),
+            importance=c.get("importance", 0.5),
+            source=c.get("source", ""),
+            timestamp=c.get("timestamp", ""),
+            suggested_action=c.get("suggested_action", "keep"),
+            content_length=c.get("content_length", 0),
+        )
+        for c in raw_candidates
+    ]
+
+    action = arguments.get("action", "keep")
+    confirm = arguments.get("confirm", False)
+    dry_run = not confirm
+
+    result = clean_noise(
+        db_path=db_path,
+        candidates=candidates,
+        action=action,
+        confirm=confirm,
+        dry_run=dry_run,
+    )
+    return {
+        "status": "dry_run" if dry_run else "applied",
+        "result": result.to_dict(),
+        "bank": bank,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -871,6 +949,8 @@ _TOOL_HANDLERS = {
     "mnemosyne_diagnose": _handle_diagnose,
     "mnemosyne_graph_query": _handle_graph_query,
     "mnemosyne_graph_link": _handle_graph_link,
+    "mnemosyne_hygiene_audit": _handle_hygiene_audit,
+    "mnemosyne_hygiene_clean": _handle_hygiene_clean,
 }
 
 
