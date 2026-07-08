@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -113,10 +114,126 @@ def test_provider_config_defaults_match(provider_modules):
     integration_config = _config_schema(provider_modules["mnemosyne_hermes"])
 
     assert _json_stable(root_config) == _json_stable(integration_config)
+    assert root_config["auto_sleep"]["default"] is True
     assert root_config["sync_roles"]["default"] == ["user"]
     assert root_config["default_scope"]["choices"] == ["session", "global"]
     assert root_config["default_scope"]["default"] == "session"
     assert root_config["tools"]["default"] is None
+
+
+def test_auto_sleep_runtime_default_enabled(monkeypatch, provider_modules):
+    monkeypatch.delenv("MNEMOSYNE_AUTO_SLEEP_ENABLED", raising=False)
+
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        assert provider._auto_sleep_enabled is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off"])
+def test_auto_sleep_env_can_disable_default(monkeypatch, provider_modules, value):
+    monkeypatch.setenv("MNEMOSYNE_AUTO_SLEEP_ENABLED", value)
+
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        assert provider._auto_sleep_enabled is False
+
+
+@pytest.mark.parametrize("configured", [False, "false", 0])
+def test_auto_sleep_config_can_disable_default(tmp_path, monkeypatch, provider_modules, configured):
+    monkeypatch.delenv("MNEMOSYNE_AUTO_SLEEP_ENABLED", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"memory": {"provider": "mnemosyne", "mnemosyne": {"auto_sleep": configured}}})
+    )
+
+    for module in provider_modules.values():
+        provider = _provider_for_config(module, tmp_path)
+        provider._apply_provider_config({})
+        assert provider._auto_sleep_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("env_value", "config_value", "kwarg_value", "expected"),
+    [
+        ("0", False, True, True),
+        ("1", True, False, False),
+        ("0", False, "true", True),
+        ("1", True, "false", False),
+    ],
+)
+def test_auto_sleep_kwargs_have_highest_precedence(
+    tmp_path, monkeypatch, provider_modules, env_value, config_value, kwarg_value, expected
+):
+    monkeypatch.setenv("MNEMOSYNE_AUTO_SLEEP_ENABLED", env_value)
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"memory": {"provider": "mnemosyne", "mnemosyne": {"auto_sleep": config_value}}})
+    )
+
+    for module in provider_modules.values():
+        provider = _provider_for_config(module, tmp_path)
+        provider._apply_provider_config({"auto_sleep": kwarg_value})
+        assert provider._auto_sleep_enabled is expected
+
+
+def test_save_config_persists_auto_sleep_default_when_missing(tmp_path, provider_modules):
+    (tmp_path / "config.yaml").write_text(
+        "memory:\n"
+        "  provider: mnemosyne\n"
+        "  mnemosyne:\n"
+        "    sleep_threshold: 75\n"
+    )
+
+    for name, module in provider_modules.items():
+        hermes_home = tmp_path / name
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text((tmp_path / "config.yaml").read_text())
+
+        provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+        provider.save_config({}, str(hermes_home))
+
+        cfg = yaml.safe_load((hermes_home / "config.yaml").read_text())
+        mnemosyne_cfg = cfg["memory"]["mnemosyne"]
+        assert mnemosyne_cfg["auto_sleep"] is True
+        assert mnemosyne_cfg["sleep_threshold"] == 75
+
+
+def test_save_config_respects_auto_sleep_env_opt_out(tmp_path, monkeypatch, provider_modules):
+    monkeypatch.setenv("MNEMOSYNE_AUTO_SLEEP_ENABLED", "0")
+
+    for name, module in provider_modules.items():
+        hermes_home = tmp_path / name
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "memory:\n"
+            "  provider: mnemosyne\n"
+            "  mnemosyne:\n"
+            "    sleep_threshold: 75\n"
+        )
+
+        provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+        provider.save_config({}, str(hermes_home))
+
+        cfg = yaml.safe_load((hermes_home / "config.yaml").read_text())
+        mnemosyne_cfg = cfg["memory"]["mnemosyne"]
+        assert mnemosyne_cfg["auto_sleep"] is False
+        assert mnemosyne_cfg["sleep_threshold"] == 75
+
+
+def test_save_config_preserves_explicit_auto_sleep_false(tmp_path, provider_modules):
+    for name, module in provider_modules.items():
+        hermes_home = tmp_path / name
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "memory:\n"
+            "  provider: mnemosyne\n"
+            "  mnemosyne:\n"
+            "    auto_sleep: false\n"
+        )
+
+        provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+        provider.save_config({}, str(hermes_home))
+
+        cfg = yaml.safe_load((hermes_home / "config.yaml").read_text())
+        assert cfg["memory"]["mnemosyne"]["auto_sleep"] is False
 
 
 def test_tool_whitelist_omitted_exposes_all_tools(tmp_path, provider_modules):
