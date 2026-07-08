@@ -123,3 +123,33 @@ class TestSleepLockHygiene:
             other.commit()
         finally:
             other.close()
+
+    def test_embed_failure_does_not_drop_summary(self, temp_db, monkeypatch):
+        """The pre-INSERT embed() call must not abort the episodic insert.
+        embed() can raise on the local path (model load failures re-raise
+        as RuntimeError); the summary row is the payload and must land,
+        just without a vector."""
+        from mnemosyne.core import embeddings as _emb
+
+        beam = BeamMemory(session_id="lock-hygiene", db_path=temp_db)
+
+        monkeypatch.setattr(_emb, "available", lambda: True)
+
+        def raising_embed(texts):
+            raise RuntimeError("Failed to load embedding model")
+
+        monkeypatch.setattr(_emb, "embed", raising_embed)
+
+        beam.consolidate_to_episodic(
+            summary="summary that must survive an embed failure",
+            source_wm_ids=["lh-x-0"],
+            source="sleep_consolidation",
+        )
+
+        row = beam.conn.execute(
+            "SELECT content FROM episodic_memory WHERE source = ?",
+            ("sleep_consolidation",),
+        ).fetchone()
+        assert row is not None
+        assert "must survive" in row["content"]
+        assert beam.conn.in_transaction is False

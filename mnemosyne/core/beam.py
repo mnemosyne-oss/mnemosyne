@@ -4160,7 +4160,19 @@ class BeamMemory:
         # heavy CPU call; running it after the INSERT held the SQLite write
         # lock across the whole call, starving every other connection
         # (busy_timeout default 5s) for the duration of sleep().
-        vec = _embeddings.embed([summary]) if _embeddings.available() else None
+        # An embed failure must not abort the insert: the summary row is the
+        # payload, the vector is an index. Fall back to vec = None like the
+        # other embed call sites (remember, remember_batch, update_working).
+        vec = None
+        if _embeddings.available():
+            try:
+                vec = _embeddings.embed([summary])
+            except Exception as exc:
+                logger.warning(
+                    "consolidate_to_episodic: embedding failed, storing "
+                    "summary without vector (%s): %s",
+                    type(exc).__name__, exc,
+                )
         cursor = self.conn.cursor()
         cursor.execute("""
             INSERT INTO episodic_memory
