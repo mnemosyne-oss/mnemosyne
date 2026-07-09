@@ -107,7 +107,7 @@ def test_get_provider_class_standalone_fallback(monkeypatch):
     assert hasattr(cls, "_sanitize_bank_name")
 
 
-def test_standalone_load_via_spec_resolves_profile_bank(tmp_path):
+def test_standalone_load_via_spec_resolves_profile_bank(tmp_path, monkeypatch):
     """End-to-end standalone load: CLI module loaded from file path
     (no __package__) resolves the active profile bank."""
     home = tmp_path / "profiles" / "work"
@@ -134,16 +134,11 @@ def test_standalone_load_via_spec_resolves_profile_bank(tmp_path):
     assert cls is not None
     assert hasattr(cls, "_sanitize_bank_name")
 
-    # Verify bank resolution works end-to-end
-    old_home = "HERMES_HOME" in __import__("os").environ
-    saved = __import__("os").environ.pop("HERMES_HOME", None)
-    try:
-        __import__("os").environ["HERMES_HOME"] = str(home)
-        result = mod._resolve_cli_bank(_args(bank=None), "stats")
-        assert result == "work", (
-            f"standalone load: expected 'work', got {result!r}. "
-            "This indicates the absolute-import fallback failed."
-        )
-    finally:
-        if old_home and saved is not None:
-            __import__("os").environ["HERMES_HOME"] = saved
+    # Verify bank resolution works end-to-end without leaking HERMES_HOME
+    # into later tests.
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    result = mod._resolve_cli_bank(_args(bank=None), "stats")
+    assert result == "work", (
+        f"standalone load: expected 'work', got {result!r}. "
+        "This indicates the absolute-import fallback failed."
+    )
