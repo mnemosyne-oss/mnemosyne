@@ -277,6 +277,7 @@ def audit_noise(
     limit: int = 200,
     tables: Optional[List[str]] = None,
     min_score: float = 0.3,
+    *,
     offset: int = 0,
     scan_all: bool = False,
     batch_size: int = 1000,

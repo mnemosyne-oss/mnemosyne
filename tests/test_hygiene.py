@@ -209,7 +209,13 @@ class TestAuditNoise:
     def test_audit_offset_and_scan_all(self, temp_db):
         db_path, beam = temp_db
         for idx in range(3):
-            _insert_row(beam, "working_memory", f"noise{idx}", "heartbeat", source="heartbeat")
+            _insert_row(
+                beam,
+                "working_memory",
+                f"noise{idx}",
+                f"heartbeat page marker {idx}",
+                source="heartbeat",
+            )
 
         paged = audit_noise(db_path=db_path, limit=1, offset=1, tables=["working_memory"], min_score=0.3)
         full = audit_noise(
@@ -222,8 +228,9 @@ class TestAuditNoise:
         )
 
         assert paged.total_scanned == 1
+        assert [c.memory_id for c in paged.candidates] == ["noise1"]
         assert full.total_scanned == 3
-        assert len(full.candidates) == 3
+        assert {c.memory_id for c in full.candidates} == {"noise0", "noise1", "noise2"}
 
     def test_noise_summary_is_pii_safe(self, temp_db):
         db_path, beam = temp_db

@@ -137,8 +137,8 @@ def _memory_orphan_diagnostics(conn) -> Dict[str, int]:
 def _sqlite_integrity_diagnostics(conn) -> Dict[str, str]:
     """Return PII-safe SQLite integrity diagnostics."""
     try:
-        row = conn.execute("PRAGMA quick_check").fetchone()
-        result = str(row[0]) if row else "unknown"
+        rows = conn.execute("PRAGMA quick_check").fetchall()
+        result = "; ".join(str(row[0]) for row in rows) if rows else "unknown"
     except Exception as exc:
         return {"quick_check": "ERROR", "detail": str(exc)[:200]}
     return {"quick_check": result, "detail": ""}
@@ -292,11 +292,15 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False) 
 
         try:
             from mnemosyne.core.hygiene import noise_summary as _noise_summary
-            hygiene = _noise_summary(Path(stats.get("database", "")), limit=200)
-            log("db", "hygiene_noise_scanned", str(hygiene.get("total_scanned", 0)))
-            log("db", "hygiene_noise_candidates", str(hygiene.get("total_candidates", 0)))
-            log("db", "hygiene_noise_ratio", str(hygiene.get("candidate_ratio", 0.0)))
-            log("db", "hygiene_noise_with_secrets", str(hygiene.get("with_secrets", 0)))
+            db_path_str = stats.get("database")
+            if not db_path_str or db_path_str == "unknown":
+                log("db", "hygiene_noise_summary", "SKIPPED", "database path unavailable")
+            else:
+                hygiene = _noise_summary(Path(db_path_str), limit=200)
+                log("db", "hygiene_noise_scanned", str(hygiene.get("total_scanned", 0)))
+                log("db", "hygiene_noise_candidates", str(hygiene.get("total_candidates", 0)))
+                log("db", "hygiene_noise_ratio", str(hygiene.get("candidate_ratio", 0.0)))
+                log("db", "hygiene_noise_with_secrets", str(hygiene.get("with_secrets", 0)))
         except Exception as exc:
             log("db", "hygiene_noise_summary", "ERROR", str(exc))
 
@@ -364,6 +368,7 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False) 
     sqlite_quick_check = next((e for e in entries if e["check"] == "sqlite_quick_check"), None)
     hygiene_noise_candidates = next((e for e in entries if e["check"] == "hygiene_noise_candidates"), None)
     hygiene_noise_scanned = next((e for e in entries if e["check"] == "hygiene_noise_scanned"), None)
+    hygiene_noise_with_secrets = next((e for e in entries if e["check"] == "hygiene_noise_with_secrets"), None)
 
     if sqlite_quick_check and sqlite_quick_check["status"] != "OK":
         summary["key_findings"].append(
@@ -376,6 +381,10 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False) 
             summary["key_findings"].append(
                 f"Hygiene noise summary: {candidates} candidates across {scanned} scanned rows (read-only sample)"
             )
+            if hygiene_noise_with_secrets and int(hygiene_noise_with_secrets["status"]) > 0:
+                summary["key_findings"].append(
+                    f"Hygiene scan flagged {hygiene_noise_with_secrets['status']} rows with possible secrets - review before sharing/export"
+                )
 
     if not embed_ok:
         summary["key_findings"].append("fastembed not available - install with: pip install mnemosyne-memory[embeddings]")

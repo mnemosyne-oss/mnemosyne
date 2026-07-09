@@ -764,14 +764,17 @@ def cmd_hygiene(args):
         if not db_path.exists():
             _fail(f"Database not found at {db_path}")
 
-        report = audit_noise(
-            db_path=db_path,
-            limit=limit,
-            min_score=min_score,
-            offset=offset,
-            scan_all=scan_all,
-            batch_size=batch_size,
-        )
+        try:
+            report = audit_noise(
+                db_path=db_path,
+                limit=limit,
+                min_score=min_score,
+                offset=offset,
+                scan_all=scan_all,
+                batch_size=batch_size,
+            )
+        except ValueError as e:
+            _fail(str(e))
 
         if as_json:
             print(json.dumps(report.to_dict(), indent=2))
@@ -809,7 +812,10 @@ def cmd_hygiene(args):
         db_path = Path(DATA_DIR) / "mnemosyne.db"
         if not db_path.exists():
             _fail(f"Database not found at {db_path}")
-        status = hygiene_status(db_path=db_path, limit=limit)
+        try:
+            status = hygiene_status(db_path=db_path, limit=limit)
+        except ValueError as e:
+            _fail(str(e))
         if as_json:
             print(json.dumps(status, indent=2))
         else:

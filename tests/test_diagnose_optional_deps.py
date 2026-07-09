@@ -116,4 +116,4 @@ def test_diagnose_reports_memory_orphans_without_mutating_rows(tmp_path, monkeyp
     assert _entry(summary, "memory_embeddings_orphan_memory_id")["status"] == "1"
     assert _entry(summary, "orphan_memory_id_overlap")["status"] == "1"
     assert _entry(summary, "hygiene_noise_scanned")["status"] == "3"
-    assert int(_entry(summary, "hygiene_noise_candidates")["status"]) >= 0
+    assert _entry(summary, "hygiene_noise_candidates")["status"] == "0"
