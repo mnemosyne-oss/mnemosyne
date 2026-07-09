@@ -153,3 +153,39 @@ class TestSleepLockHygiene:
         assert row is not None
         assert "must survive" in row["content"]
         assert beam.conn.in_transaction is False
+
+
+class TestRecallTouchRollback:
+    """The recall touch in get_context() runs an explicit transaction.
+    Pre-fix, a failure inside it (e.g. "database is locked" while a
+    consolidation pass is writing) propagated with the transaction still
+    open on the long-lived thread-local connection, so every later write
+    on that thread failed "database is locked" instantly until something
+    reset it. Observed in production as a self-healing storm of instant
+    tool failures minutes after the real writer had finished."""
+
+    def test_touch_failure_leaves_no_open_transaction(self, temp_db, monkeypatch):
+        beam = BeamMemory(session_id="touch-rollback", db_path=temp_db)
+        beam.remember("touch rollback seed", source="test")
+
+        real_commit = beam.conn.commit
+        calls = {"n": 0}
+
+        def failing_commit():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real_commit()
+
+        monkeypatch.setattr(beam.conn, "commit", failing_commit)
+        with pytest.raises(sqlite3.OperationalError):
+            beam.get_context(limit=5)
+        monkeypatch.setattr(beam.conn, "commit", real_commit)
+
+        # Pre-fix: the connection is still inside the touch transaction here,
+        # and this write fails "database is locked" (stale snapshot) or
+        # "cannot start a transaction within a transaction".
+        assert not beam.conn.in_transaction
+        beam.remember("write after failed touch", source="test")
+        rows = beam.get_context(limit=5)
+        assert any("write after failed touch" in r["content"] for r in rows)

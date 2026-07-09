@@ -3780,14 +3780,28 @@ class BeamMemory:
             ts = new_last.isoformat()
             updates.setdefault(ts, []).append(row["id"])
 
-        cursor.execute("BEGIN TRANSACTION")
-        for ts, ids in updates.items():
-            placeholders = ",".join("?" for _ in ids)
-            cursor.execute(
-                f"UPDATE working_memory SET recall_count = recall_count + 1, last_recalled = ? WHERE id IN ({placeholders})",
-                (ts, *ids)
-            )
-        self.conn.commit()
+        # Roll back on ANY failure inside this explicit transaction. Left
+        # unprotected, a "database is locked" here (e.g. while a consolidation
+        # pass is writing) abandons the connection inside an open, stale
+        # transaction -- and because the connection is a long-lived thread
+        # local, EVERY later write on this thread then fails "database is
+        # locked" instantly (stale-snapshot upgrade; the busy handler is not
+        # consulted) until something resets it.
+        try:
+            cursor.execute("BEGIN TRANSACTION")
+            for ts, ids in updates.items():
+                placeholders = ",".join("?" for _ in ids)
+                cursor.execute(
+                    f"UPDATE working_memory SET recall_count = recall_count + 1, last_recalled = ? WHERE id IN ({placeholders})",
+                    (ts, *ids)
+                )
+            self.conn.commit()
+        except Exception:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass  # rollback of a dead connection must not mask the cause
+            raise
         return rows
 
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
