@@ -182,6 +182,17 @@ class TestRecallTouchRollback:
             beam.get_context(limit=5)
         monkeypatch.setattr(beam.conn, "commit", real_commit)
 
+        # The failed touch must have been ROLLED BACK, not merely abandoned:
+        # the seeded row's recall bookkeeping is unchanged.
+        row = beam.conn.execute(
+            "SELECT recall_count, last_recalled FROM working_memory "
+            "WHERE content = ?",
+            ("touch rollback seed",),
+        ).fetchone()
+        assert row is not None
+        assert row["recall_count"] == 0
+        assert row["last_recalled"] is None
+
         # Pre-fix: the connection is still inside the touch transaction here,
         # and this write fails "database is locked" (stale snapshot) or
         # "cannot start a transaction within a transaction".
