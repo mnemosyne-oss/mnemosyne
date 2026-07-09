@@ -754,8 +754,23 @@ HYGIENE_AUDIT_SCHEMA = {
         "properties": {
             "limit": {
                 "type": "integer",
-                "description": "Max rows to scan per table (default 200).",
+                "description": "Max rows to scan per table (default 200, ignored when scan_all is true).",
                 "default": 200,
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Row offset per table for paginated audits (default 0).",
+                "default": 0,
+            },
+            "scan_all": {
+                "type": "boolean",
+                "description": "Scan all rows in each selected table using batches instead of a single limit.",
+                "default": False,
+            },
+            "batch_size": {
+                "type": "integer",
+                "description": "Batch size when scan_all is true (default 1000).",
+                "default": 1000,
             },
             "min_score": {
                 "type": "number",
@@ -768,7 +783,7 @@ HYGIENE_AUDIT_SCHEMA = {
                     "type": "string",
                     "enum": ["working_memory", "memories", "episodic_memory", "scratchpad"],
                 },
-                "description": "Tables to scan. Default: working_memory + memories.",
+                "description": "Tables to scan. Default: working_memory + memories + episodic_memory.",
             },
             "bank": {
                 "type": "string",

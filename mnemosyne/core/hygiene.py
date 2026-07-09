@@ -8,9 +8,9 @@ points that bypassed it (MCP, SDK, CLI — fixed in the companion Layer 1 patch)
 
 Two operations:
 
-1. ``audit_noise()`` — scan ``working_memory`` + ``memories`` (primary ingest
-   targets), score each row for noise likelihood + secret presence, return
-   ranked candidates.  Dry-run by default.
+1. ``audit_noise()`` — scan ``working_memory`` + ``memories`` +
+   ``episodic_memory`` (when present), score each row for noise likelihood +
+   secret presence, return ranked candidates.  Dry-run by default.
 
 2. ``clean_noise()`` — process audit output in batches, apply one of three
    actions (delete / archive / keep), write a full audit log to
@@ -86,7 +86,7 @@ class AuditReport:
     total_scanned: int = 0
     candidates: List[NoiseCandidate] = field(default_factory=list)
     tables_scanned: List[str] = field(default_factory=list)
-    summary: Dict[str, int] = field(default_factory=dict)
+    summary: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -243,46 +243,99 @@ def _scan_table(
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    )
+    return cursor.fetchone() is not None
+
+
+def _default_audit_tables() -> List[str]:
+    return ["working_memory", "memories", "episodic_memory"]
+
+
+def _build_audit_summary(
+    candidates: List[NoiseCandidate], *, table_counts: Dict[str, int]
+) -> Dict[str, Any]:
+    by_action: Dict[str, int] = {}
+    by_table: Dict[str, int] = {table: 0 for table in table_counts}
+    for c in candidates:
+        by_action[c.suggested_action] = by_action.get(c.suggested_action, 0) + 1
+        by_table[c.table_name] = by_table.get(c.table_name, 0) + 1
+    return {
+        "total_candidates": len(candidates),
+        "by_action": by_action,
+        "by_table": by_table,
+        "table_counts": table_counts,
+        "with_secrets": sum(1 for c in candidates if c.secret_flags),
+    }
+
+
 def audit_noise(
     db_path: Path,
     limit: int = 200,
     tables: Optional[List[str]] = None,
     min_score: float = 0.3,
+    offset: int = 0,
+    scan_all: bool = False,
+    batch_size: int = 1000,
 ) -> AuditReport:
     """Audit a memory database for noise.
 
-    Scans ``working_memory`` and ``memories`` (primary ingest targets) by
-    default.  Returns ranked candidates sorted by noise score descending.
+    Scans ``working_memory``, ``memories``, and ``episodic_memory`` by
+    default when those tables exist. Returns ranked candidates sorted by noise
+    score descending. The operation is read-only.
 
     Args:
         db_path: Path to the mnemosyne SQLite database.
-        limit: Maximum rows to scan per table.
-        tables: Override which tables to scan. Default: working_memory + memories.
+        limit: Maximum rows to scan per table unless ``scan_all`` is true.
+        tables: Override which tables to scan.
         min_score: Only include candidates with noise_score >= this threshold.
+        offset: Row offset per table for paginated scans.
+        scan_all: If true, page through all rows in each selected table.
+        batch_size: Batch size used when ``scan_all`` is true.
 
     Returns:
         ``AuditReport`` with ranked candidates.
     """
     if tables is None:
-        tables = ["working_memory", "memories"]
+        tables = _default_audit_tables()
+
+    if limit < 0:
+        raise ValueError("limit must be >= 0")
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
 
     report = AuditReport(tables_scanned=tables)
+    table_counts: Dict[str, int] = {}
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
 
+    def scan_rows(table_name: str) -> List[Dict[str, Any]]:
+        if not scan_all:
+            return _scan_table(conn, table_name, limit, offset=offset)
+        rows: List[Dict[str, Any]] = []
+        current_offset = offset
+        while True:
+            batch = _scan_table(conn, table_name, batch_size, offset=current_offset)
+            if not batch:
+                break
+            rows.extend(batch)
+            current_offset += len(batch)
+        return rows
+
     try:
         for table in tables:
-            # Check table exists
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-                (table,),
-            )
-            if cursor.fetchone() is None:
+            if not _table_exists(conn, table):
                 logger.debug("Table %s does not exist, skipping", table)
+                table_counts[table] = 0
                 continue
 
-            rows = _scan_table(conn, table, limit)
+            rows = scan_rows(table)
+            table_counts[table] = len(rows)
             report.total_scanned += len(rows)
 
             for row in rows:
@@ -314,20 +367,71 @@ def audit_noise(
     finally:
         conn.close()
 
-    # Sort by noise score descending (most likely noise first)
     report.candidates.sort(key=lambda c: c.noise_score, reverse=True)
-
-    # Build summary
-    report.summary = {
-        "total_candidates": len(report.candidates),
-        "by_action": {},
-        "with_secrets": sum(1 for c in report.candidates if c.secret_flags),
-    }
-    for c in report.candidates:
-        report.summary["by_action"][c.suggested_action] = \
-            report.summary["by_action"].get(c.suggested_action, 0) + 1
-
+    report.summary = _build_audit_summary(report.candidates, table_counts=table_counts)
     return report
+
+
+def noise_summary(
+    db_path: Path,
+    limit: int = 200,
+    tables: Optional[List[str]] = None,
+    min_score: float = 0.3,
+) -> Dict[str, Any]:
+    """Return a PII-safe noise summary without content previews."""
+    report = audit_noise(db_path=db_path, limit=limit, tables=tables, min_score=min_score)
+    table_counts = report.summary.get("table_counts", {})
+    candidates_by_table = report.summary.get("by_table", {})
+    ratios = {
+        table: (round(candidates_by_table.get(table, 0) / count, 4) if count else 0.0)
+        for table, count in table_counts.items()
+    }
+    return {
+        "status": "ok",
+        "tables_scanned": report.tables_scanned,
+        "total_scanned": report.total_scanned,
+        "total_candidates": len(report.candidates),
+        "candidate_ratio": round(len(report.candidates) / report.total_scanned, 4) if report.total_scanned else 0.0,
+        "by_table": candidates_by_table,
+        "table_counts": table_counts,
+        "candidate_ratio_by_table": ratios,
+        "by_action": report.summary.get("by_action", {}),
+        "with_secrets": report.summary.get("with_secrets", 0),
+        "min_score": min_score,
+        "limit_per_table": limit,
+    }
+
+
+def hygiene_status(
+    db_path: Path, *, include_noise_summary: bool = True, limit: int = 200
+) -> Dict[str, Any]:
+    """Return PII-safe hygiene status and optional current noise summary."""
+    status: Dict[str, Any] = {"status": "ok", "audit_log": {}}
+    conn = sqlite3.connect(str(db_path))
+    try:
+        if _table_exists(conn, "hygiene_audit_log"):
+            total = int(conn.execute("SELECT COUNT(*) FROM hygiene_audit_log").fetchone()[0])
+            by_action = {
+                row[0]: int(row[1])
+                for row in conn.execute(
+                    "SELECT action, COUNT(*) FROM hygiene_audit_log GROUP BY action"
+                ).fetchall()
+            }
+            last_ts = conn.execute("SELECT MAX(timestamp) FROM hygiene_audit_log").fetchone()[0]
+            status["audit_log"] = {
+                "present": True,
+                "total_entries": total,
+                "by_action": by_action,
+                "last_timestamp": last_ts,
+            }
+        else:
+            status["audit_log"] = {"present": False, "total_entries": 0, "by_action": {}}
+    finally:
+        conn.close()
+
+    if include_noise_summary:
+        status["noise_summary"] = noise_summary(db_path=db_path, limit=limit)
+    return status
 
 
 # ---------------------------------------------------------------------------

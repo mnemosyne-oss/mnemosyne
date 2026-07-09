@@ -938,12 +938,18 @@ def _handle_hygiene_audit(arguments: Dict[str, Any]) -> Dict[str, Any]:
     limit = arguments.get("limit", 200)
     min_score = arguments.get("min_score", 0.3)
     tables = arguments.get("tables") or None
+    offset = arguments.get("offset", 0)
+    scan_all = arguments.get("scan_all", False)
+    batch_size = arguments.get("batch_size", 1000)
 
     report = audit_noise(
         db_path=db_path,
         limit=limit,
         tables=tables,
         min_score=min_score,
+        offset=offset,
+        scan_all=scan_all,
+        batch_size=batch_size,
     )
     return {
         "status": "audited",

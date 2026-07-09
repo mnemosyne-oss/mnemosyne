@@ -109,8 +109,11 @@ def test_diagnose_reports_memory_orphans_without_mutating_rows(tmp_path, monkeyp
     }
     assert after_counts == before_counts
     assert _entry(summary, "foreign_keys_enabled")["status"] == "NO"
+    assert _entry(summary, "sqlite_quick_check")["status"] == "OK"
     assert _entry(summary, "gists_total")["status"] == "3"
     assert _entry(summary, "gists_orphan_memory_id")["status"] == "1"
     assert _entry(summary, "memory_embeddings_total")["status"] == "2"
     assert _entry(summary, "memory_embeddings_orphan_memory_id")["status"] == "1"
     assert _entry(summary, "orphan_memory_id_overlap")["status"] == "1"
+    assert _entry(summary, "hygiene_noise_scanned")["status"] == "3"
+    assert int(_entry(summary, "hygiene_noise_candidates")["status"]) >= 0

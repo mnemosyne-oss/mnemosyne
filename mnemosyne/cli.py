@@ -710,13 +710,21 @@ def cmd_reindex(args):
 
 def cmd_hygiene(args):
     """hygiene audit|clean|restore — noise detection and safe cleanup (issue #428)."""
-    from mnemosyne.core.hygiene import audit_noise, clean_noise, NoiseCandidate, restore_archived
+    from mnemosyne.core.hygiene import (
+        NoiseCandidate,
+        audit_noise,
+        clean_noise,
+        hygiene_status,
+        restore_archived,
+    )
 
     if not args or args[0] in ("--help", "-h"):
-        print("Usage: mnemosyne hygiene audit|clean|restore [options]")
-        print("  audit [--limit N] [--min-score F] [--json]    Scan for noise (dry-run)")
+        print("Usage: mnemosyne hygiene audit|status|clean|restore [options]")
+        print("  audit [--limit N] [--offset N] [--all] [--batch-size N] [--min-score F] [--json]")
+        print("                                          Scan for noise (dry-run)")
+        print("  status [--limit N] [--json]             Show PII-safe hygiene status")
         print("  clean --action delete|archive|flag [--confirm] [--dry-run] <candidates.json>")
-        print("  restore [--limit N]                         Restore archived memories")
+        print("  restore [--limit N]                     Restore archived memories")
         return
 
     sub = args[0]
@@ -725,12 +733,24 @@ def cmd_hygiene(args):
     if sub == "audit":
         limit = 200
         min_score = 0.3
+        offset = 0
+        batch_size = 1000
+        scan_all = False
         as_json = False
         i = 0
         while i < len(rest):
             if rest[i] == "--limit" and i + 1 < len(rest):
                 limit = _parse_int(rest[i + 1], "limit")
                 i += 2
+            elif rest[i] == "--offset" and i + 1 < len(rest):
+                offset = _parse_int(rest[i + 1], "offset")
+                i += 2
+            elif rest[i] == "--batch-size" and i + 1 < len(rest):
+                batch_size = _parse_int(rest[i + 1], "batch-size")
+                i += 2
+            elif rest[i] == "--all":
+                scan_all = True
+                i += 1
             elif rest[i] == "--min-score" and i + 1 < len(rest):
                 min_score = _parse_float(rest[i + 1], "min-score")
                 i += 2
@@ -744,14 +764,24 @@ def cmd_hygiene(args):
         if not db_path.exists():
             _fail(f"Database not found at {db_path}")
 
-        report = audit_noise(db_path=db_path, limit=limit, min_score=min_score)
+        report = audit_noise(
+            db_path=db_path,
+            limit=limit,
+            min_score=min_score,
+            offset=offset,
+            scan_all=scan_all,
+            batch_size=batch_size,
+        )
 
         if as_json:
             print(json.dumps(report.to_dict(), indent=2))
         else:
-            print(f"Audited {report.total_scanned} rows across {report.tables_scanned}")
+            mode = "all rows" if scan_all else f"limit={limit} offset={offset}"
+            print(f"Audited {report.total_scanned} rows across {report.tables_scanned} ({mode})")
             print(f"Found {len(report.candidates)} noise candidates")
             print(f"  with secrets: {report.summary.get('with_secrets', 0)}")
+            for table, count in report.summary.get("by_table", {}).items():
+                print(f"  candidates in {table}: {count}")
             for action, count in report.summary.get("by_action", {}).items():
                 print(f"  suggested {action}: {count}")
             print()
@@ -762,6 +792,39 @@ def cmd_hygiene(args):
                     print(f"         SECRETS: {', '.join(c.secret_flags)}")
             if len(report.candidates) > 20:
                 print(f"  ... and {len(report.candidates) - 20} more (use --json for full list)")
+
+    elif sub == "status":
+        as_json = False
+        limit = 200
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--json":
+                as_json = True
+                i += 1
+            elif rest[i] == "--limit" and i + 1 < len(rest):
+                limit = _parse_int(rest[i + 1], "limit")
+                i += 2
+            else:
+                i += 1
+        db_path = Path(DATA_DIR) / "mnemosyne.db"
+        if not db_path.exists():
+            _fail(f"Database not found at {db_path}")
+        status = hygiene_status(db_path=db_path, limit=limit)
+        if as_json:
+            print(json.dumps(status, indent=2))
+        else:
+            audit_log = status.get("audit_log", {})
+            print("Hygiene status")
+            print(f"  audit log present: {audit_log.get('present', False)}")
+            print(f"  audit log entries: {audit_log.get('total_entries', 0)}")
+            if audit_log.get("by_action"):
+                for action, count in audit_log["by_action"].items():
+                    print(f"  logged {action}: {count}")
+            noise = status.get("noise_summary", {})
+            print(f"  scanned rows: {noise.get('total_scanned', 0)}")
+            print(f"  noise candidates: {noise.get('total_candidates', 0)}")
+            print(f"  candidate ratio: {noise.get('candidate_ratio', 0.0)}")
+            print(f"  with secrets: {noise.get('with_secrets', 0)}")
 
     elif sub == "clean":
         action = "keep"
@@ -853,7 +916,7 @@ def cmd_hygiene(args):
         print(f"Restored {restored} archived memories.")
 
     else:
-        _fail(f"Unknown hygiene subcommand: {sub}. Use 'audit', 'clean', or 'restore'.")
+        _fail(f"Unknown hygiene subcommand: {sub}. Use 'audit', 'status', 'clean', or 'restore'.")
 
 
 def cmd_profile(args):

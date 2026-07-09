@@ -22,6 +22,8 @@ from mnemosyne.core.hygiene import (
     NoiseCandidate,
     audit_noise,
     clean_noise,
+    hygiene_status,
+    noise_summary,
     restore_archived,
     _score_noise,
     _suggest_action,
@@ -193,6 +195,81 @@ class TestAuditNoise:
 
         assert len(report.candidates) == 1
         assert report.candidates[0].table_name == "memories"
+
+    def test_audit_scans_episodic_memory_by_default(self, temp_db):
+        db_path, beam = temp_db
+        _insert_row(beam, "episodic_memory", "ep_noise", "heartbeat", source="heartbeat")
+
+        report = audit_noise(db_path=db_path, min_score=0.3)
+
+        assert "episodic_memory" in report.tables_scanned
+        assert report.summary["table_counts"]["episodic_memory"] == 1
+        assert any(c.table_name == "episodic_memory" for c in report.candidates)
+
+    def test_audit_offset_and_scan_all(self, temp_db):
+        db_path, beam = temp_db
+        for idx in range(3):
+            _insert_row(beam, "working_memory", f"noise{idx}", "heartbeat", source="heartbeat")
+
+        paged = audit_noise(db_path=db_path, limit=1, offset=1, tables=["working_memory"], min_score=0.3)
+        full = audit_noise(
+            db_path=db_path,
+            limit=1,
+            tables=["working_memory"],
+            min_score=0.3,
+            scan_all=True,
+            batch_size=2,
+        )
+
+        assert paged.total_scanned == 1
+        assert full.total_scanned == 3
+        assert len(full.candidates) == 3
+
+    def test_noise_summary_is_pii_safe(self, temp_db):
+        db_path, beam = temp_db
+        secret_content = "password = hunter2supersecret"  # nosec - test fixture
+        _insert_row(beam, "working_memory", "secret1", secret_content)
+
+        summary = noise_summary(db_path=db_path, min_score=0.0)
+
+        assert summary["total_candidates"] == 1
+        assert summary["with_secrets"] == 1
+        assert secret_content not in json.dumps(summary)
+        assert "content_preview" not in json.dumps(summary)
+
+    def test_hygiene_status_reports_audit_log_without_content(self, temp_db):
+        db_path, beam = temp_db
+        _insert_row(beam, "working_memory", "noise1", "heartbeat", source="heartbeat")
+        conn = beam.conn
+        conn.execute(
+            """
+            CREATE TABLE hygiene_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id TEXT NOT NULL,
+                table_name TEXT NOT NULL,
+                action TEXT NOT NULL,
+                reason TEXT,
+                noise_score REAL,
+                secret_flags TEXT,
+                original_content_preview TEXT,
+                original_metadata TEXT,
+                timestamp TEXT NOT NULL,
+                session_id TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO hygiene_audit_log (memory_id, table_name, action, timestamp) VALUES (?, ?, ?, ?)",
+            ("noise1", "working_memory", "flagged", "2025-01-01T00:00:00"),
+        )
+        conn.commit()
+
+        status = hygiene_status(db_path=db_path, limit=10)
+
+        assert status["audit_log"]["present"] is True
+        assert status["audit_log"]["total_entries"] == 1
+        assert status["audit_log"]["by_action"]["flagged"] == 1
+        assert "heartbeat" not in json.dumps(status)
 
     def test_audit_min_score_filter(self, temp_db):
         db_path, beam = temp_db
