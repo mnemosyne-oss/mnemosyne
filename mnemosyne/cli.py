@@ -710,6 +710,8 @@ def cmd_reindex(args):
 
 def cmd_hygiene(args):
     """hygiene audit|clean|restore — noise detection and safe cleanup (issue #428)."""
+    import sqlite3
+
     from mnemosyne.core.hygiene import (
         NoiseCandidate,
         audit_noise,
@@ -720,8 +722,8 @@ def cmd_hygiene(args):
 
     if not args or args[0] in ("--help", "-h"):
         print("Usage: mnemosyne hygiene audit|status|clean|restore [options]")
-        print("  audit [--limit N] [--offset N] [--all] [--batch-size N] [--min-score F] [--json]")
-        print("                                          Scan for noise (dry-run)")
+        print("  audit [--limit N] [--offset N] [--all [--batch-size N]] [--min-score F] [--json]")
+        print("                                          Scan for noise (dry-run; --batch-size only affects --all)")
         print("  status [--limit N] [--json]             Show PII-safe hygiene status")
         print("  clean --action delete|archive|flag [--confirm] [--dry-run] <candidates.json>")
         print("  restore [--limit N]                     Restore archived memories")
@@ -773,7 +775,7 @@ def cmd_hygiene(args):
                 scan_all=scan_all,
                 batch_size=batch_size,
             )
-        except ValueError as e:
+        except (ValueError, sqlite3.Error) as e:
             _fail(str(e))
 
         if as_json:
@@ -814,7 +816,7 @@ def cmd_hygiene(args):
             _fail(f"Database not found at {db_path}")
         try:
             status = hygiene_status(db_path=db_path, limit=limit)
-        except ValueError as e:
+        except (ValueError, sqlite3.Error) as e:
             _fail(str(e))
         if as_json:
             print(json.dumps(status, indent=2))

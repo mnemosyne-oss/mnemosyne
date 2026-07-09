@@ -27,7 +27,7 @@ import sqlite3
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from mnemosyne.core.filters import (
     DEFAULT_NOISE_PATTERNS,
@@ -227,6 +227,8 @@ def _scan_table(
     table_name: str,
     limit: int,
     offset: int = 0,
+    *,
+    after: Optional[Tuple[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """Scan a table for noise candidates. Returns rows as dicts."""
     cursor = conn.cursor()
@@ -234,11 +236,25 @@ def _scan_table(
     # working_memory, memories, and episodic_memory all share the core
     # (id, content, source, timestamp, session_id, importance, metadata_json)
     # shape, with episodic_memory having extra columns we don't need.
-    cursor.execute(
+    base_query = (
         f"SELECT id, content, source, timestamp, session_id, importance, metadata_json "
-        f"FROM {table_name} ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-        (limit, offset),
+        f"FROM {table_name}"
     )
+    if after is None:
+        cursor.execute(
+            f"{base_query} ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        )
+    else:
+        # Keyset pagination avoids repeatedly walking a growing OFFSET on large
+        # live tables; callers should process each batch before asking for more.
+        after_ts, after_id = after
+        cursor.execute(
+            f"{base_query} "
+            "WHERE timestamp < ? OR (timestamp = ? AND id < ?) "
+            "ORDER BY timestamp DESC, id DESC LIMIT ?",
+            (after_ts, after_ts, after_id, limit),
+        )
     columns = [desc[0] for desc in cursor.description]
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
@@ -315,18 +331,27 @@ def audit_noise(
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
 
-    def scan_rows(table_name: str) -> List[Dict[str, Any]]:
+    def scan_batches(table_name: str) -> Iterator[List[Dict[str, Any]]]:
         if not scan_all:
-            return _scan_table(conn, table_name, limit, offset=offset)
-        rows: List[Dict[str, Any]] = []
+            yield _scan_table(conn, table_name, limit, offset=offset)
+            return
+
+        after: Optional[Tuple[str, str]] = None
         current_offset = offset
         while True:
-            batch = _scan_table(conn, table_name, batch_size, offset=current_offset)
+            batch = _scan_table(
+                conn,
+                table_name,
+                batch_size,
+                offset=current_offset if after is None else 0,
+                after=after,
+            )
             if not batch:
                 break
-            rows.extend(batch)
-            current_offset += len(batch)
-        return rows
+            yield batch
+            last = batch[-1]
+            after = (last.get("timestamp", "") or "", last.get("id", "") or "")
+            current_offset = 0
 
     try:
         for table in tables:
@@ -335,36 +360,38 @@ def audit_noise(
                 table_counts[table] = 0
                 continue
 
-            rows = scan_rows(table)
-            table_counts[table] = len(rows)
-            report.total_scanned += len(rows)
+            table_scanned = 0
+            for rows in scan_batches(table):
+                table_scanned += len(rows)
+                report.total_scanned += len(rows)
 
-            for row in rows:
-                content = row.get("content", "") or ""
-                importance = row.get("importance", 0.5) or 0.5
-                source = row.get("source", "") or ""
+                for row in rows:
+                    content = row.get("content", "") or ""
+                    importance = row.get("importance", 0.5) or 0.5
+                    source = row.get("source", "") or ""
 
-                score, reasons = _score_noise(content, importance, source)
-                secrets = detect_secrets(content)
+                    score, reasons = _score_noise(content, importance, source)
+                    secrets = detect_secrets(content)
 
-                if score < min_score and not secrets:
-                    continue
+                    if score < min_score and not secrets:
+                        continue
 
-                suggested = _suggest_action(score, secrets)
-                candidate = NoiseCandidate(
-                    memory_id=row.get("id", ""),
-                    table_name=table,
-                    content_preview=content[:200],
-                    noise_score=round(score, 4),
-                    noise_reasons=reasons,
-                    secret_flags=secrets,
-                    importance=importance,
-                    source=source,
-                    timestamp=row.get("timestamp", "") or "",
-                    suggested_action=suggested,
-                    content_length=len(content),
-                )
-                report.candidates.append(candidate)
+                    suggested = _suggest_action(score, secrets)
+                    candidate = NoiseCandidate(
+                        memory_id=row.get("id", ""),
+                        table_name=table,
+                        content_preview=content[:200],
+                        noise_score=round(score, 4),
+                        noise_reasons=reasons,
+                        secret_flags=secrets,
+                        importance=importance,
+                        source=source,
+                        timestamp=row.get("timestamp", "") or "",
+                        suggested_action=suggested,
+                        content_length=len(content),
+                    )
+                    report.candidates.append(candidate)
+            table_counts[table] = table_scanned
     finally:
         conn.close()
 

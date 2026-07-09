@@ -232,6 +232,32 @@ class TestAuditNoise:
         assert full.total_scanned == 3
         assert {c.memory_id for c in full.candidates} == {"noise0", "noise1", "noise2"}
 
+    def test_audit_noise_rejects_invalid_pagination_args(self, temp_db):
+        db_path, beam = temp_db
+
+        with pytest.raises(ValueError, match="limit must be >= 0"):
+            audit_noise(db_path=db_path, limit=-1)
+        with pytest.raises(ValueError, match="offset must be >= 0"):
+            audit_noise(db_path=db_path, offset=-1)
+        with pytest.raises(ValueError, match="batch_size must be > 0"):
+            audit_noise(db_path=db_path, batch_size=0)
+
+    def test_hygiene_status_without_audit_log(self, temp_db):
+        db_path, beam = temp_db
+
+        status = hygiene_status(db_path=db_path, limit=10)
+
+        assert status["audit_log"]["present"] is False
+        assert status["audit_log"]["total_entries"] == 0
+        assert status["audit_log"]["by_action"] == {}
+
+    def test_hygiene_status_can_skip_noise_summary(self, temp_db):
+        db_path, beam = temp_db
+
+        status = hygiene_status(db_path=db_path, include_noise_summary=False)
+
+        assert "noise_summary" not in status
+
     def test_noise_summary_is_pii_safe(self, temp_db):
         db_path, beam = temp_db
         secret_content = "password = hunter2supersecret"  # nosec - test fixture
