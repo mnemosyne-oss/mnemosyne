@@ -1052,6 +1052,7 @@ class SyncEngine:
             importance=importance,
         )
         if payload is not None:
+            payload = self._sanitize_sync_payload(payload)
             if self.encryption:
                 envelope = {
                     "_sync": {
@@ -1121,7 +1122,8 @@ class SyncEngine:
 
     @classmethod
     def _sanitize_sync_payload(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
-        sanitized = dict(payload)
+        allowed = {*_SYNC_PAYLOAD_FIELDS, "deleted"}
+        sanitized = {key: value for key, value in payload.items() if key in allowed}
         metadata = sanitized.get("metadata_json")
         parsed = metadata
         if isinstance(metadata, str):

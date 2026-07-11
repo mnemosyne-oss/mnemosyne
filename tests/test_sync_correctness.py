@@ -622,6 +622,39 @@ def test_surface_event_payload_scrubs_private_metadata(tmp_path):
     assert metadata["nested"]["safe"] == "kept"
 
 
+def test_public_log_event_scrubs_private_payload_fields(memory):
+    encryption = SyncEncryption.from_config(SyncEncryption.generate_key())
+    assert encryption is not None
+    engine = SyncEngine(memory, device_id="writer", encryption=encryption)
+
+    event = engine.log_event(
+        "manual-event",
+        "CREATE",
+        {
+            "content": "safe",
+            "session_id": "private-session",
+            "author_id": "private-author",
+            "metadata_json": json.dumps(
+                {
+                    "source_profile_session": "private-profile",
+                    "nested": {"author_type": "private", "safe": "kept"},
+                }
+            ),
+        },
+    )
+    assert event.payload is not None
+    token = event.payload.removeprefix("mne1:")
+    envelope = encryption.decrypt(token)
+    payload = envelope["payload"]
+    metadata = json.loads(payload["metadata_json"])
+
+    assert "session_id" not in payload
+    assert "author_id" not in payload
+    assert "source_profile_session" not in metadata
+    assert "author_type" not in metadata["nested"]
+    assert metadata["nested"]["safe"] == "kept"
+
+
 def test_encrypted_metadata_tampering_is_rejected(memory):
     encryption = SyncEncryption.from_config(SyncEncryption.generate_key())
     assert encryption is not None
