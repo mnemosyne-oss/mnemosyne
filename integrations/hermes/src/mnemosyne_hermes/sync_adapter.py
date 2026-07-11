@@ -30,11 +30,8 @@ import json
 import logging
 import os
 import threading
-import urllib.request
-import urllib.error
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +96,7 @@ class SyncAdapter:
     Failure to construct is non-fatal — tools are simply not registered.
     """
 
-    def __init__(self, beam_instance, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, beam_instance, config: dict[str, Any] | None = None):
         """Initialize the adapter.
 
         Args:
@@ -110,7 +107,7 @@ class SyncAdapter:
         self._beam = beam_instance
         self._config = config or {}
         self._engine: Any = None
-        self._error: Optional[str] = None
+        self._error: str | None = None
         self._lock = threading.Lock()
 
         # Resolve configuration: explicit config > env vars > defaults
@@ -152,7 +149,30 @@ class SyncAdapter:
         elif source.startswith("file:"):
             path = raw_source[5:]
             try:
-                return Path(os.path.expanduser(path)).read_text().strip()
+                import stat
+
+                key_path = Path(os.path.expanduser(path))
+                flags = os.O_RDONLY
+                if os.name != "nt" and hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                elif key_path.is_symlink():
+                    raise ValueError("symlinks are not allowed")
+                fd = os.open(key_path, flags)
+                try:
+                    file_stat = os.fstat(fd)
+                    if not stat.S_ISREG(file_stat.st_mode):
+                        raise ValueError("not a regular file")
+                    if os.name != "nt" and file_stat.st_mode & 0o077:
+                        raise PermissionError("file is accessible by group/others")
+                    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                        fd = -1
+                        value = handle.read().strip()
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+                if not value:
+                    raise ValueError("file is empty")
+                return value
             except Exception as exc:
                 logger.warning("Sync key file %s unreadable: %s", path, exc)
                 return ""
@@ -183,22 +203,27 @@ class SyncAdapter:
     def _build_engine(self) -> None:
         """Construct the SyncEngine, encryption layer, and verify readiness."""
         try:
-            from mnemosyne.core.sync import SyncEngine, SyncEncryption
+            from mnemosyne.core.sync import SyncEncryption, SyncEngine
 
             encryption = None
             if self.encrypt_enabled and self.encryption_key:
                 encryption = SyncEncryption.from_config(key_source=self.encryption_key)
                 logger.info("Sync encryption enabled (key length: %d)", len(self.encryption_key))
             elif self.encrypt_enabled and not self.encryption_key:
-                logger.warning(
-                    "Sync encryption enabled but no key configured. "
-                    "Set MNEMOSYNE_SYNC_KEY or use key_source=keyring/file."
+                self._error = (
+                    "Sync encryption is required but no key is configured. "
+                    "Set MNEMOSYNE_SYNC_KEY or key_source=file:<path>."
                 )
-                # Don't fail — engine still works plaintext
+                logger.error(self._error)
+                self._engine = None
+                return
 
             self._engine = SyncEngine(
                 beam_instance=self._beam,
                 encryption=encryption,
+                require_encryption=self.encrypt_enabled,
+                surface_only=True,
+                initialize_surface=True,
             )
             logger.info(
                 "SyncAdapter initialized: device=%s, remote=%s, encrypt=%s",
@@ -230,7 +255,7 @@ class SyncAdapter:
         return self._engine is not None
 
     @property
-    def tool_schemas(self) -> List[Dict[str, Any]]:
+    def tool_schemas(self) -> list[dict[str, Any]]:
         if self.is_ready:
             return list(ALL_SYNC_TOOL_SCHEMAS)
         return []
@@ -265,36 +290,19 @@ class SyncAdapter:
                 "status": "error",
                 "error": "No remote configured. Set MNEMOSYNE_SYNC_REMOTE env var.",
             })
-
-        # Last cursor from sync_meta
-        cursor = self._engine._meta_get("last_sync_cursor") or ""
-        changes = self._engine.pull_changes(since_cursor=cursor or None, limit=500)
-
-        events = changes.get("events", [])
-        if not events:
-            return json.dumps({
-                "status": "ok",
-                "pushed": 0,
-                "message": "No local changes to push.",
-            })
-
-        # Push to remote
-        result = self._http_post("/sync/push", {"events": events})
-        if result.get("status") != "ok":
-            return json.dumps(result)
-
-        accepted = result.get("accepted", 0)
-        cursor = result.get("next_cursor") or changes.get("next_cursor") or ""
-
-        if cursor:
-            self._engine._meta_set("last_sync_cursor", cursor)
-
+        result = self._engine.sync_with(
+            self.remote, mode="push", api_key=self.auth_token or None
+        )
+        errors = list(result.get("errors") or [])
+        phase = result.get("push") or {}
         return json.dumps({
-            "status": "ok",
-            "pushed": accepted,
-            "duplicates": result.get("duplicates", 0),
-            "conflicts": result.get("conflicts", 0),
-            "next_cursor": cursor[:30] + "..." if len(cursor) > 30 else cursor,
+            "status": "error" if errors else "ok",
+            "pushed": phase.get("accepted", 0),
+            "duplicates": phase.get("duplicates", 0),
+            "conflicts": phase.get("conflicts", 0),
+            "discovered": phase.get("discovered", {}),
+            "batches": phase.get("batches", 0),
+            "errors": errors,
         })
 
     # --- Pull --------------------------------------------------------------
@@ -305,35 +313,19 @@ class SyncAdapter:
                 "status": "error",
                 "error": "No remote configured. Set MNEMOSYNE_SYNC_REMOTE env var.",
             })
-
-        cursor = self._engine._meta_get("last_sync_cursor") or ""
-        result = self._http_post("/sync/pull", {"since_token": cursor or None})
-
-        if result.get("status") != "ok":
-            return json.dumps(result)
-
-        incoming = result.get("events", [])
-        if not incoming:
-            return json.dumps({
-                "status": "ok",
-                "pulled": 0,
-                "message": "No remote changes to pull.",
-            })
-
-        # Apply locally
-        push_result = self._engine.push_changes(incoming)
-        accepted = push_result.get("accepted", 0)
-        cursor = result.get("next_cursor") or ""
-
-        if cursor:
-            self._engine._meta_set("last_sync_cursor", cursor)
-
+        result = self._engine.sync_with(
+            self.remote, mode="pull", api_key=self.auth_token or None
+        )
+        errors = list(result.get("errors") or [])
+        phase = result.get("pull") or {}
         return json.dumps({
-            "status": "ok",
-            "pulled": accepted,
-            "duplicates": push_result.get("duplicates", 0),
-            "conflicts": push_result.get("conflicts", 0),
-            "next_cursor": cursor[:30] + "..." if len(cursor) > 30 else cursor,
+            "status": "error" if errors else "ok",
+            "pulled": phase.get("accepted", 0),
+            "events_fetched": phase.get("events_fetched", 0),
+            "duplicates": phase.get("duplicates", 0),
+            "conflicts": phase.get("conflicts", 0),
+            "batches": phase.get("batches", 0),
+            "errors": errors,
         })
 
     # --- Status ------------------------------------------------------------
@@ -343,17 +335,33 @@ class SyncAdapter:
         if not engine:
             return json.dumps({"status": "error", "error": "No engine"})
 
-        cursor = engine._meta_get("last_sync_cursor") or ""
+        cursor = engine._meta_get(f"last_pull_cursor_{self.remote}") or ""
         device_id = getattr(engine, "device_id", "unknown")
-
-        # Count local events
         try:
-            row = engine.conn.execute(
-                "SELECT COUNT(*) FROM memory_events"
-            ).fetchone()
+            row = engine.conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()
             event_count = row[0] if row else 0
         except Exception:
             event_count = 0
+        try:
+            if self.remote:
+                row = engine.conn.execute(
+                    """SELECT COUNT(*) FROM memory_events AS me
+                       WHERE me.device_id = ? AND me.surface_id = ?
+                         AND NOT EXISTS (
+                            SELECT 1 FROM sync_outbox_ack AS ack
+                            WHERE ack.remote_url = ? AND ack.event_id = me.event_id
+                         )""",
+                    (device_id, engine.surface_id, self.remote.rstrip("/")),
+                ).fetchone()
+            else:
+                row = engine.conn.execute(
+                    """SELECT COUNT(*) FROM memory_events
+                       WHERE device_id = ? AND surface_id = ?""",
+                    (device_id, engine.surface_id),
+                ).fetchone()
+            pending = row[0] if row else 0
+        except Exception:
+            pending = 0
 
         return json.dumps({
             "status": "ok",
@@ -362,35 +370,6 @@ class SyncAdapter:
             "encryption": "enabled" if self.encrypt_enabled else "disabled",
             "mode": self.mode,
             "local_events": event_count,
+            "pending_push": pending,
             "last_cursor": cursor[:30] + "..." if len(cursor) > 30 else (cursor or "none"),
         })
-
-    # --- HTTP transport (stdlib-only, no external deps) --------------------
-
-    def _http_post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """POST JSON to the remote sync server. Never raises."""
-        url = self.remote.rstrip("/") + path
-        data = json.dumps(payload).encode("utf-8")
-
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": f"mnemosyne-sync/{getattr(self._engine, 'device_id', 'hermes')}",
-        }
-        if self.auth_token:
-            headers["Authorization"] = f"Bearer {self.auth_token}"
-
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            logger.debug("Sync HTTP %d from %s: %s", exc.code, url, exc.reason)
-            body = exc.read().decode("utf-8", errors="replace")
-            try:
-                return json.loads(body)
-            except json.JSONDecodeError:
-                return {"status": "error", "error": f"HTTP {exc.code}: {exc.reason}"}
-        except Exception as exc:
-            logger.debug("Sync request failed: %s", exc)
-            return {"status": "error", "error": str(exc)}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -445,9 +446,20 @@ def test_sync_adapter_schema_and_lifecycle_surface_match(sync_modules):
 
 
 class _FakeSyncEngine:
-    def __init__(self, beam_instance, encryption=None):
+    def __init__(
+        self,
+        beam_instance,
+        encryption=None,
+        require_encryption=False,
+        surface_only=False,
+        initialize_surface=False,
+    ):
         self.beam_instance = beam_instance
         self.encryption = encryption
+        self.require_encryption = require_encryption
+        self.surface_only = surface_only
+        self.surface_id = "shared-surface-v1" if surface_only else None
+        self.initialize_surface = initialize_surface
         self.device_id = "fake-device"
 
 
@@ -488,6 +500,41 @@ def test_sync_adapter_uses_provider_beam_for_both_surfaces(monkeypatch, sync_mod
         assert adapter._engine.beam_instance is provider_beam
 
 
+def test_provider_sync_tools_are_bound_to_shared_surface(
+    monkeypatch, provider_modules, sync_modules
+):
+    captured = {}
+
+    class CaptureAdapter:
+        def __init__(self, beam, _config):
+            captured["beam"] = beam
+
+        def handle_tool_call(self, tool_name, _args):
+            return json.dumps({"tool": tool_name})
+
+    for name, provider_module in provider_modules.items():
+        sync_module = sync_modules[name]
+        monkeypatch.setattr(sync_module, "SyncAdapter", CaptureAdapter)
+        provider = provider_module.MnemosyneMemoryProvider.__new__(
+            provider_module.MnemosyneMemoryProvider
+        )
+        provider._beam = object()
+        surface_beam = object()
+        provider._surface_beam = surface_beam
+        provider._require_surface_beam = lambda: None
+        if name == "hermes_memory_provider":
+            provider._sync_adapter = None
+        else:
+            provider._provider_sync_adapter = None
+
+        result = json.loads(
+            provider._handle_sync_tool("mnemosyne_sync_status", {})
+        )
+        assert result["tool"] == "mnemosyne_sync_status"
+        assert captured["beam"] is surface_beam
+        assert captured["beam"] is not provider._beam
+
+
 def test_sync_adapter_config_resolution_matches(monkeypatch, sync_modules):
     _install_fake_sync_modules(monkeypatch)
     monkeypatch.delenv("MNEMOSYNE_SYNC_REMOTE", raising=False)
@@ -500,18 +547,34 @@ def test_sync_adapter_config_resolution_matches(monkeypatch, sync_modules):
         observed[name] = {
             "remote": adapter.remote,
             "encryption_key_source": adapter._engine.encryption.key_source,
+            "require_encryption": adapter._engine.require_encryption,
         }
 
     assert observed["mnemosyne_hermes"] == observed["hermes_memory_provider"]
     assert observed["hermes_memory_provider"] == {
         "remote": "https://sync.example:443",
         "encryption_key_source": "encoded-key",
+        "require_encryption": True,
     }
+
+
+def test_sync_adapter_fails_closed_when_encryption_key_is_missing(
+    monkeypatch, sync_modules
+):
+    _install_fake_sync_modules(monkeypatch)
+    monkeypatch.delenv("MNEMOSYNE_SYNC_KEY", raising=False)
+    for module in sync_modules.values():
+        adapter = module.SyncAdapter(object(), {"encrypt": True})
+        assert adapter.is_ready is False
+        assert adapter._engine is None
+        assert "no key" in adapter._error.lower()
 
 
 def test_sync_adapter_key_source_file_preserves_path_case(tmp_path, sync_modules):
     key_file = tmp_path / "MixedCaseSync.key"
     key_file.write_text("file-key")
+    if os.name != "nt":
+        key_file.chmod(0o600)
 
     observed = {}
     for name, module in sync_modules.items():
@@ -523,13 +586,26 @@ def test_sync_adapter_key_source_file_preserves_path_case(tmp_path, sync_modules
     assert observed["hermes_memory_provider"] == "file-key"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
+def test_sync_adapter_rejects_insecure_key_file_permissions(tmp_path, sync_modules):
+    key_file = tmp_path / "insecure-sync.key"
+    key_file.write_text("file-key")
+    key_file.chmod(0o644)
+
+    for module in sync_modules.values():
+        adapter = module.SyncAdapter.__new__(module.SyncAdapter)
+        adapter._config = {"key_source": f"file:{key_file}"}
+        assert adapter._resolve_key() == ""
+
+
 class _ToolEngine:
     device_id = "device-1"
 
     def __init__(self, *, local_next_cursor: str | None = "local-cursor"):
-        self.meta = {"last_sync_cursor": "cursor-previous"}
+        self.meta = {
+            "last_pull_cursor_https://sync.example": local_next_cursor or ""
+        }
         self.conn = self
-        self.local_next_cursor = local_next_cursor
 
     def _meta_get(self, key):
         return self.meta.get(key)
@@ -537,14 +613,32 @@ class _ToolEngine:
     def _meta_set(self, key, value):
         self.meta[key] = value
 
-    def pull_changes(self, since_cursor=None, limit=500):
-        return {"events": [{"id": "e1"}], "next_cursor": self.local_next_cursor}
+    def sync_with(self, remote, mode="bidirectional", api_key=None):
+        assert remote == "https://sync.example"
+        assert api_key is None
+        if mode == "push":
+            return {
+                "errors": [],
+                "push": {
+                    "accepted": 2,
+                    "duplicates": 1,
+                    "conflicts": 1,
+                    "batches": 1,
+                    "discovered": {"created": 1, "updated": 1, "deleted": 0},
+                },
+            }
+        return {
+            "errors": [],
+            "pull": {
+                "accepted": 2,
+                "events_fetched": 2,
+                "duplicates": 1,
+                "conflicts": 1,
+                "batches": 1,
+            },
+        }
 
-    def push_changes(self, events):
-        self.pushed_events = events
-        return {"accepted": 2, "duplicates": 1, "conflicts": 1}
-
-    def execute(self, _sql):
+    def execute(self, _sql, _params=None):
         return self
 
     def fetchone(self):
@@ -557,6 +651,7 @@ def _adapter_with_tool_engine(
     next_cursor: str | None = "remote-cursor",
     local_next_cursor: str | None = "local-cursor",
 ):
+    del next_cursor
     adapter = module.SyncAdapter.__new__(module.SyncAdapter)
     adapter._engine = _ToolEngine(local_next_cursor=local_next_cursor)
     adapter._error = None
@@ -564,19 +659,6 @@ def _adapter_with_tool_engine(
     adapter.encrypt_enabled = False
     adapter.mode = "bidirectional"
     adapter.auth_token = ""
-
-    def fake_post(_path, _payload):
-        return {
-            "status": "ok",
-            "accepted": 2,
-            "duplicates": 1,
-            "conflicts": 1,
-            "events": [{"id": "remote-1"}, {"id": "remote-2"}],
-            "next_cursor": next_cursor,
-        }
-
-    adapter._http_post = fake_post
-    adapter._post = fake_post
     return adapter
 
 
@@ -597,48 +679,41 @@ def test_sync_adapter_tool_results_match(sync_modules):
         "pushed": 2,
         "duplicates": 1,
         "conflicts": 1,
-        "next_cursor": "remote-cursor",
+        "discovered": {"created": 1, "updated": 1, "deleted": 0},
+        "batches": 1,
+        "errors": [],
     }
     assert observed["hermes_memory_provider"]["pull"] == {
         "status": "ok",
         "pulled": 2,
+        "events_fetched": 2,
         "duplicates": 1,
         "conflicts": 1,
-        "next_cursor": "remote-cursor",
+        "batches": 1,
+        "errors": [],
     }
 
 
-def test_sync_adapter_push_tolerates_null_next_cursor(sync_modules):
+def test_sync_adapter_push_does_not_require_transport_cursor(sync_modules):
     observed = {}
     for name, module in sync_modules.items():
         adapter = _adapter_with_tool_engine(module, next_cursor=None, local_next_cursor=None)
         observed[name] = json.loads(adapter.handle_tool_call("mnemosyne_sync_push", {}))
 
     assert observed["mnemosyne_hermes"] == observed["hermes_memory_provider"]
-    assert observed["hermes_memory_provider"] == {
-        "status": "ok",
-        "pushed": 2,
-        "duplicates": 1,
-        "conflicts": 1,
-        "next_cursor": "",
-    }
+    assert observed["hermes_memory_provider"]["status"] == "ok"
+    assert observed["hermes_memory_provider"]["pushed"] == 2
 
 
-
-def test_sync_adapter_pull_tolerates_null_next_cursor(sync_modules):
+def test_sync_adapter_pull_does_not_require_transport_cursor(sync_modules):
     observed = {}
     for name, module in sync_modules.items():
         adapter = _adapter_with_tool_engine(module, next_cursor=None)
         observed[name] = json.loads(adapter.handle_tool_call("mnemosyne_sync_pull", {}))
 
     assert observed["mnemosyne_hermes"] == observed["hermes_memory_provider"]
-    assert observed["hermes_memory_provider"] == {
-        "status": "ok",
-        "pulled": 2,
-        "duplicates": 1,
-        "conflicts": 1,
-        "next_cursor": "",
-    }
+    assert observed["hermes_memory_provider"]["status"] == "ok"
+    assert observed["hermes_memory_provider"]["pulled"] == 2
 
 def _prompt_provider(module):
     provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
@@ -862,3 +937,46 @@ def test_provider_batch_dispatch_matches(tmp_path, provider_modules):
         "operations_count": 1,
         "result_statuses": ["stored"],
     }
+
+
+def test_sync_status_uses_per_remote_ack_table(sync_modules):
+    import sqlite3
+
+    class Engine:
+        device_id = "device-a"
+        surface_id = "shared-surface-v1"
+
+        def __init__(self):
+            self.conn = sqlite3.connect(":memory:")
+            self.conn.execute(
+                """CREATE TABLE memory_events (
+                    event_id TEXT PRIMARY KEY, device_id TEXT, surface_id TEXT
+                )"""
+            )
+            self.conn.execute(
+                """CREATE TABLE sync_outbox_ack (
+                    remote_url TEXT, event_id TEXT, acked_at TEXT,
+                    PRIMARY KEY (remote_url, event_id)
+                )"""
+            )
+            self.conn.execute(
+                "INSERT INTO memory_events VALUES ('event-a', 'device-a', 'shared-surface-v1')"
+            )
+            self.conn.execute(
+                "INSERT INTO sync_outbox_ack VALUES ('https://relay.example', 'event-a', 'now')"
+            )
+
+        @staticmethod
+        def _meta_get(_key):
+            return None
+
+    observed = {}
+    for name, module in sync_modules.items():
+        adapter = module.SyncAdapter.__new__(module.SyncAdapter)
+        adapter._engine = Engine()
+        adapter.remote = "https://relay.example"
+        adapter.encrypt_enabled = True
+        adapter.mode = "bidirectional"
+        observed[name] = json.loads(adapter._handle_status())["pending_push"]
+
+    assert observed == {"hermes_memory_provider": 0, "mnemosyne_hermes": 0}

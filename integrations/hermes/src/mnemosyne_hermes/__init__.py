@@ -1481,7 +1481,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             adapter = getattr(self, "_provider_sync_adapter", None)
             if adapter is None:
                 from mnemosyne_hermes.sync_adapter import SyncAdapter
-                adapter = SyncAdapter(self._beam, {})
+
+                surface_error = self._require_surface_beam()
+                if surface_error:
+                    return json.dumps({"status": "error", "error": surface_error})
+                adapter = SyncAdapter(self._surface_beam, {})
                 self._provider_sync_adapter = adapter
             return adapter.handle_tool_call(tool_name, args)
         except Exception as exc:
