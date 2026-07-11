@@ -670,6 +670,68 @@ def _read_secret_file(path: str, label: str) -> str:
     return value
 
 
+def cmd_sync_init(args):
+    """Explicitly initialize or migrate a dedicated shared-surface DB."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="mnemosyne sync-init")
+    parser.add_argument("--db-path", required=True, help="Dedicated shared-surface DB")
+    parser.add_argument(
+        "--session-id",
+        default="hermes_shared_surface",
+        help="Stable session ID used by the shared-surface Beam",
+    )
+    parser.add_argument(
+        "--claim-existing",
+        action="store_true",
+        help="Claim existing global rows after validation",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm mutation of an existing non-empty dedicated DB",
+    )
+    parsed = parser.parse_args(args)
+
+    from mnemosyne.core.memory import Mnemosyne
+    from mnemosyne.core.sync import SyncEngine
+
+    mem = Mnemosyne(db_path=parsed.db_path, session_id=parsed.session_id)
+    existing_rows = mem.beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory"
+    ).fetchone()[0]
+    invalid_rows = mem.beam.conn.execute(
+        """SELECT COUNT(*) FROM working_memory
+           WHERE scope != 'global' OR session_id != ?""",
+        (parsed.session_id,),
+    ).fetchone()[0]
+    preview = {
+        "db_path": str(parsed.db_path),
+        "session_id": parsed.session_id,
+        "existing_rows": existing_rows,
+        "invalid_rows": invalid_rows,
+    }
+    if invalid_rows:
+        raise SystemExit(
+            "Refusing migration: DB contains non-global or foreign-session rows"
+        )
+    if existing_rows and not (parsed.claim_existing and parsed.yes):
+        preview["status"] = "confirmation_required"
+        preview["required_flags"] = ["--claim-existing", "--yes"]
+        print(json.dumps(preview, sort_keys=True))
+        return
+
+    SyncEngine(
+        mem,
+        surface_only=True,
+        initialize_surface=True,
+        claim_existing_surface=bool(existing_rows),
+    )
+    preview["status"] = "initialized"
+    preview["claimed_rows"] = existing_rows
+    print(json.dumps(preview, sort_keys=True))
+
+
 def cmd_sync(args):
     """Sync memories with a remote Mnemosyne instance."""
     import argparse
@@ -795,6 +857,11 @@ def cmd_sync_serve(args):
         action="store_true",
         help="Explicitly initialize a new dedicated relay DB",
     )
+    parser.add_argument(
+        "--behind-tls-proxy",
+        action="store_true",
+        help="Allow non-loopback cleartext only behind a trusted TLS proxy",
+    )
     api_group = parser.add_mutually_exclusive_group()
     api_group.add_argument(
         "--api-key", help="API key for bearer-token auth (visible in process arguments)"
@@ -833,6 +900,7 @@ def cmd_sync_serve(args):
         tls_cert=parsed.tls_cert,
         tls_key=parsed.tls_key,
         initialize_surface=parsed.initialize_surface,
+        behind_tls_proxy=parsed.behind_tls_proxy,
     )
 
 
@@ -1528,6 +1596,7 @@ COMMANDS = {
     "verify": cmd_verify,
     "backups": cmd_backups_list,
     "sync": cmd_sync,
+    "sync-init": cmd_sync_init,
     "sync-serve": cmd_sync_serve,
     "sync-server": cmd_sync_serve,
     "sync-status": cmd_sync_status,
@@ -1570,6 +1639,8 @@ def run_cli():
         print("  mcp [--transport sse] [--port 8080]    Start MCP server")
         print("  sync --remote <url> [--mode push|pull|bidirectional]")
         print("                                      Sync with remote server")
+        print("  sync-init --db-path <path> [--claim-existing --yes]")
+        print("                                      Initialize/migrate a dedicated surface DB")
         print("  sync-serve [--port 8765] [--host 0.0.0.0]")
         print("                                      Start sync server")
         print("  sync-status [--remote <url>] [--json]")

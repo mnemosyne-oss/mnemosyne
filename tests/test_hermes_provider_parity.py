@@ -939,6 +939,37 @@ def test_provider_batch_dispatch_matches(tmp_path, provider_modules):
     }
 
 
+def test_shared_surface_is_initialized_before_first_write(tmp_path, provider_modules):
+    from mnemosyne.core.sync import SyncEngine
+
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+        provider._surface_beam = None
+        provider._shared_surface_path = tmp_path / f"{name}-surface.db"
+        provider._session_id = "private-profile-session"
+        provider._audit_event = lambda *_args, **_kwargs: None
+
+        provider._ensure_surface_beam()
+        stored = json.loads(
+            provider._handle_shared_remember(
+                {"content": f"shared {name}", "kind": "meta"}
+            )
+        )
+        assert stored["status"] == "stored_shared"
+
+        engine = SyncEngine(
+            provider._surface_beam,
+            surface_only=True,
+            initialize_surface=True,
+        )
+        event = engine.discover_local_mutations()["events"][0]
+        metadata = json.loads(json.loads(event["payload"])["metadata_json"])
+        assert "source_profile_session" not in metadata
+        assert provider._surface_beam.conn.execute(
+            "SELECT value FROM sync_meta WHERE key = 'surface_db_id'"
+        ).fetchone()[0] == "shared-surface-v1"
+
+
 def test_sync_status_uses_per_remote_ack_table(sync_modules):
     import sqlite3
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -30,16 +31,69 @@ def test_surface_mode_refuses_unmarked_db_without_claiming_rows(tmp_path):
     assert "sync_surface_id" not in after_columns
 
 
+def test_network_sync_refuses_unscoped_private_db_by_default(tmp_path):
+    from mnemosyne.core.sync import SyncEngine
+
+    memory = Mnemosyne(db_path=tmp_path / "private-sync.db", session_id="private")
+    memory.remember("must stay private", source="test", scope="session")
+    engine = SyncEngine(memory)
+
+    with pytest.raises(ValueError, match="requires surface_only=True"):
+        engine.sync_with("https://relay.example", mode="push")
+    assert engine.conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0] == 0
+
+
 def test_non_loopback_plain_http_sync_is_rejected(tmp_path):
     from mnemosyne.core.sync import SyncEngine
 
     memory = Mnemosyne(db_path=tmp_path / "https-required.db")
-    engine = SyncEngine(memory)
+    engine = SyncEngine(memory, allow_unscoped_sync=True)
 
     with pytest.raises(ValueError, match="require HTTPS"):
         engine.sync_with("http://relay.example", mode="push", api_key="secret")
     with pytest.raises(ValueError, match="require HTTPS"):
         engine.get_status(remote_url="http://relay.example", api_key="secret")
+
+
+def test_sync_init_requires_explicit_confirmation_for_existing_rows(tmp_path, capsys):
+    from mnemosyne.cli import cmd_sync_init
+
+    db_path = tmp_path / "legacy-shared.db"
+    memory = Mnemosyne(db_path=db_path, session_id="hermes_shared_surface")
+    memory.remember("existing shared", source="test", scope="global")
+
+    cmd_sync_init(["--db-path", str(db_path)])
+    preview = json.loads(capsys.readouterr().out)
+    assert preview["status"] == "confirmation_required"
+    assert preview["existing_rows"] == 1
+    sync_meta_exists = memory.beam.conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_meta'"
+    ).fetchone()
+    assert sync_meta_exists is None
+
+    cmd_sync_init(
+        ["--db-path", str(db_path), "--claim-existing", "--yes"]
+    )
+    applied = json.loads(capsys.readouterr().out)
+    assert applied["status"] == "initialized"
+    assert applied["claimed_rows"] == 1
+    assert memory.beam.conn.execute(
+        "SELECT sync_surface_id FROM working_memory"
+    ).fetchone()[0] == "shared-surface-v1"
+
+
+def test_packaged_deployment_commands_match_hardened_cli():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    compose = (root / "deploy/sync/docker-compose.yml").read_text()
+    fly = (root / "deploy/sync/fly.toml").read_text()
+
+    for rendered in (compose, fly):
+        assert "--db-path /data/relay.db" in rendered
+        assert "--initialize-surface" in rendered
+        assert "--behind-tls-proxy" in rendered
+        assert "/healthz" in rendered
 
 
 def test_sync_engine_rejects_required_encryption_without_key(tmp_path):
@@ -103,6 +157,19 @@ def test_non_loopback_server_requires_authentication(tmp_path):
         )
 
 
+def test_non_loopback_server_requires_tls_or_explicit_proxy(tmp_path):
+    memory = Mnemosyne(db_path=tmp_path / "server-no-tls.db")
+
+    with pytest.raises(ValueError, match="HTTPS is required"):
+        run_sync_server(
+            host="0.0.0.0",
+            port=0,
+            beam_instance=memory,
+            api_key="test-key",
+            daemon=True,
+        )
+
+
 def test_server_requires_complete_tls_pair(tmp_path):
     memory = Mnemosyne(db_path=tmp_path / "server-tls.db")
 
@@ -117,6 +184,8 @@ def test_server_requires_complete_tls_pair(tmp_path):
 
 
 def test_server_rejects_oversized_and_invalid_json_once(tmp_path):
+    import hashlib
+    import hmac
     import json
     import urllib.error
     import urllib.request
@@ -154,10 +223,15 @@ def test_server_rejects_oversized_and_invalid_json_once(tmp_path):
         assert invalid_error.value.code == 400
         assert "Invalid JSON" in json.loads(invalid_error.value.read())["error"]
 
+        invalid_limit_body = b'{"limit": 0}'
+        invalid_limit_headers = dict(headers)
+        invalid_limit_headers["X-Mnemosyne-Body-MAC"] = hmac.new(
+            b"body-key", invalid_limit_body, hashlib.sha256
+        ).hexdigest()
         invalid_limit = urllib.request.Request(
             f"{remote}/sync/pull",
-            data=b'{"limit": 0}',
-            headers=headers,
+            data=invalid_limit_body,
+            headers=invalid_limit_headers,
             method="POST",
         )
         with pytest.raises(urllib.error.HTTPError) as limit_error:
@@ -170,6 +244,8 @@ def test_server_rejects_oversized_and_invalid_json_once(tmp_path):
 
 
 def test_relay_rejects_plaintext_events_by_default(tmp_path):
+    import hashlib
+    import hmac
     import json
     import urllib.request
 
@@ -194,12 +270,16 @@ def test_relay_rejects_plaintext_events_by_default(tmp_path):
         "importance": 0.5,
         "event_hash": "plaintext-hash",
     }
+    body = json.dumps({"events": [event]}).encode()
     request = urllib.request.Request(
         f"{remote}/sync/push",
-        data=json.dumps({"events": [event]}).encode(),
+        data=body,
         headers={
             "Authorization": "Bearer relay-key",
             "Content-Type": "application/json",
+            "X-Mnemosyne-Body-MAC": hmac.new(
+                b"relay-key", body, hashlib.sha256
+            ).hexdigest(),
         },
         method="POST",
     )
@@ -211,6 +291,41 @@ def test_relay_rejects_plaintext_events_by_default(tmp_path):
         assert result["errors"] == 1
         assert relay.beam.conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0] == 0
         assert relay.beam.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_authenticated_server_rejects_post_without_body_mac(tmp_path):
+    import urllib.error
+    import urllib.request
+
+    relay = Mnemosyne(db_path=tmp_path / "relay-body-mac.db")
+    server = run_sync_server(
+        host="127.0.0.1",
+        port=0,
+        beam_instance=relay,
+        api_key="relay-key",
+        daemon=True,
+        initialize_surface=True,
+    )
+    remote = f"http://127.0.0.1:{server.server_address[1]}"
+    body = json.dumps({"events": []}).encode()
+    request = urllib.request.Request(
+        f"{remote}/sync/push",
+        data=body,
+        headers={
+            "Authorization": "Bearer relay-key",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=5)
+        assert error.value.code == 401
+        assert "body MAC" in json.loads(error.value.read())["error"]
     finally:
         server.shutdown()
         server.server_close()
@@ -245,6 +360,8 @@ def test_remote_status_response_is_bounded(tmp_path, monkeypatch):
 
 
 def test_remote_status_is_authenticated_and_read_only(tmp_path):
+    import urllib.request
+
     from mnemosyne.core.sync import SyncEngine
 
     relay = Mnemosyne(db_path=tmp_path / "relay-status.db")
@@ -261,6 +378,8 @@ def test_remote_status_is_authenticated_and_read_only(tmp_path):
     engine = SyncEngine(client, device_id="client")
 
     try:
+        with urllib.request.urlopen(f"{remote}/healthz", timeout=5) as response:
+            assert json.loads(response.read()) == {"status": "ok"}
         before = engine.conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]
         status = engine.get_status(remote_url=remote, api_key="status-key")
         after = engine.conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]

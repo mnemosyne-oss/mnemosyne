@@ -10,6 +10,7 @@ Mnemosyne's BEAM architecture.
 
 import json
 import hashlib
+import hmac
 import ipaddress
 import logging
 import sys
@@ -26,6 +27,15 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 _ENCRYPTED_WIRE_PREFIX = "mne1:"
+_PRIVATE_METADATA_KEYS = {
+    "session_id",
+    "source_profile_session",
+    "profile_session",
+    "author_id",
+    "author_type",
+    "channel_id",
+    "trust_tier",
+}
 _SYNC_PAYLOAD_FIELDS = (
     "content",
     "source",
@@ -647,6 +657,8 @@ class SyncEngine:
         surface_id: str = "shared-surface-v1",
         initialize_surface: bool = False,
         claim_surface_rows: bool = True,
+        claim_existing_surface: bool = False,
+        allow_unscoped_sync: bool = False,
         max_future_skew_seconds: int = 300,
         max_response_bytes: int = 10 * 1024 * 1024,
     ):
@@ -667,6 +679,8 @@ class SyncEngine:
         self.surface_id = str(surface_id).strip() if self.surface_only else None
         self.initialize_surface = bool(initialize_surface)
         self.claim_surface_rows = bool(claim_surface_rows)
+        self.claim_existing_surface = bool(claim_existing_surface)
+        self.allow_unscoped_sync = bool(allow_unscoped_sync)
         if self.surface_only and not self.surface_id:
             raise ValueError("surface_id is required in surface-only mode")
         self.surface_session_id = getattr(self._beam, "session_id", None) or "sync"
@@ -767,10 +781,20 @@ class SyncEngine:
             existing_rows = self.conn.execute(
                 "SELECT COUNT(*) FROM working_memory"
             ).fetchone()[0]
-            if existing_rows:
+            if existing_rows and not self.claim_existing_surface:
                 raise ValueError(
                     "first-time surface initialization requires an empty working_memory table"
                 )
+            if existing_rows:
+                invalid_rows = self.conn.execute(
+                    """SELECT COUNT(*) FROM working_memory
+                       WHERE scope != 'global' OR session_id != ?""",
+                    (self.surface_session_id,),
+                ).fetchone()[0]
+                if invalid_rows:
+                    raise ValueError(
+                        "existing surface migration found non-global or foreign-session rows"
+                    )
         elif marker != self.surface_id:
             raise ValueError("surface DB marker does not match configured surface_id")
 
@@ -1078,6 +1102,42 @@ class SyncEngine:
         return event
 
     @staticmethod
+    def _scrub_private_metadata(value: Any) -> Any:
+        if isinstance(value, dict):
+            scrubbed = {}
+            for key, item in value.items():
+                normalized = str(key).lower()
+                if (
+                    normalized in _PRIVATE_METADATA_KEYS
+                    or normalized.endswith("_session_id")
+                    or normalized.startswith("author_")
+                ):
+                    continue
+                scrubbed[key] = SyncEngine._scrub_private_metadata(item)
+            return scrubbed
+        if isinstance(value, list):
+            return [SyncEngine._scrub_private_metadata(item) for item in value]
+        return value
+
+    @classmethod
+    def _sanitize_sync_payload(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
+        sanitized = dict(payload)
+        metadata = sanitized.get("metadata_json")
+        parsed = metadata
+        if isinstance(metadata, str):
+            try:
+                parsed = json.loads(metadata)
+            except json.JSONDecodeError:
+                parsed = None
+        if isinstance(parsed, (dict, list)):
+            sanitized["metadata_json"] = json.dumps(
+                cls._scrub_private_metadata(parsed),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        return sanitized
+
+    @staticmethod
     def _canonical_payload(payload: Dict[str, Any]) -> str:
         """Canonical JSON used to detect semantic row changes."""
         normalized = {
@@ -1109,11 +1169,11 @@ class SyncEngine:
         self._sync_working_columns = columns
         return columns
 
-    @staticmethod
-    def _row_to_payload(row: Any) -> Tuple[str, Dict[str, Any]]:
+    @classmethod
+    def _row_to_payload(cls, row: Any) -> Tuple[str, Dict[str, Any]]:
         values = dict(row)
         memory_id = str(values.pop("id"))
-        return memory_id, values
+        return memory_id, cls._sanitize_sync_payload(values)
 
     def _working_payloads(self) -> Dict[str, Dict[str, Any]]:
         """Read every working-memory row without a fixed bootstrap cap."""
@@ -1694,6 +1754,14 @@ class SyncEngine:
         )
         for raw in events:
             try:
+                if not isinstance(raw, dict):
+                    raise ValueError("event must be an object")
+                if (
+                    self.relay_mode
+                    and self.require_encryption
+                    and raw.get("_transport_authenticated") is not True
+                ):
+                    raise ValueError("blind relay requires authenticated transport")
                 event = SyncEvent.from_dict(raw)
                 if not event.event_id or not event.memory_id or not event.device_id:
                     raise ValueError("event_id, memory_id, and device_id are required")
@@ -1744,6 +1812,8 @@ class SyncEngine:
                 sys.stderr.flush()
             try:
                 payload = self._decode_payload(event)
+                if payload is not None:
+                    payload = self._sanitize_sync_payload(payload)
                 embedding = self._prepare_embedding(payload)
                 if self.conn.in_transaction:
                     raise RuntimeError("sync apply requires a clean SQLite transaction")
@@ -1844,6 +1914,10 @@ class SyncEngine:
         del encryption_key  # retained for API compatibility; engine owns encryption state
         if mode not in {"push", "pull", "bidirectional"}:
             raise ValueError(f"unsupported sync mode: {mode}")
+        if not self.surface_only and not self.allow_unscoped_sync:
+            raise ValueError(
+                "network sync requires surface_only=True; private/unscoped DB sync is disabled"
+            )
         remote_url = remote_url.rstrip("/")
         self._validate_sync_remote_url(remote_url)
 
@@ -1883,7 +1957,14 @@ class SyncEngine:
         def _post(endpoint: str, body: dict) -> Optional[dict]:
             url = f"{remote_url.rstrip('/')}{endpoint}"
             data = json.dumps(body, default=str).encode("utf-8")
-            request = _request.Request(url, data=data, headers=headers, method="POST")
+            request_headers = dict(headers)
+            if api_key:
+                request_headers["X-Mnemosyne-Body-MAC"] = hmac.new(
+                    api_key.encode("utf-8"), data, hashlib.sha256
+                ).hexdigest()
+            request = _request.Request(
+                url, data=data, headers=request_headers, method="POST"
+            )
             try:
                 with _request.urlopen(request, timeout=30) as response:
                     return json.loads(
@@ -1903,8 +1984,8 @@ class SyncEngine:
             return None
 
         page_size = 1000
+        discovered = self.discover_local_mutations()
         if mode in ("push", "bidirectional"):
-            discovered = self.discover_local_mutations()
             push_total = {
                 "accepted": 0,
                 "duplicates": 0,
@@ -2012,7 +2093,20 @@ class SyncEngine:
                     break
                 events = list(response.get("events") or [])
                 if events:
-                    applied = self.push_changes(events)
+                    authenticated_events = []
+                    for event in events:
+                        if not isinstance(event, dict):
+                            result["errors"].append(
+                                "pull page contains a non-object event"
+                            )
+                            authenticated_events = []
+                            break
+                        authenticated = dict(event)
+                        authenticated["_transport_authenticated"] = True
+                        authenticated_events.append(authenticated)
+                    if not authenticated_events:
+                        break
+                    applied = self.push_changes(authenticated_events)
                     pull_total["batches"] += 1
                     pull_total["events_fetched"] += len(events)
                     for key in ("accepted", "duplicates", "conflicts", "errors"):
