@@ -270,12 +270,17 @@ DEFAULTS: Dict[str, Any] = {
     "sync_port": 8765,
     "sync_key": "",
     "sync_encrypt": False,
-    "sync_roles": "user,assistant",
+    # Match the Hermes provider default. Auto-seeding must not start
+    # persisting assistant transcripts for existing provider users.
+    "sync_roles": "user",
     # Provider
     "auto_sleep_enabled": True,
     "reflect_disabled_for_cron": True,
     "reflect_max_calls_per_session": 3,
-    "skip_contexts": "",
+    # Match the Hermes provider's non-primary-context safety default.
+    # An auto-seeded config must not make cron/subagent sessions initialize
+    # a memory beam merely because it now outranks the provider default.
+    "skip_contexts": "cron,flush,subagent,background,skill_loop",
     "prefetch_content_chars": 2000,
     "sync_turn_user_limit": 10,
     "sync_turn_assistant_limit": 10,

@@ -114,6 +114,58 @@ def test_initialize_skips_for_non_primary_context(monkeypatch):
     assert provider._beam is None   # But no beam initialized
 
 
+@pytest.mark.parametrize("agent_context", ["cron", "flush", "subagent", "background", "skill_loop"])
+def test_auto_seeded_core_config_preserves_provider_safety_defaults(monkeypatch, tmp_path, agent_context):
+    """Core config auto-seeding must not override Hermes provider defaults."""
+    from mnemosyne.core.config import MnemosyneConfig
+
+    expected_skip_contexts = {"cron", "flush", "subagent", "background", "skill_loop"}
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+    MnemosyneConfig.reset_instance()
+    provider = None
+    try:
+        provider = MnemosyneMemoryProvider()
+        with patch("hermes_memory_provider.hermes_llm_adapter.register_hermes_host_llm"):
+            provider.initialize(session_id="x", agent_context=agent_context)
+
+        assert (tmp_path / "config.yaml").exists()
+        assert provider._skip_contexts == expected_skip_contexts
+        assert provider._beam is None
+        assert provider._sync_roles == {"user"}
+
+        import yaml
+        seeded = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        assert seeded["skip_contexts"] == "cron,flush,subagent,background,skill_loop"
+        assert seeded["sync_roles"] == "user"
+    finally:
+        if provider is not None:
+            with patch("hermes_memory_provider.hermes_llm_adapter.unregister_hermes_host_llm"):
+                provider.shutdown()
+        MnemosyneConfig.reset_instance()
+
+
+def test_auto_seeded_core_config_does_not_skip_primary_context(monkeypatch, tmp_path):
+    """The seeded skip-context list must leave primary sessions active."""
+    from mnemosyne.core.config import MnemosyneConfig
+
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("hermes_memory_provider._get_beam_class", lambda: lambda **_: MagicMock())
+    MnemosyneConfig.reset_instance()
+    provider = None
+    try:
+        provider = MnemosyneMemoryProvider()
+        with patch("hermes_memory_provider.hermes_llm_adapter.register_hermes_host_llm"):
+            provider.initialize(session_id="x", agent_context="primary")
+
+        assert "primary" not in provider._skip_contexts
+        assert provider._beam is not None
+    finally:
+        if provider is not None:
+            with patch("hermes_memory_provider.hermes_llm_adapter.unregister_hermes_host_llm"):
+                provider.shutdown()
+        MnemosyneConfig.reset_instance()
+
+
 # ---------------------------------------------------------------------------
 # shutdown() unregistration (decision C7)
 # ---------------------------------------------------------------------------
