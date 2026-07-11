@@ -343,7 +343,7 @@ class MnemosyneConfig:
         if not self._config_path.exists():
             self._seed()
         else:
-            self._migrate_legacy_provider_defaults()
+            self._warn_legacy_provider_defaults()
 
         self._load_yaml()
 
@@ -412,54 +412,38 @@ class MnemosyneConfig:
         except Exception as e:
             logger.warning("Failed to seed config.yaml: %s", e)
 
-    def _migrate_legacy_provider_defaults(self) -> None:
-        """Repair the unsafe provider defaults seeded by 3.12.1/3.12.2.
+    def _warn_legacy_provider_defaults(self) -> None:
+        """Warn about ambiguous 3.12.1/3.12.2 auto-seeded provider values.
 
-        Only an auto-seeded file with the exact legacy pair is changed. A
-        manually created config, or a seeded config where either value was
-        edited, is treated as an explicit override and left untouched.
+        The legacy seed header does not record whether values came from the
+        environment, so rewriting the file could destroy an explicit opt-in.
+        Preserve it and provide deterministic commands for adopting the safer
+        defaults.
         """
         try:
             text = self._config_path.read_text(encoding="utf-8")
             if "# Values below reflect your current env vars" not in text:
                 return
 
-            import re
             import yaml
 
             data = yaml.safe_load(text) or {}
             if not isinstance(data, dict):
                 return
-            if data.get("sync_roles") != "user,assistant":
-                return
-            if data.get("skip_contexts") != "":
-                return
-
-            migrated, role_count = re.subn(
-                r"(?m)^sync_roles:\s*['\"]?user,assistant['\"]?\s*$",
-                "sync_roles: user",
-                text,
-            )
-            migrated, skip_count = re.subn(
-                r"(?m)^skip_contexts:\s*(?:''|\"\")\s*$",
-                "skip_contexts: cron,flush,subagent,background,skill_loop",
-                migrated,
-            )
-            if role_count != 1 or skip_count != 1:
+            if (
+                data.get("sync_roles") == "user,assistant"
+                and data.get("skip_contexts") == ""
+            ):
                 logger.warning(
-                    "Skipped legacy provider-default migration for %s: "
-                    "unexpected YAML formatting",
+                    "Legacy provider defaults detected in %s; values may be "
+                    "explicit environment choices and were not rewritten. "
+                    "To adopt safe defaults, run: mnemosyne config set "
+                    "sync_roles user && mnemosyne config set skip_contexts "
+                    "cron,flush,subagent,background,skill_loop",
                     self._config_path,
                 )
-                return
-
-            tmp_path = self._config_path.with_name(self._config_path.name + ".tmp")
-            tmp_path.write_text(migrated, encoding="utf-8")
-            tmp_path.chmod(self._config_path.stat().st_mode & 0o777)
-            os.replace(tmp_path, self._config_path)
-            logger.info("Migrated legacy provider defaults in %s", self._config_path)
         except Exception as e:
-            logger.warning("Failed to migrate legacy provider defaults: %s", e)
+            logger.warning("Failed to inspect legacy provider defaults: %s", e)
 
     @classmethod
     def reset_instance(cls) -> None:

@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
+## [Unreleased]
+
+### Fixed
+
+- **Hermes provider safety defaults after config bridging.** New auto-seeded
+  configs now preserve user-only autosave and skip `cron`, `flush`, `subagent`,
+  `background`, and `skill_loop` contexts. Existing 3.12.1/3.12.2 auto-seeded
+  files are not rewritten because their values may have come from explicit
+  environment variables. To adopt the safer defaults explicitly, run:
+
+  ```bash
+  mnemosyne config set sync_roles user
+  mnemosyne config set skip_contexts cron,flush,subagent,background,skill_loop
+  ```
+
 ## [3.12.0] — 2026-07-11
 
 ### Added
