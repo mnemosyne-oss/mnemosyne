@@ -13,8 +13,10 @@ Ready-to-use deployment configs for running a Mnemosyne sync server on your own 
 ## Docker Compose (recommended for a VPS)
 
 ```bash
-# 1. Generate an API key and store it
-echo "MNEMOSYNE_SYNC_API_KEY=$(mnemosyne sync-generate-key)" > .env
+# 1. Generate a private API-key file and point Compose at it
+umask 077
+mnemosyne sync-generate-key > mnemosyne-sync-api.key
+printf 'MNEMOSYNE_SYNC_API_KEY_FILE=%s\n' "$PWD/mnemosyne-sync-api.key" > .env
 
 # 2. Edit Caddyfile - replace memory.example.com with your domain
 
@@ -31,8 +33,9 @@ Your sync endpoint is now `https://memory.example.com`. Caddy handles TLS automa
 From a client machine:
 
 ```bash
-export MNEMOSYNE_SYNC_API_KEY="<the key from .env>"
-mnemosyne sync --remote https://memory.example.com --encrypt
+mnemosyne sync --remote https://memory.example.com \
+  --api-key-file /path/to/mnemosyne-sync-api.key \
+  --encrypt-key-file /path/to/mnemosyne-sync-encryption.key
 ```
 
 ## Fly.io
@@ -49,8 +52,8 @@ Endpoint: `https://mnemosyne-sync.fly.dev`. Fly provides HTTPS via `force_https 
 ## Security checklist
 
 - [ ] **Always use TLS in production.** Both configs terminate HTTPS at the edge.
-- [ ] **Set a strong API key.** Use `mnemosyne sync-generate-key`, never a guessable string.
-- [ ] **Enable client-side encryption** (`--encrypt`) if you don't fully trust the host. With encryption, the server stores opaque ciphertext and cannot read your memory content.
+- [ ] **Set a strong API key.** Use `mnemosyne sync-generate-key`, keep it in a mode-`0600` file, and avoid command-line secret values.
+- [ ] **Enable client-side encryption** with `--encrypt-key-file` if you don't fully trust the host. With encryption, the server stores opaque ciphertext and cannot read your memory content.
 - [ ] **Back up your encryption key separately.** Losing it means losing access to encrypted memories.
 - [ ] **Restrict the volume.** The SQLite DB on the server holds whatever isn't client-side encrypted.
 

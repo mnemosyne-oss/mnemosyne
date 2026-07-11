@@ -1675,7 +1675,7 @@ class SyncEngine:
             present = {
                 key: value
                 for key, value in values.items()
-                if key in available and value is not None
+                if key in available
             }
             assignments = ", ".join(f"{key} = ?" for key in present)
             if self.surface_only:
@@ -2083,6 +2083,7 @@ class SyncEngine:
                 "batches": 0,
             }
             while True:
+                request_cursor = pull_cursor
                 response = _post(
                     "/sync/pull",
                     {
@@ -2119,11 +2120,19 @@ class SyncEngine:
                     if int(applied.get("errors", 0) or 0) > 0:
                         result["errors"].append("pull page failed validation; cursor not advanced")
                         break
+                has_more = bool(response.get("has_more"))
                 next_cursor = response.get("next_cursor")
+                if has_more and (
+                    not next_cursor or str(next_cursor) == str(request_cursor)
+                ):
+                    result["errors"].append(
+                        "remote reported has_more without advancing next_cursor"
+                    )
+                    break
                 if next_cursor:
                     pull_cursor = str(next_cursor)
                     self._meta_set(cursor_key, pull_cursor)
-                if not response.get("has_more"):
+                if not has_more:
                     break
                 if not events:
                     result["errors"].append("remote reported has_more without returning events")

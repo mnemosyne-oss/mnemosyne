@@ -265,6 +265,7 @@ def test_relay_rejects_plaintext_events_by_default(tmp_path):
         "operation": "CREATE",
         "timestamp": "2026-07-11T10:00:00+00:00",
         "device_id": "client",
+        "surface_id": "shared-surface-v1",
         "payload": json.dumps({"content": "must be rejected", "source": "test"}),
         "parent_event_ids": "[]",
         "importance": 0.5,
@@ -289,6 +290,10 @@ def test_relay_rejects_plaintext_events_by_default(tmp_path):
             result = json.loads(response.read())
         assert result["accepted"] == 0
         assert result["errors"] == 1
+        assert any(
+            word in result["details"][0].lower()
+            for word in ("plaintext", "encrypt")
+        )
         assert relay.beam.conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0] == 0
         assert relay.beam.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 0
     finally:
@@ -326,6 +331,37 @@ def test_authenticated_server_rejects_post_without_body_mac(tmp_path):
             urllib.request.urlopen(request, timeout=5)
         assert error.value.code == 401
         assert "body MAC" in json.loads(error.value.read())["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_api_key_auth_rejects_non_ascii_bearer_without_server_error(tmp_path):
+    import http.client
+
+    relay = Mnemosyne(db_path=tmp_path / "relay-non-ascii-auth.db")
+    server = run_sync_server(
+        host="127.0.0.1",
+        port=0,
+        beam_instance=relay,
+        api_key="relay-key",
+        daemon=True,
+        initialize_surface=True,
+    )
+
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request(
+            "GET",
+            "/sync/status",
+            headers={"Authorization": "Bearer café"},
+        )
+        response = connection.getresponse()
+        assert response.status == 401
+        assert "Invalid or missing API key" in response.read().decode()
+        connection.close()
     finally:
         server.shutdown()
         server.server_close()

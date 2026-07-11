@@ -212,6 +212,92 @@ def test_pull_only_discovers_local_mutation_before_conflict_resolution(memory, m
     assert memory.get(memory_id)["content"] == "local v2"
 
 
+def test_synced_update_preserves_explicit_null_optional_fields(memory, tmp_path):
+    source_memory = Mnemosyne(db_path=tmp_path / "nullable-source.db")
+    source = SyncEngine(source_memory, device_id="source")
+    receiver = SyncEngine(memory, device_id="receiver")
+    memory_id = "nullable-memory"
+
+    created = source.log_event(
+        memory_id,
+        "CREATE",
+        {
+            "content": "version one",
+            "source": "test",
+            "memory_type": "note",
+            "valid_until": "2030-01-01",
+        },
+    ).to_dict()
+    assert receiver.push_changes([created])["accepted"] == 1
+
+    updated = source.log_event(
+        memory_id,
+        "UPDATE",
+        {
+            "content": "version two",
+            "source": "test",
+            "memory_type": None,
+            "valid_until": None,
+        },
+    ).to_dict()
+    assert receiver.push_changes([updated])["accepted"] == 1
+
+    row = memory.beam.conn.execute(
+        "SELECT content, memory_type, valid_until FROM working_memory WHERE id = ?",
+        (memory_id,),
+    ).fetchone()
+    assert tuple(row) == ("version two", None, None)
+
+
+def test_pull_stops_when_remote_cursor_does_not_advance(memory, monkeypatch):
+    import urllib.request
+
+    calls = 0
+    remote_event = {
+        "event_id": "stagnant-cursor-event",
+        "memory_id": "stagnant-cursor-memory",
+        "operation": "CREATE",
+        "timestamp": "2026-07-11T10:00:00+00:00",
+        "device_id": "remote",
+        "payload": json.dumps({"content": "remote", "source": "sync"}),
+        "parent_event_ids": "[]",
+        "importance": 0.5,
+        "event_hash": None,
+    }
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return json.dumps(
+                {
+                    "events": [remote_event],
+                    "next_cursor": None,
+                    "has_more": True,
+                }
+            ).encode()
+
+    def fake_urlopen(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return FakeResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    engine = SyncEngine(memory, device_id="local", allow_unscoped_sync=True)
+
+    result = engine.sync_with("https://relay.invalid", mode="pull")
+
+    assert calls == 1
+    assert result["pull"]["accepted"] == 1
+    assert result["errors"] == [
+        "remote reported has_more without advancing next_cursor"
+    ]
+
+
 def test_duplicate_event_id_requires_exact_event_match(memory):
     source_memory = Mnemosyne(db_path=memory.beam.db_path.parent / "duplicate-source.db")
     source = SyncEngine(source_memory, device_id="source")

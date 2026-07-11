@@ -4,7 +4,7 @@
 # automatic HTTPS. Memory data persists in a named volume.
 #
 # Usage:
-#   1. Set MNEMOSYNE_SYNC_API_KEY in a .env file (or export it)
+#   1. Set MNEMOSYNE_SYNC_API_KEY_FILE in .env to a mode-0600 secret file
 #   2. Edit Caddyfile with your domain
 #   3. docker compose up -d
 #
@@ -20,18 +20,23 @@ services:
       - "8765"
     volumes:
       - mnemosyne-data:/data
+    secrets:
+      - mnemosyne-sync-api-key
+    tmpfs:
+      - /run/mnemosyne-sync:mode=0700
     environment:
       - MNEMOSYNE_DATA_DIR=/data
-      - MNEMOSYNE_SYNC_API_KEY=${MNEMOSYNE_SYNC_API_KEY:?set MNEMOSYNE_SYNC_API_KEY in .env}
     command: >
-      sh -c "pip install --quiet 'mnemosyne-memory[embeddings,sync]' &&
-             mnemosyne sync-serve
+      sh -ec "umask 077 &&
+              cat /run/secrets/mnemosyne-sync-api-key > /run/mnemosyne-sync/api.key &&
+              pip install --quiet 'mnemosyne-memory[embeddings,sync]' &&
+              exec mnemosyne sync-serve
                --host 0.0.0.0
                --port 8765
                --db-path /data/relay.db
                --initialize-surface
                --behind-tls-proxy
-               --api-key \"$$MNEMOSYNE_SYNC_API_KEY\""
+               --api-key-file /run/mnemosyne-sync/api.key"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=5)"]
       interval: 30s
@@ -57,3 +62,7 @@ volumes:
   mnemosyne-data:
   caddy-data:
   caddy-config:
+
+secrets:
+  mnemosyne-sync-api-key:
+    file: ${MNEMOSYNE_SYNC_API_KEY_FILE:?set MNEMOSYNE_SYNC_API_KEY_FILE in .env}

@@ -162,7 +162,9 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
             auth = self.headers.get("Authorization", "")
             if auth.startswith("Bearer "):
                 token = auth[7:]
-                if hmac.compare_digest(token, self.api_key):
+                if hmac.compare_digest(
+                    token.encode("utf-8"), self.api_key.encode("utf-8")
+                ):
                     return True
             self._send_error(401, "Invalid or missing API key")
             return False
