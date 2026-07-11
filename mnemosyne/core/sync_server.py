@@ -83,9 +83,11 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
             self._send_error(413, "Request body too large")
             return None
         if content_length == 0:
+            self._last_raw_body = b""
             return None
         try:
             raw = self.rfile.read(content_length)
+            self._last_raw_body = raw
             return json.loads(raw.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             self._body_error_sent = True
@@ -180,6 +182,25 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
 
         return True  # No auth configured
 
+    def _check_body_mac(self) -> bool:
+        """Authenticate the exact POST body with the bearer credential."""
+        if self.api_key is None and self.jwt_secret is None:
+            return True
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            self._send_error(401, "Missing Bearer token for body authentication")
+            return False
+        supplied = self.headers.get("X-Mnemosyne-Body-MAC", "")
+        expected = hmac.new(
+            auth[7:].encode("utf-8"),
+            getattr(self, "_last_raw_body", b""),
+            hashlib.sha256,
+        ).hexdigest()
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            self._send_error(401, "Invalid or missing request body MAC")
+            return False
+        return True
+
     # Browser access is intentionally disabled. Sync clients do not need CORS,
     # and enabling it broadens the bearer-token attack surface.
     def do_OPTIONS(self) -> None:
@@ -201,7 +222,7 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
         else:
             self._send_error(404, f"Not found: {self.path}")
 
-    # --- GET /sync/status ---
+    # --- GET /healthz or /sync/status ---
     def do_GET(self) -> None:
         parsed = self._parse_path(self.path)
         if parsed is None:
@@ -210,7 +231,9 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
 
         endpoint, _ = parsed
 
-        if endpoint == "/sync/status":
+        if endpoint == "/healthz":
+            self._send_json(200, {"status": "ok"})
+        elif endpoint == "/sync/status":
             self._handle_status()
         else:
             self._send_error(404, f"Not found: {self.path}")
@@ -240,6 +263,8 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
             return
         if body is None:
             body = {}
+        if not self._check_body_mac():
+            return
 
         since = body.get("since") or body.get("since_token")
         try:
@@ -276,14 +301,25 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
         if body is None:
             self._send_error(400, "Request body required")
             return
+        if not self._check_body_mac():
+            return
 
         events = body.get("events", [])
         if not isinstance(events, list):
             self._send_error(400, "'events' must be a list")
             return
 
+        authenticated_events = []
+        for event in events:
+            if not isinstance(event, dict):
+                self._send_error(400, "each event must be an object")
+                return
+            authenticated = dict(event)
+            authenticated["_transport_authenticated"] = True
+            authenticated_events.append(authenticated)
+
         try:
-            result = self.sync_engine.push_changes(events)
+            result = self.sync_engine.push_changes(authenticated_events)
             self._send_json(200, result)
         except Exception as e:
             logger.exception("Error in push_changes")
@@ -319,6 +355,7 @@ def run_sync_server(
     max_body_bytes: int = 10 * 1024 * 1024,
     require_encrypted_payloads: bool = True,
     initialize_surface: bool = False,
+    behind_tls_proxy: bool = False,
 ) -> HTTPServer:
     """Start a Mnemosyne sync HTTP server.
 
@@ -350,6 +387,8 @@ def run_sync_server(
         Reject plaintext sync events while relaying opaque ciphertext (default True).
     initialize_surface : bool
         Explicitly initialize a new dedicated relay DB marker (default False).
+    behind_tls_proxy : bool
+        Explicitly allow cleartext on a non-loopback bind only behind a trusted TLS proxy.
 
     Returns
     -------
@@ -365,6 +404,10 @@ def run_sync_server(
     loopback_hosts = {"127.0.0.1", "::1", "localhost"}
     if host not in loopback_hosts and not (api_key or jwt_secret):
         raise ValueError("authentication is required when binding beyond loopback")
+    if host not in loopback_hosts and not (tls_cert and tls_key) and not behind_tls_proxy:
+        raise ValueError(
+            "HTTPS is required beyond loopback unless behind_tls_proxy is explicitly enabled"
+        )
     if max_body_bytes <= 0:
         raise ValueError("max_body_bytes must be positive")
 
@@ -439,6 +482,11 @@ def main(args: Optional[list] = None) -> None:
         action="store_true",
         help="Explicitly initialize a new dedicated relay DB",
     )
+    parser.add_argument(
+        "--behind-tls-proxy",
+        action="store_true",
+        help="Allow non-loopback cleartext only behind a trusted TLS proxy",
+    )
     parser.add_argument("--device-id", help="Device identifier for this server")
     api_group = parser.add_mutually_exclusive_group()
     api_group.add_argument("--api-key", help="API key (visible in process arguments)")
@@ -484,6 +532,7 @@ def main(args: Optional[list] = None) -> None:
         tls_cert=parsed.tls_cert,
         tls_key=parsed.tls_key,
         initialize_surface=parsed.initialize_surface,
+        behind_tls_proxy=parsed.behind_tls_proxy,
     )
 
 

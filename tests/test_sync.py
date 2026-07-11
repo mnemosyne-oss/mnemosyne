@@ -353,7 +353,9 @@ def test_e2e_plaintext_sync():
     t.start()
     time.sleep(0.5)
 
-    local_engine = SyncEngine(local_mem, device_id="local-laptop")
+    local_engine = SyncEngine(
+        local_mem, device_id="local-laptop", allow_unscoped_sync=True
+    )
     local_mem.remember("E2E plaintext memory", source="conversation", importance=0.8)
 
     result = local_engine.sync_with(

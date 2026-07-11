@@ -27,7 +27,9 @@ def _event_ops(engine: SyncEngine):
 
 
 def test_discover_local_mutations_emits_create_update_delete(memory):
-    engine = SyncEngine(memory, device_id="device-a")
+    engine = SyncEngine(
+        memory, device_id="device-a", allow_unscoped_sync=True
+    )
     memory_id = memory.remember("version one", source="test", importance=0.7)
 
     first = engine.discover_local_mutations()
@@ -54,7 +56,9 @@ def test_discover_local_mutations_emits_create_update_delete(memory):
 
 
 def test_discovery_rolls_back_event_and_shadow_together(memory, monkeypatch):
-    engine = SyncEngine(memory, device_id="device-a")
+    engine = SyncEngine(
+        memory, device_id="device-a", allow_unscoped_sync=True
+    )
     memory.remember("atomic discovery", source="test")
 
     def fail_state(*_args, **_kwargs):
@@ -91,7 +95,9 @@ def test_discover_local_mutations_does_not_stop_at_5000(memory):
     )
     memory.beam.conn.commit()
 
-    engine = SyncEngine(memory, device_id="device-a")
+    engine = SyncEngine(
+        memory, device_id="device-a", allow_unscoped_sync=True
+    )
     result = engine.discover_local_mutations()
 
     assert result["created"] == 5001
@@ -99,7 +105,9 @@ def test_discover_local_mutations_does_not_stop_at_5000(memory):
 
 
 def test_pull_cursor_orders_events_with_identical_timestamps(memory):
-    engine = SyncEngine(memory, device_id="device-a")
+    engine = SyncEngine(
+        memory, device_id="device-a", allow_unscoped_sync=True
+    )
     first = engine.log_event("m1", "CREATE", {"content": "one"})
     second = engine.log_event("m2", "CREATE", {"content": "two"})
     shared_timestamp = "2026-07-11T10:00:00+00:00"
@@ -153,6 +161,55 @@ def test_incoming_older_event_does_not_overwrite_newer_local_state(memory):
         event["event_id"] for event in engine.pull_changes(limit=100)["events"]
     }
     assert older["event_id"] not in exported_ids
+
+
+def test_pull_only_discovers_local_mutation_before_conflict_resolution(memory, monkeypatch):
+    import urllib.request
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            return json.dumps(
+                {
+                    "events": [remote_event],
+                    "next_cursor": None,
+                    "has_more": False,
+                }
+            ).encode()
+
+    engine = SyncEngine(
+        memory,
+        device_id="local",
+        allow_unscoped_sync=True,
+    )
+    memory_id = memory.remember("local v1", source="test")
+    engine.discover_local_mutations()
+    assert memory.update(memory_id, content="local v2")
+    remote_event = {
+        "event_id": "remote-stale-pull",
+        "memory_id": memory_id,
+        "operation": "UPDATE",
+        "timestamp": "2000-01-01T00:00:00+00:00",
+        "device_id": "remote",
+        "payload": json.dumps({"content": "remote stale", "source": "sync"}),
+        "parent_event_ids": "[]",
+        "importance": 0.5,
+        "event_hash": None,
+    }
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda *_args, **_kwargs: FakeResponse()
+    )
+
+    result = engine.sync_with("https://relay.invalid", mode="pull")
+
+    assert not result["errors"]
+    assert result["pull"]["conflicts"] == 1
+    assert memory.get(memory_id)["content"] == "local v2"
 
 
 def test_duplicate_event_id_requires_exact_event_match(memory):
@@ -330,6 +387,7 @@ def test_blind_relay_never_materializes_encrypted_delete(tmp_path):
     encrypted_delete = sender.log_event(
         victim_id, "DELETE", {"deleted": True}
     ).to_dict()
+    encrypted_delete["_transport_authenticated"] = True
 
     result = relay.push_changes([encrypted_delete])
 
@@ -365,6 +423,7 @@ def test_blind_relay_accepts_encrypted_event_without_materializing(memory):
         "parent_event_ids": "[]",
         "importance": 0.9,
         "event_hash": "opaque-event-hash",
+        "_transport_authenticated": True,
     }
 
     result = engine.push_changes([event])
@@ -396,6 +455,7 @@ def test_blind_relay_rejects_malformed_encrypted_wire_payload(memory):
         "parent_event_ids": "[]",
         "importance": 0.5,
         "event_hash": "poison-hash",
+        "_transport_authenticated": True,
     }
 
     result = engine.push_changes([event])
@@ -404,6 +464,36 @@ def test_blind_relay_rejects_malformed_encrypted_wire_payload(memory):
     assert result["errors"] == 1
     assert engine.conn.execute(
         "SELECT COUNT(*) FROM memory_events WHERE event_id = 'poison-event'"
+    ).fetchone()[0] == 0
+
+
+def test_blind_relay_rejects_unauthenticated_structural_ciphertext(memory):
+    engine = SyncEngine(
+        memory,
+        device_id="relay",
+        require_encryption=True,
+        relay_mode=True,
+    )
+    event = {
+        "event_id": "unauthenticated-poison",
+        "memory_id": "poison-memory",
+        "operation": "CREATE",
+        "timestamp": "2026-07-11T10:00:00+00:00",
+        "device_id": "sender",
+        "payload": "mne1:" + base64.urlsafe_b64encode(b"x" * 64).decode("ascii"),
+        "parent_event_ids": "[]",
+        "importance": 0.5,
+        "event_hash": None,
+    }
+
+    result = engine.push_changes([event])
+
+    assert result["accepted"] == 0
+    assert result["errors"] == 1
+    assert "authenticated transport" in result["details"][0]
+    assert result["acknowledged_event_ids"] == []
+    assert engine.conn.execute(
+        "SELECT COUNT(*) FROM memory_events WHERE event_id = 'unauthenticated-poison'"
     ).fetchone()[0] == 0
 
 
@@ -505,6 +595,33 @@ def test_surface_initialization_rejects_existing_global_rows(tmp_path):
     assert marker is None
 
 
+def test_surface_event_payload_scrubs_private_metadata(tmp_path):
+    memory = Mnemosyne(db_path=tmp_path / "metadata-surface.db", session_id="surface")
+    engine = SyncEngine(
+        memory,
+        device_id="surface",
+        surface_only=True,
+        initialize_surface=True,
+    )
+    memory.remember(
+        "safe shared row",
+        source="test",
+        scope="global",
+        metadata={
+            "source_profile_session": "private-profile",
+            "nested": {"author_id": "private-author", "safe": "kept"},
+        },
+    )
+
+    event = engine.discover_local_mutations()["events"][0]
+    payload = json.loads(event["payload"])
+    metadata = json.loads(payload["metadata_json"])
+
+    assert "source_profile_session" not in metadata
+    assert "author_id" not in metadata["nested"]
+    assert metadata["nested"]["safe"] == "kept"
+
+
 def test_encrypted_metadata_tampering_is_rejected(memory):
     encryption = SyncEncryption.from_config(SyncEncryption.generate_key())
     assert encryption is not None
@@ -524,7 +641,9 @@ def test_encrypted_metadata_tampering_is_rejected(memory):
 
 
 def test_discovery_recovers_from_event_logged_before_shadow_state(memory):
-    engine = SyncEngine(memory, device_id="device-a")
+    engine = SyncEngine(
+        memory, device_id="device-a", allow_unscoped_sync=True
+    )
     memory_id = memory.remember("already logged", source="test")
     payload = engine._working_payload(memory_id)
     assert payload is not None
@@ -542,7 +661,9 @@ def test_discovery_recovers_from_event_logged_before_shadow_state(memory):
 
 
 def test_upgrade_bootstrap_emits_delete_for_legacy_logged_missing_row(memory):
-    engine = SyncEngine(memory, device_id="device-a")
+    engine = SyncEngine(
+        memory, device_id="device-a", allow_unscoped_sync=True
+    )
     memory_id = memory.remember("deleted before shadow migration", source="test")
     payload = engine._working_payload(memory_id)
     assert payload is not None
@@ -561,7 +682,9 @@ def test_upgrade_bootstrap_emits_delete_for_legacy_logged_missing_row(memory):
 
 
 def test_discovery_recovers_from_delete_event_logged_before_shadow_state(memory):
-    engine = SyncEngine(memory, device_id="device-a")
+    engine = SyncEngine(
+        memory, device_id="device-a", allow_unscoped_sync=True
+    )
     memory_id = memory.remember("delete crash", source="test")
     engine.discover_local_mutations()
     previous = engine.conn.execute(
@@ -580,7 +703,9 @@ def test_discovery_recovers_from_delete_event_logged_before_shadow_state(memory)
 
 
 def test_push_database_is_fail_closed_to_one_relay(memory):
-    engine = SyncEngine(memory, device_id="device-a")
+    engine = SyncEngine(
+        memory, device_id="device-a", allow_unscoped_sync=True
+    )
     engine._meta_set("configured_push_remote", "https://relay-a.example")
 
     result = engine.sync_with("https://relay-b.example", mode="push")
@@ -592,7 +717,9 @@ def test_push_database_is_fail_closed_to_one_relay(memory):
 
 
 def test_empty_outbox_is_pinned_to_first_push_relay(memory):
-    engine = SyncEngine(memory, device_id="device-a")
+    engine = SyncEngine(
+        memory, device_id="device-a", allow_unscoped_sync=True
+    )
 
     first = engine.sync_with("https://relay-a.example", mode="push")
     second = engine.sync_with("https://relay-b.example", mode="push")
@@ -606,7 +733,9 @@ def test_empty_outbox_is_pinned_to_first_push_relay(memory):
 
 
 def test_failed_push_keeps_local_event_in_outbox(memory):
-    engine = SyncEngine(memory, device_id="device-a")
+    engine = SyncEngine(
+        memory, device_id="device-a", allow_unscoped_sync=True
+    )
     memory.remember("must retry", source="test")
 
     result = engine.sync_with("http://127.0.0.1:1", mode="push")
@@ -640,7 +769,9 @@ def test_push_rejects_acknowledgements_outside_current_batch(memory, monkeypatch
             ).encode()
 
     monkeypatch.setattr(urllib.request, "urlopen", lambda *_args, **_kwargs: FakeResponse())
-    engine = SyncEngine(memory, device_id="device-a")
+    engine = SyncEngine(
+        memory, device_id="device-a", allow_unscoped_sync=True
+    )
     memory.remember("ack boundary", source="test")
 
     result = engine.sync_with("https://relay.invalid", mode="push")
@@ -685,7 +816,9 @@ def test_partial_ack_atomically_pins_first_relay(memory, monkeypatch):
         )
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    engine = SyncEngine(memory, device_id="device-a")
+    engine = SyncEngine(
+        memory, device_id="device-a", allow_unscoped_sync=True
+    )
     memory.remember("first", source="test")
     memory.remember("second", source="test")
 
@@ -876,6 +1009,9 @@ def test_sync_with_drains_more_than_5000_opaque_events(tmp_path):
         device_id="client-relay",
         require_encryption=True,
         relay_mode=True,
+        surface_only=True,
+        initialize_surface=True,
+        claim_surface_rows=False,
     )
 
     try:
