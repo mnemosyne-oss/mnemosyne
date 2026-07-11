@@ -1659,13 +1659,55 @@ _RECALL_SYNONYMS: Dict[str, tuple[str, ...]] = {
 }
 
 
+def _is_meaningful_recall_token(token: str) -> bool:
+    """Return whether a token is eligible for lexical recall matching."""
+    return len(token) >= 3 and token not in _FACT_MATCH_STOPWORDS and not token.isdigit()
+
+
 def _recall_tokens(text: str) -> List[str]:
     """Meaningful lexical tokens for precision gates and fallback scoring."""
     return [
         token
         for token in _RECALL_TOKEN_RE.findall(text.lower())
-        if len(token) >= 3 and token not in _FACT_MATCH_STOPWORDS and not token.isdigit()
+        if _is_meaningful_recall_token(token)
     ]
+
+
+def _hyphen_components(token: str) -> List[str]:
+    """Return unique hyphen components eligible for lexical recall matching."""
+    if "-" not in token:
+        return []
+    return list(dict.fromkeys(
+        part for part in token.split("-") if _is_meaningful_recall_token(part)
+    ))
+
+
+def _component_unit_weight(components: List[str]) -> int:
+    """Return the lexical-unit weight for a token's hyphen components."""
+    return len(components) if len(components) >= 2 else 1
+
+
+def _expand_hyphenated_tokens(tokens: List[str]) -> List[str]:
+    """Keep hyphenated tokens and add their meaningful components.
+
+    The full compound remains available for precise matches. Components make
+    differently-hyphenated forms such as ``orion-telemetrie`` and
+    ``orion-gateway ... telemetrie`` comparable at the lexical gate.
+    Other structured separators (paths, versions, identifiers) stay intact.
+    """
+    expanded: List[str] = []
+    seen: Set[str] = set()
+    for token in tokens:
+        # Preserve existing token semantics. Only newly exposed hyphen
+        # components need the same filtering as _recall_tokens.
+        if token not in seen:
+            seen.add(token)
+            expanded.append(token)
+        for candidate in _hyphen_components(token):
+            if candidate not in seen:
+                seen.add(candidate)
+                expanded.append(candidate)
+    return expanded
 
 
 def _expanded_query_tokens(tokens: List[str]) -> List[str]:
@@ -1676,7 +1718,7 @@ def _expanded_query_tokens(tokens: List[str]) -> List[str]:
     """
     expanded: List[str] = []
     seen: Set[str] = set()
-    for token in tokens:
+    for token in _expand_hyphenated_tokens(tokens):
         for candidate in (token, *_RECALL_SYNONYMS.get(token, ())):
             if candidate not in seen:
                 seen.add(candidate)
@@ -1776,6 +1818,13 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
     }
     if not query_tokens and not query_cjk:
         return 0.0
+    # Callers pass raw _recall_tokens() output. Count each compound's
+    # meaningful components as separate lexical units so they can match a
+    # differently-hyphenated fact without outweighing the rest of the query.
+    component_groups = [_hyphen_components(token) for token in query_tokens]
+    lexical_unit_count = sum(
+        _component_unit_weight(components) for components in component_groups
+    )
     content_tokens = set(_recall_tokens(content_lower))
     # Structured MEMORIA contexts often encode keys as snake_case
     # (telemetry_api_latency_ms). Split separators so natural-language
@@ -1784,17 +1833,32 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
     for token in list(content_tokens):
         expanded_content_tokens.update(
             part for part in re.split(r"[_:/.-]+", token)
-            if len(part) >= 3 and part not in _FACT_MATCH_STOPWORDS and not part.isdigit()
+            if _is_meaningful_recall_token(part)
         )
     content_tokens = expanded_content_tokens
     if not content_tokens and not query_cjk:
         return 0.0
 
-    exact = sum(1 for token in query_tokens if token in content_tokens)
+    exact = 0
     partial = 0.0
-    for token in query_tokens:
+    for token, components in zip(query_tokens, component_groups, strict=True):
         if token in content_tokens:
+            exact += _component_unit_weight(components)
             continue
+
+        component_hits = sum(part in content_tokens for part in components)
+        if len(components) >= 2 and component_hits >= 2:
+            # A differently-hyphenated fact must share at least two meaningful
+            # components. One generic component (e.g. "gateway") is not enough.
+            exact += component_hits
+            continue
+        if components:
+            # Reached when there are fewer than two meaningful components, or
+            # when fewer than two components match. Keep only an exact full
+            # token match; insufficient overlap must not gain synonym or
+            # substring fallback credit.
+            continue
+
         synonyms = _RECALL_SYNONYMS.get(token, ())
         if synonyms and any(syn in content_tokens for syn in synonyms):
             partial += 0.75
@@ -1807,7 +1871,7 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
             partial += 0.4
 
     full_match = 1.0 if query_lower and query_lower in content_lower else 0.0
-    score = (exact + partial + full_match) / max(len(query_tokens), 1)
+    score = (exact + partial + full_match) / max(lexical_unit_count, 1)
 
     if score == 0.0:
         query_cjk = {
