@@ -16,7 +16,6 @@ from pathlib import Path
 import pytest
 
 from mnemosyne.core.config import (
-    DEFAULTS,
     ENV_VAR_MAP,
     REQUIRES_RESTART,
     MnemosyneConfig,
@@ -309,16 +308,49 @@ class TestTemplateSpecific:
 # ---------------------------------------------------------------------------
 
 class TestConfigReader:
-    def test_auto_seed_defaults_preserve_provider_safety_boundaries(self):
-        """Auto-seeded config must not weaken Hermes provider defaults."""
-        assert DEFAULTS["sync_roles"] == "user"
-        assert set(DEFAULTS["skip_contexts"].split(",")) == {
-            "cron",
-            "flush",
-            "subagent",
-            "background",
-            "skill_loop",
-        }
+    def test_auto_seed_persists_provider_safety_defaults(self, tmp_path):
+        """The actual generated YAML must preserve provider boundaries."""
+        import yaml
+
+        config_path = tmp_path / "config.yaml"
+        MnemosyneConfig(config_path=config_path)
+        seeded = yaml.safe_load(config_path.read_text())
+        assert seeded["sync_roles"] == "user"
+        assert seeded["skip_contexts"] == (
+            "cron,flush,subagent,background,skill_loop"
+        )
+
+    def test_auto_seeded_legacy_provider_defaults_are_migrated(self, tmp_path):
+        """Published 3.12.1/3.12.2 seed values are repaired on restart."""
+        import yaml
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "# Mnemosyne config — edit freely\n"
+            "# Values below reflect your current env vars where set, otherwise defaults.\n"
+            "sync_roles: user,assistant\n"
+            "skip_contexts: ''\n"
+        )
+        MnemosyneConfig(config_path=config_path)
+        migrated = yaml.safe_load(config_path.read_text())
+        assert migrated["sync_roles"] == "user"
+        assert migrated["skip_contexts"] == (
+            "cron,flush,subagent,background,skill_loop"
+        )
+
+    def test_manual_legacy_values_are_preserved(self, tmp_path):
+        """A manually created config remains an explicit opt-in."""
+        import yaml
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "sync_roles: user,assistant\n"
+            "skip_contexts: ''\n"
+        )
+        MnemosyneConfig(config_path=config_path)
+        configured = yaml.safe_load(config_path.read_text())
+        assert configured["sync_roles"] == "user,assistant"
+        assert configured["skip_contexts"] == ""
 
     def test_env_var_fallback(self, temp_config, monkeypatch):
         """When no YAML, env var is used."""
