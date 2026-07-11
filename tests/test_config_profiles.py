@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from mnemosyne.core.config import (
+    DEFAULTS,
     ENV_VAR_MAP,
     REQUIRES_RESTART,
     MnemosyneConfig,
@@ -308,6 +309,17 @@ class TestTemplateSpecific:
 # ---------------------------------------------------------------------------
 
 class TestConfigReader:
+    def test_auto_seed_defaults_preserve_provider_safety_boundaries(self):
+        """Auto-seeded config must not weaken Hermes provider defaults."""
+        assert DEFAULTS["sync_roles"] == "user"
+        assert set(DEFAULTS["skip_contexts"].split(",")) == {
+            "cron",
+            "flush",
+            "subagent",
+            "background",
+            "skill_loop",
+        }
+
     def test_env_var_fallback(self, temp_config, monkeypatch):
         """When no YAML, env var is used."""
         monkeypatch.setenv("MNEMOSYNE_WM_MAX_ITEMS", "9999")
