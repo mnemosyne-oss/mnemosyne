@@ -15,12 +15,11 @@ import hmac
 import importlib
 import json
 import logging
-import os
 import sys
 import threading
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Any
 
 # Full-suite tests and embedded hosts can leave sys.modules["logging"] in a
 # partially shadowed state. Recover the stdlib module instead of failing at
@@ -43,6 +42,7 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
     sync_engine: Any = None
     api_key: Optional[str] = None
     jwt_secret: Optional[str] = None
+    max_body_bytes: int = 10 * 1024 * 1024
 
     # Silence default HTTP server logs (we use our own logger)
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -56,7 +56,6 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         if headers:
             for k, v in headers.items():
                 self.send_header(k, v)
@@ -67,17 +66,33 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
         self._send_json(status, {"error": message})
 
     def _read_body(self) -> Optional[dict]:
-        """Read and parse the request body as JSON."""
-        content_length = int(self.headers.get("Content-Length", 0))
+        """Read and parse a bounded request body as JSON."""
+        self._body_error_sent = False
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self._body_error_sent = True
+            self._send_error(400, "Invalid Content-Length")
+            return None
+        if content_length < 0:
+            self._body_error_sent = True
+            self._send_error(400, "Invalid Content-Length")
+            return None
+        if content_length > self.max_body_bytes:
+            self._body_error_sent = True
+            self._send_error(413, "Request body too large")
+            return None
         if content_length == 0:
             return None
         try:
             raw = self.rfile.read(content_length)
             return json.loads(raw.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            self._body_error_sent = True
             self._send_error(400, f"Invalid JSON body: {e}")
             return None
         except Exception as e:
+            self._body_error_sent = True
             self._send_error(400, f"Failed to read body: {e}")
             return None
 
@@ -145,7 +160,7 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
             auth = self.headers.get("Authorization", "")
             if auth.startswith("Bearer "):
                 token = auth[7:]
-                if token == self.api_key:
+                if hmac.compare_digest(token, self.api_key):
                     return True
             self._send_error(401, "Invalid or missing API key")
             return False
@@ -165,14 +180,10 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
 
         return True  # No auth configured
 
-    # --- CORS preflight ---
+    # Browser access is intentionally disabled. Sync clients do not need CORS,
+    # and enabling it broadens the bearer-token attack surface.
     def do_OPTIONS(self) -> None:
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        self.send_header("Access-Control-Max-Age", "86400")
-        self.end_headers()
+        self._send_error(405, "Method not allowed")
 
     # --- POST /sync/pull ---
     def do_POST(self) -> None:
@@ -225,15 +236,21 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
             return
 
         body = self._read_body()
+        if body is None and getattr(self, "_body_error_sent", False):
+            return
         if body is None:
             body = {}
 
-        since = body.get("since")
-        limit = body.get("limit", 1000)
+        since = body.get("since") or body.get("since_token")
+        try:
+            limit = int(body.get("limit", 1000))
+        except (TypeError, ValueError):
+            self._send_error(400, "'limit' must be an integer")
+            return
+        if not 1 <= limit <= 10000:
+            self._send_error(400, "'limit' must be between 1 and 10000")
+            return
         device_id = body.get("device_id")
-
-        if limit is not None:
-            limit = min(int(limit), 10000)
 
         try:
             result = self.sync_engine.pull_changes(
@@ -254,6 +271,8 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
             return
 
         body = self._read_body()
+        if body is None and getattr(self, "_body_error_sent", False):
+            return
         if body is None:
             self._send_error(400, "Request body required")
             return
@@ -265,7 +284,6 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
 
         try:
             result = self.sync_engine.push_changes(events)
-            result["next_cursor"] = datetime.now(timezone.utc).isoformat()
             self._send_json(200, result)
         except Exception as e:
             logger.exception("Error in push_changes")
@@ -298,6 +316,9 @@ def run_sync_server(
     tls_cert: Optional[str] = None,
     tls_key: Optional[str] = None,
     daemon: bool = False,
+    max_body_bytes: int = 10 * 1024 * 1024,
+    require_encrypted_payloads: bool = True,
+    initialize_surface: bool = False,
 ) -> HTTPServer:
     """Start a Mnemosyne sync HTTP server.
 
@@ -323,6 +344,12 @@ def run_sync_server(
         Path to TLS key file (for HTTPS).
     daemon : bool
         If True, start in a background thread. Default False (blocking).
+    max_body_bytes : int
+        Maximum accepted JSON request size (default 10 MiB).
+    require_encrypted_payloads : bool
+        Reject plaintext sync events while relaying opaque ciphertext (default True).
+    initialize_surface : bool
+        Explicitly initialize a new dedicated relay DB marker (default False).
 
     Returns
     -------
@@ -331,14 +358,36 @@ def run_sync_server(
     # Lazy import to avoid circular at import time
     from mnemosyne.core.sync import SyncEngine
 
-    engine = SyncEngine(beam_instance, device_id=device_id)
+    if beam_instance is None:
+        raise ValueError("beam_instance is required")
+    if bool(tls_cert) != bool(tls_key):
+        raise ValueError("tls_cert and tls_key must be configured together")
+    loopback_hosts = {"127.0.0.1", "::1", "localhost"}
+    if host not in loopback_hosts and not (api_key or jwt_secret):
+        raise ValueError("authentication is required when binding beyond loopback")
+    if max_body_bytes <= 0:
+        raise ValueError("max_body_bytes must be positive")
 
-    # Attach engine + auth to handler class
-    SyncHTTPHandler.sync_engine = engine
-    SyncHTTPHandler.api_key = api_key
-    SyncHTTPHandler.jwt_secret = jwt_secret
-
-    server = HTTPServer((host, port), SyncHTTPHandler)
+    engine = SyncEngine(
+        beam_instance,
+        device_id=device_id,
+        require_encryption=require_encrypted_payloads,
+        relay_mode=True,
+        surface_only=require_encrypted_payloads,
+        initialize_surface=initialize_surface,
+        claim_surface_rows=False,
+    )
+    handler_class = type(
+        "BoundSyncHTTPHandler",
+        (SyncHTTPHandler,),
+        {
+            "sync_engine": engine,
+            "api_key": api_key,
+            "jwt_secret": jwt_secret,
+            "max_body_bytes": int(max_body_bytes),
+        },
+    )
+    server = HTTPServer((host, port), handler_class)
 
     if tls_cert and tls_key:
         try:
@@ -382,15 +431,35 @@ def main(args: Optional[list] = None) -> None:
     parser = argparse.ArgumentParser(description="Mnemosyne Sync Server")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address")
     parser.add_argument("--port", type=int, default=8765, help="Bind port")
-    parser.add_argument("--db-path", help="Path to Mnemosyne SQLite database")
+    parser.add_argument(
+        "--db-path", required=True, help="Explicit relay SQLite database path"
+    )
+    parser.add_argument(
+        "--initialize-surface",
+        action="store_true",
+        help="Explicitly initialize a new dedicated relay DB",
+    )
     parser.add_argument("--device-id", help="Device identifier for this server")
-    parser.add_argument("--api-key", help="API key for bearer-token auth")
-    parser.add_argument("--jwt-secret", help="JWT secret for token auth")
+    api_group = parser.add_mutually_exclusive_group()
+    api_group.add_argument("--api-key", help="API key (visible in process arguments)")
+    api_group.add_argument("--api-key-file", help="Private file containing the API key")
+    jwt_group = parser.add_mutually_exclusive_group()
+    jwt_group.add_argument("--jwt-secret", help="JWT secret (visible in process arguments)")
+    jwt_group.add_argument("--jwt-secret-file", help="Private file containing the JWT secret")
     parser.add_argument("--tls-cert", help="TLS certificate file path")
     parser.add_argument("--tls-key", help="TLS key file path")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     parsed = parser.parse_args(args)
+
+    from mnemosyne.cli import _read_secret_file
+
+    api_key = parsed.api_key
+    if parsed.api_key_file:
+        api_key = _read_secret_file(parsed.api_key_file, "API key")
+    jwt_secret = parsed.jwt_secret
+    if parsed.jwt_secret_file:
+        jwt_secret = _read_secret_file(parsed.jwt_secret_file, "JWT secret")
 
     if parsed.debug:
         logging.basicConfig(level=logging.DEBUG)
@@ -410,10 +479,11 @@ def main(args: Optional[list] = None) -> None:
         port=parsed.port,
         beam_instance=beam_instance,
         device_id=parsed.device_id,
-        api_key=parsed.api_key,
-        jwt_secret=parsed.jwt_secret,
+        api_key=api_key,
+        jwt_secret=jwt_secret,
         tls_cert=parsed.tls_cert,
         tls_key=parsed.tls_key,
+        initialize_surface=parsed.initialize_surface,
     )
 
 

@@ -145,7 +145,7 @@ def cmd_recall(args):
         print(f"  Content: {content[:150]}{'...' if len(content) > 150 else ''}")
         print(f"  Score: {score:.3f}")
         if r.get("entity_match"):
-            print(f"  [entity match]")
+            print("  [entity match]")
         print()
 
 
@@ -212,7 +212,6 @@ def cmd_diagnose(args):
     fix_mode = "--fix" in args
     dry_run = "--dry-run" in args
     repair_vec_working = "--repair-vec-working" in args
-    clean_args = [a for a in args if not a.startswith("--")]
 
     try:
         from mnemosyne.diagnose import run_diagnostics, auto_fix
@@ -233,7 +232,6 @@ def cmd_diagnose(args):
             print("\n--- Auto-fix ---")
             fix_result = auto_fix(result.get("entries", []), dry_run=dry_run)
             if fix_result["fixed"]:
-                label = "Would fix" if dry_run else "Fixed"
                 for item in fix_result["fixed"]:
                     print(f"  ✅ {item}")
             if fix_result["failed"]:
@@ -358,29 +356,92 @@ def cmd_mcp(args):
         sys.exit(1)
 
 
+def _read_secret_file(path: str, label: str) -> str:
+    """Read a secret through one no-follow file descriptor."""
+    import stat
+    from pathlib import Path
+
+    secret_path = Path(path).expanduser()
+    flags = os.O_RDONLY
+    if os.name != "nt" and hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    elif secret_path.is_symlink():
+        raise ValueError(f"{label} file must not be a symlink: {secret_path}")
+    try:
+        fd = os.open(secret_path, flags)
+    except OSError as exc:
+        raise ValueError(f"cannot securely open {label} file: {secret_path}") from exc
+    try:
+        stat_result = os.fstat(fd)
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise ValueError(f"{label} path is not a regular file: {secret_path}")
+        if os.name != "nt" and stat_result.st_mode & 0o077:
+            raise PermissionError(
+                f"{label} file must not be accessible by group/others: {secret_path}"
+            )
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            value = handle.read().strip()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if not value:
+        raise ValueError(f"{label} file is empty: {secret_path}")
+    return value
+
+
 def cmd_sync(args):
     """Sync memories with a remote Mnemosyne instance."""
     import argparse
     parser = argparse.ArgumentParser(prog="mnemosyne sync")
     parser.add_argument("--remote", required=True, help="Remote sync server URL (e.g. http://192.168.1.50:8765)")
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Explicit SQLite DB to sync; use the dedicated shared-surface DB, not a private DB",
+    )
     parser.add_argument("--mode", choices=["push", "pull", "bidirectional"], default="bidirectional",
                         help="Sync direction (default: bidirectional)")
-    parser.add_argument("--encrypt", help="Encryption key (base64) or path to key file")
-    parser.add_argument("--api-key", help="API key for remote server auth")
-    parser.add_argument("--insecure", action="store_true", help="Skip TLS verification (not implemented in stdlib impl)")
+    encryption_group = parser.add_mutually_exclusive_group()
+    encryption_group.add_argument(
+        "--encrypt", help="Encryption key (visible in process arguments)"
+    )
+    encryption_group.add_argument(
+        "--encrypt-key-file", help="Private file containing the encryption key"
+    )
+    auth_group = parser.add_mutually_exclusive_group()
+    auth_group.add_argument("--api-key", help="API key (visible in process arguments)")
+    auth_group.add_argument("--api-key-file", help="Private file containing the API key")
     parser.add_argument("--interval", type=float, default=0, help="Sync interval in seconds (repeat mode)")
+    parser.add_argument(
+        "--initialize-surface",
+        action="store_true",
+        help="Explicitly mark/claim this dedicated DB as a shared surface on first run",
+    )
 
     # Parse known flags from args; remaining are for internal use
     parsed, _ = parser.parse_known_args(args)
 
-    mem = _get_memory()
+    from mnemosyne.core.memory import Mnemosyne
     from mnemosyne.core.sync import SyncEngine, SyncEncryption
 
-    encryption = None
-    if parsed.encrypt:
-        encryption = SyncEncryption.from_config(parsed.encrypt)
+    mem = Mnemosyne(db_path=parsed.db_path)
 
-    engine = SyncEngine(mem, encryption=encryption)
+    encryption_source = parsed.encrypt
+    if parsed.encrypt_key_file:
+        encryption_source = _read_secret_file(parsed.encrypt_key_file, "encryption key")
+    encryption = SyncEncryption.from_config(encryption_source) if encryption_source else None
+    api_key = parsed.api_key
+    if parsed.api_key_file:
+        api_key = _read_secret_file(parsed.api_key_file, "API key")
+
+    engine = SyncEngine(
+        mem,
+        encryption=encryption,
+        require_encryption=encryption_source is not None,
+        surface_only=True,
+        initialize_surface=parsed.initialize_surface,
+    )
 
     if parsed.interval > 0:
         # Repeating sync
@@ -394,7 +455,7 @@ def cmd_sync(args):
                 result = engine.sync_with(
                     remote_url=parsed.remote,
                     mode=parsed.mode,
-                    api_key=parsed.api_key,
+                    api_key=api_key,
                 )
                 _print_sync_result(result)
                 time.sleep(parsed.interval)
@@ -404,7 +465,7 @@ def cmd_sync(args):
         result = engine.sync_with(
             remote_url=parsed.remote,
             mode=parsed.mode,
-            api_key=parsed.api_key,
+            api_key=api_key,
         )
         _print_sync_result(result)
 
@@ -418,14 +479,14 @@ def _print_sync_result(result: dict) -> None:
 
     push = result.get("push")
     if push is not None:
-        print(f"  Push:")
+        print("  Push:")
         print(f"    Accepted:   {push.get('accepted', 0)}")
         print(f"    Duplicates: {push.get('duplicates', 0)}")
         print(f"    Conflicts:  {push.get('conflicts', 0)}")
 
     pull = result.get("pull")
     if pull is not None:
-        print(f"  Pull:")
+        print("  Pull:")
         print(f"    Events fetched: {pull.get('events_fetched', 0)}")
         print(f"    Accepted:       {pull.get('accepted', 0)}")
         print(f"    Duplicates:     {pull.get('duplicates', 0)}")
@@ -444,27 +505,54 @@ def cmd_sync_serve(args):
     parser = argparse.ArgumentParser(prog="mnemosyne sync-serve")
     parser.add_argument("--port", type=int, default=8765, help="Server port (default: 8765)")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
-    parser.add_argument("--api-key", help="API key for bearer-token auth")
-    parser.add_argument("--jwt-secret", help="JWT secret for token auth")
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Explicit relay SQLite DB path",
+    )
+    parser.add_argument(
+        "--initialize-surface",
+        action="store_true",
+        help="Explicitly initialize a new dedicated relay DB",
+    )
+    api_group = parser.add_mutually_exclusive_group()
+    api_group.add_argument(
+        "--api-key", help="API key for bearer-token auth (visible in process arguments)"
+    )
+    api_group.add_argument("--api-key-file", help="Private file containing the API key")
+    jwt_group = parser.add_mutually_exclusive_group()
+    jwt_group.add_argument("--jwt-secret", help="JWT secret (visible in process arguments)")
+    jwt_group.add_argument(
+        "--jwt-secret-file", help="Private file containing the JWT secret"
+    )
     parser.add_argument("--tls-cert", help="TLS certificate file path")
     parser.add_argument("--tls-key", help="TLS key file path")
     parser.add_argument("--device-id", help="Custom device identifier")
 
     parsed = parser.parse_args(args)
 
-    mem = _get_memory()
-    from mnemosyne.core.sync import SyncEngine as _SyncEngine
+    api_key = parsed.api_key
+    if parsed.api_key_file:
+        api_key = _read_secret_file(parsed.api_key_file, "API key")
+    jwt_secret = parsed.jwt_secret
+    if parsed.jwt_secret_file:
+        jwt_secret = _read_secret_file(parsed.jwt_secret_file, "JWT secret")
+
+    from mnemosyne.core.memory import Mnemosyne
     from mnemosyne.core.sync_server import run_sync_server as _run_server
+
+    mem = Mnemosyne(db_path=parsed.db_path)
 
     _run_server(
         host=parsed.host,
         port=parsed.port,
         beam_instance=mem,
         device_id=parsed.device_id,
-        api_key=parsed.api_key,
-        jwt_secret=parsed.jwt_secret,
+        api_key=api_key,
+        jwt_secret=jwt_secret,
         tls_cert=parsed.tls_cert,
         tls_key=parsed.tls_key,
+        initialize_surface=parsed.initialize_surface,
     )
 
 
@@ -472,19 +560,32 @@ def cmd_sync_status(args):
     """Show sync status and statistics."""
     import argparse
     parser = argparse.ArgumentParser(prog="mnemosyne sync-status")
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Explicit shared-surface SQLite DB path",
+    )
     parser.add_argument("--remote", help="Remote sync server URL to check")
-    parser.add_argument("--api-key", help="API key for remote server auth")
+    auth_group = parser.add_mutually_exclusive_group()
+    auth_group.add_argument("--api-key", help="API key (visible in process arguments)")
+    auth_group.add_argument("--api-key-file", help="Private file containing the API key")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
 
     parsed = parser.parse_args(args)
+    api_key = parsed.api_key
+    if parsed.api_key_file:
+        api_key = _read_secret_file(parsed.api_key_file, "API key")
 
-    mem = _get_memory()
+    from mnemosyne.core.memory import Mnemosyne
     from mnemosyne.core.sync import SyncEngine
 
-    engine = SyncEngine(mem)
+    mem = Mnemosyne(db_path=parsed.db_path)
+    engine = SyncEngine(mem, surface_only=True, claim_surface_rows=False)
 
-    # Log a heartbeat event so we have data to show
-    status = engine.get_status(remote_url=parsed.remote if parsed.remote else None)
+    status = engine.get_status(
+        remote_url=parsed.remote if parsed.remote else None,
+        api_key=api_key,
+    )
 
     if parsed.json:
         print(json.dumps(status, indent=2, default=str))
@@ -503,7 +604,7 @@ def cmd_sync_status(args):
 
     op_breakdown = status.get("operation_breakdown", {})
     if op_breakdown:
-        print(f"\n  Operations breakdown:")
+        print("\n  Operations breakdown:")
         for op, cnt in sorted(op_breakdown.items(), key=lambda x: -x[1]):
             print(f"    {op}: {cnt}")
 
@@ -521,7 +622,7 @@ def cmd_sync_status(args):
                 print(f"  Remote events:    {pull_info.get('events_fetched', 'N/A')}")
             errors = remote_st.get("errors", [])
             if errors:
-                print(f"  Remote errors:")
+                print("  Remote errors:")
                 for err in errors:
                     print(f"    - {err}")
 
@@ -531,7 +632,7 @@ def cmd_sync_generate_key(args):
     from mnemosyne.core.sync import SyncEncryption as _Enc
     key = _Enc.generate_key()
     print(key)
-    print(f"\nStore this key securely. It is the only way to decrypt synced payloads.", file=sys.stderr)
+    print("\nStore this key securely. It is the only way to decrypt synced payloads.", file=sys.stderr)
 
 
 def cmd_backup(args):

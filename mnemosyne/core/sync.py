@@ -10,17 +10,31 @@ Mnemosyne's BEAM architecture.
 
 import json
 import hashlib
+import ipaddress
 import logging
 import sys
 import uuid
 import os
 import base64
+import binascii
 import threading
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
-from typing import List, Dict, Optional, Any, Tuple, Union
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Optional, Any, Tuple
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+_ENCRYPTED_WIRE_PREFIX = "mne1:"
+_SYNC_PAYLOAD_FIELDS = (
+    "content",
+    "source",
+    "importance",
+    "metadata_json",
+    "memory_type",
+    "veracity",
+    "valid_until",
+)
 
 
 def _parse_sync_timestamp(value: str) -> datetime:
@@ -32,7 +46,45 @@ def _parse_sync_timestamp(value: str) -> datetime:
     """
     if isinstance(value, str) and value.endswith("Z"):
         value = value[:-1] + "+00:00"
-    return datetime.fromisoformat(value)
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _encode_cursor(timestamp: str, event_id: str) -> str:
+    """Return an opaque cursor that cannot skip equal-timestamp events."""
+    return json.dumps(
+        {"timestamp": timestamp, "event_id": event_id},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _decode_cursor(value: Optional[str]) -> Tuple[Optional[str], str]:
+    """Decode a v2 cursor while accepting legacy timestamp-only cursors."""
+    if not value:
+        return None, ""
+    try:
+        decoded = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return str(value), ""
+    if isinstance(decoded, dict) and decoded.get("timestamp"):
+        return str(decoded["timestamp"]), str(decoded.get("event_id") or "")
+    return str(value), ""
+
+
+def _event_sort_key(event: "SyncEvent") -> Tuple[datetime, str, str]:
+    """Deterministic total order used for last-writer-wins resolution."""
+    try:
+        timestamp = _parse_sync_timestamp(event.timestamp)
+    except (TypeError, ValueError):
+        timestamp = datetime.min.replace(tzinfo=timezone.utc)
+    return (
+        timestamp,
+        event.device_id or "",
+        event.event_id or "",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +104,7 @@ class SyncEvent:
     importance: float = 0.5
     expiry: Optional[str] = None
     event_hash: Optional[str] = None
+    surface_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -79,6 +132,7 @@ class SyncEvent:
             importance=row.get("importance", 0.5),
             expiry=row.get("expiry"),
             event_hash=row.get("event_hash"),
+            surface_id=row.get("surface_id"),
         )
 
 
@@ -101,7 +155,6 @@ class SyncEncryption:
         Returns (key, salt) — salt is random if not provided, so
         callers should store it alongside the ciphertext.
         """
-        import hashlib as _hlib
 
         if salt is None:
             salt = os.urandom(16)
@@ -159,7 +212,6 @@ class SyncEncryption:
 
         try:
             import nacl.secret as _secret
-            import nacl.utils as _utils
             box = _secret.SecretBox(key)
             data = json.dumps(payload, default=str).encode("utf-8")
             encrypted = box.encrypt(data)
@@ -216,8 +268,8 @@ class SyncEncryption:
                         key = base64.urlsafe_b64decode(key_source + "==")
                     except Exception:
                         raise ValueError(
-                            f"key_source is neither a file path nor a valid "
-                            f"base64-encoded key"
+                            "key_source is neither a file path nor a valid "
+                            "base64-encoded key"
                         )
         elif "MNEMOSYNE_SYNC_KEY" in os.environ:
             raw = os.environ["MNEMOSYNE_SYNC_KEY"].strip()
@@ -355,8 +407,6 @@ class ConflictResolution:
 
         # Phase 1 — build a "descendants" lookup: for each event,
         # collect all events that transitively descend from it.
-        event_ids = {ev.event_id for ev in events}
-
         # Compute transitive ancestors for each event (BFS / fixed-point)
         ancestors: Dict[str, set] = {}
         for ev in events:
@@ -591,6 +641,14 @@ class SyncEngine:
         beam_instance,
         device_id: Optional[str] = None,
         encryption: Optional[SyncEncryption] = None,
+        require_encryption: Optional[bool] = None,
+        relay_mode: bool = False,
+        surface_only: bool = False,
+        surface_id: str = "shared-surface-v1",
+        initialize_surface: bool = False,
+        claim_surface_rows: bool = True,
+        max_future_skew_seconds: int = 300,
+        max_response_bytes: int = 10 * 1024 * 1024,
     ):
         # Accept either a Mnemosyne or a BeamMemory instance.
         # Store both the outer (Mnemosyne) and inner (BeamMemory) so
@@ -605,7 +663,26 @@ class SyncEngine:
             pass
 
         self.conn = self._beam.conn
+        self.surface_only = bool(surface_only)
+        self.surface_id = str(surface_id).strip() if self.surface_only else None
+        self.initialize_surface = bool(initialize_surface)
+        self.claim_surface_rows = bool(claim_surface_rows)
+        if self.surface_only and not self.surface_id:
+            raise ValueError("surface_id is required in surface-only mode")
+        self.surface_session_id = getattr(self._beam, "session_id", None) or "sync"
         self.encryption = encryption
+        self.relay_mode = bool(relay_mode)
+        self.require_encryption = (
+            encryption is not None if require_encryption is None else bool(require_encryption)
+        )
+        if self.require_encryption and encryption is None and not self.relay_mode:
+            raise ValueError("encryption is required but no encryption key is configured")
+        if max_future_skew_seconds < 0:
+            raise ValueError("max_future_skew_seconds must be non-negative")
+        self.max_future_skew_seconds = int(max_future_skew_seconds)
+        if max_response_bytes <= 0:
+            raise ValueError("max_response_bytes must be positive")
+        self.max_response_bytes = int(max_response_bytes)
 
         # Lazy import DeltaSync (avoid circular at module level)
         # DeltaSync requires a full Mnemosyne instance; if we only have
@@ -623,7 +700,28 @@ class SyncEngine:
 
         self._lock = threading.Lock()
 
+        if self.surface_only and not self.initialize_surface:
+            meta_exists = self.conn.execute(
+                """SELECT 1 FROM sqlite_master
+                   WHERE type = 'table' AND name = 'sync_meta'"""
+            ).fetchone()
+            if meta_exists is None:
+                raise ValueError(
+                    "surface DB is not initialized; use explicit surface initialization"
+                )
+            marker = self.conn.execute(
+                "SELECT value FROM sync_meta WHERE key = 'surface_db_id'"
+            ).fetchone()
+            if marker is None or marker[0] != self.surface_id:
+                raise ValueError("surface DB marker is missing or does not match")
+
         self._init_events_table()
+        if self.surface_only:
+            try:
+                self._init_surface_namespace()
+            except Exception:
+                self.conn.rollback()
+                raise
 
         # Device identity: explicit arg wins, then load from DB, then generate
         # new. Persisted in sync_meta so `mnemosyne sync-status` reports a
@@ -638,6 +736,157 @@ class SyncEngine:
                 self.device_id = f"device-{uuid.uuid4().hex[:8]}"
                 self._meta_set("device_id", self.device_id)
 
+        if self.surface_only:
+            legacy_count = self.conn.execute(
+                "SELECT COUNT(*) FROM memory_events WHERE surface_id IS NULL"
+            ).fetchone()[0]
+            if legacy_count:
+                raise ValueError(
+                    "surface-only sync found legacy unscoped events; migrate them explicitly"
+                )
+            foreign_count = self.conn.execute(
+                "SELECT COUNT(*) FROM memory_events WHERE surface_id != ?",
+                (self.surface_id,),
+            ).fetchone()[0]
+            if foreign_count:
+                raise ValueError("surface-only sync requires a dedicated single-surface event log")
+        if self.encryption is not None and self.require_encryption:
+            self._migrate_legacy_encrypted_payloads()
+        elif self.relay_mode and self.require_encryption:
+            self._validate_relay_wire_payloads()
+
+    def _init_surface_namespace(self) -> None:
+        """Validate or explicitly initialize a durable shared-surface marker."""
+        marker = self._meta_get("surface_db_id")
+        initializing = marker is None
+        if initializing:
+            if not self.initialize_surface:
+                raise ValueError(
+                    "surface DB is not initialized; use explicit surface initialization"
+                )
+            existing_rows = self.conn.execute(
+                "SELECT COUNT(*) FROM working_memory"
+            ).fetchone()[0]
+            if existing_rows:
+                raise ValueError(
+                    "first-time surface initialization requires an empty working_memory table"
+                )
+        elif marker != self.surface_id:
+            raise ValueError("surface DB marker does not match configured surface_id")
+
+        columns = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(working_memory)").fetchall()
+        }
+        if "sync_surface_id" not in columns:
+            if not self.initialize_surface:
+                raise ValueError("surface DB schema has no durable row marker")
+            self.conn.execute(
+                "ALTER TABLE working_memory ADD COLUMN sync_surface_id TEXT"
+            )
+        if initializing:
+            self.conn.execute(
+                "INSERT INTO sync_meta (key, value) VALUES ('surface_db_id', ?)",
+                (self.surface_id,),
+            )
+        if self.claim_surface_rows:
+            self._claim_current_surface_rows()
+        self._validate_surface_ownership()
+        self.conn.commit()
+
+    def _claim_current_surface_rows(self) -> None:
+        """Claim new global rows written by the configured shared-surface Beam."""
+        self.conn.execute(
+            """UPDATE working_memory SET sync_surface_id = ?
+               WHERE sync_surface_id IS NULL AND scope = 'global' AND session_id = ?""",
+            (self.surface_id, self.surface_session_id),
+        )
+
+    def _validate_surface_ownership(self) -> None:
+        """Require a physically dedicated working-memory surface."""
+        unowned = self.conn.execute(
+            """SELECT COUNT(*) FROM working_memory
+               WHERE sync_surface_id IS NULL OR sync_surface_id != ?""",
+            (self.surface_id,),
+        ).fetchone()[0]
+        if unowned:
+            raise ValueError(
+                "surface-only sync requires a dedicated DB with no unowned working rows"
+            )
+
+    def _migrate_legacy_encrypted_payloads(self) -> None:
+        """Rewrap pre-mne1 events into the authenticated encrypted wire format."""
+        if self.surface_only:
+            rows = self.conn.execute(
+                "SELECT * FROM memory_events WHERE payload IS NOT NULL AND surface_id = ?",
+                (self.surface_id,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM memory_events WHERE payload IS NOT NULL"
+            ).fetchall()
+        changed = False
+        try:
+            for row in rows:
+                event = SyncEvent.from_row(dict(row))
+                if self._payload_looks_encrypted(event.payload):
+                    self._validate_encrypted_wire_payload(event.payload)
+                    self._decode_payload(event)
+                    continue
+                try:
+                    payload = json.loads(event.payload)
+                except (TypeError, json.JSONDecodeError):
+                    payload = self.encryption.decrypt(event.payload)
+                if not isinstance(payload, dict):
+                    raise ValueError(
+                        f"legacy event {event.event_id} payload is not an object"
+                    )
+                envelope = {
+                    "_sync": {
+                        "version": 1,
+                        "event_id": event.event_id,
+                        "memory_id": event.memory_id,
+                        "operation": event.operation,
+                        "timestamp": event.timestamp,
+                        "device_id": event.device_id,
+                        "surface_id": event.surface_id,
+                        "parent_event_ids": event.parent_event_ids,
+                        "importance": event.importance,
+                    },
+                    "payload": payload,
+                }
+                event.payload = _ENCRYPTED_WIRE_PREFIX + self.encryption.encrypt(envelope)
+                event.event_hash = self._compute_event_hash(event)
+                self.conn.execute(
+                    "UPDATE memory_events SET payload = ?, event_hash = ? WHERE event_id = ?",
+                    (event.payload, event.event_hash, event.event_id),
+                )
+                changed = True
+            if changed:
+                self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def _validate_relay_wire_payloads(self) -> None:
+        """Refuse startup when a blind relay contains legacy/plaintext events."""
+        if self.surface_only:
+            rows = self.conn.execute(
+                """SELECT event_id, payload FROM memory_events
+                   WHERE payload IS NOT NULL AND surface_id = ?""",
+                (self.surface_id,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT event_id, payload FROM memory_events WHERE payload IS NOT NULL"
+            ).fetchall()
+        for row in rows:
+            try:
+                self._validate_encrypted_wire_payload(row["payload"])
+            except ValueError as exc:
+                raise ValueError(
+                    f"relay event {row['event_id']} requires offline encrypted migration"
+                ) from exc
+
     def _init_events_table(self) -> None:
         """Safely ensure the memory_events and sync_meta tables exist."""
         cursor = self.conn.cursor()
@@ -647,15 +896,44 @@ class SyncEngine:
                 memory_id TEXT NOT NULL,
                 operation TEXT NOT NULL CHECK(operation IN ('CREATE','UPDATE','DELETE','CONSOLIDATE')),
                 timestamp TEXT NOT NULL,
+                timestamp_epoch REAL,
                 device_id TEXT NOT NULL,
+                surface_id TEXT,
                 payload TEXT,
                 parent_event_ids TEXT DEFAULT '[]',
                 importance REAL DEFAULT 0.5,
                 expiry TEXT,
                 event_hash TEXT,
-                synced_at TEXT
+                synced_at TEXT,
+                apply_state TEXT NOT NULL DEFAULT 'applied'
             )
         """)
+        event_columns = {
+            row[1] for row in cursor.execute("PRAGMA table_info(memory_events)").fetchall()
+        }
+        if "timestamp_epoch" not in event_columns:
+            cursor.execute("ALTER TABLE memory_events ADD COLUMN timestamp_epoch REAL")
+        if "surface_id" not in event_columns:
+            cursor.execute("ALTER TABLE memory_events ADD COLUMN surface_id TEXT")
+        if "apply_state" not in event_columns:
+            cursor.execute(
+                "ALTER TABLE memory_events ADD COLUMN apply_state "
+                "TEXT NOT NULL DEFAULT 'applied'"
+            )
+        rows_without_epoch = cursor.execute(
+            "SELECT event_id, timestamp FROM memory_events WHERE timestamp_epoch IS NULL"
+        ).fetchall()
+        for row in rows_without_epoch:
+            try:
+                epoch = _parse_sync_timestamp(row["timestamp"]).timestamp()
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"invalid stored sync timestamp for event {row['event_id']}"
+                ) from exc
+            cursor.execute(
+                "UPDATE memory_events SET timestamp_epoch = ? WHERE event_id = ?",
+                (epoch, row["event_id"]),
+            )
         # Persist device identity and sync state across engine restarts
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS sync_meta (
@@ -663,10 +941,28 @@ class SyncEngine:
                 value TEXT
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sync_outbox_ack (
+                remote_url TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                acked_at TEXT NOT NULL,
+                PRIMARY KEY (remote_url, event_id)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sync_memory_state (
+                memory_id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL DEFAULT '',
+                last_operation TEXT NOT NULL DEFAULT 'CREATE',
+                event_id TEXT,
+                timestamp TEXT NOT NULL
+            )
+        """)
         # Indices (IF NOT EXISTS is not supported for indices in all
         # SQLite versions, so we try/except)
         for index_ddl in [
             "CREATE INDEX IF NOT EXISTS idx_me_timestamp ON memory_events(timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_me_epoch_event ON memory_events(timestamp_epoch, event_id)",
             "CREATE INDEX IF NOT EXISTS idx_me_memory_id ON memory_events(memory_id)",
             "CREATE INDEX IF NOT EXISTS idx_me_device_id ON memory_events(device_id)",
         ]:
@@ -706,6 +1002,7 @@ class SyncEngine:
         payload: Optional[dict] = None,
         importance: float = 0.5,
         parent_event_ids: Optional[List[str]] = None,
+        commit: bool = True,
     ) -> SyncEvent:
         """Create and persist a sync event.
 
@@ -717,15 +1014,6 @@ class SyncEngine:
 
         event_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
-
-        # Serialize payload if present
-        payload_str: Optional[str] = None
-        if payload is not None:
-            if self.encryption:
-                payload_str = self.encryption.encrypt(payload)
-            else:
-                payload_str = json.dumps(payload, default=str)
-
         parent_ids_json = json.dumps(parent_event_ids or [])
 
         event = SyncEvent(
@@ -734,24 +1022,46 @@ class SyncEngine:
             operation=operation,
             timestamp=now,
             device_id=self.device_id,
-            payload=payload_str,
+            surface_id=self.surface_id,
+            payload=None,
             parent_event_ids=parent_ids_json,
             importance=importance,
         )
+        if payload is not None:
+            if self.encryption:
+                envelope = {
+                    "_sync": {
+                        "version": 1,
+                        "event_id": event.event_id,
+                        "memory_id": event.memory_id,
+                        "operation": event.operation,
+                        "timestamp": event.timestamp,
+                        "device_id": event.device_id,
+                        "surface_id": event.surface_id,
+                        "parent_event_ids": event.parent_event_ids,
+                        "importance": event.importance,
+                    },
+                    "payload": payload,
+                }
+                event.payload = _ENCRYPTED_WIRE_PREFIX + self.encryption.encrypt(envelope)
+            else:
+                event.payload = json.dumps(payload, default=str)
         event.event_hash = self._compute_event_hash(event)
 
         cursor = self.conn.cursor()
         cursor.execute(
             """INSERT INTO memory_events (
-                event_id, memory_id, operation, timestamp, device_id,
-                payload, parent_event_ids, importance, expiry, event_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                event_id, memory_id, operation, timestamp, timestamp_epoch, device_id,
+                surface_id, payload, parent_event_ids, importance, expiry, event_hash, apply_state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'applied')""",
             (
                 event.event_id,
                 event.memory_id,
                 event.operation,
                 event.timestamp,
+                _parse_sync_timestamp(event.timestamp).timestamp(),
                 event.device_id,
+                event.surface_id,
                 event.payload,
                 event.parent_event_ids,
                 event.importance,
@@ -759,65 +1069,269 @@ class SyncEngine:
                 event.event_hash,
             ),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
         logger.debug(
             "Logged sync event %s: %s %s", event_id, operation, memory_id
         )
         return event
 
-    def _find_unlogged_memories(self, limit: int = 5000) -> List[dict]:
-        """Scan working_memory for entries not yet logged as sync events.
+    @staticmethod
+    def _canonical_payload(payload: Dict[str, Any]) -> str:
+        """Canonical JSON used to detect semantic row changes."""
+        normalized = {
+            key: payload[key] for key in _SYNC_PAYLOAD_FIELDS if key in payload
+        }
+        metadata = normalized.get("metadata_json")
+        if isinstance(metadata, str):
+            try:
+                normalized["metadata_json"] = json.loads(metadata)
+            except json.JSONDecodeError:
+                pass
+        return json.dumps(normalized, sort_keys=True, separators=(",", ":"), default=str)
 
-        Creates events for unlogged memories so they can be synced to peers.
-        Returns the events created.
-        """
-        cursor = self.conn.cursor()
-        # Find memory IDs already in the event log
-        cursor.execute("SELECT DISTINCT memory_id FROM memory_events")
-        logged_ids = {row[0] for row in cursor.fetchall()}
+    @classmethod
+    def _payload_fingerprint(cls, payload: Dict[str, Any]) -> str:
+        return hashlib.sha256(cls._canonical_payload(payload).encode("utf-8")).hexdigest()
 
-        cursor.execute(
-            """SELECT id, content, source, timestamp, importance, metadata_json, memory_type, veracity
-               FROM main.working_memory
-               ORDER BY timestamp ASC
-               LIMIT ?""",
-            (limit,),
+    def _working_columns(self) -> List[str]:
+        cached = getattr(self, "_sync_working_columns", None)
+        if cached is not None:
+            return cached
+        available = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(working_memory)").fetchall()
+        }
+        wanted = ["id", *_SYNC_PAYLOAD_FIELDS]
+        columns = [column for column in wanted if column in available]
+        if "id" not in columns or "content" not in columns:
+            raise RuntimeError("working_memory schema is missing id/content")
+        self._sync_working_columns = columns
+        return columns
+
+    @staticmethod
+    def _row_to_payload(row: Any) -> Tuple[str, Dict[str, Any]]:
+        values = dict(row)
+        memory_id = str(values.pop("id"))
+        return memory_id, values
+
+    def _working_payloads(self) -> Dict[str, Dict[str, Any]]:
+        """Read every working-memory row without a fixed bootstrap cap."""
+        columns = self._working_columns()
+        if self.surface_only:
+            rows = self.conn.execute(
+                f"""SELECT {', '.join(columns)} FROM main.working_memory
+                    WHERE sync_surface_id = ? ORDER BY id""",
+                (self.surface_id,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                f"SELECT {', '.join(columns)} FROM main.working_memory ORDER BY id"
+            ).fetchall()
+        return dict(self._row_to_payload(row) for row in rows)
+
+    def _working_payload(self, memory_id: str) -> Optional[Dict[str, Any]]:
+        columns = self._working_columns()
+        if self.surface_only:
+            row = self.conn.execute(
+                f"""SELECT {', '.join(columns)} FROM main.working_memory
+                    WHERE id = ? AND sync_surface_id = ?""",
+                (memory_id, self.surface_id),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                f"SELECT {', '.join(columns)} FROM main.working_memory WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
+        return self._row_to_payload(row)[1] if row else None
+
+    def _state_set(
+        self,
+        memory_id: str,
+        fingerprint: str,
+        operation: str,
+        event_id: Optional[str],
+        timestamp: Optional[str] = None,
+    ) -> None:
+        self.conn.execute(
+            """INSERT OR REPLACE INTO sync_memory_state
+               (memory_id, fingerprint, last_operation, event_id, timestamp)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                memory_id,
+                fingerprint,
+                operation,
+                event_id,
+                timestamp or datetime.now(timezone.utc).isoformat(),
+            ),
         )
-        rows = cursor.fetchall()
-        created = []
-        for row in rows:
-            mem_id = row["id"] if isinstance(row, dict) else row[0]
-            if mem_id in logged_ids:
+
+    def discover_local_mutations(self) -> Dict[str, Any]:
+        """Discover mutations in one transaction, rolling back on any failure."""
+        try:
+            if self.conn.in_transaction:
+                raise RuntimeError("mutation discovery requires a clean SQLite transaction")
+            self.conn.execute("BEGIN IMMEDIATE")
+            stats = self._discover_local_mutations()
+            self.conn.commit()
+            return stats
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def _discover_local_mutations(self) -> Dict[str, Any]:
+        """Snapshot working memory and emit CREATE/UPDATE/DELETE events.
+
+        All writers (Hermes, Codex MCP, CLI, direct Beam calls) converge through
+        the SQLite table, so snapshot comparison is more reliable than requiring
+        every caller to install a mutation hook. State is updated when an event
+        is durably logged; failed network pushes leave that event in the outbox.
+        """
+        if self.surface_only:
+            self._claim_current_surface_rows()
+            self._validate_surface_ownership()
+        current = self._working_payloads()
+        state_rows = self.conn.execute(
+            "SELECT memory_id, fingerprint, last_operation, event_id FROM sync_memory_state"
+        ).fetchall()
+        state = {row["memory_id"]: dict(row) for row in state_rows}
+        stats: Dict[str, Any] = {
+            "created": 0,
+            "updated": 0,
+            "deleted": 0,
+            "events": [],
+        }
+
+        # Upgrade/bootstrap recovery: the legacy event log may contain the last
+        # known row while sync_memory_state is still empty. Seed that shadow, or
+        # emit the missing tombstone when the row was deleted before upgrade.
+        latest_applied: Dict[str, SyncEvent] = {}
+        if self.surface_only:
+            applied_rows = self.conn.execute(
+                """SELECT * FROM memory_events
+                   WHERE apply_state = 'applied' AND surface_id = ?""",
+                (self.surface_id,),
+            ).fetchall()
+        else:
+            applied_rows = self.conn.execute(
+                "SELECT * FROM memory_events WHERE apply_state = 'applied'"
+            ).fetchall()
+        for row in applied_rows:
+            candidate = SyncEvent.from_row(dict(row))
+            previous_event = latest_applied.get(candidate.memory_id)
+            if previous_event is None or _event_sort_key(candidate) > _event_sort_key(previous_event):
+                latest_applied[candidate.memory_id] = candidate
+        for memory_id, latest_event in latest_applied.items():
+            if memory_id in state or memory_id in current:
                 continue
-            if isinstance(row, dict):
-                content = row.get("content", "")
-                source = row.get("source", "conversation")
-                timestamp = row.get("timestamp", "")
-                importance = row.get("importance", 0.5)
-                metadata_json = row.get("metadata_json")
-            else:
-                content = row[1] or ""
-                source = row[2] or "conversation"
-                timestamp = row[3] or ""
-                importance = row[4] if row[4] is not None else 0.5
-                metadata_json = row[6] if len(row) > 6 else None
-
-            payload = {"content": content, "source": source}
-            if metadata_json:
-                try:
-                    payload["metadata_json"] = json.loads(metadata_json) if isinstance(metadata_json, str) else metadata_json
-                except (json.JSONDecodeError, TypeError):
-                    payload["metadata_json"] = metadata_json
-
-            ev = self.log_event(
-                memory_id=mem_id,
-                operation="CREATE",
-                payload=payload,
-                importance=float(importance) if importance else 0.5,
+            if latest_event.operation == "DELETE":
+                self._state_set(
+                    memory_id,
+                    "",
+                    "DELETE",
+                    latest_event.event_id,
+                    latest_event.timestamp,
+                )
+                state[memory_id] = {
+                    "memory_id": memory_id,
+                    "fingerprint": "",
+                    "last_operation": "DELETE",
+                    "event_id": latest_event.event_id,
+                }
+                continue
+            tombstone = self.log_event(
+                memory_id=memory_id,
+                operation="DELETE",
+                payload={"deleted": True},
+                parent_event_ids=[latest_event.event_id],
+                commit=False,
             )
-            created.append(ev)
-        return created
+            self._state_set(
+                memory_id, "", "DELETE", tombstone.event_id, tombstone.timestamp
+            )
+            state[memory_id] = {
+                "memory_id": memory_id,
+                "fingerprint": "",
+                "last_operation": "DELETE",
+                "event_id": tombstone.event_id,
+            }
+            stats["deleted"] += 1
+            stats["events"].append(tombstone.to_dict())
+
+        for memory_id, payload in current.items():
+            fingerprint = self._payload_fingerprint(payload)
+            previous = state.get(memory_id)
+            if previous is not None and previous["fingerprint"] == fingerprint \
+                    and previous["last_operation"] != "DELETE":
+                continue
+
+            latest = self._latest_event(memory_id)
+            if latest is not None and latest.operation != "DELETE":
+                try:
+                    latest_payload = self._decode_payload(latest)
+                except Exception:
+                    latest_payload = None
+                if latest_payload is not None and self._payload_fingerprint(latest_payload) == fingerprint:
+                    self._state_set(
+                        memory_id,
+                        fingerprint,
+                        latest.operation,
+                        latest.event_id,
+                        latest.timestamp,
+                    )
+                    continue
+
+            if previous is None and latest is None:
+                operation = "CREATE"
+            elif previous is not None and previous["last_operation"] == "DELETE":
+                operation = "CREATE"
+            else:
+                operation = "UPDATE"
+            parent_event_id = (
+                previous.get("event_id") if previous else (latest.event_id if latest else None)
+            )
+            parent_ids = [parent_event_id] if parent_event_id else []
+            event = self.log_event(
+                memory_id=memory_id,
+                operation=operation,
+                payload=payload,
+                importance=float(payload.get("importance") or 0.5),
+                parent_event_ids=parent_ids,
+                commit=False,
+            )
+            self._state_set(memory_id, fingerprint, operation, event.event_id, event.timestamp)
+            stats["created" if operation == "CREATE" else "updated"] += 1
+            stats["events"].append(event.to_dict())
+
+        for memory_id, previous in state.items():
+            if memory_id in current or previous["last_operation"] == "DELETE":
+                continue
+            latest = self._latest_event(memory_id)
+            if latest is not None and latest.operation == "DELETE":
+                self._state_set(memory_id, "", "DELETE", latest.event_id, latest.timestamp)
+                continue
+            parent_ids = [previous["event_id"]] if previous.get("event_id") else []
+            event = self.log_event(
+                memory_id=memory_id,
+                operation="DELETE",
+                payload={"deleted": True},
+                parent_event_ids=parent_ids,
+                commit=False,
+            )
+            self._state_set(memory_id, "", "DELETE", event.event_id, event.timestamp)
+            stats["deleted"] += 1
+            stats["events"].append(event.to_dict())
+
+        return stats
+
+    def _find_unlogged_memories(self, limit: int = 5000) -> List[dict]:
+        """Backward-compatible wrapper around full mutation discovery.
+
+        ``limit`` is intentionally ignored: a fixed cap caused databases larger
+        than 5000 rows to become permanently only partially synchronized.
+        """
+        del limit
+        return self.discover_local_mutations()["events"]
 
     def pull_changes(
         self,
@@ -836,22 +1350,32 @@ class SyncEngine:
             }
         """
         cursor = self.conn.cursor()
+        since_timestamp, since_event_id = _decode_cursor(since_cursor)
+        clauses: List[str] = ["apply_state IN ('applied', 'relayed')"]
+        params: List[Any] = []
+        if self.surface_only:
+            clauses.append("surface_id = ?")
+            params.append(self.surface_id)
 
-        if since_cursor:
-            cursor.execute(
-                """SELECT * FROM memory_events
-                   WHERE timestamp > ?
-                   ORDER BY timestamp ASC, event_id ASC
-                   LIMIT ?""",
-                (since_cursor, limit + 1),
+        if since_timestamp:
+            since_epoch = _parse_sync_timestamp(since_timestamp).timestamp()
+            clauses.append(
+                "(timestamp_epoch > ? OR (timestamp_epoch = ? AND event_id > ?))"
             )
-        else:
-            cursor.execute(
-                """SELECT * FROM memory_events
-                   ORDER BY timestamp ASC, event_id ASC
-                   LIMIT ?""",
-                (limit + 1,),
-            )
+            params.extend([since_epoch, since_epoch, since_event_id])
+        if device_id:
+            clauses.append("device_id != ?")
+            params.append(device_id)
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit + 1)
+        cursor.execute(
+            f"""SELECT * FROM memory_events
+                {where}
+                ORDER BY timestamp_epoch ASC, event_id ASC
+                LIMIT ?""",
+            params,
+        )
 
         rows = cursor.fetchall()
         has_more = len(rows) > limit
@@ -859,14 +1383,10 @@ class SyncEngine:
             rows = rows[:limit]
 
         events = [SyncEvent.from_row(dict(row)) for row in rows]
-
-        next_cursor = None
-        if events:
-            next_cursor = events[-1].timestamp
-            # Ensure cursor is past the last returned event
-            if has_more:
-                import uuid as _uuid
-                next_cursor = events[-1].timestamp
+        next_cursor = (
+            _encode_cursor(events[-1].timestamp, events[-1].event_id)
+            if events else since_cursor
+        )
 
         return {
             "events": [ev.to_dict() for ev in events],
@@ -875,193 +1395,435 @@ class SyncEngine:
             "total": len(events),
         }
 
-    def push_changes(
+    @staticmethod
+    def _payload_looks_encrypted(payload: str) -> bool:
+        return isinstance(payload, str) and payload.startswith(_ENCRYPTED_WIRE_PREFIX)
+
+    @staticmethod
+    def _validate_encrypted_wire_payload(payload: str) -> str:
+        if not SyncEngine._payload_looks_encrypted(payload):
+            raise ValueError("encrypted sync payload is missing the mne1 wire marker")
+        token = payload[len(_ENCRYPTED_WIRE_PREFIX):]
+        if not token:
+            raise ValueError("encrypted sync payload is empty")
+        try:
+            padding = "=" * (-len(token) % 4)
+            decoded = base64.b64decode(
+                (token + padding).encode("ascii"), altchars=b"-_", validate=True
+            )
+        except (ValueError, UnicodeEncodeError, binascii.Error) as exc:
+            raise ValueError("encrypted sync payload is not valid base64") from exc
+        if len(decoded) < 40:
+            raise ValueError("encrypted sync payload is too short")
+        return token
+
+    def _decode_payload(self, event: SyncEvent) -> Optional[Dict[str, Any]]:
+        if not event.payload:
+            if self.require_encryption:
+                raise ValueError("encrypted sync requires an authenticated payload")
+            if event.operation == "DELETE":
+                return {}
+            raise ValueError("CREATE/UPDATE sync events require a payload")
+        encrypted = self._payload_looks_encrypted(event.payload)
+        if encrypted:
+            token = self._validate_encrypted_wire_payload(event.payload)
+            if self.encryption is None:
+                if self.relay_mode:
+                    return None
+                raise ValueError("encrypted payload received without a decryption key")
+            decoded = self.encryption.decrypt(token)
+            if not isinstance(decoded, dict):
+                raise ValueError("decrypted sync payload is not an object")
+            envelope_meta = decoded.get("_sync")
+            envelope_payload = decoded.get("payload")
+            if not isinstance(envelope_meta, dict) or not isinstance(envelope_payload, dict):
+                if self.require_encryption:
+                    raise ValueError("encrypted payload has no authenticated sync envelope")
+                return decoded
+            expected_meta = {
+                "version": 1,
+                "event_id": event.event_id,
+                "memory_id": event.memory_id,
+                "operation": event.operation,
+                "timestamp": event.timestamp,
+                "device_id": event.device_id,
+                "surface_id": event.surface_id,
+                "parent_event_ids": event.parent_event_ids,
+                "importance": event.importance,
+            }
+            if envelope_meta != expected_meta:
+                raise ValueError("authenticated sync metadata does not match the event")
+            return envelope_payload
+        if self.require_encryption:
+            raise ValueError("plaintext payload rejected because encryption is required")
+        decoded = json.loads(event.payload)
+        if not isinstance(decoded, dict):
+            raise ValueError("sync payload is not an object")
+        return decoded
+
+    def _latest_event(
+        self, memory_id: str, exclude_event_id: Optional[str] = None
+    ) -> Optional[SyncEvent]:
+        clauses = ["memory_id = ?"]
+        params: List[Any] = [memory_id]
+        if self.surface_only:
+            clauses.append("surface_id = ?")
+            params.append(self.surface_id)
+        if exclude_event_id:
+            clauses.append("event_id != ?")
+            params.append(exclude_event_id)
+        rows = self.conn.execute(
+            f"SELECT * FROM memory_events WHERE {' AND '.join(clauses)}",
+            params,
+        ).fetchall()
+        events = [SyncEvent.from_row(dict(row)) for row in rows]
+        return max(events, key=_event_sort_key) if events else None
+
+    def _insert_incoming_event(self, event: SyncEvent, apply_state: str) -> None:
+        self.conn.execute(
+            """INSERT OR IGNORE INTO memory_events (
+                event_id, memory_id, operation, timestamp, timestamp_epoch, device_id,
+                surface_id, payload, parent_event_ids, importance, expiry, event_hash, synced_at,
+                apply_state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                event.event_id, event.memory_id, event.operation, event.timestamp,
+                _parse_sync_timestamp(event.timestamp).timestamp(),
+                event.device_id, event.surface_id, event.payload, event.parent_event_ids,
+                event.importance, event.expiry, event.event_hash,
+                datetime.now(timezone.utc).isoformat(), apply_state,
+            ),
+        )
+
+    def _mark_event_state(self, event_id: str, apply_state: str) -> None:
+        self.conn.execute(
+            "UPDATE memory_events SET apply_state = ? WHERE event_id = ?",
+            (apply_state, event_id),
+        )
+
+    def _prepare_embedding(self, payload: Optional[Dict[str, Any]]) -> Optional[Any]:
+        """Compute derived vector state before opening the SQLite write transaction."""
+        if not payload or not payload.get("content"):
+            return None
+        try:
+            from mnemosyne.core.beam import _embeddings
+
+            if not _embeddings.available():
+                return None
+            vectors = _embeddings.embed([str(payload["content"])])
+            return vectors[0] if vectors is not None and len(vectors) else None
+        except Exception as exc:
+            logger.warning("sync embedding preparation failed: %s", exc)
+            return None
+
+    def _apply_memory_event(
         self,
-        events: List[dict],
-    ) -> Dict[str, Any]:
-        """Validate, deduplicate, and apply incoming events.
+        event: SyncEvent,
+        payload: Optional[Dict[str, Any]],
+        embedding: Optional[Any] = None,
+    ) -> None:
+        """Materialize one event without committing the active transaction."""
+        if payload is None:  # blind relay: never materialize opaque operations
+            return
 
-        Uses DeltaSync.apply_delta to apply memory mutations.
-        Returns stats: {accepted, duplicates, conflicts, errors, next_cursor}.
+        if event.operation == "DELETE":
+            if self.surface_only:
+                target = self.conn.execute(
+                    """SELECT id FROM main.working_memory
+                       WHERE id = ? AND sync_surface_id = ?""",
+                    (event.memory_id, self.surface_id),
+                ).fetchone()
+            else:
+                target = self.conn.execute(
+                    "SELECT id FROM main.working_memory WHERE id = ?",
+                    (event.memory_id,),
+                ).fetchone()
+            if target is not None:
+                try:
+                    from mnemosyne.core.beam import _wm_vec_delete
 
-        Events with an event_hash already present in the local log are
-        silently skipped (idempotent push).
-        """
-        cursor = self.conn.cursor()
+                    _wm_vec_delete(self.conn, event.memory_id)
+                except Exception:
+                    pass
+                if self.surface_only:
+                    self.conn.execute(
+                        """DELETE FROM main.working_memory
+                           WHERE id = ? AND sync_surface_id = ?""",
+                        (event.memory_id, self.surface_id),
+                    )
+                else:
+                    self.conn.execute(
+                        "DELETE FROM main.working_memory WHERE id = ?", (event.memory_id,)
+                    )
+                self.conn.execute(
+                    "DELETE FROM annotations WHERE memory_id = ?", (event.memory_id,)
+                )
+                self.conn.execute(
+                    "DELETE FROM memory_embeddings WHERE memory_id = ?", (event.memory_id,)
+                )
+            self._state_set(event.memory_id, "", "DELETE", event.event_id, event.timestamp)
+            return
+
+        content = str(payload.get("content") or "")
+        if not content:
+            raise ValueError(f"event {event.event_id} has no content")
+        importance = float(payload.get("importance", event.importance or 0.5))
+        source = str(payload.get("source") or "sync")
+        metadata = payload.get("metadata_json")
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except json.JSONDecodeError:
+                metadata = {"raw": metadata}
+        if metadata is not None and not isinstance(metadata, dict):
+            metadata = {"value": metadata}
+
+        available = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(working_memory)").fetchall()
+        }
+        values: Dict[str, Any] = {
+            "content": content,
+            "source": source,
+            "timestamp": event.timestamp,
+            "importance": importance,
+            "metadata_json": json.dumps(metadata or {}, sort_keys=True),
+            "memory_type": payload.get("memory_type"),
+            "veracity": payload.get("veracity") or "unknown",
+            "valid_until": payload.get("valid_until"),
+            "scope": "global",
+            "sync_surface_id": self.surface_id,
+        }
+        if self.surface_only:
+            exists = self.conn.execute(
+                """SELECT 1 FROM main.working_memory
+                   WHERE id = ? AND sync_surface_id = ?""",
+                (event.memory_id, self.surface_id),
+            ).fetchone() is not None
+        else:
+            exists = self.conn.execute(
+                "SELECT 1 FROM main.working_memory WHERE id = ?", (event.memory_id,)
+            ).fetchone() is not None
+        if exists:
+            try:
+                from mnemosyne.core.beam import _wm_vec_delete
+
+                _wm_vec_delete(self.conn, event.memory_id)
+            except Exception:
+                pass
+            present = {
+                key: value
+                for key, value in values.items()
+                if key in available and value is not None
+            }
+            assignments = ", ".join(f"{key} = ?" for key in present)
+            if self.surface_only:
+                self.conn.execute(
+                    f"""UPDATE main.working_memory SET {assignments}
+                        WHERE id = ? AND sync_surface_id = ?""",
+                    [*present.values(), event.memory_id, self.surface_id],
+                )
+            else:
+                self.conn.execute(
+                    f"UPDATE main.working_memory SET {assignments} WHERE id = ?",
+                    [*present.values(), event.memory_id],
+                )
+            self.conn.execute(
+                "DELETE FROM memory_embeddings WHERE memory_id = ?", (event.memory_id,)
+            )
+        else:
+            insert_values: Dict[str, Any] = {
+                "id": event.memory_id,
+                **values,
+                "session_id": self.surface_session_id,
+            }
+            present = {
+                key: value
+                for key, value in insert_values.items()
+                if key in available and value is not None
+            }
+            columns = ", ".join(present)
+            placeholders = ", ".join("?" for _ in present)
+            self.conn.execute(
+                f"INSERT INTO main.working_memory ({columns}) VALUES ({placeholders})",
+                list(present.values()),
+            )
+
+        if embedding is not None:
+            try:
+                from mnemosyne.core.beam import _store_working_embedding
+
+                _store_working_embedding(
+                    self.conn, event.memory_id, embedding, commit_vec=False
+                )
+            except Exception as exc:
+                logger.warning("sync embedding storage failed for %s: %s", event.memory_id, exc)
+
+        normalized_payload = self._working_payload(event.memory_id) or payload
+        fingerprint = self._payload_fingerprint(normalized_payload)
+        self._state_set(
+            event.memory_id, fingerprint, event.operation, event.event_id, event.timestamp
+        )
+
+    def push_changes(self, events: List[dict]) -> Dict[str, Any]:
+        """Validate, order, deduplicate, and restart-safely apply events."""
+        if self.surface_only:
+            self._validate_surface_ownership()
         stats: Dict[str, Any] = {
             "accepted": 0,
             "duplicates": 0,
             "conflicts": 0,
             "errors": 0,
             "details": [],
+            "acknowledged_event_ids": [],
+        }
+        if self.surface_only:
+            known_query = self.conn.execute(
+                "SELECT * FROM memory_events WHERE surface_id = ?", (self.surface_id,)
+            ).fetchall()
+        else:
+            known_query = self.conn.execute("SELECT * FROM memory_events").fetchall()
+        known_rows = {row["event_id"]: dict(row) for row in known_query}
+        known_states = {
+            event_id: row["apply_state"] for event_id, row in known_rows.items()
         }
 
-        # Build set of known event_hashes for dedup
-        cursor.execute("SELECT event_hash FROM memory_events WHERE event_hash IS NOT NULL")
-        known_hashes = {row[0] for row in cursor.fetchall()}
-
-        incoming: List[SyncEvent] = []
+        incoming: List[Tuple[SyncEvent, bool]] = []
+        scheduled_ids = set()
+        maximum_timestamp = datetime.now(timezone.utc) + timedelta(
+            seconds=self.max_future_skew_seconds
+        )
         for raw in events:
             try:
-                ev = SyncEvent.from_dict(raw)
-                if ev.event_hash and ev.event_hash in known_hashes:
-                    stats["duplicates"] += 1
+                event = SyncEvent.from_dict(raw)
+                if not event.event_id or not event.memory_id or not event.device_id:
+                    raise ValueError("event_id, memory_id, and device_id are required")
+                if self.surface_only and event.surface_id != self.surface_id:
+                    raise ValueError("event belongs to a different or unscoped surface")
+                if event.operation not in {"CREATE", "UPDATE", "DELETE", "CONSOLIDATE"}:
+                    raise ValueError(f"invalid operation: {event.operation!r}")
+                event_timestamp = _parse_sync_timestamp(event.timestamp)
+                if event_timestamp > maximum_timestamp:
+                    raise ValueError("event timestamp exceeds allowed future clock skew")
+                provided_hash = str(event.event_hash or "")
+                computed_hash = self._compute_event_hash(event)
+                if (
+                    len(provided_hash) == 64
+                    and all(char in "0123456789abcdefABCDEF" for char in provided_hash)
+                    and provided_hash.lower() != computed_hash
+                ):
+                    raise ValueError("event_hash does not match event contents")
+                event.event_hash = computed_hash
+                if event.event_id in scheduled_ids:
                     continue
-                incoming.append(ev)
+                scheduled_ids.add(event.event_id)
+                existing_state = known_states.get(event.event_id)
+                if existing_state is not None and existing_state != "pending":
+                    stored_event = SyncEvent.from_row(known_rows[event.event_id])
+                    if stored_event.to_dict() != event.to_dict():
+                        raise ValueError("duplicate event_id does not match stored event")
+                    stats["duplicates"] += 1
+                    stats["acknowledged_event_ids"].append(event.event_id)
+                    continue
+                if existing_state == "pending":
+                    stored_event = SyncEvent.from_row(known_rows[event.event_id])
+                    if stored_event.to_dict() != event.to_dict():
+                        raise ValueError("pending retry does not match the stored event")
+                    event = stored_event
+                incoming.append((event, existing_state == "pending"))
             except Exception as exc:
                 stats["errors"] += 1
                 stats["details"].append(f"invalid event: {exc}")
-                continue
 
-        # Detect conflicts with local events in the same time window
-        if incoming:
-            local_raw = self.pull_changes(
-                since_cursor=None, limit=5000
-            )
-            local_events = [SyncEvent.from_dict(d) for d in local_raw["events"]]
-            conflict_groups = ConflictResolution.detect_conflicts(
-                local_events, incoming
-            )
-
-            # Resolve each conflict group
-            resolved_ids: set = set()
-            for group in conflict_groups:
-                winner = ConflictResolution.resolve(group)
-                for ev in group:
-                    if ev.event_id != winner.event_id:
-                        resolved_ids.add(ev.event_id)
-                stats["conflicts"] += len(group) - 1
-
-            # Filter out losing events, keep winners
-            incoming = [ev for ev in incoming if ev.event_id not in resolved_ids]
-
-        # Apply memory mutations through the full Mnemosyne pipeline
-        # (FTS5 indexing, embeddings, entity extraction, callbacks).
-        _total = len(incoming)
-        _progress_interval = max(1, _total // 50) if _total > 100 else 100
-        for idx, ev in enumerate(incoming):
+        incoming.sort(key=lambda item: _event_sort_key(item[0]))
+        total = len(incoming)
+        progress_interval = max(1, total // 50) if total > 100 else 100
+        for index, (event, retry_pending) in enumerate(incoming):
+            if total > 100 and index > 0 and index % progress_interval == 0:
+                pct = int(index / total * 100)
+                sys.stderr.write(f"\r  Progress: {index}/{total} ({pct}%)  \r")
+                sys.stderr.flush()
             try:
-                if _total > 100 and idx > 0 and idx % _progress_interval == 0:
-                    pct = int(idx / _total * 100)
-                    sys.stderr.write(f"\r  Progress: {idx}/{_total} ({pct}%)  \r")
-                    sys.stderr.flush()
+                payload = self._decode_payload(event)
+                embedding = self._prepare_embedding(payload)
+                if self.conn.in_transaction:
+                    raise RuntimeError("sync apply requires a clean SQLite transaction")
+                self.conn.execute("BEGIN IMMEDIATE")
+                latest = self._latest_event(
+                    event.memory_id,
+                    exclude_event_id=event.event_id if retry_pending else None,
+                )
+                if latest is not None and _event_sort_key(latest) >= _event_sort_key(event):
+                    if retry_pending:
+                        self._mark_event_state(event.event_id, "conflict")
+                    else:
+                        self._insert_incoming_event(event, "conflict")
+                    self.conn.commit()
+                    stats["conflicts"] += 1
+                    stats["acknowledged_event_ids"].append(event.event_id)
+                    continue
+
+                if payload is None:
+                    if retry_pending:
+                        self._mark_event_state(event.event_id, "relayed")
+                    else:
+                        self._insert_incoming_event(event, "relayed")
+                    self.conn.commit()
+                    stats["accepted"] += 1
+                    stats["acknowledged_event_ids"].append(event.event_id)
+                    continue
+
+                if not retry_pending:
+                    self._insert_incoming_event(event, "pending")
+                self._apply_memory_event(event, payload, embedding=embedding)
+                self._mark_event_state(event.event_id, "applied")
+                self.conn.commit()
+                stats["accepted"] += 1
+                stats["acknowledged_event_ids"].append(event.event_id)
             except KeyboardInterrupt:
+                self.conn.rollback()
                 stats["interrupted"] = True
                 break
-            try:
-                payload_dict: Optional[dict] = None
-                if ev.payload:
-                    # Detect encrypted payloads (Fernet base64 prefix)
-                    _is_encrypted = ev.payload.startswith("gAAAAA")
-                    if self.encryption and _is_encrypted:
-                        payload_dict = self.encryption.decrypt(ev.payload)
-                    elif not _is_encrypted:
-                        payload_dict = json.loads(ev.payload)
-                    else:
-                        # Encrypted but no key -- store opaque; memory
-                        # mutation skipped, but event is logged for relay
-                        pass
-
-                content = ""
-                source = "sync"
-                importance = ev.importance or 0.5
-                metadata: Optional[dict] = None
-                veracity = "unknown"
-
-                if payload_dict:
-                    content = payload_dict.get("content", "")
-                    source = payload_dict.get("source", "sync")
-                    importance = payload_dict.get("importance", importance)
-                    metadata = payload_dict.get("metadata_json")
-                    if metadata and isinstance(metadata, str):
-                        try:
-                            metadata = json.loads(metadata)
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-                    veracity = payload_dict.get("veracity", "unknown")
-
-                if ev.operation == "DELETE":
-                    # Call forget() through the Mnemosyne API pipeline
-                    if self._mnemosyne is not None and hasattr(self._mnemosyne, "forget"):
-                        self._mnemosyne.forget(ev.memory_id)
-                    else:
-                        cursor.execute(
-                            "DELETE FROM main.working_memory WHERE id = ?",
-                            (ev.memory_id,),
-                        )
-                    stats["accepted"] += 1
-
-                elif ev.operation in ("CREATE", "UPDATE", "CONSOLIDATE"):
-                    if content:
-                        # Route through remember() for full pipeline
-                        applied = False
-                        try:
-                            if self._beam is not None and hasattr(self._beam, "remember"):
-                                self._beam.remember(
-                                    content=content,
-                                    source=source,
-                                    importance=importance,
-                                    metadata=metadata,
-                                    memory_id=ev.memory_id,
-                                )
-                                stats["accepted"] += 1
-                                applied = True
-                        except KeyboardInterrupt:
-                            stats["interrupted"] = True
-                            break
-
-                        if not applied:
-                            # Fallback: direct DeltaSync
-                            delta_item: Dict[str, Any] = {"id": ev.memory_id}
-                            for key in ("content", "importance", "source", "memory_type", "veracity"):
-                                if payload_dict and key in payload_dict:
-                                    delta_item[key] = payload_dict[key]
-                            if self._delta_sync is not None:
-                                apply_stats = self._delta_sync.apply_delta(
-                                    peer_id=ev.device_id,
-                                    delta=[delta_item],
-                                    table="working_memory",
-                                )
-                                if apply_stats.get("inserted") or apply_stats.get("updated"):
-                                    stats["accepted"] += 1
-                                else:
-                                    stats["details"].append(
-                                        f"event {ev.event_id}: no rows affected"
-                                    )
-                            else:
-                                stats["accepted"] += 1
-                    else:
-                        # No content — just log the event
-                        stats["accepted"] += 1
-
-                # Log the event locally for future syncs
-                cursor.execute(
-                    """INSERT OR IGNORE INTO memory_events (
-                        event_id, memory_id, operation, timestamp, device_id,
-                        payload, parent_event_ids, importance, expiry, event_hash, synced_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        ev.event_id,
-                        ev.memory_id,
-                        ev.operation,
-                        ev.timestamp,
-                        ev.device_id,
-                        ev.payload,
-                        ev.parent_event_ids,
-                        ev.importance,
-                        ev.expiry,
-                        ev.event_hash,
-                        datetime.now(timezone.utc).isoformat(),
-                    ),
-                )
             except Exception as exc:
+                self.conn.rollback()
                 stats["errors"] += 1
-                stats["details"].append(f"event {ev.event_id}: {exc}")
-                logger.warning("Failed to apply event %s: %s", ev.event_id, exc)
-
-        self.conn.commit()
+                stats["details"].append(f"event {event.event_id}: {exc}")
+                logger.warning("Failed to apply event %s: %s", event.event_id, exc)
 
         return stats
+
+    def _read_bounded_http_response(self, response: Any) -> bytes:
+        """Read an HTTP response without allowing an unbounded allocation."""
+        headers = getattr(response, "headers", None)
+        content_length = headers.get("Content-Length") if headers is not None else None
+        if content_length is not None:
+            try:
+                if int(content_length) > self.max_response_bytes:
+                    raise ValueError("remote response exceeds configured size limit")
+            except ValueError as exc:
+                if "exceeds" in str(exc):
+                    raise
+                raise ValueError("remote response has invalid Content-Length") from exc
+        data = response.read(self.max_response_bytes + 1)
+        if len(data) > self.max_response_bytes:
+            raise ValueError("remote response exceeds configured size limit")
+        return data
+
+    @staticmethod
+    def _validate_sync_remote_url(remote_url: str) -> None:
+        parsed = urlparse(remote_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("sync remote must be an absolute HTTP(S) URL")
+        if parsed.scheme == "https":
+            return
+        hostname = parsed.hostname.lower()
+        loopback = hostname == "localhost"
+        if not loopback:
+            try:
+                loopback = ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                loopback = False
+        if not loopback:
+            raise ValueError("non-loopback sync remotes require HTTPS")
 
     def sync_with(
         self,
@@ -1079,6 +1841,12 @@ class SyncEngine:
         import urllib.request as _request
         import urllib.error as _error
 
+        del encryption_key  # retained for API compatibility; engine owns encryption state
+        if mode not in {"push", "pull", "bidirectional"}:
+            raise ValueError(f"unsupported sync mode: {mode}")
+        remote_url = remote_url.rstrip("/")
+        self._validate_sync_remote_url(remote_url)
+
         result: Dict[str, Any] = {
             "remote": remote_url,
             "mode": mode,
@@ -1086,138 +1854,240 @@ class SyncEngine:
             "pull": None,
             "errors": [],
         }
-
-        headers: Dict[str, str] = {
-            "Content-Type": "application/json",
-        }
+        configured_remote: Optional[str] = None
+        if mode in ("push", "bidirectional"):
+            configured_remote = self._meta_get("configured_push_remote")
+            ack_remotes = {
+                row[0]
+                for row in self.conn.execute(
+                    "SELECT DISTINCT remote_url FROM sync_outbox_ack"
+                ).fetchall()
+            }
+            if not configured_remote and ack_remotes:
+                if ack_remotes != {remote_url}:
+                    result["errors"].append(
+                        "existing outbox acknowledgements belong to a different relay"
+                    )
+                    return result
+                configured_remote = remote_url
+                self._meta_set("configured_push_remote", remote_url)
+            if configured_remote and configured_remote != remote_url:
+                result["errors"].append(
+                    "this sync database is pinned to a different push relay"
+                )
+                return result
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
         def _post(endpoint: str, body: dict) -> Optional[dict]:
             url = f"{remote_url.rstrip('/')}{endpoint}"
             data = json.dumps(body, default=str).encode("utf-8")
-            req = _request.Request(url, data=data, headers=headers, method="POST")
+            request = _request.Request(url, data=data, headers=headers, method="POST")
             try:
-                with _request.urlopen(req, timeout=30) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
-            except _error.HTTPError as e:
-                err_body = e.read().decode("utf-8", errors="replace") if e.fp else str(e)
-                result["errors"].append(f"HTTP {e.code} on {endpoint}: {err_body}")
-                return None
-            except Exception as e:
-                result["errors"].append(f"{endpoint}: {e}")
-                return None
-
-        def _get(endpoint: str) -> Optional[dict]:
-            url = f"{remote_url.rstrip('/')}{endpoint}"
-            req = _request.Request(url, headers=headers, method="GET")
-            try:
-                with _request.urlopen(req, timeout=30) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
-            except Exception as e:
-                result["errors"].append(f"{endpoint}: {e}")
-                return None
-
-        # Phase 1: Push (send local changes to remote)
-        if mode in ("push", "bidirectional"):
-            # Scan for memories that haven't been logged as events yet
-            new_events = self._find_unlogged_memories(limit=5000)
-            if new_events:
-                logger.debug("Found %d unlogged memories to sync", len(new_events))
-
-            pull_status = _post("/sync/pull", {
-                "since": None,
-                "device_id": self.device_id,
-                "limit": 1000,
-            })
-            remote_since = None
-            if pull_status and "next_cursor" in pull_status:
-                remote_since = pull_status["next_cursor"]
-
-            local_changes = self.pull_changes(since_cursor=remote_since, limit=5000)
-            if local_changes["events"]:
-                push_resp = _post("/sync/push", {
-                    "events": local_changes["events"],
-                    "device_id": self.device_id,
-                })
-                result["push"] = push_resp
-            else:
-                result["push"] = {"accepted": 0, "duplicates": 0, "conflicts": 0}
-
-        # Phase 2: Pull (fetch remote changes)
-        if mode in ("pull", "bidirectional"):
-            # Load persisted cursor, then fall back to DB-derived max
-            since_cursor = self._meta_get(
-                f"last_sync_cursor_{remote_url}"
-            )
-            if not since_cursor:
-                cur = self.conn.cursor()
-                cur.execute(
-                    "SELECT MAX(timestamp) FROM memory_events WHERE device_id != ?",
-                    (self.device_id,),
+                with _request.urlopen(request, timeout=30) as response:
+                    return json.loads(
+                        self._read_bounded_http_response(response).decode("utf-8")
+                    )
+            except _error.HTTPError as exc:
+                body_text = (
+                    self._read_bounded_http_response(exc).decode(
+                        "utf-8", errors="replace"
+                    )
+                    if exc.fp
+                    else str(exc)
                 )
-                row = cur.fetchone()
-                since_cursor = row[0] if row and row[0] else None
+                result["errors"].append(f"HTTP {exc.code} on {endpoint}: {body_text}")
+            except Exception as exc:
+                result["errors"].append(f"{endpoint}: {exc}")
+            return None
 
-            pull_resp = _post("/sync/pull", {
-                "since": since_cursor,
-                "device_id": self.device_id,
-                "limit": 5000,
-            })
+        page_size = 1000
+        if mode in ("push", "bidirectional"):
+            discovered = self.discover_local_mutations()
+            push_total = {
+                "accepted": 0,
+                "duplicates": 0,
+                "conflicts": 0,
+                "errors": 0,
+                "batches": 0,
+                "discovered": {
+                    key: discovered[key] for key in ("created", "updated", "deleted")
+                },
+            }
+            while True:
+                if self.surface_only:
+                    rows = self.conn.execute(
+                        """SELECT me.* FROM memory_events AS me
+                           WHERE me.device_id = ? AND me.surface_id = ?
+                             AND NOT EXISTS (
+                                SELECT 1 FROM sync_outbox_ack AS ack
+                                WHERE ack.remote_url = ? AND ack.event_id = me.event_id
+                             )
+                           ORDER BY me.timestamp_epoch ASC, me.event_id ASC LIMIT ?""",
+                        (self.device_id, self.surface_id, remote_url, page_size),
+                    ).fetchall()
+                else:
+                    rows = self.conn.execute(
+                        """SELECT me.* FROM memory_events AS me
+                           WHERE me.device_id = ?
+                             AND NOT EXISTS (
+                                SELECT 1 FROM sync_outbox_ack AS ack
+                                WHERE ack.remote_url = ? AND ack.event_id = me.event_id
+                             )
+                           ORDER BY me.timestamp_epoch ASC, me.event_id ASC LIMIT ?""",
+                        (self.device_id, remote_url, page_size),
+                    ).fetchall()
+                if not rows:
+                    break
+                batch = [SyncEvent.from_row(dict(row)).to_dict() for row in rows]
+                response = _post(
+                    "/sync/push", {"events": batch, "device_id": self.device_id}
+                )
+                if response is None:
+                    break
+                push_total["batches"] += 1
+                for key in ("accepted", "duplicates", "conflicts", "errors"):
+                    push_total[key] += int(response.get(key, 0) or 0)
 
-            if pull_resp and pull_resp.get("events"):
-                push_result = self.push_changes(pull_resp["events"])
-                result["pull"] = {
-                    "events_fetched": len(pull_resp["events"]),
-                    "accepted": push_result.get("accepted", 0),
-                    "duplicates": push_result.get("duplicates", 0),
-                    "conflicts": push_result.get("conflicts", 0),
-                    "errors": push_result.get("errors", 0),
-                }
-                if push_result.get("interrupted"):
-                    result["interrupted"] = True
-                # Persist cursor so next sync picks up where we left off
-                if pull_resp.get("next_cursor"):
-                    self._meta_set(
-                        f"last_sync_cursor_{remote_url}",
-                        pull_resp["next_cursor"],
+                batch_ids = {event["event_id"] for event in batch}
+                acknowledged_raw = list(response.get("acknowledged_event_ids") or [])
+                unknown_acknowledgements = set(acknowledged_raw) - batch_ids
+                if unknown_acknowledgements:
+                    result["errors"].append(
+                        "remote acknowledged event IDs outside the current push batch"
                     )
-                # Also mark synced_at on just-accepted events
-                if push_result.get("accepted", 0) > 0:
-                    self._meta_set(
-                        f"last_sync_at_{remote_url}",
-                        datetime.now(timezone.utc).isoformat(),
+                    break
+                acknowledged_set = set(acknowledged_raw)
+                if not acknowledged_set:
+                    result["errors"].append("remote did not acknowledge pushed events")
+                    break
+                acknowledged = [
+                    event["event_id"]
+                    for event in batch
+                    if event["event_id"] in acknowledged_set
+                ]
+                now = datetime.now(timezone.utc).isoformat()
+                if configured_remote is None:
+                    self.conn.execute(
+                        """INSERT OR REPLACE INTO sync_meta (key, value)
+                           VALUES ('configured_push_remote', ?)""",
+                        (remote_url,),
                     )
-            else:
-                result["pull"] = {"events_fetched": 0}
+                    configured_remote = remote_url
+                self.conn.executemany(
+                    """INSERT OR REPLACE INTO sync_outbox_ack
+                       (remote_url, event_id, acked_at) VALUES (?, ?, ?)""",
+                    [(remote_url, event_id, now) for event_id in acknowledged],
+                )
+                self.conn.commit()
+                if len(acknowledged) < len(batch):
+                    result["errors"].append("remote only partially acknowledged a push batch")
+                    break
+            result["push"] = push_total
+            if not result["errors"]:
+                self._meta_set("configured_push_remote", remote_url)
 
+        if mode in ("pull", "bidirectional"):
+            cursor_key = f"last_pull_cursor_{remote_url}"
+            pull_cursor = self._meta_get(cursor_key)
+            pull_total = {
+                "events_fetched": 0,
+                "accepted": 0,
+                "duplicates": 0,
+                "conflicts": 0,
+                "errors": 0,
+                "batches": 0,
+            }
+            while True:
+                response = _post(
+                    "/sync/pull",
+                    {
+                        "since": pull_cursor,
+                        "device_id": self.device_id,
+                        "limit": page_size,
+                    },
+                )
+                if response is None:
+                    break
+                events = list(response.get("events") or [])
+                if events:
+                    applied = self.push_changes(events)
+                    pull_total["batches"] += 1
+                    pull_total["events_fetched"] += len(events)
+                    for key in ("accepted", "duplicates", "conflicts", "errors"):
+                        pull_total[key] += int(applied.get(key, 0) or 0)
+                    if applied.get("interrupted"):
+                        result["interrupted"] = True
+                        break
+                    if int(applied.get("errors", 0) or 0) > 0:
+                        result["errors"].append("pull page failed validation; cursor not advanced")
+                        break
+                next_cursor = response.get("next_cursor")
+                if next_cursor:
+                    pull_cursor = str(next_cursor)
+                    self._meta_set(cursor_key, pull_cursor)
+                if not response.get("has_more"):
+                    break
+                if not events:
+                    result["errors"].append("remote reported has_more without returning events")
+                    break
+            result["pull"] = pull_total
+
+        if not result["errors"]:
+            self._meta_set(
+                f"last_sync_at_{remote_url}", datetime.now(timezone.utc).isoformat()
+            )
         return result
 
-    def get_status(self, remote_url: Optional[str] = None) -> Dict[str, Any]:
-        """Return sync status and statistics."""
+    def get_status(
+        self,
+        remote_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return local sync statistics and optionally read remote status."""
         cursor = self.conn.cursor()
 
-        cursor.execute("SELECT COUNT(*) FROM memory_events")
+        where = " WHERE surface_id = ?" if self.surface_only else ""
+        params: Tuple[Any, ...] = (self.surface_id,) if self.surface_only else ()
+
+        cursor.execute(f"SELECT COUNT(*) FROM memory_events{where}", params)
         total_events = cursor.fetchone()[0]
 
-        cursor.execute("SELECT COUNT(DISTINCT device_id) FROM memory_events")
+        cursor.execute(
+            f"SELECT COUNT(DISTINCT device_id) FROM memory_events{where}", params
+        )
         device_count = cursor.fetchone()[0]
 
-        cursor.execute("SELECT MAX(timestamp) FROM memory_events")
+        cursor.execute(f"SELECT MAX(timestamp) FROM memory_events{where}", params)
         last_event_time = cursor.fetchone()[0]
 
-        cursor.execute("""
-            SELECT operation, COUNT(*) as cnt
-            FROM memory_events
-            GROUP BY operation
-            ORDER BY cnt DESC
-        """)
+        cursor.execute(
+            f"""SELECT operation, COUNT(*) as cnt
+                FROM memory_events{where}
+                GROUP BY operation
+                ORDER BY cnt DESC""",
+            params,
+        )
         operation_breakdown = {row[0]: row[1] for row in cursor.fetchall()}
 
-        cursor.execute(
-            "SELECT COUNT(*) FROM memory_events WHERE synced_at IS NOT NULL"
-        )
-        synced_count = cursor.fetchone()[0]
+        configured_remote = self._meta_get("configured_push_remote")
+        if configured_remote:
+            ack_where = " AND me.surface_id = ?" if self.surface_only else ""
+            ack_params: Tuple[Any, ...] = (
+                (configured_remote, self.surface_id)
+                if self.surface_only
+                else (configured_remote,)
+            )
+            cursor.execute(
+                f"""SELECT COUNT(*) FROM sync_outbox_ack AS ack
+                    JOIN memory_events AS me ON me.event_id = ack.event_id
+                    WHERE ack.remote_url = ?{ack_where}""",
+                ack_params,
+            )
+            synced_count = cursor.fetchone()[0]
+        else:
+            synced_count = 0
 
         result: Dict[str, Any] = {
             "device_id": self.device_id,
@@ -1229,14 +2099,28 @@ class SyncEngine:
         }
 
         if remote_url:
+            remote_url = remote_url.rstrip("/")
+            self._validate_sync_remote_url(remote_url)
             result["remote"] = remote_url
             last_sync = self._meta_get(f"last_sync_at_{remote_url}")
             if last_sync:
                 result["last_sync"] = last_sync
             try:
-                remote_status = self.sync_with(remote_url, mode="pull")
-                result["remote_status"] = remote_status
-            except Exception as e:
-                result["remote_error"] = str(e)
+                import urllib.request as _request
+
+                headers = {"Accept": "application/json"}
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                request = _request.Request(
+                    f"{remote_url.rstrip('/')}/sync/status",
+                    headers=headers,
+                    method="GET",
+                )
+                with _request.urlopen(request, timeout=10) as response:
+                    result["remote_status"] = json.loads(
+                        self._read_bounded_http_response(response).decode("utf-8")
+                    )
+            except Exception as exc:
+                result["remote_error"] = str(exc)
 
         return result
