@@ -47,7 +47,7 @@ primary_region = "iad"
 # The process writes the Fly secret to a private runtime file, removes it from
 # the long-lived process environment, then starts the server by file reference.
 [processes]
-  app = "sh -ec 'umask 077; printf %s \"$MNEMOSYNE_SYNC_API_KEY\" > /run/mnemosyne-sync-api.key; unset MNEMOSYNE_SYNC_API_KEY; pip install --quiet mnemosyne-memory[embeddings,sync]; exec mnemosyne sync-serve --host 0.0.0.0 --port 8765 --db-path /data/relay.db --initialize-surface --behind-tls-proxy --api-key-file /run/mnemosyne-sync-api.key'"
+  app = "sh -ec 'umask 077; printf %s \"$MNEMOSYNE_SYNC_API_KEY\" > /run/mnemosyne-sync-api.key; unset MNEMOSYNE_SYNC_API_KEY; pip install --quiet mnemosyne-memory[embeddings,sync]==3.12.1; exec mnemosyne sync-serve --host 0.0.0.0 --port 8765 --db-path /data/relay.db --initialize-surface --behind-tls-proxy --api-key-file /run/mnemosyne-sync-api.key'"
 
 [[vm]]
   size = "shared-cpu-1x"

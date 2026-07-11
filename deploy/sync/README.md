@@ -2,6 +2,8 @@
 
 Ready-to-use deployment configs for running a Mnemosyne sync server on your own infrastructure.
 
+The reference runtime is pinned to `mnemosyne-memory==3.12.1`; update both relay and clients together when intentionally upgrading the sync protocol.
+
 ## What's here
 
 | File | Purpose |
