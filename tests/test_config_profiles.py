@@ -424,6 +424,33 @@ class TestConfigReader:
         assert "ep_limit" in changed
         assert "wm_max_items" not in changed
 
+    def test_external_write_with_same_mtime_is_detected(self, temp_config):
+        """Hot reload must not rely on mtime alone on coarse filesystems."""
+        initial_stat = temp_config.config_path.stat()
+        writer = MnemosyneConfig(config_path=temp_config.config_path)
+
+        writer.set_many({"vec_type": "bit", "ep_limit": 10000})
+        os.utime(
+            temp_config.config_path,
+            ns=(initial_stat.st_atime_ns, initial_stat.st_mtime_ns),
+        )
+
+        assert temp_config.get_str("vec_type") == "bit"
+        assert temp_config.get_int("ep_limit") == 10000
+
+    def test_deleted_yaml_falls_back_to_environment_and_recreated_file(
+        self, temp_config, monkeypatch
+    ):
+        temp_config.set("sync_roles", [])
+        assert temp_config.get("sync_roles") == []
+
+        temp_config.config_path.unlink()
+        monkeypatch.setenv("MNEMOSYNE_SYNC_ROLES", "user")
+        assert temp_config.get("sync_roles") == "user"
+
+        temp_config.config_path.write_text("sync_roles: [assistant]\n")
+        assert temp_config.get("sync_roles") == ["assistant"]
+
     def test_migrate_from_env(self, temp_config, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_WM_MAX_ITEMS", "12345")
         monkeypatch.setenv("MNEMOSYNE_VEC_TYPE", "float32")

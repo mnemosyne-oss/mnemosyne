@@ -337,6 +337,7 @@ class MnemosyneConfig:
         self._config_path = config_path or _default_config_path()
         self._yaml_cache: Dict[str, Any] = {}
         self._yaml_mtime: float = 0.0
+        self._yaml_signature: Optional[Tuple[int, int, int]] = None
         self._yaml_lock = threading.Lock()
 
         # Auto-seed config.yaml on first access if it doesn't exist
@@ -466,9 +467,15 @@ class MnemosyneConfig:
                 if not self._config_path.exists():
                     self._yaml_cache = {}
                     self._yaml_mtime = 0.0
+                    self._yaml_signature = None
                     return
-                mtime = self._config_path.stat().st_mtime
-                if mtime == self._yaml_mtime and self._yaml_cache:
+                stat_result = self._config_path.stat()
+                signature = (
+                    stat_result.st_mtime_ns,
+                    stat_result.st_ctime_ns,
+                    stat_result.st_size,
+                )
+                if signature == self._yaml_signature:
                     return  # unchanged
                 import yaml
                 with open(self._config_path, "r") as f:
@@ -476,13 +483,15 @@ class MnemosyneConfig:
                 # Flatten nested YAML into dot-separated keys, but most
                 # Mnemosyne config is flat key: value. Support both.
                 self._yaml_cache = self._flatten_yaml(data)
-                self._yaml_mtime = mtime
+                self._yaml_mtime = stat_result.st_mtime
+                self._yaml_signature = signature
                 logger.debug("Loaded config from %s (%d keys)",
                              self._config_path, len(self._yaml_cache))
             except Exception as e:
                 logger.warning("Failed to load config.yaml: %s", e)
                 self._yaml_cache = {}
                 self._yaml_mtime = 0.0
+                self._yaml_signature = None
 
     def _flatten_yaml(self, data: Dict, prefix: str = "") -> Dict[str, Any]:
         """Flatten nested YAML into dot-separated keys.
@@ -511,8 +520,16 @@ class MnemosyneConfig:
         """
         try:
             if not self._config_path.exists():
+                if self._yaml_signature is not None or self._yaml_cache:
+                    self._load_yaml()
                 return
-            if self._config_path.stat().st_mtime != self._yaml_mtime:
+            stat_result = self._config_path.stat()
+            signature = (
+                stat_result.st_mtime_ns,
+                stat_result.st_ctime_ns,
+                stat_result.st_size,
+            )
+            if signature != self._yaml_signature:
                 self._load_yaml()
         except OSError:
             pass
@@ -527,7 +544,8 @@ class MnemosyneConfig:
         Also checks for file mtime changes to skip unnecessary reloads.
         """
         old_values = dict(self._yaml_cache)
-        self._yaml_mtime = 0.0  # force reload
+        self._yaml_mtime = 0.0  # backwards-compatible introspection
+        self._yaml_signature = None  # force reload
         self._load_yaml()
 
         changed = set()
@@ -642,6 +660,7 @@ class MnemosyneConfig:
 
         # Refresh cache
         self._yaml_mtime = 0.0
+        self._yaml_signature = None
         self._load_yaml()
 
         # Warn about requires_restart
@@ -673,6 +692,7 @@ class MnemosyneConfig:
             yaml.dump(existing, f, default_flow_style=False, sort_keys=True)
 
         self._yaml_mtime = 0.0
+        self._yaml_signature = None
         self._load_yaml()
 
         for key in items:

@@ -9,6 +9,10 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Reliable config hot reload.** External writes are detected even when a
+  coarse filesystem preserves the previous mtime, and deleting or recreating
+  `config.yaml` correctly switches between YAML and environment/default values.
+
 - **Hermes provider safety defaults after config bridging.** New auto-seeded
   configs now preserve user-only autosave and skip `cron`, `flush`, `subagent`,
   `background`, and `skill_loop` contexts. Existing 3.12.1/3.12.2 auto-seeded
