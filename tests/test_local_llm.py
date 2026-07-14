@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import subprocess
 import sys
 import pytest
@@ -124,6 +125,183 @@ class TestRemoteLLM:
                 assert result is None
                 mock_remote.assert_called_once()
                 mock_load.assert_called_once()
+
+
+class TestConfiguredLocalModel:
+    def test_download_uses_model_selected_in_config(self, monkeypatch, tmp_path):
+        """A configured local model must override the MiniCPM zero-config fallback."""
+        configured_repo = "bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF"
+        configured_file = "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "llm_repo: bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF\n"
+            "llm_file: Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf\n"
+        )
+        from mnemosyne.core.config import MnemosyneConfig
+        config = MnemosyneConfig(config_path=config_path)
+        monkeypatch.setenv("MNEMOSYNE_LLM_REPO", "env/ignored-by-yaml")
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", "ignored.gguf")
+        monkeypatch.setattr(local_llm, "get_config", lambda: config)
+        monkeypatch.setattr(local_llm, "DEFAULT_MODEL_REPO", "fallback/example")
+        monkeypatch.setattr(local_llm, "DEFAULT_MODEL_FILE", "fallback.gguf")
+        monkeypatch.setattr(local_llm, "MODEL_CACHE_DIR", tmp_path)
+
+        downloaded = tmp_path / configured_file
+        calls = []
+
+        def fake_download(**kwargs):
+            calls.append(kwargs)
+            downloaded.touch()
+            return str(downloaded)
+
+        monkeypatch.setitem(
+            sys.modules,
+            "huggingface_hub",
+            MagicMock(hf_hub_download=fake_download),
+        )
+
+        assert local_llm._download_model() == downloaded
+        assert calls[0]["repo_id"] == configured_repo
+        assert calls[0]["filename"] == configured_file
+        assert Path(calls[0]["local_dir"]).parent == tmp_path
+
+    def test_config_unavailable_keeps_zero_config_fallback(self, monkeypatch):
+        """Missing optional YAML support must not break standalone local LLM use."""
+        monkeypatch.delenv("MNEMOSYNE_LLM_REPO", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_LLM_FILE", raising=False)
+        monkeypatch.setattr(
+            local_llm,
+            "get_config",
+            lambda: (_ for _ in ()).throw(ModuleNotFoundError("No module named 'yaml'", name="yaml")),
+        )
+        monkeypatch.setattr(local_llm, "DEFAULT_MODEL_REPO", "fallback/example")
+        monkeypatch.setattr(local_llm, "DEFAULT_MODEL_FILE", "fallback.gguf")
+
+        assert local_llm._configured_model() == ("fallback/example", "fallback.gguf")
+
+    def test_configured_repo_does_not_reuse_same_filename_from_other_repo(
+        self, monkeypatch, tmp_path
+    ):
+        """A cache entry is scoped to its repository, not only its filename."""
+        configured_repo = "org/new-model"
+        filename = "shared.gguf"
+        config = MagicMock()
+        config.get_str.side_effect = lambda key, default="": {
+            "llm_repo": configured_repo,
+            "llm_file": filename,
+        }.get(key, default)
+        monkeypatch.setattr(local_llm, "get_config", lambda: config)
+        monkeypatch.setattr(local_llm, "MODEL_CACHE_DIR", tmp_path)
+        legacy_file = tmp_path / filename
+        legacy_file.touch()
+
+        assert local_llm._model_path() is None
+
+        calls = []
+
+        def fake_download(**kwargs):
+            calls.append(kwargs)
+            target = Path(kwargs["local_dir"]) / filename
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.touch()
+            return str(target)
+
+        monkeypatch.setitem(
+            sys.modules,
+            "huggingface_hub",
+            MagicMock(hf_hub_download=fake_download),
+        )
+
+        assert local_llm._download_model().name == filename
+        assert calls[0]["repo_id"] == configured_repo
+        assert calls[0]["local_dir"] != str(tmp_path)
+
+    def test_environment_model_is_used_when_config_is_absent(
+        self, monkeypatch, tmp_path
+    ):
+        """A fresh config seeds local-model values from environment variables."""
+        from mnemosyne.core.config import MnemosyneConfig
+
+        configured_repo = "org/environment-model"
+        configured_file = "environment.gguf"
+        monkeypatch.setenv("MNEMOSYNE_LLM_REPO", configured_repo)
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", configured_file)
+        config = MnemosyneConfig(config_path=tmp_path / "config.yaml")
+        monkeypatch.setattr(local_llm, "get_config", lambda: config)
+        monkeypatch.setattr(local_llm, "DEFAULT_MODEL_REPO", "fallback/example")
+        monkeypatch.setattr(local_llm, "DEFAULT_MODEL_FILE", "fallback.gguf")
+
+        assert local_llm._configured_model() == (configured_repo, configured_file)
+
+    def test_zero_config_without_pyyaml_keeps_fallback(self, tmp_path):
+        """No optional YAML dependency must not break standalone local LLM use."""
+        env = os.environ.copy()
+        env.update({
+            "HERMES_HOME": str(tmp_path),
+            "MNEMOSYNE_DATA_DIR": str(tmp_path / "mnemosyne"),
+            "PYTHONPATH": str(Path(__file__).parents[1]),
+        })
+        env.pop("MNEMOSYNE_LLM_REPO", None)
+        env.pop("MNEMOSYNE_LLM_FILE", None)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-S",
+                "-c",
+                "from mnemosyne.core.local_llm import _configured_model; "
+                "print(_configured_model())",
+            ],
+            capture_output=True,
+            env=env,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == (
+            "('openbmb/MiniCPM5-1B-GGUF', 'MiniCPM5-1B-Q4_K_M.gguf')"
+        )
+
+    def test_empty_yaml_does_not_inherit_environment_model(self, tmp_path):
+        """Explicitly blank YAML model settings take precedence over env values."""
+        config_dir = tmp_path / "mnemosyne"
+        config_dir.mkdir()
+        (config_dir / "config.yaml").write_text("llm_repo: ''\nllm_file: ''\n")
+        env = os.environ.copy()
+        env.update({
+            "HERMES_HOME": str(tmp_path),
+            "MNEMOSYNE_DATA_DIR": str(config_dir),
+            "MNEMOSYNE_LLM_REPO": "org/environment-model",
+            "MNEMOSYNE_LLM_FILE": "environment.gguf",
+            "PYTHONPATH": str(Path(__file__).parents[1]),
+        })
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from mnemosyne.core.local_llm import _configured_model; "
+                "print(_configured_model())",
+            ],
+            capture_output=True,
+            env=env,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == (
+            "('openbmb/MiniCPM5-1B-GGUF', 'MiniCPM5-1B-Q4_K_M.gguf')"
+        )
+
+    def test_unrelated_missing_module_is_not_silenced(self, monkeypatch):
+        """Only an unavailable YAML parser is allowed to trigger fallback."""
+        missing = ModuleNotFoundError("No module named 'other_dependency'", name="other_dependency")
+        monkeypatch.setattr(
+            local_llm,
+            "get_config",
+            lambda: (_ for _ in ()).throw(missing),
+        )
+
+        with pytest.raises(ModuleNotFoundError, match="other_dependency"):
+            local_llm._configured_model()
 
 
 class TestSleepPromptOverride:

@@ -12,8 +12,11 @@ Default model: openbmb/MiniCPM5-1B-GGUF (Q4_K_M, ~656MB)
 import os
 import sys
 import re
+from hashlib import sha256
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+from mnemosyne.core.config import get_config
 
 # --- Config ------------------------------------------------------------------
 DEFAULT_MODEL_REPO = "openbmb/MiniCPM5-1B-GGUF"
@@ -24,13 +27,6 @@ LLM_ENABLED = os.environ.get("MNEMOSYNE_LLM_ENABLED", "true").lower() in ("1", "
 LLM_MAX_TOKENS=int(os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "2048") or "2048")
 LLM_N_THREADS = int(os.environ.get("MNEMOSYNE_LLM_N_THREADS", "4"))
 LLM_N_CTX = int(os.environ.get("MNEMOSYNE_LLM_N_CTX", "2048"))
-
-# Override model via env
-_env_repo = os.environ.get("MNEMOSYNE_LLM_REPO")
-_env_file = os.environ.get("MNEMOSYNE_LLM_FILE")
-if _env_repo and _env_file:
-    DEFAULT_MODEL_REPO = _env_repo
-    DEFAULT_MODEL_FILE = _env_file
 
 # Remote API config
 LLM_BASE_URL = os.environ.get("MNEMOSYNE_LLM_BASE_URL", "").rstrip("/")
@@ -77,16 +73,55 @@ def _ensure_sys_path():
         sys.path.append(sp)
 
 
+def _fallback_model() -> Tuple[str, str]:
+    """Return the environment-selected or built-in model without YAML config."""
+    repo = os.environ.get("MNEMOSYNE_LLM_REPO", "").strip()
+    filename = os.environ.get("MNEMOSYNE_LLM_FILE", "").strip()
+    if repo and filename:
+        return repo, filename
+    return DEFAULT_MODEL_REPO, DEFAULT_MODEL_FILE
+
+
+def _configured_model() -> Tuple[str, str]:
+    """Return the configured local model, or the zero-config fallback.
+
+    ``MnemosyneConfig`` owns YAML > environment > hardcoded-default precedence.
+    Keeping the MiniCPM constants as the final fallback preserves standalone,
+    zero-config behavior while allowing configured installations to select a
+    different local GGUF model.
+    """
+    try:
+        config = get_config()
+    except ModuleNotFoundError as error:
+        if error.name == "yaml":
+            return _fallback_model()
+        raise
+
+    repo = config.get_str("llm_repo").strip()
+    filename = config.get_str("llm_file").strip()
+    if repo and filename:
+        return repo, filename
+    return DEFAULT_MODEL_REPO, DEFAULT_MODEL_FILE
+
+
+def _model_cache_dir(repo: str) -> Path:
+    """Return the repository-scoped cache directory for a local model."""
+    return MODEL_CACHE_DIR / sha256(repo.encode("utf-8")).hexdigest()[:16]
+
+
 def _model_path() -> Optional[Path]:
-    """Return path to the local GGUF model file, or None if not downloaded."""
-    candidate = MODEL_CACHE_DIR / DEFAULT_MODEL_FILE
+    """Return path to the configured local GGUF model file, or None."""
+    repo, filename = _configured_model()
+    candidate = _model_cache_dir(repo) / filename
     return candidate if candidate.exists() else None
 
 
 def _download_model() -> Path:
-    """Download the GGUF model from HuggingFace if not present."""
-    MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    local_path = MODEL_CACHE_DIR / DEFAULT_MODEL_FILE
+    """Download the configured local GGUF model from HuggingFace if absent."""
+    repo, filename = _configured_model()
+    cache_dir = _model_cache_dir(repo)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    local_path = cache_dir / filename
     if local_path.exists():
         return local_path
 
@@ -98,9 +133,9 @@ def _download_model() -> Path:
         )
 
     downloaded = hf_hub_download(
-        repo_id=DEFAULT_MODEL_REPO,
-        filename=DEFAULT_MODEL_FILE,
-        local_dir=str(MODEL_CACHE_DIR),
+        repo_id=repo,
+        filename=filename,
+        local_dir=str(cache_dir),
         local_dir_use_symlinks=False,
     )
     return Path(downloaded)

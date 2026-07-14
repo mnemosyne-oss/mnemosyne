@@ -9,6 +9,12 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Configured local LLM model is now honored.** Local consolidation uses
+  `llm_repo` and `llm_file` from `config.yaml` (or their environment-variable
+  equivalents when YAML config is unavailable), preserves zero-config operation
+  without PyYAML, and scopes cached GGUF files by repository to prevent
+  same-filename cache collisions.
+
 - **Hermes provider safety defaults after config bridging.** New auto-seeded
   configs now preserve user-only autosave and skip `cron`, `flush`, `subagent`,
   `background`, and `skill_loop` contexts. Existing 3.12.1/3.12.2 auto-seeded
