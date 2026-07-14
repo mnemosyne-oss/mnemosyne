@@ -18,7 +18,6 @@ Usage:
 """
 
 from typing import List, Dict, Callable, Optional
-import math
 
 
 def _jaccard_similarity(text_a: str, text_b: str) -> float:

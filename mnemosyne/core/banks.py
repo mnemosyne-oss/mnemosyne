@@ -25,7 +25,7 @@ import os
 import shutil
 import sqlite3
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 # On Fly.io and other ephemeral VMs, only ~/.hermes is persisted.
 _DEFAULT_ROOT = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))

@@ -1,12 +1,10 @@
 
-import re
 
 def orchestrate_recall(query: str, conn, top_k=20, **kwargs):
     """
     Expert retrieval orchestrator for high-reasoning tasks.
     """
     # 1. Base Recall - call the connection's internal search logic
-    from mnemosyne.core.beam import BeamMemory
     # This is a hacky way to access the base functionality without wrapping it
     # We should have a proper _internal_recall method on BeamMemory
     results = []

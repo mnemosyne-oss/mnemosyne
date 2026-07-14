@@ -15,9 +15,9 @@ import uuid
 import os
 import base64
 import threading
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Any, Tuple, Union
+from typing import List, Dict, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +100,6 @@ class SyncEncryption:
         Returns (key, salt) — salt is random if not provided, so
         callers should store it alongside the ciphertext.
         """
-        import hashlib as _hlib
 
         if salt is None:
             salt = os.urandom(16)
@@ -215,8 +214,8 @@ class SyncEncryption:
                         key = base64.urlsafe_b64decode(key_source + "==")
                     except Exception:
                         raise ValueError(
-                            f"key_source is neither a file path nor a valid "
-                            f"base64-encoded key"
+                            "key_source is neither a file path nor a valid "
+                            "base64-encoded key"
                         )
         elif "MNEMOSYNE_SYNC_KEY" in os.environ:
             raw = os.environ["MNEMOSYNE_SYNC_KEY"].strip()
@@ -864,7 +863,6 @@ class SyncEngine:
             next_cursor = events[-1].timestamp
             # Ensure cursor is past the last returned event
             if has_more:
-                import uuid as _uuid
                 next_cursor = events[-1].timestamp
 
         return {

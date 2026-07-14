@@ -30,7 +30,7 @@ import sqlite3
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 LEGACY_DATA_DIR = Path.home() / ".hermes" / "mnemosyne" / "data"
 DEFAULT_DATA_DIR = Path(os.environ.get("MNEMOSYNE_DATA_DIR", LEGACY_DATA_DIR))

@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
 

@@ -20,13 +20,12 @@ import logging
 import sqlite3
 import json
 import hashlib
-import logging
 import threading
 import math
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Any, Set, Union, Tuple
+from typing import List, Dict, Optional, Any, Set, Union, Tuple, Callable
 from pathlib import Path
 
 
@@ -1999,7 +1998,7 @@ def _cjk_like_search(conn: sqlite3.Connection, query: str, k: int = 20, working:
         id_col = "rowid"
 
     # Build parameterized LIKE clauses for each CJK character
-    conditions = " OR ".join(f"content LIKE ? ESCAPE '\\'" for _ in cjk_chars)
+    conditions = " OR ".join("content LIKE ? ESCAPE '\\'" for _ in cjk_chars)
     params = [f"%{ch}%" for ch in cjk_chars]
     # Also search for mixed CJK+ASCII: any of the CJK chars must be present
     try:
@@ -5946,7 +5945,6 @@ class BeamMemory:
         if _os.environ.get("MNEMOSYNE_ENHANCED_RECALL", "0") != "1":
             return self.recall(query, top_k=top_k, **kwargs)
 
-        import json as _json
 
         original_query = query
         expanded_query = query

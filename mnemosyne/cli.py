@@ -88,7 +88,7 @@ def cmd_recall(args):
         print(f"  Content: {content[:150]}{'...' if len(content) > 150 else ''}")
         print(f"  Score: {score:.3f}")
         if r.get("entity_match"):
-            print(f"  [entity match]")
+            print("  [entity match]")
         print()
 
 
@@ -355,14 +355,14 @@ def _print_sync_result(result: dict) -> None:
 
     push = result.get("push")
     if push is not None:
-        print(f"  Push:")
+        print("  Push:")
         print(f"    Accepted:   {push.get('accepted', 0)}")
         print(f"    Duplicates: {push.get('duplicates', 0)}")
         print(f"    Conflicts:  {push.get('conflicts', 0)}")
 
     pull = result.get("pull")
     if pull is not None:
-        print(f"  Pull:")
+        print("  Pull:")
         print(f"    Events fetched: {pull.get('events_fetched', 0)}")
         print(f"    Accepted:       {pull.get('accepted', 0)}")
         print(f"    Duplicates:     {pull.get('duplicates', 0)}")
@@ -390,7 +390,6 @@ def cmd_sync_serve(args):
     parsed = parser.parse_args(args)
 
     mem = _get_memory()
-    from mnemosyne.core.sync import SyncEngine as _SyncEngine
     from mnemosyne.core.sync_server import run_sync_server as _run_server
 
     _run_server(
@@ -440,7 +439,7 @@ def cmd_sync_status(args):
 
     op_breakdown = status.get("operation_breakdown", {})
     if op_breakdown:
-        print(f"\n  Operations breakdown:")
+        print("\n  Operations breakdown:")
         for op, cnt in sorted(op_breakdown.items(), key=lambda x: -x[1]):
             print(f"    {op}: {cnt}")
 
@@ -458,7 +457,7 @@ def cmd_sync_status(args):
                 print(f"  Remote events:    {pull_info.get('events_fetched', 'N/A')}")
             errors = remote_st.get("errors", [])
             if errors:
-                print(f"  Remote errors:")
+                print("  Remote errors:")
                 for err in errors:
                     print(f"    - {err}")
 
@@ -468,7 +467,7 @@ def cmd_sync_generate_key(args):
     from mnemosyne.core.sync import SyncEncryption as _Enc
     key = _Enc.generate_key()
     print(key)
-    print(f"\nStore this key securely. It is the only way to decrypt synced payloads.", file=sys.stderr)
+    print("\nStore this key securely. It is the only way to decrypt synced payloads.", file=sys.stderr)
 
 
 def cmd_backup(args):

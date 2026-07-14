@@ -31,7 +31,7 @@ import json
 import os
 import sqlite3
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,7 +40,6 @@ try:
 except ImportError:  # numpy is required by other voices too; guard for parity
     np = None
 
-from mnemosyne.core.typed_memory import classify_memory, MemoryType, get_type_priority
 from mnemosyne.core.episodic_graph import EpisodicGraph
 from mnemosyne.core.veracity_consolidation import (
     VeracityConsolidator,
@@ -373,7 +372,7 @@ class PolyphonicRecallEngine:
                         # caught the silent EM-starvation regression.
                         em_consumed_via_vec_episodes = bool(em_rows_via_vec)
             except (ImportError, AttributeError,
-                    sqlite3.Error, ValueError, TypeError) as exc:
+                    sqlite3.Error, ValueError, TypeError):
                 # Broader catch than the original tuple -- partial
                 # imports can surface as AttributeError, corrupt DB
                 # state as sqlite3.DatabaseError (other Error

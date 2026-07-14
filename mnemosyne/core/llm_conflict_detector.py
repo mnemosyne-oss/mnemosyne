@@ -8,11 +8,9 @@ import os
 import re
 import json
 import logging
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime
+from typing import Optional, Tuple
 from pathlib import Path
 
-from mnemosyne.core.llm_backends import call_host_llm, get_host_llm_backend
 from mnemosyne.core.cost_log import log_cost
 
 logger = logging.getLogger(__name__)

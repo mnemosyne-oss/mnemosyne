@@ -12,12 +12,7 @@ This covers the "agent extraction" use case:
 - User runs `hermes mnemosyne import --file export.json` to ingest
 """
 
-import json
-from datetime import datetime
-from typing import List, Dict, Optional, Any
-from pathlib import Path
 
-from mnemosyne.core.importers.base import BaseImporter, ImporterResult
 
 
 # Known provider metadata for script generation

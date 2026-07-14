@@ -11,8 +11,7 @@ Usage:
 All imports are guarded — this module loads safely even if mcp is not installed.
 """
 
-from typing import Dict, Any, List, Optional
-import json
+from typing import Dict, Any, List
 import os
 from pathlib import Path
 

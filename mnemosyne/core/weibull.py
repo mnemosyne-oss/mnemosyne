@@ -20,7 +20,7 @@ Usage:
 
 import math
 from datetime import datetime, timezone
-from typing import Optional, Union
+from typing import Optional
 
 
 # Per-memory-type Weibull parameters (k=shape, eta=scale in hours)

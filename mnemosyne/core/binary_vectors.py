@@ -20,9 +20,8 @@ Benefits:
 """
 
 import numpy as np
-import json
 import sqlite3
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict
 from pathlib import Path
 
 # --- Configuration ---
@@ -352,13 +351,13 @@ if __name__ == "__main__":
     query = test_embeddings[0]
     results = store.search(query, top_k=3)
     
-    print(f"Query vector matches itself:")
+    print("Query vector matches itself:")
     print(f"  Top result: {results[0]['memory_id']} (score: {results[0]['score']:.4f})")
     print(f"  Distance: {results[0]['distance']} / {EMBEDDING_DIM}")
     
     # Stats
     stats = store.get_stats()
-    print(f"\nStorage Stats:")
+    print("\nStorage Stats:")
     print(f"  Total vectors: {stats['total_vectors']}")
     print(f"  Bytes per vector: {stats['avg_bytes_per_vector']}")
     print(f"  Compression ratio: {stats['compression_ratio']:.2%}")

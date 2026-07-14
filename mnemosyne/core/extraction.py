@@ -21,22 +21,12 @@ content does not create near-duplicate facts in the facts table.
 
 import logging
 import os
-from typing import List, Optional
+from typing import List
 
 logger = logging.getLogger(__name__)
 
 # Reuse local_llm infrastructure
 from mnemosyne.core import local_llm
-from mnemosyne.core.local_llm import (
-    llm_available,
-    _call_remote_llm,
-    _load_llm,
-    _try_host_llm,
-    LLM_BASE_URL,
-    LLM_ENABLED,
-    LLM_MAX_TOKENS,
-    _clean_output,
-)
 
 # --- Config ------------------------------------------------------------------
 EXTRACTION_PROMPT_TEMPLATE = os.environ.get(

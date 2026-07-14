@@ -277,7 +277,7 @@ def auto_fix(entries: List[Dict] = None, dry_run: bool = False) -> Dict:
             print(f"   ❌ Failed: {e.stderr.strip()[:200]}")
         except FileNotFoundError:
             result["failed"].append({"label": label, "error": "pip not found"})
-            print(f"   ❌ pip not found in PATH")
+            print("   ❌ pip not found in PATH")
 
     return result
 

@@ -22,7 +22,7 @@ from pathlib import Path
 import os
 
 from mnemosyne.core import embeddings as _embeddings
-from mnemosyne.core.beam import BeamMemory, init_beam, _get_connection as _beam_get_connection
+from mnemosyne.core.beam import BeamMemory, init_beam
 _thread_local = threading.local()
 
 # Default data directory
