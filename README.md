@@ -1,3 +1,5 @@
+> ⚠️ **Personal note** — I'm navigating a difficult personal situation, but I've got the right counsel in place and we're moving forward safely. ❤️
+
 <div align="center">
 
 <img src="/assets/mnemosyne.jpg" alt="Mnemosyne" width="40%">

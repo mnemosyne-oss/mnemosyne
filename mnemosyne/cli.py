@@ -69,10 +69,25 @@ def _parse_int(value: str, name: str) -> int:
         _fail(f"{name} must be an integer: {value}")
 
 
+def _resolve_bank_name(bank_override: str | None = None) -> str:
+    """Resolve the selected memory bank from an override or MNEMOSYNE_BANK."""
+    value = bank_override if bank_override is not None else os.environ.get("MNEMOSYNE_BANK", "")
+    return value.strip() or "default"
+
+
 def _get_memory():
-    """Get a Mnemosyne v2 instance."""
+    """Get a Mnemosyne v2 instance, honoring MNEMOSYNE_BANK."""
     from mnemosyne.core.memory import Mnemosyne
-    return Mnemosyne(db_path=os.path.join(DATA_DIR, "mnemosyne.db"))
+    from mnemosyne.core.banks import BankManager
+
+    bank = _resolve_bank_name()
+    bm = BankManager(Path(DATA_DIR))
+    try:
+        db_path = bm.get_bank_db_path(bank)
+    except ValueError as e:
+        _fail(str(e))
+
+    return Mnemosyne(db_path=str(db_path), bank=bank)
 
 
 def _resolve_default_scope() -> str:
@@ -792,6 +807,13 @@ def cmd_bank(args):
     try:
         if subcmd == "list":
             banks = bm.list_banks()
+            # CLI output should reflect on-disk state: if the default
+            # bank file does not exist yet, suppress the phantom
+            # virtual 'default' entry here while keeping BankManager's
+            # core virtual-default contract unchanged.
+            default_db = bm.get_bank_db_path("default")
+            if not default_db.exists():
+                banks = [b for b in banks if b != "default"]
             print("\nMemory Banks:\n")
             for b in banks:
                 print(f"  - {b}")
@@ -1236,6 +1258,53 @@ def cmd_config(args):
         _fail(f"Unknown config subcommand: {sub}. Use 'reload', 'get', 'set', or 'migrate'.")
 
 
+def cmd_migrate(args):
+    """Add the 3.11.1 schema tables to an existing bank.
+
+    Bank selection: ``--bank <name>`` flag, else ``$MNEMOSYNE_BANK``,
+    else the default bank.
+    """
+    usage = "Usage: mnemosyne migrate [--bank <name>]"
+    bank_override = None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--bank":
+            if i + 1 >= len(args) or args[i + 1].startswith("--"):
+                _usage(usage)
+            bank_override = args[i + 1]
+            i += 2
+        else:
+            _usage(usage)
+
+    bank = _resolve_bank_name(bank_override)
+
+    from mnemosyne.core.banks import BankManager
+    from mnemosyne.migrations.e7_311_tables import migrate_311_tables
+
+    bm = BankManager(Path(DATA_DIR))
+    try:
+        db_path = bm.get_bank_db_path(bank)
+    except ValueError as e:
+        _fail(str(e))
+
+    if not db_path.exists():
+        _fail(f"Bank '{bank}' does not exist (no db at {db_path})", exit_code=1)
+
+    try:
+        report = migrate_311_tables(db_path)
+    except Exception as e:
+        _fail(f"Migration failed: {e}", exit_code=1)
+
+    print(f"migrate 311: bank={bank} db={db_path}")
+    print(f"  tables added: {', '.join(report['tables_added']) or '(none)'}")
+    print(
+        "  tables already present: "
+        f"{', '.join(report['tables_already_present']) or '(none)'}"
+    )
+    print(f"  indices added: {report['indices_added']}")
+
+
 COMMANDS = {
     "store": cmd_store,
     "remember": cmd_store,
@@ -1266,6 +1335,7 @@ COMMANDS = {
     "sync-server": cmd_sync_serve,
     "sync-status": cmd_sync_status,
     "sync-generate-key": cmd_sync_generate_key,
+    "migrate": cmd_migrate,
     "hygiene": cmd_hygiene,
     "profile": cmd_profile,
     "config": cmd_config,
@@ -1305,6 +1375,7 @@ def run_cli():
         print("  sync-status [--remote <url>] [--json]")
         print("                                      Show sync status")
         print("  sync-generate-key                    Generate encryption key")
+        print("  migrate [--bank <name>]                Add 3.11.1 schema tables to an existing bank")
         print("  hygiene audit|clean                  Noise audit and safe cleanup")
         print("  profile list|apply|show|create       Config templates (gamified)")
         print("  config reload|get|set|migrate         Manage config.yaml")

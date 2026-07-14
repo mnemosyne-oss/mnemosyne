@@ -68,6 +68,28 @@ _DEFAULT_MODEL = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "BAAI/bge-small-en-
 _embedding_model = None
 _API_CALL_COUNT = 0
 
+# (1) Prefix support — read at call time so env changes and test fixtures take effect
+# without a module reload. The _PREFIXES_LOGGED guard suppresses log spam.
+_PREFIXES_LOGGED = False
+
+
+def _get_prefix(kind: str) -> str:
+    """Model prompt prefixes (e.g. E5 'query: '/'passage: ', EmbeddingGemma retrieval
+    prompts). Applied VERBATIM — no trimming, no separator magic — because trailing
+    whitespace is part of the trained prompt for several models."""
+    var = ("MNEMOSYNE_EMBEDDING_QUERY_PREFIX" if kind == "query"
+           else "MNEMOSYNE_EMBEDDING_DOC_PREFIX")
+    prefix = os.environ.get(var, "")
+    global _PREFIXES_LOGGED
+    if prefix and not _PREFIXES_LOGGED:
+        import logging
+        logging.getLogger(__name__).info(
+            "embedding prefixes active: query=%r doc=%r",
+            os.environ.get("MNEMOSYNE_EMBEDDING_QUERY_PREFIX", ""),
+            os.environ.get("MNEMOSYNE_EMBEDDING_DOC_PREFIX", ""))
+        _PREFIXES_LOGGED = True
+    return prefix
+
 
 def _is_disabled() -> bool:
     """True when dense retrieval has been opted out via env var.
@@ -274,44 +296,47 @@ def available_api() -> bool:
     return bool(_OPENAI_API_KEY)
 
 
-@lru_cache(maxsize=512)
+# (2) embed_query: apply query prefix verbatim, then delegate to a cached inner
+#     function keyed on the PREFIXED text. Keying on prefixed text (rather than raw)
+#     prevents stale vectors if the prefix env var changes within a process.
 def embed_query(text: str) -> Optional[np.ndarray]:
     """Encode a single query text into a dense vector."""
     if not text:
         return None
+    return _embed_query_cached(_get_prefix("query") + text)
 
+
+@lru_cache(maxsize=512)
+def _embed_query_cached(prefixed: str) -> Optional[np.ndarray]:
     if _is_api_model(_DEFAULT_MODEL):
-        result = _embed_api([text])
+        result = _embed_api([prefixed])
         return result[0] if result is not None else None
 
     model = _get_model()
     if model is None or model == "api":
         return None
-    vectors = list(model.embed([text]))
+    vectors = list(model.embed([prefixed]))
     if not vectors:
         return None
     return vectors[0].astype(np.float32)
 
 
+# (3) embed: apply DOC prefix to every text. Removed the single-text delegation to
+#     embed_query — that path stamped the query prefix onto stored documents.
 def embed(texts: List[str]) -> Optional[np.ndarray]:
-    """Encode texts into dense vectors."""
+    """Encode texts (documents) into dense vectors."""
     if not texts:
         return None
+    doc_prefix = _get_prefix("doc")
+    prefixed = [doc_prefix + t for t in texts]
 
     if _is_api_model(_DEFAULT_MODEL):
-        return _embed_api(texts)
-
-    # Use cached single-query path for common case of 1 text
-    if len(texts) == 1:
-        v = embed_query(texts[0])
-        if v is None:
-            return None
-        return np.stack([v])
+        return _embed_api(prefixed)
 
     model = _get_model()
     if model is None or model == "api":
         return None
-    vectors = list(model.embed(texts))
+    vectors = list(model.embed(prefixed))
     return np.stack(vectors).astype(np.float32)
 
 

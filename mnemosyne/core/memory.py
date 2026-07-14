@@ -99,14 +99,15 @@ def init_db(db_path: Path = None):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON memories(timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_source ON memories(source)")
 
-    # Legacy embeddings table
+    # Legacy embeddings table — no FK to memories(id) (see beam.py DDL).
+    # The FK was removed because working_memory ids (not memories ids)
+    # are stored here, making the constraint invalid. See issue #451.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS memory_embeddings (
             memory_id TEXT PRIMARY KEY,
             embedding_json TEXT NOT NULL,
             model TEXT DEFAULT 'bge-small-en-v1.5',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
@@ -137,6 +138,10 @@ class Mnemosyne:
     def __init__(self, session_id: str = "default", db_path: Path = None, bank: str = None,
                  author_id: str = None, author_type: str = None,
                  channel_id: str = None):
+        # Auto-seed config.yaml on first Mnemosyne init
+        from mnemosyne.core.config import get_config
+        get_config()  # triggers _seed() if config.yaml doesn't exist
+
         self.session_id = session_id
         self.bank = bank or "default"
         self.author_id = author_id
@@ -430,6 +435,20 @@ class Mnemosyne:
         Supports temporal scoring: temporal_weight, query_time, temporal_halflife.
         Supports scoring weight overrides: vec_weight, fts_weight, importance_weight.
         """
+        import os as _os
+        if _os.environ.get("MNEMOSYNE_ENHANCED_RECALL", "0") == "1":
+            return self.beam.recall_enhanced(query, top_k=top_k,
+                                             from_date=from_date, to_date=to_date,
+                                             source=source, topic=topic,
+                                             author_id=author_id, author_type=author_type,
+                                             channel_id=channel_id,
+                                             temporal_weight=temporal_weight,
+                                             query_time=query_time,
+                                             temporal_halflife=temporal_halflife,
+                                             vec_weight=vec_weight,
+                                             fts_weight=fts_weight,
+                                             importance_weight=importance_weight,
+                                             explain=explain)
         return self.beam.recall(query, top_k=top_k,
                                 from_date=from_date, to_date=to_date,
                                 source=source, topic=topic,

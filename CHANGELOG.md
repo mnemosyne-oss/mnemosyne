@@ -7,37 +7,214 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Hermes provider safety defaults after config bridging.** New auto-seeded
+  configs now preserve user-only autosave and skip `cron`, `flush`, `subagent`,
+  `background`, and `skill_loop` contexts. Existing 3.12.1/3.12.2 auto-seeded
+  files are not rewritten because their values may have come from explicit
+  environment variables. To adopt the safer defaults explicitly, run:
+
+  ```bash
+  mnemosyne config set sync_roles user
+  mnemosyne config set skip_contexts cron,flush,subagent,background,skill_loop
+  ```
+
+- **Migrate legacy `memory_embeddings` FK on database init (#451).**
+  Databases created by the old `memory.py` DDL carried a
+  `FOREIGN KEY (memory_id) REFERENCES memories(id)` constraint on
+  `memory_embeddings`. The `memories` table is unused — working_memory
+  ids are stored instead. When `PRAGMA foreign_keys=ON` was enabled
+  (#408), every embedding insert silently failed with
+  `IntegrityError: FOREIGN KEY constraint failed`. This release adds
+  an idempotent migration that rebuilds the table without the FK
+  and removes the FK from the `memory.py` DDL so fresh
+  databases are clean.
+
+## [3.12.0] — 2026-07-11
+
+### Added
+
+- **Config.yaml system with profiles, hot-reload, and write filters.**
+  Mnemosyne now supports profile-based configuration, hot-reloading config
+  changes without restart, and write filters for fine-grained control over
+  what gets stored. (#431, #433)
+
+- **`MNEMOSYNE_CROSS_SESSION` env var for cross-session recall.**
+  When set, `recall()` searches across all sessions instead of only the
+  current one. (#371)
+
+- **Atomic `mnemosyne_batch` tool.** Batch multiple memory operations
+  (remember, update, forget, invalidate) in a single atomic transaction
+  via the Hermes provider. (#400)
+
+- **Sync turn diagnostics.** `sync_turn` now exposes diagnostic information
+  for debugging sync pipeline issues. (#115162b)
+
+- **Read-only doctor hygiene signals.** The doctor diagnostic tool now
+  reports hygiene signals (foreign key gaps, orphaned rows, stale
+  connections) without requiring write access. (#71e013d)
+
+- **Orphan diagnostics to doctor.** Doctor now detects orphaned memory
+  rows with no corresponding FTS5 or embedding entries. (#417)
+
+- **CLI bank selection, bank list, and schema migration.**
+  `mnemosyne store` and other CLI commands now honor `MNEMOSYNE_BANK`.
+  New `mnemosyne bank list` command for multi-tenant visibility.
+  New `mnemosyne migrate` command for 3.11.0-era banks. (#404)
+
+- **Hermes memory providers skill v2.0.0.** Bundled skill for the Hermes
+  ecosystem documenting all memory providers. (#4ee3a58)
+
+- **Zero and Pi agent integrations.** Mnemosyne now integrates with the Zero
+  agent framework and Pi agent. (#418, #c0a7176)
+
+- **Layered agent memory roadmap.** Architecture document defining the
+  L0-L4 memory layer model for AI agents. (#96e6978)
+
+### Fixed
+
+- **`MNEMOSYNE_ENHANCED_RECALL=1` now routes through the full enhanced
+  recall pipeline.** `Mnemosyne.recall()` always called `beam.recall()`
+  directly, bypassing `beam.recall_enhanced()` entirely. The flag had zero
+  effect on production call paths. Now routes to `recall_enhanced()` when
+  the flag is set. (#436, reported by @ValentinSergief with full RCA)
+
+- **SSE transport Route handlers no longer crash Starlette.** Route
+  handlers returning `None` caused Starlette crashes in SSE transport
+  mode. (#383)
+
+- **Diagnostics fallback DB path now respects `HERMES_HOME`.**
+  The diagnostics tool used a hardcoded fallback path instead of
+  resolving from `HERMES_HOME`. (#384)
+
+- **Veracity forwarding through `Mnemosyne.remember()`.** The module-level
+  `remember()` function now forwards the veracity argument to the
+  underlying beam, fixing the MCP remember handler silently dropping
+  veracity. (#399, #386)
+
+- **Namespace collision: `tools/` renamed to `_benchmarks/`.** The
+  `tools/` directory collided with `hermes-agent` tool discovery.
+  Renamed to avoid the conflict. (#9ca278a)
+
+- **Profile bank resolution in standalone CLI.** CLI commands loaded
+  standalone now correctly resolve the profile bank. (#6725b80)
+
+- **ASGI middleware replaced with pure-ASGI bearer auth.** Replaced
+  `BaseHTTPMiddleware` with a pure-ASGI approach for bearer auth in
+  MCP SSE transport, fixing Mount compatibility. (#be8c865)
+
+- **Current-state recall ranking.** Fixed a bug where recall ranking
+  used stale scores instead of current-state values. (#416)
+
+- **Bank name validation before path operations.** Bank names are now
+  validated before any filesystem path operations, preventing directory
+  traversal and invalid characters. (#415)
+
+- **SQLite write lock released across consolidation LLM calls.**
+  `BeamMemory` no longer holds the SQLite write lock while waiting for
+  LLM consolidation responses, preventing WAL checkpoint blocking.
+  (#432, reported by @kirocop in #382)
+
+- **Recall-touch transaction rolled back on failure.** The recall-touch
+  UPDATE now properly rolls back the transaction on failure instead of
+  leaving a stale write lock. (#f418044)
+
+- **`PRAGMA foreign_keys=ON` in both connection factories.**
+  Foreign key enforcement is now enabled in both the main and the
+  thread-local connection factories. (#408, reported by @Iman-Sharif)
+
+- **Hygiene audit CLI and table handling hardened.** The doctor CLI
+  now handles edge cases in table detection and reporting. (#f072e1a)
+
+- **Host LLM timeout now configurable.** Added `MNEMOSYNE_LLM_TIMEOUT`
+  env var (default 60s) for remote LLM consolidation and extraction
+  calls. (#d290193)
+
+- **Hermes provider fixes (6 commits):**
+  - Auto-sleep default enabled across both provider surfaces (#429)
+  - Bundled memory override skill installer (#424)
+  - Cross-session recall and CLI default scope (#422)
+  - Pip sync adapter parity with core (#419)
+  - L3 persona prompt parity restored (#ed05503)
+  - `HERMES_HOME` leak in CLI bank test (#6664e81)
+
 ### Changed
 
 - **Default prompt context excludes consolidated working-memory rows.**
   `BeamMemory.get_context()` no longer includes rows where
-  `consolidated_at IS NOT NULL`, preventing already-consolidated originals
-  from competing with hot unconsolidated memories in the context window.
-  Consolidated rows remain fully recallable through `recall()`. Set
-  `MNEMOSYNE_CONTEXT_INCLUDE_CONSOLIDATED=1` to temporarily restore legacy
-  injection behavior (truthy values: `1`, `true`, `yes`, `on`).
+  `consolidated_at IS NOT NULL`. Set `MNEMOSYNE_CONTEXT_INCLUDE_CONSOLIDATED=1`
+  to restore legacy behavior. (#427)
 
-## [3.11.1] — 2026-07-01
+### Documentation
+
+- Installation steps revised for Hermes users (#414, @bruvv)
+- Pi agent integration docs added (#c0a7176)
+- Hermes Tweet compatibility table (#e032008, @Burak Bayır)
+- `.coderabbit.yaml` with grouped reviews and architectural rigor (#da4832a)
+
+### Thanks
+
+@dplush (Denis H) — 11 commits: sync diagnostics, recall ranking, bank validation,
+orphan detection, auto-sleep, cross-session recall, batch tool, L3 persona,
+hygiene audit, veracity forwarding, pip sync parity
+
+@codxt — 3 commits: CLI bank selection + migration, ASGI middleware fix,
+layered memory roadmap
+
+@Milgauss — 2 commits: SQLite write lock fix, recall-touch rollback
+
+@TurgutKural — 2 commits: profile bank resolution, host LLM timeout
+
+@ValentinSergief — thorough ENHANCED_RECALL RCA with file+line references
+
+@PlainWu, @ClaytonChew, @bruvv, @justanotherAIcontributor, @BurakBayır,
+@Iman-Sharif, @webtecnica — bug reports, fixes, and docs improvements
+
+## [3.12.1] — 2026-07-11
+
+### Added
+
+- **Config.yaml auto-seed on first access.** Mnemosyne now creates a
+  `config.yaml` at the standard location with all 106 known keys and their
+  default values. The file is created automatically on first access — no
+  manual setup needed. For each key, if the corresponding env var is set,
+  its value is used instead of the default, ensuring existing env var
+  configurations are never silently overridden. Hot-reload with
+  `mnemosyne config reload`. Precedence unchanged: config.yaml > env vars
+  > hardcoded defaults.
 
 ### Fixed
 
-- **Polyphonic recall to_date filter excludes the bound day.** The
-  polyphonic path compared ISO timestamps against bare `to_date` with raw
-  lexical `>`, so `2026-06-29T10:30:00 > 2026-06-29` evaluated True and the
-  entire bound day was dropped. Now appends `T23:59:59` to the bound,
-  matching the linear path. (#390, reported by @NodeGuy)
+- **Config.yaml auto-seed respects existing env vars.** The initial
+  implementation wrote all defaults blindly, which would silently override
+  any `MNEMOSYNE_*` env vars the user had set (since config.yaml takes
+  precedence over env vars). Now each key checks for an active env var
+  before writing. Type coercion is applied: env var strings are parsed as
+  bool/int/float to match the default type.
 
-- **MCP remember handler silently drops veracity.** `_handle_remember()`
-  accepted veracity in the tool schema but never extracted it from arguments
-  or passed it to `mem.remember()`. Every MCP remember call stored
-  `veracity: "unknown"` regardless of what was passed. Now properly forwards
-  the veracity argument. (#386, reported by @freeformz)
+## [3.12.2] — 2026-07-11
 
-- **mnemosyne-hermes CLI crashes on fresh install.** The 0.3.0 release had
-  two bugs: the CLI entry point was broken by a function rename in
-  install.py, and eager imports from `mnemosyne.core` crashed when core
-  wasn't in the pipx venv. Fixed by restoring the entry point and converting
-  to lazy imports. (#388, reported by @SeaXen, fixed by @dplush in #391)
+### Fixed
+
+- **Config reload now bridges to the Hermes provider.** `mnemosyne config
+  set` and `mnemosyne config reload` previously wrote to the Mnemosyne
+  config.yaml but the Hermes provider only read from the Hermes config.yaml
+  (`memory.mnemosyne.<key>`). The two files never connected, so config
+  changes appeared to do nothing. Now the provider falls back to the
+  Mnemosyne config singleton when the Hermes config has no value, and
+  `MnemosyneConfig.get()` auto-reloads on file mtime changes so `config set`
+  takes effect immediately without an explicit reload.
+
+- **Config.yaml auto-seed on all entry points.** The auto-seed now fires on
+  `Mnemosyne()` and `BeamMemory()` init, not just explicit config imports.
+  Idempotent — checks file existence first.
+
+- **Test isolation for config auto-seed.** Config profile tests now create
+  an empty config.yaml before init so the auto-seed doesn't override test
+  env vars with defaults.
+
+## [Unreleased]
 
 ## [3.11.0] — 2026-06-30
 

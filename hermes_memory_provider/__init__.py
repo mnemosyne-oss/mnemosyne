@@ -1580,8 +1580,27 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         return False
 
     def _read_config_key(self, key: str) -> Any:
-        """Read a single key from memory.mnemosyne in config.yaml."""
-        return read_hermes_config_key(getattr(self, "_hermes_home", None), key)
+        """Read a single key, checking Hermes config first, then Mnemosyne config.
+
+        Precedence: Hermes config.yaml (memory.mnemosyne.<key>) > Mnemosyne
+        config.yaml > env var > hardcoded default.
+
+        This bridges the two config systems so that ``mnemosyne config set``
+        and ``mnemosyne config reload`` actually affect the running provider.
+        """
+        from mnemosyne.core.config import get_config
+
+        # 1. Hermes config (memory.mnemosyne.<key>)
+        val = read_hermes_config_key(getattr(self, "_hermes_home", None), key)
+        if val is not None:
+            return val
+
+        # 2. Mnemosyne config singleton (auto-reloads on file change)
+        val = get_config().get(key)
+        if val is not None:
+            return val
+
+        return None
 
     def _configured_tool_schemas(self) -> List[Dict[str, Any]]:
         """Return schemas filtered by memory.mnemosyne.tools, if configured.

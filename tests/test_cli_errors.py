@@ -133,9 +133,14 @@ def test_import_reports_actual_imported_memory_counts(tmp_path):
 
 
 def test_bank_cli_list_create_delete_uses_configured_data_dir(tmp_path):
+    # After [Issue 2] fix: when no mnemosyne.db exists on disk and
+    # no bank subdirs exist,  must NOT report a phantom
+    #  bank. (The old assertion asserted the buggy behavior.)
     result = run_cli(["bank", "list"], tmp_path)
     assert result.returncode == 0, result.stderr
-    assert "default" in result.stdout
+    assert "  - default" not in result.stdout, (
+        f"bank list reported a phantom 'default' bank: {result.stdout!r}"
+    )
     assert "Traceback" not in result.stderr
 
     result = run_cli(["bank", "create", "project_a"], tmp_path)

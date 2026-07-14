@@ -88,6 +88,16 @@ These are not mandates — just directions where help would be valuable:
 - **Issues & bugs:** [GitHub Issues](https://github.com/AxDSan/mnemosyne/issues)
 - **Feature ideas & questions:** [Join our Discord](https://discord.gg/Cgzpw9x3R) or open an issue
 
+## Contributor License Agreement (CLA)
+
+All new contributions require signing the [Contributor License Agreement](CLA.md). This is effective as of 2026-07-13.
+
+The CLA grants the project a license to use, relicense, and distribute your contributions while you retain full ownership. It is adapted from the Apache Software Foundation's Individual CLA.
+
+Past contributions made before this date remain under the MIT License and are not affected.
+
+By submitting a pull request, you confirm you have read and agree to the CLA.
+
 ## License
 
-By contributing, you agree that your contributions will be licensed under the MIT License.
+Mnemosyne is licensed under the MIT License. See [LICENSE](LICENSE) for details.
