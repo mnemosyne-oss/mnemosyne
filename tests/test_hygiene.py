@@ -300,6 +300,7 @@ class TestAuditNoise:
         assert summary["with_secrets"] == 1
         assert fixture_secret not in json.dumps(summary)
         assert summary["candidates"][0]["preview"] == "password=<redacted>"
+        assert "id" not in summary["candidates"][0]
 
     def test_hygiene_adapter_whitelists_bounded_safe_data(self, monkeypatch, tmp_path):
         db_path = tmp_path / "doctor.db"
@@ -337,7 +338,7 @@ class TestAuditNoise:
         payload = json.dumps(summary)
         assert raw_secret not in payload
         assert "password=<redacted>" in payload
-        for forbidden in ("content", "body", "embedding_json", "metadata"):
+        for forbidden in ("id", "content", "body", "embedding_json", "metadata"):
             assert forbidden not in summary["candidates"][0]
 
     def test_build_doctor_report_never_constructs_mnemosyne(self, tmp_path, monkeypatch):
@@ -746,9 +747,25 @@ def test_hygiene_suite_does_not_leak_config_into_subagent_provider(tmp_path, mon
     process: the autouse cleanup must discard that singleton before a subagent
     provider resolves its temporary data-directory configuration.
     """
+    from conftest import _close_cached_connections
     from hermes_memory_provider import MnemosyneMemoryProvider
+    from mnemosyne.core.config import MnemosyneConfig
 
-    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+    stale_data_dir = tmp_path / "stale-data"
+    test_data_dir = tmp_path / "provider-data"
+    stale_data_dir.mkdir()
+    test_data_dir.mkdir()
+    # The stale config enables subagent initialization. The replacement config
+    # must win after the fixture boundary resets the process-global singleton.
+    (stale_data_dir / "config.yaml").write_text("skip_contexts: ''\n", encoding="utf-8")
+    (test_data_dir / "config.yaml").write_text("skip_contexts: subagent\n", encoding="utf-8")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(stale_data_dir))
+    stale_config = MnemosyneConfig.get_instance()
+    assert stale_config.config_path == stale_data_dir / "config.yaml"
+
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(test_data_dir))
+    _close_cached_connections()
+    assert MnemosyneConfig._instance is None
     provider = MnemosyneMemoryProvider()
     provider.initialize("hygiene-followup", agent_context="subagent")
 

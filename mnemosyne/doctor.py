@@ -227,6 +227,10 @@ def safe_preview(value: Any, max_length: int = 120) -> str:
     else:
         text = "[structured value redacted]"
 
+    # Keep every regex pass bounded even when callers hand Doctor a very large
+    # string. This remains larger than the final preview so redaction happens
+    # before truncation for values that cross the final preview boundary.
+    text = text[: max_length * 4]
     text = _PREVIEW_SECRET_ASSIGNMENT.sub(r"\1\2<redacted>", text)
     text = _PREVIEW_STANDALONE_TOKEN.sub("<redacted>", text)
     for label, pattern in _PREVIEW_CANONICAL_SECRET_PATTERNS:
@@ -524,7 +528,6 @@ class HygieneSummaryAdapter:
                 score = candidate.get("noise_score")
                 candidates.append(
                     {
-                        "id": safe_preview(candidate.get("id"), max_length=120),
                         "table": candidate.get("table")
                         if candidate.get("table") in {"working_memory", "memories", "episodic_memory"}
                         else "unknown",
@@ -779,13 +782,12 @@ def render_doctor_markdown(payload: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_doctor_artifacts_atomically(
-    *, json_path: str | Path, json_text: str, markdown_path: str | Path, markdown_text: str
-) -> None:
-    """Write both artifacts together and roll back a partial second replacement."""
+def _write_doctor_artifacts_atomically(targets: list[tuple[Path, str]]) -> None:
+    """Stage and replace one or more rendered Doctor artifacts safely."""
 
-    targets = [(Path(json_path), json_text), (Path(markdown_path), markdown_text)]
-    if targets[0][0].resolve() == targets[1][0].resolve():
+    if not targets:
+        raise ValueError("At least one Doctor output target is required")
+    if len({target.resolve() for target, _ in targets}) != len(targets):
         raise ValueError("JSON and Markdown output paths must be different")
     for target, _ in targets:
         if not target.parent.is_dir():
@@ -849,6 +851,22 @@ def write_doctor_artifacts_atomically(
                 # Cleanup is best effort under OS failures, but attempt every
                 # tracked path and never mask the primary write/rollback error.
                 pass
+
+
+def write_doctor_artifact_atomically(*, path: str | Path, text: str) -> None:
+    """Atomically replace one rendered Doctor artifact."""
+
+    _write_doctor_artifacts_atomically([(Path(path), text)])
+
+
+def write_doctor_artifacts_atomically(
+    *, json_path: str | Path, json_text: str, markdown_path: str | Path, markdown_text: str
+) -> None:
+    """Write both artifacts together and roll back a partial second replacement."""
+
+    _write_doctor_artifacts_atomically(
+        [(Path(json_path), json_text), (Path(markdown_path), markdown_text)]
+    )
 
 
 def _append_metric_lines(lines: list[str], metrics: Any) -> None:

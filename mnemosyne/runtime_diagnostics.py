@@ -70,9 +70,12 @@ def collect_runtime_diagnostics() -> dict[str, Any]:
         vec_can_load = False
         if _SQLITE_VEC_AVAILABLE:
             try:
+                import sqlite_vec
+
                 test_conn = sqlite3.connect(":memory:")
                 try:
                     test_conn.enable_load_extension(True)
+                    sqlite_vec.load(test_conn)
                     vec_can_load = True
                 finally:
                     test_conn.close()

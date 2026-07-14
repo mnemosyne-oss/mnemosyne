@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import sys
 import uuid
 from typing import Any
 
@@ -237,7 +238,12 @@ def _verify_report_gate(
     # a private hardlink has been made, *never* re-stat that attacker-mutable
     # path while using the locked connection: the connection is authorized by
     # the inode captured in ``bound_identity`` instead.
-    current_identity = bound_identity if conn is not None else _database_identity(db_path)
+    if conn is None:
+        current_identity = _database_identity(db_path)
+    elif bound_identity is None:
+        raise RepairError("Database identity could not be verified")
+    else:
+        current_identity = bound_identity
     if manifest.database_identity != current_identity:
         raise RepairError("Repair report does not authorize the selected database")
     expected_fingerprint = manifest.fingerprint
@@ -892,6 +898,8 @@ def run_repair(
     one selected row remains actionable.
     """
 
+    if sys.platform != "linux":
+        raise RepairError("Repair is supported only on Linux")
     if action not in _ALLOWED_ACTIONS:
         raise RepairError("--action must be backfill-vec-working or expire")
     if not selections:

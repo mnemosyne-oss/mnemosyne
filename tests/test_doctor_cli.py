@@ -129,6 +129,10 @@ def test_doctor_cli_writes_safe_both_reports_without_mutating_db(tmp_path):
     assert "blue-orchard rehearsal" not in json_path.read_text()
     assert FIXTURE_ORDINARY_MEMORY not in markdown
     assert "blue-orchard rehearsal" not in markdown
+    assert "safe-id" not in json_path.read_text()
+    assert "ordinary-id" not in json_path.read_text()
+    assert "safe-id" not in markdown
+    assert "ordinary-id" not in markdown
     assert "[0.1, 0.2]" not in json_path.read_text()
     assert "[0.1, 0.2]" not in markdown
     assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before_hash
@@ -168,6 +172,8 @@ def test_doctor_cli_writes_content_free_markdown_candidates_without_json_artifac
     assert FIXTURE_SECRET not in markdown
     assert FIXTURE_ORDINARY_MEMORY not in markdown
     assert "blue-orchard rehearsal" not in markdown
+    assert "safe-id" not in markdown
+    assert "ordinary-id" not in markdown
     assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before_hash
     conn = sqlite3.connect(db_path)
     try:

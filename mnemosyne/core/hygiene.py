@@ -500,7 +500,6 @@ def doctor_hygiene_summary(
         "candidate_limit": candidate_limit,
         "candidates": [
             {
-                "id": safe_preview(candidate.memory_id, max_length=120),
                 "table": candidate.table_name,
                 "noise_score": candidate.noise_score,
                 "reasons": list(candidate.noise_reasons),

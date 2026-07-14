@@ -409,6 +409,7 @@ def cmd_doctor(args):
         doctor_report_payload,
         render_doctor_json,
         render_doctor_markdown,
+        write_doctor_artifact_atomically,
         write_doctor_artifacts_atomically,
     )
 
@@ -433,12 +434,12 @@ def cmd_doctor(args):
             print(f"Doctor Markdown: {resolved_markdown_path}")
         elif output_format == "json":
             if json_out:
-                resolved_json_path.write_text(json_text, encoding="utf-8", newline="\n")
+                write_doctor_artifact_atomically(path=resolved_json_path, text=json_text)
                 print(f"Doctor JSON: {resolved_json_path}")
             else:
                 print(json_text, end="")
         elif markdown_out:
-            resolved_markdown_path.write_text(markdown_text, encoding="utf-8", newline="\n")
+            write_doctor_artifact_atomically(path=resolved_markdown_path, text=markdown_text)
             print(f"Doctor Markdown: {resolved_markdown_path}")
         else:
             print(markdown_text, end="")

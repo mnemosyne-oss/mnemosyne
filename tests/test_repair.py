@@ -175,6 +175,24 @@ def test_dry_run_is_read_only_and_creates_no_backup(tmp_path):
     assert _hash(db_path) == before
 
 
+def test_repair_fails_closed_before_dry_run_on_non_linux(tmp_path, monkeypatch):
+    db_path = tmp_path / "memory.db"
+    _create_db(db_path)
+    report_path = tmp_path / "missing-report.json"
+    monkeypatch.setattr(repair.sys, "platform", "darwin")
+
+    with pytest.raises(RepairError, match="supported only on Linux"):
+        run_repair(
+            db_path=db_path,
+            bank_name="default",
+            report_path=report_path,
+            selections=["working_memory:selected"],
+            action="expire",
+        )
+
+    assert not report_path.exists()
+
+
 def test_manifest_bank_fingerprint_and_parse_fail_closed_before_backup_or_write(tmp_path):
     db_path = tmp_path / "memory.db"
     _create_db(db_path)

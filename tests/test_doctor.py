@@ -3,6 +3,8 @@
 import builtins
 import json
 import sqlite3
+import sys
+import types
 from typing import cast
 
 import pytest
@@ -138,6 +140,51 @@ def test_doctor_runtime_dependency_failure_is_safe_and_unknown(tmp_path, monkeyp
     }
     assert raw_secret not in payload
     assert "dependency capability failed" not in payload
+
+
+def test_runtime_diagnostics_marks_sqlite_vec_available_only_after_loading(monkeypatch):
+    """The diagnostic must test the extension load, not only SQLite's toggle."""
+
+    from mnemosyne import runtime_diagnostics
+    from mnemosyne.core import beam
+
+    calls: list[sqlite3.Connection] = []
+    fake_sqlite_vec = types.SimpleNamespace(load=lambda conn: calls.append(conn))
+    monkeypatch.setattr(beam, "_SQLITE_VEC_AVAILABLE", True)
+    monkeypatch.setitem(sys.modules, "sqlite_vec", fake_sqlite_vec)
+
+    result = runtime_diagnostics.collect_runtime_diagnostics()
+
+    assert len(calls) == 1
+    assert any(
+        check == {
+            "category": "core",
+            "check": "sqlite_vec_available",
+            "status": "YES",
+            "detail": "",
+        }
+        for check in result["checks"]
+    )
+
+
+def test_safe_preview_caps_raw_text_before_regex_redaction(monkeypatch):
+    """Unbounded input must not be handed to Doctor's regex redactors."""
+
+    from mnemosyne import doctor
+
+    captured: list[str] = []
+
+    class CapturePattern:
+        def sub(self, _replacement, text):
+            captured.append(text)
+            return text
+
+    monkeypatch.setattr(doctor, "_PREVIEW_SECRET_ASSIGNMENT", CapturePattern())
+
+    preview = doctor.safe_preview("x" * 100, max_length=10)
+
+    assert captured == ["x" * 40]
+    assert preview == "x" * 9 + "…"
 
 
 def test_doctor_runtime_adapter_does_not_import_or_call_diagnose(tmp_path, monkeypatch):
