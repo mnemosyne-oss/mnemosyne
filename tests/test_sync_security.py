@@ -12,6 +12,18 @@ from mnemosyne.core.memory import Mnemosyne
 from mnemosyne.core.sync_server import run_sync_server
 
 
+def test_top_level_sync_help_lists_required_db_path(monkeypatch, capsys):
+    from mnemosyne import cli
+
+    monkeypatch.setattr(cli.sys, "argv", ["mnemosyne", "--help"])
+    cli.run_cli()
+    help_text = capsys.readouterr().out
+
+    assert "sync --db-path <path> --remote <url>" in help_text
+    assert "sync-serve --db-path <path>" in help_text
+    assert "sync-status --db-path <path>" in help_text
+
+
 def test_surface_mode_refuses_unmarked_db_without_claiming_rows(tmp_path):
     from mnemosyne.core.sync import SyncEngine
 

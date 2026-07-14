@@ -160,7 +160,7 @@ def cmd_recall(args):
         print(f"  Content: {content[:150]}{'...' if len(content) > 150 else ''}")
         print(f"  Score: {score:.3f}")
         if r.get("entity_match"):
-            print("  [entity match]")
+            print(f"  [entity match]")
         print()
 
 
@@ -227,6 +227,7 @@ def cmd_diagnose(args):
     fix_mode = "--fix" in args
     dry_run = "--dry-run" in args
     repair_vec_working = "--repair-vec-working" in args
+    clean_args = [a for a in args if not a.startswith("--")]
 
     try:
         from mnemosyne.diagnose import run_diagnostics, auto_fix
@@ -247,6 +248,7 @@ def cmd_diagnose(args):
             print("\n--- Auto-fix ---")
             fix_result = auto_fix(result.get("entries", []), dry_run=dry_run)
             if fix_result["fixed"]:
+                label = "Would fix" if dry_run else "Fixed"
                 for item in fix_result["fixed"]:
                     print(f"  ✅ {item}")
             if fix_result["failed"]:
@@ -1366,13 +1368,13 @@ def run_cli():
         print("  verify [db_path] [--quick]             Verify database integrity")
         print("  backups [backup_dir]                   List available backups")
         print("  mcp [--transport sse] [--port 8080]    Start MCP server")
-        print("  sync --remote <url> [--mode push|pull|bidirectional]")
+        print("  sync --db-path <path> --remote <url> [--mode push|pull|bidirectional]")
         print("                                      Sync with remote server")
         print("  sync-init --db-path <path> [--claim-existing --yes]")
         print("                                      Initialize/migrate a dedicated surface DB")
-        print("  sync-serve [--port 8765] [--host 0.0.0.0]")
+        print("  sync-serve --db-path <path> [--port 8765] [--host 0.0.0.0]")
         print("                                      Start sync server")
-        print("  sync-status [--remote <url>] [--json]")
+        print("  sync-status --db-path <path> [--remote <url>] [--json]")
         print("                                      Show sync status")
         print("  sync-generate-key                    Generate encryption key")
         print("  migrate [--bank <name>]                Add 3.11.1 schema tables to an existing bank")
