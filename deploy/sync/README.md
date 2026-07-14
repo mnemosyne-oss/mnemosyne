@@ -32,8 +32,18 @@ Your sync endpoint is now `https://memory.example.com`. Caddy handles TLS automa
 
 From a client machine:
 
+Create and initialize a physically dedicated shared-surface database before the first sync. Do not point sync at a private profile/session database:
+
 ```bash
-mnemosyne sync --remote https://memory.example.com \
+MNEMOSYNE_SYNC_DB="$HOME/.mnemosyne/shared-surface.db"
+mkdir -p "$(dirname "$MNEMOSYNE_SYNC_DB")"
+chmod 700 "$(dirname "$MNEMOSYNE_SYNC_DB")"
+
+# Run once for a new dedicated client database.
+mnemosyne sync-init --db-path "$MNEMOSYNE_SYNC_DB"
+
+mnemosyne sync --db-path "$MNEMOSYNE_SYNC_DB" \
+  --remote https://memory.example.com \
   --api-key-file /path/to/mnemosyne-sync-api.key \
   --encrypt-key-file /path/to/mnemosyne-sync-encryption.key
 ```

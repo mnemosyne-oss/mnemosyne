@@ -45,6 +45,23 @@ def test_sync_cli_commands_reject_missing_db_path(
     assert "--db-path" in capsys.readouterr().err
 
 
+def test_deployment_readme_initializes_client_surface_before_sync():
+    from pathlib import Path
+
+    readme = (
+        Path(__file__).resolve().parents[1] / "deploy" / "sync" / "README.md"
+    ).read_text(encoding="utf-8")
+    client_section = readme.split("From a client machine:", 1)[1].split(
+        "## Fly.io", 1
+    )[0]
+
+    init_command = 'mnemosyne sync-init --db-path "$MNEMOSYNE_SYNC_DB"'
+    sync_command = 'mnemosyne sync --db-path "$MNEMOSYNE_SYNC_DB"'
+    assert init_command in client_section
+    assert sync_command in client_section
+    assert client_section.index(init_command) < client_section.index(sync_command)
+
+
 def test_surface_mode_refuses_unmarked_db_without_claiming_rows(tmp_path):
     from mnemosyne.core.sync import SyncEngine
 
