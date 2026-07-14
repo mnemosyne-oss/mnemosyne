@@ -119,6 +119,162 @@ def _require_vec_working(conn):
         pytest.skip("sqlite-vec vec_working table unavailable")
 
 
+def test_vec_insert_commit_respects_deferred_transaction_rollback(temp_db):
+    beam = BeamMemory(session_id="vec-deferred-rollback", db_path=temp_db)
+    _require_vec_working(beam.conn)
+    memory_id = "vec-deferred"
+    rowid = None
+
+    with pytest.raises(RuntimeError, match="rollback vec transaction"):
+        with beam_module._deferred_commits(beam.conn):
+            cursor = beam.conn.execute(
+                "INSERT INTO working_memory "
+                "(id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+                (
+                    memory_id,
+                    "must roll back with vector",
+                    "test",
+                    datetime.now().isoformat(),
+                    beam.session_id,
+                ),
+            )
+            inserted_rowid = cursor.lastrowid
+            assert inserted_rowid is not None
+            rowid = int(inserted_rowid)
+            beam_module._vec_table_insert(
+                beam.conn,
+                "vec_working",
+                rowid,
+                _unit_embedding(),
+                commit=True,
+            )
+            raise RuntimeError("rollback vec transaction")
+
+    assert rowid is not None
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
+    ).fetchone()[0] == 0
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM vec_working WHERE rowid = ?", (rowid,)
+    ).fetchone()[0] == 0
+
+
+def test_guarded_transaction_rolls_back_keyboard_interrupt(temp_db):
+    beam = BeamMemory(session_id="guarded-interrupt", db_path=temp_db)
+
+    with pytest.raises(KeyboardInterrupt, match="guarded interrupted"):
+        with beam_module._guarded_transaction(beam.conn):
+            beam.conn.execute(
+                "INSERT INTO working_memory "
+                "(id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+                (
+                    "guarded-interrupt",
+                    "must roll back",
+                    "test",
+                    datetime.now().isoformat(),
+                    beam.session_id,
+                ),
+            )
+            raise KeyboardInterrupt("guarded interrupted")
+
+    assert beam.conn.in_transaction is False
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = 'guarded-interrupt'"
+    ).fetchone()[0] == 0
+
+
+def test_deferred_commits_resets_flag_and_rolls_back_system_exit(temp_db):
+    beam = BeamMemory(session_id="deferred-interrupt", db_path=temp_db)
+
+    with pytest.raises(SystemExit, match="deferred interrupted"):
+        with beam_module._deferred_commits(beam.conn):
+            beam.conn.execute(
+                "INSERT INTO working_memory "
+                "(id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+                (
+                    "deferred-interrupt",
+                    "must roll back",
+                    "test",
+                    datetime.now().isoformat(),
+                    beam.session_id,
+                ),
+            )
+            beam.conn.commit()
+            assert getattr(beam.conn, "_defer_commit") is True
+            raise SystemExit("deferred interrupted")
+
+    assert getattr(beam.conn, "_defer_commit") is False
+    assert beam.conn.in_transaction is False
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = 'deferred-interrupt'"
+    ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "interruption",
+    [KeyboardInterrupt("commit interrupted"), SystemExit("commit interrupted")],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+def test_deferred_commits_rolls_back_interrupted_final_commit(
+    temp_db, monkeypatch, interruption
+):
+    beam = BeamMemory(session_id="deferred-final-commit", db_path=temp_db)
+    original_real_commit = getattr(beam.conn, "_real_commit")
+
+    def interrupt_final_commit():
+        raise interruption
+
+    monkeypatch.setattr(beam.conn, "_real_commit", interrupt_final_commit)
+    with pytest.raises(type(interruption), match="commit interrupted"):
+        with beam_module._deferred_commits(beam.conn):
+            beam.conn.execute(
+                "INSERT INTO working_memory "
+                "(id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+                (
+                    "interrupted-final-commit",
+                    "must never be published",
+                    "test",
+                    datetime.now().isoformat(),
+                    beam.session_id,
+                ),
+            )
+
+    assert getattr(beam.conn, "_defer_commit") is False
+    assert beam.conn.in_transaction is False
+    monkeypatch.setattr(beam.conn, "_real_commit", original_real_commit)
+    beam.conn.commit()
+
+    fresh = sqlite3.connect(temp_db)
+    try:
+        assert fresh.execute(
+            "SELECT COUNT(*) FROM working_memory "
+            "WHERE id = 'interrupted-final-commit'"
+        ).fetchone()[0] == 0
+    finally:
+        fresh.close()
+
+
+@pytest.mark.parametrize(
+    "transaction_guard",
+    [beam_module._guarded_transaction, beam_module._deferred_commits],
+    ids=["guarded-transaction", "deferred-commits"],
+)
+def test_transaction_guard_preserves_body_interrupt_when_rollback_is_interrupted(
+    temp_db, monkeypatch, transaction_guard
+):
+    beam = BeamMemory(session_id="rollback-interrupt", db_path=temp_db)
+
+    def interrupt_rollback():
+        raise SystemExit("rollback interrupted")
+
+    monkeypatch.setattr(beam.conn, "rollback", interrupt_rollback)
+    with pytest.raises(KeyboardInterrupt, match="body interrupted"):
+        with transaction_guard(beam.conn):
+            raise KeyboardInterrupt("body interrupted")
+
+    assert getattr(beam.conn, "_defer_commit") is False
+
+
 def test_remember_update_and_forget_maintain_vec_working(temp_db, monkeypatch):
     beam = BeamMemory(session_id="vec-working-session", db_path=temp_db)
     _require_vec_working(beam.conn)

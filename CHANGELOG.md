@@ -9,6 +9,10 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Atomic batch and sqlite-vec transactions.** Deferred vector writes now
+  respect the enclosing transaction, while transaction guards reset state and
+  roll back cleanly across exceptions, cancellation, and interrupted commits.
+
 - **Hermes provider safety defaults after config bridging.** New auto-seeded
   configs now preserve user-only autosave and skip `cron`, `flush`, `subagent`,
   `background`, and `skill_loop` contexts. Existing 3.12.1/3.12.2 auto-seeded

@@ -1262,11 +1262,15 @@ def _guarded_transaction(conn: sqlite3.Connection):
     try:
         yield
         conn.commit()
-    except Exception:
+    except BaseException:
         try:
             conn.rollback()
-        except sqlite3.Error:
-            pass  # rollback of a dead connection must not mask the cause
+        except BaseException:
+            logger.error(
+                "_guarded_transaction: rollback failed while preserving "
+                "the original exception",
+                exc_info=True,
+            )
         raise
 
 
@@ -1299,18 +1303,22 @@ def _deferred_commits(conn: sqlite3.Connection):
     conn._defer_commit = True
     try:
         yield
-    except Exception:
+    except BaseException:
         conn._defer_commit = False
         try:
             conn.rollback()
-        except sqlite3.Error:
-            pass
+        except BaseException:
+            logger.error(
+                "_deferred_commits: rollback failed while preserving "
+                "the original exception",
+                exc_info=True,
+            )
         raise
     else:
         conn._defer_commit = False
         try:
             conn._real_commit()
-        except sqlite3.Error as exc:
+        except BaseException as exc:
             logger.error(
                 "_deferred_commits: final commit failed: %s; "
                 "rolling back the buffered transaction",
@@ -1318,8 +1326,12 @@ def _deferred_commits(conn: sqlite3.Connection):
             )
             try:
                 conn.rollback()
-            except sqlite3.Error:
-                pass
+            except BaseException:
+                logger.error(
+                    "_deferred_commits: rollback after final commit failure "
+                    "also failed",
+                    exc_info=True,
+                )
             raise
     finally:
         # Defense in depth: clear the flag on any control-flow path.
@@ -2134,15 +2146,12 @@ def _vec_table_insert(conn: sqlite3.Connection, table: str, rowid: int, embeddin
             f"INSERT INTO {table}(rowid, embedding) VALUES (?, ?)",
             (rowid, emb_json)
         )
-    # Ensure the insert is committed even when the caller's connection
-    # has _defer_commit=True (_BeamConnection). Without this, inserts
-    # sit in the deferred transaction and disappear if the caller
-    # later rolls back or the connection is reused in a different context.
+    # Use the public commit path so an enclosing _deferred_commits() scope
+    # remains atomic. _BeamConnection.commit() commits immediately outside
+    # such a scope and deliberately becomes a no-op inside it; bypassing that
+    # contract with _real_commit() would make a later batch rollback partial.
     if commit:
-        if isinstance(conn, _BeamConnection):
-            conn._real_commit()
-        else:
-            conn.commit()
+        conn.commit()
 
 
 def _wm_rowid(conn: sqlite3.Connection, memory_id: str) -> Optional[int]:
