@@ -40,6 +40,17 @@ def _close_cached_connections():
     except Exception:
         pass
 
+    # MnemosyneConfig also caches the config path selected from the environment.
+    # A preceding test may initialize it using the ambient data directory while
+    # a later provider test swaps MNEMOSYNE_DATA_DIR to a temporary bank.  Keep
+    # that path selection test-local just like the database connection caches;
+    # otherwise the later provider reads stale skip_contexts configuration.
+    try:
+        from mnemosyne.core.config import MnemosyneConfig
+        MnemosyneConfig.reset_instance()
+    except Exception:
+        pass
+
     # Reset hermes_plugin singleton
     try:
         import hermes_plugin

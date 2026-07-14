@@ -17,7 +17,9 @@ import sys
 import platform
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
+
+from mnemosyne.runtime_diagnostics import collect_runtime_diagnostics
 
 LOG_DIR = Path.home() / ".hermes" / "mnemosyne" / "logs"
 
@@ -174,82 +176,9 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, 
         entries.append(entry)
         return entry
 
-    # --- Python environment ---
-    log("env", "python_version", sys.version.split()[0])
-    log("env", "platform", platform.platform())
-    log("env", "python_executable", sys.executable)
-
-    # --- Mnemosyne package ---
-    try:
-        import mnemosyne
-        version = getattr(mnemosyne, "__version__", None)
-        if not version:
-            version = importlib.metadata.version("mnemosyne-memory")
-        log("package", "mnemosyne_version", str(version))
-    except Exception as e:
-        log("package", "mnemosyne_version", "ERROR", str(e))
-
-    # --- Core dependencies ---
-    required_deps = {
-        "fastembed": "fastembed",
-        "sqlite_vec": "sqlite_vec",
-        "numpy": "numpy",
-        "huggingface_hub": "huggingface_hub",
-    }
-    optional_deps = {
-        # Optional local-GGUF fallback only. Host/remote LLM paths and the
-        # non-LLM fallback work without it, so absence should not fail the
-        # installation health check.
-        "ctransformers": "ctransformers",
-    }
-    for name, module in required_deps.items():
-        try:
-            mod = __import__(module)
-            ver = getattr(mod, "__version__", "unknown")
-            log("deps", name, "OK", f"version={ver}")
-        except ImportError:
-            log("deps", name, "MISSING")
-        except Exception as e:
-            log("deps", name, "ERROR", str(e))
-    for name, module in optional_deps.items():
-        try:
-            mod = __import__(module)
-            ver = getattr(mod, "__version__", "unknown")
-            log("deps", name, "OK", f"version={ver}")
-        except ImportError:
-            log("deps", name, "OPTIONAL", "optional local-GGUF fallback dependency not installed")
-        except Exception as e:
-            log("deps", name, "ERROR", str(e))
-
-    # --- Mnemosyne core components ---
-    try:
-        from mnemosyne.core import embeddings as _embeddings
-        log("core", "embeddings_available", "YES" if _embeddings.available() else "NO")
-        log("core", "embeddings_model", _embeddings._DEFAULT_MODEL)
-    except Exception as e:
-        log("core", "embeddings", "ERROR", str(e))
-
-    try:
-        from mnemosyne.core.beam import _SQLITE_VEC_AVAILABLE
-        # _SQLITE_VEC_AVAILABLE only checks whether the pip package imports.
-        # It doesn't verify that the running sqlite3 module can actually load
-        # the extension (required for Python builds without
-        # --enable-loadable-sqlite-extensions). Do a runtime check here.
-        _vec_can_load = False
-        if _SQLITE_VEC_AVAILABLE:
-            try:
-                import sqlite3 as _sqlite3
-                _test_conn = _sqlite3.connect(":memory:")
-                _test_conn.enable_load_extension(True)
-                _vec_can_load = True
-                _test_conn.close()
-            except Exception:
-                _vec_can_load = False
-        log("core", "sqlite_vec_available", "YES" if _vec_can_load else "NO")
-        if _SQLITE_VEC_AVAILABLE and not _vec_can_load:
-            log("core", "sqlite_vec_warning", "Package imports but extension cannot load. Rebuild Python with --enable-loadable-sqlite-extensions.")
-    except Exception as e:
-        log("core", "sqlite_vec", "ERROR", str(e))
+    # --- Pure runtime/dependency/capability checks (no provider construction) ---
+    for check in collect_runtime_diagnostics()["checks"]:
+        log(check["category"], check["check"], check["status"], check["detail"])
 
     # --- Database state ---
     try:
