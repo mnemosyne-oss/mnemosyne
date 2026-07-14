@@ -1481,11 +1481,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             adapter = getattr(self, "_provider_sync_adapter", None)
             if adapter is None:
                 from mnemosyne_hermes.sync_adapter import SyncAdapter
-
-                surface_error = self._require_surface_beam()
-                if surface_error:
-                    return json.dumps({"status": "error", "error": surface_error})
-                adapter = SyncAdapter(self._surface_beam, {})
+                adapter = SyncAdapter(self._beam, {})
                 self._provider_sync_adapter = adapter
             return adapter.handle_tool_call(tool_name, args)
         except Exception as exc:
@@ -1689,14 +1685,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         shared_path = self._shared_surface_path or (Path.home() / ".mnemosyne" / "data" / "shared" / "mnemosyne.db")
         shared_path.parent.mkdir(parents=True, exist_ok=True)
         self._shared_surface_path = shared_path
-        surface_beam = BeamMemory(session_id="hermes_shared_surface", db_path=shared_path)
-        from mnemosyne.core.sync import SyncEngine
-        SyncEngine(
-            surface_beam,
-            surface_only=True,
-            initialize_surface=True,
-        )
-        self._surface_beam = surface_beam
+        self._surface_beam = BeamMemory(session_id="hermes_shared_surface", db_path=shared_path)
         logger.info("Mnemosyne shared surface initialized: db=%s", shared_path)
 
     def _require_surface_beam(self) -> Optional[str]:
@@ -1729,11 +1718,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         surface_content = self._surface_label(content, kind)
         stable_id = "sf_" + self._surface_hash(surface_content)
         meta = dict(metadata)
-        meta.update({
-            "shared_memory": True,
-            "surface_kind": kind,
-            "write_path": "manual_tool",
-        })
+        meta.update({"shared_memory": True, "surface_kind": kind, "write_path": "manual_tool", "source_profile_session": self._session_id})
         existing_id = self._surface_beam._find_duplicate(surface_content)
         memory_id = self._surface_beam.remember(
             content=surface_content,
