@@ -20,8 +20,29 @@ def test_top_level_sync_help_lists_required_db_path(monkeypatch, capsys):
     help_text = capsys.readouterr().out
 
     assert "sync --db-path <path> --remote <url>" in help_text
+    assert "sync-init --db-path <path>" in help_text
     assert "sync-serve --db-path <path>" in help_text
     assert "sync-status --db-path <path>" in help_text
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "args"),
+    [
+        ("cmd_sync", ["--remote", "https://relay.example"]),
+        ("cmd_sync_serve", []),
+        ("cmd_sync_status", []),
+    ],
+)
+def test_sync_cli_commands_reject_missing_db_path(
+    handler_name, args, capsys
+):
+    from mnemosyne import cli
+
+    with pytest.raises(SystemExit) as exc_info:
+        getattr(cli, handler_name)(args)
+
+    assert exc_info.value.code == 2
+    assert "--db-path" in capsys.readouterr().err
 
 
 def test_surface_mode_refuses_unmarked_db_without_claiming_rows(tmp_path):
