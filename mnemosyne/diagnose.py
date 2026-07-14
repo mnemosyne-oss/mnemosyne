@@ -144,7 +144,7 @@ def _sqlite_integrity_diagnostics(conn) -> Dict[str, str]:
     return {"quick_check": result, "detail": ""}
 
 
-def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False) -> Dict:
+def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, bank: str | None = None) -> Dict:
     """
     Run full diagnostic scan and write PII-safe log.
     Returns summary dict for display.
@@ -154,9 +154,14 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False) 
             dedicated working-memory sqlite-vec table from memory_embeddings.
         dry_run: With repair_vec_working, report what would be repaired without
             writing.
+        bank: Optional named bank to diagnose. When provided, diagnostics run
+            against the bank's own SQLite DB (data/banks/<bank>/mnemosyne.db).
+            When None, the default/profile-root DB is used.
     """
     log_path = _log_path()
     entries: List[Dict] = []
+    resolved_bank: str | None = None
+    resolved_db: str | None = None
 
     def log(category: str, check: str, status: str, detail: str = ""):
         entry = {
@@ -249,7 +254,10 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False) 
     # --- Database state ---
     try:
         from mnemosyne.core.memory import Mnemosyne
-        mem = Mnemosyne()
+        if bank:
+            mem = Mnemosyne(session_id="hermes_default", bank=bank)
+        else:
+            mem = Mnemosyne()
         stats = mem.get_stats()
 
         # PII-safe: counts and config only, never content
@@ -265,6 +273,15 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False) 
         log("db", "episodic_vectors", str(ep.get("vectors", 0)))
         log("db", "episodic_vec_type", ep.get("vec_type", "none"))
         log("db", "db_path", stats.get("database", "unknown"))
+
+        if bank:
+            log("db", "resolved_bank", bank)
+            log("db", "resolved_db", stats.get("database", "unknown"))
+            resolved_bank = bank
+            resolved_db = stats.get("database", "unknown")
+        else:
+            resolved_bank = "default"
+            resolved_db = stats.get("database", "unknown")
 
         try:
             integrity = _sqlite_integrity_diagnostics(mem.beam.conn)
@@ -352,6 +369,8 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False) 
         "key_findings": [],
         "fixable": [],
         "entries": entries,
+        "resolved_bank": resolved_bank,
+        "resolved_db": resolved_db,
     }
 
     # Auto-detect common problems
@@ -482,9 +501,10 @@ if __name__ == "__main__":
     parser.add_argument("--fix", action="store_true", help="Auto-install missing dependencies")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be fixed/repaired without writing")
     parser.add_argument("--repair-vec-working", action="store_true", help="Backfill missing vec_working rows from memory_embeddings")
+    parser.add_argument("--bank", type=str, default=None, help="Mnemosyme bank to diagnose (default: profile-root DB)")
     args = parser.parse_args()
 
-    result = run_diagnostics(repair_vec_working=args.repair_vec_working, dry_run=args.dry_run)
+    result = run_diagnostics(repair_vec_working=args.repair_vec_working, dry_run=args.dry_run, bank=args.bank)
     print(json.dumps(result, indent=2))
 
     if args.fix or (args.dry_run and not args.repair_vec_working):

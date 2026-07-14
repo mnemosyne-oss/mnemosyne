@@ -178,15 +178,45 @@ class BankManager:
         }
 
     def _validate_name(self, name: str):
-        """Validate bank name format."""
-        if not name:
-            raise ValueError("Bank name cannot be empty")
-        if name == "default":
-            return  # 'default' is always valid
-        if not all(c.isalnum() or c in "-_" for c in name):
-            raise ValueError(f"Invalid bank name '{name}'. Use alphanumeric, hyphens, underscores only.")
-        if len(name) > 64:
-            raise ValueError(f"Bank name '{name}' exceeds 64 characters")
+        """Validate bank name format (delegates to module-level helper)."""
+        _validate_bank_name(name)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers (side-effect-free)
+# ---------------------------------------------------------------------------
+
+def _validate_bank_name(name: str):
+    """Validate bank name format without touching the filesystem."""
+    if not name:
+        raise ValueError("Bank name cannot be empty")
+    if name == "default":
+        return  # 'default' is always valid
+    if not all(c.isalnum() or c in "-_" for c in name):
+        raise ValueError(
+            f"Invalid bank name '{name}'. Use alphanumeric, hyphens, underscores only."
+        )
+    if len(name) > 64:
+        raise ValueError(f"Bank name '{name}' exceeds 64 characters")
+
+
+def bank_exists_read_only(name: str, data_dir: Path = None) -> bool:
+    """Check whether a named bank exists WITHOUT creating any directories.
+
+    Unlike ``BankManager(name).bank_exists(name)``, this never calls
+    ``mkdir`` — ``BankManager.__init__`` eagerly creates ``banks/``. Use it
+    when rejecting unknown banks before any database initialization, so we never
+    silently materialize an empty bank directory or DB for invalid input.
+
+    Resolution follows the same authoritative rules as the rest of the module:
+    ``MNEMOSYNE_DATA_DIR`` wins, otherwise the cached ``DEFAULT_DATA_DIR``.
+    """
+    _validate_bank_name(name)
+    if name == "default":
+        return True
+    resolved: Path = data_dir or _default_data_dir()
+    banks_dir = resolved / "banks"
+    return (banks_dir / name).is_dir()
 
 
 # Module-level convenience functions
