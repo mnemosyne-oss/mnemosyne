@@ -6,6 +6,7 @@ from mnemosyne.core.beam import (
     _expand_hyphenated_tokens,
     _lexical_relevance,
     _recall_tokens,
+    BeamMemory,
 )
 
 
@@ -136,15 +137,30 @@ def test_two_hyphenated_compounds_share_their_total_lexical_unit_count():
 
 @pytest.mark.parametrize(
     "content",
-    (
+    [
         "The orion_telemetrie_api is healthy.",
         "The orion.telemetrie.api is healthy.",
         "The orion/telemetrie/api is healthy.",
-    ),
+    ],
 )
 def test_hyphenated_query_matches_structured_key_separators(content):
     query = _recall_tokens("orion-telemetrie")
     assert _lexical_relevance(query, content, "orion-telemetrie") == 1.0
+
+
+def test_hyphenated_query_recalls_split_components_via_public_api(tmp_path):
+    beam = BeamMemory(session_id="hyphenated-recall", db_path=tmp_path / "memory.db")
+    expected_id = beam.remember(
+        "Orion Gateway handles Telemetrie packets.", source="test", importance=0.5
+    )
+    distractor_id = beam.remember(
+        "Gateway health is stable without Orion details.", source="test", importance=0.5
+    )
+
+    results = beam.recall("orion-telemetrie", top_k=5)
+
+    assert results[0]["id"] == expected_id
+    assert all(result["id"] != distractor_id for result in results)
 
 
 def test_sentence_transformers_multilingual_dimensions_are_known():
