@@ -132,6 +132,16 @@ def test_two_hyphenated_compounds_share_their_total_lexical_unit_count():
     assert score == 1.0
 
 
+def test_hyphenated_query_matches_structured_key_separators():
+    query = _recall_tokens("orion-telemetrie")
+    for content in (
+        "The orion_telemetrie_api is healthy.",
+        "The orion.telemetrie.api is healthy.",
+        "The orion/telemetrie/api is healthy.",
+    ):
+        assert _lexical_relevance(query, content, "orion-telemetrie") == 1.0
+
+
 def test_sentence_transformers_multilingual_dimensions_are_known():
     assert embeddings._get_embedding_dim(
         "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
