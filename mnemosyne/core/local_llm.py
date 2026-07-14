@@ -500,7 +500,8 @@ def _call_remote_llm_with_model(
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": LLM_MAX_TOKENS,
         "temperature": temperature,
-        "stop": ["</s>", "<|user|>"]
+        "stop": ["</s>", "<|user|>"],
+        "stream": False
     }
 
     try:
