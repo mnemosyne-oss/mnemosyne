@@ -29,7 +29,7 @@ services:
     command: >
       sh -ec "umask 077 &&
               cat /run/secrets/mnemosyne-sync-api-key > /run/mnemosyne-sync/api.key &&
-              pip install --quiet 'mnemosyne-memory[embeddings,sync]==3.12.1' &&
+              pip install --quiet 'mnemosyne-memory[embeddings,sync]' &&
               exec mnemosyne sync-serve
                --host 0.0.0.0
                --port 8765
