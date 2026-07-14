@@ -1,3 +1,5 @@
+import pytest
+
 from mnemosyne.core import embeddings
 from mnemosyne.core.beam import (
     _expanded_query_tokens,
@@ -132,14 +134,17 @@ def test_two_hyphenated_compounds_share_their_total_lexical_unit_count():
     assert score == 1.0
 
 
-def test_hyphenated_query_matches_structured_key_separators():
-    query = _recall_tokens("orion-telemetrie")
-    for content in (
+@pytest.mark.parametrize(
+    "content",
+    (
         "The orion_telemetrie_api is healthy.",
         "The orion.telemetrie.api is healthy.",
         "The orion/telemetrie/api is healthy.",
-    ):
-        assert _lexical_relevance(query, content, "orion-telemetrie") == 1.0
+    ),
+)
+def test_hyphenated_query_matches_structured_key_separators(content):
+    query = _recall_tokens("orion-telemetrie")
+    assert _lexical_relevance(query, content, "orion-telemetrie") == 1.0
 
 
 def test_sentence_transformers_multilingual_dimensions_are_known():
