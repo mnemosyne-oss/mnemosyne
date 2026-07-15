@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import ssl
+import time
+import urllib.error
 import urllib.request
 from typing import List, Optional
 from functools import lru_cache
@@ -231,6 +234,16 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_transient_embedding_error(exc: Exception) -> bool:
+    """Return whether an API embedding request is safe to retry."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code == 429 or 500 <= exc.code < 600
+    if isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError, OSError)):
+        return True
+    message = str(exc).lower()
+    return "429" in message or "rate limit" in message or "rate-limit" in message
+
+
 def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint)."""
     global _API_CALL_COUNT
@@ -269,9 +282,8 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
             _API_CALL_COUNT += 1
             return np.array(embeddings, dtype=np.float32)
         except Exception as e:
-            if "429" in str(e) or "rate" in str(e).lower():
-                import time
-                time.sleep(2 ** attempt)
+            if _is_transient_embedding_error(e) and attempt < 2:
+                time.sleep((0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25))
                 continue
             return None
 
