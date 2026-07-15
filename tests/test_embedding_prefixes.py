@@ -81,6 +81,12 @@ def test_fastembed_path_applies_prefixes(monkeypatch):
             return [np.ones(768, dtype=np.float32) for _ in texts]
     monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_URL", raising=False)   # force non-API path
     monkeypatch.delenv("MNEMOSYNE_EMBEDDINGS_VIA_API", raising=False)
+    # CI globally disables local model loading to avoid downloads. This test
+    # installs a fake already-loaded model, so it must explicitly exercise the
+    # local branch rather than inherit that suite-level opt-out.
+    monkeypatch.delenv("MNEMOSYNE_NO_EMBEDDINGS", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_SKIP_EMBEDDINGS", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDINGS_OFF", raising=False)
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_QUERY_PREFIX", QUERY_PREFIX)
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_DOC_PREFIX", DOC_PREFIX)
     fake = FakeFastembedModel()
