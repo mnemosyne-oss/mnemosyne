@@ -9,6 +9,11 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Hermes provider guardrails.** Effective runtime settings are normalized and
+  inspectable, empty `sync_roles` remains an explicit opt-out, invalid values
+  fail closed without discarding the last valid configuration, and provider
+  config reads preserve the documented precedence.
+
 - **Hermes provider safety defaults after config bridging.** New auto-seeded
   configs now preserve user-only autosave and skip `cron`, `flush`, `subagent`,
   `background`, and `skill_loop` contexts. Existing 3.12.1/3.12.2 auto-seeded

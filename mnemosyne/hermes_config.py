@@ -2,9 +2,80 @@
 
 from __future__ import annotations
 
+import ast
+import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Set, Tuple, List
+
+
+def parse_sync_roles(
+    value: Any,
+    *,
+    current: Iterable[str],
+    valid_roles: Iterable[str] = ("user", "assistant"),
+) -> Tuple[Set[str], List[str]]:
+    """Parse Hermes ``sync_roles`` without silently disabling capture.
+
+    Native lists/tuples/sets and comma-separated strings are canonical.  JSON
+    or Python-literal list strings are accepted for compatibility with older
+    config writers that serialized ``['user']`` as a scalar.  An explicit
+    empty list/string disables capture; invalid or unknown-only non-empty
+    values preserve the currently effective roles and return warnings.
+    """
+    effective = {str(role).strip().lower() for role in current if str(role).strip()}
+    allowed = {str(role).strip().lower() for role in valid_roles if str(role).strip()}
+    warnings: List[str] = []
+
+    raw_roles: Any
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raw_roles = []
+        elif stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                raw_roles = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError):
+                try:
+                    raw_roles = ast.literal_eval(stripped)
+                except (ValueError, SyntaxError):
+                    warnings.append(f"invalid serialized sync_roles value: {value!r}")
+                    return effective, warnings
+            if not isinstance(raw_roles, (list, tuple, set)):
+                warnings.append(f"serialized sync_roles must be a list: {value!r}")
+                return effective, warnings
+        else:
+            raw_roles = stripped.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw_roles = value
+    else:
+        warnings.append(f"invalid sync_roles type {type(value).__name__}: {value!r}")
+        return effective, warnings
+
+    parsed = {str(role).strip().lower() for role in raw_roles if str(role).strip()}
+    unknown = parsed - allowed
+    if unknown:
+        warnings.append(f"unknown sync_roles ignored: {sorted(unknown)!r}")
+    valid = parsed & allowed
+    if parsed and not valid:
+        warnings.append(f"no valid sync_roles in {sorted(parsed)!r}; keeping {sorted(effective)!r}")
+        return effective, warnings
+    return valid, warnings
+
+
+def parse_strict_bool(value: Any) -> Tuple[bool | None, str | None]:
+    """Parse documented boolean forms without weakening active guardrails."""
+    if isinstance(value, bool):
+        return value, None
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value), None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True, None
+        if normalized in {"false", "0", "no", "off"}:
+            return False, None
+    return None, f"invalid boolean value {value!r}; keeping the current effective value"
 
 
 def read_hermes_config_key(hermes_home: str | None, key: str) -> Any:

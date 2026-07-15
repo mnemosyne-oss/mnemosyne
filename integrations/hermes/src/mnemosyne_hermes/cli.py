@@ -73,17 +73,22 @@ def register_cli(subparser):
 
 
 def _profile_isolation_enabled(hermes_home: str) -> bool:
-    """True when ``memory.mnemosyne.profile_isolation`` is set in config.yaml."""
+    """Read profile isolation strictly; invalid values must not select a bank."""
     try:
         import yaml
+        from mnemosyne.hermes_config import parse_strict_bool
+
         with open(os.path.join(hermes_home, "config.yaml")) as f:
             cfg = yaml.safe_load(f) or {}
         val = (cfg.get("memory", {}) or {}).get("mnemosyne", {}).get("profile_isolation", False)
+        parsed, warning = parse_strict_bool(val)
+        if warning:
+            raise ValueError(warning)
+        return bool(parsed)
+    except ValueError:
+        raise
     except Exception:
         return False
-    if isinstance(val, str):
-        return val.strip().lower() in ("true", "1", "yes", "on")
-    return bool(val)
 
 
 def _get_provider_class():
@@ -139,6 +144,8 @@ def _resolve_cli_bank(args, cmd):
             return None
         bank = sanitize(basename)
         return bank if bank != "default" else None
+    except ValueError:
+        raise
     except Exception:
         return None
 
@@ -165,7 +172,11 @@ def mnemosyne_command(args):
     except Exception:
         pass
 
-    bank = _resolve_cli_bank(args, cmd)
+    try:
+        bank = _resolve_cli_bank(args, cmd)
+    except ValueError as exc:
+        print(f"Error: invalid profile_isolation configuration: {exc}", file=sys.stderr)
+        return 2
 
     # Reject unknown named banks BEFORE touching the filesystem. Mnemosyne(bank=)
     # would otherwise lazily create an empty bank directory + DB on first access

@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime, timedelta
 
 # Mnemosyne core is installed via pip (mnemosyne-memory>=3.11.1 dependency),
@@ -69,7 +69,7 @@ except Exception as _batch_tool_import_exc:  # pragma: no cover - broken install
         return {"status": "error", "error": "mnemosyne_batch is unavailable; upgrade mnemosyne-memory"}
 
 try:
-    from mnemosyne.hermes_config import read_hermes_config_key
+    from mnemosyne.hermes_config import parse_strict_bool, parse_sync_roles, read_hermes_config_key
 except Exception as _hermes_config_import_exc:  # pragma: no cover - broken install diagnostic path
     logging.getLogger(__name__).warning(
         "Hermes config helper unavailable (%s); memory.mnemosyne config keys will use defaults until mnemosyne-memory is upgraded.",
@@ -78,6 +78,24 @@ except Exception as _hermes_config_import_exc:  # pragma: no cover - broken inst
 
     def read_hermes_config_key(_hermes_home: Optional[str], _key: str) -> Any:
         return None
+
+    def parse_strict_bool(value: Any) -> Tuple[bool | None, str | None]:
+        if isinstance(value, bool):
+            return value, None
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value), None
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True, None
+            if normalized in {"false", "0", "no", "off"}:
+                return False, None
+        return None, f"invalid boolean value {value!r}; keeping the current effective value"
+
+    def parse_sync_roles(
+        _value: Any, *, current: Any, valid_roles: Any = ("user", "assistant")
+    ) -> Tuple[Set[str], List[str]]:
+        return set(current), ["sync_roles parser unavailable; keeping current roles"]
 
 try:
     from mnemosyne.integrations.hermes_persona_prompt import HermesPersonaPromptMixin
@@ -101,7 +119,7 @@ except Exception as _persona_import_exc:  # pragma: no cover - graceful import f
         def _with_persona_block(self, base: str) -> str:
             return base
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +339,7 @@ def _prefetch_topic_signal(row: Dict[str, Any]) -> float:
         float(row.get("keyword_score") or 0.0),
         float(row.get("fts_score") or 0.0),
         float(row.get("dense_score") or 0.0),
+        float(row.get("topic_signal") or 0.0),
     )
     if row.get("fact_match") or row.get("entity_match"):
         signal = max(signal, 0.20)
@@ -546,8 +565,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._sync_roles: Set[str] = {"user"}
         _sync_env = os.environ.get("MNEMOSYNE_SYNC_ROLES")
         if _sync_env is not None:
-            _parsed_roles = {r.strip().lower() for r in _sync_env.split(",") if r.strip()}
-            self._sync_roles = _parsed_roles & self._VALID_SYNC_ROLES
+            self._sync_roles, _sync_warnings = parse_sync_roles(
+                _sync_env, current=self._sync_roles, valid_roles=self._VALID_SYNC_ROLES
+            )
+            for warning in _sync_warnings:
+                logger.warning("Mnemosyne: %s", warning)
         self._skip_contexts = {"cron", "flush", "subagent", "background", "skill_loop"}  # Agent contexts to skip
         # Allow override via MNEMOSYNE_SKIP_CONTEXTS env var.
         # Set to empty string to skip nothing (enable all contexts).
@@ -727,10 +749,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if profile_isolation is None:
             profile_isolation = self._read_config_key("profile_isolation")
         if profile_isolation is not None:
-            if isinstance(profile_isolation, str):
-                self._profile_isolation_enabled = profile_isolation.lower() in ("true", "1", "yes", "on")
+            parsed_isolation, isolation_warning = parse_strict_bool(profile_isolation)
+            if isolation_warning:
+                logger.warning("Mnemosyne: %s", isolation_warning)
             else:
-                self._profile_isolation_enabled = bool(profile_isolation)
+                self._profile_isolation_enabled = parsed_isolation
 
         shared_surface_path = kwargs.get("shared_surface_path")
         if shared_surface_path is None:
@@ -745,13 +768,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if _sync_raw is None:
             _sync_raw = self._read_config_key("sync_roles")
         if _sync_raw is not None:
-            if isinstance(_sync_raw, str):
-                parsed = {r.strip().lower() for r in _sync_raw.split(",") if r.strip()}
-            elif isinstance(_sync_raw, (list, tuple, set)):
-                parsed = {str(r).strip().lower() for r in _sync_raw if str(r).strip()}
-            else:
-                parsed = set()
-            self._sync_roles = parsed & self._VALID_SYNC_ROLES
+            self._sync_roles, _sync_warnings = parse_sync_roles(
+                _sync_raw, current=self._sync_roles, valid_roles=self._VALID_SYNC_ROLES
+            )
+            for warning in _sync_warnings:
+                logger.warning("Mnemosyne: %s", warning)
 
         # skip_contexts: kwargs > config.yaml > env var (already set in __init__)
         _skip_raw = kwargs.get("skip_contexts")
@@ -786,6 +807,20 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             else:
                 logger.warning("Mnemosyne: invalid default_scope=%r, must be 'session' or 'global'", default_scope)
 
+    def effective_config(self) -> Dict[str, Any]:
+        """Return normalized provider settings used by the current process."""
+        return {
+            "auto_sleep": self._auto_sleep_enabled,
+            "default_scope": self._default_scope,
+            "profile_isolation": self._profile_isolation_enabled,
+            "reflect": {
+                "disabled_for_cron": self._reflect_disabled_for_cron,
+                "max_calls_per_session": self._reflect_max_calls_per_session,
+            },
+            "skip_contexts": sorted(self._skip_contexts),
+            "sync_roles": sorted(self._sync_roles),
+        }
+
     def _should_filter(self, content: str) -> bool:
         """Check if content matches any ignore pattern. Returns True if it should be skipped."""
         if not self._ignore_patterns:
@@ -800,8 +835,22 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         return False
 
     def _read_config_key(self, key: str) -> Any:
-        """Read a single key from memory.mnemosyne in config.yaml."""
-        return read_hermes_config_key(getattr(self, "_hermes_home", None), key)
+        """Read Hermes config first, then the hot-reloaded Mnemosyne config."""
+        val = read_hermes_config_key(getattr(self, "_hermes_home", None), key)
+        if val is not None:
+            return val
+
+        from mnemosyne.core.config import get_config
+
+        core_key = "auto_sleep_enabled" if key == "auto_sleep" else key
+        val = get_config().get(core_key)
+        if (
+            key == "skip_contexts"
+            and val in (None, "", [], (), set())
+            and "MNEMOSYNE_SKIP_CONTEXTS" not in os.environ
+        ):
+            return None
+        return val
 
 
     def _configured_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -2435,6 +2484,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # main shutdown path is freed after the join timeout.
         if not self._beam:
             return
+        if not self._auto_sleep_enabled:
+            logger.info("Mnemosyne session-end sleep skipped: auto_sleep disabled")
+            return
         try:
             skip = self._reserve_reflection_budget("session_end")
             if skip is not None:
@@ -2578,8 +2630,12 @@ def register_memory_provider(ctx):
 # Plugin registration (used when loaded via Hermes plugin system)
 # ---------------------------------------------------------------------------
 
+_provider: Optional[Any] = None
+
+
 def register(ctx):
     """Called by Hermes plugin loader to register CLI commands and tools."""
+    global _provider
     # Register the memory provider first so Hermes discovers it
     register_memory_provider(ctx)
 

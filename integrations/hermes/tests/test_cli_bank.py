@@ -14,7 +14,9 @@ import importlib.util
 import types
 from pathlib import Path
 
-from mnemosyne_hermes.cli import _resolve_cli_bank, _get_provider_class
+import pytest
+
+from mnemosyne_hermes.cli import _profile_isolation_enabled, _resolve_cli_bank, _get_provider_class
 import mnemosyne_hermes as _mnh
 
 
@@ -46,6 +48,18 @@ def test_default_bank_when_isolation_disabled(tmp_path, monkeypatch):
     _write_config(home, "false")
     monkeypatch.setenv("HERMES_HOME", str(home))
     assert _resolve_cli_bank(_args(bank=None), "stats") is None
+
+
+
+def test_invalid_profile_isolation_aborts_bank_resolution(tmp_path, monkeypatch):
+    home = tmp_path / "profiles" / "zedd"
+    _write_config(home, "definitely-not-a-bool")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with pytest.raises(ValueError, match="invalid boolean"):
+        _profile_isolation_enabled(str(home))
+    with pytest.raises(ValueError, match="invalid boolean"):
+        _resolve_cli_bank(_args(bank=None), "stats")
 
 
 def test_default_bank_when_no_config(tmp_path, monkeypatch):

@@ -97,6 +97,18 @@ def _provider_for_config(module, hermes_home: Path):
     return provider
 
 
+def test_invalid_profile_isolation_preserves_boundary_in_both_provider_surfaces(
+    provider_modules, tmp_path, caplog
+):
+    for name, module in provider_modules.items():
+        provider = _provider_for_config(module, tmp_path / name)
+        provider._read_config_key = lambda _key: None
+        provider._apply_provider_config({"profile_isolation": True})
+        assert provider._profile_isolation_enabled is True
+        provider._apply_provider_config({"profile_isolation": "definitely-not-a-bool"})
+        assert provider._profile_isolation_enabled is True
+
+
 def _json_stable(value):
     return json.loads(json.dumps(value, sort_keys=True))
 

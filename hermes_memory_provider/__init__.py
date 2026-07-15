@@ -41,7 +41,7 @@ from mnemosyne.batch_tool import (
     dry_run_batch,
     validate_batch_operations,
 )
-from mnemosyne.hermes_config import read_hermes_config_key
+from mnemosyne.hermes_config import parse_strict_bool, parse_sync_roles, read_hermes_config_key
 from mnemosyne.integrations.hermes_persona_prompt import HermesPersonaPromptMixin
 
 logger = logging.getLogger(__name__)
@@ -260,6 +260,7 @@ def _prefetch_topic_signal(row: Dict[str, Any]) -> float:
         float(row.get("keyword_score") or 0.0),
         float(row.get("fts_score") or 0.0),
         float(row.get("dense_score") or 0.0),
+        float(row.get("topic_signal") or 0.0),
     )
     # Fact/entity matches are explicit relevance signals even when recall() did
     # not fill keyword/FTS scores for that path.
@@ -1309,8 +1310,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._sync_roles: Set[str] = {"user"}
         _sync_env = os.environ.get("MNEMOSYNE_SYNC_ROLES")
         if _sync_env is not None:
-            _parsed_roles = {r.strip().lower() for r in _sync_env.split(",") if r.strip()}
-            self._sync_roles = _parsed_roles & self._VALID_SYNC_ROLES
+            self._sync_roles, _sync_warnings = parse_sync_roles(
+                _sync_env, current=self._sync_roles, valid_roles=self._VALID_SYNC_ROLES
+            )
+            for warning in _sync_warnings:
+                logger.warning("Mnemosyne: %s", warning)
         self._skip_contexts = {"cron", "flush", "subagent", "background", "skill_loop"}  # Agent contexts to skip
         # Allow override via MNEMOSYNE_SKIP_CONTEXTS env var.
         # Set to empty string to skip nothing (enable all contexts).
@@ -1495,10 +1499,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if profile_isolation is None:
             profile_isolation = self._read_config_key("profile_isolation")
         if profile_isolation is not None:
-            if isinstance(profile_isolation, str):
-                self._profile_isolation_enabled = profile_isolation.lower() in ("true", "1", "yes", "on")
+            parsed_isolation, isolation_warning = parse_strict_bool(profile_isolation)
+            if isolation_warning:
+                logger.warning("Mnemosyne: %s", isolation_warning)
             else:
-                self._profile_isolation_enabled = bool(profile_isolation)
+                self._profile_isolation_enabled = parsed_isolation
 
         shared_surface_path = kwargs.get("shared_surface_path")
         if shared_surface_path is None:
@@ -1524,24 +1529,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if _sync_raw is None:
             _sync_raw = self._read_config_key("sync_roles")
         if _sync_raw is not None:
-            if isinstance(_sync_raw, str):
-                _parsed_roles = {r.strip().lower() for r in _sync_raw.split(",") if r.strip()}
-            elif isinstance(_sync_raw, (list, tuple, set)):
-                _parsed_roles = {str(r).strip().lower() for r in _sync_raw if str(r).strip()}
-            else:
-                logger.warning("Mnemosyne: invalid sync_roles type %s (%r); keeping %s",
-                               type(_sync_raw).__name__, _sync_raw, sorted(self._sync_roles))
-                _sync_raw = None
-            if _sync_raw is not None:
-                _unknown = _parsed_roles - self._VALID_SYNC_ROLES
-                if _unknown:
-                    logger.warning("Mnemosyne: unknown sync_roles ignored: %s", sorted(_unknown))
-                _valid = _parsed_roles & self._VALID_SYNC_ROLES
-                if _parsed_roles and not _valid:
-                    logger.warning("Mnemosyne: no valid sync_roles in %r; keeping %s",
-                                   _parsed_roles, sorted(self._sync_roles))
-                else:
-                    self._sync_roles = _valid
+            self._sync_roles, _sync_warnings = parse_sync_roles(
+                _sync_raw, current=self._sync_roles, valid_roles=self._VALID_SYNC_ROLES
+            )
+            for warning in _sync_warnings:
+                logger.warning("Mnemosyne: %s", warning)
 
         shared_surface_read = kwargs.get("shared_surface_read")
         if shared_surface_read is None:
@@ -1564,6 +1556,20 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 self._default_scope = scope_str
             else:
                 logger.warning("Mnemosyne: invalid default_scope=%r, must be 'session' or 'global'", default_scope)
+
+    def effective_config(self) -> Dict[str, Any]:
+        """Return normalized provider settings used by the current process."""
+        return {
+            "auto_sleep": self._auto_sleep_enabled,
+            "default_scope": self._default_scope,
+            "profile_isolation": self._profile_isolation_enabled,
+            "reflect": {
+                "disabled_for_cron": self._reflect_disabled_for_cron,
+                "max_calls_per_session": self._reflect_max_calls_per_session,
+            },
+            "skip_contexts": sorted(self._skip_contexts),
+            "sync_roles": sorted(self._sync_roles),
+        }
 
 
     def _should_filter(self, content: str) -> bool:
@@ -1596,7 +1602,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return val
 
         # 2. Mnemosyne config singleton (auto-reloads on file change)
-        val = get_config().get(key)
+        core_key = "auto_sleep_enabled" if key == "auto_sleep" else key
+        val = get_config().get(core_key)
+        if (
+            key == "skip_contexts"
+            and val in (None, "", [], (), set())
+            and "MNEMOSYNE_SKIP_CONTEXTS" not in os.environ
+        ):
+            # Historical auto-seeded core config used an empty value, which
+            # must not erase the provider's safe skip-context defaults.
+            return None
         if val is not None:
             return val
 
@@ -3394,6 +3409,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # the thread keeps running in the background if it overruns, but the
         # main shutdown path is freed after the join timeout.
         if not self._beam:
+            return
+        if not self._auto_sleep_enabled:
+            logger.info("Mnemosyne session-end sleep skipped: auto_sleep disabled")
             return
         try:
             skip = self._reserve_reflection_budget("session_end")
