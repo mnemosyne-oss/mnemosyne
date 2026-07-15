@@ -453,7 +453,11 @@ class RuntimeDiagnosticsAdapter:
         if not isinstance(result, dict) or not isinstance(result.get("checks"), list):
             return AdapterResult(metrics={"status": STATUS_UNKNOWN, "error_class": "runtime_error"})
         checks = [
-            {"check": entry["check"], "status": entry["status"]}
+            {
+                "check": entry["check"],
+                "status": entry["status"],
+                "detail": safe_preview(entry.get("detail", ""), max_length=240),
+            }
             for entry in result["checks"]
             if isinstance(entry, dict)
             and entry.get("check") in _RUNTIME_CHECK_NAMES
@@ -741,6 +745,24 @@ def render_doctor_markdown(payload: dict[str, Any]) -> str:
     else:
         lines.append(f"- status: `{_compact_json(sqlite_health)}`")
 
+    lines.extend(["", "## Runtime", ""])
+    runtime_diagnostics = payload.get("runtime_diagnostics", {})
+    if isinstance(runtime_diagnostics, dict):
+        if "status" in runtime_diagnostics:
+            lines.append(f"- status: `{_compact_json(runtime_diagnostics['status'])}`")
+        checks = runtime_diagnostics.get("checks", [])
+        if isinstance(checks, list):
+            for check in checks:
+                if not isinstance(check, dict) or not isinstance(check.get("check"), str):
+                    continue
+                detail = safe_preview(check.get("detail", ""), max_length=240)
+                lines.append(
+                    f"- {_markdown_scalar(check['check'])}: "
+                    f"`{_compact_json({'status': check.get('status'), 'detail': detail})}`"
+                )
+    else:
+        lines.append(f"- status: `{_compact_json(runtime_diagnostics)}`")
+
     lines.extend(["", "## References", ""])
     _append_metric_lines(lines, payload.get("reference_contracts"))
     lines.extend(["", "## Vector tiers", ""])
@@ -782,6 +804,36 @@ def render_doctor_markdown(payload: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _rollback_doctor_artifacts(
+    committed: list[Path], originals: dict[Path, bytes | None], temporary_paths: set[Path]
+) -> list[BaseException]:
+    """Best-effort restore of committed Doctor artifacts in reverse order."""
+
+    rollback_errors: list[BaseException] = []
+    for target in reversed(committed):
+        try:
+            original = originals[target]
+            if original is None:
+                target.unlink(missing_ok=True)
+                continue
+            fd, temporary = tempfile.mkstemp(
+                prefix=f".{target.name}-restore-", suffix=".tmp", dir=target.parent
+            )
+            temporary_path = Path(temporary)
+            temporary_paths.add(temporary_path)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(original)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, target)
+        except BaseException as rollback_error:
+            # Continue trying every committed target.  The original write
+            # error remains the public failure, with rollback trouble
+            # attached as diagnostic context rather than masking it.
+            rollback_errors.append(rollback_error)
+    return rollback_errors
+
+
 def _write_doctor_artifacts_atomically(targets: list[tuple[Path, str]]) -> None:
     """Stage and replace one or more rendered Doctor artifacts safely."""
 
@@ -816,28 +868,7 @@ def _write_doctor_artifacts_atomically(targets: list[tuple[Path, str]]) -> None:
         for target, _ in targets:
             _fsync_directory(target.parent)
     except BaseException as error:
-        rollback_errors: list[BaseException] = []
-        for target in reversed(committed):
-            try:
-                original = originals[target]
-                if original is None:
-                    target.unlink(missing_ok=True)
-                    continue
-                fd, temporary = tempfile.mkstemp(
-                    prefix=f".{target.name}-restore-", suffix=".tmp", dir=target.parent
-                )
-                temporary_path = Path(temporary)
-                temporary_paths.add(temporary_path)
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(original)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary_path, target)
-            except BaseException as rollback_error:
-                # Continue trying every committed target.  The original write
-                # error remains the public failure, with rollback trouble
-                # attached as diagnostic context rather than masking it.
-                rollback_errors.append(rollback_error)
+        rollback_errors = _rollback_doctor_artifacts(committed, originals, temporary_paths)
         if rollback_errors and hasattr(error, "add_note"):
             error.add_note(
                 f"Doctor output rollback encountered {len(rollback_errors)} error(s)."

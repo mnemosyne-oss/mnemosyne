@@ -19,7 +19,9 @@ def test_diagnose_version_falls_back_to_distribution_metadata(tmp_path, monkeypa
 
     summary = diagnose.run_diagnostics()
 
-    assert _entry(summary, "mnemosyne_version")["status"] == "9.9.9"
+    version = _entry(summary, "mnemosyne_version")
+    assert version["status"] == "OK"
+    assert version["detail"] == "9.9.9"
 
 
 def test_diagnose_treats_ctransformers_as_optional(tmp_path, monkeypatch):

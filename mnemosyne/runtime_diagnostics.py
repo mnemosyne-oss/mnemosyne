@@ -20,9 +20,9 @@ def collect_runtime_diagnostics() -> dict[str, Any]:
     def add(category: str, check: str, status: str, detail: str = "") -> None:
         checks.append({"category": category, "check": check, "status": status, "detail": detail})
 
-    add("env", "python_version", sys.version.split()[0])
-    add("env", "platform", platform.platform())
-    add("env", "python_executable", sys.executable)
+    add("env", "python_version", "OK", sys.version.split()[0])
+    add("env", "platform", "OK", platform.platform())
+    add("env", "python_executable", "OK", sys.executable)
 
     try:
         import mnemosyne
@@ -30,7 +30,7 @@ def collect_runtime_diagnostics() -> dict[str, Any]:
         version = getattr(mnemosyne, "__version__", None)
         if not version:
             version = importlib.metadata.version("mnemosyne-memory")
-        add("package", "mnemosyne_version", str(version))
+        add("package", "mnemosyne_version", "OK", str(version))
     except Exception:
         add("package", "mnemosyne_version", "ERROR", "package version unavailable")
 
@@ -60,7 +60,7 @@ def collect_runtime_diagnostics() -> dict[str, Any]:
         from mnemosyne.core import embeddings as _embeddings
 
         add("core", "embeddings_available", "YES" if _embeddings.available() else "NO")
-        add("core", "embeddings_model", _embeddings._DEFAULT_MODEL)
+        add("core", "embeddings_model", "OK", _embeddings._DEFAULT_MODEL)
     except Exception:
         add("core", "embeddings_available", "ERROR", "embeddings capability unavailable")
 

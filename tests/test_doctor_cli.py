@@ -12,7 +12,8 @@ import sys
 
 import pytest
 
-from mnemosyne.doctor import write_doctor_artifacts_atomically
+from mnemosyne import cli, doctor
+from mnemosyne.doctor import write_doctor_artifact_atomically, write_doctor_artifacts_atomically
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -416,4 +417,81 @@ def test_atomic_both_output_write_cleans_restore_temp_when_rollback_replace_fail
     # only because this test injects failure in its rollback replacement.
     assert json_path.read_text() == '{"safe": true}\n'
     assert markdown_path.read_text() == "# previous\n"
+    assert not list(tmp_path.glob(".doctor-*"))
+
+
+@pytest.mark.parametrize(
+    ("output_name", "failure"),
+    [("doctor.json", "replace"), ("doctor.md", "fsync")],
+)
+def test_atomic_single_output_write_preserves_target_and_cleans_temps(tmp_path, monkeypatch, output_name, failure):
+    target = tmp_path / output_name
+    previous = "previous artifact\n"
+    target.write_text(previous)
+
+    if failure == "replace":
+        real_replace = os.replace
+
+        def fail_replace(source, destination):
+            if Path(destination) == target:
+                raise OSError("simulated single-target replace failure")
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(doctor.os, "replace", fail_replace)
+        error = "simulated single-target replace failure"
+    else:
+
+        def fail_fsync(_descriptor):
+            raise OSError("simulated single-target fsync failure")
+
+        monkeypatch.setattr(doctor.os, "fsync", fail_fsync)
+        error = "simulated single-target fsync failure"
+
+    with pytest.raises(OSError, match=error):
+        write_doctor_artifact_atomically(path=target, text="safe artifact\n")
+
+    assert target.read_text() == previous
+    assert not list(tmp_path.glob(".doctor-*"))
+
+
+@pytest.mark.parametrize(
+    ("output_format", "output_flag", "output_name", "failure"),
+    [
+        ("json", "--json-out", "doctor.json", "replace"),
+        ("markdown", "--markdown-out", "doctor.md", "fsync"),
+    ],
+)
+def test_doctor_cli_single_output_failure_preserves_target_and_cleans_temps(
+    tmp_path, monkeypatch, capsys, output_format, output_flag, output_name, failure
+):
+    db_path = tmp_path / "fixture.db"
+    _create_fixture_db(db_path)
+    target = tmp_path / output_name
+    previous = "previous artifact\n"
+    target.write_text(previous)
+
+    if failure == "replace":
+        real_replace = os.replace
+
+        def fail_replace(source, destination):
+            if Path(destination) == target:
+                raise OSError("simulated CLI single-target replace failure")
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(doctor.os, "replace", fail_replace)
+        error = "simulated CLI single-target replace failure"
+    else:
+
+        def fail_fsync(_descriptor):
+            raise OSError("simulated CLI single-target fsync failure")
+
+        monkeypatch.setattr(doctor.os, "fsync", fail_fsync)
+        error = "simulated CLI single-target fsync failure"
+
+    with pytest.raises(SystemExit) as raised:
+        cli.cmd_doctor(["--db", str(db_path), "--format", output_format, output_flag, str(target)])
+
+    assert raised.value.code == 1
+    assert error in capsys.readouterr().err
+    assert target.read_text() == previous
     assert not list(tmp_path.glob(".doctor-*"))

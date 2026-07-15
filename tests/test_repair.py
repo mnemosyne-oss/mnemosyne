@@ -179,7 +179,14 @@ def test_repair_fails_closed_before_dry_run_on_non_linux(tmp_path, monkeypatch):
     db_path = tmp_path / "memory.db"
     _create_db(db_path)
     report_path = tmp_path / "missing-report.json"
+    before = tuple(tmp_path.iterdir())
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("platform guard must run before filesystem work")
+
     monkeypatch.setattr(repair.sys, "platform", "darwin")
+    monkeypatch.setattr(repair, "_database_identity", fail_if_called)
+    monkeypatch.setattr(repair, "_load_manifest", fail_if_called)
 
     with pytest.raises(RepairError, match="supported only on Linux"):
         run_repair(
@@ -191,6 +198,7 @@ def test_repair_fails_closed_before_dry_run_on_non_linux(tmp_path, monkeypatch):
         )
 
     assert not report_path.exists()
+    assert tuple(tmp_path.iterdir()) == before
 
 
 def test_manifest_bank_fingerprint_and_parse_fail_closed_before_backup_or_write(tmp_path):

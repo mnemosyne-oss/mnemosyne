@@ -13,6 +13,7 @@ from mnemosyne.doctor import (
     DoctorReport,
     Finding,
     ReferenceContractRegistry,
+    RuntimeDiagnosticsAdapter,
     SQLiteHealthAdapter,
     VectorCoverageAdapter,
     RepairCandidate,
@@ -165,6 +166,42 @@ def test_runtime_diagnostics_marks_sqlite_vec_available_only_after_loading(monke
         }
         for check in result["checks"]
     )
+
+
+def test_runtime_metadata_is_retained_in_safe_doctor_artifacts(monkeypatch):
+    """Metadata checks use enum statuses while preserving their values as details."""
+
+    metadata = {
+        "python_version": "3.13.5",
+        "platform": "Linux-6.18.34-rpt-rpi-2712-aarch64-with-glibc2.40",
+        "python_executable": "/usr/bin/python3",
+        "mnemosyne_version": "1.2.3",
+        "embeddings_model": "BAAI/bge-small-en-v1.5",
+    }
+    monkeypatch.setattr(
+        "mnemosyne.runtime_diagnostics.collect_runtime_diagnostics",
+        lambda: {
+            "status": "ok",
+            "checks": [
+                {"check": check, "status": "OK", "detail": detail}
+                for check, detail in metadata.items()
+            ],
+        },
+    )
+
+    runtime = RuntimeDiagnosticsAdapter().inspect().metrics
+    payload = DoctorReport(bank_name="default", runtime_diagnostics=runtime).to_dict()
+    json_artifact = render_doctor_json(payload)
+    markdown_artifact = render_doctor_markdown(payload)
+
+    assert runtime["checks"] == [
+        {"check": check, "status": "OK", "detail": detail}
+        for check, detail in metadata.items()
+    ]
+    assert "## Runtime" in markdown_artifact
+    for detail in metadata.values():
+        assert detail in json_artifact
+        assert detail in markdown_artifact
 
 
 def test_safe_preview_caps_raw_text_before_regex_redaction(monkeypatch):
