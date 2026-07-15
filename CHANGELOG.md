@@ -9,6 +9,11 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Atomic SQLite backup and restore.** Disaster-recovery snapshots now preserve
+  committed WAL, FTS5, and sqlite-vec state as validated binary SQLite archives,
+  publish metadata atomically, restore in place for active connections, and
+  roll back interrupted or failed cutovers.
+
 - **Hermes provider safety defaults after config bridging.** New auto-seeded
   configs now preserve user-only autosave and skip `cron`, `flush`, `subagent`,
   `background`, and `skill_loop` contexts. Existing 3.12.1/3.12.2 auto-seeded

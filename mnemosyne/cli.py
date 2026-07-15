@@ -566,10 +566,27 @@ def cmd_backup(args):
 def cmd_restore(args):
     """Restore database from a backup file."""
     if not args:
-        _usage("Usage: mnemosyne restore <backup_file.db.gz>")
+        _usage("Usage: mnemosyne restore <backup_file.db.gz> [--target <database.db>]")
+    backup_path = None
+    target_path = None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--target":
+            if target_path is not None or i + 1 >= len(args):
+                _usage("Usage: mnemosyne restore <backup_file.db.gz> [--target <database.db>]")
+            target_path = Path(args[i + 1])
+            i += 2
+        elif arg.startswith("-") or backup_path is not None:
+            _usage("Usage: mnemosyne restore <backup_file.db.gz> [--target <database.db>]")
+        else:
+            backup_path = Path(arg)
+            i += 1
+    if backup_path is None:
+        _usage("Usage: mnemosyne restore <backup_file.db.gz> [--target <database.db>]")
     from mnemosyne.dr.recovery import restore_backup
     try:
-        result = restore_backup(Path(args[0]))
+        result = restore_backup(backup_path, target_path)
         status = "valid" if result["integrity_check"] else "corrupt"
         print(f"Restored from: {result['backup_used']}")
         print(f"  Database:     {result['database_path']}")

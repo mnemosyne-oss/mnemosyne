@@ -53,13 +53,10 @@ def test_get_default_paths_data_dir_takes_precedence_over_hermes_home(monkeypatc
 
 
 def test_create_backup_succeeds_with_sqlite_vec_tables(tmp_path):
-    """Regression: create_backup() must load sqlite-vec on the source AND
-    destination connections, otherwise sqlite3.Connection.backup() and
-    Connection.iterdump() both fail with ``no such module: vec0`` on
-    databases that use vec0 virtual tables.
+    """The binary snapshot must remain queryable with sqlite-vec loaded.
 
-    Pre-fix: this test fails with ``sqlite3.OperationalError: no such
-    module: vec0`` raised from inside the backup serialization path.
+    A SQL dump is not a valid recovery format for vec0/FTS shadow tables;
+    decompress the native SQLite file and exercise the virtual table instead.
     """
     pytest.importorskip("sqlite_vec")
 
@@ -85,12 +82,20 @@ def test_create_backup_succeeds_with_sqlite_vec_tables(tmp_path):
     # raised sqlite3.OperationalError: no such module: vec0.
     result = recovery.create_backup(db_path=db_path, backup_dir=backup_dir)
 
-    # Assert: backup file exists, is non-empty, gzipped, and the gz
-    # contents contain the vec0 table definition.
+    # Assert: backup file exists, is non-empty and decompresses to a native
+    # SQLite database whose vec0 table can be queried.
     assert Path(result["backup_path"]).exists()
     assert result["backup_size"] > 0
     import gzip
-    with gzip.open(result["backup_path"], "rt") as f:
-        dump = f.read()
-    assert "vec_items" in dump
-    assert "CREATE VIRTUAL TABLE" in dump
+    restored = tmp_path / "snapshot.db"
+    with gzip.open(result["backup_path"], "rb") as source, restored.open("wb") as target:
+        target.write(source.read())
+    assert restored.read_bytes().startswith(b"SQLite format 3\x00")
+    check = sqlite3.connect(str(restored))
+    check.enable_load_extension(True)
+    sqlite_vec.load(check)
+    try:
+        assert check.execute("SELECT COUNT(*) FROM vec_items").fetchone()[0] == 0
+        assert check.execute("SELECT COUNT(*) FROM meta").fetchone()[0] == 2
+    finally:
+        check.close()
