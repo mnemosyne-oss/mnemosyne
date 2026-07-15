@@ -23,10 +23,11 @@ import hashlib
 import logging
 import threading
 import math
+import uuid
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Any, Set, Union, Tuple
+from typing import List, Dict, Optional, Any, Set, Union, Tuple, Callable
 from pathlib import Path
 
 
@@ -278,6 +279,14 @@ WM_PINNED_IDS = set(
 EPISODIC_RECALL_LIMIT = int(os.environ.get("MNEMOSYNE_EP_LIMIT", "50000"))
 SLEEP_BATCH_SIZE = int(os.environ.get("MNEMOSYNE_SLEEP_BATCH", "5000"))
 SCRATCHPAD_MAX_ITEMS = int(os.environ.get("MNEMOSYNE_SP_MAX", "1000"))
+
+
+def _new_consolidation_claim_token(now: Optional[datetime] = None) -> str:
+    """Return a time-sortable claim token that remains unique across workers."""
+    timestamp = (now or datetime.now()).isoformat()
+    return f"{timestamp}:{uuid.uuid4().hex}"
+
+
 RECENCY_HALFLIFE_HOURS = float(os.environ.get("MNEMOSYNE_RECENCY_HALFLIFE", "168"))  # 1 week default
 
 # Tiered episodic degradation
@@ -1174,6 +1183,14 @@ def init_beam(db_path: Path = None):
             VALUES ('delete', old.rowid, old.subject, old.predicate, old.object);
         END
     """)
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
+            INSERT INTO fts_facts(fts_facts, rowid, subject, predicate, object)
+            VALUES ('delete', old.rowid, old.subject, old.predicate, old.object);
+            INSERT INTO fts_facts(rowid, subject, predicate, object)
+            VALUES (new.rowid, new.subject, new.predicate, new.object);
+        END
+    """)
 
     # Vector table for facts (sqlite-vec). Skipped on a dimension mismatch for the
     # same reason as vec_episodes / vec_working above (see the guard in the
@@ -1262,11 +1279,15 @@ def _guarded_transaction(conn: sqlite3.Connection):
     try:
         yield
         conn.commit()
-    except Exception:
+    except BaseException:
         try:
             conn.rollback()
-        except sqlite3.Error:
-            pass  # rollback of a dead connection must not mask the cause
+        except BaseException:
+            logger.error(
+                "_guarded_transaction: rollback failed while preserving "
+                "the original exception",
+                exc_info=True,
+            )
         raise
 
 
@@ -1299,18 +1320,22 @@ def _deferred_commits(conn: sqlite3.Connection):
     conn._defer_commit = True
     try:
         yield
-    except Exception:
+    except BaseException:
         conn._defer_commit = False
         try:
             conn.rollback()
-        except sqlite3.Error:
-            pass
+        except BaseException:
+            logger.error(
+                "_deferred_commits: rollback failed while preserving "
+                "the original exception",
+                exc_info=True,
+            )
         raise
     else:
         conn._defer_commit = False
         try:
             conn._real_commit()
-        except sqlite3.Error as exc:
+        except BaseException as exc:
             logger.error(
                 "_deferred_commits: final commit failed: %s; "
                 "rolling back the buffered transaction",
@@ -1318,8 +1343,12 @@ def _deferred_commits(conn: sqlite3.Connection):
             )
             try:
                 conn.rollback()
-            except sqlite3.Error:
-                pass
+            except BaseException:
+                logger.error(
+                    "_deferred_commits: rollback after final commit failure "
+                    "also failed",
+                    exc_info=True,
+                )
             raise
     finally:
         # Defense in depth: clear the flag on any control-flow path.
@@ -2092,9 +2121,9 @@ def _effective_vec_type(conn: sqlite3.Connection, table: str = "vec_episodes") -
     return "float32"
 
 
-def _vec_insert(conn: sqlite3.Connection, rowid: int, embedding: List[float]):
+def _vec_insert(conn: sqlite3.Connection, rowid: int, embedding: List[float], *, commit: bool = True):
     """Insert embedding into the episodic sqlite-vec table."""
-    _vec_table_insert(conn, "vec_episodes", rowid, embedding)
+    _vec_table_insert(conn, "vec_episodes", rowid, embedding, commit=commit)
 
 
 def _vec_table_insert(conn: sqlite3.Connection, table: str, rowid: int, embedding: List[float], *, commit: bool = True):
@@ -2134,15 +2163,12 @@ def _vec_table_insert(conn: sqlite3.Connection, table: str, rowid: int, embeddin
             f"INSERT INTO {table}(rowid, embedding) VALUES (?, ?)",
             (rowid, emb_json)
         )
-    # Ensure the insert is committed even when the caller's connection
-    # has _defer_commit=True (_BeamConnection). Without this, inserts
-    # sit in the deferred transaction and disappear if the caller
-    # later rolls back or the connection is reused in a different context.
+    # Use the public commit path so an enclosing _deferred_commits() scope
+    # remains atomic. _BeamConnection.commit() commits immediately outside
+    # such a scope and deliberately becomes a no-op inside it; bypassing that
+    # contract with _real_commit() would make a later batch rollback partial.
     if commit:
-        if isinstance(conn, _BeamConnection):
-            conn._real_commit()
-        else:
-            conn.commit()
+        conn.commit()
 
 
 def _wm_rowid(conn: sqlite3.Connection, memory_id: str) -> Optional[int]:
@@ -4293,7 +4319,9 @@ class BeamMemory:
                                 source: str = "consolidation", importance: float = 0.6,
                                 metadata: Dict = None, valid_until: str = None,
                                 scope: str = "session",
-                                veracity: Optional[str] = None) -> str:
+                                veracity: Optional[str] = None,
+                                commit: bool = True,
+                                enrich: bool = True) -> str:
         """
         Store a consolidated summary into episodic_memory with optional embedding.
 
@@ -4359,7 +4387,12 @@ class BeamMemory:
         if vec is not None:
             if _vec_available(self.conn):
                 try:
-                    _vec_insert(self.conn, rowid, np.asarray(vec[0]).tolist())
+                    _vec_insert(
+                        self.conn,
+                        rowid,
+                        np.asarray(vec[0]).tolist(),
+                        commit=commit,
+                    )
                 except Exception as _vec_exc:
                     logger.warning(
                         "vec_episodes insert failed (rowid=%s): %s",
@@ -4383,7 +4416,8 @@ class BeamMemory:
                 except Exception:
                     pass  # Non-blocking
 
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
         # Phase 3-4: Graph + veracity for consolidated episodic memory
         # E4.a.1 review fix (H2): thread the aggregated row_veracity into
@@ -4393,11 +4427,12 @@ class BeamMemory:
         # the consolidator's `consolidate_fact` then used as the veracity
         # weight in its confidence update -- undermining the very signal
         # we just preserved in the episodic INSERT.
-        self._ingest_graph_and_veracity(memory_id, summary, source, veracity=row_veracity)
+        if enrich:
+            self._ingest_graph_and_veracity(memory_id, summary, source, veracity=row_veracity)
 
-        self._emit_event("MEMORY_CONSOLIDATED", memory_id, content=summary,
-                         source=source, importance=importance,
-                         metadata={"summary_of": source_wm_ids, **(metadata or {})})
+            self._emit_event("MEMORY_CONSOLIDATED", memory_id, content=summary,
+                             source=source, importance=importance,
+                             metadata={"summary_of": source_wm_ids, **(metadata or {})})
         return memory_id
 
     # ------------------------------------------------------------------
@@ -7967,8 +8002,7 @@ class BeamMemory:
         orphan_query = """
             SELECT wm.id
             FROM working_memory wm
-            WHERE wm.consolidated_at IS NOT NULL
-              AND wm.consolidation_claimed_at IS NOT NULL
+            WHERE wm.consolidation_claimed_at IS NOT NULL
               AND wm.consolidation_claimed_at < ?
               AND NOT EXISTS (
                   SELECT 1
@@ -7976,7 +8010,7 @@ class BeamMemory:
                   WHERE instr(',' || COALESCE(em.summary_of, '') || ',',
                               ',' || wm.id || ',') > 0
               )
-            ORDER BY wm.consolidated_at ASC
+            ORDER BY wm.consolidation_claimed_at ASC
             LIMIT ?
         """
         cursor.execute(orphan_query, (cutoff, limit))
@@ -8008,7 +8042,6 @@ class BeamMemory:
             SET consolidated_at = NULL,
                 consolidation_claimed_at = NULL
             WHERE id IN ({placeholders})
-              AND consolidated_at IS NOT NULL
               AND consolidation_claimed_at IS NOT NULL
               AND consolidation_claimed_at < ?
               AND NOT EXISTS (
@@ -8032,7 +8065,109 @@ class BeamMemory:
             "candidate_ids": candidate_ids,
         }
 
+    def _store_sleep_model_refresh_proposal(
+        self,
+        *,
+        content: str,
+        importance: float,
+        metadata: Dict,
+        consolidated_at: str,
+    ) -> str:
+        """Insert and finalize a review proposal in the caller's transaction."""
+        cursor = self.conn.cursor()
+        existing = cursor.execute(
+            "SELECT id FROM working_memory "
+            "WHERE content = ? AND session_id = ? "
+            "AND source = 'sleep_model_refresh_proposal' LIMIT 1",
+            (content, self.session_id),
+        ).fetchone()
+        timestamp = datetime.now().isoformat()
+        if existing:
+            proposal_id = existing["id"] if hasattr(existing, "keys") else existing[0]
+            cursor.execute(
+                "UPDATE working_memory SET source = ?, timestamp = ?, "
+                "importance = MAX(importance, ?), metadata_json = ?, scope = 'session', "
+                "veracity = 'inferred', trust_tier = 'DERIVED', "
+                "consolidated_at = NULL, consolidation_claimed_at = NULL "
+                "WHERE id = ? AND session_id = ?",
+                (
+                    "sleep_model_refresh_proposal",
+                    timestamp,
+                    importance,
+                    json.dumps(metadata),
+                    proposal_id,
+                    self.session_id,
+                ),
+            )
+        else:
+            proposal_id = _generate_id(f"{self.session_id}\0{content}")
+            cursor.execute(
+                "INSERT INTO working_memory "
+                "(id, content, source, timestamp, session_id, importance, metadata_json, "
+                "scope, author_id, author_type, channel_id, veracity, trust_tier) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'session', ?, ?, ?, 'inferred', 'DERIVED')",
+                (
+                    proposal_id,
+                    content,
+                    "sleep_model_refresh_proposal",
+                    timestamp,
+                    self.session_id,
+                    importance,
+                    json.dumps(metadata),
+                    self.author_id,
+                    self.author_type,
+                    self.channel_id,
+                ),
+            )
+        cursor.execute(
+            "UPDATE working_memory SET consolidated_at = ?, "
+            "consolidation_claimed_at = NULL WHERE id = ?",
+            (consolidated_at, proposal_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("model-refresh proposal finalize lost its row")
+        return proposal_id
+
     def sleep(self, dry_run: bool = False, force: bool = False) -> Dict:
+        """Run sleep with token-scoped cleanup for every cancellation point."""
+        claim_state: Dict[str, Optional[str]] = {}
+        try:
+            return self._sleep_impl(
+                dry_run=dry_run,
+                force=force,
+                _claim_state=claim_state,
+            )
+        except BaseException:
+            try:
+                self.conn.rollback()
+            except BaseException:
+                logger.error("sleep: rollback during cancellation failed", exc_info=True)
+
+            claim_token = claim_state.get("token")
+            if claim_token:
+                try:
+                    with _guarded_transaction(self.conn):
+                        self.conn.execute(
+                            "UPDATE working_memory "
+                            "SET consolidation_claimed_at = NULL "
+                            "WHERE consolidated_at IS NULL "
+                            "AND consolidation_claimed_at = ?",
+                            (claim_token,),
+                        )
+                except BaseException:
+                    logger.error(
+                        "sleep: token-scoped claim release during cancellation failed",
+                        exc_info=True,
+                    )
+            raise
+
+    def _sleep_impl(
+        self,
+        dry_run: bool = False,
+        force: bool = False,
+        *,
+        _claim_state: Optional[Dict[str, Optional[str]]] = None,
+    ) -> Dict:
         """
         Consolidate old working_memory for this session into episodic summaries.
         Uses a local lightweight LLM when available; falls back to aaak
@@ -8074,6 +8209,7 @@ class BeamMemory:
             WHERE COALESCE(session_id, 'default') = ?
               AND timestamp < ?
               AND consolidated_at IS NULL
+              AND consolidation_claimed_at IS NULL
               AND (pinned IS NULL OR pinned = 0)
             ORDER BY timestamp ASC
             LIMIT {SLEEP_BATCH_SIZE}
@@ -8082,29 +8218,24 @@ class BeamMemory:
         if not rows:
             return {"status": "no_op", "message": "No old working memories to consolidate"}
 
-        # Atomic claim: mark rows consolidated_at BEFORE writing the
-        # episodic summary, gated on consolidated_at IS STILL NULL.
-        # This serves two roles at once:
-        # (1) concurrent sleep() callers -- a second process that also
-        #     SELECTed the same rows finds rowcount=0 on its claim and
-        #     bails before producing a duplicate summary
-        # (2) crash safety -- if the process dies after the claim but
-        #     before episodic INSERT, the next sleep cycle finds
-        #     consolidated_at set and skips them rather than producing
-        #     a duplicate. The flip side is a possible orphan claim
-        #     (marker set, no summary) -- acceptable; the originals
-        #     remain recallable and a manual "reclaim" can clear
-        #     consolidated_at if needed.
+        # Atomic claim: reserve rows with consolidation_claimed_at only.
+        # consolidated_at remains NULL until the episodic INSERT and source
+        # markers can be committed in one final transaction. A stale claim is
+        # reclaimable after a crash; a failed summary releases its own claim.
         # The dry_run branch skips the claim entirely so it stays
         # side-effect-free.
+        claim_token = None
         if not dry_run:
-            now_iso = datetime.now().isoformat()
+            claim_token = _new_consolidation_claim_token()
+            if _claim_state is not None:
+                _claim_state["token"] = claim_token
             ids_to_claim = [row["id"] for row in rows]
             placeholders = ",".join("?" * len(ids_to_claim))
             cursor.execute(
-                f"UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? "
-                f"WHERE id IN ({placeholders}) AND consolidated_at IS NULL",
-                (now_iso, now_iso, *ids_to_claim),
+                f"UPDATE working_memory SET consolidation_claimed_at = ? "
+                f"WHERE id IN ({placeholders}) AND consolidated_at IS NULL "
+                f"AND consolidation_claimed_at IS NULL",
+                (claim_token, *ids_to_claim),
             )
             claimed_ids = set()
             if cursor.rowcount == len(ids_to_claim):
@@ -8116,8 +8247,9 @@ class BeamMemory:
                 # so we only summarize those.
                 cursor.execute(
                     f"SELECT id FROM working_memory "
-                    f"WHERE id IN ({placeholders}) AND consolidated_at = ?",
-                    (*ids_to_claim, now_iso),
+                    f"WHERE id IN ({placeholders}) AND consolidated_at IS NULL "
+                    f"AND consolidation_claimed_at = ?",
+                    (*ids_to_claim, claim_token),
                 )
                 claimed_ids = {r["id"] for r in cursor.fetchall()}
 
@@ -8130,6 +8262,54 @@ class BeamMemory:
             rows = [r for r in rows if r["id"] in claimed_ids]
             self.conn.commit()
 
+        def _release_claims(ids: List[str]) -> None:
+            if dry_run or not ids or claim_token is None:
+                return
+            release_placeholders = ",".join("?" * len(ids))
+            with _guarded_transaction(self.conn):
+                self.conn.execute(
+                    f"UPDATE working_memory SET consolidation_claimed_at = NULL "
+                    f"WHERE id IN ({release_placeholders}) "
+                    f"AND consolidated_at IS NULL AND consolidation_claimed_at = ?",
+                    (*ids, claim_token),
+                )
+
+        claimed_row_ids = [row["id"] for row in rows]
+
+        def _abort_claimed_sleep() -> None:
+            try:
+                self.conn.rollback()
+            except BaseException:
+                logger.error("sleep: rollback during local abort failed", exc_info=True)
+            try:
+                _release_claims(claimed_row_ids)
+            except BaseException:
+                logger.error("sleep: claim release during local abort failed", exc_info=True)
+
+        def _detect_group_conflicts(items: List[Dict]) -> List[Tuple[str, str]]:
+            if len(items) < 2:
+                return []
+            conflicts = self._detect_conflicts(items)
+            from mnemosyne.core.llm_conflict_detector import (
+                LLM_CONFLICT_DETECTION_ENABLED,
+                validate_conflict_pair,
+            )
+            if not LLM_CONFLICT_DETECTION_ENABLED:
+                return conflicts
+
+            group_conflicts = []
+            content_map = {item["id"]: item["content"] for item in items}
+            for older_id, newer_id in conflicts:
+                is_conflict, _confidence, _correct_fact = validate_conflict_pair(
+                    content_map.get(older_id, ""),
+                    content_map.get(newer_id, ""),
+                    session_id=self.session_id,
+                    db_path=self.db_path,
+                )
+                if is_conflict:
+                    group_conflicts.append((older_id, newer_id))
+            return group_conflicts
+
         grouped: Dict[str, List[Dict]] = {}
         for row in rows:
             grouped.setdefault(row["source"], []).append(dict(row))
@@ -8140,6 +8320,7 @@ class BeamMemory:
         conflicts_resolved = 0
         model_refresh_proposals = 0
         model_refresh_applied = 0
+        failed_groups: List[Dict[str, Any]] = []
         for source, items in grouped.items():
             lines = [item["content"] for item in items]
             ids = [item["id"] for item in items]
@@ -8159,168 +8340,243 @@ class BeamMemory:
             # Pre-fix the episodic INSERT omitted veracity and the row
             # took 'unknown' (0.8 multiplier) regardless of how confident
             # the sources were.
-            aggregated_veracity = aggregate_veracity(
-                [item.get("veracity") for item in items]
-            )
-
-            # --- Phase 1: heuristic conflict detection (no LLM) ---
-            if len(items) >= 2:
-                conflicts = self._detect_conflicts(items)
-                from mnemosyne.core.llm_conflict_detector import (
-                    LLM_CONFLICT_DETECTION_ENABLED,
-                    validate_conflict_pair,
+            try:
+                aggregated_veracity = aggregate_veracity(
+                    [item.get("veracity") for item in items]
                 )
-                if LLM_CONFLICT_DETECTION_ENABLED:
-                    content_map = {item["id"]: item["content"] for item in items}
-                    for older_id, newer_id in conflicts:
-                        older_content = content_map.get(older_id, "")
-                        newer_content = content_map.get(newer_id, "")
-                        is_conflict, confidence, correct_fact = validate_conflict_pair(
-                            older_content,
-                            newer_content,
-                            session_id=self.session_id,
-                            db_path=self.db_path,
-                        )
-                        if is_conflict:
-                            if not dry_run:
-                                self.invalidate(older_id, replacement_id=newer_id)
-                            conflicts_resolved += 1
-                else:
-                    for older_id, newer_id in conflicts:
-                        if not dry_run:
-                            self.invalidate(older_id, replacement_id=newer_id)
-                    conflicts_resolved += len(conflicts)
+            except BaseException:
+                _abort_claimed_sleep()
+                raise
+
+            # --- Phase 1: heuristic conflict detection (no writes yet) ---
+            try:
+                group_conflicts = _detect_group_conflicts(items)
+            except BaseException:
+                _abort_claimed_sleep()
+                raise
 
             # --- Try LLM summarization (chunked to fit context) ---
             summary = None
             llm_succeeded = False
-            if local_llm.llm_available():
-                # --- Optional pre-compression for small local LLMs ---
-                # Uses CompressionPlugin (registered in plugins.py). The env
-                # var MNEMOSYNE_USE_CAVEMAN still works as a deprecated
-                # fallback — see CompressionPlugin for deprecation warning.
-                compression_plugin = _plugins.get_manager().get_plugin("compression")
-                if compression_plugin and compression_plugin.enabled:
-                    lines = compression_plugin.compress_lines(lines)
+            try:
+                llm_selected = local_llm.llm_available()
+            except BaseException:
+                _abort_claimed_sleep()
+                raise
+            llm_failed = False
+            if llm_selected:
+                try:
+                    # --- Optional pre-compression for small local LLMs ---
+                    compression_plugin = _plugins.get_manager().get_plugin("compression")
+                    if compression_plugin and compression_plugin.enabled:
+                        lines = compression_plugin.compress_lines(lines)
 
-                chunks = local_llm.chunk_memories_by_budget(lines, source=source)
-                if chunks:
-                    if len(chunks) == 1:
-                        # All memories fit in one prompt
+                    chunks = local_llm.chunk_memories_by_budget(lines, source=source)
+                    if not chunks:
+                        llm_failed = True
+                    elif len(chunks) == 1:
                         summary = local_llm.summarize_memories(chunks[0], source=source)
+                        llm_failed = not bool(summary)
                     else:
-                        # Multi-chunk: summarize each chunk, then summarize the summaries
                         chunk_summaries = []
                         for chunk in chunks:
                             chunk_summary = local_llm.summarize_memories(chunk, source=source)
-                            if chunk_summary:
-                                chunk_summaries.append(chunk_summary)
-                        if chunk_summaries:
-                            # Second-pass: summarize the chunk summaries
+                            if not chunk_summary:
+                                llm_failed = True
+                                break
+                            chunk_summaries.append(chunk_summary)
+                        if not llm_failed:
                             if len(chunk_summaries) == 1:
                                 summary = chunk_summaries[0]
                             else:
                                 summary = local_llm.summarize_memories(
                                     chunk_summaries,
-                                    source=f"{source} (consolidated)"
+                                    source=f"{source} (consolidated)",
                                 )
-                                # If second-pass also overflows, concatenate
-                                if not summary:
-                                    summary = " | ".join(chunk_summaries)
+                                llm_failed = not bool(summary)
                     if summary:
                         llm_used_count += 1
                         llm_succeeded = True
+                except BaseException:
+                    _abort_claimed_sleep()
+                    raise
 
-            # --- Fallback to aaak encoding ---
+            allow_aaak_on_failure = os.environ.get(
+                "MNEMOSYNE_SLEEP_ALLOW_AAAK_FALLBACK", "false"
+            ).lower() in ("1", "true", "yes")
             if summary is None:
-                logger.warning(
-                    "sleep: LLM summarization failed for source=%r (items=%d, "
-                    "llm_available=%s) — falling back to AAAK compression",
-                    source, len(items), local_llm.llm_available(),
-                )
+                if llm_selected and llm_failed and not allow_aaak_on_failure:
+                    logger.error(
+                        "sleep: selected LLM failed for source=%r (items=%d); "
+                        "releasing claims without consolidation",
+                        source,
+                        len(items),
+                    )
+                    _release_claims(ids)
+                    failed_groups.append({
+                        "source": source,
+                        "reason": "selected_llm_failed",
+                        "ids": ids,
+                    })
+                    continue
                 combined = " | ".join(lines)
-                compressed = aaak_encode(combined)
+                try:
+                    compressed = aaak_encode(combined)
+                except BaseException:
+                    _abort_claimed_sleep()
+                    raise
                 summary = f"[{source}] {compressed}"
 
             # --- Phase 2: model-refresh inference for canonical model slots ---
-            # This follows sleep by default. It asks the same configured LLM path
-            # for structured candidate updates, then stores pending proposal rows
-            # instead of directly overwriting canonical facts.
+            # Inference is read-only. Proposals are persisted only after the
+            # core source→episode transaction succeeds; configured auto-apply
+            # runs only after each proposal transaction commits.
             proposals = []
             agent_context = str(getattr(self, "agent_context", "") or "").strip().lower()
-            model_refresh_owner_id = str(getattr(self, "canonical_owner_id", "") or "").strip() or "default"
+            model_refresh_owner_id = (
+                str(getattr(self, "canonical_owner_id", "") or "").strip()
+                or "default"
+            )
             if agent_context != "cron":
                 try:
                     from mnemosyne.core import model_refresh
                     proposals = model_refresh.infer_model_update_proposals(items)
                 except Exception:
                     proposals = []
-            model_refresh_proposals += len(proposals)
+                except BaseException:
+                    _abort_claimed_sleep()
+                    raise
 
+            summary_metadata = {
+                "original_count": len(items),
+                "source": source,
+                "llm_used": llm_succeeded,
+            }
+            episode_id = None
             if not dry_run:
-                # Originals are already claimed (consolidated_at set above).
-                # Just write the summary. If consolidate_to_episodic raises
-                # the claim survives -- the rows show as consolidated but
-                # without a summary. That's preferable to a phantom-summary-
-                # without-claim race the previous ordering allowed.
-                self.consolidate_to_episodic(
-                    summary=summary,
-                    source_wm_ids=ids,
-                    source="sleep_consolidation",
-                    importance=0.6,
-                    scope=aggregated_scope,
-                    valid_until=aggregated_valid_until,
-                    veracity=aggregated_veracity,
-                    metadata={
-                        "original_count": len(items),
+                group_placeholders = ",".join("?" * len(ids))
+                try:
+                    with _guarded_transaction(self.conn):
+                        episode_id = self.consolidate_to_episodic(
+                            summary=summary,
+                            source_wm_ids=ids,
+                            source="sleep_consolidation",
+                            importance=0.6,
+                            scope=aggregated_scope,
+                            valid_until=aggregated_valid_until,
+                            veracity=aggregated_veracity,
+                            metadata=summary_metadata,
+                            commit=False,
+                            enrich=False,
+                        )
+                        cursor.execute(
+                            f"UPDATE working_memory SET consolidated_at = ?, "
+                            f"consolidation_claimed_at = NULL "
+                            f"WHERE id IN ({group_placeholders}) "
+                            f"AND consolidated_at IS NULL "
+                            f"AND consolidation_claimed_at = ?",
+                            (datetime.now().isoformat(), *ids, claim_token),
+                        )
+                        if cursor.rowcount != len(ids):
+                            raise RuntimeError(
+                                f"sleep finalize lost claim ownership: expected={len(ids)} "
+                                f"updated={cursor.rowcount}"
+                            )
+                except Exception as exc:
+                    _release_claims(ids)
+                    failed_groups.append({
                         "source": source,
-                        "llm_used": llm_succeeded
-                    }
-                )
+                        "reason": f"finalize_failed:{type(exc).__name__}",
+                        "ids": ids,
+                    })
+                    logger.exception("sleep: atomic finalize failed for source=%r", source)
+                    continue
+                except BaseException:
+                    _abort_claimed_sleep()
+                    raise
+
+                # Derived indexes/events are best-effort and deliberately run
+                # after the atomic payload transaction.
+                try:
+                    self._ingest_graph_and_veracity(
+                        episode_id,
+                        summary,
+                        "sleep_consolidation",
+                        veracity=aggregated_veracity,
+                    )
+                    self._emit_event(
+                        "MEMORY_CONSOLIDATED",
+                        episode_id,
+                        content=summary,
+                        source="sleep_consolidation",
+                        importance=0.6,
+                        metadata={"summary_of": ids, **summary_metadata},
+                    )
+                except Exception:
+                    logger.warning(
+                        "sleep: post-commit episodic enrichment failed for %s",
+                        episode_id,
+                        exc_info=True,
+                    )
+                except BaseException:
+                    _abort_claimed_sleep()
+                    raise
+
+                for older_id, newer_id in group_conflicts:
+                    try:
+                        self.invalidate(older_id, replacement_id=newer_id)
+                        conflicts_resolved += 1
+                    except Exception:
+                        logger.warning("sleep: deferred conflict invalidation failed", exc_info=True)
+                    except BaseException:
+                        _abort_claimed_sleep()
+                        raise
+
                 if proposals:
                     from mnemosyne.core import model_refresh
                     proposal_ts = datetime.now().isoformat()
                     for proposal in proposals:
-                        metadata = model_refresh.prepare_proposal_metadata(proposal, source_wm_ids=ids)
-                        proposal_id = self.remember(
-                            model_refresh.proposal_to_memory_content(proposal),
-                            source="sleep_model_refresh_proposal",
-                            importance=float(proposal.get("confidence") or 0.5),
-                            metadata=metadata,
-                            scope="session",
-                            veracity="inferred",
-                            trust_tier="DERIVED",
-                        )
-                        # Proposal rows are review artifacts from this sleep pass,
-                        # not fresh raw memories that should recursively trigger
-                        # another sleep loop.
-                        cursor.execute(
-                            "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = NULL WHERE id = ?",
-                            (proposal_ts, proposal_id),
-                        )
-                        if model_refresh.maybe_auto_apply_model_refresh_proposal(self, proposal_id, owner_id=model_refresh_owner_id):
-                            model_refresh_applied += 1
-                    self.conn.commit()
-                group_placeholders = ",".join("?" * len(ids))
-                cursor.execute(
-                    f"UPDATE working_memory SET consolidation_claimed_at = NULL "
-                    f"WHERE id IN ({group_placeholders})",
-                    tuple(ids),
-                )
-                # Commit the claim-clear NOW. Leaving this UPDATE uncommitted
-                # opened an implicit write transaction that stayed open across
-                # the NEXT group's LLM calls (validate_conflict_pair /
-                # summarize_memories — remote API seconds-to-minutes, local
-                # GGUF fallback unbounded), holding the SQLite write lock the
-                # whole time and failing every concurrent tool call with
-                # "database is locked". Observed wedging a live instance for
-                # 7+ hours with a frozen 52MB WAL.
-                self.conn.commit()
+                        try:
+                            metadata = model_refresh.prepare_proposal_metadata(
+                                proposal, source_wm_ids=ids
+                            )
+                            with _guarded_transaction(self.conn):
+                                proposal_id = self._store_sleep_model_refresh_proposal(
+                                    content=model_refresh.proposal_to_memory_content(proposal),
+                                    importance=float(proposal.get("confidence") or 0.5),
+                                    metadata=metadata,
+                                    consolidated_at=proposal_ts,
+                                )
+                            model_refresh_proposals += 1
+                            if model_refresh.maybe_auto_apply_model_refresh_proposal(
+                                self,
+                                proposal_id,
+                                owner_id=model_refresh_owner_id,
+                            ):
+                                model_refresh_applied += 1
+                        except Exception:
+                            logger.warning(
+                                "sleep: storing model-refresh proposal failed",
+                                exc_info=True,
+                            )
+                        except BaseException:
+                            _abort_claimed_sleep()
+                            raise
+            else:
+                conflicts_resolved += len(group_conflicts)
+                model_refresh_proposals += len(proposals)
+
             consolidated_ids.extend(ids)
             summaries_created += 1
 
-        method = "llm" if llm_used_count == summaries_created else ("llm+aaak" if llm_used_count > 0 else "aaak")
-        if not dry_run:
+        if summaries_created:
+            method = (
+                "llm" if llm_used_count == summaries_created
+                else ("llm+aaak" if llm_used_count > 0 else "aaak")
+            )
+        else:
+            method = "none"
+        if not dry_run and consolidated_ids:
             cursor.execute("""
                 INSERT INTO consolidation_log (session_id, items_consolidated, summary_preview, created_at)
                 VALUES (?, ?, ?, ?)
@@ -8332,19 +8588,33 @@ class BeamMemory:
             ))
             self.conn.commit()
 
-        # Run tiered degradation after consolidation
-        degrade_result = self.degrade_episodic(dry_run=dry_run)
+        # Do not mutate unrelated episodic rows when every group failed.
+        degrade_result = (
+            self.degrade_episodic(dry_run=dry_run)
+            if summaries_created
+            else {"status": "skipped", "reason": "no successful consolidation"}
+        )
 
         logger.info(
-            "sleep: consolidated=%d summaries=%d conflicts=%d llm=%s method=%s",
-            len(consolidated_ids), summaries_created, conflicts_resolved,
+            "sleep: consolidated=%d summaries=%d failed_groups=%d conflicts=%d llm=%s method=%s",
+            len(consolidated_ids), summaries_created, len(failed_groups), conflicts_resolved,
             llm_used_count > 0, method,
         )
 
+        if dry_run:
+            status = "dry_run"
+        elif failed_groups and not summaries_created:
+            status = "failed"
+        elif failed_groups:
+            status = "partial"
+        else:
+            status = "consolidated"
+
         return {
-            "status": "dry_run" if dry_run else "consolidated",
+            "status": status,
             "items_consolidated": len(consolidated_ids),
             "summaries_created": summaries_created,
+            "failed_groups": failed_groups,
             "conflicts_resolved": conflicts_resolved,
             "llm_used": llm_used_count,
             "method": method,
@@ -8402,6 +8672,7 @@ class BeamMemory:
         summaries_created = 0
         llm_used = 0
         errors = []
+        partial_sessions = 0
         model_refresh_proposals = 0
         model_refresh_applied = 0
 
@@ -8422,19 +8693,26 @@ class BeamMemory:
                 # channel_id=caller surfaces alien content. Letting it default
                 # to the alien session_id is the semantically correct behavior.
                 # See C9 + adversarial review in the memory-contract ledger.
-                beam = self if session_id == self.session_id else BeamMemory(
-                    session_id=session_id,
-                    db_path=self.db_path,
-                    author_id=self.author_id,
-                    author_type=self.author_type,
-                )
+                if session_id == self.session_id:
+                    beam = self
+                else:
+                    beam = BeamMemory(
+                        session_id=session_id,
+                        db_path=self.db_path,
+                        author_id=self.author_id,
+                        author_type=self.author_type,
+                    )
+                    beam.canonical_owner_id = self.canonical_owner_id
+                    beam.agent_context = self.agent_context
                 result = beam.sleep(dry_run=dry_run, force=force)
                 result = dict(result)
                 result["session_id"] = session_id
                 result["eligible"] = row["eligible"] if hasattr(row, "keys") else row[1]
                 session_results.append(result)
 
-                if result.get("status") in ("consolidated", "dry_run"):
+                if result.get("status") in ("consolidated", "partial", "dry_run"):
+                    if result.get("status") == "partial":
+                        partial_sessions += 1
                     sessions_consolidated += 1
                     items_consolidated += int(result.get("items_consolidated", 0) or 0)
                     summaries_created += int(result.get("summaries_created", 0) or 0)
@@ -8442,6 +8720,12 @@ class BeamMemory:
                     refresh = result.get("model_refresh") or {}
                     model_refresh_proposals += int(refresh.get("proposals", 0) or 0)
                     model_refresh_applied += int(refresh.get("applied", 0) or 0)
+                elif result.get("status") == "failed":
+                    errors.append({
+                        "session_id": session_id,
+                        "error": "sleep returned failed",
+                        "failed_groups": result.get("failed_groups") or [],
+                    })
             except Exception as exc:
                 logger.error(
                     "sleep_all_sessions: session %r consolidation failed: %s",
@@ -8456,8 +8740,17 @@ class BeamMemory:
         if not dry_run:
             dedup_result = self._deduplicate_memoria_cross_session()
 
+        if dry_run:
+            status = "dry_run"
+        elif errors:
+            status = "partial" if sessions_consolidated else "failed"
+        elif partial_sessions:
+            status = "partial"
+        else:
+            status = "consolidated" if items_consolidated else "no_op"
+
         return {
-            "status": "dry_run" if dry_run else ("consolidated" if items_consolidated else "no_op"),
+            "status": status,
             "sessions_scanned": len(session_rows),
             "sessions_consolidated": sessions_consolidated,
             "items_consolidated": items_consolidated,
