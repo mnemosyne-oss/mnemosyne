@@ -171,12 +171,20 @@ def test_runtime_diagnostics_marks_sqlite_vec_available_only_after_loading(monke
 def test_runtime_metadata_is_retained_in_safe_doctor_artifacts(monkeypatch):
     """Metadata checks use enum statuses while preserving their values as details."""
 
+    raw_python_path = "/home/doctor-user/.venvs/mnemosyne/bin/python3.13"
+    raw_model_path = "/home/doctor-user/.cache/mnemosyne/models/bge-small-en-v1.5"
+    safe_python_executable = "python3.13"
     metadata = {
         "python_version": "3.13.5",
         "platform": "Linux-6.18.34-rpt-rpi-2712-aarch64-with-glibc2.40",
-        "python_executable": "/usr/bin/python3",
+        "python_executable": raw_python_path,
         "mnemosyne_version": "1.2.3",
-        "embeddings_model": "BAAI/bge-small-en-v1.5",
+        "embeddings_model": f"model cache: {raw_model_path}",
+    }
+    safe_metadata = {
+        **metadata,
+        "python_executable": safe_python_executable,
+        "embeddings_model": "model cache: <redacted-path>",
     }
     monkeypatch.setattr(
         "mnemosyne.runtime_diagnostics.collect_runtime_diagnostics",
@@ -190,16 +198,42 @@ def test_runtime_metadata_is_retained_in_safe_doctor_artifacts(monkeypatch):
     )
 
     runtime = RuntimeDiagnosticsAdapter().inspect().metrics
-    payload = DoctorReport(bank_name="default", runtime_diagnostics=runtime).to_dict()
+    assert runtime["checks"] == [
+        {
+            "check": check,
+            "status": "OK",
+            "detail": safe_metadata[check],
+        }
+        for check in metadata
+    ]
+
+    # The canonical payload boundary must also protect a future runtime source
+    # that bypasses the adapter and hands Doctor an absolute executable path.
+    payload = doctor_report_payload(
+        DoctorReport(
+            bank_name="default",
+            runtime_diagnostics={
+                "status": "ok",
+                "checks": [
+                    {"check": check, "status": "OK", "detail": detail}
+                    for check, detail in metadata.items()
+                ],
+            },
+        )
+    )
     json_artifact = render_doctor_json(payload)
     markdown_artifact = render_doctor_markdown(payload)
 
-    assert runtime["checks"] == [
-        {"check": check, "status": "OK", "detail": detail}
-        for check, detail in metadata.items()
-    ]
     assert "## Runtime" in markdown_artifact
-    for detail in metadata.values():
+    assert raw_python_path not in json_artifact
+    assert raw_python_path not in markdown_artifact
+    assert raw_model_path not in json_artifact
+    assert raw_model_path not in markdown_artifact
+    assert safe_python_executable in json_artifact
+    assert safe_python_executable in markdown_artifact
+    assert "<redacted-path>" in json_artifact
+    assert "<redacted-path>" in markdown_artifact
+    for detail in safe_metadata.values():
         assert detail in json_artifact
         assert detail in markdown_artifact
 

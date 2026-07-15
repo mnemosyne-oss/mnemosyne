@@ -62,6 +62,9 @@ _PREVIEW_CANONICAL_SECRET_PATTERNS = tuple(
     (label, re.compile(pattern, re.IGNORECASE))
     for label, pattern in SECRET_LABELED_PATTERNS
 )
+_RUNTIME_ABSOLUTE_PATH = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?:~[\\/]|(?:[A-Za-z]:)?[\\/])[^\s`<>\"']+"
+)
 
 # Adapter SQL is deliberately limited to these known contracts. Catalog
 # metadata only proves that one of these names exists; it never turns an
@@ -440,6 +443,42 @@ _RUNTIME_CHECK_NAMES = frozenset(
 _RUNTIME_STATUSES = frozenset({"OK", "YES", "NO", "MISSING", "OPTIONAL", "ERROR"})
 
 
+def _safe_runtime_detail(check: str, value: Any) -> str:
+    """Keep runtime metadata useful without serializing host-specific paths."""
+
+    if check == "python_executable" and isinstance(value, str):
+        return safe_preview(Path(value).name, max_length=240)
+    detail = safe_preview(value, max_length=240)
+    return _RUNTIME_ABSOLUTE_PATH.sub("<redacted-path>", detail)
+
+
+def _sanitize_runtime_diagnostics(runtime: Any) -> dict[str, Any]:
+    """Apply the Doctor report boundary to runtime checks from any producer."""
+
+    if not isinstance(runtime, dict):
+        return {}
+    if not runtime:
+        return {}
+    if not isinstance(runtime.get("checks"), list):
+        return {"status": STATUS_UNKNOWN, "error_class": "runtime_error"}
+
+    status = runtime.get("status")
+    if status not in {STATUS_OK, STATUS_WARNING, "unavailable"}:
+        status = STATUS_UNKNOWN
+    checks = [
+        {
+            "check": entry["check"],
+            "status": entry["status"],
+            "detail": _safe_runtime_detail(entry["check"], entry.get("detail", "")),
+        }
+        for entry in runtime["checks"]
+        if isinstance(entry, dict)
+        and entry.get("check") in _RUNTIME_CHECK_NAMES
+        and entry.get("status") in _RUNTIME_STATUSES
+    ]
+    return {"status": status, "checks": checks}
+
+
 class RuntimeDiagnosticsAdapter:
     """Expose pure runtime/dependency checks without constructing Mnemosyne."""
 
@@ -452,21 +491,7 @@ class RuntimeDiagnosticsAdapter:
             return AdapterResult(metrics={"status": STATUS_UNKNOWN, "error_class": "runtime_error"})
         if not isinstance(result, dict) or not isinstance(result.get("checks"), list):
             return AdapterResult(metrics={"status": STATUS_UNKNOWN, "error_class": "runtime_error"})
-        checks = [
-            {
-                "check": entry["check"],
-                "status": entry["status"],
-                "detail": safe_preview(entry.get("detail", ""), max_length=240),
-            }
-            for entry in result["checks"]
-            if isinstance(entry, dict)
-            and entry.get("check") in _RUNTIME_CHECK_NAMES
-            and entry.get("status") in _RUNTIME_STATUSES
-        ]
-        status = result.get("status")
-        if status not in {STATUS_OK, STATUS_WARNING, "unavailable"}:
-            status = STATUS_UNKNOWN
-        return AdapterResult(metrics={"status": status, "checks": checks})
+        return AdapterResult(metrics=_sanitize_runtime_diagnostics(result))
 
 
 class HygieneSummaryAdapter:
@@ -626,6 +651,7 @@ def doctor_report_payload(report: DoctorReport, *, include_candidates: bool = Fa
     """Return the canonical JSON-safe doctor model used by every renderer."""
 
     payload = report.to_dict()
+    payload["runtime_diagnostics"] = _sanitize_runtime_diagnostics(payload.get("runtime_diagnostics"))
     hygiene = payload.get("hygiene_summary")
     if isinstance(hygiene, dict):
         hygiene["candidates"] = _content_free_hygiene_candidates(hygiene.get("candidates"))

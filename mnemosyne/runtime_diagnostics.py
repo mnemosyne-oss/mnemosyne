@@ -9,6 +9,7 @@ import importlib.metadata
 import platform
 import sqlite3
 import sys
+from pathlib import Path
 from typing import Any
 
 
@@ -22,7 +23,9 @@ def collect_runtime_diagnostics() -> dict[str, Any]:
 
     add("env", "python_version", "OK", sys.version.split()[0])
     add("env", "platform", "OK", platform.platform())
-    add("env", "python_executable", "OK", sys.executable)
+    # Report only the executable name: an absolute interpreter path can reveal
+    # a user's home directory or virtual-environment layout in diagnostics.
+    add("env", "python_executable", "OK", Path(sys.executable).name)
 
     try:
         import mnemosyne
