@@ -959,7 +959,8 @@ def _degradation_notes(payload: dict[str, Any]) -> list[str]:
         value = payload.get(section)
         if not isinstance(value, dict):
             continue
-        for name, metric in value.items():
+        for name in sorted(value):
+            metric = value[name]
             status = metric.get("status") if isinstance(metric, dict) else None
             if status in {STATUS_UNKNOWN, "unavailable", STATUS_PRESENT_BUT_UNLOADABLE, "scan_limited"}:
                 notes.append(f"{section}.{name}: `{status}`")
@@ -967,16 +968,11 @@ def _degradation_notes(payload: dict[str, Any]) -> list[str]:
 
 
 def _fsync_directory(directory: Path) -> None:
-    """Best-effort directory sync for completed output replacements."""
+    """Durably sync a completed output replacement's parent directory."""
 
-    try:
-        descriptor = os.open(directory, os.O_RDONLY)
-    except OSError:
-        return
+    descriptor = os.open(directory, os.O_RDONLY)
     try:
         os.fsync(descriptor)
-    except OSError:
-        pass
     finally:
         os.close(descriptor)
 

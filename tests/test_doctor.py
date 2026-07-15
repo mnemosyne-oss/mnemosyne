@@ -2,13 +2,17 @@
 
 import builtins
 import json
+import os
 import sqlite3
+import stat
 import sys
 import types
+from pathlib import Path
 from typing import cast
 
 import pytest
 
+from mnemosyne import doctor
 from mnemosyne.doctor import (
     DoctorReport,
     Finding,
@@ -29,6 +33,7 @@ from mnemosyne.doctor import (
     open_readonly_doctor_db,
     render_doctor_json,
     render_doctor_markdown,
+    write_doctor_artifacts_atomically,
 )
 
 
@@ -172,8 +177,8 @@ def test_runtime_diagnostics_marks_sqlite_vec_available_only_after_loading(monke
     ("raw_python_path", "safe_python_executable"),
     [
         ("/home/doctor-user/.venvs/mnemosyne/bin/python3.13", "python3.13"),
-        (r"C:\\Users\\doctor-user\\venvs\\mnemosyne\\python.exe", "python.exe"),
-        (r"\\\\server\\share\\venvs\\mnemosyne\\python.exe", "python.exe"),
+        (r"C:\Users\doctor-user\venvs\mnemosyne\python.exe", "python.exe"),
+        (r"\\server\share\venvs\mnemosyne\python.exe", "python.exe"),
     ],
 )
 def test_runtime_metadata_is_retained_in_safe_doctor_artifacts(
@@ -667,6 +672,106 @@ def test_report_payload_removes_all_raw_repair_candidate_fields_from_both_render
     ]
     assert all(raw not in json_report for raw in raw_values)
     assert all(raw not in markdown_report for raw in raw_values)
+
+
+def test_equivalent_payload_mapping_orders_render_byte_identical_artifacts():
+    """Renderer ordering must not depend on how an equivalent payload was built."""
+
+    payload = {
+        "bank_name": "work",
+        "sqlite_health": {
+            "quick_check": {"status": "ok"},
+            "foreign_key_check": {"status": "ok"},
+        },
+        "reference_contracts": {
+            "zeta": {"status": "unavailable"},
+            "alpha": {"status": "scan_limited"},
+        },
+        "vector_coverage": {
+            "working": {"status": "ok"},
+            "archive": {"status": "unknown"},
+        },
+        "hygiene_summary": {"status": "ok", "candidates": []},
+        "findings": [],
+        "repair_candidates": [],
+    }
+    reordered_payload = {
+        "repair_candidates": [],
+        "findings": [],
+        "hygiene_summary": {"candidates": [], "status": "ok"},
+        "vector_coverage": {
+            "archive": {"status": "unknown"},
+            "working": {"status": "ok"},
+        },
+        "reference_contracts": {
+            "alpha": {"status": "scan_limited"},
+            "zeta": {"status": "unavailable"},
+        },
+        "sqlite_health": {
+            "foreign_key_check": {"status": "ok"},
+            "quick_check": {"status": "ok"},
+        },
+        "bank_name": "work",
+    }
+
+    assert payload == reordered_payload
+    assert render_doctor_json(payload) == render_doctor_json(reordered_payload)
+    assert render_doctor_markdown(payload) == render_doctor_markdown(reordered_payload)
+
+
+@pytest.mark.parametrize(
+    ("failure", "error"),
+    [
+        ("replace", "simulated second target replace failure"),
+        ("file_fsync", "simulated staging file fsync failure"),
+        ("directory_fsync", "simulated directory fsync failure"),
+    ],
+)
+def test_atomic_two_target_failures_restore_existing_artifacts_and_clean_staging(
+    tmp_path, monkeypatch, failure, error
+):
+    """A failed pair write never leaves either old artifact replaced or staged."""
+
+    json_path = tmp_path / "doctor.json"
+    markdown_path = tmp_path / "doctor.md"
+    original_json = '{"previous": true}\n'
+    original_markdown = "# previous\n"
+    json_path.write_text(original_json)
+    markdown_path.write_text(original_markdown)
+
+    if failure == "replace":
+        real_replace = os.replace
+
+        def fail_second_replace(source, destination):
+            if Path(destination) == markdown_path:
+                raise OSError(error)
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(doctor.os, "replace", fail_second_replace)
+    else:
+        real_fsync = os.fsync
+
+        def fail_selected_fsync(descriptor):
+            is_directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
+            if (failure == "file_fsync" and not is_directory) or (
+                failure == "directory_fsync" and is_directory
+            ):
+                raise OSError(error)
+            return real_fsync(descriptor)
+
+        monkeypatch.setattr(doctor.os, "fsync", fail_selected_fsync)
+
+    with pytest.raises(OSError, match=error):
+        write_doctor_artifacts_atomically(
+            json_path=json_path,
+            json_text='{"safe": true}\n',
+            markdown_path=markdown_path,
+            markdown_text="# safe\n",
+        )
+
+    assert json_path.read_text() == original_json
+    assert markdown_path.read_text() == original_markdown
+    assert not list(tmp_path.glob(".doctor-*"))
 
 
 def test_finding_details_are_redacted_and_json_safe():
