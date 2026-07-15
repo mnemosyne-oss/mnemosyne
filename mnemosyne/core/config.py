@@ -18,11 +18,19 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import tempfile
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+
+try:  # POSIX advisory locking for cross-process config writes.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback retains process safety.
+    fcntl = None
 
 logger = logging.getLogger(__name__)
 
@@ -332,13 +340,15 @@ class MnemosyneConfig:
 
     _instance: Optional["MnemosyneConfig"] = None
     _lock = threading.Lock()
+    _path_locks: Dict[Path, threading.RLock] = {}
+    _path_locks_guard = threading.Lock()
 
     def __init__(self, config_path: Optional[Path] = None):
         self._config_path = config_path or _default_config_path()
         self._yaml_cache: Dict[str, Any] = {}
         self._yaml_mtime: float = 0.0
-        self._yaml_signature: Optional[Tuple[int, int, int]] = None
-        self._yaml_lock = threading.Lock()
+        self._yaml_signature: Optional[Tuple[int, int, int, str]] = None
+        self._yaml_lock = threading.RLock()
 
         # Auto-seed config.yaml on first access if it doesn't exist
         if not self._config_path.exists():
@@ -460,38 +470,46 @@ class MnemosyneConfig:
     def config_path(self) -> Path:
         return self._config_path
 
+    def _snapshot_yaml(self) -> Tuple[bytes, Tuple[int, int, int, str]]:
+        """Read one config generation and return metadata plus a content digest."""
+        raw = self._config_path.read_bytes()
+        stat_result = self._config_path.stat()
+        signature = (
+            stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+            stat_result.st_size,
+            hashlib.sha256(raw).hexdigest(),
+        )
+        return raw, signature
+
+    def _clear_yaml_cache(self) -> None:
+        self._yaml_cache = {}
+        self._yaml_mtime = 0.0
+        self._yaml_signature = None
+
     def _load_yaml(self) -> None:
-        """Load config.yaml into the cache if it exists and has changed."""
+        """Load config.yaml into the cache if its content changed."""
         with self._yaml_lock:
             try:
-                if not self._config_path.exists():
-                    self._yaml_cache = {}
-                    self._yaml_mtime = 0.0
-                    self._yaml_signature = None
-                    return
-                stat_result = self._config_path.stat()
-                signature = (
-                    stat_result.st_mtime_ns,
-                    stat_result.st_ctime_ns,
-                    stat_result.st_size,
-                )
+                raw, signature = self._snapshot_yaml()
                 if signature == self._yaml_signature:
-                    return  # unchanged
+                    return
                 import yaml
-                with open(self._config_path, "r") as f:
-                    data = yaml.safe_load(f) or {}
-                # Flatten nested YAML into dot-separated keys, but most
-                # Mnemosyne config is flat key: value. Support both.
+
+                data = yaml.safe_load(raw.decode("utf-8")) or {}
                 self._yaml_cache = self._flatten_yaml(data)
-                self._yaml_mtime = stat_result.st_mtime
+                self._yaml_mtime = signature[0] / 1_000_000_000
                 self._yaml_signature = signature
-                logger.debug("Loaded config from %s (%d keys)",
-                             self._config_path, len(self._yaml_cache))
+                logger.debug(
+                    "Loaded config from %s (%d keys)",
+                    self._config_path,
+                    len(self._yaml_cache),
+                )
+            except FileNotFoundError:
+                self._clear_yaml_cache()
             except Exception as e:
                 logger.warning("Failed to load config.yaml: %s", e)
-                self._yaml_cache = {}
-                self._yaml_mtime = 0.0
-                self._yaml_signature = None
+                self._clear_yaml_cache()
 
     def _flatten_yaml(self, data: Dict, prefix: str = "") -> Dict[str, Any]:
         """Flatten nested YAML into dot-separated keys.
@@ -513,26 +531,19 @@ class MnemosyneConfig:
         return flat
 
     def _maybe_reload(self) -> None:
-        """Re-read config.yaml if it changed on disk since last load.
-
-        Cheap stat() check — no lock contention on the hot path when
-        the file hasn't changed.
-        """
-        try:
-            if not self._config_path.exists():
-                if self._yaml_signature is not None or self._yaml_cache:
-                    self._load_yaml()
+        """Re-read config.yaml when its metadata or content digest changes."""
+        with self._yaml_lock:
+            try:
+                _raw, signature = self._snapshot_yaml()
+            except FileNotFoundError:
+                self._clear_yaml_cache()
                 return
-            stat_result = self._config_path.stat()
-            signature = (
-                stat_result.st_mtime_ns,
-                stat_result.st_ctime_ns,
-                stat_result.st_size,
-            )
+            except OSError as exc:
+                logger.warning("Failed to inspect config.yaml: %s", exc)
+                self._clear_yaml_cache()
+                return
             if signature != self._yaml_signature:
                 self._load_yaml()
-        except OSError:
-            pass
 
     # -------------------------------------------------------------------
     # Public API
@@ -543,17 +554,17 @@ class MnemosyneConfig:
 
         Also checks for file mtime changes to skip unnecessary reloads.
         """
-        old_values = dict(self._yaml_cache)
-        self._yaml_mtime = 0.0  # backwards-compatible introspection
-        self._yaml_signature = None  # force reload
-        self._load_yaml()
+        with self._yaml_lock:
+            old_values = dict(self._yaml_cache)
+            self._yaml_mtime = 0.0  # backwards-compatible introspection
+            self._yaml_signature = None  # force reload
+            self._load_yaml()
 
-        changed = set()
-        for key in set(list(old_values.keys()) + list(self._yaml_cache.keys())):
-            old_val = old_values.get(key)
-            new_val = self._yaml_cache.get(key)
-            if old_val != new_val:
-                changed.add(key)
+            changed = {
+                key
+                for key in old_values.keys() | self._yaml_cache.keys()
+                if old_values.get(key) != self._yaml_cache.get(key)
+            }
 
         # Warn about requires_restart keys
         for key in changed:
@@ -580,9 +591,10 @@ class MnemosyneConfig:
         # 1. Check YAML cache.  Auto-reload if the file mtime changed
         # so that `mnemosyne config set` + provider reads work without
         # an explicit reload call.
-        self._maybe_reload()
-        if key in self._yaml_cache:
-            return self._yaml_cache[key]
+        with self._yaml_lock:
+            self._maybe_reload()
+            if key in self._yaml_cache:
+                return self._yaml_cache[key]
 
         # 2. Check env var
         env_var = ENV_VAR_MAP.get(key)
@@ -631,69 +643,90 @@ class MnemosyneConfig:
             return val
         return str(val).strip().lower() in ("1", "true", "yes", "on")
 
-    def set(self, key: str, value: Any) -> None:
-        """Write a config value to config.yaml.
+    def _config_file_path(self) -> Path:
+        """Return the concrete filesystem path for this config instance."""
+        return Path(os.fspath(self._config_path)).expanduser().resolve()
 
-        Creates the file if it doesn't exist.
-        """
-        self._load_yaml()
+    @classmethod
+    def _path_lock(cls, path: Path) -> threading.RLock:
+        """Return the shared in-process write lock for one config path."""
+        with cls._path_locks_guard:
+            return cls._path_locks.setdefault(path, threading.RLock())
 
-        # Read existing YAML
+    @contextmanager
+    def _exclusive_write_lock(self) -> Iterator[None]:
+        """Serialize one config read-modify-write across instances/processes."""
+        path = self._config_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self._path_lock(path):
+            lock_path = path.with_name(f".{path.name}.lock")
+            with open(lock_path, "a+", encoding="utf-8") as lock_file:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _read_yaml_mapping_locked(self) -> Dict[str, Any]:
         import yaml
-        existing: Dict[str, Any] = {}
-        if self._config_path.exists():
+
+        try:
+            raw = self._config_file_path().read_bytes()
+        except FileNotFoundError:
+            return {}
+        data = yaml.safe_load(raw.decode("utf-8")) or {}
+        if not isinstance(data, dict):
+            raise ValueError("config.yaml root must be a mapping")
+        return data
+
+    def _write_yaml_mapping_locked(self, data: Dict[str, Any]) -> None:
+        import yaml
+
+        path = self._config_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, raw_tmp = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        tmp = Path(raw_tmp)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                yaml.dump(data, handle, default_flow_style=False, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
             try:
-                with open(self._config_path, "r") as f:
-                    existing = yaml.safe_load(f) or {}
-            except Exception:
-                existing = {}
-
-        # Set the key (flat structure for now)
-        existing[key] = value
-
-        # Ensure parent dir
-        self._config_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Write back
-        with open(self._config_path, "w") as f:
-            yaml.dump(existing, f, default_flow_style=False, sort_keys=True)
-
-        # Refresh cache
-        self._yaml_mtime = 0.0
+                dir_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                logger.debug("Directory fsync is unavailable for %s", path.parent)
+        finally:
+            tmp.unlink(missing_ok=True)
         self._yaml_signature = None
         self._load_yaml()
 
-        # Warn about requires_restart
+    def set(self, key: str, value: Any) -> None:
+        """Atomically write one config value without losing concurrent updates."""
+        with self._yaml_lock, self._exclusive_write_lock():
+            existing = self._read_yaml_mapping_locked()
+            existing[key] = value
+            self._write_yaml_mapping_locked(existing)
+
         if key in REQUIRES_RESTART:
             logger.warning(
                 "Config key '%s' requires restart to take effect.", key
             )
 
     def set_many(self, items: Dict[str, Any]) -> None:
-        """Write multiple config values to config.yaml in a single read-modify-write.
-
-        Avoids the per-key overhead of calling set() in a loop.
-        """
-        self._load_yaml()
-
-        import yaml
-        existing: Dict[str, Any] = {}
-        if self._config_path.exists():
-            try:
-                with open(self._config_path, "r") as f:
-                    existing = yaml.safe_load(f) or {}
-            except Exception:
-                existing = {}
-
-        existing.update(items)
-
-        self._config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._config_path, "w") as f:
-            yaml.dump(existing, f, default_flow_style=False, sort_keys=True)
-
-        self._yaml_mtime = 0.0
-        self._yaml_signature = None
-        self._load_yaml()
+        """Atomically write multiple config values in one transaction."""
+        with self._yaml_lock, self._exclusive_write_lock():
+            existing = self._read_yaml_mapping_locked()
+            existing.update(items)
+            self._write_yaml_mapping_locked(existing)
 
         for key in items:
             if key in REQUIRES_RESTART:

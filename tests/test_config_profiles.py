@@ -9,8 +9,10 @@ Covers:
 - Config migrate: env vars -> YAML
 """
 
+import multiprocessing
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -532,3 +534,141 @@ class TestProfileCreate:
         assert USER_PROFILES["custom"]["settings"]["wm_max_items"] == "7777"
         # Cleanup so it doesn't leak into other tests
         USER_PROFILES.pop("custom", None)
+
+
+def test_concurrent_set_preserves_all_keys(tmp_path):
+    config = MnemosyneConfig(config_path=tmp_path / "config.yaml")
+    start = threading.Barrier(16)
+
+    def writer(index):
+        start.wait()
+        config.set(f"key_{index}", index)
+
+    threads = [threading.Thread(target=writer, args=(index,)) for index in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert {f"key_{index}": config.get(f"key_{index}") for index in range(16)} == {
+        f"key_{index}": index for index in range(16)
+    }
+
+
+
+def _set_config_value_in_process(path, key, start):
+    config = MnemosyneConfig(config_path=Path(path))
+    start.wait(timeout=10)
+    config.set(key, key)
+
+
+
+def test_config_write_preserves_symlink_target(tmp_path):
+    target = tmp_path / "target.yaml"
+    target.write_text("original: value\n")
+    alias = tmp_path / "config.yaml"
+    alias.symlink_to(target)
+
+    MnemosyneConfig(config_path=alias).set("new_key", "new_value")
+
+    assert alias.is_symlink()
+    reloaded = MnemosyneConfig(config_path=target)
+    assert reloaded.get("original") == "value"
+    assert reloaded.get("new_key") == "new_value"
+
+
+def test_two_config_instances_preserve_concurrent_updates(tmp_path):
+    path = tmp_path / "config.yaml"
+    first = MnemosyneConfig(config_path=path)
+    second = MnemosyneConfig(config_path=path)
+    start = threading.Barrier(2)
+
+    def writer(config, key):
+        start.wait()
+        config.set(key, key)
+
+    threads = [
+        threading.Thread(target=writer, args=(first, "first_key")),
+        threading.Thread(target=writer, args=(second, "second_key")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    reloaded = MnemosyneConfig(config_path=path)
+    assert reloaded.get("first_key") == "first_key"
+    assert reloaded.get("second_key") == "second_key"
+
+
+def test_separate_processes_preserve_concurrent_updates(tmp_path):
+    path = tmp_path / "config.yaml"
+    MnemosyneConfig(config_path=path)
+    ctx = multiprocessing.get_context("fork")
+    start = ctx.Event()
+    workers = [
+        ctx.Process(target=_set_config_value_in_process, args=(path, "process_first", start)),
+        ctx.Process(target=_set_config_value_in_process, args=(path, "process_second", start)),
+    ]
+    for worker in workers:
+        worker.start()
+    start.set()
+    for worker in workers:
+        worker.join(timeout=15)
+        assert worker.exitcode == 0
+
+    reloaded = MnemosyneConfig(config_path=path)
+    assert reloaded.get("process_first") == "process_first"
+    assert reloaded.get("process_second") == "process_second"
+
+
+def test_metadata_identical_rewrite_uses_content_fingerprint(tmp_path, monkeypatch):
+    path = tmp_path / "config.yaml"
+    path.write_text("ep_limit: 10000\n")
+    config = MnemosyneConfig(config_path=path)
+    assert config.get("ep_limit") == 10000
+    original_stat = path.stat()
+
+    class StableMetadataPath:
+        def exists(self):
+            return path.exists()
+
+        def stat(self):
+            return original_stat
+
+        def read_bytes(self):
+            return path.read_bytes()
+
+        def __fspath__(self):
+            return os.fspath(path)
+
+    path.write_text("ep_limit: 20000\n")
+    monkeypatch.setattr(config, "_config_path", StableMetadataPath())
+
+    assert config.get("ep_limit") == 20000
+
+
+def test_deletion_between_exists_and_stat_clears_yaml_cache(tmp_path, monkeypatch):
+    path = tmp_path / "config.yaml"
+    path.write_text("sync_roles: yaml\n")
+    config = MnemosyneConfig(config_path=path)
+    assert config.get("sync_roles") == "yaml"
+    monkeypatch.setenv("MNEMOSYNE_SYNC_ROLES", "environment")
+
+    class DeleteOnStatPath:
+        def exists(self):
+            return True
+
+        def stat(self):
+            path.unlink(missing_ok=True)
+            raise FileNotFoundError(path)
+
+        def read_bytes(self):
+            return path.read_bytes()
+
+        def __fspath__(self):
+            return os.fspath(path)
+
+    monkeypatch.setattr(config, "_config_path", DeleteOnStatPath())
+
+    assert config.get("sync_roles") == "environment"
