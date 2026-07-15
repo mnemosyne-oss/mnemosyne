@@ -487,15 +487,24 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
     return _thread_local.conn
 
 
-def _close_beam_connection() -> None:
+def _close_beam_connection(db_path: Optional[Path] = None) -> None:
     """Close the thread-local BEAM connection and checkpoint the WAL.
 
     Thread-local connections under WAL mode can block checkpoints
     after the owning thread exits.  Explicitly closing the connection
     and running ``PRAGMA wal_checkpoint(TRUNCATE)`` prevents the
     ``database is locked`` cascade documented in #382.
+
+    When ``db_path`` is provided, leave a thread-local connection for a
+    different database alone. This lets Mnemosyne release a closed bank
+    without invalidating a newer instance that selected another bank.
     """
-    if hasattr(_thread_local, 'conn') and _thread_local.conn is not None:
+    expected_path = str(Path(db_path)) if db_path is not None else None
+    if (
+        hasattr(_thread_local, 'conn')
+        and _thread_local.conn is not None
+        and (expected_path is None or getattr(_thread_local, 'db_path', None) == expected_path)
+    ):
         try:
             _thread_local.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:

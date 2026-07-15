@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 from mnemosyne.core import embeddings as _embeddings
 from mnemosyne.core.beam import BeamMemory, init_beam
 _thread_local = threading.local()
+_instance_connection_lock = threading.Lock()
+_instance_connection_refcounts: Dict[tuple, int] = {}
 
 # Default data directory
 # NOTE: On Fly.io and ephemeral VMs, only ~/.hermes is persisted.
@@ -77,15 +79,25 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
     return _thread_local.conn
 
 
-def _close_connection() -> None:
+def _close_connection(db_path: Optional[Path] = None) -> None:
     """Close the thread-local connection and checkpoint the WAL.
 
     Thread-local connections under WAL mode can block checkpoints
     after the owning thread exits.  Explicitly closing the connection
     and running ``PRAGMA wal_checkpoint(TRUNCATE)`` prevents the
     ``database is locked`` cascade documented in #382.
+
+    When ``db_path`` is provided, leave a thread-local connection for a
+    different database alone.  A thread can switch banks between live
+    Mnemosyne instances, so closing an unrelated cached connection would
+    invalidate the newer instance.
     """
-    if hasattr(_thread_local, 'conn') and _thread_local.conn is not None:
+    expected_path = str(Path(db_path)) if db_path is not None else None
+    if (
+        hasattr(_thread_local, 'conn')
+        and _thread_local.conn is not None
+        and (expected_path is None or getattr(_thread_local, 'db_path', None) == expected_path)
+    ):
         try:
             _thread_local.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:
@@ -96,6 +108,30 @@ def _close_connection() -> None:
             pass
         _thread_local.conn = None
         _thread_local.db_path = None
+
+
+def _connection_owner_key(db_path: Path) -> tuple:
+    """Return the per-thread key for Mnemosyne-owned shared connections."""
+    return threading.get_ident(), str(Path(db_path))
+
+
+def _acquire_instance_connections(db_path: Path) -> tuple:
+    """Register one live Mnemosyne owner for the current thread and database."""
+    key = _connection_owner_key(db_path)
+    with _instance_connection_lock:
+        _instance_connection_refcounts[key] = _instance_connection_refcounts.get(key, 0) + 1
+    return key
+
+
+def _release_instance_connections(key: tuple) -> bool:
+    """Release an owner and return whether it was the last one."""
+    with _instance_connection_lock:
+        remaining = _instance_connection_refcounts.get(key, 0) - 1
+        if remaining <= 0:
+            _instance_connection_refcounts.pop(key, None)
+            return True
+        _instance_connection_refcounts[key] = remaining
+        return False
 
 
 def wal_checkpoint(db_path=None) -> dict:
@@ -177,6 +213,11 @@ class Mnemosyne:
     def __init__(self, session_id: str = "default", db_path: Path = None, bank: str = None,
                  author_id: str = None, author_type: str = None,
                  channel_id: str = None):
+        # Set lifecycle state before allocating BEAM resources so a partially
+        # constructed instance can be cleaned up safely by __del__.
+        self._closed = False
+        self._instance_connection_owner_key = None
+
         # Auto-seed config.yaml on first Mnemosyne init
         from mnemosyne.core.config import get_config
         get_config()  # triggers _seed() if config.yaml doesn't exist
@@ -196,23 +237,35 @@ class Mnemosyne:
         else:
             self.db_path = _default_db_path()
 
-        self.conn = _get_connection(self.db_path)
-        init_db(self.db_path)
+        # Mnemosyne instances in one thread share both module-level SQLite
+        # connections. Keep a small ownership count so closing one wrapper
+        # cannot close the BeamMemory connection another live wrapper needs.
+        self._instance_connection_owner_key = _acquire_instance_connections(self.db_path)
+        try:
+            self.conn = _get_connection(self.db_path)
+            init_db(self.db_path)
 
-        # Phase 8: Streaming + Patterns + Plugins (lazy init)
-        self._stream = None
-        self._compressor = None
-        self._pattern_detector = None
-        self._delta_sync = None
-        self._plugin_manager = None
+            # Phase 8: Streaming + Patterns + Plugins (lazy init)
+            self._stream = None
+            self._compressor = None
+            self._pattern_detector = None
+            self._delta_sync = None
+            self._plugin_manager = None
 
-        # Create beam with streaming emitter wired
-        self.beam = BeamMemory(session_id=session_id, db_path=self.db_path,
-                               author_id=author_id, author_type=author_type,
-                               channel_id=channel_id,
-                               event_emitter=self._stream_emit)
-
-        self._closed = False
+            # Create beam with streaming emitter wired
+            self.beam = BeamMemory(session_id=session_id, db_path=self.db_path,
+                                   author_id=author_id, author_type=author_type,
+                                   channel_id=channel_id,
+                                   event_emitter=self._stream_emit)
+        except Exception:
+            # BeamMemory can open its own thread-local connection before a
+            # later constructor step fails. Release this provisional owner and
+            # close both resources only if no live Mnemosyne shares them.
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
     def close(self) -> None:
         """Close the database connection and checkpoint the WAL.
@@ -223,9 +276,14 @@ class Mnemosyne:
         if self._closed:
             return
         self._closed = True
-        _close_connection()
+        owner_key = self._instance_connection_owner_key
+        self._instance_connection_owner_key = None
+        if owner_key is None or not _release_instance_connections(owner_key):
+            return
+
+        _close_connection(self.db_path)
         from mnemosyne.core.beam import _close_beam_connection
-        _close_beam_connection()
+        _close_beam_connection(self.db_path)
 
     def __del__(self):
         """Best-effort cleanup on garbage collection."""

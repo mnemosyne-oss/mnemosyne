@@ -952,11 +952,19 @@ class TestSleepCycle:
 
 
 class TestMnemosyneIntegration:
-    def test_constructor_wires_beam_before_close(self, temp_db):
+    def test_constructor_wires_beam_before_close(self, temp_db, monkeypatch):
         """A close lifecycle must not move BEAM initialization into __del__."""
         mem = Mnemosyne(session_id="lifecycle", db_path=temp_db)
         assert isinstance(mem.beam, BeamMemory)
         assert mem.beam._event_emitter == mem._stream_emit
+
+        delivered = []
+        monkeypatch.setattr(mem.stream, "emit", delivered.append)
+        mem.enable_streaming()
+        event = object()
+        assert mem.beam._event_emitter is not None
+        mem.beam._event_emitter(event)
+        assert delivered == [event]
 
         mem.close()
         mem.close()  # Idempotent cleanup is safe for callers and __del__.
@@ -964,6 +972,31 @@ class TestMnemosyneIntegration:
         successor = Mnemosyne(session_id="successor", db_path=temp_db)
         assert isinstance(successor.beam, BeamMemory)
         successor.close()
+
+    def test_close_keeps_shared_beam_connection_for_live_instance(self, temp_db):
+        first = Mnemosyne(session_id="first", db_path=temp_db)
+        second = Mnemosyne(session_id="second", db_path=temp_db)
+
+        first.close()
+        assert second.beam.conn.execute("SELECT 1").fetchone()[0] == 1
+        second.close()
+
+    def test_constructor_failure_releases_provisional_connection(self, temp_db, monkeypatch):
+        import mnemosyne.core.memory as memory_module
+
+        real_beam = memory_module.BeamMemory
+
+        def fail_beam(*args, **kwargs):
+            raise RuntimeError("beam construction failed")
+
+        monkeypatch.setattr(memory_module, "BeamMemory", fail_beam)
+        with pytest.raises(RuntimeError, match="beam construction failed"):
+            Mnemosyne(session_id="broken", db_path=temp_db)
+
+        monkeypatch.setattr(memory_module, "BeamMemory", real_beam)
+        recovered = Mnemosyne(session_id="recovered", db_path=temp_db)
+        assert isinstance(recovered.beam, BeamMemory)
+        recovered.close()
 
     def test_legacy_and_beam_dual_write(self, temp_db):
         mem = Mnemosyne(session_id="s2", db_path=temp_db)
