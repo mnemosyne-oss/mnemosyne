@@ -447,7 +447,10 @@ def _safe_runtime_detail(check: str, value: Any) -> str:
     """Keep runtime metadata useful without serializing host-specific paths."""
 
     if check == "python_executable" and isinstance(value, str):
-        return safe_preview(Path(value).name, max_length=240)
+        # Runtime data can originate on a different OS than the Doctor host.
+        # Normalize Windows separators before extracting a portable basename.
+        executable_name = value.replace("\\", "/").rsplit("/", 1)[-1]
+        return safe_preview(executable_name, max_length=240)
     detail = safe_preview(value, max_length=240)
     return _RUNTIME_ABSOLUTE_PATH.sub("<redacted-path>", detail)
 

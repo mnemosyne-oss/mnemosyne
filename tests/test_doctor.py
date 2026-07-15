@@ -168,12 +168,20 @@ def test_runtime_diagnostics_marks_sqlite_vec_available_only_after_loading(monke
     )
 
 
-def test_runtime_metadata_is_retained_in_safe_doctor_artifacts(monkeypatch):
+@pytest.mark.parametrize(
+    ("raw_python_path", "safe_python_executable"),
+    [
+        ("/home/doctor-user/.venvs/mnemosyne/bin/python3.13", "python3.13"),
+        (r"C:\\Users\\doctor-user\\venvs\\mnemosyne\\python.exe", "python.exe"),
+        (r"\\\\server\\share\\venvs\\mnemosyne\\python.exe", "python.exe"),
+    ],
+)
+def test_runtime_metadata_is_retained_in_safe_doctor_artifacts(
+    monkeypatch, raw_python_path, safe_python_executable
+):
     """Metadata checks use enum statuses while preserving their values as details."""
 
-    raw_python_path = "/home/doctor-user/.venvs/mnemosyne/bin/python3.13"
     raw_model_path = "/home/doctor-user/.cache/mnemosyne/models/bge-small-en-v1.5"
-    safe_python_executable = "python3.13"
     metadata = {
         "python_version": "3.13.5",
         "platform": "Linux-6.18.34-rpt-rpi-2712-aarch64-with-glibc2.40",
