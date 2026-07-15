@@ -199,6 +199,19 @@ class Mnemosyne:
         self.conn = _get_connection(self.db_path)
         init_db(self.db_path)
 
+        # Phase 8: Streaming + Patterns + Plugins (lazy init)
+        self._stream = None
+        self._compressor = None
+        self._pattern_detector = None
+        self._delta_sync = None
+        self._plugin_manager = None
+
+        # Create beam with streaming emitter wired
+        self.beam = BeamMemory(session_id=session_id, db_path=self.db_path,
+                               author_id=author_id, author_type=author_type,
+                               channel_id=channel_id,
+                               event_emitter=self._stream_emit)
+
         self._closed = False
 
     def close(self) -> None:
@@ -220,19 +233,6 @@ class Mnemosyne:
             self.close()
         except Exception:
             pass
-
-        # Phase 8: Streaming + Patterns + Plugins (lazy init)
-        self._stream = None
-        self._compressor = None
-        self._pattern_detector = None
-        self._delta_sync = None
-        self._plugin_manager = None
-
-        # Create beam with streaming emitter wired
-        self.beam = BeamMemory(session_id=session_id, db_path=self.db_path,
-                               author_id=author_id, author_type=author_type,
-                               channel_id=channel_id,
-                               event_emitter=self._stream_emit)
 
     # ─── Phase 8: Streaming ─────────────────────────────────────────
 

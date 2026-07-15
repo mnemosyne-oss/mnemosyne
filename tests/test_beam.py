@@ -952,6 +952,19 @@ class TestSleepCycle:
 
 
 class TestMnemosyneIntegration:
+    def test_constructor_wires_beam_before_close(self, temp_db):
+        """A close lifecycle must not move BEAM initialization into __del__."""
+        mem = Mnemosyne(session_id="lifecycle", db_path=temp_db)
+        assert isinstance(mem.beam, BeamMemory)
+        assert mem.beam._event_emitter == mem._stream_emit
+
+        mem.close()
+        mem.close()  # Idempotent cleanup is safe for callers and __del__.
+
+        successor = Mnemosyne(session_id="successor", db_path=temp_db)
+        assert isinstance(successor.beam, BeamMemory)
+        successor.close()
+
     def test_legacy_and_beam_dual_write(self, temp_db):
         mem = Mnemosyne(session_id="s2", db_path=temp_db)
         mid = mem.remember("Likes pizza", source="preference", importance=0.8)
