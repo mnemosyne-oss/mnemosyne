@@ -47,15 +47,6 @@ from mnemosyne.core.veracity_consolidation import (
     compute_fact_id,
 )
 
-# Cached embedding dim for vector normalization — resolved once at import time.
-# Avoids a per-row import inside the bit-vec normalization hot path.
-try:
-    from mnemosyne.core.embeddings import EMBEDDING_DIM as _EMB_DIM
-except ImportError:
-    _EMB_DIM = 384
-_EMBEDDING_DIM_BITS = float(_EMB_DIM)
-
-
 def _env_disabled(name: str) -> bool:
     """A/B toggle helper: return True iff env var is set to a falsy
     value (`0`/`false`/`no`/`off`). Used by the per-voice ablation
@@ -65,6 +56,18 @@ def _env_disabled(name: str) -> bool:
     """
     val = os.environ.get(name, "").strip().lower()
     return val in ("0", "false", "no", "off")
+
+
+def _vector_distance_to_similarity(distance: float, vec_type: str) -> float:
+    """Use the linear recall path's sqlite-vec distance calibration."""
+    from mnemosyne.core.beam import _vec_distance_to_similarity
+
+    return _vec_distance_to_similarity(distance, vec_type)
+
+
+def _cosine_to_similarity(cosine: float) -> float:
+    """Keep absolute cosine semantics used by the linear numpy fallback."""
+    return max(0.0, min(1.0, float(cosine)))
 
 
 @dataclass
@@ -326,29 +329,13 @@ class PolyphonicRecallEngine:
                             # /review (4-source: Codex structured P2,
                             # Codex adversarial MEDIUM, Claude
                             # CRITICAL, perf HIGH) caught the pre-fix
-                            # behavior of using `1.0 - distance`
-                            # directly: bit-type Hamming distance is
-                            # an int in [0, EMBEDDING_DIM_BITS], so
-                            # the score went heavily negative
-                            # (~-383). WM cosine is in [-1, 1].
-                            # Dedup at `sim > existing.score` then
-                            # always preferred WM hits over EM
-                            # sqlite-vec hits, silently inverting the
-                            # tier-priority semantics for bit-quantized
-                            # vectors. Normalize per vec_type:
-                            #   bit:    1 - dist/EMBEDDING_DIM_BITS
-                            #   int8:   1 - dist/2  (cosine_dist in
-                            #                       [0, 2] for unit
-                            #                       vectors)
-                            #   raw f32: 1/(1+dist) (L2 → (0, 1])
+                            # behavior of using one generic formula for
+                            # incompatible sqlite-vec metrics. Delegate
+                            # to beam.py so Polyphonic and linear recall
+                            # share the exact same per-type calibration;
+                            # normalized float32 uses 1 - d²/2.
                             raw_dist = float(dist)
-                            if vec_type == "bit":
-                                # Resolved from configured model dim
-                                sim = 1.0 - (raw_dist / _EMBEDDING_DIM_BITS)
-                            elif vec_type == "int8":
-                                sim = 1.0 - (raw_dist / 2.0)
-                            else:
-                                sim = 1.0 / (1.0 + raw_dist)
+                            sim = _vector_distance_to_similarity(raw_dist, vec_type)
                             existing = by_id.get(mid)
                             if existing is None or sim > existing.score:
                                 by_id[mid] = RecallResult(
@@ -412,12 +399,9 @@ class PolyphonicRecallEngine:
                         if vec_norm == 0.0:
                             continue
                         cos_sim = float(np.dot(query_unit, vec / vec_norm))
-                        # Normalize cosine to [0, 1] so cross-path dedup
-                        # against the sqlite-vec fast path (which now
-                        # also produces [0, 1] scores) compares apples
-                        # to apples. /review (4-source) caught the
-                        # raw-cosine-vs-bit-Hamming inversion bug.
-                        sim = min(1.0, max(0.0, (cos_sim + 1.0) / 2.0))
+                        # Keep the absolute positive cosine score, matching
+                        # the linear numpy fallback and sqlite-vec calibration.
+                        sim = _cosine_to_similarity(cos_sim)
                         existing = by_id.get(memory_id)
                         if existing is None or sim > existing.score:
                             by_id[memory_id] = RecallResult(
@@ -465,9 +449,8 @@ class PolyphonicRecallEngine:
                     if vec_norm == 0.0:
                         continue
                     cos_sim = float(np.dot(query_unit, vec / vec_norm))
-                    # Normalize cosine to [0, 1] -- same rationale as EM
-                    # numpy path above (cross-path dedup parity).
-                    sim = min(1.0, max(0.0, (cos_sim + 1.0) / 2.0))
+                    # Keep parity with the episodic numpy path above.
+                    sim = _cosine_to_similarity(cos_sim)
                     existing = by_id.get(memory_id)
                     if existing is None or sim > existing.score:
                         by_id[memory_id] = RecallResult(
@@ -731,6 +714,8 @@ class PolyphonicRecallEngine:
                 combined[r.memory_id].voice_scores[r.voice] = rrf_contribution
                 combined[r.memory_id].combined_score += rrf_contribution
                 combined[r.memory_id].metadata.update(r.metadata)
+                raw_scores = combined[r.memory_id].metadata.setdefault("raw_voice_scores", {})
+                raw_scores[r.voice] = max(float(r.score), float(raw_scores.get(r.voice, 0.0)))
 
         return combined
     

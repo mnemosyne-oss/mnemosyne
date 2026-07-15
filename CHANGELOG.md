@@ -9,6 +9,11 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Calibrated hybrid recall.** Dense scores now use backend-correct geometry,
+  vector-only results require calibrated top-1 confidence and margin, Polish
+  question glue no longer creates lexical relevance, full content is returned
+  unless truncation is explicitly requested, and fact FTS updates stay synchronized.
+
 - **Hermes provider safety defaults after config bridging.** New auto-seeded
   configs now preserve user-only autosave and skip `cron`, `flush`, `subagent`,
   `background`, and `skill_loop` contexts. Existing 3.12.1/3.12.2 auto-seeded

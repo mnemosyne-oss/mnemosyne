@@ -260,6 +260,7 @@ def _prefetch_topic_signal(row: Dict[str, Any]) -> float:
         float(row.get("keyword_score") or 0.0),
         float(row.get("fts_score") or 0.0),
         float(row.get("dense_score") or 0.0),
+        float(row.get("topic_signal") or 0.0),
     )
     # Fact/entity matches are explicit relevance signals even when recall() did
     # not fill keyword/FTS scores for that path.

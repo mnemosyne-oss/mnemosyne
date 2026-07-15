@@ -26,7 +26,7 @@ import math
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Any, Set, Union, Tuple
+from typing import List, Dict, Optional, Any, Set, Union, Tuple, Callable
 from pathlib import Path
 
 
@@ -1174,6 +1174,14 @@ def init_beam(db_path: Path = None):
             VALUES ('delete', old.rowid, old.subject, old.predicate, old.object);
         END
     """)
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
+            INSERT INTO fts_facts(fts_facts, rowid, subject, predicate, object)
+            VALUES ('delete', old.rowid, old.subject, old.predicate, old.object);
+            INSERT INTO fts_facts(rowid, subject, predicate, object)
+            VALUES (new.rowid, new.subject, new.predicate, new.object);
+        END
+    """)
 
     # Vector table for facts (sqlite-vec). Skipped on a dimension mismatch for the
     # same reason as vec_episodes / vec_working above (see the guard in the
@@ -1668,6 +1676,11 @@ _FACT_MATCH_STOPWORDS: Set[str] = {
     # to them" to fact-match unrelated policies via overlaps such as "not/they".
     "again", "into", "not", "please", "somewhere", "supposed", "them", "then",
     "they", "whatever",
+    # Polish conversational/question glue.  These were calibrated against the
+    # multilingual regression harness after a negative WiFi question matched
+    # unrelated memories through only "jest"/"dla".  Keep domain nouns out.
+    "czy", "dla", "dokąd", "gdzie", "ile", "jak", "jaka", "jaki", "jakie", "jaką",
+    "jest", "kiedy", "kto", "która", "które", "którego", "który", "oraz", "przy", "się",
     # Query/meta words describe the retrieval act, not the user's target.
     # Deployments can extend these with MNEMOSYNE_RECALL_EXTRA_STOPWORDS
     # instead of patching source for local corpora.
@@ -2092,9 +2105,9 @@ def _effective_vec_type(conn: sqlite3.Connection, table: str = "vec_episodes") -
     return "float32"
 
 
-def _vec_insert(conn: sqlite3.Connection, rowid: int, embedding: List[float]):
+def _vec_insert(conn: sqlite3.Connection, rowid: int, embedding: List[float], *, commit: bool = True):
     """Insert embedding into the episodic sqlite-vec table."""
-    _vec_table_insert(conn, "vec_episodes", rowid, embedding)
+    _vec_table_insert(conn, "vec_episodes", rowid, embedding, commit=commit)
 
 
 def _vec_table_insert(conn: sqlite3.Connection, table: str, rowid: int, embedding: List[float], *, commit: bool = True):
@@ -2817,6 +2830,106 @@ def _wm_vec_search(conn: sqlite3.Connection, query_embedding, k: int = 20,
                                    where_params=where_params)
 
 
+def _vec_distance_to_similarity(distance: float, vec_type: str) -> float:
+    """Convert sqlite-vec distance to a bounded cosine-like similarity.
+
+    float32 vectors are normalized on insert/query, so Euclidean distance ``d``
+    has the exact relation ``cosine = 1 - d²/2``.  Bit vectors report Hamming
+    distance.  Keep the historical bounded int8 scaling until sqlite-vec exposes
+    a stable dequantized metric contract for that backend.
+    """
+    d = max(float(distance), 0.0)
+    if vec_type == "float32":
+        similarity = 1.0 - ((d * d) / 2.0)
+    elif vec_type == "bit":
+        similarity = 1.0 - (d / max(float(EMBEDDING_DIM), 1.0))
+    else:
+        similarity = 1.0 - (d / max(2.0 * float(EMBEDDING_DIM), 1.0))
+    return max(0.0, min(1.0, similarity))
+
+
+def _cosine_distance_to_similarity(distance: float) -> float:
+    """Convert the in-memory fallback's ``1 - cosine`` distance."""
+    return max(0.0, min(1.0, 1.0 - float(distance)))
+
+
+def _admit_vector_only(
+    memory_id: str,
+    ranked: List[Dict[str, Any]],
+    *,
+    env_prefix: str,
+    label: str,
+) -> bool:
+    """Admit one strong, unambiguous semantic hit without lexical overlap.
+
+    The defaults are calibrated against the checked-in Polish multilingual-e5
+    harness: the weakest positive is 0.8126 and the strongest negative is
+    0.8006.  Only vector top-1 can pass; with multiple candidates it must also
+    have a minimum lead over the runner-up.
+    """
+    if not ranked or ranked[0].get("id") != memory_id:
+        return False
+    try:
+        min_sim = float(os.environ.get(f"{env_prefix}_MIN_SIM", "0.81"))
+        min_margin = float(os.environ.get(f"{env_prefix}_MIN_MARGIN", "0.02"))
+    except ValueError:
+        logger.warning("Invalid %s vector-only threshold; using safe defaults", label)
+        min_sim, min_margin = 0.81, 0.02
+    top_sim = float(ranked[0].get("sim") or 0.0)
+    if top_sim < min_sim:
+        return False
+    if len(ranked) > 1:
+        runner_up = float(ranked[1].get("sim") or 0.0)
+        if top_sim - runner_up < min_margin:
+            return False
+    return True
+
+
+def _admit_wm_vector_only(memory_id: str, ranked: List[Dict[str, Any]]) -> bool:
+    return _admit_vector_only(
+        memory_id,
+        ranked,
+        env_prefix="MNEMOSYNE_WM_VECTOR_ONLY",
+        label="WM",
+    )
+
+
+def _admit_ep_vector_only(memory_id: str, ranked: List[Dict[str, Any]]) -> bool:
+    return _admit_vector_only(
+        memory_id,
+        ranked,
+        env_prefix="MNEMOSYNE_EP_VECTOR_ONLY",
+        label="episodic",
+    )
+
+
+def _admit_poly_vector_only(memory_id: str, ranked: List[Dict[str, Any]]) -> bool:
+    return _admit_vector_only(
+        memory_id,
+        ranked,
+        env_prefix="MNEMOSYNE_POLY_VECTOR_ONLY",
+        label="Polyphonic",
+    )
+
+
+def _recall_content_char_limit() -> int:
+    """Return recall result content limit; ``0`` means full content."""
+    raw = os.environ.get("MNEMOSYNE_RECALL_CONTENT_CHARS", "0").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid MNEMOSYNE_RECALL_CONTENT_CHARS=%r; disabling recall truncation",
+            raw,
+        )
+        return 0
+
+
+def _format_recall_content(content: str) -> str:
+    limit = _recall_content_char_limit()
+    return content[:limit] if limit > 0 else content
+
+
 def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20,
                           *, where_sql: str,
                           where_params: Tuple[Any, ...] = ()) -> List[Dict]:
@@ -2868,12 +2981,7 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
     results = []
     for row in rows:
         distance = float(row["distance"])
-        # Keep the existing caller contract: larger sim is better and roughly
-        # cosine-like. sqlite-vec reports a distance whose raw scale differs
-        # by backend/vector type; divide by dimensionality before bounding so
-        # the vector voice remains comparable to the memory_embeddings cosine
-        # fallback instead of collapsing to ~0 on high-dimensional vectors.
-        sim = max(0.0, min(1.0, 1.0 - (max(distance, 0.0) / (2.0 * EMBEDDING_DIM))))
+        sim = _vec_distance_to_similarity(distance, vec_type)
         results.append({"id": row["id"], "sim": sim})
     return results[:k]
 
@@ -5632,6 +5740,7 @@ class BeamMemory:
 
         # ---- Working memory (vector search) ----
         wm_vec_sims = {}
+        wm_vec = []
         if embeddings_available:
             try:
                 emb_result = _get_query_embedding()
@@ -5721,7 +5830,15 @@ class BeamMemory:
             else:
                 relevance = _lexical_relevance(query_words, row["content"], query_lower)
                 row_min_relevance = single_token_relevance if broad_multi_hit_query else min_relevance
-            if relevance >= row_min_relevance or (wm_ranks and len(query_words) <= 1 and relevance > 0):
+            vec_sim = wm_vec_sims.get(row["id"], 0.0)
+            vector_only = (
+                relevance < row_min_relevance
+                and (relevance == 0.0 or len(query_words) >= 4)
+                and _admit_wm_vector_only(row["id"], wm_vec)
+            )
+            if (relevance >= row_min_relevance
+                    or (wm_ranks and len(query_words) <= 1 and relevance > 0)
+                    or vector_only):
                 decay = _recency_decay(row["timestamp"])
                 # Phase 4: configurable scoring for working memory
                 # keyword_share = (1 - importance_weight) * 0.6, recency_share = (1 - importance_weight) * 0.4
@@ -5729,7 +5846,6 @@ class BeamMemory:
                 rc_share = (1.0 - iw) * 0.4
                 base_score = relevance * kw_share + row["importance"] * iw + (relevance ** 2) * 0.08
                 # Blend vector similarity into working memory score (weighted toward keyword precision)
-                vec_sim = wm_vec_sims.get(row["id"], 0.0)
                 if vec_sim > 0:
                     base_score = base_score * 0.80 + vec_sim * 0.20
                 score = base_score * (rc_share + (1.0 - rc_share) * decay)
@@ -5754,13 +5870,14 @@ class BeamMemory:
                     _wm_vec_kept += 1
                 results.append({
                     "id": row["id"],
-                    "content": row["content"][:500],
+                    "content": _format_recall_content(row["content"]),
                     "source": row["source"],
                     "timestamp": row["timestamp"],
                     "tier": "working",
                     "score": round(score, 4),
                     "keyword_score": round(relevance, 4),
                     "dense_score": round(vec_sim, 4),
+                    "vector_only": vector_only,
                     "fts_score": round(relevance, 4) if wm_ranks else 0.0,
                     "importance": row["importance"],
                     "recall_count": row["recall_count"] or 0,
@@ -5824,7 +5941,7 @@ class BeamMemory:
                         score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": _format_recall_content(row["content"]),
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "working",
@@ -5886,7 +6003,7 @@ class BeamMemory:
                         score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": _format_recall_content(row["content"]),
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "episodic",
@@ -5947,7 +6064,7 @@ class BeamMemory:
                         score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": _format_recall_content(row["content"]),
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "working",
@@ -6008,7 +6125,7 @@ class BeamMemory:
                         score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": _format_recall_content(row["content"]),
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "episodic",
@@ -6048,20 +6165,20 @@ class BeamMemory:
 
         # ---- Episodic memory (vec + FTS5 hybrid) ----
         vec_results = {}
-        max_distance = 0.0
         if embeddings_available:
             emb_result = _get_query_embedding()
             if emb_result is not None:
                 if _vec_available(self.conn):
                     vec_rows = _vec_search(self.conn, emb_result.tolist(), k=max(top_k * 3, 20))
+                    vec_type = _effective_vec_type(self.conn, "vec_episodes")
+                    distance_to_similarity = lambda d: _vec_distance_to_similarity(d, vec_type)
                 else:
                     # Fallback: in-memory cosine similarity search
                     vec_rows = _in_memory_vec_search(self.conn, emb_result, k=max(top_k * 3, 20))
+                    distance_to_similarity = _cosine_distance_to_similarity
                 if vec_rows:
-                    max_distance = max(vr["distance"] for vr in vec_rows)
                     for vr in vec_rows:
-                        sim = max(0.0, 1.0 - (vr["distance"] / max_distance)) if max_distance > 0 else 1.0
-                        vec_results[vr["rowid"]] = sim
+                        vec_results[vr["rowid"]] = distance_to_similarity(vr["distance"])
 
         fts_results = {}
         fts_rows = _fts_search(self.conn, query, k=max(top_k * 3, 20))
@@ -6144,6 +6261,15 @@ class BeamMemory:
             _em_candidate_rows = cursor.fetchall()
         else:
             _em_candidate_rows = []
+        em_vec_ranked = sorted(
+            [
+                {"id": row["id"], "sim": vec_results[row["rowid"]]}
+                for row in _em_candidate_rows
+                if row["rowid"] in vec_results
+            ],
+            key=lambda item: item["sim"],
+            reverse=True,
+        )
         for row in _em_candidate_rows:
             rid = row["rowid"]
             sim = vec_results.get(rid, 0.0)
@@ -6170,6 +6296,13 @@ class BeamMemory:
             # lexical coverage before admitting FTS-only episodic rows, while
             # still allowing genuinely strong vector-only hits through.
             if lexical < min_relevance and sim < 0.65:
+                continue
+            if (
+                sim > 0.0
+                and fts == 0.0
+                and (lexical == 0.0 or len(query_words) >= 4)
+                and not _admit_ep_vector_only(memory_id, em_vec_ranked)
+            ):
                 continue
             if self.episodic_graph is not None and not _env_disabled("MNEMOSYNE_GRAPH_BONUS"):
                 try:
@@ -6234,7 +6367,7 @@ class BeamMemory:
                 _em_vec_kept += 1
             results.append({
                 "id": row["id"],
-                "content": row["content"][:500],
+                "content": _format_recall_content(row["content"]),
                 "source": row["source"],
                 "timestamp": row["timestamp"],
                 "tier": "episodic",
@@ -6338,7 +6471,7 @@ class BeamMemory:
                     _em_fallback_kept += 1
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": _format_recall_content(row["content"]),
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "episodic",
@@ -7075,7 +7208,9 @@ class BeamMemory:
         final = []
         cursor = self.conn.cursor()
         now_iso = datetime.now().isoformat()
-
+        query_lower = query.lower()
+        query_words = _recall_tokens(query_lower)
+        visible_polyphonic_results = []
         for r in polyphonic_results:
             memory_id = r.memory_id
             if memory_id.startswith("cf_"):
@@ -7091,6 +7226,49 @@ class BeamMemory:
                 source=source, topic=topic, author_id=author_id,
                 author_type=author_type, channel_id=channel_id,
                 veracity=veracity, memory_type=memory_type, now_iso=now_iso,
+            ):
+                continue
+            visible_polyphonic_results.append((r, row_dict))
+
+        poly_vector_ranked = sorted(
+            [
+                {
+                    "id": result.memory_id,
+                    "sim": float(
+                        result.metadata.get("raw_voice_scores", {}).get("vector", 0.0)
+                    ),
+                }
+                for result, _row_dict in visible_polyphonic_results
+                if float(
+                    result.metadata.get("raw_voice_scores", {}).get("vector", 0.0)
+                ) > 0.0
+            ],
+            key=lambda item: item["sim"],
+            reverse=True,
+        )
+
+        for r, row_dict in visible_polyphonic_results:
+            memory_id = r.memory_id
+
+            raw_voice_scores = dict(r.metadata.get("raw_voice_scores", {}))
+            vector_score = float(raw_voice_scores.get("vector", 0.0))
+            topical_voice_scores = {
+                name: float(value)
+                for name, value in raw_voice_scores.items()
+                if name in {"vector", "fact", "graph"}
+            }
+            has_other_voice = any(
+                name != "vector" and value > 0.0
+                for name, value in topical_voice_scores.items()
+            )
+            lexical = _lexical_relevance(
+                query_words, row_dict.get("content", ""), query_lower
+            )
+            if (
+                vector_score > 0.0
+                and not has_other_voice
+                and (lexical == 0.0 or len(query_words) >= 4)
+                and not _admit_poly_vector_only(memory_id, poly_vector_ranked)
             ):
                 continue
 
@@ -7111,6 +7289,10 @@ class BeamMemory:
 
             row_dict["score"] = score
             row_dict["voice_scores"] = dict(r.voice_scores)
+            row_dict["raw_voice_scores"] = raw_voice_scores
+            row_dict["topic_signal"] = max(
+                list(topical_voice_scores.values()) or [0.0]
+            )
             final.append(row_dict)
             # No early-break: dedup needs to see all candidates before
             # truncation, otherwise a wm row dropped from top-K by an

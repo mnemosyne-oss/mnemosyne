@@ -1,0 +1,102 @@
+{
+  "records": [
+    {
+      "key": "hydraulika",
+      "content": "Prasa hydrauliczna PH-7 ma nominalne ciśnienie robocze 180 bar. Przegląd filtra oleju odbywa się w każdy pierwszy poniedziałek miesiąca."
+    },
+    {
+      "key": "backup",
+      "content": "Backup bazy PostgreSQL jest wykonywany codziennie o 02:30 na serwer NAS Orion. Retencja kopii wynosi 30 dni."
+    },
+    {
+      "key": "brygadzista",
+      "content": "Jan Kowalski jest brygadzistą zmiany nocnej i odpowiada za linię montażową numer trzy."
+    },
+    {
+      "key": "router",
+      "content": "Router MikroTik RB5009 obsługuje sieć produkcyjną VLAN 40. Adres bramy tej sieci to 10.40.0.1."
+    },
+    {
+      "key": "faktury",
+      "content": "Faktury dostawcy Stalpol zatwierdza Anna Nowak. Termin płatności wynosi 21 dni od daty wystawienia."
+    },
+    {
+      "key": "cnc",
+      "content": "Tokarka CNC Mazak QTN-250 wymaga kalibracji osi X co 500 godzin pracy. Ostatnią kalibrację wykonano w czerwcu."
+    },
+    {
+      "key": "energia",
+      "content": "Sprężarka Atlas Copco GA37 jest wyłączana w godzinach szczytu energetycznego od 17:00 do 19:00."
+    },
+    {
+      "key": "ewakuacja",
+      "content": "Punkt zbiórki ewakuacyjnej dla hali B znajduje się przy północnej bramie obok magazynu narzędzi."
+    },
+    {
+      "key": "stal",
+      "content": "Dostawy blach S355 od firmy Metalex przyjeżdżają we wtorki i czwartki o godzinie 06:00."
+    },
+    {
+      "key": "spoiny",
+      "content": "Pomiar jakości spoin metodą ultradźwiękową wykonuje laboratorium Delta. Raport trafia do działu jakości."
+    }
+  ],
+  "queries": [
+    {"expected": "hydraulika", "query": "Jakie ciśnienie robocze ma prasa PH-7?"},
+    {"expected": "hydraulika", "query": "Kiedy odbywa się przegląd filtra oleju?"},
+    {"expected": "hydraulika", "query": "Ile barów ma prasa hydrauliczna?"},
+    {"expected": "hydraulika", "query": "Którego dnia przeglądamy filtr prasy?"},
+
+    {"expected": "backup", "query": "O której godzinie wykonywany jest backup PostgreSQL?"},
+    {"expected": "backup", "query": "Jak długo trwa retencja kopii bazy?"},
+    {"expected": "backup", "query": "Na jaki serwer trafia backup?"},
+    {"expected": "backup", "query": "Ile dni przechowujemy kopie PostgreSQL?"},
+
+    {"expected": "brygadzista", "query": "Kto jest brygadzistą zmiany nocnej?"},
+    {"expected": "brygadzista", "query": "Za którą linię odpowiada Jan Kowalski?"},
+    {"expected": "brygadzista", "query": "Kto odpowiada za linię montażową numer trzy?"},
+    {"expected": "brygadzista", "query": "Jaką funkcję pełni Jan na nocnej zmianie?"},
+
+    {"expected": "router", "query": "Jaki router obsługuje VLAN 40?"},
+    {"expected": "router", "query": "Jaki jest adres bramy sieci produkcyjnej?"},
+    {"expected": "router", "query": "Który model MikroTik działa w produkcji?"},
+    {"expected": "router", "query": "Do jakiej sieci należy adres 10.40.0.1?"},
+
+    {"expected": "faktury", "query": "Kto zatwierdza faktury Stalpol?"},
+    {"expected": "faktury", "query": "Jaki termin płatności ma dostawca Stalpol?"},
+    {"expected": "faktury", "query": "Ile dni jest na zapłatę faktury?"},
+    {"expected": "faktury", "query": "Które faktury zatwierdza Anna Nowak?"},
+
+    {"expected": "cnc", "query": "Co ile godzin kalibrujemy oś X tokarki?"},
+    {"expected": "cnc", "query": "Kiedy wykonano ostatnią kalibrację Mazaka?"},
+    {"expected": "cnc", "query": "Która tokarka wymaga kalibracji osi X?"},
+    {"expected": "cnc", "query": "Jaki model CNC ma interwał 500 godzin?"},
+
+    {"expected": "energia", "query": "Kiedy wyłączamy sprężarkę Atlas Copco?"},
+    {"expected": "energia", "query": "W jakich godzinach trwa szczyt energetyczny?"},
+    {"expected": "energia", "query": "Która sprężarka jest wyłączana od 17 do 19?"},
+    {"expected": "energia", "query": "Jaki model sprężarki ogranicza pobór energii?"},
+
+    {"expected": "ewakuacja", "query": "Gdzie jest punkt zbiórki dla hali B?"},
+    {"expected": "ewakuacja", "query": "Przy której bramie znajduje się punkt ewakuacyjny?"},
+    {"expected": "ewakuacja", "query": "Co znajduje się obok magazynu narzędzi?"},
+    {"expected": "ewakuacja", "query": "Dokąd ewakuuje się hala B?"},
+
+    {"expected": "stal", "query": "W jakie dni przyjeżdżają dostawy blach S355?"},
+    {"expected": "stal", "query": "O której godzinie przyjeżdża Metalex?"},
+    {"expected": "stal", "query": "Kto dostarcza blachy S355?"},
+    {"expected": "stal", "query": "Czy dostawy stali są we wtorki i czwartki?"},
+
+    {"expected": "spoiny", "query": "Kto wykonuje ultradźwiękowy pomiar spoin?"},
+    {"expected": "spoiny", "query": "Dokąd trafia raport z badania spoin?"},
+    {"expected": "spoiny", "query": "Jaką metodą laboratorium Delta bada jakość?"},
+    {"expected": "spoiny", "query": "Który dział otrzymuje raport ultradźwiękowy?"}
+  ],
+  "negative_queries": [
+    "Jaki kolor ma prywatny samochód prezesa?",
+    "Jakie jest hasło do sieci WiFi dla gości?",
+    "Co dziś podaje stołówka na obiad?",
+    "Kiedy marketing wymienia drukarkę kolorową?",
+    "Ile dni urlopu zostało Pawłowi?"
+  ]
+}
