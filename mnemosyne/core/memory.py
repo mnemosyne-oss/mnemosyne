@@ -56,46 +56,106 @@ def _default_db_path() -> Path:
     return _default_data_dir() / "mnemosyne.db"
 
 
-def _get_connection(db_path = None) -> sqlite3.Connection:
-    """Get thread-local database connection"""
+def _canonical_db_path(db_path=None) -> tuple[str, Path]:
+    """Return a stable cache key and path for a database location."""
     path = Path(db_path) if db_path else _default_db_path()
-    if not hasattr(_thread_local, 'conn') or _thread_local.conn is None or getattr(_thread_local, 'db_path', None) != str(path):
+    path = path.expanduser().resolve()
+    return str(path), path
+
+
+def _connections() -> dict[str, sqlite3.Connection]:
+    """Return this thread's database connections, keyed by canonical path."""
+    if not hasattr(_thread_local, "connections"):
+        _thread_local.connections = {}
+    return _thread_local.connections
+
+
+def _owners() -> dict[str, int]:
+    """Return this thread's live Mnemosyne-wrapper count per database."""
+    if not hasattr(_thread_local, "owners"):
+        _thread_local.owners = {}
+    return _thread_local.owners
+
+
+def _get_connection(db_path=None) -> sqlite3.Connection:
+    """Get a live thread-local database connection for ``db_path``."""
+    key, path = _canonical_db_path(db_path)
+    connections = _connections()
+    conn = connections.get(key)
+    if conn is not None:
+        try:
+            conn.execute("SELECT 1")
+        except Exception:
+            connections.pop(key, None)
+            conn = None
+
+    if conn is None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        _thread_local.conn = sqlite3.connect(str(path), check_same_thread=False)
-        _thread_local.conn.row_factory = sqlite3.Row
-        _thread_local.conn.execute("PRAGMA journal_mode=WAL")
-        _thread_local.conn.execute("PRAGMA busy_timeout=5000")
-        _thread_local.conn.execute("PRAGMA foreign_keys=ON")
+        conn = sqlite3.connect(str(path), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
         # Load sqlite-vec extension for vector search (matches beam._get_connection)
         try:
             import sqlite_vec
-            _thread_local.conn.enable_load_extension(True)
-            sqlite_vec.load(_thread_local.conn)
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
         except Exception:
             pass
-        _thread_local.db_path = str(path)
-    return _thread_local.conn
+        connections[key] = conn
+    return conn
 
 
-def _close_connection() -> None:
-    """Close the thread-local connection and checkpoint the WAL.
+def _acquire_connection(db_path=None) -> sqlite3.Connection:
+    """Get a connection and register one live Mnemosyne wrapper for its path."""
+    key, _ = _canonical_db_path(db_path)
+    conn = _get_connection(db_path)
+    owners = _owners()
+    owners[key] = owners.get(key, 0) + 1
+    return conn
 
-    Thread-local connections under WAL mode can block checkpoints
-    after the owning thread exits.  Explicitly closing the connection
-    and running ``PRAGMA wal_checkpoint(TRUNCATE)`` prevents the
-    ``database is locked`` cascade documented in #382.
+
+def _release_connection(db_path=None) -> None:
+    """Release one wrapper; close its connection only after its final owner."""
+    key, path = _canonical_db_path(db_path)
+    owners = _owners()
+    remaining = owners.get(key, 0) - 1
+    if remaining > 0:
+        owners[key] = remaining
+        return
+    owners.pop(key, None)
+    _close_connection(path)
+
+
+def _close_connection(db_path=None) -> None:
+    """Close one cached connection, or every cached connection when omitted.
+
+    Each close checkpoints WAL before releasing the handle, preventing the
+    ``database is locked`` cascade documented in #382.  Explicit close is a
+    force-close operation; wrapper ownership uses ``_release_connection``.
     """
-    if hasattr(_thread_local, 'conn') and _thread_local.conn is not None:
+    connections = _connections()
+    owners = _owners()
+    if db_path is None:
+        keys = list(connections)
+    else:
+        key, _ = _canonical_db_path(db_path)
+        keys = [key]
+
+    for key in keys:
+        conn = connections.pop(key, None)
+        owners.pop(key, None)
+        if conn is None:
+            continue
         try:
-            _thread_local.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:
             pass
         try:
-            _thread_local.conn.close()
+            conn.close()
         except Exception:
             pass
-        _thread_local.conn = None
-        _thread_local.db_path = None
 
 
 def wal_checkpoint(db_path=None) -> dict:
@@ -104,10 +164,7 @@ def wal_checkpoint(db_path=None) -> dict:
     Returns a dict with ``busy``, ``log``, ``checkpointed`` keys so
     callers can monitor whether the checkpoint succeeded.
     """
-    conn = _get_connection(db_path) if db_path else (
-        _thread_local.conn if hasattr(_thread_local, 'conn') and _thread_local.conn is not None
-        else _get_connection()
-    )
+    conn = _get_connection(db_path)
     try:
         row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         return {"busy": row[0], "log": row[1], "checkpointed": row[2]}
@@ -177,6 +234,8 @@ class Mnemosyne:
     def __init__(self, session_id: str = "default", db_path: Path = None, bank: str = None,
                  author_id: str = None, author_type: str = None,
                  channel_id: str = None):
+        self._closed = False
+        self._owns_connection = False
         # Auto-seed config.yaml on first Mnemosyne init
         from mnemosyne.core.config import get_config
         get_config()  # triggers _seed() if config.yaml doesn't exist
@@ -196,10 +255,29 @@ class Mnemosyne:
         else:
             self.db_path = _default_db_path()
 
-        self.conn = _get_connection(self.db_path)
-        init_db(self.db_path)
+        try:
+            self.conn = _acquire_connection(self.db_path)
+            self._owns_connection = True
+            init_db(self.db_path)
 
-        self._closed = False
+            # Phase 8: Streaming + Patterns + Plugins (lazy init)
+            self._stream = None
+            self._compressor = None
+            self._pattern_detector = None
+            self._delta_sync = None
+            self._plugin_manager = None
+
+            # Create beam with streaming emitter wired
+            self.beam = BeamMemory(session_id=session_id, db_path=self.db_path,
+                                   author_id=author_id, author_type=author_type,
+                                   channel_id=channel_id,
+                                   event_emitter=self._stream_emit)
+        except BaseException:
+            if self._owns_connection:
+                self._owns_connection = False
+                _release_connection(self.db_path)
+            self._closed = True
+            raise
 
     def close(self) -> None:
         """Close the database connection and checkpoint the WAL.
@@ -210,9 +288,11 @@ class Mnemosyne:
         if self._closed:
             return
         self._closed = True
-        _close_connection()
-        from mnemosyne.core.beam import _close_beam_connection
-        _close_beam_connection()
+        if self._owns_connection:
+            self._owns_connection = False
+            _release_connection(self.db_path)
+        if hasattr(self, "beam"):
+            self.beam.close()
 
     def __del__(self):
         """Best-effort cleanup on garbage collection."""
@@ -220,19 +300,6 @@ class Mnemosyne:
             self.close()
         except Exception:
             pass
-
-        # Phase 8: Streaming + Patterns + Plugins (lazy init)
-        self._stream = None
-        self._compressor = None
-        self._pattern_detector = None
-        self._delta_sync = None
-        self._plugin_manager = None
-
-        # Create beam with streaming emitter wired
-        self.beam = BeamMemory(session_id=session_id, db_path=self.db_path,
-                               author_id=author_id, author_type=author_type,
-                               channel_id=channel_id,
-                               event_emitter=self._stream_emit)
 
     # ─── Phase 8: Streaming ─────────────────────────────────────────
 

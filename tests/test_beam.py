@@ -952,6 +952,24 @@ class TestSleepCycle:
 
 
 class TestMnemosyneIntegration:
+    def test_close_isolated_by_database_path_and_live_owner(self, temp_db, tmp_path):
+        other_db = tmp_path / "other.db"
+        first = Mnemosyne(session_id="first", db_path=temp_db)
+        second = Mnemosyne(session_id="second", db_path=temp_db)
+        other = Mnemosyne(session_id="other", db_path=other_db)
+
+        first.close()
+        assert second.conn.execute("SELECT 1").fetchone()[0] == 1
+        assert second.beam.conn.execute("SELECT 1").fetchone()[0] == 1
+        assert other.conn.execute("SELECT 1").fetchone()[0] == 1
+        assert other.beam.conn.execute("SELECT 1").fetchone()[0] == 1
+
+        second.close()
+        with pytest.raises(sqlite3.ProgrammingError):
+            second.conn.execute("SELECT 1")
+        assert other.conn.execute("SELECT 1").fetchone()[0] == 1
+        other.close()
+
     def test_legacy_and_beam_dual_write(self, temp_db):
         mem = Mnemosyne(session_id="s2", db_path=temp_db)
         mid = mem.remember("Likes pizza", source="preference", importance=0.8)

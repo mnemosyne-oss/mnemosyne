@@ -19,15 +19,14 @@ def _close_cached_connections():
         try:
             import importlib
             mod = importlib.import_module(mod_path)
-            tl = getattr(mod, "_thread_local", None)
-            if tl is not None and hasattr(tl, "conn") and tl.conn is not None:
-                try:
-                    tl.conn.close()
-                except Exception:
-                    pass
-                tl.conn = None
-                if hasattr(tl, "db_path"):
-                    tl.db_path = None
+            close_name = (
+                "_close_beam_connection"
+                if mod_path.endswith(".beam")
+                else "_close_connection"
+            )
+            close = getattr(mod, close_name, None)
+            if close is not None:
+                close()
         except Exception:
             pass
 
@@ -78,9 +77,9 @@ def _reset_thread_local_connections():
     tests that use different database paths.
 
     Both mnemosyne.core.beam and mnemosyne.core.memory maintain their own
-    thread-local caches (_thread_local.conn / _thread_local.db_path).
-    When tests create instances with different db_paths, the old connection
-    is never closed, leading to "database is locked" errors.
+    thread-local connection maps keyed by canonical database path. Closing all
+    entries around each test prevents per-path cache state from leaking into
+    later tests.
     """
     _close_cached_connections()
     yield

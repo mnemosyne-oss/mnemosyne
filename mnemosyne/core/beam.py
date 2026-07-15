@@ -437,6 +437,27 @@ if VEC_TYPE not in ("float32", "int8", "bit"):
     VEC_TYPE = "float32"
 
 
+def _canonical_db_path(db_path: Path = None) -> tuple[str, Path]:
+    """Return a stable cache key and path for a database location."""
+    path = Path(db_path) if db_path else _default_db_path()
+    path = path.expanduser().resolve()
+    return str(path), path
+
+
+def _connections() -> dict[str, sqlite3.Connection]:
+    """Return this thread's BEAM connections, keyed by canonical path."""
+    if not hasattr(_thread_local, "connections"):
+        _thread_local.connections = {}
+    return _thread_local.connections
+
+
+def _owners() -> dict[str, int]:
+    """Return this thread's live BeamMemory-wrapper count per database."""
+    if not hasattr(_thread_local, "owners"):
+        _thread_local.owners = {}
+    return _thread_local.owners
+
+
 def _get_connection(db_path: Path = None) -> sqlite3.Connection:
     """Get thread-local database connection with extensions loaded.
 
@@ -445,20 +466,18 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
     `_deferred_commits`. Connection is otherwise identical to a
     plain sqlite3.Connection.
     """
-    path = Path(db_path) if db_path else _default_db_path()
-    needs_reconnect = (
-        not hasattr(_thread_local, 'conn')
-        or _thread_local.conn is None
-        or getattr(_thread_local, 'db_path', None) != str(path)
-    )
-    if not needs_reconnect:
+    key, path = _canonical_db_path(db_path)
+    connections = _connections()
+    conn = connections.get(key)
+    if conn is not None:
         # Verify the cached connection is still alive
         try:
-            _thread_local.conn.execute("SELECT 1")
+            conn.execute("SELECT 1")
         except Exception:
-            needs_reconnect = True
+            connections.pop(key, None)
+            conn = None
 
-    if needs_reconnect:
+    if conn is None:
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(
             str(path),
@@ -482,30 +501,59 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
                 sqlite_vec.load(conn)
             except Exception:
                 pass  # Some environments don't support load_extension
-        _thread_local.conn = conn
-        _thread_local.db_path = str(path)
-    return _thread_local.conn
+        connections[key] = conn
+    return conn
 
 
-def _close_beam_connection() -> None:
-    """Close the thread-local BEAM connection and checkpoint the WAL.
+def _acquire_beam_connection(db_path: Path = None) -> sqlite3.Connection:
+    """Get a connection and register one live BeamMemory wrapper for its path."""
+    key, _ = _canonical_db_path(db_path)
+    conn = _get_connection(db_path)
+    owners = _owners()
+    owners[key] = owners.get(key, 0) + 1
+    return conn
 
-    Thread-local connections under WAL mode can block checkpoints
-    after the owning thread exits.  Explicitly closing the connection
-    and running ``PRAGMA wal_checkpoint(TRUNCATE)`` prevents the
-    ``database is locked`` cascade documented in #382.
+
+def _release_beam_connection(db_path: Path = None) -> None:
+    """Release one wrapper; close its connection only after its final owner."""
+    key, path = _canonical_db_path(db_path)
+    owners = _owners()
+    remaining = owners.get(key, 0) - 1
+    if remaining > 0:
+        owners[key] = remaining
+        return
+    owners.pop(key, None)
+    _close_beam_connection(path)
+
+
+def _close_beam_connection(db_path: Path = None) -> None:
+    """Close one cached BEAM connection, or all current-thread entries.
+
+    Each close checkpoints WAL before releasing the handle, preventing the
+    ``database is locked`` cascade documented in #382. Explicit close is a
+    force-close operation; wrapper ownership uses ``_release_beam_connection``.
     """
-    if hasattr(_thread_local, 'conn') and _thread_local.conn is not None:
+    connections = _connections()
+    owners = _owners()
+    if db_path is None:
+        keys = list(connections)
+    else:
+        key, _ = _canonical_db_path(db_path)
+        keys = [key]
+
+    for key in keys:
+        conn = connections.pop(key, None)
+        owners.pop(key, None)
+        if conn is None:
+            continue
         try:
-            _thread_local.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:
             pass
         try:
-            _thread_local.conn.close()
+            conn.close()
         except Exception:
             pass
-        _thread_local.conn = None
-        _thread_local.db_path = None
 
 
 def _detect_vec_type(conn: sqlite3.Connection) -> str:
@@ -2979,7 +3027,21 @@ class BeamMemory:
         self._extraction_client = None  # Lazy-loaded ExtractionClient
         self._extraction_buffer = []  # Buffer for batch extraction
         self._event_emitter = event_emitter  # Streaming event callback
-        self.conn = _get_connection(self.db_path)
+        self._closed = False
+        self._owns_connection = False
+        try:
+            self.conn = _acquire_beam_connection(self.db_path)
+            self._owns_connection = True
+            self._initialize_stores()
+        except BaseException:
+            if self._owns_connection:
+                self._owns_connection = False
+                _release_beam_connection(self.db_path)
+            self._closed = True
+            raise
+
+    def _initialize_stores(self) -> None:
+        """Initialize schemas and shared stores after acquiring ``self.conn``."""
         init_beam(self.db_path)
 
         # E6: ensure schema split + auto-migrate legacy TripleStore rows
@@ -3028,6 +3090,22 @@ class BeamMemory:
                 self.veracity_consolidator = VeracityConsolidator(conn=self.conn, db_path=self.db_path)
             except Exception:
                 logger.info("Regex extraction failed, skipping", exc_info=True)
+
+    def close(self) -> None:
+        """Release this wrapper's BEAM connection ownership."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._owns_connection:
+            self._owns_connection = False
+            _release_beam_connection(self.db_path)
+
+    def __del__(self):
+        """Best-effort cleanup on garbage collection."""
+        try:
+            self.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # E6 schema split + auto-migration
