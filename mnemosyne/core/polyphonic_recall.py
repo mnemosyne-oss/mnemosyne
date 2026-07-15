@@ -82,6 +82,7 @@ class PolyphonicResult:
     combined_score: float
     voice_scores: Dict[str, float]
     metadata: Dict
+    content: str = ""
 
 
 class PolyphonicRecallEngine:
@@ -152,13 +153,14 @@ class PolyphonicRecallEngine:
         temporal_results = self._temporal_voice(query)
         
         # Combine results
-        all_results = self._combine_voices(
+        combined = self._combine_voices(
             vector_results, graph_results, fact_results, temporal_results
         )
-        
-        # Re-rank with diversity
-        reranked = self._diversity_rerank(all_results, top_k)
-        
+        self._hydrate_result_content(combined)
+
+        # Diversity re-rank
+        reranked = self._diversity_rerank(combined, top_k)
+
         # Assemble context within budget
         context = self._assemble_context(reranked, context_budget)
         
@@ -690,6 +692,38 @@ class PolyphonicRecallEngine:
         entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
         return list(set(entities))
     
+    def _hydrate_result_content(self, results: Dict[str, PolyphonicResult]) -> None:
+        """Attach source content before applying content-based diversity ranking."""
+        if not results:
+            return
+
+        if self.conn is not None:
+            conn = self.conn
+            own_conn = False
+        else:
+            conn = sqlite3.connect(str(self.db_path))
+            conn.row_factory = sqlite3.Row
+            own_conn = True
+
+        try:
+            memory_ids = tuple(results)
+            placeholders = ", ".join("?" for _ in memory_ids)
+            for table in ("working_memory", "episodic_memory"):
+                try:
+                    rows = conn.execute(
+                        f"SELECT id, content FROM {table} WHERE id IN ({placeholders})",
+                        memory_ids,
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    continue
+                for row in rows:
+                    result = results.get(row["id"])
+                    if result is not None and not result.content:
+                        result.content = row["content"] or ""
+        finally:
+            if own_conn:
+                conn.close()
+
     def _combine_voices(self, *voice_results: List[RecallResult]) -> Dict[str, PolyphonicResult]:
         """Combine results from all voices using Reciprocal Rank Fusion.
 

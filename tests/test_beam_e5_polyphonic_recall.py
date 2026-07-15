@@ -175,6 +175,29 @@ class TestE5FeatureFlag:
 
 class TestE5EnginePlumbing:
 
+    def test_diversity_hydrates_source_content(self, temp_db):
+        """Content Jaccard must use DB content, not a missing result attribute."""
+        from mnemosyne.core.polyphonic_recall import (
+            PolyphonicRecallEngine,
+            RecallResult,
+        )
+
+        beam = BeamMemory(session_id="e5-content", db_path=temp_db)
+        first_id = beam.remember("Alice deployed the auth service")
+        second_id = beam.remember("Bob fixed the billing dashboard")
+        engine = PolyphonicRecallEngine(db_path=temp_db, conn=beam.conn)
+        combined = engine._combine_voices([
+            RecallResult(first_id, 0.8, "vector", {}),
+            RecallResult(second_id, 0.7, "vector", {}),
+        ])
+
+        engine._hydrate_result_content(combined)
+        assert combined[first_id].content == "Alice deployed the auth service"
+        assert combined[second_id].content == "Bob fixed the billing dashboard"
+        assert engine._estimate_similarity(
+            combined[first_id], combined[second_id]
+        ) < 0.8
+
     def test_engine_accepts_shared_connection(self, temp_db):
         """[E5 connection reuse] PolyphonicRecallEngine.__init__ must
         accept conn= so BeamMemory can share its thread-local
