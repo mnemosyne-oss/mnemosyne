@@ -198,6 +198,23 @@ class TestE5EnginePlumbing:
             combined[first_id], combined[second_id]
         ) < 0.8
 
+    def test_diversity_handles_unmapped_ids_without_shared_connection(self, temp_db):
+        """Standalone engines keep synthetic IDs harmless during reranking."""
+        from mnemosyne.core.polyphonic_recall import (
+            PolyphonicRecallEngine,
+            RecallResult,
+        )
+
+        engine = PolyphonicRecallEngine(db_path=temp_db)
+        combined = engine._combine_voices([
+            RecallResult("synthetic:missing", 0.8, "graph", {}),
+        ])
+        engine._hydrate_result_content(combined)
+
+        result = combined["synthetic:missing"]
+        assert result.content == ""
+        assert engine._estimate_similarity(result, result) == 0.0
+
     def test_engine_accepts_shared_connection(self, temp_db):
         """[E5 connection reuse] PolyphonicRecallEngine.__init__ must
         accept conn= so BeamMemory can share its thread-local
