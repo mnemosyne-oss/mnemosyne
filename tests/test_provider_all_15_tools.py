@@ -52,7 +52,7 @@ class TestToolRegistration:
     def test_all_tools_registered(self, tmp_path):
         provider = _provider(tmp_path)
         names = _tool_names(provider)
-        assert len(names) == 39, f"Expected 39 tools, got {len(names)}"
+        assert len(names) == 40, f"Expected 40 tools, got {len(names)}"
 
     def test_canonical_tools_present(self, tmp_path):
         provider = _provider(tmp_path)

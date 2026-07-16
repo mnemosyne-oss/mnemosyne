@@ -772,12 +772,34 @@ SYNC_STATUS_SCHEMA = {
     },
 }
 
+APPLY_PENDING_SCHEMA = {
+    "name": "mnemosyne_apply_pending",
+    "description": (
+        "Commit staged pending memory writes to Mnemosyne. "
+        "When memory.write_approval is enabled, calls to mnemosyne_remember "
+        "and mnemosyne_batch are staged to pending/memory/ instead of "
+        "written directly. This tool replays approved pending records "
+        "through the BEAM write path, committing them to the database."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "pending_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of pending record IDs to commit (e.g., ['a1b2c3d4']). From the staged response.",
+            },
+        },
+        "required": ["pending_ids"],
+    },
+}
+
 ALL_TOOL_SCHEMAS = [
     REMEMBER_SCHEMA, RECALL_SCHEMA, SHARED_REMEMBER_SCHEMA, SHARED_RECALL_SCHEMA,
     SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
     INVALIDATE_SCHEMA, VALIDATE_SCHEMA, GET_SCHEMA, TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA,
     TRIPLE_END_SCHEMA,
-    REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA, FORGET_CANONICAL_SCHEMA, MODEL_CARD_SCHEMA,
+    REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA, FORGET_CANONICAL_SCHEMA, APPLY_PENDING_SCHEMA, MODEL_CARD_SCHEMA,
     MODEL_REFRESH_SCHEMA, SCRATCHPAD_WRITE_SCHEMA, SCRATCHPAD_READ_SCHEMA, SCRATCHPAD_CLEAR_SCHEMA,
     EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, BATCH_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
     RECALL_DIAGNOSTICS_SCHEMA,

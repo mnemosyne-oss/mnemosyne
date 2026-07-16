@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import ssl
 import time
 import urllib.error
@@ -256,6 +257,9 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     if _OPENAI_API_KEY:
         headers["Authorization"] = f"Bearer {_OPENAI_API_KEY}"
 
+    def retry_delay(attempt: int) -> float:
+        return 0.5 * (2 ** attempt) + random.uniform(0, 0.5)
+
     for attempt in range(3):
         try:
             req = urllib.request.Request(url, data=payload, headers=headers)
@@ -276,14 +280,14 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
             # existing None degradation path.
             if exc.code == 429 or 500 <= exc.code < 600:
                 if attempt < 2:
-                    time.sleep(2 ** attempt)
+                    time.sleep(retry_delay(attempt))
                     continue
             return None
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
             # Network failures are transient often enough to warrant the same
             # bounded retry policy as HTTP 5xx responses.
             if attempt < 2:
-                time.sleep(2 ** attempt)
+                time.sleep(retry_delay(attempt))
                 continue
             return None
         except Exception as exc:
@@ -293,7 +297,7 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
             if ("429" in message or "too many requests" in message
                     or "rate limit" in message or "rate-limit" in message):
                 if attempt < 2:
-                    time.sleep(2 ** attempt)
+                    time.sleep(retry_delay(attempt))
                     continue
             return None
 
