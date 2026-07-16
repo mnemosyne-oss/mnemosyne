@@ -25,6 +25,40 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
+
+import uuid
+
+
+# Write-approval gate: when memory.write_approval is enabled, writes are
+# staged to pending/memory/<id>.json instead of committed directly.
+def _write_approval_enabled() -> bool:
+    try:
+        from hermes_cli.config import load_config, cfg_get
+        cfg = load_config()
+        raw = cfg_get(cfg, "memory", "write_approval", default=False)
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"on", "true", "yes", "1", "approve", "enabled"}
+        return False
+    except Exception:
+        return False
+
+
+def _stage_pending_write(payload: Dict[str, Any]) -> str:
+    from hermes_constants import get_hermes_home
+    pid = uuid.uuid4().hex[:8]
+    pending_dir = get_hermes_home() / "pending" / "memory"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    record = {
+        "id": pid, "subsystem": "memory", "provider": "mnemosyne",
+        "tool": payload.get("tool", "mnemosyne_remember"),
+        "payload": payload,
+        "summary": payload.get("content", "")[:200],
+        "created_at": time.time(),
+    }
+    (pending_dir / f"{pid}.json").write_text(json.dumps(record, indent=2))
+    return pid
 from datetime import datetime, timedelta
 
 # Mnemosyne core is installed via pip (mnemosyne-memory>=3.11.1 dependency),
@@ -1440,6 +1474,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 return self._handle_recall_canonical(args)
             elif tool_name == "mnemosyne_forget_canonical":
                 return self._handle_forget_canonical(args)
+            elif tool_name == "mnemosyne_apply_pending":
+                return self._handle_apply_pending(args)
             elif tool_name == "mnemosyne_model_card":
                 return self._handle_model_card(args)
             elif tool_name == "mnemosyne_model_refresh":
@@ -1525,6 +1561,24 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         )
         if not content:
             return json.dumps({"error": "content is required"})
+
+        # Write-approval gate: stage to pending when enabled.
+        if _write_approval_enabled():
+            pid = _stage_pending_write({
+                "tool": "mnemosyne_remember",
+                "content": content, "importance": importance,
+                "source": source, "scope": scope,
+                "valid_until": valid_until,
+                "extract_entities": extract_entities,
+                "extract": extract, "metadata": metadata,
+                "veracity": veracity,
+            })
+            return json.dumps({
+                "status": "staged", "pending_id": pid,
+                "content_preview": content[:100],
+                "message": "Write staged for approval. Use mnemosyne_apply_pending to commit.",
+            })
+
         memory_id = self._beam.remember(
             content=content,
             importance=importance,
@@ -2087,6 +2141,45 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         retired = store.forget(owner_id, category, name)
         return json.dumps({"retired": retired, "owner_id": owner_id,
                            "category": category, "name": name})
+
+    def _handle_apply_pending(self, args: Dict[str, Any]) -> str:
+        from hermes_constants import get_hermes_home
+        from mnemosyne.core.veracity_consolidation import clamp_veracity
+        pending_ids = args.get("pending_ids") or []
+        if isinstance(pending_ids, str):
+            pending_ids = [pid.strip() for pid in pending_ids.split(",") if pid.strip()]
+        pending_dir = get_hermes_home() / "pending" / "memory"
+        applied, failed = [], []
+        for pid in pending_ids:
+            rp = pending_dir / f"{pid}.json"
+            if not rp.exists():
+                failed.append({"id": pid, "error": "not found"})
+                continue
+            try:
+                record = json.loads(rp.read_text())
+                p = record.get("payload", {})
+                c = p.get("content", "")
+                if not c:
+                    failed.append({"id": pid, "error": "empty content"})
+                    rp.unlink(missing_ok=True)
+                    continue
+                mid = self._beam.remember(
+                    content=c,
+                    importance=float(p.get("importance", 0.5)),
+                    source=p.get("source", "user"),
+                    scope=p.get("scope", self._default_scope),
+                    valid_until=p.get("valid_until"),
+                    extract_entities=bool(p.get("extract_entities", False)),
+                    extract=bool(p.get("extract", False)),
+                    metadata=p.get("metadata"),
+                    veracity=clamp_veracity(p.get("veracity"), context="apply_pending"),
+                )
+                rp.unlink(missing_ok=True)
+                applied.append({"id": pid, "memory_id": mid})
+            except Exception as exc:
+                failed.append({"id": pid, "error": str(exc)})
+        return json.dumps({"applied": applied, "failed": failed,
+                           "applied_count": len(applied), "failed_count": len(failed)})
 
     def _handle_model_card(self, args: Dict[str, Any]) -> str:
         category = (args.get("category") or "").strip()
