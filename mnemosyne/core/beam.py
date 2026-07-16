@@ -487,7 +487,7 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
     return _thread_local.conn
 
 
-def _close_beam_connection() -> None:
+def _close_beam_connection(expected_conn=None, db_path=None) -> None:
     """Close the thread-local BEAM connection and checkpoint the WAL.
 
     Thread-local connections under WAL mode can block checkpoints
@@ -495,7 +495,13 @@ def _close_beam_connection() -> None:
     and running ``PRAGMA wal_checkpoint(TRUNCATE)`` prevents the
     ``database is locked`` cascade documented in #382.
     """
-    if hasattr(_thread_local, 'conn') and _thread_local.conn is not None:
+    if not hasattr(_thread_local, "conn") or _thread_local.conn is None:
+        return
+    if expected_conn is not None and _thread_local.conn is not expected_conn:
+        return
+    if db_path is not None and getattr(_thread_local, "db_path", None) != str(db_path):
+        return
+    if _thread_local.conn is not None:
         try:
             _thread_local.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:

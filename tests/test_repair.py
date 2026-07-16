@@ -17,6 +17,12 @@ from mnemosyne.doctor import build_doctor_report, doctor_report_payload
 from mnemosyne.repair import RepairError, run_repair
 
 
+pytestmark = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="repair hardening is Linux-only and relies on /proc",
+)
+
+
 ROOT = Path(__file__).resolve().parent.parent
 RAW_SECRET = "repair-output-private-secret-79d1"  # nosec - redaction fixture
 RAW_CONTENT = "Only the hidden cobalt-archive content may contain this phrase."

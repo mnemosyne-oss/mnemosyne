@@ -59,7 +59,18 @@ def _default_db_path() -> Path:
 def _get_connection(db_path = None) -> sqlite3.Connection:
     """Get thread-local database connection"""
     path = Path(db_path) if db_path else _default_db_path()
-    if not hasattr(_thread_local, 'conn') or _thread_local.conn is None or getattr(_thread_local, 'db_path', None) != str(path):
+    needs_reconnect = (
+        not hasattr(_thread_local, "conn")
+        or _thread_local.conn is None
+        or getattr(_thread_local, "db_path", None) != str(path)
+    )
+    if not needs_reconnect:
+        try:
+            _thread_local.conn.execute("SELECT 1")
+        except sqlite3.ProgrammingError:
+            needs_reconnect = True
+
+    if needs_reconnect:
         path.parent.mkdir(parents=True, exist_ok=True)
         _thread_local.conn = sqlite3.connect(str(path), check_same_thread=False)
         _thread_local.conn.row_factory = sqlite3.Row
@@ -77,7 +88,7 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
     return _thread_local.conn
 
 
-def _close_connection() -> None:
+def _close_connection(expected_conn=None, db_path=None) -> None:
     """Close the thread-local connection and checkpoint the WAL.
 
     Thread-local connections under WAL mode can block checkpoints
@@ -85,7 +96,13 @@ def _close_connection() -> None:
     and running ``PRAGMA wal_checkpoint(TRUNCATE)`` prevents the
     ``database is locked`` cascade documented in #382.
     """
-    if hasattr(_thread_local, 'conn') and _thread_local.conn is not None:
+    if not hasattr(_thread_local, "conn") or _thread_local.conn is None:
+        return
+    if expected_conn is not None and _thread_local.conn is not expected_conn:
+        return
+    if db_path is not None and getattr(_thread_local, "db_path", None) != str(db_path):
+        return
+    if _thread_local.conn is not None:
         try:
             _thread_local.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:
@@ -201,6 +218,19 @@ class Mnemosyne:
 
         self._closed = False
 
+        # Phase 8: Streaming + Patterns + Plugins (lazy init)
+        self._stream = None
+        self._compressor = None
+        self._pattern_detector = None
+        self._delta_sync = None
+        self._plugin_manager = None
+
+        # Create beam with streaming emitter wired
+        self.beam = BeamMemory(session_id=self.session_id, db_path=self.db_path,
+                               author_id=self.author_id, author_type=self.author_type,
+                               channel_id=self.channel_id,
+                               event_emitter=self._stream_emit)
+
     def close(self) -> None:
         """Close the database connection and checkpoint the WAL.
 
@@ -210,9 +240,9 @@ class Mnemosyne:
         if self._closed:
             return
         self._closed = True
-        _close_connection()
+        _close_connection(self.conn, self.db_path)
         from mnemosyne.core.beam import _close_beam_connection
-        _close_beam_connection()
+        _close_beam_connection(self.beam.conn, self.beam.db_path)
 
     def __del__(self):
         """Best-effort cleanup on garbage collection."""
@@ -220,19 +250,6 @@ class Mnemosyne:
             self.close()
         except Exception:
             pass
-
-        # Phase 8: Streaming + Patterns + Plugins (lazy init)
-        self._stream = None
-        self._compressor = None
-        self._pattern_detector = None
-        self._delta_sync = None
-        self._plugin_manager = None
-
-        # Create beam with streaming emitter wired
-        self.beam = BeamMemory(session_id=session_id, db_path=self.db_path,
-                               author_id=author_id, author_type=author_type,
-                               channel_id=channel_id,
-                               event_emitter=self._stream_emit)
 
     # ─── Phase 8: Streaming ─────────────────────────────────────────
 

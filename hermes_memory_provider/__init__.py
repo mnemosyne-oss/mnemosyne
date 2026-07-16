@@ -805,6 +805,24 @@ RECALL_CANONICAL_SCHEMA = {
     },
 }
 
+FORGET_CANONICAL_SCHEMA = {
+    "name": "mnemosyne_forget_canonical",
+    "description": (
+        "Retire a CANONICAL self-fact slot for the current profile. "
+        "Stamps valid_until on the current row, preserving it as history. "
+        "Returns whether a current row was retired. Nothing is deleted. "
+        "Use this to remove a canonical fact (e.g. a stale preference or identity)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "category": {"type": "string", "description": "Slot group, e.g. 'identity', 'voice', 'preference'"},
+            "name": {"type": "string", "description": "Slot key within the category, e.g. 'name', 'pronouns'"},
+        },
+        "required": ["category", "name"],
+    },
+}
+
 MODEL_CARD_SCHEMA = {
     "name": "mnemosyne_model_card",
     "description": (
@@ -1171,7 +1189,7 @@ ALL_TOOL_SCHEMAS = [
     SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
     INVALIDATE_SCHEMA, VALIDATE_SCHEMA, GET_SCHEMA, TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA,
     TRIPLE_END_SCHEMA,
-    REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA, MODEL_CARD_SCHEMA,
+    REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA, FORGET_CANONICAL_SCHEMA, MODEL_CARD_SCHEMA,
     MODEL_REFRESH_SCHEMA, SCRATCHPAD_WRITE_SCHEMA, SCRATCHPAD_READ_SCHEMA, SCRATCHPAD_CLEAR_SCHEMA,
     EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, BATCH_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
     RECALL_DIAGNOSTICS_SCHEMA, TASK_PROGRESS_SCHEMA,
@@ -1257,6 +1275,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     _VALID_SYNC_ROLES: frozenset = frozenset({"user", "assistant"})
 
     def __init__(self):
+        # Keep the wrapper alive whenever the provider adopts its BeamMemory.
+        # Mnemosyne owns the thread-local connections, so allowing this local
+        # wrapper to be garbage-collected would close the provider's beam.
+        self._memory: Optional[Any] = None
         self._beam: Optional[Any] = None
         self._surface_beam: Optional[Any] = None
         self._shared_surface_bank = "surface"
@@ -1768,6 +1790,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # _beam active, causing system_prompt_block() to report "Active"
         # and handle_tool_call() to silently write into the wrong session.
         # _init_error reset complements this for the failure-recovery case.
+        if self._memory is not None:
+            try:
+                self._memory.close()
+            except Exception:
+                logger.debug("Mnemosyne: could not close prior wrapper", exc_info=True)
+        self._memory = None
         self._beam = None
         self._surface_beam = None
         self._init_error = None
@@ -1823,6 +1851,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     bank=bank_name,
                     channel_id=kwargs.get("channel_id", ""),
                 )
+                self._memory = mem
                 self._beam = mem.beam
                 logger.info(
                     "Mnemosyne initialized (profile isolation ON): session=%s, bank=%s, db=%s",
@@ -2409,6 +2438,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 return self._handle_remember_canonical(args)
             elif tool_name == "mnemosyne_recall_canonical":
                 return self._handle_recall_canonical(args)
+            elif tool_name == "mnemosyne_forget_canonical":
+                return self._handle_forget_canonical(args)
             elif tool_name == "mnemosyne_model_card":
                 return self._handle_model_card(args)
             elif tool_name == "mnemosyne_model_refresh":
@@ -3019,6 +3050,21 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                            "category": category or None,
                            "count": len(results), "results": results})
 
+    def _handle_forget_canonical(self, args: Dict[str, Any]) -> str:
+        category = (args.get("category") or "").strip()
+        name = (args.get("name") or "").strip()
+        if not category or not name:
+            return json.dumps({"error": "category and name are required"})
+        owner_id = self._canonical_owner()
+        store = getattr(self._beam, "canonical", None)
+        if store is None:
+            from mnemosyne.core.canonical import CanonicalStore
+            store = CanonicalStore(db_path=self._beam.db_path, conn=self._beam.conn)
+            self._beam.canonical = store
+        retired = store.forget(owner_id, category, name)
+        return json.dumps({"retired": retired, "owner_id": owner_id,
+                           "category": category, "name": name})
+
     def _handle_model_card(self, args: Dict[str, Any]) -> str:
         category = (args.get("category") or "").strip()
         if not category:
@@ -3487,6 +3533,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 unregister_hermes_host_llm()
             except Exception as exc:
                 logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
+        if self._memory is not None:
+            try:
+                self._memory.close()
+            except Exception:
+                logger.debug("Mnemosyne: could not close wrapper", exc_info=True)
+        self._memory = None
         self._beam = None
 
         # C13: decrement this instance's contribution to the module-level
