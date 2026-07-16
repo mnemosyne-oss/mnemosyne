@@ -77,45 +77,6 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
     return _thread_local.conn
 
 
-def _close_connection() -> None:
-    """Close the thread-local connection and checkpoint the WAL.
-
-    Thread-local connections under WAL mode can block checkpoints
-    after the owning thread exits.  Explicitly closing the connection
-    and running ``PRAGMA wal_checkpoint(TRUNCATE)`` prevents the
-    ``database is locked`` cascade documented in #382.
-    """
-    if hasattr(_thread_local, 'conn') and _thread_local.conn is not None:
-        try:
-            _thread_local.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception:
-            pass
-        try:
-            _thread_local.conn.close()
-        except Exception:
-            pass
-        _thread_local.conn = None
-        _thread_local.db_path = None
-
-
-def wal_checkpoint(db_path=None) -> dict:
-    """Run a WAL checkpoint on the thread-local or specified connection.
-
-    Returns a dict with ``busy``, ``log``, ``checkpointed`` keys so
-    callers can monitor whether the checkpoint succeeded.
-    """
-    conn = _get_connection(db_path) if db_path else (
-        _thread_local.conn if hasattr(_thread_local, 'conn') and _thread_local.conn is not None
-        else _get_connection()
-    )
-    try:
-        row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-        return {"busy": row[0], "log": row[1], "checkpointed": row[2]}
-    except Exception as exc:
-        logger.warning("wal_checkpoint failed: %s", exc)
-        return {"busy": -1, "log": -1, "checkpointed": -1}
-
-
 def init_db(db_path: Path = None):
     """Initialize legacy database schema + BEAM schema"""
     conn = _get_connection(db_path)
@@ -198,28 +159,6 @@ class Mnemosyne:
 
         self.conn = _get_connection(self.db_path)
         init_db(self.db_path)
-
-        self._closed = False
-
-    def close(self) -> None:
-        """Close the database connection and checkpoint the WAL.
-
-        Must be called before the owning thread exits to prevent
-        WAL checkpoint blocking (#382).
-        """
-        if self._closed:
-            return
-        self._closed = True
-        _close_connection()
-        from mnemosyne.core.beam import _close_beam_connection
-        _close_beam_connection()
-
-    def __del__(self):
-        """Best-effort cleanup on garbage collection."""
-        try:
-            self.close()
-        except Exception:
-            pass
 
         # Phase 8: Streaming + Patterns + Plugins (lazy init)
         self._stream = None

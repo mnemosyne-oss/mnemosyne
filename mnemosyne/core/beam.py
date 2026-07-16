@@ -487,27 +487,6 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
     return _thread_local.conn
 
 
-def _close_beam_connection() -> None:
-    """Close the thread-local BEAM connection and checkpoint the WAL.
-
-    Thread-local connections under WAL mode can block checkpoints
-    after the owning thread exits.  Explicitly closing the connection
-    and running ``PRAGMA wal_checkpoint(TRUNCATE)`` prevents the
-    ``database is locked`` cascade documented in #382.
-    """
-    if hasattr(_thread_local, 'conn') and _thread_local.conn is not None:
-        try:
-            _thread_local.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception:
-            pass
-        try:
-            _thread_local.conn.close()
-        except Exception:
-            pass
-        _thread_local.conn = None
-        _thread_local.db_path = None
-
-
 def _detect_vec_type(conn: sqlite3.Connection) -> str:
     """
     Detect whether sqlite-vec supports int8/bit.
