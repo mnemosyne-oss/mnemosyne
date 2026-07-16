@@ -196,7 +196,7 @@ class TestE5EnginePlumbing:
         assert combined[second_id].content == "Bob fixed the billing dashboard"
         assert engine._estimate_similarity(
             combined[first_id], combined[second_id]
-        ) < 0.8
+        ) == pytest.approx(1 / 9)
 
     def test_diversity_handles_unmapped_ids_without_shared_connection(self, temp_db):
         """Standalone engines keep synthetic IDs harmless during reranking."""
