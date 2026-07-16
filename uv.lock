@@ -996,6 +996,9 @@ wheels = [
 [[package]]
 name = "mnemosyne-memory"
 source = { editable = "." }
+dependencies = [
+    { name = "pyyaml" },
+]
 
 [package.optional-dependencies]
 all = [
@@ -1054,6 +1057,7 @@ requires-dist = [
     { name = "openclaw", marker = "python_full_version >= '3.10' and extra == 'openclaw'", specifier = ">=0.1.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "sqlite-vec", marker = "extra == 'all'", specifier = ">=0.1.0" },
     { name = "sqlite-vec", marker = "extra == 'embeddings'", specifier = ">=0.1.0" },
     { name = "twine", marker = "extra == 'dev'" },

@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 import os
 import ssl
+import time
+import urllib.error
 import urllib.request
 from typing import List, Optional
 from functools import lru_cache
@@ -268,11 +270,31 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
             embeddings = [item["embedding"] for item in data["data"]]
             _API_CALL_COUNT += 1
             return np.array(embeddings, dtype=np.float32)
-        except Exception as e:
-            if "429" in str(e) or "rate" in str(e).lower():
-                import time
+        except urllib.error.HTTPError as exc:
+            # Retry rate limits and transient server failures, but surface
+            # permanent client/authentication failures to callers as the
+            # existing None degradation path.
+            if exc.code == 429 or 500 <= exc.code < 600:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+            return None
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+            # Network failures are transient often enough to warrant the same
+            # bounded retry policy as HTTP 5xx responses.
+            if attempt < 2:
                 time.sleep(2 ** attempt)
                 continue
+            return None
+        except Exception as exc:
+            # Preserve compatibility with mocked/custom transports that expose
+            # rate-limit failures only through their message text.
+            message = str(exc).lower()
+            if ("429" in message or "too many requests" in message
+                    or "rate limit" in message or "rate-limit" in message):
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
             return None
 
     return None

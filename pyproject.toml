@@ -12,6 +12,9 @@ requires-python = ">=3.10"
 authors = [
     {name = "Abdias J", email = "1641797+AxDSan@users.noreply.github.com"},
 ]
+dependencies = [
+    "PyYAML>=6.0",
+]
 keywords = [
     "ai",
     "memory",

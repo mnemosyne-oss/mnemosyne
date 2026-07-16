@@ -3,7 +3,8 @@ Mnemosyne Diagnostics
 =====================
 PII-safe debug logging for troubleshooting installation and runtime issues.
 
-Logs to ~/.hermes/mnemosyne/logs/diagnose_YYYY-MM-DD_HHMMSS.jsonl
+Logs to $HERMES_HOME/mnemosyne/logs/diagnose_YYYY-MM-DD_HHMMSS.jsonl,
+or ~/.hermes/mnemosyne/logs when HERMES_HOME is unset.
 Never includes memory content, user queries, or API keys.
 
 Supports --fix mode: auto-installs missing dependencies.
@@ -21,7 +22,14 @@ from typing import Any, Dict, List
 
 from mnemosyne.runtime_diagnostics import collect_runtime_diagnostics
 
-LOG_DIR = Path.home() / ".hermes" / "mnemosyne" / "logs"
+def _default_log_dir() -> Path:
+    """Resolve diagnostics beside the active Hermes home."""
+    hermes_home = os.environ.get("HERMES_HOME")
+    base = Path(hermes_home).expanduser() if hermes_home else Path.home() / ".hermes"
+    return base / "mnemosyne" / "logs"
+
+
+LOG_DIR = _default_log_dir()
 
 # Map of missing dependency checks to pip install commands
 FIX_MAP = {
