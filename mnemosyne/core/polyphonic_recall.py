@@ -807,8 +807,8 @@ class PolyphonicRecallEngine:
         dominates the candidate set, causing MMR diversity reranking to
         discard all but one result (#389).
         """
-        content_a = (a.metadata.get("content") or "").lower().split()
-        content_b = (b.metadata.get("content") or "").lower().split()
+        content_a = (a.content or a.metadata.get("content") or "").lower().split()
+        content_b = (b.content or b.metadata.get("content") or "").lower().split()
 
         if not content_a or not content_b:
             return 0.0
