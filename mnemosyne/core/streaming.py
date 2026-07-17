@@ -15,11 +15,10 @@ Delta sync:
 """
 
 import json
-import hashlib
 import logging
 import threading
 from datetime import datetime
-from typing import List, Dict, Optional, Any, Callable, Iterator, Union
+from typing import List, Dict, Optional, Any, Callable, Iterator
 from dataclasses import dataclass, field, asdict
 from enum import Enum, auto
 from pathlib import Path

@@ -25,7 +25,7 @@ import os
 logger = logging.getLogger(__name__)
 
 from mnemosyne.core import embeddings as _embeddings
-from mnemosyne.core.beam import BeamMemory, init_beam, _get_connection as _beam_get_connection
+from mnemosyne.core.beam import BeamMemory, init_beam
 _thread_local = threading.local()
 
 # Default data directory
@@ -99,14 +99,15 @@ def init_db(db_path: Path = None):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON memories(timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_source ON memories(source)")
 
-    # Legacy embeddings table
+    # Legacy embeddings table — no FK to memories(id) (see beam.py DDL).
+    # The FK was removed because working_memory ids (not memories ids)
+    # are stored here, making the constraint invalid. See issue #451.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS memory_embeddings (
             memory_id TEXT PRIMARY KEY,
             embedding_json TEXT NOT NULL,
             model TEXT DEFAULT 'bge-small-en-v1.5',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
@@ -362,14 +363,19 @@ class Mnemosyne:
 
         _content = sanitized_content if blob_meta else content
 
-        # Temporal tagging pass
+        # Temporal tagging pass — store annotations in metadata, not content.
+        # Appending [DATES:]/[DURATIONS:] to the content field mutates the
+        # caller's stored text, surprising workflows that expect verbatim
+        # reproduction (#387).
         import re
         dates = re.findall(r'\b\d{4}-\d{2}-\d{2}\b', _content)
-        if dates:
-            _content = f"{_content} [DATES: {', '.join(dates)}]"
         durations = re.findall(r'\b\d+\s(?:days|weeks|months|years)\b', _content, re.IGNORECASE)
-        if durations:
-            _content = f"{_content} [DURATIONS: {', '.join(durations)}]"
+        if dates or durations:
+            metadata = (metadata or {}).copy()
+            if dates:
+                metadata["_dates"] = dates
+            if durations:
+                metadata["_durations"] = durations
 
         memory_id = self.beam.remember(
             _content, source=source,

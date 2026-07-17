@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import ssl
+import time
+import urllib.error
 import urllib.request
 from typing import List, Optional
 from functools import lru_cache
@@ -67,6 +70,28 @@ _OPENAI_BASE_URL = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openro
 _DEFAULT_MODEL = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 _embedding_model = None
 _API_CALL_COUNT = 0
+
+# (1) Prefix support — read at call time so env changes and test fixtures take effect
+# without a module reload. The _PREFIXES_LOGGED guard suppresses log spam.
+_PREFIXES_LOGGED = False
+
+
+def _get_prefix(kind: str) -> str:
+    """Model prompt prefixes (e.g. E5 'query: '/'passage: ', EmbeddingGemma retrieval
+    prompts). Applied VERBATIM — no trimming, no separator magic — because trailing
+    whitespace is part of the trained prompt for several models."""
+    var = ("MNEMOSYNE_EMBEDDING_QUERY_PREFIX" if kind == "query"
+           else "MNEMOSYNE_EMBEDDING_DOC_PREFIX")
+    prefix = os.environ.get(var, "")
+    global _PREFIXES_LOGGED
+    if prefix and not _PREFIXES_LOGGED:
+        import logging
+        logging.getLogger(__name__).info(
+            "embedding prefixes active: query=%r doc=%r",
+            os.environ.get("MNEMOSYNE_EMBEDDING_QUERY_PREFIX", ""),
+            os.environ.get("MNEMOSYNE_EMBEDDING_DOC_PREFIX", ""))
+        _PREFIXES_LOGGED = True
+    return prefix
 
 
 def _is_disabled() -> bool:
@@ -153,6 +178,23 @@ def _get_embedding_dim(model_name: str) -> int:
     return dims.get(model_name, 384)
 
 
+def _embedding_threads() -> int:
+    """Return the thread count for the onnxruntime embedding model.
+
+    Defaults to os.cpu_count() or 4.  Explicitly passing a thread count
+    prevents onnxruntime from calling pthread_setaffinity_np(), which
+    fails with EINVAL in unprivileged LXC containers (#453).
+    The MNEMOSYNE_EMBEDDING_THREADS env var overrides the default.
+    """
+    try:
+        from_env = os.environ.get("MNEMOSYNE_EMBEDDING_THREADS")
+        if from_env is not None:
+            return int(from_env)
+    except (ValueError, TypeError):
+        pass
+    return max(int(os.cpu_count() or 4), 1)
+
+
 def _get_model():
     """Lazy-load the embedding model (local fastembed).
 
@@ -176,6 +218,7 @@ def _get_model():
                 _embedding_model = TextEmbedding(
                     model_name=_DEFAULT_MODEL,
                     cache_dir=_FASTEMBED_CACHE_DIR,
+                    threads=_embedding_threads(),
                 )
                 return _embedding_model
             except Exception as exc:  # noqa: BLE001
@@ -232,6 +275,9 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     if _OPENAI_API_KEY:
         headers["Authorization"] = f"Bearer {_OPENAI_API_KEY}"
 
+    def retry_delay(attempt: int) -> float:
+        return 0.5 * (2 ** attempt) + random.uniform(0, 0.5)
+
     for attempt in range(3):
         try:
             req = urllib.request.Request(url, data=payload, headers=headers)
@@ -246,11 +292,31 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
             embeddings = [item["embedding"] for item in data["data"]]
             _API_CALL_COUNT += 1
             return np.array(embeddings, dtype=np.float32)
-        except Exception as e:
-            if "429" in str(e) or "rate" in str(e).lower():
-                import time
-                time.sleep(2 ** attempt)
+        except urllib.error.HTTPError as exc:
+            # Retry rate limits and transient server failures, but surface
+            # permanent client/authentication failures to callers as the
+            # existing None degradation path.
+            if exc.code == 429 or 500 <= exc.code < 600:
+                if attempt < 2:
+                    time.sleep(retry_delay(attempt))
+                    continue
+            return None
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+            # Network failures are transient often enough to warrant the same
+            # bounded retry policy as HTTP 5xx responses.
+            if attempt < 2:
+                time.sleep(retry_delay(attempt))
                 continue
+            return None
+        except Exception as exc:
+            # Preserve compatibility with mocked/custom transports that expose
+            # rate-limit failures only through their message text.
+            message = str(exc).lower()
+            if ("429" in message or "too many requests" in message
+                    or "rate limit" in message or "rate-limit" in message):
+                if attempt < 2:
+                    time.sleep(retry_delay(attempt))
+                    continue
             return None
 
     return None
@@ -274,44 +340,47 @@ def available_api() -> bool:
     return bool(_OPENAI_API_KEY)
 
 
-@lru_cache(maxsize=512)
+# (2) embed_query: apply query prefix verbatim, then delegate to a cached inner
+#     function keyed on the PREFIXED text. Keying on prefixed text (rather than raw)
+#     prevents stale vectors if the prefix env var changes within a process.
 def embed_query(text: str) -> Optional[np.ndarray]:
     """Encode a single query text into a dense vector."""
     if not text:
         return None
+    return _embed_query_cached(_get_prefix("query") + text)
 
+
+@lru_cache(maxsize=512)
+def _embed_query_cached(prefixed: str) -> Optional[np.ndarray]:
     if _is_api_model(_DEFAULT_MODEL):
-        result = _embed_api([text])
+        result = _embed_api([prefixed])
         return result[0] if result is not None else None
 
     model = _get_model()
     if model is None or model == "api":
         return None
-    vectors = list(model.embed([text]))
+    vectors = list(model.embed([prefixed]))
     if not vectors:
         return None
     return vectors[0].astype(np.float32)
 
 
+# (3) embed: apply DOC prefix to every text. Removed the single-text delegation to
+#     embed_query — that path stamped the query prefix onto stored documents.
 def embed(texts: List[str]) -> Optional[np.ndarray]:
-    """Encode texts into dense vectors."""
+    """Encode texts (documents) into dense vectors."""
     if not texts:
         return None
+    doc_prefix = _get_prefix("doc")
+    prefixed = [doc_prefix + t for t in texts]
 
     if _is_api_model(_DEFAULT_MODEL):
-        return _embed_api(texts)
-
-    # Use cached single-query path for common case of 1 text
-    if len(texts) == 1:
-        v = embed_query(texts[0])
-        if v is None:
-            return None
-        return np.stack([v])
+        return _embed_api(prefixed)
 
     model = _get_model()
     if model is None or model == "api":
         return None
-    vectors = list(model.embed(texts))
+    vectors = list(model.embed(prefixed))
     return np.stack(vectors).astype(np.float32)
 
 

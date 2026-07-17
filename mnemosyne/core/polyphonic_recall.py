@@ -31,7 +31,7 @@ import json
 import os
 import sqlite3
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,7 +40,6 @@ try:
 except ImportError:  # numpy is required by other voices too; guard for parity
     np = None
 
-from mnemosyne.core.typed_memory import classify_memory, MemoryType, get_type_priority
 from mnemosyne.core.episodic_graph import EpisodicGraph
 from mnemosyne.core.veracity_consolidation import (
     VeracityConsolidator,
@@ -83,6 +82,7 @@ class PolyphonicResult:
     combined_score: float
     voice_scores: Dict[str, float]
     metadata: Dict
+    content: str = ""
 
 
 class PolyphonicRecallEngine:
@@ -153,13 +153,14 @@ class PolyphonicRecallEngine:
         temporal_results = self._temporal_voice(query)
         
         # Combine results
-        all_results = self._combine_voices(
+        combined = self._combine_voices(
             vector_results, graph_results, fact_results, temporal_results
         )
-        
-        # Re-rank with diversity
-        reranked = self._diversity_rerank(all_results, top_k)
-        
+        self._hydrate_result_content(combined)
+
+        # Diversity re-rank
+        reranked = self._diversity_rerank(combined, top_k)
+
         # Assemble context within budget
         context = self._assemble_context(reranked, context_budget)
         
@@ -373,7 +374,7 @@ class PolyphonicRecallEngine:
                         # caught the silent EM-starvation regression.
                         em_consumed_via_vec_episodes = bool(em_rows_via_vec)
             except (ImportError, AttributeError,
-                    sqlite3.Error, ValueError, TypeError) as exc:
+                    sqlite3.Error, ValueError, TypeError):
                 # Broader catch than the original tuple -- partial
                 # imports can surface as AttributeError, corrupt DB
                 # state as sqlite3.DatabaseError (other Error
@@ -691,6 +692,38 @@ class PolyphonicRecallEngine:
         entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
         return list(set(entities))
     
+    def _hydrate_result_content(self, results: Dict[str, PolyphonicResult]) -> None:
+        """Attach source content before applying content-based diversity ranking."""
+        if not results:
+            return
+
+        if self.conn is not None:
+            conn = self.conn
+            own_conn = False
+        else:
+            conn = sqlite3.connect(str(self.db_path))
+            conn.row_factory = sqlite3.Row
+            own_conn = True
+
+        try:
+            memory_ids = tuple(results)
+            placeholders = ", ".join("?" for _ in memory_ids)
+            for table in ("working_memory", "episodic_memory"):
+                try:
+                    rows = conn.execute(
+                        f"SELECT id, content FROM {table} WHERE id IN ({placeholders})",
+                        memory_ids,
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    continue
+                for row in rows:
+                    result = results.get(row["id"])
+                    if result is not None and not result.content:
+                        result.content = row["content"] or ""
+        finally:
+            if own_conn:
+                conn.close()
+
     def _combine_voices(self, *voice_results: List[RecallResult]) -> Dict[str, PolyphonicResult]:
         """Combine results from all voices using Reciprocal Rank Fusion.
 
@@ -767,18 +800,25 @@ class PolyphonicRecallEngine:
         return selected
     
     def _estimate_similarity(self, a: PolyphonicResult, b: PolyphonicResult) -> float:
-        """Estimate similarity between two results."""
-        # Simple Jaccard-like similarity on voice scores
-        voices_a = set(a.voice_scores.keys())
-        voices_b = set(b.voice_scores.keys())
-        
-        if not voices_a or not voices_b:
+        """Estimate similarity between two results using content overlap.
+
+        Uses word-level Jaccard on the content field instead of voice-name
+        Jaccard.  Voice-name Jaccard collapses to 1.0 when a single voice
+        dominates the candidate set, causing MMR diversity reranking to
+        discard all but one result (#389).
+        """
+        content_a = (a.content or a.metadata.get("content") or "").lower().split()
+        content_b = (b.content or b.metadata.get("content") or "").lower().split()
+
+        if not content_a or not content_b:
             return 0.0
-        
-        intersection = voices_a & voices_b
-        union = voices_a | voices_b
-        
-        return len(intersection) / len(union)
+
+        set_a = set(content_a)
+        set_b = set(content_b)
+        intersection = set_a & set_b
+        union = set_a | set_b
+
+        return len(intersection) / len(union) if union else 0.0
     
     def _assemble_context(self, results: List[PolyphonicResult],
                          budget: int) -> List[PolyphonicResult]:

@@ -308,6 +308,55 @@ class TestTemplateSpecific:
 # ---------------------------------------------------------------------------
 
 class TestConfigReader:
+    def test_auto_seed_persists_provider_safety_defaults(self, tmp_path, monkeypatch):
+        """The actual generated YAML must preserve provider boundaries."""
+        import yaml
+
+        monkeypatch.delenv("MNEMOSYNE_SYNC_ROLES", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_SKIP_CONTEXTS", raising=False)
+        config_path = tmp_path / "config.yaml"
+        MnemosyneConfig(config_path=config_path)
+        seeded = yaml.safe_load(config_path.read_text())
+        assert seeded["sync_roles"] == "user"
+        assert seeded["skip_contexts"] == (
+            "cron,flush,subagent,background,skill_loop"
+        )
+
+    def test_auto_seeded_explicit_env_values_are_preserved(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Legacy seed provenance is ambiguous, so explicit env values survive."""
+        import yaml
+
+        monkeypatch.setenv("MNEMOSYNE_SYNC_ROLES", "user,assistant")
+        monkeypatch.setenv("MNEMOSYNE_SKIP_CONTEXTS", "")
+        config_path = tmp_path / "config.yaml"
+        MnemosyneConfig(config_path=config_path)
+        seeded_text = config_path.read_text()
+
+        MnemosyneConfig(config_path=config_path)
+        configured = yaml.safe_load(config_path.read_text())
+        assert config_path.read_text() == seeded_text
+        assert configured["sync_roles"] == "user,assistant"
+        assert configured["skip_contexts"] == ""
+        assert "were not rewritten" in caplog.text
+        assert "mnemosyne config set sync_roles user" in caplog.text
+
+    def test_manual_legacy_values_are_preserved(self, tmp_path, caplog):
+        """A manually created config remains an explicit opt-in."""
+        import yaml
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "sync_roles: user,assistant\n"
+            "skip_contexts: ''\n"
+        )
+        MnemosyneConfig(config_path=config_path)
+        configured = yaml.safe_load(config_path.read_text())
+        assert configured["sync_roles"] == "user,assistant"
+        assert configured["skip_contexts"] == ""
+        assert "Legacy provider defaults detected" not in caplog.text
+
     def test_env_var_fallback(self, temp_config, monkeypatch):
         """When no YAML, env var is used."""
         monkeypatch.setenv("MNEMOSYNE_WM_MAX_ITEMS", "9999")

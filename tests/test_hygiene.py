@@ -17,17 +17,27 @@ import pytest
 
 from mnemosyne.cli import cmd_hygiene
 from mnemosyne.core.beam import BeamMemory, init_beam
+from mnemosyne.core.filters import SECRET_LABELED_PATTERNS
 from mnemosyne.core.hygiene import (
     AuditReport,
     CleanResult,
     NoiseCandidate,
     audit_noise,
     clean_noise,
+    doctor_hygiene_summary,
     hygiene_status,
     noise_summary,
     restore_archived,
     _score_noise,
     _suggest_action,
+)
+from mnemosyne.doctor import (
+    DoctorReport,
+    HygieneSummaryAdapter,
+    STATUS_OK,
+    build_doctor_report,
+    open_readonly_doctor_db,
+    safe_preview,
 )
 
 
@@ -163,6 +173,194 @@ class TestSuggestAction:
 # ---------------------------------------------------------------------------
 
 class TestAuditNoise:
+    @pytest.mark.parametrize(
+        ("label", "secret", "sensitive_prefix"),
+        [
+            ("api_key_prefix", "sk-" + "a" * 20, "sk-"),
+            ("aws_access_key", "AKIA" + "A" * 16, "AKIA"),
+            ("github_token", "ghp_" + "a" * 36, "ghp_"),
+            ("slack_token", "xoxr-" + "a" * 20, "xoxr-"),
+            ("google_api_key", "AIza" + "a" * 35, "AIza"),
+            ("jwt_token", "eyJaaa.eyJbbb.ccc", "eyJ"),
+            ("secret_assignment", "passwd=supersecretvalue123", "supersecret"),
+            ("secret_assignment", "pwd=supersecretvalue123", "supersecret"),
+            ("secret_assignment", "access_key=supersecretvalue123", "supersecret"),
+            (
+                "private_key_block",
+                "-----BEGIN RSA PRIVATE KEY-----\nMIIJKQIBAA",
+                "MIIJK",
+            ),
+            (
+                "connection_string_with_credentials",
+                "postgres://alice:***@localhost/db",
+                "postgres://alice:",
+            ),
+            ("env_secret_assignment", "DB_PASS=supersecretvalue123", "supersecret"),
+        ],
+    )
+    def test_safe_preview_redacts_all_canonical_hygiene_secrets_before_truncating(
+        self, label, secret, sensitive_prefix
+    ):
+        prefix = " " * 110 if label == "env_secret_assignment" else "x" * 110 + " "
+        preview = safe_preview(prefix + secret, max_length=120)
+        payload = json.dumps(
+            DoctorReport(
+                bank_name="test",
+                hygiene_summary={"candidates": [{"preview": preview}]},
+            ).to_dict()
+        )
+
+        assert label in {name for name, _pattern in SECRET_LABELED_PATTERNS}
+        assert secret not in payload
+        assert sensitive_prefix not in payload
+        assert "<redact" in payload
+
+    def test_safe_preview_redacts_a_secret_before_truncating(self):
+        # If truncation happened first, the secret value would partially survive.
+        raw_secret = "redaction-before-truncation-secret"  # nosec - regression fixture
+        preview = safe_preview("x" * 90 + f" password={raw_secret}" + " trailing", max_length=120)
+
+        assert len(preview) <= 120
+        assert raw_secret not in preview
+        assert "password=<redacted>" in preview
+
+    def test_doctor_hygiene_redacts_cross_boundary_values_before_truncating(self, tmp_path):
+        db_path = tmp_path / "cross-boundary-hygiene.db"
+        email = "crossboundary-email-" + "a" * 85 + "@example.test"
+        secret = "crossboundary-secret-" + "b" * 80  # nosec - regression fixture
+        content = "x" * 110 + f" {email} password={secret}"
+        writable = sqlite3.connect(db_path)
+        writable.execute(
+            """
+            CREATE TABLE working_memory (
+                id TEXT PRIMARY KEY, content TEXT, source TEXT, timestamp TEXT,
+                session_id TEXT, importance REAL, metadata_json TEXT
+            )
+            """
+        )
+        writable.execute(
+            "INSERT INTO working_memory VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("candidate", content, "test", "2026-01-01", "s", 0.5, "{}"),
+        )
+        writable.commit()
+        writable.close()
+
+        readonly = open_readonly_doctor_db(db_path)
+        try:
+            summary = doctor_hygiene_summary(
+                db_path, conn=readonly, min_score=0.0, candidate_limit=1
+            )
+        finally:
+            readonly.close()
+
+        payload = json.dumps(summary)
+        assert summary["candidates"][0]["preview"] == "x" * 110 + " <redacte…"
+        assert len(summary["candidates"][0]["preview"]) <= 120
+        for sensitive in (email, secret, "crossboundary-email", "crossboundary-secret"):
+            assert sensitive not in payload
+
+    def test_noise_summary_uses_supplied_readonly_connector_without_db_changes(self, tmp_path):
+        db_path = tmp_path / "readonly-hygiene.db"
+        fixture_secret = "fixture-hygiene-secret-123456"  # nosec - redaction fixture
+        writable = sqlite3.connect(db_path)
+        writable.execute(
+            """
+            CREATE TABLE working_memory (
+                id TEXT PRIMARY KEY, content TEXT, source TEXT, timestamp TEXT,
+                session_id TEXT, importance REAL, metadata_json TEXT
+            )
+            """
+        )
+        writable.execute(
+            "INSERT INTO working_memory VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("candidate", f"password = {fixture_secret}", "test", "2026-01-01", "s", 0.5, "{}"),
+        )
+        writable.commit()
+        writable.close()
+
+        readonly = open_readonly_doctor_db(db_path)
+        try:
+            summary = doctor_hygiene_summary(
+                db_path, conn=readonly, min_score=0.0, candidate_limit=1
+            )
+            with pytest.raises(sqlite3.OperationalError):
+                readonly.execute("INSERT INTO working_memory (id) VALUES ('forbidden')")
+        finally:
+            readonly.close()
+
+        verify = sqlite3.connect(db_path)
+        try:
+            assert verify.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 1
+            assert verify.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'hygiene_audit_log'"
+            ).fetchone()[0] == 0
+        finally:
+            verify.close()
+        assert summary["status"] == "ok"
+        assert summary["with_secrets"] == 1
+        assert fixture_secret not in json.dumps(summary)
+        assert summary["candidates"][0]["preview"] == "password=<redacted>"
+        assert "id" not in summary["candidates"][0]
+
+    def test_hygiene_adapter_whitelists_bounded_safe_data(self, monkeypatch, tmp_path):
+        db_path = tmp_path / "doctor.db"
+        sqlite3.connect(db_path).close()
+        raw_secret = "adapter-private-secret"  # nosec - regression fixture
+
+        def unsafe_summary(*_args, **_kwargs):
+            return {
+                "status": "ok",
+                "total_scanned": 1,
+                "total_candidates": 1,
+                "with_secrets": 1,
+                "candidates": [{
+                    "id": "candidate",
+                    "table": "working_memory",
+                    "noise_score": 0.9,
+                    "reasons": ["secret_detected"],
+                    "secret_flags": ["secret_assignment"],
+                    "suggested_action": "flag",
+                    "preview": f"password={raw_secret}",
+                    "content": raw_secret,
+                    "body": raw_secret,
+                    "embedding_json": raw_secret,
+                    "metadata": {"private": raw_secret},
+                }],
+            }
+
+        monkeypatch.setattr("mnemosyne.core.hygiene.doctor_hygiene_summary", unsafe_summary)
+        conn = open_readonly_doctor_db(db_path)
+        try:
+            summary = HygieneSummaryAdapter(conn, db_path, candidate_limit=1).inspect().metrics
+        finally:
+            conn.close()
+
+        payload = json.dumps(summary)
+        assert raw_secret not in payload
+        assert "password=<redacted>" in payload
+        for forbidden in ("id", "content", "body", "embedding_json", "metadata"):
+            assert forbidden not in summary["candidates"][0]
+
+    def test_build_doctor_report_never_constructs_mnemosyne(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "doctor.db"
+        writable = sqlite3.connect(db_path)
+        writable.execute(
+            "CREATE TABLE working_memory (id TEXT, content TEXT, source TEXT, timestamp TEXT, "
+            "session_id TEXT, importance REAL, metadata_json TEXT)"
+        )
+        writable.commit()
+        writable.close()
+
+        class ForbiddenMnemosyne:
+            def __init__(self, *_args, **_kwargs):
+                raise AssertionError("Doctor must not construct Mnemosyne")
+
+        monkeypatch.setattr("mnemosyne.core.memory.Mnemosyne", ForbiddenMnemosyne)
+        report = build_doctor_report("work", db_path, scan_limit=1, candidate_limit=1)
+
+        assert report.bank_name == "work"
+        assert report.hygiene_summary["status"] == STATUS_OK
+
     def test_audit_finds_noise(self, temp_db):
         db_path, beam = temp_db
         _insert_row(beam, "working_memory", "noise1", "$ pip install foo\nCollecting foo", source="terminal")
@@ -539,3 +737,36 @@ class TestRestoreArchived:
         assert "_original_importance" not in meta  # cleaned up on restore
         assert meta.get("original") == "data"
         conn.close()
+
+
+def test_hygiene_suite_does_not_leak_config_into_subagent_provider(tmp_path, monkeypatch):
+    """A provider after hygiene must use its own safe temporary config.
+
+    Hygiene/Doctor paths initialize the process-wide MnemosyneConfig singleton.
+    This regression exercises the subsequent provider path in the same pytest
+    process: the autouse cleanup must discard that singleton before a subagent
+    provider resolves its temporary data-directory configuration.
+    """
+    from conftest import _close_cached_connections
+    from hermes_memory_provider import MnemosyneMemoryProvider
+    from mnemosyne.core.config import MnemosyneConfig
+
+    stale_data_dir = tmp_path / "stale-data"
+    test_data_dir = tmp_path / "provider-data"
+    stale_data_dir.mkdir()
+    test_data_dir.mkdir()
+    # The stale config enables subagent initialization. The replacement config
+    # must win after the fixture boundary resets the process-global singleton.
+    (stale_data_dir / "config.yaml").write_text("skip_contexts: ''\n", encoding="utf-8")
+    (test_data_dir / "config.yaml").write_text("skip_contexts: subagent\n", encoding="utf-8")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(stale_data_dir))
+    stale_config = MnemosyneConfig.get_instance()
+    assert stale_config.config_path == stale_data_dir / "config.yaml"
+
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(test_data_dir))
+    _close_cached_connections()
+    assert MnemosyneConfig._instance is None
+    provider = MnemosyneMemoryProvider()
+    provider.initialize("hygiene-followup", agent_context="subagent")
+
+    assert provider._beam is None

@@ -21,7 +21,7 @@ Field mapping:
 
 import json
 from datetime import datetime
-from typing import List, Dict, Optional, Any
+from typing import List, Dict
 
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
 

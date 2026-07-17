@@ -217,7 +217,7 @@ class HolographicImporter(BaseImporter):
 
             memories.append({
                 "content": content,
-                "source": f"holographic_import",
+                "source": "holographic_import",
                 "importance": importance,
                 "metadata": meta,
                 "valid_until": None,

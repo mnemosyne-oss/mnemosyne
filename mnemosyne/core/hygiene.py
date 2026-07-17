@@ -27,7 +27,7 @@ import sqlite3
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from mnemosyne.core.filters import (
     DEFAULT_NOISE_PATTERNS,
@@ -240,12 +240,10 @@ def _scan_table(
     """Scan a table for noise candidates. Returns rows as dicts."""
     cursor = conn.cursor()
     quoted_table = _quote_identifier(table_name)
-    # We deliberately select all columns we need; the schemas for
-    # working_memory, memories, and episodic_memory all share the core
-    # (id, content, source, timestamp, session_id, importance, metadata_json)
-    # shape, with episodic_memory having extra columns we don't need.
+    # Audit scoring needs only this fixed contract. Metadata is intentionally
+    # excluded so a read-only doctor scan never loads raw metadata.
     base_query = (
-        f"SELECT id, content, source, timestamp, session_id, importance, metadata_json "
+        f"SELECT id, content, source, timestamp, session_id, importance "
         f"FROM {quoted_table}"
     )
     if after is None:
@@ -305,6 +303,8 @@ def audit_noise(
     offset: int = 0,
     scan_all: bool = False,
     batch_size: int = 1000,
+    conn: Optional[sqlite3.Connection] = None,
+    content_preview_transform: Optional[Callable[[str], str]] = None,
 ) -> AuditReport:
     """Audit a memory database for noise.
 
@@ -320,6 +320,8 @@ def audit_noise(
         offset: Row offset per table for paginated scans.
         scan_all: If true, page through all rows in each selected table.
         batch_size: Batch size used when ``scan_all`` is true.
+        content_preview_transform: Optional bounded preview renderer for a
+            caller with a stricter content-safety contract.
 
     Returns:
         ``AuditReport`` with ranked candidates.
@@ -336,8 +338,10 @@ def audit_noise(
 
     report = AuditReport(tables_scanned=tables)
     table_counts: Dict[str, int] = {}
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
+    owns_connection = conn is None
+    if conn is None:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
 
     def scan_batches(table_name: str) -> Iterator[List[Dict[str, Any]]]:
         if not scan_all:
@@ -390,7 +394,11 @@ def audit_noise(
                     candidate = NoiseCandidate(
                         memory_id=row.get("id", ""),
                         table_name=table,
-                        content_preview=content[:200],
+                        content_preview=(
+                            content_preview_transform(content)
+                            if content_preview_transform is not None
+                            else content[:200]
+                        ),
                         noise_score=round(score, 4),
                         noise_reasons=reasons,
                         secret_flags=secrets,
@@ -403,7 +411,8 @@ def audit_noise(
                     report.candidates.append(candidate)
             table_counts[table] = table_scanned
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()
 
     report.candidates.sort(key=lambda c: c.noise_score, reverse=True)
     report.summary = _build_audit_summary(report.candidates, table_counts=table_counts)
@@ -415,9 +424,17 @@ def noise_summary(
     limit: int = 200,
     tables: Optional[List[str]] = None,
     min_score: float = 0.3,
+    *,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> Dict[str, Any]:
     """Return a PII-safe noise summary without content previews."""
-    report = audit_noise(db_path=db_path, limit=limit, tables=tables, min_score=min_score)
+    report = audit_noise(
+        db_path=db_path,
+        limit=limit,
+        tables=tables,
+        min_score=min_score,
+        conn=conn,
+    )
     table_counts = report.summary.get("table_counts", {})
     candidates_by_table = report.summary.get("by_table", {})
     ratios = {
@@ -437,6 +454,61 @@ def noise_summary(
         "with_secrets": report.summary.get("with_secrets", 0),
         "min_score": min_score,
         "limit_per_table": limit,
+    }
+
+
+def doctor_hygiene_summary(
+    db_path: Path,
+    limit: int = 200,
+    candidate_limit: int = 20,
+    min_score: float = 0.3,
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Dict[str, Any]:
+    """Return a bounded, redacted hygiene view for the read-only doctor.
+
+    A caller may supply the doctor's ``mode=ro``/``query_only`` connector.
+    This helper owns no mutation path and omits raw metadata, embeddings,
+    BLOBs, sources, and timestamps from candidates.
+    """
+
+    if not isinstance(candidate_limit, int) or isinstance(candidate_limit, bool) or candidate_limit < 0:
+        raise ValueError("candidate_limit must be a non-negative integer")
+    from mnemosyne.doctor import safe_preview
+
+    try:
+        report = audit_noise(
+            db_path=db_path,
+            limit=limit,
+            min_score=min_score,
+            conn=conn,
+            content_preview_transform=lambda content: safe_preview(content, max_length=120),
+        )
+    except sqlite3.Error:
+        return {"status": "unavailable", "error_class": "sqlite_error", "candidates": []}
+    except Exception:
+        return {"status": "unknown", "error_class": "runtime_error", "candidates": []}
+
+    summary = report.summary
+    return {
+        "status": "ok",
+        "total_scanned": report.total_scanned,
+        "total_candidates": len(report.candidates),
+        "candidate_ratio": round(len(report.candidates) / report.total_scanned, 4) if report.total_scanned else 0.0,
+        "with_secrets": summary.get("with_secrets", 0),
+        "limit_per_table": limit,
+        "candidate_limit": candidate_limit,
+        "candidates": [
+            {
+                "table": candidate.table_name,
+                "noise_score": candidate.noise_score,
+                "reasons": list(candidate.noise_reasons),
+                "secret_flags": list(candidate.secret_flags),
+                "suggested_action": candidate.suggested_action,
+                "preview": safe_preview(candidate.content_preview, max_length=120),
+            }
+            for candidate in report.candidates[:candidate_limit]
+        ],
     }
 
 

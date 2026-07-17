@@ -12,6 +12,8 @@ paths, returning None cleanly without raising.
 from __future__ import annotations
 
 import os
+import json
+import urllib.error
 
 import pytest
 
@@ -137,3 +139,59 @@ def test_get_model_retries_on_rate_limit(monkeypatch):
         embeddings._get_model()
     assert "429" in str(excinfo.value) or "rate" in str(excinfo.value).lower()
     assert call_count["n"] == 3  # Retried up to 3 times before giving up.
+
+
+def test_embed_api_retries_transient_http_503(monkeypatch):
+    """Transient HTTP 5xx responses receive bounded retries."""
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "https://example.test/v1")
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_KEY", "test-key")
+    monkeypatch.setattr(embeddings, "_DEFAULT_MODEL", "text-embedding-test")
+    monkeypatch.setattr(embeddings, "np", __import__("numpy"))
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    calls = {"count": 0}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({"data": [{"embedding": [0.1, 0.2]}]}).encode()
+
+    def _urlopen(_request, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise urllib.error.HTTPError(
+                "https://example.test/v1/embeddings", 503, "unavailable", {}, None
+            )
+        return _Response()
+
+    monkeypatch.setattr(embeddings.urllib.request, "urlopen", _urlopen)
+    result = embeddings._embed_api(["hello"])
+
+    __import__("numpy").testing.assert_allclose(result, [[0.1, 0.2]])
+    assert calls["count"] == 3
+
+
+def test_embed_api_does_not_retry_permanent_http_400(monkeypatch):
+    """Permanent client errors fail fast instead of hammering the endpoint."""
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "https://example.test/v1")
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_KEY", "test-key")
+    monkeypatch.setattr(embeddings, "_DEFAULT_MODEL", "text-embedding-test")
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+    calls = {"count": 0}
+
+    def _urlopen(_request, **_kwargs):
+        calls["count"] += 1
+        raise urllib.error.HTTPError(
+            "https://example.test/v1/embeddings", 400, "bad request", {}, None
+        )
+
+    monkeypatch.setattr(embeddings.urllib.request, "urlopen", _urlopen)
+
+    assert embeddings._embed_api(["hello"]) is None
+    assert calls["count"] == 1

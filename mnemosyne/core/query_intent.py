@@ -20,7 +20,7 @@ Usage:
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, Optional
+from typing import Tuple, Optional
 import re
 
 

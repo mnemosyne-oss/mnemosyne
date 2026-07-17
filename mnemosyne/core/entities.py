@@ -9,7 +9,7 @@ Storage: TripleStore triples (subject=memory_id, predicate="mentions", object="e
 """
 
 import re
-from typing import List, Optional, Set, Tuple
+from typing import List, Set, Tuple
 
 
 # =============================================================================

@@ -346,13 +346,16 @@ def test_e2e_plaintext_sync():
             "beam_instance": remote_mem,
             "device_id": "remote-server",
             "api_key": api_key,
+            "require_encrypted_payloads": False,
         },
         daemon=True,
     )
     t.start()
     time.sleep(0.5)
 
-    local_engine = SyncEngine(local_mem, device_id="local-laptop")
+    local_engine = SyncEngine(
+        local_mem, device_id="local-laptop", allow_unscoped_sync=True
+    )
     local_mem.remember("E2E plaintext memory", source="conversation", importance=0.8)
 
     result = local_engine.sync_with(
@@ -391,6 +394,7 @@ def test_e2e_encrypted_sync():
             "beam_instance": remote_mem,
             "device_id": "remote-server",
             "api_key": api_key,
+            "initialize_surface": True,
         },
         daemon=True,
     )
@@ -399,8 +403,16 @@ def test_e2e_encrypted_sync():
 
     # Local has the key; remote does NOT (stores opaque ciphertext)
     enc = SyncEncryption.from_config(SyncEncryption.generate_key())
-    local_engine = SyncEngine(local_mem, device_id="local-laptop", encryption=enc)
-    local_mem.remember("E2E encrypted secret", source="conversation", importance=0.9)
+    local_engine = SyncEngine(
+        local_mem,
+        device_id="local-laptop",
+        encryption=enc,
+        surface_only=True,
+        initialize_surface=True,
+    )
+    local_mem.remember(
+        "E2E encrypted secret", source="conversation", importance=0.9, scope="global"
+    )
 
     result = local_engine.sync_with(
         remote_url=f"http://127.0.0.1:{port}",

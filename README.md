@@ -1,4 +1,4 @@
-> ⚠️ **Personal note** — I'm going through a difficult personal situation and need to step away briefly. Development is paused for the coming week while I focus on family. This isn't goodbye, just a short pause. I'll be back. Thank you for understanding. ❤️
+> ⚠️ **Personal note** — I'm navigating a difficult personal situation, but I've got the right counsel in place and we're moving forward safely. ❤️
 
 <div align="center">
 
@@ -13,7 +13,7 @@
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![CI](https://github.com/mnemosyne-oss/mnemosyne/actions/workflows/ci.yml/badge.svg)](https://github.com/mnemosyne-oss/mnemosyne/actions/workflows/ci.yml)
 [![BEAM](https://img.shields.io/badge/BEAM-ICLR%202026-purple.svg)](https://beam-benchmark.github.io/)
-[![Discord](https://badgen.net/discord/online-members/29ZszXTgY3)](https://discord.gg/Cgzpw9x3R)
+[![Discord](https://badgen.net/discord/online-members/nousresearch)](https://discord.gg/nousresearch)
 [![ProductHunt](https://img.shields.io/badge/ProductHunt-Launch-orange)](https://www.producthunt.com/posts/mnemosyne)
 [![MCP](https://img.shields.io/badge/MCP-Ready-6366f1)](https://modelcontextprotocol.io)
 
@@ -458,7 +458,7 @@ If your company runs an OSS credits program and wants to partner, open an issue 
 
 <div align="center">
 
-**Discord:** [Join the Mnemosyne community](https://discord.gg/Cgzpw9x3R) . **Issues:** [GitHub Issues](https://github.com/AxDSan/mnemosyne/issues)
+**Discord:** [Join the Mnemosyne community](https://discord.gg/nousresearch) . **Issues:** [GitHub Issues](https://github.com/AxDSan/mnemosyne/issues)
 
 <a href="https://github.com/sponsors/AxDSan"><img src="https://img.shields.io/badge/%F0%9F%92%96_GitHub_Sponsors-30363D?style=for-the-badge&logo=github&logoColor=white" alt="GitHub Sponsors"/></a>
 <a href="https://ko-fi.com/axdsan"><img src="https://img.shields.io/badge/%E2%98%95_Ko-fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white" alt="Ko-fi"/></a>

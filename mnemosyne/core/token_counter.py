@@ -4,8 +4,6 @@ Lightweight token estimation for memory context benchmarking.
 Uses tiktoken if available, falls back to chars/4 heuristic.
 """
 
-import os
-from typing import Optional
 
 # Try to import tiktoken, but don't fail if missing
 try:

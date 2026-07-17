@@ -27,7 +27,6 @@ def _default_data_dir() -> str:
 
 
 DATA_DIR = _default_data_dir()
-os.makedirs(DATA_DIR, exist_ok=True)
 
 
 def _fail(message: str, exit_code: int = 2) -> NoReturn:
@@ -73,6 +72,50 @@ def _resolve_bank_name(bank_override: str | None = None) -> str:
     """Resolve the selected memory bank from an override or MNEMOSYNE_BANK."""
     value = bank_override if bank_override is not None else os.environ.get("MNEMOSYNE_BANK", "")
     return value.strip() or "default"
+
+
+def _resolve_doctor_bank_db_path(bank_name: str) -> Path:
+    """Resolve an existing bank DB without constructing ``BankManager``.
+
+    ``BankManager`` eagerly creates ``data_dir/banks`` in its constructor,
+    which is correct for mutating CLI commands but violates doctor's strict
+    read-only contract.  Keep this small lookup local to the doctor command:
+    validation and path inspection are the only filesystem operations.
+    """
+
+    from mnemosyne.core.banks import _validate_bank_name
+
+    _validate_bank_name(bank_name)
+    data_dir = Path(DATA_DIR)
+    if bank_name == "default":
+        return data_dir / "mnemosyne.db"
+    bank_dir = data_dir / "banks" / bank_name
+    if not bank_dir.is_dir():
+        _fail(f"Bank '{bank_name}' does not exist", exit_code=1)
+    return bank_dir / "mnemosyne.db"
+
+
+def _doctor_output_target_is_database(output_path: Path, db_path: Path) -> bool:
+    """Return whether an existing output target is the inspected DB itself.
+
+    Path resolution protects aliases for absent targets and symlinks, but it
+    cannot identify a hardlink. For an existing directory entry, compare
+    filesystem identity and fail closed if that comparison is unavailable.
+    """
+    try:
+        output_path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        _fail(f"Unable to safely inspect Doctor output path {output_path}: {error}")
+
+    try:
+        return os.path.samefile(output_path, db_path)
+    except OSError as error:
+        _fail(
+            "Unable to determine filesystem identity for existing Doctor "
+            f"output path {output_path}: {error}"
+        )
 
 
 def _get_memory():
@@ -260,6 +303,228 @@ def cmd_diagnose(args):
         print(f"Diagnostic failed: {e}")
 
 
+def cmd_doctor(args):
+    """Render a bounded, read-only health report for one existing database."""
+
+    usage = (
+        "Usage: mnemosyne doctor [--db PATH | --bank NAME] "
+        "[--format json|markdown|both] [--json-out PATH] [--markdown-out PATH] "
+        "[--scan-limit N] [--sample-limit N] [--all] [--include-candidates]"
+    )
+    db_override = None
+    bank_override = None
+    output_format = "both"
+    json_out = None
+    markdown_out = None
+    scan_limit = 200
+    sample_limit = 20
+    scan_all = False
+    include_candidates = False
+    scan_limit_set = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--db":
+            db_override, i = _require_value(args, i, "--db", lambda value, _name: value)
+        elif arg == "--bank":
+            bank_override, i = _require_value(args, i, "--bank", lambda value, _name: value)
+        elif arg == "--format":
+            output_format, i = _require_value(args, i, "--format", lambda value, _name: value)
+        elif arg == "--json-out":
+            json_out, i = _require_value(args, i, "--json-out", lambda value, _name: value)
+        elif arg == "--markdown-out":
+            markdown_out, i = _require_value(args, i, "--markdown-out", lambda value, _name: value)
+        elif arg == "--scan-limit":
+            scan_limit, i = _require_value(args, i, "--scan-limit", _parse_int)
+            scan_limit_set = True
+        elif arg == "--sample-limit":
+            sample_limit, i = _require_value(args, i, "--sample-limit", _parse_int)
+        elif arg == "--all":
+            scan_all = True
+            i += 1
+        elif arg == "--include-candidates":
+            include_candidates = True
+            i += 1
+        else:
+            _usage(f"{usage}\nUnknown doctor option: {arg}")
+
+    if db_override is not None and bank_override is not None:
+        _fail("--db and --bank cannot be used together")
+    if output_format not in {"json", "markdown", "both"}:
+        _fail("--format must be one of: json, markdown, both")
+    if not isinstance(scan_limit, int) or scan_limit < 1:
+        _fail("--scan-limit must be a positive integer")
+    if not isinstance(sample_limit, int) or sample_limit < 0:
+        _fail("--sample-limit must be a non-negative integer")
+    if scan_limit > 10_000:
+        _fail("--scan-limit must not exceed 10000")
+    if sample_limit > 100:
+        _fail("--sample-limit must not exceed 100")
+    if output_format == "json" and markdown_out is not None:
+        _fail("--markdown-out requires --format markdown or both")
+    if output_format == "markdown" and json_out is not None:
+        _fail("--json-out requires --format json or both")
+
+    # ``--all`` remains bounded: it requests the largest safe report scan
+    # budget unless the operator selected an explicit, smaller/larger limit.
+    if scan_all and not scan_limit_set:
+        scan_limit = 10_000
+
+    if db_override is not None:
+        db_path = Path(db_override).expanduser()
+        bank_name = "default"
+    else:
+        bank_name = _resolve_bank_name(bank_override)
+        try:
+            db_path = _resolve_doctor_bank_db_path(bank_name)
+        except ValueError as error:
+            _fail(str(error))
+    if not db_path.is_file():
+        _fail(f"Database not found: {db_path}", exit_code=1)
+
+    resolved_db = db_path.resolve()
+    resolved_json_path = (
+        Path(json_out).expanduser() if json_out else Path.cwd() / "mnemosyne-doctor.json"
+    )
+    resolved_markdown_path = (
+        Path(markdown_out).expanduser() if markdown_out else Path.cwd() / "mnemosyne-doctor.md"
+    )
+    if output_format == "both":
+        output_paths = [resolved_json_path, resolved_markdown_path]
+    elif output_format == "json" and json_out:
+        output_paths = [resolved_json_path]
+    elif output_format == "markdown" and markdown_out:
+        output_paths = [resolved_markdown_path]
+    else:
+        output_paths = []
+    if output_format == "both" and resolved_json_path.resolve() == resolved_markdown_path.resolve():
+        _fail("JSON and Markdown output paths must be different")
+    if any(path.resolve() == resolved_db for path in output_paths):
+        _fail("Doctor output path must not overwrite the inspected database")
+    if any(_doctor_output_target_is_database(path, db_path) for path in output_paths):
+        _fail("Doctor output path must not overwrite the inspected database")
+
+    from mnemosyne.doctor import (
+        build_doctor_report,
+        doctor_report_payload,
+        render_doctor_json,
+        render_doctor_markdown,
+        write_doctor_artifact_atomically,
+        write_doctor_artifacts_atomically,
+    )
+
+    try:
+        report = build_doctor_report(
+            bank_name,
+            db_path,
+            scan_limit=scan_limit,
+            candidate_limit=sample_limit if include_candidates else 0,
+        )
+        payload = doctor_report_payload(report, include_candidates=include_candidates)
+        json_text = render_doctor_json(payload)
+        markdown_text = render_doctor_markdown(payload)
+        if output_format == "both":
+            write_doctor_artifacts_atomically(
+                json_path=resolved_json_path,
+                json_text=json_text,
+                markdown_path=resolved_markdown_path,
+                markdown_text=markdown_text,
+            )
+            print(f"Doctor JSON: {resolved_json_path}")
+            print(f"Doctor Markdown: {resolved_markdown_path}")
+        elif output_format == "json":
+            if json_out:
+                write_doctor_artifact_atomically(path=resolved_json_path, text=json_text)
+                print(f"Doctor JSON: {resolved_json_path}")
+            else:
+                print(json_text, end="")
+        elif markdown_out:
+            write_doctor_artifact_atomically(path=resolved_markdown_path, text=markdown_text)
+            print(f"Doctor Markdown: {resolved_markdown_path}")
+        else:
+            print(markdown_text, end="")
+    except (OSError, ValueError) as error:
+        _fail(f"Doctor report failed: {error}", exit_code=1)
+
+
+def cmd_repair(args):
+    """Apply one narrow, explicitly selected doctor-gated repair action."""
+
+    usage = (
+        "Usage: mnemosyne repair --report REPORT.json --select working_memory:ID "
+        "[--select working_memory:ID ...] [--db PATH | --bank NAME] "
+        "[--action backfill-vec-working|expire] [--dry-run|--apply] [--backup PATH]"
+    )
+    db_override = None
+    bank_override = None
+    report_path = None
+    selections = []
+    action = "backfill-vec-working"
+    apply = False
+    dry_run_seen = False
+    backup_path = None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--db":
+            db_override, i = _require_value(args, i, "--db", lambda value, _name: value)
+        elif arg == "--bank":
+            bank_override, i = _require_value(args, i, "--bank", lambda value, _name: value)
+        elif arg == "--report":
+            report_path, i = _require_value(args, i, "--report", lambda value, _name: value)
+        elif arg == "--select":
+            selection, i = _require_value(args, i, "--select", lambda value, _name: value)
+            selections.append(selection)
+        elif arg == "--action":
+            action, i = _require_value(args, i, "--action", lambda value, _name: value)
+        elif arg == "--backup":
+            backup_path, i = _require_value(args, i, "--backup", lambda value, _name: value)
+        elif arg == "--apply":
+            apply = True
+            i += 1
+        elif arg == "--dry-run":
+            dry_run_seen = True
+            i += 1
+        else:
+            _usage(f"{usage}\nUnknown repair option")
+
+    if db_override is not None and bank_override is not None:
+        _fail("--db and --bank cannot be used together")
+    if apply and dry_run_seen:
+        _fail("--apply and --dry-run cannot be used together")
+    if report_path is None:
+        _fail("--report is required")
+    if not selections:
+        _fail("At least one complete --select working_memory:ID is required")
+    if db_override is not None:
+        db_path = Path(db_override).expanduser()
+        bank_name = "default"
+    else:
+        bank_name = _resolve_bank_name(bank_override)
+        try:
+            db_path = _resolve_doctor_bank_db_path(bank_name)
+        except ValueError:
+            _fail("Invalid bank name")
+    if not db_path.is_file():
+        _fail("Database not found", exit_code=1)
+
+    from mnemosyne.repair import RepairError, render_repair_json, run_repair
+
+    try:
+        result = run_repair(
+            db_path=db_path,
+            bank_name=bank_name,
+            report_path=report_path,
+            selections=selections,
+            action=action,
+            apply=apply,
+            backup_path=backup_path,
+        )
+    except RepairError as error:
+        _fail(str(error), exit_code=1)
+    print(render_repair_json(result), end="")
+
+
 def cmd_export(args):
     """Export memories to JSON.
 
@@ -373,29 +638,154 @@ def cmd_mcp(args):
         sys.exit(1)
 
 
+def _read_secret_file(path: str, label: str) -> str:
+    """Read a secret through one no-follow file descriptor."""
+    import stat
+    from pathlib import Path
+
+    secret_path = Path(path).expanduser()
+    flags = os.O_RDONLY
+    if os.name != "nt" and hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    elif secret_path.is_symlink():
+        raise ValueError(f"{label} file must not be a symlink: {secret_path}")
+    try:
+        fd = os.open(secret_path, flags)
+    except OSError as exc:
+        raise ValueError(f"cannot securely open {label} file: {secret_path}") from exc
+    try:
+        stat_result = os.fstat(fd)
+        if not stat.S_ISREG(stat_result.st_mode):
+            raise ValueError(f"{label} path is not a regular file: {secret_path}")
+        if os.name != "nt" and stat_result.st_mode & 0o077:
+            raise PermissionError(
+                f"{label} file must not be accessible by group/others: {secret_path}"
+            )
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            value = handle.read().strip()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if not value:
+        raise ValueError(f"{label} file is empty: {secret_path}")
+    return value
+
+
+def cmd_sync_init(args):
+    """Explicitly initialize or migrate a dedicated shared-surface DB."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="mnemosyne sync-init")
+    parser.add_argument("--db-path", required=True, help="Dedicated shared-surface DB")
+    parser.add_argument(
+        "--session-id",
+        default="hermes_shared_surface",
+        help="Stable session ID used by the shared-surface Beam",
+    )
+    parser.add_argument(
+        "--claim-existing",
+        action="store_true",
+        help="Claim existing global rows after validation",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm mutation of an existing non-empty dedicated DB",
+    )
+    parsed = parser.parse_args(args)
+
+    from mnemosyne.core.memory import Mnemosyne
+    from mnemosyne.core.sync import SyncEngine
+
+    mem = Mnemosyne(db_path=parsed.db_path, session_id=parsed.session_id)
+    existing_rows = mem.beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory"
+    ).fetchone()[0]
+    invalid_rows = mem.beam.conn.execute(
+        """SELECT COUNT(*) FROM working_memory
+           WHERE scope != 'global' OR session_id != ?""",
+        (parsed.session_id,),
+    ).fetchone()[0]
+    preview = {
+        "db_path": str(parsed.db_path),
+        "session_id": parsed.session_id,
+        "existing_rows": existing_rows,
+        "invalid_rows": invalid_rows,
+    }
+    if invalid_rows:
+        raise SystemExit(
+            "Refusing migration: DB contains non-global or foreign-session rows"
+        )
+    if existing_rows and not (parsed.claim_existing and parsed.yes):
+        preview["status"] = "confirmation_required"
+        preview["required_flags"] = ["--claim-existing", "--yes"]
+        print(json.dumps(preview, sort_keys=True))
+        return
+
+    SyncEngine(
+        mem,
+        surface_only=True,
+        initialize_surface=True,
+        claim_existing_surface=bool(existing_rows),
+    )
+    preview["status"] = "initialized"
+    preview["claimed_rows"] = existing_rows
+    print(json.dumps(preview, sort_keys=True))
+
+
 def cmd_sync(args):
     """Sync memories with a remote Mnemosyne instance."""
     import argparse
     parser = argparse.ArgumentParser(prog="mnemosyne sync")
     parser.add_argument("--remote", required=True, help="Remote sync server URL (e.g. http://192.168.1.50:8765)")
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Explicit SQLite DB to sync; use the dedicated shared-surface DB, not a private DB",
+    )
     parser.add_argument("--mode", choices=["push", "pull", "bidirectional"], default="bidirectional",
                         help="Sync direction (default: bidirectional)")
-    parser.add_argument("--encrypt", help="Encryption key (base64) or path to key file")
-    parser.add_argument("--api-key", help="API key for remote server auth")
-    parser.add_argument("--insecure", action="store_true", help="Skip TLS verification (not implemented in stdlib impl)")
+    encryption_group = parser.add_mutually_exclusive_group()
+    encryption_group.add_argument(
+        "--encrypt", help="Encryption key (visible in process arguments)"
+    )
+    encryption_group.add_argument(
+        "--encrypt-key-file", help="Private file containing the encryption key"
+    )
+    auth_group = parser.add_mutually_exclusive_group()
+    auth_group.add_argument("--api-key", help="API key (visible in process arguments)")
+    auth_group.add_argument("--api-key-file", help="Private file containing the API key")
     parser.add_argument("--interval", type=float, default=0, help="Sync interval in seconds (repeat mode)")
+    parser.add_argument(
+        "--initialize-surface",
+        action="store_true",
+        help="Explicitly mark/claim this dedicated DB as a shared surface on first run",
+    )
 
     # Parse known flags from args; remaining are for internal use
     parsed, _ = parser.parse_known_args(args)
 
-    mem = _get_memory()
+    from mnemosyne.core.memory import Mnemosyne
     from mnemosyne.core.sync import SyncEngine, SyncEncryption
 
-    encryption = None
-    if parsed.encrypt:
-        encryption = SyncEncryption.from_config(parsed.encrypt)
+    mem = Mnemosyne(db_path=parsed.db_path)
 
-    engine = SyncEngine(mem, encryption=encryption)
+    encryption_source = parsed.encrypt
+    if parsed.encrypt_key_file:
+        encryption_source = _read_secret_file(parsed.encrypt_key_file, "encryption key")
+    encryption = SyncEncryption.from_config(encryption_source) if encryption_source else None
+    api_key = parsed.api_key
+    if parsed.api_key_file:
+        api_key = _read_secret_file(parsed.api_key_file, "API key")
+
+    engine = SyncEngine(
+        mem,
+        encryption=encryption,
+        require_encryption=encryption_source is not None,
+        surface_only=True,
+        initialize_surface=parsed.initialize_surface,
+    )
 
     if parsed.interval > 0:
         # Repeating sync
@@ -409,7 +799,7 @@ def cmd_sync(args):
                 result = engine.sync_with(
                     remote_url=parsed.remote,
                     mode=parsed.mode,
-                    api_key=parsed.api_key,
+                    api_key=api_key,
                 )
                 _print_sync_result(result)
                 time.sleep(parsed.interval)
@@ -419,7 +809,7 @@ def cmd_sync(args):
         result = engine.sync_with(
             remote_url=parsed.remote,
             mode=parsed.mode,
-            api_key=parsed.api_key,
+            api_key=api_key,
         )
         _print_sync_result(result)
 
@@ -433,14 +823,14 @@ def _print_sync_result(result: dict) -> None:
 
     push = result.get("push")
     if push is not None:
-        print(f"  Push:")
+        print("  Push:")
         print(f"    Accepted:   {push.get('accepted', 0)}")
         print(f"    Duplicates: {push.get('duplicates', 0)}")
         print(f"    Conflicts:  {push.get('conflicts', 0)}")
 
     pull = result.get("pull")
     if pull is not None:
-        print(f"  Pull:")
+        print("  Pull:")
         print(f"    Events fetched: {pull.get('events_fetched', 0)}")
         print(f"    Accepted:       {pull.get('accepted', 0)}")
         print(f"    Duplicates:     {pull.get('duplicates', 0)}")
@@ -459,27 +849,60 @@ def cmd_sync_serve(args):
     parser = argparse.ArgumentParser(prog="mnemosyne sync-serve")
     parser.add_argument("--port", type=int, default=8765, help="Server port (default: 8765)")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
-    parser.add_argument("--api-key", help="API key for bearer-token auth")
-    parser.add_argument("--jwt-secret", help="JWT secret for token auth")
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Explicit relay SQLite DB path",
+    )
+    parser.add_argument(
+        "--initialize-surface",
+        action="store_true",
+        help="Explicitly initialize a new dedicated relay DB",
+    )
+    parser.add_argument(
+        "--behind-tls-proxy",
+        action="store_true",
+        help="Allow non-loopback cleartext only behind a trusted TLS proxy",
+    )
+    api_group = parser.add_mutually_exclusive_group()
+    api_group.add_argument(
+        "--api-key", help="API key for bearer-token auth (visible in process arguments)"
+    )
+    api_group.add_argument("--api-key-file", help="Private file containing the API key")
+    jwt_group = parser.add_mutually_exclusive_group()
+    jwt_group.add_argument("--jwt-secret", help="JWT secret (visible in process arguments)")
+    jwt_group.add_argument(
+        "--jwt-secret-file", help="Private file containing the JWT secret"
+    )
     parser.add_argument("--tls-cert", help="TLS certificate file path")
     parser.add_argument("--tls-key", help="TLS key file path")
     parser.add_argument("--device-id", help="Custom device identifier")
 
     parsed = parser.parse_args(args)
 
-    mem = _get_memory()
-    from mnemosyne.core.sync import SyncEngine as _SyncEngine
+    api_key = parsed.api_key
+    if parsed.api_key_file:
+        api_key = _read_secret_file(parsed.api_key_file, "API key")
+    jwt_secret = parsed.jwt_secret
+    if parsed.jwt_secret_file:
+        jwt_secret = _read_secret_file(parsed.jwt_secret_file, "JWT secret")
+
+    from mnemosyne.core.memory import Mnemosyne
     from mnemosyne.core.sync_server import run_sync_server as _run_server
+
+    mem = Mnemosyne(db_path=parsed.db_path)
 
     _run_server(
         host=parsed.host,
         port=parsed.port,
         beam_instance=mem,
         device_id=parsed.device_id,
-        api_key=parsed.api_key,
-        jwt_secret=parsed.jwt_secret,
+        api_key=api_key,
+        jwt_secret=jwt_secret,
         tls_cert=parsed.tls_cert,
         tls_key=parsed.tls_key,
+        initialize_surface=parsed.initialize_surface,
+        behind_tls_proxy=parsed.behind_tls_proxy,
     )
 
 
@@ -487,19 +910,32 @@ def cmd_sync_status(args):
     """Show sync status and statistics."""
     import argparse
     parser = argparse.ArgumentParser(prog="mnemosyne sync-status")
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Explicit shared-surface SQLite DB path",
+    )
     parser.add_argument("--remote", help="Remote sync server URL to check")
-    parser.add_argument("--api-key", help="API key for remote server auth")
+    auth_group = parser.add_mutually_exclusive_group()
+    auth_group.add_argument("--api-key", help="API key (visible in process arguments)")
+    auth_group.add_argument("--api-key-file", help="Private file containing the API key")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
 
     parsed = parser.parse_args(args)
+    api_key = parsed.api_key
+    if parsed.api_key_file:
+        api_key = _read_secret_file(parsed.api_key_file, "API key")
 
-    mem = _get_memory()
+    from mnemosyne.core.memory import Mnemosyne
     from mnemosyne.core.sync import SyncEngine
 
-    engine = SyncEngine(mem)
+    mem = Mnemosyne(db_path=parsed.db_path)
+    engine = SyncEngine(mem, surface_only=True, claim_surface_rows=False)
 
-    # Log a heartbeat event so we have data to show
-    status = engine.get_status(remote_url=parsed.remote if parsed.remote else None)
+    status = engine.get_status(
+        remote_url=parsed.remote if parsed.remote else None,
+        api_key=api_key,
+    )
 
     if parsed.json:
         print(json.dumps(status, indent=2, default=str))
@@ -518,7 +954,7 @@ def cmd_sync_status(args):
 
     op_breakdown = status.get("operation_breakdown", {})
     if op_breakdown:
-        print(f"\n  Operations breakdown:")
+        print("\n  Operations breakdown:")
         for op, cnt in sorted(op_breakdown.items(), key=lambda x: -x[1]):
             print(f"    {op}: {cnt}")
 
@@ -536,7 +972,7 @@ def cmd_sync_status(args):
                 print(f"  Remote events:    {pull_info.get('events_fetched', 'N/A')}")
             errors = remote_st.get("errors", [])
             if errors:
-                print(f"  Remote errors:")
+                print("  Remote errors:")
                 for err in errors:
                     print(f"    - {err}")
 
@@ -546,7 +982,7 @@ def cmd_sync_generate_key(args):
     from mnemosyne.core.sync import SyncEncryption as _Enc
     key = _Enc.generate_key()
     print(key)
-    print(f"\nStore this key securely. It is the only way to decrypt synced payloads.", file=sys.stderr)
+    print("\nStore this key securely. It is the only way to decrypt synced payloads.", file=sys.stderr)
 
 
 def cmd_backup(args):
@@ -1075,7 +1511,8 @@ def cmd_config(args):
         config = get_config()
         config.set(key, value)
         print(f"Set {key} = {value}")
-        if key in config.REQUIRES_RESTART:
+        from mnemosyne.core.config import REQUIRES_RESTART
+        if key in REQUIRES_RESTART:
             print(f"  ⚠ {key} requires restart to take effect.")
 
     elif sub == "migrate":
@@ -1167,7 +1604,8 @@ COMMANDS = {
     "sleep": cmd_sleep,
     "consolidate": cmd_sleep,
     "diagnose": cmd_diagnose,
-    "doctor": cmd_diagnose,
+    "doctor": cmd_doctor,
+    "repair": cmd_repair,
     "export": cmd_export,
     "import": cmd_import,
     "import-hindsight": cmd_import_hindsight,
@@ -1179,6 +1617,7 @@ COMMANDS = {
     "verify": cmd_verify,
     "backups": cmd_backups_list,
     "sync": cmd_sync,
+    "sync-init": cmd_sync_init,
     "sync-serve": cmd_sync_serve,
     "sync-server": cmd_sync_serve,
     "sync-status": cmd_sync_status,
@@ -1195,6 +1634,9 @@ COMMANDS = {
 def run_cli():
     """Main CLI entry point."""
     if len(sys.argv) < 2 or sys.argv[1] in ("--help", "-h", "help"):
+        # Keep historical setup behavior for non-doctor CLI entry points while
+        # leaving module import and the doctor path free of mkdir side effects.
+        os.makedirs(DATA_DIR, exist_ok=True)
         print("Mnemosyne - Local AI Memory System\n")
         print("Usage: mnemosyne <command> [args]\n")
         print("Commands:")
@@ -1205,6 +1647,8 @@ def run_cli():
         print("  stats                                  Show statistics")
         print("  sleep                                  Run consolidation")
         print("  diagnose [--fix] [--dry-run] [--repair-vec-working]  Run diagnostics / optional repairs")
+        print("  doctor [--db PATH|--bank NAME] [--format json|markdown|both]  Read-only report")
+        print("  repair --report REPORT.json --select working_memory:ID [--apply]  Narrow doctor-gated repair")
         print("  export [--include-sync-events] [file.json]    Export memories")
         print("  import <file.json>                     Import memories")
         print("  import-hindsight <file|url> [bank]     Import Hindsight memories")
@@ -1216,11 +1660,13 @@ def run_cli():
         print("  verify [db_path] [--quick]             Verify database integrity")
         print("  backups [backup_dir]                   List available backups")
         print("  mcp [--transport sse] [--port 8080]    Start MCP server")
-        print("  sync --remote <url> [--mode push|pull|bidirectional]")
+        print("  sync --db-path <path> --remote <url> [--mode push|pull|bidirectional]")
         print("                                      Sync with remote server")
-        print("  sync-serve [--port 8765] [--host 0.0.0.0]")
+        print("  sync-init --db-path <path> [--claim-existing --yes]")
+        print("                                      Initialize/migrate a dedicated surface DB")
+        print("  sync-serve --db-path <path> [--port 8765] [--host 0.0.0.0]")
         print("                                      Start sync server")
-        print("  sync-status [--remote <url>] [--json]")
+        print("  sync-status --db-path <path> [--remote <url>] [--json]")
         print("                                      Show sync status")
         print("  sync-generate-key                    Generate encryption key")
         print("  migrate [--bank <name>]                Add 3.11.1 schema tables to an existing bank")
@@ -1230,6 +1676,8 @@ def run_cli():
         return
 
     command = sys.argv[1]
+    if command not in {"doctor", "repair"}:
+        os.makedirs(DATA_DIR, exist_ok=True)
     handler = COMMANDS.get(command)
 
     if handler:

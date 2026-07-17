@@ -3,7 +3,8 @@ Mnemosyne Diagnostics
 =====================
 PII-safe debug logging for troubleshooting installation and runtime issues.
 
-Logs to ~/.hermes/mnemosyne/logs/diagnose_YYYY-MM-DD_HHMMSS.jsonl
+Logs to $HERMES_HOME/mnemosyne/logs/diagnose_YYYY-MM-DD_HHMMSS.jsonl,
+or ~/.hermes/mnemosyne/logs when HERMES_HOME is unset.
 Never includes memory content, user queries, or API keys.
 
 Supports --fix mode: auto-installs missing dependencies.
@@ -17,9 +18,18 @@ import sys
 import platform
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
-LOG_DIR = Path.home() / ".hermes" / "mnemosyne" / "logs"
+from mnemosyne.runtime_diagnostics import collect_runtime_diagnostics
+
+def _default_log_dir() -> Path:
+    """Resolve diagnostics beside the active Hermes home."""
+    hermes_home = os.environ.get("HERMES_HOME")
+    base = Path(hermes_home).expanduser() if hermes_home else Path.home() / ".hermes"
+    return base / "mnemosyne" / "logs"
+
+
+LOG_DIR = _default_log_dir()
 
 # Map of missing dependency checks to pip install commands
 FIX_MAP = {
@@ -144,7 +154,7 @@ def _sqlite_integrity_diagnostics(conn) -> Dict[str, str]:
     return {"quick_check": result, "detail": ""}
 
 
-def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False) -> Dict:
+def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, bank: str | None = None) -> Dict:
     """
     Run full diagnostic scan and write PII-safe log.
     Returns summary dict for display.
@@ -154,9 +164,14 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False) 
             dedicated working-memory sqlite-vec table from memory_embeddings.
         dry_run: With repair_vec_working, report what would be repaired without
             writing.
+        bank: Optional named bank to diagnose. When provided, diagnostics run
+            against the bank's own SQLite DB (data/banks/<bank>/mnemosyne.db).
+            When None, the default/profile-root DB is used.
     """
     log_path = _log_path()
     entries: List[Dict] = []
+    resolved_bank: str | None = None
+    resolved_db: str | None = None
 
     def log(category: str, check: str, status: str, detail: str = ""):
         entry = {
@@ -169,87 +184,17 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False) 
         entries.append(entry)
         return entry
 
-    # --- Python environment ---
-    log("env", "python_version", sys.version.split()[0])
-    log("env", "platform", platform.platform())
-    log("env", "python_executable", sys.executable)
-
-    # --- Mnemosyne package ---
-    try:
-        import mnemosyne
-        version = getattr(mnemosyne, "__version__", None)
-        if not version:
-            version = importlib.metadata.version("mnemosyne-memory")
-        log("package", "mnemosyne_version", str(version))
-    except Exception as e:
-        log("package", "mnemosyne_version", "ERROR", str(e))
-
-    # --- Core dependencies ---
-    required_deps = {
-        "fastembed": "fastembed",
-        "sqlite_vec": "sqlite_vec",
-        "numpy": "numpy",
-        "huggingface_hub": "huggingface_hub",
-    }
-    optional_deps = {
-        # Optional local-GGUF fallback only. Host/remote LLM paths and the
-        # non-LLM fallback work without it, so absence should not fail the
-        # installation health check.
-        "ctransformers": "ctransformers",
-    }
-    for name, module in required_deps.items():
-        try:
-            mod = __import__(module)
-            ver = getattr(mod, "__version__", "unknown")
-            log("deps", name, "OK", f"version={ver}")
-        except ImportError:
-            log("deps", name, "MISSING")
-        except Exception as e:
-            log("deps", name, "ERROR", str(e))
-    for name, module in optional_deps.items():
-        try:
-            mod = __import__(module)
-            ver = getattr(mod, "__version__", "unknown")
-            log("deps", name, "OK", f"version={ver}")
-        except ImportError:
-            log("deps", name, "OPTIONAL", "optional local-GGUF fallback dependency not installed")
-        except Exception as e:
-            log("deps", name, "ERROR", str(e))
-
-    # --- Mnemosyne core components ---
-    try:
-        from mnemosyne.core import embeddings as _embeddings
-        log("core", "embeddings_available", "YES" if _embeddings.available() else "NO")
-        log("core", "embeddings_model", _embeddings._DEFAULT_MODEL)
-    except Exception as e:
-        log("core", "embeddings", "ERROR", str(e))
-
-    try:
-        from mnemosyne.core.beam import _SQLITE_VEC_AVAILABLE
-        # _SQLITE_VEC_AVAILABLE only checks whether the pip package imports.
-        # It doesn't verify that the running sqlite3 module can actually load
-        # the extension (required for Python builds without
-        # --enable-loadable-sqlite-extensions). Do a runtime check here.
-        _vec_can_load = False
-        if _SQLITE_VEC_AVAILABLE:
-            try:
-                import sqlite3 as _sqlite3
-                _test_conn = _sqlite3.connect(":memory:")
-                _test_conn.enable_load_extension(True)
-                _vec_can_load = True
-                _test_conn.close()
-            except Exception:
-                _vec_can_load = False
-        log("core", "sqlite_vec_available", "YES" if _vec_can_load else "NO")
-        if _SQLITE_VEC_AVAILABLE and not _vec_can_load:
-            log("core", "sqlite_vec_warning", "Package imports but extension cannot load. Rebuild Python with --enable-loadable-sqlite-extensions.")
-    except Exception as e:
-        log("core", "sqlite_vec", "ERROR", str(e))
+    # --- Pure runtime/dependency/capability checks (no provider construction) ---
+    for check in collect_runtime_diagnostics()["checks"]:
+        log(check["category"], check["check"], check["status"], check["detail"])
 
     # --- Database state ---
     try:
         from mnemosyne.core.memory import Mnemosyne
-        mem = Mnemosyne()
+        if bank:
+            mem = Mnemosyne(session_id="hermes_default", bank=bank)
+        else:
+            mem = Mnemosyne()
         stats = mem.get_stats()
 
         # PII-safe: counts and config only, never content
@@ -265,6 +210,15 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False) 
         log("db", "episodic_vectors", str(ep.get("vectors", 0)))
         log("db", "episodic_vec_type", ep.get("vec_type", "none"))
         log("db", "db_path", stats.get("database", "unknown"))
+
+        if bank:
+            log("db", "resolved_bank", bank)
+            log("db", "resolved_db", stats.get("database", "unknown"))
+            resolved_bank = bank
+            resolved_db = stats.get("database", "unknown")
+        else:
+            resolved_bank = "default"
+            resolved_db = stats.get("database", "unknown")
 
         try:
             integrity = _sqlite_integrity_diagnostics(mem.beam.conn)
@@ -352,6 +306,8 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False) 
         "key_findings": [],
         "fixable": [],
         "entries": entries,
+        "resolved_bank": resolved_bank,
+        "resolved_db": resolved_db,
     }
 
     # Auto-detect common problems
@@ -471,7 +427,7 @@ def auto_fix(entries: List[Dict] = None, dry_run: bool = False) -> Dict:
             print(f"   ❌ Failed: {e.stderr.strip()[:200]}")
         except FileNotFoundError:
             result["failed"].append({"label": label, "error": "pip not found"})
-            print(f"   ❌ pip not found in PATH")
+            print("   ❌ pip not found in PATH")
 
     return result
 
@@ -482,9 +438,10 @@ if __name__ == "__main__":
     parser.add_argument("--fix", action="store_true", help="Auto-install missing dependencies")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be fixed/repaired without writing")
     parser.add_argument("--repair-vec-working", action="store_true", help="Backfill missing vec_working rows from memory_embeddings")
+    parser.add_argument("--bank", type=str, default=None, help="Mnemosyme bank to diagnose (default: profile-root DB)")
     args = parser.parse_args()
 
-    result = run_diagnostics(repair_vec_working=args.repair_vec_working, dry_run=args.dry_run)
+    result = run_diagnostics(repair_vec_working=args.repair_vec_working, dry_run=args.dry_run, bank=args.bank)
     print(json.dumps(result, indent=2))
 
     if args.fix or (args.dry_run and not args.repair_vec_working):

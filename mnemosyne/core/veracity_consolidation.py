@@ -29,8 +29,8 @@ import sqlite3
 import json
 import threading
 import unicodedata
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
+from datetime import datetime
+from typing import Dict, List, Optional
 from dataclasses import dataclass
 from pathlib import Path
 

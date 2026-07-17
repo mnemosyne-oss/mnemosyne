@@ -215,7 +215,7 @@ pip install -e integrations/hermes
 ## Support
 
 - [Documentation](https://github.com/AxDSan/mnemosyne#readme)
-- [Discord](https://discord.gg/3bDyGmE2)
+- [Discord](https://discord.gg/nousresearch)
 - [Issues](https://github.com/AxDSan/mnemosyne/issues)
 
 ## License

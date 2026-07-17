@@ -14,7 +14,7 @@ Honcho uses PostgreSQL with pgvector. No bulk export.
 
 import json
 from datetime import datetime
-from typing import List, Dict, Optional, Any
+from typing import List, Dict
 
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
 

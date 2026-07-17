@@ -342,6 +342,8 @@ class MnemosyneConfig:
         # Auto-seed config.yaml on first access if it doesn't exist
         if not self._config_path.exists():
             self._seed()
+        else:
+            self._warn_legacy_provider_defaults()
 
         self._load_yaml()
 
@@ -409,6 +411,39 @@ class MnemosyneConfig:
                          self._config_path, len(seed_data), env_count)
         except Exception as e:
             logger.warning("Failed to seed config.yaml: %s", e)
+
+    def _warn_legacy_provider_defaults(self) -> None:
+        """Warn about ambiguous 3.12.1/3.12.2 auto-seeded provider values.
+
+        The legacy seed header does not record whether values came from the
+        environment, so rewriting the file could destroy an explicit opt-in.
+        Preserve it and provide deterministic commands for adopting the safer
+        defaults.
+        """
+        try:
+            text = self._config_path.read_text(encoding="utf-8")
+            if "# Values below reflect your current env vars" not in text:
+                return
+
+            import yaml
+
+            data = yaml.safe_load(text) or {}
+            if not isinstance(data, dict):
+                return
+            if (
+                data.get("sync_roles") == "user,assistant"
+                and data.get("skip_contexts") == ""
+            ):
+                logger.warning(
+                    "Legacy provider defaults detected in %s; values may be "
+                    "explicit environment choices and were not rewritten. "
+                    "To adopt safe defaults, run: mnemosyne config set "
+                    "sync_roles user && mnemosyne config set skip_contexts "
+                    "cron,flush,subagent,background,skill_loop",
+                    self._config_path,
+                )
+        except Exception as e:
+            logger.warning("Failed to inspect legacy provider defaults: %s", e)
 
     @classmethod
     def reset_instance(cls) -> None:

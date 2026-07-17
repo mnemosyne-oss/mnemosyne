@@ -20,13 +20,12 @@ import logging
 import sqlite3
 import json
 import hashlib
-import logging
 import threading
 import math
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Any, Set, Union, Tuple
+from typing import List, Dict, Optional, Any, Set, Union, Tuple, Callable
 from pathlib import Path
 
 
@@ -989,6 +988,54 @@ def init_beam(db_path: Path = None):
         )
     """)
 
+    # --- Migration: drop legacy FK on memory_embeddings (#451) ---
+    # Databases created by the old memory.py DDL carry a
+    # FOREIGN KEY (memory_id) REFERENCES memories(id) constraint.
+    # The memories table is unused (0 rows); working_memory ids are
+    # stored here instead. With PRAGMA foreign_keys=ON (#408), every
+    # embedding insert silently fails. This migration rebuilds the
+    # table without the FK, preserving all existing data. Lost embeddings
+    # from the enforcement window are tracked as follow-up work.
+    _me_schema = cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'memory_embeddings'"
+    ).fetchone()
+    if _me_schema and "REFERENCES memories" in _me_schema[0]:
+        # Atomic rebuild: Python's sqlite3 only auto-opens a transaction
+        # before DML, not DDL, so CREATE TABLE below would otherwise
+        # autocommit on its own before the INSERT/DROP/RENAME transaction
+        # starts. Issue an explicit BEGIN so all four statements share one
+        # transaction and a crash/error rolls back to the original table.
+        try:
+            if conn.in_transaction:
+                conn.commit()
+            cursor.execute("BEGIN")
+            cursor.execute("""
+                CREATE TABLE _me_rebuilt (
+                    memory_id TEXT PRIMARY KEY,
+                    embedding_json TEXT NOT NULL,
+                    model TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            # Explicit column list — don't rely on SELECT * column order
+            # matching between legacy and rebuilt table.
+            cursor.execute("""
+                INSERT INTO _me_rebuilt (memory_id, embedding_json, model, created_at)
+                SELECT memory_id, embedding_json, model, created_at FROM memory_embeddings
+            """)
+            cursor.execute("DROP TABLE memory_embeddings")
+            cursor.execute("ALTER TABLE _me_rebuilt RENAME TO memory_embeddings")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            # Clean up temp table if it was created before the failure
+            try:
+                cursor.execute("DROP TABLE IF EXISTS _me_rebuilt")
+                conn.commit()
+            except Exception:
+                pass
+            raise
+
     conn.commit()
 
     # --- Migration: recall tracking columns (v2.1) ---
@@ -1659,13 +1706,55 @@ _RECALL_SYNONYMS: Dict[str, tuple[str, ...]] = {
 }
 
 
+def _is_meaningful_recall_token(token: str) -> bool:
+    """Return whether a token is eligible for lexical recall matching."""
+    return len(token) >= 3 and token not in _FACT_MATCH_STOPWORDS and not token.isdigit()
+
+
 def _recall_tokens(text: str) -> List[str]:
     """Meaningful lexical tokens for precision gates and fallback scoring."""
     return [
         token
         for token in _RECALL_TOKEN_RE.findall(text.lower())
-        if len(token) >= 3 and token not in _FACT_MATCH_STOPWORDS and not token.isdigit()
+        if _is_meaningful_recall_token(token)
     ]
+
+
+def _hyphen_components(token: str) -> List[str]:
+    """Return unique hyphen components eligible for lexical recall matching."""
+    if "-" not in token:
+        return []
+    return list(dict.fromkeys(
+        part for part in token.split("-") if _is_meaningful_recall_token(part)
+    ))
+
+
+def _component_unit_weight(components: List[str]) -> int:
+    """Return the lexical-unit weight for a token's hyphen components."""
+    return len(components) if len(components) >= 2 else 1
+
+
+def _expand_hyphenated_tokens(tokens: List[str]) -> List[str]:
+    """Keep hyphenated tokens and add their meaningful components.
+
+    The full compound remains available for precise matches. Components make
+    differently-hyphenated forms such as ``orion-telemetrie`` and
+    ``orion-gateway ... telemetrie`` comparable at the lexical gate.
+    Other structured separators (paths, versions, identifiers) stay intact.
+    """
+    expanded: List[str] = []
+    seen: Set[str] = set()
+    for token in tokens:
+        # Preserve existing token semantics. Only newly exposed hyphen
+        # components need the same filtering as _recall_tokens.
+        if token not in seen:
+            seen.add(token)
+            expanded.append(token)
+        for candidate in _hyphen_components(token):
+            if candidate not in seen:
+                seen.add(candidate)
+                expanded.append(candidate)
+    return expanded
 
 
 def _expanded_query_tokens(tokens: List[str]) -> List[str]:
@@ -1676,7 +1765,7 @@ def _expanded_query_tokens(tokens: List[str]) -> List[str]:
     """
     expanded: List[str] = []
     seen: Set[str] = set()
-    for token in tokens:
+    for token in _expand_hyphenated_tokens(tokens):
         for candidate in (token, *_RECALL_SYNONYMS.get(token, ())):
             if candidate not in seen:
                 seen.add(candidate)
@@ -1776,6 +1865,13 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
     }
     if not query_tokens and not query_cjk:
         return 0.0
+    # Callers pass raw _recall_tokens() output. Count each compound's
+    # meaningful components as separate lexical units so they can match a
+    # differently-hyphenated fact without outweighing the rest of the query.
+    component_groups = [_hyphen_components(token) for token in query_tokens]
+    lexical_unit_count = sum(
+        _component_unit_weight(components) for components in component_groups
+    )
     content_tokens = set(_recall_tokens(content_lower))
     # Structured MEMORIA contexts often encode keys as snake_case
     # (telemetry_api_latency_ms). Split separators so natural-language
@@ -1784,17 +1880,32 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
     for token in list(content_tokens):
         expanded_content_tokens.update(
             part for part in re.split(r"[_:/.-]+", token)
-            if len(part) >= 3 and part not in _FACT_MATCH_STOPWORDS and not part.isdigit()
+            if _is_meaningful_recall_token(part)
         )
     content_tokens = expanded_content_tokens
     if not content_tokens and not query_cjk:
         return 0.0
 
-    exact = sum(1 for token in query_tokens if token in content_tokens)
+    exact = 0
     partial = 0.0
-    for token in query_tokens:
+    for token, components in zip(query_tokens, component_groups, strict=True):
         if token in content_tokens:
+            exact += _component_unit_weight(components)
             continue
+
+        component_hits = sum(part in content_tokens for part in components)
+        if len(components) >= 2 and component_hits >= 2:
+            # A differently-hyphenated fact must share at least two meaningful
+            # components. One generic component (e.g. "gateway") is not enough.
+            exact += component_hits
+            continue
+        if components:
+            # Reached when there are fewer than two meaningful components, or
+            # when fewer than two components match. Keep only an exact full
+            # token match; insufficient overlap must not gain synonym or
+            # substring fallback credit.
+            continue
+
         synonyms = _RECALL_SYNONYMS.get(token, ())
         if synonyms and any(syn in content_tokens for syn in synonyms):
             partial += 0.75
@@ -1807,7 +1918,7 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
             partial += 0.4
 
     full_match = 1.0 if query_lower and query_lower in content_lower else 0.0
-    score = (exact + partial + full_match) / max(len(query_tokens), 1)
+    score = (exact + partial + full_match) / max(lexical_unit_count, 1)
 
     if score == 0.0:
         query_cjk = {
@@ -2436,7 +2547,7 @@ def _cjk_like_search(conn: sqlite3.Connection, query: str, k: int = 20, working:
         id_col = "rowid"
 
     # Build parameterized LIKE clauses for each CJK character
-    conditions = " OR ".join(f"content LIKE ? ESCAPE '\\'" for _ in cjk_chars)
+    conditions = " OR ".join("content LIKE ? ESCAPE '\\'" for _ in cjk_chars)
     params = [f"%{ch}%" for ch in cjk_chars]
     # Also search for mixed CJK+ASCII: any of the CJK chars must be present
     try:
@@ -6559,7 +6670,6 @@ class BeamMemory:
         if _os.environ.get("MNEMOSYNE_ENHANCED_RECALL", "0") != "1":
             return self.recall(query, top_k=top_k, **kwargs)
 
-        import json as _json
 
         original_query = query
         expanded_query = query

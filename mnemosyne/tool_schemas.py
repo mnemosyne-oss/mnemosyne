@@ -362,6 +362,24 @@ RECALL_CANONICAL_SCHEMA = {
     },
 }
 
+FORGET_CANONICAL_SCHEMA = {
+    "name": "mnemosyne_forget_canonical",
+    "description": (
+        "Retire a CANONICAL self-fact slot for the current profile. "
+        "Stamps valid_until on the current row, preserving it as history. "
+        "Returns whether a current row was retired. Nothing is deleted. "
+        "Use this to remove a canonical fact (e.g. a stale preference or identity)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "category": {"type": "string", "description": "Slot group, e.g. 'identity', 'voice', 'preference'"},
+            "name": {"type": "string", "description": "Slot key within the category, e.g. 'name', 'pronouns'"},
+        },
+        "required": ["category", "name"],
+    },
+}
+
 SCRATCHPAD_WRITE_SCHEMA = {
     "name": "mnemosyne_scratchpad_write",
     "description": "Write a temporary note to the Mnemosyne scratchpad.",

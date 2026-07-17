@@ -597,3 +597,19 @@ def recall_canonical(
     """Read a single canonical fact without instantiating CanonicalStore."""
     store = CanonicalStore(db_path=db_path)
     return store.recall(owner_id, category, name)
+
+
+def forget_canonical(
+    owner_id: str,
+    category: str,
+    name: str,
+    db_path: Optional[Path] = None,
+) -> bool:
+    """Retire a canonical slot without replacing it.
+
+    Stamps ``valid_until`` on the current row, preserving it as history.
+    Returns True if a current row was retired, False if the slot was
+    already empty.
+    """
+    store = CanonicalStore(db_path=db_path)
+    return store.forget(owner_id, category, name)

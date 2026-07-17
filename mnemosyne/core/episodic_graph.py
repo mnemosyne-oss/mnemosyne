@@ -20,8 +20,8 @@ import re
 import json
 import sqlite3
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Set
-from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -600,7 +600,7 @@ if __name__ == "__main__":
     
     # Find related
     related = graph.find_related_memories("mem_001", depth=1)
-    print(f"\nRelated memories:")
+    print("\nRelated memories:")
     for r in related:
         print(f"  {r['memory_id']} --{r['edge_type']}--> weight={r['weight']} (depth={r['depth']})")
     

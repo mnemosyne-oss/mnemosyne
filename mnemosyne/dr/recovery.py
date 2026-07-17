@@ -13,7 +13,7 @@ import shutil
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 
 def get_default_paths():
@@ -198,7 +198,7 @@ def emergency_restore(backup_dir: Path = None, db_path: Path = None) -> Dict:
                     "backup_used": str(backup),
                     "attempts": 1
                 }
-        except Exception as e:
+        except Exception:
             continue
     
     raise RuntimeError("All backups failed integrity check")

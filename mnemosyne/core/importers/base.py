@@ -12,7 +12,7 @@ import hashlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Dict, Optional, Any
+from typing import List, Dict
 
 
 @dataclass
@@ -198,7 +198,7 @@ def import_from_file(filepath: str, mnemosyne, dry_run: bool = False,
     Returns:
         ImporterResult
     """
-    from .base import BaseImporter, ImporterResult
+    from .base import BaseImporter
 
     class FileImporter(BaseImporter):
         provider_name = "file"

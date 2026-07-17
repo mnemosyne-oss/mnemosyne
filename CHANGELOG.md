@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
+## [Unreleased]
+
+### Fixed
+
+- **Declare PyYAML as a runtime dependency.** First-run config initialization imports `yaml`, so clean installs now receive the dependency automatically.
+- **Honor `HERMES_HOME` for diagnostic logs.** `mnemosyne diagnose` now writes beside the active Hermes home instead of always writing under `~/.hermes`.
+- **Retry transient embedding API failures.** HTTP 429/5xx responses and transient network errors now receive bounded exponential-backoff retries, while permanent 4xx errors fail fast.
+- **Harden runtime lifecycle and connection ownership.** `Mnemosyne` now initializes its BEAM runtime reliably, reconnects stale thread-local connections, and prevents an older instance from closing a newer owner’s database connection.
+- **Restore polyphonic recall and provider parity.** Polyphonic similarity reads the current memory representation, and the root Hermes provider now exposes and dispatches the canonical forget operation alongside the integration provider.
+- **Synchronize Hermes package version metadata.** The integration module now reports the same `0.4.0` version declared by its package metadata.
+- **Hermes provider safety defaults after config bridging.** New auto-seeded
+  configs now preserve user-only autosave and skip `cron`, `flush`, `subagent`,
+  `background`, and `skill_loop` contexts. Existing 3.12.1/3.12.2 auto-seeded
+  files are not rewritten because their values may have come from explicit
+  environment variables. To adopt the safer defaults explicitly, run:
+
+  ```bash
+  mnemosyne config set sync_roles user
+  mnemosyne config set skip_contexts cron,flush,subagent,background,skill_loop
+  ```
+
+- **Migrate legacy `memory_embeddings` FK on database init (#451).**
+  Databases created by the old `memory.py` DDL carried a
+  `FOREIGN KEY (memory_id) REFERENCES memories(id)` constraint on
+  `memory_embeddings`. The `memories` table is unused — working_memory
+  ids are stored instead. When `PRAGMA foreign_keys=ON` was enabled
+  (#408), every embedding insert silently failed with
+  `IntegrityError: FOREIGN KEY constraint failed`. This release adds
+  an idempotent migration that rebuilds the table without the FK
+  and removes the FK from the `memory.py` DDL so fresh
+  databases are clean.
+
 ## [3.13.0] — 2026-07-18
 
 ### Fixed

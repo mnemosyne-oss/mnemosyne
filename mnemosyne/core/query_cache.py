@@ -29,13 +29,11 @@ Usage:
     cache.put(query, results, embedding)
 """
 
-import hashlib
 import json
 import math
 import time
 import threading
-from datetime import datetime
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional
 from pathlib import Path
 import sqlite3
 

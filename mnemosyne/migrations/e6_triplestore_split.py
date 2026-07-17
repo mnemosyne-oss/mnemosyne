@@ -30,7 +30,7 @@ from __future__ import annotations
 import shutil
 import sqlite3
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from mnemosyne.core.annotations import ANNOTATION_KINDS, init_annotations
 

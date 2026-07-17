@@ -27,12 +27,10 @@ Security note (S1, 2026-05-12):
 
 import hmac
 import os
-import sys
 import json
 import asyncio
 import logging
 from typing import Optional, Tuple
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 

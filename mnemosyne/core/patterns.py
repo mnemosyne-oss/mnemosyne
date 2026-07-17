@@ -16,10 +16,8 @@ Pattern detection:
 """
 
 import re
-import json
-import math
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Any, Callable, Tuple, Set
+from datetime import datetime
+from typing import List, Dict, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from collections import Counter, defaultdict
 
