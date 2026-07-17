@@ -1136,6 +1136,24 @@ def cmd_migrate(args):
     print(f"  indices added: {report['indices_added']}")
 
 
+def cmd_cleanup_orphans(args):
+    """Prune orphaned gists + memory_embeddings rows whose memory_id no longer exists in any parent table.
+
+    Accumulate from earlier forget/consolidate paths that lacked cascade cleanup.
+    Use --dry-run to preview without modifying the database.
+    """
+    dry_run = "--dry-run" in args
+    mem = _get_memory()
+    result = mem.beam.prune_cascade_orphans(dry_run=dry_run)
+    print(f"Status: {result['status']}")
+    print(f"  Gists orphans:       {result['gists_orphans']}")
+    print(f"  Embeddings orphans:  {result['memory_embeddings_orphans']}")
+    if not dry_run:
+        print(f"  Gists deleted:       {result['gists_deleted']}")
+        print(f"  Embeddings deleted:  {result['memory_embeddings_deleted']}")
+        print(f"  Total rows cleaned:  {result['total_deleted']}")
+
+
 COMMANDS = {
     "store": cmd_store,
     "remember": cmd_store,
@@ -1169,6 +1187,8 @@ COMMANDS = {
     "hygiene": cmd_hygiene,
     "profile": cmd_profile,
     "config": cmd_config,
+    "prune-orphans": cmd_cleanup_orphans,
+    "cleanup-orphans": cmd_cleanup_orphans,
 }
 
 

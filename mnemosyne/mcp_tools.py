@@ -511,6 +511,12 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         if action == "delete":
+            conn.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
+            conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+            conn.execute("DELETE FROM annotations WHERE memory_id = ?", (memory_id,))
+            row = conn.execute("SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)).fetchone()
+            if row is not None:
+                conn.execute("DELETE FROM vec_working WHERE rowid = ?", (row["rowid"],))
             conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
         elif action == "update":
             conn.execute(

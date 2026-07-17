@@ -628,6 +628,11 @@ class Mnemosyne:
             limit=limit,
         )
 
+    def prune_cascade_orphans(self, dry_run: bool = False) -> Dict:
+        """Prune orphaned gists + memory_embeddings rows (accumulated from
+        earlier forget/consolidate paths that lacked cascade cleanup)."""
+        return self.beam.prune_cascade_orphans(dry_run=dry_run)
+
     def scratchpad_write(self, content: str) -> str:
         """Write to scratchpad."""
         return self.beam.scratchpad_write(content)
@@ -1040,6 +1045,11 @@ def reclaim_orphans(dry_run: bool = False, stale_after_seconds: int = 3600,
         stale_after_seconds=stale_after_seconds,
         limit=limit,
     )
+
+
+def prune_cascade_orphans(dry_run: bool = False, bank: str = None) -> Dict:
+    """Prune orphaned gists + memory_embeddings rows using the global instance."""
+    return _get_default(bank).prune_cascade_orphans(dry_run=dry_run)
 
 
 def scratchpad_write(content: str, bank: str = None) -> str:

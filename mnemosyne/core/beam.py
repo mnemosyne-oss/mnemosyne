@@ -4172,6 +4172,11 @@ class BeamMemory:
                     "DELETE FROM annotations WHERE memory_id = ?", (memory_id,)
                 )
                 cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+                # gists table is optional (episodic graph extension) — skip if missing
+                try:
+                    cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
+                except Exception:
+                    pass
         return wm_rows > 0
 
     # ------------------------------------------------------------------
@@ -7919,6 +7924,50 @@ class BeamMemory:
             "reclaimed": reclaimed,
             "candidate_ids": candidate_ids,
         }
+
+    def prune_cascade_orphans(self, dry_run: bool = False) -> Dict:
+        """Clean up orphaned gists + memory_embeddings rows whose memory_id
+        does not exist in any parent table (working_memory, episodic_memory,
+        memoria_facts, etc.). These accumulate from earlier forget/consolidate
+        paths that lacked cascade cleanup (the deferred design question from #452).
+
+        With dry_run=True, only reports counts — no writes.
+        """
+        cursor = self.conn.cursor()
+        parent_union = (
+            "SELECT id FROM working_memory"
+            " UNION SELECT id FROM episodic_memory"
+            " UNION SELECT id FROM memoria_facts"
+            " UNION SELECT id FROM memoria_preferences"
+            " UNION SELECT id FROM memoria_instructions"
+            " UNION SELECT id FROM memoria_kg"
+            " UNION SELECT event_id AS id FROM memoria_timelines"
+        )
+
+        result = {"gists_orphans": 0, "memory_embeddings_orphans": 0, "gists_deleted": 0, "memory_embeddings_deleted": 0}
+
+        # Check if child tables exist
+        tables_present = {row["name"] for row in cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('gists','memory_embeddings')"
+        )}
+
+        for child, id_col in [("gists", "memory_id"), ("memory_embeddings", "memory_id")]:
+            if child not in tables_present:
+                continue
+            # Count orphans
+            cursor.execute(f"SELECT COUNT(*) FROM {child} WHERE {id_col} IS NOT NULL AND {id_col} NOT IN ({parent_union})")
+            orphan_count = cursor.fetchone()[0]
+            result[f"{child}_orphans"] = orphan_count
+            if orphan_count and not dry_run:
+                cursor.execute(f"DELETE FROM {child} WHERE {id_col} IS NOT NULL AND {id_col} NOT IN ({parent_union})")
+                result[f"{child}_deleted"] = cursor.rowcount
+
+        if not dry_run:
+            self.conn.commit()
+
+        result["status"] = "dry_run" if dry_run else "pruned"
+        result["total_deleted"] = result["gists_deleted"] + result["memory_embeddings_deleted"]
+        return result
 
     def sleep(self, dry_run: bool = False, force: bool = False) -> Dict:
         """

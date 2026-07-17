@@ -10,7 +10,7 @@ Example:
     >>> results = recall("user preferences")
 """
 
-__version__ = "3.12.2"
+__version__ = "3.13.0"
 __author__ = "Abdias J"
 __license__ = "MIT"
 
@@ -26,6 +26,7 @@ _lazy_exports = {
     "forget": (".core.memory", "forget"),
     "update": (".core.memory", "update"),
     "reclaim_orphans": (".core.memory", "reclaim_orphans"),
+    "prune_cascade_orphans": (".core.memory", "prune_cascade_orphans"),
     "SyncEngine": (".core.sync", "SyncEngine"),
     "SyncEvent": (".core.sync", "SyncEvent"),
     "SyncEncryption": (".core.sync", "SyncEncryption"),
