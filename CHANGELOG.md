@@ -5,29 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
-## [Unreleased]
+## [3.14.0] - 2026-07-17
+
+### Added
+
+- **Write-approval gate for Mnemosyne memory writes (#456).** When `memory.write_approval: true` is set in Hermes config.yaml, `mnemosyne_remember` and `mnemosyne_batch` stage writes to `pending/memory/<id>.json` instead of committing directly. The new `mnemosyne_apply_pending` tool replays approved records through the BEAM write path. Both standalone and bundled Hermes providers are supported.
+- **`mnemosyne_forget_canonical` tool (#435).** Completes the CRUD surface for canonical facts: remember, recall, and now forget (retire) a slot. Stamps `valid_until` on the current row, preserving history. Nothing is deleted.
+- **Safe doctor and selected repair workflow.** The `mnemosyne doctor` command now supports a `--safe` mode that performs read-only diagnostics, plus a `--repair` mode that can fix selected issues (orphaned references, WAL cleanup, vec_working migration gaps).
+- **Query/document embedding prompt prefix env vars (#401).** `MNEMOSYNE_EMBEDDING_QUERY_PREFIX` and `MNEMOSYNE_EMBEDDING_DOCUMENT_PREFIX` allow customizing embedding prompt prefixes for BGE-style models.
+- **Shared-surface sync hardening (#442).** Blind-relay security: sync event payloads are sanitized before public broadcast, cross-model security findings are closed, and the sync server binds to a dedicated shared surface.
+- **CLA requirement for contributors.** All PRs now require a signed Contributor License Agreement. Branch protection enforces the `license/cla` check on main.
 
 ### Fixed
 
-- **Declare PyYAML as a runtime dependency.** First-run config initialization imports `yaml`, so clean installs now receive the dependency automatically.
-- **Honor `HERMES_HOME` for diagnostic logs.** `mnemosyne diagnose` now writes beside the active Hermes home instead of always writing under `~/.hermes`.
-- **Retry transient embedding API failures.** HTTP 429/5xx responses and transient network errors now receive bounded exponential-backoff retries, while permanent 4xx errors fail fast.
-- **Harden runtime lifecycle and connection ownership.** `Mnemosyne` now initializes its BEAM runtime reliably, reconnects stale thread-local connections, and prevents an older instance from closing a newer owner’s database connection.
-- **Restore polyphonic recall and provider parity.** Polyphonic similarity reads the current memory representation, and the root Hermes provider now exposes and dispatches the canonical forget operation alongside the integration provider.
-- **Synchronize Hermes package version metadata.** The integration module now reports the same `0.4.0` version declared by its package metadata.
-- **Hermes provider safety defaults after config bridging.** New auto-seeded
-  configs now preserve user-only autosave and skip `cron`, `flush`, `subagent`,
-  `background`, and `skill_loop` contexts. Existing 3.12.1/3.12.2 auto-seeded
-  files are not rewritten because their values may have come from explicit
-  environment variables. To adopt the safer defaults explicitly, run:
+- **Config set crash (#481).** `mnemosyne config set` no longer crashes with AttributeError after writing the value. The `REQUIRES_RESTART` check now imports from the module-level set.
+- **Expired Discord links (#479).** All Discord invite links updated to `discord.gg/nousresearch`.
+- **onnxruntime thread affinity spam in LXC containers (#453).** `TextEmbedding` now receives an explicit `threads=` parameter, preventing `pthread_setaffinity_np` EINVAL errors in unprivileged containers. Override with `MNEMOSYNE_EMBEDDING_THREADS` env var.
+- **Polyphonic recall collapse (#389).** `_estimate_similarity` now uses word-level content Jaccard instead of voice-name Jaccard, preventing MMR diversity reranking from collapsing to a single result when one voice dominates.
+- **Content mutation (#387).** Temporal annotations (`[DATES:]`, `[DURATIONS:]`) are now stored in metadata instead of appended to the content field, preserving byte-identical content for verbatim-reproduction workflows.
+- **Polyphonic content hydration (#471).** `PolyphonicResult` now carries a `content` attribute, hydrated from the database before diversity ranking, so the content-Jaccard scorer works correctly.
+- **Main CI contracts restored (#480).** Post-merge CI test alignment fixed, restoring green CI on main.
+- **Unsafe connection lifecycle change reverted (#477, #382).** The `__del__`-based WAL cleanup was reverted. Safe multi-DB lifecycle support needs a defined lease contract, not a destructor.
+- **Embedding API retries (#475, #478).** HTTP 429/5xx and transient network failures now receive bounded exponential-backoff retries with jitter. Permanent 4xx errors still fail fast.
+- **Hermes provider diagnostics.** `mnemosyne diagnose` now resolves logs under `HERMES_HOME` when set, and the doctor tool respects the resolved bank.
+- **Local LLM SSE errors (#447).** Streaming set to false to prevent SSE errors on certain local LLM backends.
+- **Legacy memory_embeddings FK migration (#452).** Databases created by old DDL now migrate their foreign keys correctly on init.
+- **Hyphenated recall query expansion.** Compound query tokens are now expanded for better matching.
+- **Hermes provider defaults after config bridge.** New auto-seeded configs preserve user-only autosave and skip noisy contexts.
+- **Code audit cleanup (#460).** Callable import, duplicate import, and F-rules linting fixed.
 
-  ```bash
-  mnemosyne config set sync_roles user
-  mnemosyne config set skip_contexts cron,flush,subagent,background,skill_loop
-  ```
+### Security
 
-- **Migrate legacy `memory_embeddings` FK on database init (#451).**
-  Databases created by the old `memory.py` DDL carried a
+- Sync event payloads are sanitized before public broadcast.
+- Cross-model security findings in sync layer closed.
+- Branch protection enforces `license/cla` check on main (no admin bypass).
   `FOREIGN KEY (memory_id) REFERENCES memories(id)` constraint on
   `memory_embeddings`. The `memories` table is unused — working_memory
   ids are stored instead. When `PRAGMA foreign_keys=ON` was enabled
