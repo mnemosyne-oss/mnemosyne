@@ -83,9 +83,3 @@ results/
 
 # Agent logs
 growth_agent_log_*.json
-
-# Local development hooks (not for public repo)
-.local-hooks/
-
-# Internal documentation (operational handoffs, not for public)
-internal docs/
