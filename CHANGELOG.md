@@ -36,31 +36,11 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   an idempotent migration that rebuilds the table without the FK
   and removes the FK from the `memory.py` DDL so fresh
   databases are clean.
-
-## [3.13.0] — 2026-07-18
-
-### Fixed
-
-- **Cascade delete now cleans up `gists` on `forget_working()`.** The
-  `BeamMemory.forget_working()` path already cascaded to `memory_embeddings`,
-  `annotations`, and `vec_working` but was missing `gists`. Orphaned gist
-  rows accumulated when a memory was forgotten or consolidated.
-- **`mcp_tools.py` validate(delete) path now cascades fully.** The bare
-  `DELETE FROM working_memory` previously left orphaned child rows in
-  `gists`, `memory_embeddings`, `annotations`, and `vec_working`. Now
-  mirrors `BeamMemory.forget_working()` by deleting all dependent rows
-  before removing the parent.
-
-### Added
-
-- **`mnemosyne cleanup-orphans` / `prune-orphans` CLI command.** One-time
-  cleanup that deletes all orphaned `gists` and `memory_embeddings` rows
-  whose `memory_id` does not exist in any parent table. Supports `--dry-run`
-  (counts only, no writes). Safe by construction — only removes already-dangling
-  pointer rows. (Follow-on from #452's deferred polymorphic ownership-model
-  question.)
-- **`mnemosyne.prune_cascade_orphans()` public API.** Accessible as
-  `from mnemosyne import prune_cascade_orphans`.
+- **`mcp_tools.py` validate(delete) path now cascades to child rows.**
+  The bare `DELETE FROM working_memory` previously left orphaned
+  `memory_embeddings`, `annotations`, and `vec_working` rows behind.
+  The path now deletes all dependent rows before removing the parent,
+  with guarded vec_working handling for sqlite-vec-unavailable environments.
 
 ## [3.12.0] — 2026-07-11
 

@@ -1,0 +1,76 @@
+#!/bin/bash
+# Mnemosyne pre-push hook — validates tags against __version__ and SemVer rules.
+# Install: git config core.hooksPath .githooks
+
+set -euo pipefail
+
+VERSION_FILE="mnemosyne/__init__.py"
+
+# Only run during tag pushes
+refs=()
+while read -r local_ref local_sha remote_ref remote_sha; do
+    if [[ "$remote_ref" == refs/tags/* ]]; then
+        refs+=("${remote_ref#refs/tags/}")
+    fi
+done
+
+if [ ${#refs[@]} -eq 0 ]; then
+    exit 0
+fi
+
+# Parse version from __init__.py
+if [ ! -f "$VERSION_FILE" ]; then
+    echo "ERROR: $VERSION_FILE not found. Run from repo root."
+    exit 1
+fi
+
+pkg_version=$(grep -E "^__version__\s*=" "$VERSION_FILE" | sed -E "s/__version__\s*=\s*['\"]([^'\"]+)['\"].*/\1/")
+if [ -z "$pkg_version" ]; then
+    echo "ERROR: Could not extract __version__ from $VERSION_FILE"
+    exit 1
+fi
+
+for tag in "${refs[@]}"; do
+    # Validate format: vMAJOR.MINOR.PATCH
+    if ! echo "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo "ERROR: Tag '$tag' must match format vMAJOR.MINOR.PATCH (e.g. v3.1.2)"
+        echo "  Got:      $tag"
+        echo "  Expected: vMAJOR.MINOR.PATCH"
+        exit 1
+    fi
+
+    # Strip 'v' prefix for comparison
+    tag_version="${tag#v}"
+
+    # Must match __version__
+    if [ "$tag_version" != "$pkg_version" ]; then
+        echo "ERROR: Tag version '$tag_version' does not match __version__ in $VERSION_FILE"
+        echo "  Tag:         $tag"
+        echo "  __version__: $pkg_version"
+        echo ""
+        echo "  Fix: Update mnemosyne/__init__.py or use the correct tag."
+        exit 1
+    fi
+
+    # Extract components
+    major=$(echo "$tag_version" | cut -d. -f1)
+    minor=$(echo "$tag_version" | cut -d. -f2)
+    patch=$(echo "$tag_version" | cut -d. -f3)
+
+    # Check that the tag isn't backtracking (new tag must be >= all existing tags)
+    # Uses git tag sorting (version sort, so v3.1.9 < v3.1.10)
+    latest_existing=$(git tag --sort=-v:refname 2>/dev/null | head -1 || echo "")
+    if [ -n "$latest_existing" ]; then
+        latest_ver="${latest_existing#v}"
+        # Only compare if the new tag would go backwards
+        if [ "$(printf '%s\n' "$tag_version" "$latest_ver" | sort -V | head -1)" = "$tag_version" ] && [ "$tag_version" != "$latest_ver" ]; then
+            echo "ERROR: Tag '$tag_version' is behind existing tag '$latest_ver'"
+            echo "  New tag must be greater than the latest existing tag."
+            exit 1
+        fi
+    fi
+
+    echo "✓ Tag '$tag' matches __version__ ('$pkg_version')"
+done
+
+exit 0

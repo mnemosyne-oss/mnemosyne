@@ -1,0 +1,49 @@
+#!/bin/sh
+# Pre-commit hook: block commits containing personal email + scan for secrets
+# Install: git config core.hooksPath .local-hooks
+
+HOOK_FILE=".local-hooks/pre-commit"
+
+# ── PII check (from upstream) ─────────────────────────────────────────
+PII_PATTERNS="1641797+AxDSan@users.noreply.github.com"
+
+staged=$(git diff --cached --name-only | grep -v "^$HOOK_FILE$" || true)
+if [ -n "$staged" ]; then
+  if echo "$staged" | xargs grep -l "$PII_PATTERNS" 2>/dev/null; then
+    echo "ERROR: PII detected in staged files. Remove before committing."
+    echo "Found pattern: $PII_PATTERNS"
+    exit 1
+  fi
+fi
+
+CURRENT_EMAIL=$(git config user.email)
+if [ "$CURRENT_EMAIL" = "1641797+AxDSan@users.noreply.github.com" ]; then
+  echo "INFO: Git user.email set to the noreply address (expected for Mnemosyne repo). Skipping check."
+fi
+
+# ── Gitleaks secret scan ──────────────────────────────────────────────
+GITLEAKS="/home/linuxbrew/.linuxbrew/bin/gitleaks"
+if [ ! -x "$GITLEAKS" ]; then
+  GITLEAKS=$(command -v gitleaks 2>/dev/null)
+fi
+
+if [ -n "$GITLEAKS" ] && [ -x "$GITLEAKS" ]; then
+  REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+  GITLEAKS_CONFIG=""
+  if [ -n "$REPO_ROOT" ] && [ -f "$REPO_ROOT/.gitleaksrc.toml" ]; then
+    GITLEAKS_CONFIG="--config $REPO_ROOT/.gitleaksrc.toml"
+  fi
+
+  if ! "$GITLEAKS" protect --staged --no-banner --source . $GITLEAKS_CONFIG 2>/dev/null; then
+    echo ""
+    echo "ERROR: Gitleaks detected secrets in staged files."
+    echo "  Review the findings above and remove any real secrets."
+    echo "  To bypass (emergency only): git commit --no-verify"
+    exit 1
+  fi
+else
+  echo "WARNING: gitleaks not found — secret scan skipped."
+  echo "  Install: brew install gitleaks"
+fi
+
+exit 0
