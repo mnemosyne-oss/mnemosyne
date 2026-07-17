@@ -179,8 +179,6 @@ class EpisodicGraph:
         Returns:
             Gist object
         """
-        content_lower = content.lower()
-        
         # Extract participants
         participants = self._extract_participants(content)
         

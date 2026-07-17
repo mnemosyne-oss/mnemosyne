@@ -298,12 +298,6 @@ class Mem0Importer(BaseImporter):
                     if ts:
                         meta["imported_at_original"] = ts
 
-                    # Override session_id if specified
-                    if session_id:
-                        sid = session_id
-                    else:
-                        sid = None  # Let Mnemosyne use its own session
-
                     mid = mnemosyne.remember(
                         content=mem_dict["content"],
                         source=mem_dict.get("source", self.provider_name),

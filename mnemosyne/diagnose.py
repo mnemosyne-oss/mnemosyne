@@ -10,15 +10,13 @@ Never includes memory content, user queries, or API keys.
 Supports --fix mode: auto-installs missing dependencies.
 """
 
-import importlib.metadata
+import importlib.metadata  # noqa: F401  (monkeypatched by tests; runtime_diagnostics calls .version)
 import json
 import os
 import subprocess
-import sys
-import platform
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List
 
 from mnemosyne.runtime_diagnostics import collect_runtime_diagnostics
 

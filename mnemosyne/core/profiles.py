@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from mnemosyne.core.config import ENV_VAR_MAP, REQUIRES_RESTART, get_config
+from mnemosyne.core.config import ENV_VAR_MAP, get_config
 
 logger = logging.getLogger(__name__)
 

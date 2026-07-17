@@ -137,7 +137,6 @@ def _format_cluster_for_llm(cluster: List[Dict]) -> str:
         predicate = item.get("predicate", "stated")
         obj = item.get("object", item.get("content", ""))
         confidence = item.get("confidence", 0.5)
-        timestamp = item.get("timestamp", "unknown")
         source = item.get("source", "fact")
         lines.append(
             f"[{i}] ({source}, conf={confidence:.2f}) {subject} | {predicate} | {obj}"
@@ -532,7 +531,6 @@ def recall_beliefs(beam, query: str, top_k: int = 10) -> List[Dict]:
 
     try:
         query_emb = _embed(query)
-        query_blob = query_emb.tobytes()
 
         # Search by embedding on object text
         results = []
