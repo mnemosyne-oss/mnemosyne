@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
+## [3.15.0] - 2026-07-18
+
+### Fixed
+
+- **Trim-before-embedding foreign-key failure (#491).** Working-memory embedding storage now atomically checks that its parent row still exists. A row legitimately removed by trimming or concurrent deletion becomes a clean no-op instead of logging a foreign-key failure; foreign-key enforcement remains enabled and no orphan embedding is created.
+
 ## [3.14.0] - 2026-07-17
 
 ### Added
