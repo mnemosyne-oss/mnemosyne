@@ -4,7 +4,7 @@ import json
 import logging
 import sqlite3
 
-import mnemosyne.core.beam as beam
+from mnemosyne.core import beam
 
 
 def _minimal_connection() -> sqlite3.Connection:
@@ -32,7 +32,7 @@ def test_embedding_store_skips_parent_removed_by_trim(monkeypatch):
     monkeypatch.setattr(beam, "np", None)
     monkeypatch.setattr(beam._embeddings, "serialize", json.dumps)
     monkeypatch.setattr(
-        beam, "_wm_vec_upsert", lambda *args, **kwargs: vec_calls.append(args)
+        beam, "_wm_vec_upsert", lambda *args, **_kwargs: vec_calls.append(args)
     )
 
     beam._store_working_embedding(conn, "trimmed", [0.1, 0.2])
@@ -49,7 +49,7 @@ def test_embedding_store_preserves_present_parent_and_cascade(monkeypatch):
     monkeypatch.setattr(beam, "np", None)
     monkeypatch.setattr(beam._embeddings, "serialize", json.dumps)
     monkeypatch.setattr(
-        beam, "_wm_vec_upsert", lambda *args, **kwargs: vec_calls.append(args)
+        beam, "_wm_vec_upsert", lambda *args, **_kwargs: vec_calls.append(args)
     )
 
     beam._store_working_embedding(conn, "live", [0.1, 0.2])
@@ -71,10 +71,10 @@ def test_remember_trim_before_embedding_is_quiet(tmp_path, monkeypatch, caplog):
     memory = beam.BeamMemory(session_id="trim-race", db_path=tmp_path / "mnemosyne.db")
     monkeypatch.setattr(beam, "np", None)
     monkeypatch.setattr(beam._embeddings, "available", lambda: True)
-    monkeypatch.setattr(beam._embeddings, "embed", lambda values: [[0.1, 0.2]])
+    monkeypatch.setattr(beam._embeddings, "embed", lambda _values: [[0.1, 0.2]])
     monkeypatch.setattr(beam._embeddings, "serialize", json.dumps)
 
-    def delete_new_parent():
+    def delete_new_parent() -> None:
         memory.conn.execute(
             "DELETE FROM working_memory WHERE session_id = ?", (memory.session_id,)
         )
