@@ -90,6 +90,28 @@ hermes mnemosyne stats     # Working + episodic memory counts
 
 > If `hermes mnemosyne stats` gives "invalid choice: 'mnemosyne'", the plugin CLI registration didn't load. Use the fallback `hermes hermes-mnemosyne stats` instead, or re-run step 2 to relink the plugin.
 
+## Health checks and repair
+
+Use `mnemosyne doctor` for a bounded, read-only report on one database. It never writes to the inspected database; write its report artifacts somewhere other than that database:
+
+```bash
+mnemosyne doctor --bank default \
+  --format both \
+  --json-out mnemosyne-doctor.json \
+  --markdown-out mnemosyne-doctor.md
+```
+
+`mnemosyne repair` is intentionally narrow and report-gated, not a global cleanup command. Review the Doctor report, select only the candidate you intend to act on, and run a dry run first:
+
+```bash
+mnemosyne repair \
+  --report mnemosyne-doctor.json \
+  --select working_memory:<ID> \
+  --dry-run
+```
+
+Only add `--apply` after reviewing the report and dry-run output. Repair requires both the report and an explicit selection; do not use it as a substitute for an ownership, retention, or delete-behavior decision.
+
 ## How It Works
 
 Mnemosyne hooks into the Hermes agent lifecycle:
