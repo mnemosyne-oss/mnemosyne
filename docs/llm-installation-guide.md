@@ -176,11 +176,9 @@ In `~/.hermes/config.yaml`:
 ```yaml
 memory:
   provider: mnemosyne
-
-plugins:
-  enabled:
-    - mnemosyne
 ```
+
+The wrapper installer registers the plugin; do not add a separate `plugins.enabled` entry for that path.
 
 ### Optional environment variables
 
@@ -217,8 +215,6 @@ hermes config set memory.provider null
 hermes gateway restart
 ```
 
-To also remove the plugin from config, delete `mnemosyne` from `plugins.enabled` in `~/.hermes/config.yaml`.
-
 ---
 
 ## Troubleshooting for Agents
@@ -245,8 +241,9 @@ The package isn't installed in Hermes's Python environment. Either:
 # Check plugins are loaded
 hermes plugins list
 
-# If mnemosyne isn't listed, check config.yaml plugins.enabled
-grep -A5 "plugins:" ~/.hermes/config.yaml
+# Verify wrapper registration and the active provider
+mnemosyne-hermes status --hermes-home /opt/data
+hermes memory status
 
 # Restart gateway after any config change
 hermes gateway restart

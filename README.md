@@ -391,11 +391,11 @@ See [docs/hermes-integration.md](docs/hermes-integration.md) for the full setup 
 
 | Category | Tools |
 |----------|-------|
-| **Core memory** | `remember`, `recall`, `sleep`, `stats`, `get`, `update`, `forget`, `invalidate`, `validate` |
-| **Knowledge graph** | `triple_add`, `triple_query`, `graph_query`, `graph_link` |
-| **Multi-agent surface** | `shared_remember`, `shared_recall`, `shared_forget`, `shared_stats` |
-| **Working notes** | `scratchpad_write`, `scratchpad_read`, `scratchpad_clear` |
-| **Ops** | `export`, `import`, `diagnose` |
+| **Core memory** | `mnemosyne_remember`, `mnemosyne_recall`, `mnemosyne_sleep`, `mnemosyne_stats`, `mnemosyne_get`, `mnemosyne_update`, `mnemosyne_forget`, `mnemosyne_invalidate`, `mnemosyne_validate` |
+| **Knowledge graph** | `mnemosyne_triple_add`, `mnemosyne_triple_query`, `mnemosyne_graph_query`, `mnemosyne_graph_link` |
+| **Multi-agent surface** | `mnemosyne_shared_remember`, `mnemosyne_shared_recall`, `mnemosyne_shared_forget`, `mnemosyne_shared_stats` |
+| **Working notes** | `mnemosyne_scratchpad_write`, `mnemosyne_scratchpad_read`, `mnemosyne_scratchpad_clear` |
+| **Ops** | `mnemosyne_export`, `mnemosyne_import`, `mnemosyne_diagnose` |
 
 The provider tool inventory evolves with the installed package versions. Verify the active provider with `hermes memory status` and inspect the available tools with `hermes tools list`. The plugin manifest at `integrations/hermes/` is also discoverable by Hermes' plugin system.
 
