@@ -391,13 +391,13 @@ See [docs/hermes-integration.md](docs/hermes-integration.md) for the full setup 
 
 | Category | Tools |
 |----------|-------|
-| **Core memory** (9) | `remember`, `recall`, `sleep`, `stats`, `get`, `update`, `forget`, `invalidate`, `validate` |
-| **Knowledge graph** (4) | `triple_add`, `triple_query`, `graph_query`, `graph_link` |
-| **Multi-agent surface** (4) | `shared_remember`, `shared_recall`, `shared_forget`, `shared_stats` |
-| **Working notes** (3) | `scratchpad_write`, `scratchpad_read`, `scratchpad_clear` |
-| **Ops** (3) | `export`, `import`, `diagnose` |
+| **Core memory** | `remember`, `recall`, `sleep`, `stats`, `get`, `update`, `forget`, `invalidate`, `validate` |
+| **Knowledge graph** | `triple_add`, `triple_query`, `graph_query`, `graph_link` |
+| **Multi-agent surface** | `shared_remember`, `shared_recall`, `shared_forget`, `shared_stats` |
+| **Working notes** | `scratchpad_write`, `scratchpad_read`, `scratchpad_clear` |
+| **Ops** | `export`, `import`, `diagnose` |
 
-All 23 tools surface through the `mnemosyne-hermes` package, which wraps the `mnemosyne-memory` core library. The plugin manifest at `integrations/hermes/` is also discoverable by Hermes' plugin system.
+The provider tool inventory evolves with the installed package versions. Verify the active provider with `hermes memory status` and inspect the available tools with `hermes tools list`. The plugin manifest at `integrations/hermes/` is also discoverable by Hermes' plugin system.
 
 **Updating:** `pip install --upgrade mnemosyne-hermes && hermes gateway restart` or `git pull && pip install --upgrade integrations/hermes && hermes gateway restart` (source).
 

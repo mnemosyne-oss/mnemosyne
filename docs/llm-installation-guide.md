@@ -9,7 +9,7 @@
 
 | User has... | Use |
 |---|---|
-| Hermes Agent already installed | **Path A: One-liner deploy** (fastest, 1 command) |
+| Hermes Agent already installed | **Path A: persistent side venv + wrapper** — install, configure, then restart |
 | Hermes Agent + wants PyPI package | **Path B: pip install + register** |
 | No Hermes, just wants the library | **Path C: pip install (standalone)** |
 | Wants to contribute or develop | **Path D: Source install** |
@@ -21,8 +21,11 @@
 For a persistent Docker/image install, use a persistent side venv and the wrapper installer. It keeps the plugin directory independent from a rebuildable Hermes venv:
 
 ```bash
-# install mnemosyne-memory plus mnemosyne-hermes into a persistent venv first
-mnemosyne-hermes install --hermes-home /opt/data --mode wrapper --python /path/to/venv/bin/python
+VENV=/opt/data/.mnemosyne/venv
+python3 -m venv "$VENV"
+"$VENV/bin/python" -m pip install --upgrade pip
+"$VENV/bin/python" -m pip install 'mnemosyne-memory[embeddings]' mnemosyne-hermes
+"$VENV/bin/mnemosyne-hermes" install --hermes-home /opt/data --mode wrapper --python "$VENV/bin/python"
 hermes config set memory.provider mnemosyne
 hermes gateway restart
 ```
@@ -30,7 +33,7 @@ hermes gateway restart
 The wrapper installer registers the provider plugin. Verify the active profile rather than adding a separate `plugins.enabled` entry:
 
 ```bash
-mnemosyne-hermes status --hermes-home /opt/data
+"$VENV/bin/mnemosyne-hermes" status --hermes-home /opt/data
 hermes memory status
 ```
 

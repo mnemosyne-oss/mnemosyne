@@ -75,10 +75,11 @@ hermes memory setup
 
 Do **not** use `hermes tools disable memory`: that disables the memory toolset, including provider tools. In current Hermes versions, built-in memory and an external provider are separate mechanisms; `hermes memory off` disables the external provider only. Keep existing built-in memory as a rollback/reference point during a transition.
 
-Start a new session or restart the gateway, then verify the active Hermes profile:
+Start a new session or restart the gateway, then verify the active Hermes profile. `hermes memory status` reports local provider registration/state; it is not a connectivity or end-to-end write test:
 
 ```bash
 hermes memory status
+hermes tools list
 ```
 
 ### Step 5: Verify
