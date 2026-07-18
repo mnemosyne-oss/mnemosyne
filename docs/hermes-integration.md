@@ -71,19 +71,15 @@ hermes config set memory.provider mnemosyne
 hermes memory setup
 ```
 
-### Step 4: Disable built-in memory
+### Step 4: Verify the active provider
 
-Disable Hermes' built-in MEMORY.md/USER.md system so Mnemosyne is the sole memory provider. Do NOT use `hermes tools disable memory` — that also kills all 23 Mnemosyne-registered tools.
+Do **not** use `hermes tools disable memory`: that disables the memory toolset, including provider tools. In current Hermes versions, built-in memory and an external provider are separate mechanisms; `hermes memory off` disables the external provider only. Keep existing built-in memory as a rollback/reference point during a transition.
 
-Edit `~/.hermes/config.yaml`:
+Start a new session or restart the gateway, then verify the active Hermes profile:
 
-```yaml
-memory:
-  memory_enabled: false
-user_profile_enabled: false
+```bash
+hermes memory status
 ```
-
-`memory_enabled: false` turns off the file-based MEMORY.md system. `user_profile_enabled: false` stops USER.md injection. Both are redundant once Mnemosyne is active.
 
 ### Step 5: Verify
 

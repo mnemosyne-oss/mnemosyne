@@ -348,9 +348,9 @@ See [docs/configuration.md#custom-embedding-models](docs/configuration.md#custom
 
 ---
 
-## Hermes Plugin (23 tools)
+## Hermes Plugin
 
-When used with Hermes Agent, Mnemosyne exposes **23 tools** for full memory lifecycle management -- 3 lifecycle hooks (`pre_llm_call`, `on_session_start`, `post_tool_call`) for automatic context injection, plus MCP support.
+When used with Hermes Agent, Mnemosyne exposes provider tools for the memory lifecycle, lifecycle hooks for automatic context injection, and MCP support.
 
 > **For the full Hermes setup guide, see [docs/hermes-integration.md](docs/hermes-integration.md).** That is the canonical, most up-to-date reference.
 
@@ -377,15 +377,13 @@ hermes config set memory.provider mnemosyne
 hermes memory setup
 ```
 
-Then disable Hermes' built-in MEMORY.md/USER.md system so Mnemosyne is the sole memory provider. Do NOT use `hermes tools disable memory` -- that also kills all 23 Mnemosyne-registered tools.
+After installing, verify the provider in the active Hermes profile and start a new session or restart the gateway:
 
-Edit `~/.hermes/config.yaml`:
-
-```yaml
-memory:
-  memory_enabled: false
-user_profile_enabled: false
+```bash
+hermes memory status
 ```
+
+Do **not** use `hermes tools disable memory`: that disables the memory toolset, including provider tools. In current Hermes versions, built-in memory and an external provider are separate mechanisms; `hermes memory off` disables the external provider only. Keep existing built-in memory as a rollback/reference point during a transition and confirm the active provider with `hermes memory status`.
 
 See [docs/hermes-integration.md](docs/hermes-integration.md) for the full setup guide.
 

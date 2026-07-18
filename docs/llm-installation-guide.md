@@ -16,45 +16,22 @@
 
 ---
 
-## Path A: One-Liner Deploy (Hermes MemoryProvider)
+## Path A: Hermes provider install
 
-The fastest way to integrate Mnemosyne as Hermes's memory backend. Creates a symlink — no pip needed, no venv needed.
-
-```bash
-curl -sSL https://raw.githubusercontent.com/AxDSan/mnemosyne/main/deploy_hermes_provider.sh | bash
-```
-
-**What this does:**
-1. Symlinks `hermes_memory_provider/` → `~/.hermes/plugins/mnemosyne/`
-2. Tells you to set `memory.provider: mnemosyne` in config
-
-**After running, configure Hermes:**
+For a persistent Docker/image install, use a persistent side venv and the wrapper installer. It keeps the plugin directory independent from a rebuildable Hermes venv:
 
 ```bash
+# install mnemosyne-memory plus mnemosyne-hermes into a persistent venv first
+mnemosyne-hermes install --hermes-home /opt/data --mode wrapper --python /path/to/venv/bin/python
 hermes config set memory.provider mnemosyne
+hermes gateway restart
 ```
 
-**Or edit `~/.hermes/config.yaml` directly:**
-
-```yaml
-memory:
-  provider: mnemosyne
-```
-
-**IMPORTANT:** Also add `mnemosyne` to `plugins.enabled` in `~/.hermes/config.yaml`:
-
-```yaml
-plugins:
-  enabled:
-    - mnemosyne
-```
-
-**Verify:**
+The wrapper installer registers the provider plugin. Verify the active profile rather than adding a separate `plugins.enabled` entry:
 
 ```bash
-hermes gateway restart
+mnemosyne-hermes status --hermes-home /opt/data
 hermes memory status
-hermes mnemosyne stats
 ```
 
 ---
@@ -163,7 +140,7 @@ Expected: `Provider: mnemosyne` with `is_available: true`
 hermes tools list | grep mnemosyne
 ```
 
-Expected: 15 tools (remember, recall, stats, sleep, triple_add, triple_query, scratchpad_write, scratchpad_read, scratchpad_clear, invalidate, export, update, forget, import, diagnose)
+Expected: Mnemosyne provider tools are listed. The exact tool surface evolves with the installed package versions, so do not use a fixed tool count as the health check.
 
 ### 3. Memory operations work
 
