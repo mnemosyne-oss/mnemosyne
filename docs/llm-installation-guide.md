@@ -9,8 +9,8 @@
 
 | User has... | Use |
 |---|---|
-| Hermes Agent already installed | **Path A: persistent side venv + wrapper** — install, configure, then restart |
-| Hermes Agent + wants PyPI package | **Path B: pip install + register** |
+| Hermes Agent in a persistent Docker/image deployment | **Path A: persistent side venv + wrapper** — install, configure, then restart |
+| Hermes Agent installed locally | **Path B: pip install + register** |
 | No Hermes, just wants the library | **Path C: pip install (standalone)** |
 | Wants to contribute or develop | **Path D: Source install** |
 
