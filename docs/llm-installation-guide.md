@@ -222,6 +222,8 @@ Set `HERMES_HOME` to the active Hermes home before removing a Path A wrapper ins
 
 ```bash
 export HERMES_HOME=/opt/data  # Replace with the active Hermes home
+hermes memory off  # Disable the external provider; built-in memory remains active
+hermes gateway restart  # Run from a shell outside the gateway process
 "$HERMES_HOME/.mnemosyne/venv/bin/mnemosyne-hermes" uninstall
 rm -rf "$HERMES_HOME/.mnemosyne/venv"  # Only if this venv was created by Path A
 ```
@@ -229,14 +231,9 @@ rm -rf "$HERMES_HOME/.mnemosyne/venv"  # Only if this venv was created by Path A
 ### Path B or Path D: pip/source install
 
 ```bash
-python -m mnemosyne.install --uninstall
-```
-
-After either path, disable the external provider and restart:
-
-```bash
 hermes memory off
-hermes gateway restart
+hermes gateway restart  # Run from a shell outside the gateway process
+python -m mnemosyne.install --uninstall
 ```
 
 ---
