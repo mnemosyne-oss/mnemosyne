@@ -154,6 +154,14 @@ Expected: Mnemosyne provider tools are listed. The exact tool surface evolves wi
 
 ### 3. Memory operations work
 
+For Path A:
+
+```bash
+"$VENV/bin/mnemosyne" stats
+```
+
+For other install paths:
+
 ```bash
 mnemosyne stats
 ```
