@@ -16,10 +16,10 @@ def _minimal_connection() -> sqlite3.Connection:
             id TEXT PRIMARY KEY
         );
         CREATE TABLE memory_embeddings (
-            memory_id TEXT PRIMARY KEY
-                REFERENCES working_memory(id) ON DELETE CASCADE,
+            memory_id TEXT PRIMARY KEY,
             embedding_json TEXT NOT NULL,
-            model TEXT NOT NULL
+            model TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """
     )
@@ -39,10 +39,10 @@ def test_embedding_store_skips_parent_removed_by_trim(monkeypatch):
 
     assert conn.execute("SELECT count(*) FROM memory_embeddings").fetchone()[0] == 0
     assert vec_calls == []
-    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert conn.execute("PRAGMA foreign_key_list(memory_embeddings)").fetchall() == []
 
 
-def test_embedding_store_preserves_present_parent_and_cascade(monkeypatch):
+def test_embedding_store_preserves_present_parent_and_updates(monkeypatch):
     conn = _minimal_connection()
     conn.execute("INSERT INTO working_memory(id) VALUES ('live')")
     vec_calls = []
@@ -64,10 +64,6 @@ def test_embedding_store_preserves_present_parent_and_cascade(monkeypatch):
         ("live", [0.1, 0.2]),
         ("live", [0.3, 0.4]),
     ]
-
-    conn.execute("DELETE FROM working_memory WHERE id='live'")
-    assert conn.execute("SELECT count(*) FROM memory_embeddings").fetchone()[0] == 0
-    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_remember_trim_before_embedding_is_quiet(tmp_path, monkeypatch, caplog):

@@ -9,7 +9,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
-- **Trim-before-embedding foreign-key failure (#491).** Working-memory embedding storage now atomically checks that its parent row still exists. A row legitimately removed by trimming or concurrent deletion becomes a clean no-op instead of logging a foreign-key failure; foreign-key enforcement remains enabled and no orphan embedding is created.
+- **Trim-before-embedding race (#491).** Working-memory embedding storage now atomically checks that its parent row still exists. If trimming or concurrent deletion removes the parent before the fallback insert executes, both fallback and `vec_working` writes become a clean no-op instead of logging an embedding-storage failure.
 
 ## [3.14.0] - 2026-07-17
 
