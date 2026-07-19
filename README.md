@@ -146,25 +146,25 @@ Full reports: [docs/beam-benchmark.md](docs/beam-benchmark.md)
 
 ## CLI Usage
 
+If Mnemosyne is installed in an isolated venv, activate that venv or invoke its `bin/mnemosyne` executable before running these commands.
+
 ```bash
 # MCP server (works with any MCP client)
 mnemosyne mcp                          # stdio (default)
 mnemosyne mcp --transport sse --port 8080  # SSE (web clients)
 
 # Direct memory ops
-mnemosyne remember "User likes dark mode"
+mnemosyne store "User likes dark mode"
 mnemosyne recall "preferences"
 mnemosyne stats
 mnemosyne sleep                         # Run consolidation
 
 # Export / import
-mnemosyne export --output backup.json
-mnemosyne import --input backup.json
+mnemosyne export backup.json
+mnemosyne import backup.json
 
 # Sync (bidirectional memory sync between instances)
-mnemosyne sync --remote https://my-vps:8765
-mnemosyne sync --remote https://my-vps:8765 --encrypt
-mnemosyne sync serve --port 8765 --api-key "sk-..."
+mnemosyne sync --db-path /path/to/mnemosyne.db --remote https://my-vps:8765
 ```
 
 ---
@@ -374,7 +374,6 @@ python -m pip install mnemosyne-hermes
 mkdir -p ~/.hermes/plugins/mnemosyne
 ln -sfn "$(~/.hermes/hermes-agent/venv/bin/python -c 'import pathlib, mnemosyne_hermes; print(pathlib.Path(mnemosyne_hermes.__file__).resolve().parent)')"/* ~/.hermes/plugins/mnemosyne/
 hermes config set memory.provider mnemosyne
-hermes memory setup
 ```
 
 After installing, verify the provider in the active Hermes profile and start a new session or restart the gateway:
@@ -399,7 +398,15 @@ See [docs/hermes-integration.md](docs/hermes-integration.md) for the full setup 
 
 The provider tool inventory evolves with the installed package versions. Verify the active provider with `hermes memory status` and inspect the available tools with `hermes tools list`. The plugin manifest at `integrations/hermes/` is also discoverable by Hermes' plugin system.
 
-**Updating:** `pip install --upgrade mnemosyne-hermes && hermes gateway restart` or `git pull && pip install --upgrade integrations/hermes && hermes gateway restart` (source).
+**Updating:** For the persistent side-venv wrapper path, use the side venv rather than a bare `pip`:
+
+```bash
+export HERMES_HOME=/opt/data  # Replace with the active Hermes home
+"$HERMES_HOME/.mnemosyne/venv/bin/python" -m pip install --upgrade 'mnemosyne-memory[embeddings]' mnemosyne-hermes
+hermes gateway restart
+```
+
+For a direct or source install, use `pip install --upgrade mnemosyne-hermes && hermes gateway restart` or `git pull && pip install --upgrade integrations/hermes && hermes gateway restart` (source).
 
 ---
 

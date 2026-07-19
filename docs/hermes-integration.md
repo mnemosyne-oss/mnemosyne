@@ -45,12 +45,14 @@ pip install -e "integrations/hermes[dev]"
 >
 > ```bash
 > # Inside the container, pointing at a side/persistent venv that has mnemosyne-hermes installed
-> mnemosyne-hermes install --hermes-home /opt/data --mode wrapper --python /path/to/venv/bin/python
-> mnemosyne-hermes status --hermes-home /opt/data
+> export HERMES_HOME=/opt/data
+> mnemosyne-hermes install --mode wrapper --python /path/to/venv/bin/python
+> mnemosyne-hermes status
+> hermes config set memory.provider mnemosyne
 > hermes gateway restart
 > ```
 >
-> The default `install` mode still creates the historical plugin symlink. Wrapper mode creates a real directory under `$HERMES_HOME/plugins/mnemosyne/` and imports `mnemosyne_hermes` from the selected Python environment. Skip Steps 2-4 below; the installer handles everything. Run `hermes memory setup` after restarting to activate.
+> The default `install` mode still creates the historical plugin symlink. Wrapper mode creates a real directory under `$HERMES_HOME/plugins/mnemosyne/` and imports `mnemosyne_hermes` from the selected Python environment. Skip the manual link and activation steps below; the installer handles plugin registration. Verify the active provider after restarting.
 
 ### Step 2: Link the plugin
 
@@ -68,7 +70,6 @@ If you installed in a custom venv (e.g. `~/.hermes-venv`), replace `~/.hermes/he
 
 ```bash
 hermes config set memory.provider mnemosyne
-hermes memory setup
 ```
 
 ### Step 4: Verify the active provider
@@ -84,16 +85,16 @@ hermes tools list
 
 ### Step 5: Verify
 
+The commands below assume `mnemosyne` is on `PATH`. For persistent wrapper mode, invoke the core CLI through the side venv (for example, `/path/to/venv/bin/mnemosyne`) or activate that venv first.
+
 ```bash
 hermes memory status       # Should show "Provider: mnemosyne"
-hermes mnemosyne stats     # Working + episodic memory counts
+mnemosyne stats            # Working + episodic memory counts
 ```
-
-> If `hermes mnemosyne stats` gives "invalid choice: 'mnemosyne'", the plugin CLI registration didn't load. Use the fallback `hermes hermes-mnemosyne stats` instead, or re-run step 2 to relink the plugin.
 
 ## Health checks and repair
 
-Use `mnemosyne doctor` for a bounded, read-only report on one database. It never writes to the inspected database; write its report artifacts somewhere other than that database:
+Use `mnemosyne doctor` for a bounded, read-only report on one bank/database. It never writes to the inspected database and rejects an output path that would overwrite it; the example writes report files to the current directory, so choose explicit output paths when needed:
 
 ```bash
 mnemosyne doctor --bank default \
@@ -148,20 +149,13 @@ Mnemosyne registers these tools in the Hermes tool registry:
 ## CLI Commands
 
 ```bash
-hermes mnemosyne stats              # Current session stats
-hermes mnemosyne stats --global     # Stats across all sessions
-hermes mnemosyne inspect "query"    # Search memories
-hermes mnemosyne sleep              # Run consolidation
-hermes mnemosyne export --output backup.json
-hermes mnemosyne import --input backup.json
-
-# Import historical Hindsight memories via PR #28's timestamp-preserving importer
-hermes mnemosyne import --from hindsight --file hindsight-export.json --bank hermes
-hermes mnemosyne import --from hindsight --input hindsight-export.json --bank hermes
-hermes mnemosyne import --from hindsight --base-url http://localhost:8888 --bank hermes
-
-hermes mnemosyne clear              # Clear scratchpad
-hermes mnemosyne version            # Show version
+mnemosyne stats                         # Show memory statistics
+mnemosyne sleep                         # Run consolidation
+mnemosyne export backup.json            # Export memories
+mnemosyne import backup.json            # Import memories
+mnemosyne import-hindsight hindsight-export.json hermes
+mnemosyne doctor --bank default --format both
+mnemosyne repair --report mnemosyne-doctor.json --select working_memory:<ID> --dry-run
 ```
 
 ## Data Location
@@ -205,7 +199,7 @@ Mnemosyne does not currently expose a standalone REST API server.
 ## Uninstall
 
 ```bash
+mnemosyne-hermes uninstall
+hermes memory off  # Disable the external provider; built-in memory remains active
 pip uninstall mnemosyne-hermes
-hermes config set memory.provider memory   # Switch back to built-in
-hermes memory setup
 ```
