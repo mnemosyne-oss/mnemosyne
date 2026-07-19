@@ -39,6 +39,15 @@ class PluginState:
 
 
 @dataclass(frozen=True)
+class _WrapperMetadata:
+    """Validated wrapper manifest metadata or a manifest validation error."""
+
+    python: Path | None = None
+    site_packages: Path | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class SkillState:
     """Detailed installation state for the bundled Hermes skill."""
 
@@ -263,25 +272,33 @@ def _extract_wrapper_metadata(init_file: Path) -> tuple[Path | None, Path | None
     return _match("_PYTHON"), _match("_SITE")
 
 
-def _wrapper_metadata(target: Path, init_file: Path) -> tuple[Path | None, Path | None]:
-    """Read v1 wrapper metadata, falling back to legacy shim assignments."""
+def _wrapper_metadata(target: Path, init_file: Path) -> _WrapperMetadata:
+    """Read wrapper metadata, using legacy assignments only when no manifest exists."""
     manifest = target / "mnemosyne-wrapper.json"
     try:
+        if not manifest.exists():
+            python, site_packages = _extract_wrapper_metadata(init_file)
+            return _WrapperMetadata(python=python, site_packages=site_packages)
+        if not manifest.is_file():
+            return _WrapperMetadata(error="Invalid Mnemosyne wrapper manifest: not a file")
         data = json.loads(manifest.read_text(encoding="utf-8"))
-        if (
-            isinstance(data, dict)
-            and data.get("schema_version") == 1
-            and data.get("package") == "mnemosyne_hermes"
-            and isinstance(data.get("python"), str)
-            and isinstance(data.get("site_packages"), str)
-        ):
-            python = Path(data["python"]).expanduser()
-            site_packages = Path(data["site_packages"]).expanduser()
-            if python.is_absolute() and site_packages.is_absolute():
-                return python, site_packages
-    except (OSError, ValueError, TypeError):
-        pass
-    return _extract_wrapper_metadata(init_file)
+    except (OSError, ValueError, TypeError) as exc:
+        return _WrapperMetadata(error=f"Invalid Mnemosyne wrapper manifest: {exc}")
+
+    if (
+        not isinstance(data, dict)
+        or data.get("schema_version") != 1
+        or data.get("package") != "mnemosyne_hermes"
+    ):
+        return _WrapperMetadata(error="Invalid Mnemosyne wrapper manifest schema")
+    if not isinstance(data.get("python"), str) or not isinstance(data.get("site_packages"), str):
+        return _WrapperMetadata(error="Invalid Mnemosyne wrapper manifest paths")
+
+    python = Path(data["python"]).expanduser()
+    site_packages = Path(data["site_packages"]).expanduser()
+    if not python.is_absolute() or not site_packages.is_absolute():
+        return _WrapperMetadata(error="Invalid Mnemosyne wrapper manifest paths")
+    return _WrapperMetadata(python=python, site_packages=site_packages)
 
 
 def _site_packages_for_python(python: Path) -> Path:
@@ -305,21 +322,37 @@ def _check_wrapper_import(site_packages: Path, python: Path | None = None) -> tu
     """Return whether mnemosyne_hermes imports from the wrapper target."""
     if not site_packages.exists():
         return False, f"site-packages target missing: {site_packages}"
-    if python is not None and not python.is_file():
-        return False, f"wrapper Python missing: {python}"
     runner = python or Path(sys.executable)
+    if not runner.is_file():
+        return False, f"wrapper Python missing: {runner}"
+    if not os.access(runner, os.X_OK):
+        return False, f"wrapper Python is not executable: {runner}"
+    package_init = site_packages / "mnemosyne_hermes" / "__init__.py"
+    origin_check = ""
+    if package_init.is_file():
+        origin_check = (
+            f"expected = Path({str(package_init)!r}).resolve(); "
+            "actual = Path(mnemosyne_hermes.__file__).resolve(); "
+            "assert actual == expected, f'package origin mismatch: {actual} != {expected}'; "
+        )
     code = (
-        "import sys; "
+        "import sys; from pathlib import Path; "
         f"sys.path.insert(0, {str(site_packages)!r}); "
         "import mnemosyne_hermes; "
-        "print(getattr(mnemosyne_hermes, '__version__', 'unknown'))"
+        + origin_check
+        + "print(getattr(mnemosyne_hermes, '__version__', 'unknown'))"
     )
-    result = subprocess.run(
-        [str(runner), "-c", code],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
+    try:
+        result = subprocess.run(
+            [str(runner), "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except OSError as exc:
+        return False, f"could not run wrapper Python {runner}: {exc}"
+    except subprocess.TimeoutExpired:
+        return False, f"wrapper Python import timed out: {runner}"
     if result.returncode == 0:
         return True, None
     return False, (result.stderr.strip() or result.stdout.strip() or "import failed")[:500]
@@ -373,6 +406,18 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
             message=f"Plugin path exists but has no __init__.py: {target}",
         )
 
+    wrapper_metadata = _wrapper_metadata(target, init_file) if not target.is_symlink() else None
+    if wrapper_metadata is not None and wrapper_metadata.error is not None:
+        return PluginState(
+            status="invalid_wrapper",
+            installed=False,
+            target=target,
+            mode="wrapper",
+            wrapper_import_ok=False,
+            wrapper_import_error=wrapper_metadata.error,
+            message=wrapper_metadata.error,
+        )
+
     if not _provider_init_is_valid(init_file):
         return PluginState(
             status="invalid_provider",
@@ -400,7 +445,9 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
             link_target = target.parent / link_target
         link_target = link_target.expanduser()
     else:
-        wrapper_python, wrapper_site = _wrapper_metadata(target, init_file)
+        assert wrapper_metadata is not None
+        wrapper_python = wrapper_metadata.python
+        wrapper_site = wrapper_metadata.site_packages
         if wrapper_site is None:
             mode = "directory"
         else:
@@ -409,8 +456,11 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
                 wrapper_python,
             )
             if not wrapper_import_ok:
+                status = "invalid_wrapper" if wrapper_import_error and (
+                    "wrapper Python" in wrapper_import_error
+                ) else "stale_wrapper"
                 return PluginState(
-                    status="stale_wrapper",
+                    status=status,
                     installed=False,
                     target=target,
                     mode="wrapper",
@@ -418,7 +468,11 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
                     wrapper_site_packages=wrapper_site,
                     wrapper_import_ok=wrapper_import_ok,
                     wrapper_import_error=wrapper_import_error,
-                    message="Wrapper plugin exists but its target package cannot be imported.",
+                    message=(
+                        "Wrapper plugin has invalid runtime metadata: " + (wrapper_import_error or "unknown error")
+                        if status == "invalid_wrapper"
+                        else "Wrapper plugin exists but its target package cannot be imported."
+                    ),
                 )
 
     return PluginState(
@@ -772,6 +826,7 @@ def _write_wrapper_plugin(target: Path, *, python: Path, site_packages: Path) ->
     bootstrap_source = """\"\"\"Bootstrap a generated Mnemosyne Hermes wrapper using only the stdlib.\"\"\"
 from __future__ import annotations
 
+import importlib
 import json
 import os
 from pathlib import Path
@@ -779,7 +834,7 @@ import sys
 
 
 def activate() -> dict[str, object]:
-    \"\"\"Validate this wrapper manifest and prepend its selected site-packages.\"\"\"
+    \"\"\"Validate the wrapper and import its selected package identity.\"\"\"
     manifest_path = Path(__file__).with_name("mnemosyne-wrapper.json")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -803,10 +858,43 @@ def activate() -> dict[str, object]:
         raise RuntimeError("Invalid Mnemosyne wrapper Python executable")
     if not site_path.is_absolute() or not site_path.is_dir():
         raise RuntimeError("Invalid Mnemosyne wrapper site-packages target")
+    package_root = site_path / "mnemosyne_hermes"
+    package_init = package_root / "__init__.py"
+    expected_root = package_root.resolve() if package_init.is_file() else None
     site = str(site_path)
     while site in sys.path:
         sys.path.remove(site)
     sys.path.insert(0, site)
+    def from_selected_package(module: object) -> bool:
+        if expected_root is None:
+            return False
+        source = getattr(module, "__file__", None)
+        if not source:
+            return False
+        try:
+            Path(source).resolve().relative_to(expected_root)
+        except (OSError, ValueError):
+            return False
+        return True
+
+    package_name = "mnemosyne_hermes"
+    cached_package = sys.modules.get(package_name)
+    if cached_package is not None and not from_selected_package(cached_package):
+        names_to_remove = [
+            name for name in sys.modules
+            if name == package_name or name.startswith(package_name + ".")
+        ]
+    else:
+        names_to_remove = [
+            name for name, module in sys.modules.items()
+            if name.startswith(package_name + ".") and not from_selected_package(module)
+        ]
+    for name in names_to_remove:
+        sys.modules.pop(name, None)
+
+    selected_package = importlib.import_module(package_name)
+    if expected_root is not None and not from_selected_package(selected_package):
+        raise RuntimeError("Mnemosyne wrapper imported package from an unexpected origin")
     return manifest
 """
     init_source = """\"\"\"Persistent Mnemosyne Hermes plugin wrapper.\"\"\"

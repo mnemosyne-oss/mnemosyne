@@ -1,7 +1,10 @@
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
+
+import pytest
 
 from mnemosyne_hermes import install
 
@@ -235,6 +238,75 @@ def test_plugin_state_uses_legacy_wrapper_metadata_without_manifest(tmp_path):
     assert state.mode == "wrapper"
     assert state.wrapper_python == Path(sys.executable)
     assert state.wrapper_site_packages == site_packages
+
+
+@pytest.mark.parametrize(
+    ("manifest_text", "expected_message"),
+    [
+        ("{not valid json", "Invalid Mnemosyne wrapper manifest"),
+        (json.dumps({"schema_version": 2}), "Invalid Mnemosyne wrapper manifest schema"),
+    ],
+)
+def test_plugin_state_reports_invalid_wrapper_manifest_without_legacy_fallback(
+    tmp_path, manifest_text, expected_message
+):
+    target = tmp_path / "plugins" / "mnemosyne"
+    target.mkdir(parents=True)
+    (target / "__init__.py").write_text(
+        f"_PYTHON = {str(Path(sys.executable))!r}\n"
+        f"_SITE = {str(install._site_packages_for_python(Path(sys.executable)))!r}\n"
+        "# register_memory_provider / MnemosyneMemoryProvider\n"
+        "from mnemosyne_hermes import *\n",
+        encoding="utf-8",
+    )
+    (target / "mnemosyne-wrapper.json").write_text(manifest_text, encoding="utf-8")
+
+    state = install.plugin_state(hermes_home_path=tmp_path)
+
+    assert state.status == "invalid_wrapper"
+    assert state.installed is False
+    assert state.mode == "wrapper"
+    assert state.wrapper_import_ok is False
+    assert expected_message in state.message
+
+
+def test_plugin_state_reports_non_executable_wrapper_interpreter_without_raising(tmp_path, monkeypatch):
+    target = tmp_path / "plugins" / "mnemosyne"
+    site_packages = install._site_packages_for_python(Path(sys.executable))
+    install._write_wrapper_plugin(target, python=Path(sys.executable), site_packages=site_packages)
+    non_executable = tmp_path / "non-executable-python"
+    non_executable.write_text("not executable\n", encoding="utf-8")
+    manifest_path = target / "mnemosyne-wrapper.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["python"] = str(non_executable)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    real_access = os.access
+    monkeypatch.setattr(
+        install.os,
+        "access",
+        lambda path, mode: False if Path(path) == non_executable else real_access(path, mode),
+    )
+
+    state = install.plugin_state(hermes_home_path=tmp_path)
+
+    assert state.status == "invalid_wrapper"
+    assert state.installed is False
+    assert state.mode == "wrapper"
+    assert state.wrapper_python == non_executable
+    assert state.wrapper_import_ok is False
+    assert state.wrapper_import_error == f"wrapper Python is not executable: {non_executable}"
+
+
+def test_check_wrapper_import_returns_error_when_interpreter_cannot_launch(tmp_path, monkeypatch):
+    def raise_permission_error(*args, **kwargs):
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(install.subprocess, "run", raise_permission_error)
+
+    ok, error = install._check_wrapper_import(tmp_path, Path(sys.executable))
+
+    assert ok is False
+    assert error == f"could not run wrapper Python {Path(sys.executable)}: permission denied"
 
 
 def test_plugin_state_reports_stale_wrapper_target(tmp_path):

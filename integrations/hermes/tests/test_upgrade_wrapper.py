@@ -55,3 +55,22 @@ def test_upgrade_reregisters_with_existing_wrapper_mode_and_interpreter(
             "python": expected_python,
         }
     ]
+
+
+def test_upgrade_stops_before_package_upgrade_for_invalid_wrapper(monkeypatch, tmp_path, capsys):
+    state = install.PluginState(
+        status="invalid_wrapper",
+        installed=False,
+        target=tmp_path / "plugins" / "mnemosyne",
+        message="Invalid Mnemosyne wrapper manifest schema",
+        mode="wrapper",
+        wrapper_import_ok=False,
+    )
+    upgrade_calls = []
+    monkeypatch.setattr(install, "plugin_state", lambda **kwargs: state)
+    monkeypatch.setattr(upgrade, "detect_install_method", lambda: "pip")
+    monkeypatch.setattr(upgrade, "run_upgrade_command", lambda *args: upgrade_calls.append(args))
+
+    assert upgrade.upgrade_command(SimpleNamespace(hermes_home=str(tmp_path))) == 1
+    assert upgrade_calls == []
+    assert "Cannot safely upgrade an invalid Mnemosyne wrapper" in capsys.readouterr().out

@@ -119,6 +119,11 @@ def upgrade_command(args=None) -> int:
     from mnemosyne_hermes.install import plugin_state
 
     existing_plugin = plugin_state(hermes_home_path=hermes_home_path)
+    if existing_plugin.status == "invalid_wrapper":
+        print("⚠ Cannot safely upgrade an invalid Mnemosyne wrapper.")
+        print(f"  {existing_plugin.message}")
+        print("  Repair it with: mnemosyne-hermes install --force --mode wrapper")
+        return 1
     install_mode = "wrapper" if existing_plugin.mode == "wrapper" else "symlink"
     wrapper_python = existing_plugin.wrapper_python if install_mode == "wrapper" else None
 
