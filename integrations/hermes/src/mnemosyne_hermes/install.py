@@ -771,6 +771,7 @@ def _write_wrapper_plugin(target: Path, *, python: Path, site_packages: Path) ->
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -792,7 +793,13 @@ def activate() -> dict[str, object]:
         raise RuntimeError("Invalid Mnemosyne wrapper manifest paths")
     python_path = Path(python)
     site_path = Path(site_packages)
-    if not python_path.is_absolute() or not site_path.is_absolute() or not site_path.is_dir():
+    if (
+        not python_path.is_absolute()
+        or not python_path.is_file()
+        or not os.access(python_path, os.X_OK)
+    ):
+        raise RuntimeError("Invalid Mnemosyne wrapper Python executable")
+    if not site_path.is_absolute() or not site_path.is_dir():
         raise RuntimeError("Invalid Mnemosyne wrapper site-packages target")
     site = str(site_path)
     while site in sys.path:
@@ -809,7 +816,18 @@ _activate()
 from mnemosyne_hermes import *  # noqa: F401,F403,E402
 """
     cli_source = """\"\"\"Hermes CLI wrapper for the selected Mnemosyne package.\"\"\"
-from ._mnemosyne_bootstrap import activate as _activate
+import importlib.util
+from pathlib import Path
+
+_bootstrap_path = Path(__file__).resolve().with_name("_mnemosyne_bootstrap.py")
+_bootstrap_spec = importlib.util.spec_from_file_location(
+    f"{__name__}._mnemosyne_bootstrap", _bootstrap_path
+)
+if _bootstrap_spec is None or _bootstrap_spec.loader is None:
+    raise ImportError("Cannot load Mnemosyne wrapper bootstrap")
+_bootstrap_module = importlib.util.module_from_spec(_bootstrap_spec)
+_bootstrap_spec.loader.exec_module(_bootstrap_module)
+_activate = _bootstrap_module.activate
 
 _activate()
 

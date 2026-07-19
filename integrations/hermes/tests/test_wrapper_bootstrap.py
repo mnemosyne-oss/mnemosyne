@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -58,9 +59,63 @@ sys.modules[cli_name] = cli_module
 cli_spec.loader.exec_module(cli_module)
 assert cli_module.register_cli() == 'selected-cli'
 
+standalone_cli_spec = importlib.util.spec_from_file_location(
+    'standalone_mnemosyne_cli', wrapper / 'cli.py'
+)
+standalone_cli_module = importlib.util.module_from_spec(standalone_cli_spec)
+standalone_cli_spec.loader.exec_module(standalone_cli_module)
+assert standalone_cli_module.register_cli() == 'selected-cli'
+
 side = sys.modules['mnemosyne_hermes']
 assert Path(side.__file__).parent == Path({str(package)!r})
 assert sys.path[0] == {str(site_packages)!r}
+"""
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_generated_bootstrap_rejects_missing_manifest_python_without_sys_path_mutation(tmp_path):
+    site_packages = tmp_path / "side-venv" / "site-packages"
+    site_packages.mkdir(parents=True)
+    wrapper = tmp_path / "hermes-home" / "plugins" / "mnemosyne"
+    install._write_wrapper_plugin(
+        wrapper,
+        python=Path(sys.executable),
+        site_packages=site_packages,
+    )
+    manifest_path = wrapper / "mnemosyne-wrapper.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["python"] = str(tmp_path / "missing-python")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    code = f"""
+import importlib.util
+import sys
+from pathlib import Path
+
+wrapper = Path({str(wrapper)!r})
+bootstrap_spec = importlib.util.spec_from_file_location(
+    'standalone_mnemosyne_bootstrap', wrapper / '_mnemosyne_bootstrap.py'
+)
+bootstrap_module = importlib.util.module_from_spec(bootstrap_spec)
+bootstrap_spec.loader.exec_module(bootstrap_module)
+before = list(sys.path)
+try:
+    bootstrap_module.activate()
+except RuntimeError as exc:
+    assert str(exc) == 'Invalid Mnemosyne wrapper Python executable'
+else:
+    raise AssertionError('missing manifest python should fail activation')
+assert sys.path == before
 """
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
