@@ -128,7 +128,7 @@ hermes gateway restart
 
 ## Post-Install: Verify Everything Works
 
-For Path A, invoke the core CLI as `"$VENV/bin/mnemosyne"` below or activate the side venv first. Other install paths assume `mnemosyne` is on `PATH`.
+For Path A, re-export `VENV=/path/to/venv` to the same side venv passed to the wrapper install when verifying from a new shell, then invoke the core CLI as `"$VENV/bin/mnemosyne"` below. Other install paths assume `mnemosyne` is on `PATH`.
 
 Run these checks in order. Stop if any fails.
 
@@ -159,7 +159,8 @@ Expected: Working and episodic memory counts (numbers, even if 0).
 ### 4. Store and recall a test memory
 
 ```bash
-python3 -c "
+# Path A: use the persistent side venv. Other paths: replace with python3.
+"$VENV/bin/python" -c "
 from mnemosyne import remember, recall
 mid = remember('TEST: install verification', importance=0.5, source='test')
 print(f'Stored: {mid}')

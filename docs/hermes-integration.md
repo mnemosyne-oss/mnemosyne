@@ -124,27 +124,15 @@ Mnemosyne hooks into the Hermes agent lifecycle:
 | `on_session_start` | Initializes session-scoped memory state |
 | `post_tool_call` | Captures tool results as memories (if configured) |
 
-### Registered Tools
+### Tool discovery
 
-Mnemosyne registers these tools in the Hermes tool registry:
+The provider tool inventory is version-specific. Confirm the active provider with `hermes memory status`, then inspect the runtime tool surface:
 
-| Tool | Description |
-|---|---|
-| `mnemosyne_remember` | Store a memory |
-| `mnemosyne_recall` | Search memories |
-| `mnemosyne_stats` | Show memory statistics |
-| `mnemosyne_triple_add` | Add a knowledge graph triple |
-| `mnemosyne_triple_query` | Query the knowledge graph |
-| `mnemosyne_sleep` | Run consolidation |
-| `mnemosyne_scratchpad_write` | Write to scratchpad |
-| `mnemosyne_scratchpad_read` | Read scratchpad |
-| `mnemosyne_scratchpad_clear` | Clear scratchpad |
-| `mnemosyne_update` | Update a memory by ID |
-| `mnemosyne_forget` | Delete a memory by ID |
-| `mnemosyne_invalidate` | Mark a memory as superseded |
-| `mnemosyne_export` | Export all memories to JSON |
-| `mnemosyne_import` | Import memories from JSON |
-| `mnemosyne_diagnose` | Run PII-safe diagnostics |
+```bash
+hermes tools list | grep mnemosyne_
+```
+
+The provider exposes memory, knowledge-graph, multi-agent-surface, working-note, and operational tools; use the runtime list rather than a fixed documentation inventory.
 
 ## CLI Commands
 
@@ -203,8 +191,9 @@ Mnemosyne does not currently expose a standalone REST API server.
 ```bash
 export HERMES_HOME=/opt/data  # Replace with the non-default Hermes home used at install time
 VENV=/path/to/venv             # The same side venv passed to the wrapper install
-"$VENV/bin/mnemosyne-hermes" uninstall
 hermes memory off  # Disable the external provider; built-in memory remains active
+hermes gateway restart  # Run from a shell outside the gateway process
+"$VENV/bin/mnemosyne-hermes" uninstall
 "$VENV/bin/python" -m pip uninstall mnemosyne-hermes
 ```
 
@@ -213,7 +202,8 @@ hermes memory off  # Disable the external provider; built-in memory remains acti
 ### Activated local environment
 
 ```bash
-mnemosyne-hermes uninstall
 hermes memory off
+hermes gateway restart  # Run from a shell outside the gateway process
+mnemosyne-hermes uninstall
 pip uninstall mnemosyne-hermes
 ```
