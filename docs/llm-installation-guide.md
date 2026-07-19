@@ -38,6 +38,8 @@ The wrapper installer registers the provider plugin in `$HERMES_HOME/plugins`. V
 hermes memory status
 ```
 
+These status commands report local provider state only; they do not prove database access, tool execution, or a successful memory round trip. Use the stats and store/recall checks in [Post-Install: Verify Everything Works](#post-install-verify-everything-works) for functional validation.
+
 ---
 
 ## Path B: pip install + Register with Hermes
@@ -86,6 +88,8 @@ hermes memory status        # Should show: Provider: mnemosyne
 mnemosyne stats             # Working + episodic counts
 hermes tools list | grep mnemosyne
 ```
+
+`hermes memory status` reports local provider state only; it does not prove database access, tool execution, or a successful memory round trip. Confirm functional behavior with `mnemosyne stats` and the store/recall check in [Post-Install: Verify Everything Works](#post-install-verify-everything-works).
 
 ---
 
