@@ -63,8 +63,8 @@ cli_spec.loader.exec_module(cli_module)
 assert cli_module.register_cli() == 'selected-cli'
 
 side = sys.modules['mnemosyne_hermes']
-assert Path(side.__file__).parent == Path({str(package)!r})
-assert sys.path[0] == {str(site_packages)!r}
+assert Path(side.__file__).parent == Path({str(package.resolve())!r})
+assert sys.path[0] == {str(site_packages.resolve())!r}
 """
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
@@ -103,7 +103,7 @@ import sys
 from pathlib import Path
 
 wrapper = Path({str(wrapper)!r})
-site_packages = {str(site_packages)!r}
+site_packages = {str(site_packages.resolve())!r}
 for name in list(sys.modules):
     if name == 'mnemosyne_hermes' or name.startswith('mnemosyne_hermes.'):
         del sys.modules[name]
@@ -116,7 +116,7 @@ cli_module = importlib.util.module_from_spec(cli_spec)
 cli_spec.loader.exec_module(cli_module)
 
 assert sys.path[0] == site_packages
-assert Path(sys.modules['mnemosyne_hermes'].__file__).parent == Path({str(package)!r})
+assert Path(sys.modules['mnemosyne_hermes'].__file__).parent == Path({str(package.resolve())!r})
 assert cli_module.register_cli() == 'selected-cli'
 assert cli_module.mnemosyne_command() == 'selected-command'
 """
@@ -175,7 +175,7 @@ from pathlib import Path
 
 wrapper = Path({str(wrapper)!r})
 wrong_site = {str(wrong_site)!r}
-selected_package = Path({str(package)!r})
+selected_package = Path({str(package.resolve())!r})
 sys.path.insert(0, wrong_site)
 wrong = importlib.import_module('mnemosyne_hermes')
 wrong_cli = importlib.import_module('mnemosyne_hermes.cli')

@@ -318,15 +318,17 @@ def _site_packages_for_python(python: Path) -> Path:
     return site
 
 
-def _check_wrapper_import(site_packages: Path, python: Path | None = None) -> tuple[bool, str | None]:
-    """Return whether mnemosyne_hermes imports from the wrapper target."""
+def _check_wrapper_import(
+    site_packages: Path, python: Path | None = None
+) -> tuple[bool, str | None, bool]:
+    """Return import success, error text, and whether the runtime is invalid."""
     if not site_packages.exists():
-        return False, f"site-packages target missing: {site_packages}"
+        return False, f"site-packages target missing: {site_packages}", False
     runner = python or Path(sys.executable)
     if not runner.is_file():
-        return False, f"wrapper Python missing: {runner}"
+        return False, f"wrapper Python missing: {runner}", True
     if not os.access(runner, os.X_OK):
-        return False, f"wrapper Python is not executable: {runner}"
+        return False, f"wrapper Python is not executable: {runner}", True
     package_init = site_packages / "mnemosyne_hermes" / "__init__.py"
     origin_check = ""
     if package_init.is_file():
@@ -350,12 +352,12 @@ def _check_wrapper_import(site_packages: Path, python: Path | None = None) -> tu
             timeout=10,
         )
     except OSError as exc:
-        return False, f"could not run wrapper Python {runner}: {exc}"
+        return False, f"could not run wrapper Python {runner}: {exc}", True
     except subprocess.TimeoutExpired:
-        return False, f"wrapper Python import timed out: {runner}"
+        return False, f"wrapper Python import timed out: {runner}", False
     if result.returncode == 0:
-        return True, None
-    return False, (result.stderr.strip() or result.stdout.strip() or "import failed")[:500]
+        return True, None, False
+    return False, (result.stderr.strip() or result.stdout.strip() or "import failed")[:500], False
 
 
 def _copy_plugin_yaml(target: Path) -> None:
@@ -451,14 +453,12 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
         if wrapper_site is None:
             mode = "directory"
         else:
-            wrapper_import_ok, wrapper_import_error = _check_wrapper_import(
+            wrapper_import_ok, wrapper_import_error, invalid_runtime = _check_wrapper_import(
                 wrapper_site,
                 wrapper_python,
             )
             if not wrapper_import_ok:
-                status = "invalid_wrapper" if wrapper_import_error and (
-                    "wrapper Python" in wrapper_import_error
-                ) else "stale_wrapper"
+                status = "invalid_wrapper" if invalid_runtime else "stale_wrapper"
                 return PluginState(
                     status=status,
                     installed=False,
@@ -967,7 +967,7 @@ def install_plugin(
     if not wrapper_python.is_file():
         raise FileNotFoundError(f"Python interpreter not found: {wrapper_python}")
     site_packages = _site_packages_for_python(wrapper_python)
-    import_ok, import_error = _check_wrapper_import(site_packages, wrapper_python)
+    import_ok, import_error, _invalid_runtime = _check_wrapper_import(site_packages, wrapper_python)
     if not import_ok:
         raise RuntimeError(
             "Selected Python environment cannot import mnemosyne_hermes: "

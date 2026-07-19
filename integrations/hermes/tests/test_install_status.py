@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -303,10 +304,29 @@ def test_check_wrapper_import_returns_error_when_interpreter_cannot_launch(tmp_p
 
     monkeypatch.setattr(install.subprocess, "run", raise_permission_error)
 
-    ok, error = install._check_wrapper_import(tmp_path, Path(sys.executable))
+    ok, error, invalid_runtime = install._check_wrapper_import(tmp_path, Path(sys.executable))
 
     assert ok is False
     assert error == f"could not run wrapper Python {Path(sys.executable)}: permission denied"
+    assert invalid_runtime is True
+
+
+def test_plugin_state_classifies_timed_out_wrapper_import_as_stale(tmp_path, monkeypatch):
+    target = tmp_path / "plugins" / "mnemosyne"
+    site_packages = install._site_packages_for_python(Path(sys.executable))
+    install._write_wrapper_plugin(target, python=Path(sys.executable), site_packages=site_packages)
+
+    def raise_timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], 10)
+
+    monkeypatch.setattr(install.subprocess, "run", raise_timeout)
+
+    state = install.plugin_state(hermes_home_path=tmp_path)
+
+    assert state.status == "stale_wrapper"
+    assert state.installed is False
+    assert state.wrapper_import_ok is False
+    assert state.wrapper_import_error == f"wrapper Python import timed out: {Path(sys.executable)}"
 
 
 def test_plugin_state_reports_stale_wrapper_target(tmp_path):
