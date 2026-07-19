@@ -1,4 +1,5 @@
 import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -195,17 +196,45 @@ def test_install_plugin_wrapper_creates_persistent_shim(tmp_path):
     init_source = (target / "__init__.py").read_text(encoding="utf-8")
     assert "register_memory_provider" in init_source
     assert "from mnemosyne_hermes import *" in init_source
-    assert "_PYTHON" in init_source
-    assert "_SITE" in init_source
+    assert "_mnemosyne_bootstrap" in init_source
+    assert (target / "cli.py").is_file()
+    assert (target / "_mnemosyne_bootstrap.py").is_file()
+    manifest = json.loads((target / "mnemosyne-wrapper.json").read_text(encoding="utf-8"))
+    assert manifest == {
+        "schema_version": 1,
+        "python": str(Path(sys.executable).resolve()),
+        "site_packages": str(install._site_packages_for_python(Path(sys.executable)).resolve()),
+        "package": "mnemosyne_hermes",
+    }
     assert (target / "plugin.yaml").is_file()
 
     state = install.plugin_state(hermes_home_path=tmp_path)
     assert state.status == "installed"
     assert state.installed is True
     assert state.mode == "wrapper"
-    assert state.wrapper_python == Path(sys.executable)
+    assert state.wrapper_python == Path(sys.executable).resolve()
     assert state.wrapper_site_packages is not None
     assert state.wrapper_import_ok is True
+
+
+def test_plugin_state_uses_legacy_wrapper_metadata_without_manifest(tmp_path):
+    target = tmp_path / "plugins" / "mnemosyne"
+    target.mkdir(parents=True)
+    site_packages = install._site_packages_for_python(Path(sys.executable))
+    (target / "__init__.py").write_text(
+        f"_PYTHON = {str(Path(sys.executable))!r}\n"
+        f"_SITE = {str(site_packages)!r}\n"
+        "# register_memory_provider / MnemosyneMemoryProvider\n"
+        "from mnemosyne_hermes import *\n",
+        encoding="utf-8",
+    )
+
+    state = install.plugin_state(hermes_home_path=tmp_path)
+
+    assert state.status == "installed"
+    assert state.mode == "wrapper"
+    assert state.wrapper_python == Path(sys.executable)
+    assert state.wrapper_site_packages == site_packages
 
 
 def test_plugin_state_reports_stale_wrapper_target(tmp_path):
