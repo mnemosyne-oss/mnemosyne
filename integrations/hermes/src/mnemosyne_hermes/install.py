@@ -759,7 +759,9 @@ def _prepare_plugin_target(base: Path, target: Path, *, force: bool) -> None:
 def _write_wrapper_plugin(target: Path, *, python: Path, site_packages: Path) -> None:
     """Create a persistent Hermes plugin shim that imports from a selected env."""
     target.mkdir(parents=True, exist_ok=False)
-    python = python.resolve()
+    # Keep a virtualenv interpreter symlink intact: resolving it would select
+    # the base interpreter while retaining the virtualenv's site-packages.
+    python = python.expanduser().absolute()
     site_packages = site_packages.resolve()
     manifest = {
         "schema_version": 1,

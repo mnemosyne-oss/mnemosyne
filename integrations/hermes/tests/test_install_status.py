@@ -202,7 +202,7 @@ def test_install_plugin_wrapper_creates_persistent_shim(tmp_path):
     manifest = json.loads((target / "mnemosyne-wrapper.json").read_text(encoding="utf-8"))
     assert manifest == {
         "schema_version": 1,
-        "python": str(Path(sys.executable).resolve()),
+        "python": str(Path(sys.executable).absolute()),
         "site_packages": str(install._site_packages_for_python(Path(sys.executable)).resolve()),
         "package": "mnemosyne_hermes",
     }
@@ -212,7 +212,7 @@ def test_install_plugin_wrapper_creates_persistent_shim(tmp_path):
     assert state.status == "installed"
     assert state.installed is True
     assert state.mode == "wrapper"
-    assert state.wrapper_python == Path(sys.executable).resolve()
+    assert state.wrapper_python == Path(sys.executable).absolute()
     assert state.wrapper_site_packages is not None
     assert state.wrapper_import_ok is True
 
