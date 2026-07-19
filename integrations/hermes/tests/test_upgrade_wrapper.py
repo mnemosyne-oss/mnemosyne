@@ -67,10 +67,13 @@ def test_upgrade_stops_before_package_upgrade_for_invalid_wrapper(monkeypatch, t
         wrapper_import_ok=False,
     )
     upgrade_calls = []
+    install_calls = []
     monkeypatch.setattr(install, "plugin_state", lambda **kwargs: state)
+    monkeypatch.setattr(install, "run_install", lambda **kwargs: install_calls.append(kwargs))
     monkeypatch.setattr(upgrade, "detect_install_method", lambda: "pip")
     monkeypatch.setattr(upgrade, "run_upgrade_command", lambda *args: upgrade_calls.append(args))
 
     assert upgrade.upgrade_command(SimpleNamespace(hermes_home=str(tmp_path))) == 1
     assert upgrade_calls == []
+    assert install_calls == []
     assert "Cannot safely upgrade an invalid Mnemosyne wrapper" in capsys.readouterr().out

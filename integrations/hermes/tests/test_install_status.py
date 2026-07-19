@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -270,22 +271,21 @@ def test_plugin_state_reports_invalid_wrapper_manifest_without_legacy_fallback(
     assert expected_message in state.message
 
 
-def test_plugin_state_reports_non_executable_wrapper_interpreter_without_raising(tmp_path, monkeypatch):
+def test_plugin_state_reports_non_executable_wrapper_interpreter_without_raising(tmp_path):
     target = tmp_path / "plugins" / "mnemosyne"
     site_packages = install._site_packages_for_python(Path(sys.executable))
     install._write_wrapper_plugin(target, python=Path(sys.executable), site_packages=site_packages)
     non_executable = tmp_path / "non-executable-python"
     non_executable.write_text("not executable\n", encoding="utf-8")
+    non_executable.chmod(non_executable.stat().st_mode & ~(stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+    if os.access(non_executable, os.X_OK):
+        pytest.skip("platform cannot create a non-executable regular file")
+    assert non_executable.is_file()
+    assert not os.access(non_executable, os.X_OK)
     manifest_path = target / "mnemosyne-wrapper.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["python"] = str(non_executable)
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    real_access = os.access
-    monkeypatch.setattr(
-        install.os,
-        "access",
-        lambda path, mode: False if Path(path) == non_executable else real_access(path, mode),
-    )
 
     state = install.plugin_state(hermes_home_path=tmp_path)
 

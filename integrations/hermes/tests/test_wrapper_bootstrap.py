@@ -181,6 +181,8 @@ wrong = importlib.import_module('mnemosyne_hermes')
 wrong_cli = importlib.import_module('mnemosyne_hermes.cli')
 assert wrong.SIDE_VALUE == 'wrong-cached-package'
 assert wrong_cli.register_cli() == 'wrong-cli'
+sentinel = types.ModuleType('unrelated_wrapper_cache_sentinel')
+sys.modules[sentinel.__name__] = sentinel
 
 parent = types.ModuleType('synthetic_hermes_plugins')
 parent.__path__ = []
@@ -195,6 +197,7 @@ init_spec.loader.exec_module(init_module)
 
 assert init_module.SIDE_VALUE == 'selected-side-package'
 assert init_module.register_memory_provider() == 'selected-provider'
+assert sys.modules[sentinel.__name__] is sentinel
 side = sys.modules['mnemosyne_hermes']
 assert Path(side.__file__).parent == selected_package
 assert 'mnemosyne_hermes.cli' not in sys.modules
