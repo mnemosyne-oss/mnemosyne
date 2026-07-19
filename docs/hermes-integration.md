@@ -46,8 +46,8 @@ pip install -e "integrations/hermes[dev]"
 > ```bash
 > # Inside the container, pointing at a side/persistent venv that has mnemosyne-hermes installed
 > export HERMES_HOME=/opt/data
-> mnemosyne-hermes install --mode wrapper --python /path/to/venv/bin/python
-> mnemosyne-hermes status
+> /path/to/venv/bin/mnemosyne-hermes install --mode wrapper --python /path/to/venv/bin/python
+> /path/to/venv/bin/mnemosyne-hermes status
 > hermes config set memory.provider mnemosyne
 > hermes gateway restart
 > ```
@@ -198,8 +198,22 @@ Mnemosyne does not currently expose a standalone REST API server.
 
 ## Uninstall
 
+### Persistent wrapper / Docker-image install
+
+```bash
+export HERMES_HOME=/opt/data  # Replace with the non-default Hermes home used at install time
+VENV=/path/to/venv             # The same side venv passed to the wrapper install
+"$VENV/bin/mnemosyne-hermes" uninstall
+hermes memory off  # Disable the external provider; built-in memory remains active
+"$VENV/bin/python" -m pip uninstall mnemosyne-hermes
+```
+
+`mnemosyne-hermes uninstall` removes the plugin registration at `$HERMES_HOME/plugins/mnemosyne`.
+
+### Activated local environment
+
 ```bash
 mnemosyne-hermes uninstall
-hermes memory off  # Disable the external provider; built-in memory remains active
+hermes memory off
 pip uninstall mnemosyne-hermes
 ```

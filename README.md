@@ -396,7 +396,7 @@ See [docs/hermes-integration.md](docs/hermes-integration.md) for the full setup 
 | **Working notes** | `mnemosyne_scratchpad_write`, `mnemosyne_scratchpad_read`, `mnemosyne_scratchpad_clear` |
 | **Ops** | `mnemosyne_export`, `mnemosyne_import`, `mnemosyne_diagnose` |
 
-The provider tool inventory evolves with the installed package versions. Verify the active provider with `hermes memory status` and inspect the available tools with `hermes tools list`. The plugin manifest at `integrations/hermes/` is also discoverable by Hermes' plugin system.
+The provider tool inventory evolves with the installed package versions. Verify the active provider with `hermes memory status` and inspect the available tools with `hermes tools list`. The installer or wrapper registers the plugin manifest under `$HERMES_HOME/plugins/mnemosyne`, where Hermes discovers it.
 
 **Updating:** For the persistent side-venv wrapper path, use the side venv rather than a bare `pip`:
 
