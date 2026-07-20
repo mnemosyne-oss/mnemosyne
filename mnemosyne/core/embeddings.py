@@ -167,6 +167,14 @@ def _get_embedding_dim(model_name: str) -> int:
         # --- Jina ---
         "jina-embeddings-v5-omni-nano": 768,
         "jina-embeddings-v5-omni-small": 1024,
+        # Jina v2 base family (bilingual/monolingual, all 768-dim). Without these
+        # entries these popular models silently fall back to 384 below, which
+        # mismatches their true 768-dim output and corrupts vector search.
+        "jinaai/jina-embeddings-v2-base-es": 768,
+        "jinaai/jina-embeddings-v2-base-en": 768,
+        "jinaai/jina-embeddings-v2-base-de": 768,
+        "jinaai/jina-embeddings-v2-base-zh": 768,
+        "jinaai/jina-embeddings-v2-base-code": 768,
     }
     # Check env override first
     env_dim = os.environ.get("MNEMOSYNE_EMBEDDING_DIM")
