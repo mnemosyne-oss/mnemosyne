@@ -1613,6 +1613,29 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if bool(args.get("dry_run", False)):
             return json.dumps(dry_run_batch(normalized))
 
+        # Write-approval gate: stage each operation to pending when enabled.
+        if _write_approval_enabled():
+            staged = []
+            for op in normalized:
+                pid = _stage_pending_write({
+                    "tool": "mnemosyne_batch",
+                    "action": op.get("action"),
+                    "content": op.get("content", ""),
+                    "importance": op.get("importance", 0.5),
+                    "source": op.get("source", "user"),
+                    "scope": op.get("scope", self._default_scope),
+                    "valid_until": op.get("valid_until"),
+                    "metadata": op.get("metadata"),
+                    "veracity": op.get("veracity"),
+                    "memory_id": op.get("memory_id"),
+                })
+                staged.append({"action": op.get("action"), "pending_id": pid})
+            return json.dumps({
+                "status": "staged", "staged": staged,
+                "staged_count": len(staged),
+                "message": "Batch write staged for approval. Use mnemosyne_apply_pending to commit.",
+            })
+
         return json.dumps(apply_beam_batch(
             self._beam,
             normalized,
@@ -2149,14 +2172,34 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if isinstance(pending_ids, str):
             pending_ids = [pid.strip() for pid in pending_ids.split(",") if pid.strip()]
         pending_dir = get_hermes_home() / "pending" / "memory"
+        pending_dir = pending_dir.resolve()
         applied, failed = [], []
         for pid in pending_ids:
-            rp = pending_dir / f"{pid}.json"
-            if not rp.exists():
+            # Validate pid is a safe identifier: hex chars only, no path traversal
+            if not isinstance(pid, str) or not pid.strip():
+                failed.append({"id": str(pid), "error": "invalid: empty"})
+                continue
+            pid = pid.strip()
+            if not all(c.isalnum() and c.isascii() for c in pid):
+                failed.append({"id": pid, "error": "invalid: non-alphanumeric"})
+                continue
+            if len(pid) > 64:
+                failed.append({"id": pid, "error": "invalid: too long"})
+                continue
+            # Resolve and verify containment
+            rp = (pending_dir / f"{pid}.json").resolve()
+            if str(rp.parent) != str(pending_dir):
+                failed.append({"id": pid, "error": "invalid: path traversal"})
+                continue
+            if not rp.is_file():
                 failed.append({"id": pid, "error": "not found"})
                 continue
             try:
                 record = json.loads(rp.read_text())
+                # Verify the record's own id matches the filename
+                if record.get("id") != pid:
+                    failed.append({"id": pid, "error": "id mismatch"})
+                    continue
                 p = record.get("payload", {})
                 c = p.get("content", "")
                 if not c:
