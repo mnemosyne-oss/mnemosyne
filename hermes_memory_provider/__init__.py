@@ -3202,17 +3202,35 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             pending_ids = [pid.strip() for pid in pending_ids.split(",") if pid.strip()]
 
         pending_dir = get_hermes_home() / "pending" / "memory"
+        pending_dir = pending_dir.resolve()
         applied = []
         failed = []
 
         for pid in pending_ids:
-            record_path = pending_dir / f"{pid}.json"
-            if not record_path.exists():
+            # Validate pid is a safe identifier: no path traversal
+            if not isinstance(pid, str) or not pid.strip():
+                failed.append({"id": str(pid), "error": "invalid: empty"})
+                continue
+            pid = pid.strip()
+            if not all(c.isalnum() and c.isascii() for c in pid):
+                failed.append({"id": pid, "error": "invalid: non-alphanumeric"})
+                continue
+            if len(pid) > 64:
+                failed.append({"id": pid, "error": "invalid: too long"})
+                continue
+            record_path = (pending_dir / f"{pid}.json").resolve()
+            if str(record_path.parent) != str(pending_dir):
+                failed.append({"id": pid, "error": "invalid: path traversal"})
+                continue
+            if not record_path.is_file():
                 failed.append({"id": pid, "error": "pending record not found"})
                 continue
 
             try:
                 record = json.loads(record_path.read_text())
+                if record.get("id") != pid:
+                    failed.append({"id": pid, "error": "id mismatch"})
+                    continue
                 payload = record.get("payload", {})
                 content = payload.get("content", "")
                 if not content:

@@ -58,6 +58,45 @@ def test_task_progress_roundtrip_and_list(tmp_path):
         _close(provider)
 
 
+def test_persona_mutations_commit_before_task_progress(tmp_path):
+    provider = _provider(tmp_path, profile="profile_a")
+    try:
+        assert provider._beam is not None
+        remembered = json.loads(provider.handle_tool_call(
+            "mnemosyne_remember",
+            {"content": "Persona transaction regression fixture.", "source": "test"},
+        ))
+        promoted = json.loads(provider.handle_tool_call(
+            "mnemosyne_persona_promote",
+            {"memory_id": remembered["memory_id"], "tier": "working"},
+        ))
+        assert promoted["status"] == "ok"
+        assert provider._beam.conn.in_transaction is False
+
+        progressed = json.loads(provider.handle_tool_call(
+            "mnemosyne_task_progress",
+            {"action": "set", "task": "persona-transaction", "state": "current"},
+        ))
+        assert progressed["status"] == "set"
+        assert provider._beam.conn.in_transaction is False
+
+        reinforced = json.loads(provider.handle_tool_call(
+            "mnemosyne_persona_reinforce",
+            {"persona_id": promoted["persona_id"]},
+        ))
+        assert reinforced["status"] == "ok"
+        assert provider._beam.conn.in_transaction is False
+
+        demoted = json.loads(provider.handle_tool_call(
+            "mnemosyne_persona_demote",
+            {"persona_id": promoted["persona_id"]},
+        ))
+        assert demoted["status"] == "ok"
+        assert provider._beam.conn.in_transaction is False
+    finally:
+        _close(provider)
+
+
 def test_task_progress_is_profile_scoped(tmp_path):
     provider = _provider(tmp_path, profile="profile_a")
     try:

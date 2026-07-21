@@ -1,6 +1,7 @@
 """Tests for the L3 persona adapter (v3.10.0)."""
 
 import json
+import logging
 import tempfile
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 
 from mnemosyne.core.beam import BeamMemory
 from mnemosyne_hermes.persona_adapter import PersonaAdapter, VALID_TIERS
+from hermes_memory_provider.persona_adapter import PersonaAdapter as LegacyPersonaAdapter
 
 
 @pytest.fixture
@@ -72,6 +74,47 @@ class TestPersonaPromote:
         ))
         assert result["status"] == "error"
         assert "not found" in result["error"]
+
+    def test_promote_rolls_back_when_insert_fails(self, adapter, beam_with_memories, caplog):
+        caplog.set_level(logging.ERROR)
+        mid = _memory_id_by_content(beam_with_memories, "XYZ")
+        conn = beam_with_memories.conn
+        conn.execute(
+            "CREATE TRIGGER fail_persona_insert BEFORE INSERT ON memoria_persona "
+            "BEGIN SELECT RAISE(ABORT, 'forced insert failure'); END"
+        )
+        conn.commit()
+
+        result = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_promote", {"memory_id": mid, "tier": "long_term"},
+        ))
+
+        assert result["status"] == "error"
+        assert conn.in_transaction is False
+        assert conn.execute("SELECT 1 FROM memoria_persona").fetchone() is None
+        assert "Persona promotion failed; rolling back transaction" in caplog.text
+        assert "Persona tool mnemosyne_persona_promote failed" in caplog.text
+
+    def test_legacy_promote_rolls_back_when_insert_fails(self, beam_with_memories, caplog):
+        caplog.set_level(logging.ERROR)
+        adapter = LegacyPersonaAdapter(beam_instance=beam_with_memories)
+        mid = _memory_id_by_content(beam_with_memories, "XYZ")
+        conn = beam_with_memories.conn
+        conn.execute(
+            "CREATE TRIGGER fail_legacy_persona_insert BEFORE INSERT ON memoria_persona "
+            "BEGIN SELECT RAISE(ABORT, 'forced insert failure'); END"
+        )
+        conn.commit()
+
+        result = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_promote", {"memory_id": mid, "tier": "long_term"},
+        ))
+
+        assert result["status"] == "error"
+        assert conn.in_transaction is False
+        assert conn.execute("SELECT 1 FROM memoria_persona").fetchone() is None
+        assert "Persona promotion failed; rolling back transaction" in caplog.text
+        assert "Persona tool mnemosyne_persona_promote failed" in caplog.text
 
 
 class TestPersonaList:
@@ -165,6 +208,57 @@ class TestPersonaReinforce:
             "mnemosyne_persona_reinforce", {"persona_id": 9999},
         ))
         assert result["status"] == "error"
+        assert adapter._conn().in_transaction is False
+
+    def test_reinforce_rolls_back_when_update_fails(self, adapter, beam_with_memories, caplog):
+        caplog.set_level(logging.ERROR)
+        mid = _memory_id_by_content(beam_with_memories, "XYZ")
+        promoted = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_promote", {"memory_id": mid, "tier": "long_term"},
+        ))
+        conn = beam_with_memories.conn
+        conn.execute(
+            "CREATE TRIGGER fail_persona_reinforce BEFORE UPDATE ON memoria_persona "
+            "BEGIN SELECT RAISE(ABORT, 'forced update failure'); END"
+        )
+        conn.commit()
+
+        result = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_reinforce", {"persona_id": promoted["persona_id"]},
+        ))
+
+        assert result["status"] == "error"
+        assert conn.in_transaction is False
+        assert conn.execute(
+            "SELECT reinforcement_count FROM memoria_persona WHERE id = ?",
+            (promoted["persona_id"],),
+        ).fetchone()[0] == 0
+        assert "Persona reinforcement failed; rolling back transaction" in caplog.text
+        assert "Persona tool mnemosyne_persona_reinforce failed" in caplog.text
+
+    def test_legacy_reinforce_rolls_back_when_update_fails(self, beam_with_memories):
+        adapter = LegacyPersonaAdapter(beam_instance=beam_with_memories)
+        mid = _memory_id_by_content(beam_with_memories, "XYZ")
+        promoted = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_promote", {"memory_id": mid, "tier": "long_term"},
+        ))
+        conn = beam_with_memories.conn
+        conn.execute(
+            "CREATE TRIGGER fail_legacy_persona_reinforce BEFORE UPDATE ON memoria_persona "
+            "BEGIN SELECT RAISE(ABORT, 'forced update failure'); END"
+        )
+        conn.commit()
+
+        result = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_reinforce", {"persona_id": promoted["persona_id"]},
+        ))
+
+        assert result["status"] == "error"
+        assert conn.in_transaction is False
+        assert conn.execute(
+            "SELECT reinforcement_count FROM memoria_persona WHERE id = ?",
+            (promoted["persona_id"],),
+        ).fetchone()[0] == 0
 
 
 class TestPersonaDemote:
@@ -203,6 +297,86 @@ class TestPersonaDemote:
             "mnemosyne_persona_demote", {"persona_id": 9999},
         ))
         assert result["status"] == "error"
+
+    def test_demote_rolls_back_tombstone_when_delete_fails(self, adapter, beam_with_memories):
+        mid = _memory_id_by_content(beam_with_memories, "XYZ")
+        promoted = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_promote",
+            {"memory_id": mid, "tier": "long_term"},
+        ))
+        pid = promoted["persona_id"]
+        conn = beam_with_memories.conn
+        conn.execute(
+            "CREATE TRIGGER fail_persona_delete BEFORE DELETE ON memoria_persona "
+            "BEGIN SELECT RAISE(ABORT, 'forced delete failure'); END"
+        )
+        conn.commit()
+
+        result = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_demote", {"persona_id": pid},
+        ))
+
+        assert result["status"] == "error"
+        assert conn.in_transaction is False
+        assert conn.execute("SELECT 1 FROM memoria_persona WHERE id = ?", (pid,)).fetchone()
+        assert conn.execute(
+            "SELECT 1 FROM memoria_preferences WHERE source_memory_id = ?",
+            (f"persona:{pid}",),
+        ).fetchone() is None
+
+    def test_legacy_demote_rolls_back_tombstone_when_delete_fails(self, beam_with_memories):
+        adapter = LegacyPersonaAdapter(beam_instance=beam_with_memories)
+        mid = _memory_id_by_content(beam_with_memories, "XYZ")
+        promoted = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_promote",
+            {"memory_id": mid, "tier": "long_term"},
+        ))
+        pid = promoted["persona_id"]
+        conn = beam_with_memories.conn
+        conn.execute(
+            "CREATE TRIGGER fail_legacy_persona_delete BEFORE DELETE ON memoria_persona "
+            "BEGIN SELECT RAISE(ABORT, 'forced delete failure'); END"
+        )
+        conn.commit()
+
+        result = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_demote", {"persona_id": pid},
+        ))
+
+        assert result["status"] == "error"
+        assert conn.in_transaction is False
+        assert conn.execute("SELECT 1 FROM memoria_persona WHERE id = ?", (pid,)).fetchone()
+        assert conn.execute(
+            "SELECT 1 FROM memoria_preferences WHERE source_memory_id = ?",
+            (f"persona:{pid}",),
+        ).fetchone() is None
+
+    def test_legacy_persona_mutations_leave_connection_clean(self, beam_with_memories):
+        adapter = LegacyPersonaAdapter(beam_instance=beam_with_memories)
+        mid = _memory_id_by_content(beam_with_memories, "XYZ")
+        promoted = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_promote", {"memory_id": mid, "tier": "working"},
+        ))
+        conn = beam_with_memories.conn
+        assert promoted["status"] == "ok"
+        assert conn.in_transaction is False
+
+        reinforced = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_reinforce", {"persona_id": promoted["persona_id"]},
+        ))
+        assert reinforced["status"] == "ok"
+        assert conn.in_transaction is False
+
+        beam_with_memories.canonical.remember(
+            "default", "task:progress", "legacy-persona", "current"
+        )
+        assert conn.in_transaction is False
+
+        demoted = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_demote", {"persona_id": promoted["persona_id"]},
+        ))
+        assert demoted["status"] == "ok"
+        assert conn.in_transaction is False
 
 
 class TestPersonaAdapterReadiness:
