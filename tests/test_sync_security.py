@@ -132,6 +132,61 @@ def test_sync_init_requires_explicit_confirmation_for_existing_rows(tmp_path, ca
     ).fetchone()[0] == "shared-surface-v1"
 
 
+def test_sync_cli_claims_new_hermes_shared_surface_rows(tmp_path, monkeypatch, capsys):
+    from mnemosyne.cli import cmd_sync, cmd_sync_init
+    from mnemosyne.core.sync import SyncEngine
+
+    db_path = tmp_path / "hermes-shared.db"
+    cmd_sync_init(["--db-path", str(db_path)])
+    capsys.readouterr()
+
+    memory = Mnemosyne(db_path=db_path, session_id="hermes_shared_surface")
+    memory_id = memory.beam.remember(
+        "new Hermes shared memory",
+        source="surface_manual",
+        scope="global",
+    )
+
+    observed = {}
+
+    def fake_sync_with(engine, remote_url, mode="bidirectional", api_key=None, **_kwargs):
+        observed["surface_session_id"] = engine.surface_session_id
+        observed["unowned_rows"] = engine.conn.execute(
+            """SELECT COUNT(*) FROM working_memory
+               WHERE sync_surface_id IS NULL OR sync_surface_id != ?""",
+            (engine.surface_id,),
+        ).fetchone()[0]
+        return {
+            "remote": remote_url,
+            "mode": mode,
+            "push": {"accepted": 0, "duplicates": 0, "conflicts": 0},
+            "pull": None,
+            "errors": [],
+        }
+
+    monkeypatch.setattr(SyncEngine, "sync_with", fake_sync_with)
+
+    cmd_sync(
+        [
+            "--db-path",
+            str(db_path),
+            "--remote",
+            "http://127.0.0.1:8765",
+            "--mode",
+            "push",
+        ]
+    )
+
+    assert observed == {
+        "surface_session_id": "hermes_shared_surface",
+        "unowned_rows": 0,
+    }
+    assert memory.beam.conn.execute(
+        "SELECT sync_surface_id FROM working_memory WHERE id = ?",
+        (memory_id,),
+    ).fetchone()[0] == "shared-surface-v1"
+
+
 def test_packaged_deployment_commands_match_hardened_cli():
     from pathlib import Path
 
