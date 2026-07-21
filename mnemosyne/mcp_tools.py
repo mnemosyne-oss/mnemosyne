@@ -1026,6 +1026,7 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
             or not isinstance(importance, (int, float))
             or isinstance(importance, bool)
             or not math.isfinite(importance)
+            or not 0 <= importance <= 1
             or not isinstance(content_length, int)
             or isinstance(content_length, bool)
             or content_length < 0

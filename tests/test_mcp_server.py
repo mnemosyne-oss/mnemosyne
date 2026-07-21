@@ -467,6 +467,7 @@ class TestToolHandlers:
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "noise_score": float("nan")}]),
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "noise_score": 1.1}]),
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "importance": float("inf")}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "importance": 1.1}]),
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "content_length": -1}]),
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "content_length": 1.5}]),
         ],
