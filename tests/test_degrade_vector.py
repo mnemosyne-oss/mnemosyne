@@ -341,12 +341,13 @@ class TestDegradeEpisodicVectorRefresh:
             summary=long_original,
             source_wm_ids=["wm-1"],
             importance=0.6,
+            tier=1,  # start hot: this test exercises the tier 1→2 transition
         )
         original_embedding = _read_fallback_embedding(temp_db, memory_id)
         assert original_embedding is not None
 
-        # Backdate so the row is eligible for tier 1→2 (tier defaults to 1
-        # in the schema, so we just need the timestamp).
+        # Backdate so the row is eligible for tier 1→2 (the row was created at
+        # tier 1 above, so we just need the timestamp).
         old_ts = (datetime.now() - timedelta(days=beam_module.TIER2_DAYS + 1)).isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.execute(
