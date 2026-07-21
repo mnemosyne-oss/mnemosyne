@@ -1694,13 +1694,26 @@ class TestTieredDegradation:
         assert any("tier" in idx for idx in indexes), "idx_em_tier index missing"
         conn.close()
 
-    def test_episodic_memory_defaults_to_tier_1(self, temp_db):
-        """New episodic memories should default to tier 1."""
+    def test_episodic_memory_defaults_to_configured_consolidation_tier(self, temp_db, monkeypatch):
+        """New consolidation summaries default to MNEMOSYNE_CONSOLIDATION_TIER (3).
+
+        Pre-#506 the INSERT omitted `tier` entirely, so summaries landed on the
+        schema default of 1 (full ranking weight) and outranked the sources they
+        paraphrase. Derived rows now enter degraded; the schema default of 1 is
+        still what a caller gets by passing `tier=1` explicitly.
+        """
+        monkeypatch.delenv("MNEMOSYNE_CONSOLIDATION_TIER", raising=False)
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         eid = beam.consolidate_to_episodic(
-            summary="Default tier should be 1",
+            summary="Default tier should be the consolidation tier",
             source_wm_ids=["wm1"],
             importance=0.8
+        )
+        legacy_eid = beam.consolidate_to_episodic(
+            summary="Explicit tier 1 restores the legacy weight",
+            source_wm_ids=["wm1"],
+            importance=0.8,
+            tier=1,
         )
 
         conn = sqlite3.connect(temp_db)
@@ -1708,8 +1721,12 @@ class TestTieredDegradation:
         tier = cursor.execute(
             "SELECT tier FROM episodic_memory WHERE id = ?", (eid,)
         ).fetchone()[0]
+        legacy_tier = cursor.execute(
+            "SELECT tier FROM episodic_memory WHERE id = ?", (legacy_eid,)
+        ).fetchone()[0]
         conn.close()
-        assert tier == 1, f"Expected tier=1, got tier={tier}"
+        assert tier == 3, f"Expected tier=3, got tier={tier}"
+        assert legacy_tier == 1, f"Expected tier=1, got tier={legacy_tier}"
 
     def test_degrade_episodic_tier1_to_tier2(self, temp_db, monkeypatch):
         """Tier 1 memories older than TIER2_DAYS should degrade to tier 2."""
@@ -1721,7 +1738,8 @@ class TestTieredDegradation:
         eid = beam.consolidate_to_episodic(
             summary="This memory is old enough for tier 2 degradation",
             source_wm_ids=["wm1"],
-            importance=0.7
+            importance=0.7,
+            tier=1,  # start hot: this test exercises the 1→2 transition
         )
 
         # Backdate the episodic memory to be older than 5 days
@@ -1754,7 +1772,8 @@ class TestTieredDegradation:
         eid = beam.consolidate_to_episodic(
             summary="This memory will go all the way to tier 3",
             source_wm_ids=["wm1"],
-            importance=0.6
+            importance=0.6,
+            tier=1,  # start hot: this test walks the full 1→2→3 path
         )
 
         # First degrade to tier 2 (older than 1 day)
@@ -1788,7 +1807,8 @@ class TestTieredDegradation:
         beam.consolidate_to_episodic(
             summary="Should be counted but not degraded",
             source_wm_ids=["wm1"],
-            importance=0.7
+            importance=0.7,
+            tier=1,  # start hot: this test exercises the 1→2 candidate count
         )
 
         conn = sqlite3.connect(temp_db)
@@ -1825,7 +1845,8 @@ class TestTieredDegradation:
             eid = beam.consolidate_to_episodic(
                 summary=f"Memory {i} for batch limit test",
                 source_wm_ids=[f"wm{i}"],
-                importance=0.5
+                importance=0.5,
+                tier=1,  # start hot: the batch limit applies to the 1→2 pass
             )
             eids.append(eid)
 
@@ -1851,7 +1872,8 @@ class TestTieredDegradation:
         eid = beam.consolidate_to_episodic(
             summary="Python projects use virtual environments for isolation",
             source_wm_ids=["wm1"],
-            importance=0.9
+            importance=0.9,
+            tier=1,  # start hot: this test degrades down to tier 3
         )
 
         # Degrade to tier 3
@@ -1923,7 +1945,8 @@ class TestTieredDegradation:
         eid = beam.consolidate_to_episodic(
             summary="The user's favorite programming language is Rust for systems work",
             source_wm_ids=["wm1"],
-            importance=0.85
+            importance=0.85,
+            tier=1,  # start hot: this test degrades down to tier 3
         )
 
         conn = sqlite3.connect(temp_db)

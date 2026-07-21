@@ -314,6 +314,62 @@ def _env_disabled(name: str) -> bool:
     val = os.environ.get(name, "").strip().lower()
     return val in ("0", "false", "no", "off")
 
+
+# Derived-memory ranking defaults (#506). Both read the environment at call
+# time rather than at import so config changes take effect without a restart
+# (see #482 for the module-level-constant bug class this avoids).
+
+DEFAULT_CONSOLIDATION_TIER = 3
+DEFAULT_PROPOSAL_IMPORTANCE_CAP = 0.5
+
+
+def resolve_consolidation_tier(tier: Optional[int] = None) -> int:
+    """Resolve the initial degradation tier for a consolidation summary.
+
+    Explicit `tier` wins; `None` reads MNEMOSYNE_CONSOLIDATION_TIER. Derived
+    summaries default to tier 3 (0.25x recall weight) so they don't enter
+    ranking at the same weight as the sources they paraphrase. Unparseable
+    values fall back to the default. Result is clamped to {1, 2, 3}, the tiers
+    `degrade_episodic()` and the recall weight map understand.
+    """
+    if tier is None:
+        try:
+            tier = int(os.environ.get(
+                "MNEMOSYNE_CONSOLIDATION_TIER", str(DEFAULT_CONSOLIDATION_TIER)))
+        except (TypeError, ValueError):
+            tier = DEFAULT_CONSOLIDATION_TIER
+    return min(3, max(1, int(tier)))
+
+
+def cap_proposal_importance(confidence, cap: Optional[float] = None) -> float:
+    """Cap a model-refresh proposal's ranking importance.
+
+    `confidence` is the generating LLM's self-reported belief in the proposal,
+    which is NOT a retrieval priority -- using it directly let review artifacts
+    (routinely 0.85-0.95) outrank curated content and made them un-droppable by
+    the Hermes prefetch gate, which requires importance < 0.65. The raw value
+    stays in the proposal metadata that the review/auto-apply flow reads.
+
+    `cap=None` reads MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP. Missing/None confidence
+    falls back to 0.5, matching the pre-cap default. Unparseable caps fall back
+    to the default cap, and both the cap and the result are clamped to [0, 1] --
+    recall scoring and the injection gate assume importance sits in that range.
+    """
+    if cap is None:
+        try:
+            cap = float(os.environ.get(
+                "MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP",
+                str(DEFAULT_PROPOSAL_IMPORTANCE_CAP)))
+        except (TypeError, ValueError):
+            cap = DEFAULT_PROPOSAL_IMPORTANCE_CAP
+    cap = min(1.0, max(0.0, float(cap)))
+    try:
+        raw = float(confidence) if confidence is not None else 0.5
+    except (TypeError, ValueError):
+        raw = 0.5
+    return min(1.0, max(0.0, min(raw, cap)))
+
+
 # Veracity weighting (memory confidence). C29: defaults come from
 # `_VW_DEFAULTS` which mirrors `veracity_consolidation.VERACITY_WEIGHTS`
 # in normal mode and falls back to a hardcoded literal in degraded-import
@@ -4554,7 +4610,8 @@ class BeamMemory:
                                 source: str = "consolidation", importance: float = 0.6,
                                 metadata: Dict = None, valid_until: str = None,
                                 scope: str = "session",
-                                veracity: Optional[str] = None) -> str:
+                                veracity: Optional[str] = None,
+                                tier: Optional[int] = None) -> str:
         """
         Store a consolidated summary into episodic_memory with optional embedding.
 
@@ -4566,6 +4623,30 @@ class BeamMemory:
         aggregate via `aggregate_veracity()` over the source rows' veracity
         values and pass it here. `None` falls back to 'unknown' (matches
         legacy behavior + schema default).
+
+        `tier` sets the initial degradation tier of the consolidated row
+        (upstream issue #506). Pre-fix the INSERT omitted the tier column, so
+        every consolidation summary entered at the schema default tier 1 (full
+        1.0x recall weight) and competed with the source memories it
+        paraphrases at equal weight for TIER2_DAYS (30d). `None` reads
+        MNEMOSYNE_CONSOLIDATION_TIER (default "3" = 0.25x weight; set "1" to
+        restore legacy behavior); see `resolve_consolidation_tier()`.
+
+        The tier multiplier REDUCES a derived row's ranking contribution; it
+        does not guarantee that sources outrank summaries, since vector, FTS
+        and temporal signals also feed the final score. Applied at write time
+        only — rows already in the bank keep the tier they were written with.
+
+        Note that `tier` here means RANKING WEIGHT ONLY, not stored-content
+        compression. `degrade_episodic()` couples the two because it rewrites
+        content as it moves a row down (LLM summarization at 1->2, key-signal
+        extraction at 2->3), and its SELECTs only match rows currently at tier
+        1 or 2 — so a row inserted directly at tier 3 keeps its full text
+        permanently. That is intentional: the summary written by `sleep()` is
+        already the compressed artifact (its sources stay in working_memory),
+        and truncating it again at insert time would discard content the
+        consolidation LLM just decided was worth keeping. Callers wanting a
+        length bound on the stored summary should bound the summary they pass.
         """
         memory_id = _generate_id(summary)
         timestamp = datetime.now().isoformat()
@@ -4607,14 +4688,17 @@ class BeamMemory:
                     type(exc).__name__, exc,
                 )
         cursor = self.conn.cursor()
+        # Resolve + clamp the initial tier and include it in the INSERT
+        # (previously omitted -> schema default 1). See #506.
+        row_tier = resolve_consolidation_tier(tier)
         cursor.execute("""
             INSERT INTO episodic_memory
             (id, content, source, timestamp, session_id, importance, metadata_json, summary_of, valid_until, scope,
-             author_id, author_type, channel_id, memory_type, veracity)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             author_id, author_type, channel_id, memory_type, veracity, tier)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (memory_id, _sanitize_utf8(summary), source, timestamp, self.session_id, importance,
               json.dumps(metadata or {}), ",".join(source_wm_ids), valid_until, scope,
-              self.author_id, self.author_type, self.channel_id, ep_type, row_veracity))
+              self.author_id, self.author_type, self.channel_id, ep_type, row_veracity, row_tier))
         rowid = cursor.lastrowid
 
         if vec is not None:
@@ -8754,14 +8838,19 @@ class BeamMemory:
                         proposal_id = self.remember(
                             model_refresh.proposal_to_memory_content(proposal),
                             source="sleep_model_refresh_proposal",
-                            # Convert defensively: this runs AFTER the claim
-                            # commit, so a raise here strands this group's
-                            # consolidation_claimed_at and orphans every
-                            # later group's claim. Proposals normally arrive
-                            # sanitized by parse_model_update_proposals, but
-                            # that invariant lives a module away.
-                            importance=model_refresh.coerce_confidence(
-                                proposal.get("confidence"), 0.5
+                            # Compose both hardenings: coerce_confidence()
+                            # degrades NaN/Infinity/text/bool to 0.5 and
+                            # clamps to [0, 1] (this runs AFTER the claim
+                            # commit, so a raise or a NaN here strands this
+                            # group's consolidation_claimed_at); then
+                            # cap_proposal_importance() caps the result —
+                            # the LLM's self-reported confidence is not a
+                            # retrieval priority. Raw value stays in
+                            # metadata. (#506)
+                            importance=cap_proposal_importance(
+                                model_refresh.coerce_confidence(
+                                    proposal.get("confidence"), 0.5
+                                )
                             ),
                             metadata=metadata,
                             scope="session",
