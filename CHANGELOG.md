@@ -53,6 +53,11 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   an idempotent migration that rebuilds the table without the FK
   and removes the FK from the `memory.py` DDL so fresh
   databases are clean.
+- **`mcp_tools.py` validate(delete) path now cascades to child rows.**
+  The bare `DELETE FROM working_memory` previously left orphaned
+  `memory_embeddings`, `annotations`, and `vec_working` rows behind.
+  The path now deletes all dependent rows before removing the parent,
+  with guarded vec_working handling for sqlite-vec-unavailable environments.
 
 ## [3.12.0] — 2026-07-11
 

@@ -13,6 +13,7 @@ All imports are guarded — this module loads safely even if mcp is not installe
 
 from typing import Dict, Any, List
 import os
+import sqlite3
 from pathlib import Path
 
 # Guarded import — MCP is optional
@@ -510,6 +511,17 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         if action == "delete":
+            # Cascade delete child rows before removing parent
+            conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+            conn.execute("DELETE FROM annotations WHERE memory_id = ?", (memory_id,))
+            # vec_working is optional (sqlite-vec may be unavailable)
+            row = conn.execute("SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)).fetchone()
+            if row is not None:
+                try:
+                    conn.execute("DELETE FROM vec_working WHERE rowid = ?", (row["rowid"],))
+                except sqlite3.OperationalError as vec_err:
+                    if "no such table" not in str(vec_err).lower():
+                        raise
             conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
         elif action == "update":
             conn.execute(
