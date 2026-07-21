@@ -5,11 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
-## [3.15.0] - 2026-07-18
+## [3.15.0] - 2026-07-20
 
 ### Fixed
 
 - **Trim-before-embedding race (#491).** Working-memory embedding storage now atomically checks that its parent row still exists. If trimming or concurrent deletion removes the parent before the fallback insert executes, both fallback and `vec_working` writes become a clean no-op instead of logging an embedding-storage failure.
+- **Jina v2 base embedding models silently fell back to 384 dimensions.** The
+  `jinaai/jina-embeddings-v2-base-{es,en,de,zh,code}` models output 768-dim
+  vectors, but were absent from `_get_embedding_dim`'s table and so resolved to
+  the 384 unknown-model fallback — a silent dimension mismatch that corrupts
+  vector similarity search for anyone using these popular models (notably the
+  `-es` Spanish/English bilingual model). Added explicit 768-dim entries plus a
+  regression test in `tests/test_embeddings_multilingual.py`.
 
 ## [3.14.0] - 2026-07-17
 
