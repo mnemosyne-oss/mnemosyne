@@ -60,6 +60,7 @@ class PersonaAdapter:
             elif tool_name == "mnemosyne_persona_reinforce":
                 return self._reinforce(**args)
         except Exception as exc:
+            logger.exception("Persona tool %s failed", tool_name)
             return json.dumps({"status": "error", "error": str(exc)})
         return json.dumps({"status": "error", "error": f"Unknown tool: {tool_name}"})
 
@@ -114,6 +115,7 @@ class PersonaAdapter:
             persona_id = cur.lastrowid
             conn.commit()
         except Exception:
+            logger.exception("Persona promotion failed; rolling back transaction")
             conn.rollback()
             raise
         return json.dumps({
@@ -158,6 +160,7 @@ class PersonaAdapter:
             )
             conn.commit()
         except Exception:
+            logger.exception("Persona demotion failed; rolling back transaction")
             conn.rollback()
             raise
         return json.dumps({
@@ -223,6 +226,7 @@ class PersonaAdapter:
                 })
             conn.commit()
         except Exception:
+            logger.exception("Persona reinforcement failed; rolling back transaction")
             conn.rollback()
             raise
         return json.dumps({
