@@ -41,7 +41,7 @@ jobs:
         run: python -m pip install ruff==0.15.22
 
       - name: Check fatal Python errors
-        run: ruff check --select E9,F63,F7,F82 mnemosyne tests integrations/hermes/src hermes_memory_provider
+        run: ruff check --select E9,F63,F7,F82 mnemosyne tests integrations/hermes/src integrations/hermes/tests hermes_memory_provider
 
   test:
     runs-on: ubuntu-latest

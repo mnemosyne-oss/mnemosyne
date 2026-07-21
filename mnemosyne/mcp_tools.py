@@ -13,6 +13,7 @@ All imports are guarded — this module loads safely even if mcp is not installe
 
 from typing import Dict, Any, List
 import json
+import math
 import os
 import sqlite3
 from pathlib import Path
@@ -1012,10 +1013,22 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
             for key in ("memory_id", "table_name")
         ):
             return {"error": "candidates_json must be a list of valid hygiene candidates"}
-        if any(
-            key in candidate_data
-            and (not isinstance(candidate_data[key], (int, float)) or isinstance(candidate_data[key], bool))
-            for key in ("noise_score", "importance", "content_length")
+        if candidate_data["table_name"] not in {"working_memory", "memories", "episodic_memory"}:
+            return {"error": "candidates_json must be a list of valid hygiene candidates"}
+        noise_score = candidate_data.get("noise_score", 0.0)
+        importance = candidate_data.get("importance", 0.5)
+        content_length = candidate_data.get("content_length", 0)
+        if (
+            not isinstance(noise_score, (int, float))
+            or isinstance(noise_score, bool)
+            or not math.isfinite(noise_score)
+            or not 0 <= noise_score <= 1
+            or not isinstance(importance, (int, float))
+            or isinstance(importance, bool)
+            or not math.isfinite(importance)
+            or not isinstance(content_length, int)
+            or isinstance(content_length, bool)
+            or content_length < 0
         ):
             return {"error": "candidates_json must be a list of valid hygiene candidates"}
         if any(

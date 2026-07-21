@@ -457,7 +457,20 @@ class TestToolHandlers:
 
         assert result == {"error": "candidates_json is not valid JSON"}
 
-    @pytest.mark.parametrize("candidates_json", ["null", "{}", "[{}]"])
+    @pytest.mark.parametrize(
+        "candidates_json",
+        [
+            "null",
+            "{}",
+            "[{}]",
+            json.dumps([{"memory_id": "memory-1", "table_name": "unknown"}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "noise_score": float("nan")}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "noise_score": 1.1}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "importance": float("inf")}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "content_length": -1}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "content_length": 1.5}]),
+        ],
+    )
     def test_hygiene_clean_rejects_malformed_candidates(self, candidates_json, monkeypatch):
         """Malformed candidate payloads return MCP errors before opening a memory instance."""
         monkeypatch.setattr(
@@ -518,8 +531,15 @@ class TestToolHandlers:
         candidate = captured["candidates"][0]
         assert candidate.memory_id == "memory-1"
         assert candidate.table_name == "working_memory"
+        assert candidate.content_preview == "done"
+        assert candidate.noise_score == 0.9
         assert candidate.noise_reasons == ["short acknowledgement"]
+        assert candidate.secret_flags == []
+        assert candidate.importance == 0.2
+        assert candidate.source == "test"
+        assert candidate.timestamp == "2026-07-21T00:00:00Z"
         assert candidate.suggested_action == "archive"
+        assert candidate.content_length == 4
 
     def test_unknown_tool(self):
         """Unknown tool raises ValueError."""
