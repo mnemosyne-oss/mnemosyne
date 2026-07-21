@@ -739,9 +739,29 @@ def _handle_recall_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
                     "name": name, "results_count": len(results),
                     "results": results, "store": "canonical"}
         row = store.recall(owner_id, category, name)
-        return {"mode": "recall", "owner_id": owner_id, "category": category,
+        result = {"mode": "recall", "owner_id": owner_id, "category": category,
                 "name": name, "found": row is not None, "result": row,
                 "store": "canonical"}
+        if row is None:
+            # Diagnostic: check if the row exists under a different owner_id
+            try:
+                conn = store.conn if hasattr(store, "conn") else None
+                if conn is not None:
+                    cur = conn.execute(
+                        "SELECT owner_id FROM canonical_facts "
+                        "WHERE category=? AND name=? AND valid_until IS NULL LIMIT 1",
+                        (category, name),
+                    )
+                    alt = cur.fetchone()
+                    if alt:
+                        result["hint"] = (
+                            f"Row exists under owner_id '{alt[0]}' but you queried "
+                            f"with '{owner_id}'. Set MNEMOSYNE_DEFAULT_OWNER={alt[0]} "
+                            f"or check your profile/provider config."
+                        )
+            except Exception:
+                pass
+        return result
     results = store.list(owner_id, category=category or None)
     return {"mode": "list", "owner_id": owner_id, "category": category or None,
             "results_count": len(results), "results": results, "store": "canonical"}
