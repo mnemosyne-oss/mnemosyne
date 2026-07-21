@@ -74,6 +74,23 @@ class TestPersonaPromote:
         assert result["status"] == "error"
         assert "not found" in result["error"]
 
+    def test_promote_rolls_back_when_insert_fails(self, adapter, beam_with_memories):
+        mid = _memory_id_by_content(beam_with_memories, "XYZ")
+        conn = beam_with_memories.conn
+        conn.execute(
+            "CREATE TRIGGER fail_persona_insert BEFORE INSERT ON memoria_persona "
+            "BEGIN SELECT RAISE(ABORT, 'forced insert failure'); END"
+        )
+        conn.commit()
+
+        result = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_promote", {"memory_id": mid, "tier": "long_term"},
+        ))
+
+        assert result["status"] == "error"
+        assert conn.in_transaction is False
+        assert conn.execute("SELECT 1 FROM memoria_persona").fetchone() is None
+
 
 class TestPersonaList:
     def test_list_empty(self, adapter):
@@ -166,6 +183,7 @@ class TestPersonaReinforce:
             "mnemosyne_persona_reinforce", {"persona_id": 9999},
         ))
         assert result["status"] == "error"
+        assert adapter._conn().in_transaction is False
 
 
 class TestPersonaDemote:
