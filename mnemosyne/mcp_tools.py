@@ -1021,12 +1021,12 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
         if (
             not isinstance(noise_score, (int, float))
             or isinstance(noise_score, bool)
-            or not math.isfinite(noise_score)
             or not 0 <= noise_score <= 1
+            or (isinstance(noise_score, float) and not math.isfinite(noise_score))
             or not isinstance(importance, (int, float))
             or isinstance(importance, bool)
-            or not math.isfinite(importance)
             or not 0 <= importance <= 1
+            or (isinstance(importance, float) and not math.isfinite(importance))
             or not isinstance(content_length, int)
             or isinstance(content_length, bool)
             or content_length < 0
@@ -1042,6 +1042,8 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
             key in candidate_data and not isinstance(candidate_data[key], str)
             for key in ("content_preview", "source", "timestamp", "suggested_action")
         ):
+            return {"error": "candidates_json must be a list of valid hygiene candidates"}
+        if candidate_data.get("suggested_action", "keep") not in {"delete", "archive", "keep", "flag"}:
             return {"error": "candidates_json must be a list of valid hygiene candidates"}
         candidates.append(
             NoiseCandidate(

@@ -466,10 +466,16 @@ class TestToolHandlers:
             json.dumps([{"memory_id": "memory-1", "table_name": "unknown"}]),
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "noise_score": float("nan")}]),
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "noise_score": 1.1}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "noise_score": True}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "noise_score": 10**1000}]),
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "importance": float("inf")}]),
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "importance": 1.1}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "importance": True}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "importance": 10**1000}]),
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "content_length": -1}]),
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "content_length": 1.5}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "content_length": True}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "suggested_action": "destroy"}]),
         ],
     )
     def test_hygiene_clean_rejects_malformed_candidates(self, candidates_json, monkeypatch):

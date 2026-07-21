@@ -79,13 +79,6 @@ def test_get_provider_class_returns_real_class():
     assert hasattr(cls, "_sanitize_bank_name")
 
 
-def test_get_provider_class_standalone_fallback():
-    """The helper returns the provider class through the package import path."""
-    cls = _get_provider_class()
-    assert cls is not None
-    assert hasattr(cls, "_sanitize_bank_name")
-
-
 def test_standalone_load_via_spec_resolves_profile_bank(tmp_path, monkeypatch):
     """End-to-end standalone load: CLI module loaded from file path
     (no __package__) resolves the active profile bank."""
