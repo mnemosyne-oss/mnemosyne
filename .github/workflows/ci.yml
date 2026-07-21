@@ -54,7 +54,7 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       - name: Cache embedding model
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ env.MNEMOSYNE_FASTEMBED_CACHE_DIR }}
           key: fastembed-bge-small-en-v1.5-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
