@@ -60,6 +60,7 @@ class PersonaAdapter:
             elif tool_name == "mnemosyne_persona_reinforce":
                 return self._reinforce(**args)
         except Exception as exc:
+            logger.exception("Persona tool %s failed", tool_name)
             return json.dumps({"status": "error", "error": str(exc)})
         return json.dumps({"status": "error", "error": f"Unknown tool: {tool_name}"})
 
@@ -103,12 +104,20 @@ class PersonaAdapter:
             })
         if not topic:
             topic = "general"
-        cur = self._conn().execute(
-            "INSERT INTO memoria_persona (tier, topic, content, source_memory_id, promotion_reason) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (tier, topic, content, memory_id, reason),
-        )
-        persona_id = cur.lastrowid
+        conn = self._conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "INSERT INTO memoria_persona (tier, topic, content, source_memory_id, promotion_reason) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (tier, topic, content, memory_id, reason),
+            )
+            persona_id = cur.lastrowid
+            conn.commit()
+        except Exception as exc:
+            logger.error("Persona promotion failed; rolling back transaction: %s", exc)
+            conn.rollback()
+            raise
         return json.dumps({
             "status": "ok",
             "persona_id": persona_id,
@@ -119,31 +128,41 @@ class PersonaAdapter:
     def _demote(self, persona_id: int = 0, reason: str = "") -> str:
         # Demotion = delete from persona tier (caller decides what to do next).
         # We keep a record by writing into memoria_preferences as a tombstone.
-        cur = self._conn().execute(
-            "SELECT topic, content, tier FROM memoria_persona WHERE id = ?",
-            (persona_id,),
-        ).fetchone()
-        if cur is None:
-            return json.dumps({
-                "status": "error",
-                "error": f"Persona id {persona_id} not found.",
-            })
-        topic, content, tier = cur
-        self._conn().execute(
-            "INSERT INTO memoria_preferences (preference, topic, evolution, context_snippet, source_memory_id) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (
-                f"[demoted from {tier}] {content}",
-                topic,
-                f"demoted: {reason}" if reason else "demoted",
-                "",
-                f"persona:{persona_id}",
-            ),
-        )
-        self._conn().execute(
-            "DELETE FROM memoria_persona WHERE id = ?",
-            (persona_id,),
-        )
+        conn = self._conn()
+        try:
+            # The tombstone insert and persona delete must be all-or-nothing.
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "SELECT topic, content, tier FROM memoria_persona WHERE id = ?",
+                (persona_id,),
+            ).fetchone()
+            if cur is None:
+                conn.rollback()
+                return json.dumps({
+                    "status": "error",
+                    "error": f"Persona id {persona_id} not found.",
+                })
+            topic, content, tier = cur
+            conn.execute(
+                "INSERT INTO memoria_preferences (preference, topic, evolution, context_snippet, source_memory_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    f"[demoted from {tier}] {content}",
+                    topic,
+                    f"demoted: {reason}" if reason else "demoted",
+                    "",
+                    f"persona:{persona_id}",
+                ),
+            )
+            conn.execute(
+                "DELETE FROM memoria_persona WHERE id = ?",
+                (persona_id,),
+            )
+            conn.commit()
+        except Exception as exc:
+            logger.error("Persona demotion failed; rolling back transaction: %s", exc)
+            conn.rollback()
+            raise
         return json.dumps({
             "status": "ok",
             "persona_id": persona_id,
@@ -191,16 +210,25 @@ class PersonaAdapter:
         return json.dumps({"status": "ok", "count": len(out), "personas": out})
 
     def _reinforce(self, persona_id: int = 0) -> str:
-        cur = self._conn().execute(
-            "UPDATE memoria_persona SET reinforcement_count = reinforcement_count + 1, "
-            "last_reinforced_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (persona_id,),
-        )
-        if cur.rowcount == 0:
-            return json.dumps({
-                "status": "error",
-                "error": f"Persona id {persona_id} not found.",
-            })
+        conn = self._conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE memoria_persona SET reinforcement_count = reinforcement_count + 1, "
+                "last_reinforced_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (persona_id,),
+            )
+            if cur.rowcount == 0:
+                conn.rollback()
+                return json.dumps({
+                    "status": "error",
+                    "error": f"Persona id {persona_id} not found.",
+                })
+            conn.commit()
+        except Exception as exc:
+            logger.error("Persona reinforcement failed; rolling back transaction: %s", exc)
+            conn.rollback()
+            raise
         return json.dumps({
             "status": "ok",
             "persona_id": persona_id,

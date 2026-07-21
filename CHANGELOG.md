@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
+## [3.15.0] - 2026-07-18
+
+### Fixed
+
+- **Trim-before-embedding race (#491).** Working-memory embedding storage now atomically checks that its parent row still exists. If trimming or concurrent deletion removes the parent before the fallback insert executes, both fallback and `vec_working` writes become a clean no-op instead of logging an embedding-storage failure.
+
 ## [3.14.0] - 2026-07-17
 
 ### Added
