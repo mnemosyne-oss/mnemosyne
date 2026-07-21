@@ -2178,10 +2178,16 @@ def _store_working_embedding(conn: sqlite3.Connection, memory_id: str, embedding
     """
     emb_for_json = np.array(embedding, dtype=np.float32) if np is not None else embedding
     emb_json = _embeddings.serialize(emb_for_json)
-    conn.execute(
-        "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
-        (memory_id, emb_json, _embeddings._DEFAULT_MODEL)
+    inserted = conn.execute(
+        """
+        INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
+        SELECT ?, ?, ?
+        WHERE EXISTS (SELECT 1 FROM working_memory WHERE id = ?)
+        """,
+        (memory_id, emb_json, _embeddings._DEFAULT_MODEL, memory_id),
     )
+    if inserted.rowcount == 0:
+        return
     try:
         _wm_vec_upsert(conn, memory_id, embedding, commit=commit_vec)
     except Exception as exc:

@@ -9,53 +9,36 @@
 
 | User has... | Use |
 |---|---|
-| Hermes Agent already installed | **Path A: One-liner deploy** (fastest, 1 command) |
-| Hermes Agent + wants PyPI package | **Path B: pip install + register** |
+| Hermes Agent in a persistent Docker/image deployment | **Path A: persistent side venv + wrapper** — install, configure, then restart |
+| Hermes Agent installed locally | **Path B: pip install + register** |
 | No Hermes, just wants the library | **Path C: pip install (standalone)** |
 | Wants to contribute or develop | **Path D: Source install** |
 
 ---
 
-## Path A: One-Liner Deploy (Hermes MemoryProvider)
+## Path A: Hermes provider install
 
-The fastest way to integrate Mnemosyne as Hermes's memory backend. Creates a symlink — no pip needed, no venv needed.
-
-```bash
-curl -sSL https://raw.githubusercontent.com/AxDSan/mnemosyne/main/deploy_hermes_provider.sh | bash
-```
-
-**What this does:**
-1. Symlinks `hermes_memory_provider/` → `~/.hermes/plugins/mnemosyne/`
-2. Tells you to set `memory.provider: mnemosyne` in config
-
-**After running, configure Hermes:**
+For a persistent Docker/image install, use a persistent side venv and the wrapper installer. It keeps the plugin directory independent from a rebuildable Hermes venv. Set `HERMES_HOME` to the directory that contains the active Hermes `config.yaml`; `/opt/data` below is the Docker/image example and must be replaced for other deployments:
 
 ```bash
+export HERMES_HOME=/opt/data
+VENV="$HERMES_HOME/.mnemosyne/venv"
+python3 -m venv "$VENV"
+"$VENV/bin/python" -m pip install --upgrade pip
+"$VENV/bin/python" -m pip install 'mnemosyne-memory[embeddings]' mnemosyne-hermes
+"$VENV/bin/mnemosyne-hermes" install --mode wrapper --python "$VENV/bin/python"
 hermes config set memory.provider mnemosyne
+hermes gateway restart
 ```
 
-**Or edit `~/.hermes/config.yaml` directly:**
-
-```yaml
-memory:
-  provider: mnemosyne
-```
-
-**IMPORTANT:** Also add `mnemosyne` to `plugins.enabled` in `~/.hermes/config.yaml`:
-
-```yaml
-plugins:
-  enabled:
-    - mnemosyne
-```
-
-**Verify:**
+The wrapper installer registers the provider plugin in `$HERMES_HOME/plugins`. Verify the active profile rather than adding a separate `plugins.enabled` entry:
 
 ```bash
-hermes gateway restart
+"$VENV/bin/mnemosyne-hermes" status
 hermes memory status
-hermes mnemosyne stats
 ```
+
+These status commands report local provider state only; they do not prove database access, tool execution, or a successful memory round trip. Use the stats and store/recall checks in [Post-Install: Verify Everything Works](#post-install-verify-everything-works) for functional validation.
 
 ---
 
@@ -102,9 +85,11 @@ This creates `~/.hermes/plugins/mnemosyne/` and sets `memory.provider: mnemosyne
 ```bash
 hermes gateway restart
 hermes memory status        # Should show: Provider: mnemosyne
-hermes mnemosyne stats      # Working + episodic counts
+mnemosyne stats             # Working + episodic counts
 hermes tools list | grep mnemosyne
 ```
+
+`hermes memory status` reports local provider state only; it does not prove database access, tool execution, or a successful memory round trip. Confirm functional behavior with `mnemosyne stats` and the store/recall check in [Post-Install: Verify Everything Works](#post-install-verify-everything-works).
 
 ---
 
@@ -147,6 +132,8 @@ hermes gateway restart
 
 ## Post-Install: Verify Everything Works
 
+For Path A, re-export `VENV=/path/to/venv` to the same side venv passed to the wrapper install when verifying from a new shell, then invoke the core CLI as `"$VENV/bin/mnemosyne"` below. Other install paths assume `mnemosyne` is on `PATH`.
+
 Run these checks in order. Stop if any fails.
 
 ### 1. Provider is registered
@@ -163,12 +150,20 @@ Expected: `Provider: mnemosyne` with `is_available: true`
 hermes tools list | grep mnemosyne
 ```
 
-Expected: 15 tools (remember, recall, stats, sleep, triple_add, triple_query, scratchpad_write, scratchpad_read, scratchpad_clear, invalidate, export, update, forget, import, diagnose)
+Expected: Mnemosyne provider tools are listed. The exact tool surface evolves with the installed package versions, so do not use a fixed tool count as the health check.
 
 ### 3. Memory operations work
 
+For Path A:
+
 ```bash
-hermes mnemosyne stats
+"$VENV/bin/mnemosyne" stats
+```
+
+For other install paths:
+
+```bash
+mnemosyne stats
 ```
 
 Expected: Working and episodic memory counts (numbers, even if 0).
@@ -176,7 +171,8 @@ Expected: Working and episodic memory counts (numbers, even if 0).
 ### 4. Store and recall a test memory
 
 ```bash
-python3 -c "
+# Path A: use the persistent side venv. Other paths: replace with python3.
+"$VENV/bin/python" -c "
 from mnemosyne import remember, recall
 mid = remember('TEST: install verification', importance=0.5, source='test')
 print(f'Stored: {mid}')
@@ -196,11 +192,9 @@ In `~/.hermes/config.yaml`:
 ```yaml
 memory:
   provider: mnemosyne
-
-plugins:
-  enabled:
-    - mnemosyne
 ```
+
+Both Path A's wrapper installer and Path B's `python -m mnemosyne.install` register the plugin; do not add a separate `plugins.enabled` entry for either of those installer paths.
 
 ### Optional environment variables
 
@@ -215,29 +209,44 @@ plugins:
 ## Updating
 
 ```bash
-# PyPI users
+# Path A: persistent side venv + wrapper
+export HERMES_HOME=/opt/data  # Replace with the active Hermes home
+"$HERMES_HOME/.mnemosyne/venv/bin/python" -m pip install --upgrade 'mnemosyne-memory[embeddings]' mnemosyne-hermes
+hermes gateway restart
+
+# Path B: direct PyPI install
 pip install --upgrade mnemosyne-memory
 hermes gateway restart
 
-# Source users
+# Path D: source install
 cd mnemosyne && git pull
-hermes gateway restart
-
-# Re-run pip install -e only if setup.py or pyproject.toml changed
 pip install -e ".[all,dev]"
+hermes gateway restart
 ```
 
 ---
 
 ## Uninstalling
 
+Set `HERMES_HOME` to the active Hermes home before removing a Path A wrapper install.
+
+### Path A: persistent side venv + wrapper
+
 ```bash
-python -m mnemosyne.install --uninstall
-hermes config set memory.provider null
-hermes gateway restart
+export HERMES_HOME=/opt/data  # Replace with the active Hermes home
+hermes memory off  # Disable the external provider; built-in memory remains active
+hermes gateway restart  # Run from a shell outside the gateway process
+"$HERMES_HOME/.mnemosyne/venv/bin/mnemosyne-hermes" uninstall
+rm -rf "$HERMES_HOME/.mnemosyne/venv"  # Only if this venv was created by Path A
 ```
 
-To also remove the plugin from config, delete `mnemosyne` from `plugins.enabled` in `~/.hermes/config.yaml`.
+### Path B or Path D: pip/source install
+
+```bash
+hermes memory off
+hermes gateway restart  # Run from a shell outside the gateway process
+python -m mnemosyne.install --uninstall
+```
 
 ---
 
@@ -257,7 +266,7 @@ python -m mnemosyne.install
 
 The package isn't installed in Hermes's Python environment. Either:
 - Activate the correct venv and reinstall
-- Use Path A (symlink deploy) instead — it doesn't need pip
+- Use Path A's persistent side venv + wrapper so the package does not need to live in Hermes's rebuildable environment
 
 ### Tools not showing up
 
@@ -265,8 +274,9 @@ The package isn't installed in Hermes's Python environment. Either:
 # Check plugins are loaded
 hermes plugins list
 
-# If mnemosyne isn't listed, check config.yaml plugins.enabled
-grep -A5 "plugins:" ~/.hermes/config.yaml
+# For Path A, after setting HERMES_HOME as shown above:
+"$HERMES_HOME/.mnemosyne/venv/bin/mnemosyne-hermes" status
+hermes memory status
 
 # Restart gateway after any config change
 hermes gateway restart

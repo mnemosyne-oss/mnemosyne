@@ -146,25 +146,25 @@ Full reports: [docs/beam-benchmark.md](docs/beam-benchmark.md)
 
 ## CLI Usage
 
+If Mnemosyne is installed in an isolated venv, activate that venv or invoke its `bin/mnemosyne` executable before running these commands.
+
 ```bash
 # MCP server (works with any MCP client)
 mnemosyne mcp                          # stdio (default)
 mnemosyne mcp --transport sse --port 8080  # SSE (web clients)
 
 # Direct memory ops
-mnemosyne remember "User likes dark mode"
+mnemosyne store "User likes dark mode"
 mnemosyne recall "preferences"
 mnemosyne stats
 mnemosyne sleep                         # Run consolidation
 
 # Export / import
-mnemosyne export --output backup.json
-mnemosyne import --input backup.json
+mnemosyne export backup.json
+mnemosyne import backup.json
 
 # Sync (bidirectional memory sync between instances)
-mnemosyne sync --remote https://my-vps:8765
-mnemosyne sync --remote https://my-vps:8765 --encrypt
-mnemosyne sync serve --port 8765 --api-key "sk-..."
+mnemosyne sync --db-path /path/to/mnemosyne.db --remote https://my-vps:8765
 ```
 
 ---
@@ -348,9 +348,9 @@ See [docs/configuration.md#custom-embedding-models](docs/configuration.md#custom
 
 ---
 
-## Hermes Plugin (23 tools)
+## Hermes Plugin
 
-When used with Hermes Agent, Mnemosyne exposes **23 tools** for full memory lifecycle management -- 3 lifecycle hooks (`pre_llm_call`, `on_session_start`, `post_tool_call`) for automatic context injection, plus MCP support.
+When used with Hermes Agent, Mnemosyne exposes provider tools for the memory lifecycle, lifecycle hooks for automatic context injection, and MCP support.
 
 > **For the full Hermes setup guide, see [docs/hermes-integration.md](docs/hermes-integration.md).** That is the canonical, most up-to-date reference.
 
@@ -374,34 +374,37 @@ python -m pip install mnemosyne-hermes
 mkdir -p ~/.hermes/plugins/mnemosyne
 ln -sfn "$(~/.hermes/hermes-agent/venv/bin/python -c 'import pathlib, mnemosyne_hermes; print(pathlib.Path(mnemosyne_hermes.__file__).resolve().parent)')"/* ~/.hermes/plugins/mnemosyne/
 hermes config set memory.provider mnemosyne
-hermes memory setup
 ```
 
-Then disable Hermes' built-in MEMORY.md/USER.md system so Mnemosyne is the sole memory provider. Do NOT use `hermes tools disable memory` -- that also kills all 23 Mnemosyne-registered tools.
+After installing, verify the provider in the active Hermes profile and start a new session or restart the gateway:
 
-Edit `~/.hermes/config.yaml`:
-
-```yaml
-memory:
-  memory_enabled: false
-user_profile_enabled: false
+```bash
+hermes memory status
 ```
+
+Do **not** use `hermes tools disable memory`: that disables the memory toolset, including provider tools. In current Hermes versions, built-in memory and an external provider are separate mechanisms; `hermes memory off` disables the external provider only. Keep existing built-in memory as a rollback/reference point during a transition and confirm the active provider with `hermes memory status`.
 
 See [docs/hermes-integration.md](docs/hermes-integration.md) for the full setup guide.
 
-### Tool categories
+### Tool discovery
 
-| Category | Tools |
-|----------|-------|
-| **Core memory** (9) | `remember`, `recall`, `sleep`, `stats`, `get`, `update`, `forget`, `invalidate`, `validate` |
-| **Knowledge graph** (4) | `triple_add`, `triple_query`, `graph_query`, `graph_link` |
-| **Multi-agent surface** (4) | `shared_remember`, `shared_recall`, `shared_forget`, `shared_stats` |
-| **Working notes** (3) | `scratchpad_write`, `scratchpad_read`, `scratchpad_clear` |
-| **Ops** (3) | `export`, `import`, `diagnose` |
+The provider tool inventory is version-specific. Confirm the active provider with `hermes memory status`, then inspect the runtime tool surface:
 
-All 23 tools surface through the `mnemosyne-hermes` package, which wraps the `mnemosyne-memory` core library. The plugin manifest at `integrations/hermes/` is also discoverable by Hermes' plugin system.
+```bash
+hermes tools list | grep mnemosyne_
+```
 
-**Updating:** `pip install --upgrade mnemosyne-hermes && hermes gateway restart` or `git pull && pip install --upgrade integrations/hermes && hermes gateway restart` (source).
+Mnemosyne exposes memory, knowledge-graph, multi-agent-surface, working-note, and operational tools. Treat the runtime list as authoritative. The installer or wrapper registers the plugin manifest under `$HERMES_HOME/plugins/mnemosyne`, where Hermes discovers it.
+
+**Updating:** For the persistent side-venv wrapper path, use the side venv rather than a bare `pip`:
+
+```bash
+export HERMES_HOME=/opt/data  # Replace with the active Hermes home
+"$HERMES_HOME/.mnemosyne/venv/bin/python" -m pip install --upgrade 'mnemosyne-memory[embeddings]' mnemosyne-hermes
+hermes gateway restart
+```
+
+For a direct or source install, use `pip install --upgrade mnemosyne-hermes && hermes gateway restart` or `git pull && pip install --upgrade integrations/hermes && hermes gateway restart` (source).
 
 ---
 

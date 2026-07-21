@@ -39,6 +39,24 @@ def test_get_embedding_dim_jina_models():
     assert embeddings._get_embedding_dim("jina-embeddings-v5-omni-small") == 1024
 
 
+def test_get_embedding_dim_jina_v2_base_family():
+    """Jina v2 base models are all 768-dim, not the 384 unknown-model fallback.
+
+    Regression guard: these popular bilingual/monolingual models (the ES one is
+    a common Spanish/English choice) output 768-dim vectors. If they are absent
+    from the dim table they silently resolve to 384, mismatching the real output
+    and corrupting similarity search.
+    """
+    for model in (
+        "jinaai/jina-embeddings-v2-base-es",
+        "jinaai/jina-embeddings-v2-base-en",
+        "jinaai/jina-embeddings-v2-base-de",
+        "jinaai/jina-embeddings-v2-base-zh",
+        "jinaai/jina-embeddings-v2-base-code",
+    ):
+        assert embeddings._get_embedding_dim(model) == 768, model
+
+
 def test_get_embedding_dim_env_override():
     """MNEMOSYNE_EMBEDDING_DIM env var overrides model-based detection."""
     os.environ["MNEMOSYNE_EMBEDDING_DIM"] = "768"
