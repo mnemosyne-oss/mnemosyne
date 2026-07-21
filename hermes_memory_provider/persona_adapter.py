@@ -105,6 +105,7 @@ class PersonaAdapter:
             topic = "general"
         conn = self._conn()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             cur = conn.execute(
                 "INSERT INTO memoria_persona (tier, topic, content, source_memory_id, promotion_reason) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -208,6 +209,7 @@ class PersonaAdapter:
     def _reinforce(self, persona_id: int = 0) -> str:
         conn = self._conn()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             cur = conn.execute(
                 "UPDATE memoria_persona SET reinforcement_count = reinforcement_count + 1, "
                 "last_reinforced_at = CURRENT_TIMESTAMP WHERE id = ?",

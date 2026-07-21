@@ -276,6 +276,33 @@ class TestPersonaDemote:
             (f"persona:{pid}",),
         ).fetchone() is None
 
+    def test_legacy_persona_mutations_leave_connection_clean(self, beam_with_memories):
+        adapter = LegacyPersonaAdapter(beam_instance=beam_with_memories)
+        mid = _memory_id_by_content(beam_with_memories, "XYZ")
+        promoted = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_promote", {"memory_id": mid, "tier": "working"},
+        ))
+        conn = beam_with_memories.conn
+        assert promoted["status"] == "ok"
+        assert conn.in_transaction is False
+
+        reinforced = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_reinforce", {"persona_id": promoted["persona_id"]},
+        ))
+        assert reinforced["status"] == "ok"
+        assert conn.in_transaction is False
+
+        beam_with_memories.canonical.remember(
+            "default", "task:progress", "legacy-persona", "current"
+        )
+        assert conn.in_transaction is False
+
+        demoted = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_demote", {"persona_id": promoted["persona_id"]},
+        ))
+        assert demoted["status"] == "ok"
+        assert conn.in_transaction is False
+
 
 class TestPersonaAdapterReadiness:
     def test_adapter_not_ready_without_beam(self, tmp_path):
