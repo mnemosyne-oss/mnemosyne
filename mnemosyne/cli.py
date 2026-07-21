@@ -672,6 +672,9 @@ def _read_secret_file(path: str, label: str) -> str:
     return value
 
 
+_DEFAULT_SYNC_SESSION_ID = "hermes_shared_surface"
+
+
 def cmd_sync_init(args):
     """Explicitly initialize or migrate a dedicated shared-surface DB."""
     import argparse
@@ -680,7 +683,7 @@ def cmd_sync_init(args):
     parser.add_argument("--db-path", required=True, help="Dedicated shared-surface DB")
     parser.add_argument(
         "--session-id",
-        default="hermes_shared_surface",
+        default=_DEFAULT_SYNC_SESSION_ID,
         help="Stable session ID used by the shared-surface Beam",
     )
     parser.add_argument(
@@ -744,6 +747,11 @@ def cmd_sync(args):
         required=True,
         help="Explicit SQLite DB to sync; use the dedicated shared-surface DB, not a private DB",
     )
+    parser.add_argument(
+        "--session-id",
+        default=_DEFAULT_SYNC_SESSION_ID,
+        help="Stable session ID used by the shared-surface Beam",
+    )
     parser.add_argument("--mode", choices=["push", "pull", "bidirectional"], default="bidirectional",
                         help="Sync direction (default: bidirectional)")
     encryption_group = parser.add_mutually_exclusive_group()
@@ -769,7 +777,7 @@ def cmd_sync(args):
     from mnemosyne.core.memory import Mnemosyne
     from mnemosyne.core.sync import SyncEngine, SyncEncryption
 
-    mem = Mnemosyne(db_path=parsed.db_path)
+    mem = Mnemosyne(db_path=parsed.db_path, session_id=parsed.session_id)
 
     encryption_source = parsed.encrypt
     if parsed.encrypt_key_file:
