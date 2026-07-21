@@ -204,6 +204,32 @@ class TestPersonaDemote:
         ))
         assert result["status"] == "error"
 
+    def test_demote_rolls_back_tombstone_when_delete_fails(self, adapter, beam_with_memories):
+        mid = _memory_id_by_content(beam_with_memories, "XYZ")
+        promoted = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_promote",
+            {"memory_id": mid, "tier": "long_term"},
+        ))
+        pid = promoted["persona_id"]
+        conn = beam_with_memories.conn
+        conn.execute(
+            "CREATE TRIGGER fail_persona_delete BEFORE DELETE ON memoria_persona "
+            "BEGIN SELECT RAISE(ABORT, 'forced delete failure'); END"
+        )
+        conn.commit()
+
+        result = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_demote", {"persona_id": pid},
+        ))
+
+        assert result["status"] == "error"
+        assert conn.in_transaction is False
+        assert conn.execute("SELECT 1 FROM memoria_persona WHERE id = ?", (pid,)).fetchone()
+        assert conn.execute(
+            "SELECT 1 FROM memoria_preferences WHERE source_memory_id = ?",
+            (f"persona:{pid}",),
+        ).fetchone() is None
+
 
 class TestPersonaAdapterReadiness:
     def test_adapter_not_ready_without_beam(self, tmp_path):
