@@ -116,6 +116,16 @@ def upgrade_command(args=None) -> int:
     """
     dry_run = getattr(args, "dry_run", False) if args else False
     hermes_home_path = getattr(args, "hermes_home", None) if args else None
+    from mnemosyne_hermes.install import plugin_state
+
+    existing_plugin = plugin_state(hermes_home_path=hermes_home_path)
+    if existing_plugin.status == "invalid_wrapper":
+        print("⚠ Cannot safely upgrade an invalid Mnemosyne wrapper.")
+        print(f"  {existing_plugin.message}")
+        print("  Repair it with: mnemosyne-hermes install --force --mode wrapper")
+        return 1
+    install_mode = "wrapper" if existing_plugin.mode == "wrapper" else "symlink"
+    wrapper_python = existing_plugin.wrapper_python if install_mode == "wrapper" else None
 
     method = detect_install_method()
     current_ver = get_current_version()
@@ -174,7 +184,12 @@ def upgrade_command(args=None) -> int:
     print("\n→ Re-registering plugin with Hermes...")
     try:
         from mnemosyne_hermes.install import run_install  # noqa: F811
-        result_code = run_install(force=True, hermes_home_path=hermes_home_path)
+        result_code = run_install(
+            force=True,
+            hermes_home_path=hermes_home_path,
+            mode=install_mode,
+            python=wrapper_python,
+        )
         if result_code != 0:
             print("  ⚠ Re-registration had issues (see output above).")
             print("  Run manually: mnemosyne-hermes install --force")
