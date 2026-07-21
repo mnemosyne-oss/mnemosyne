@@ -12,6 +12,7 @@ All imports are guarded — this module loads safely even if mcp is not installe
 """
 
 from typing import Dict, Any, List
+import json
 import os
 import sqlite3
 from pathlib import Path

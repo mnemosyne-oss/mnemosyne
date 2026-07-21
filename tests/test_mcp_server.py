@@ -11,6 +11,8 @@ import sys
 import pytest
 from unittest.mock import MagicMock, patch
 
+import mnemosyne.mcp_tools as mcp_tools
+
 # Test tool schemas
 from mnemosyne.mcp_tools import (
     TOOLS, get_tool_definitions, handle_tool_call, _create_instance,
@@ -446,6 +448,42 @@ class TestToolHandlers:
         with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
             with pytest.raises(RuntimeError, match="DB locked"):
                 handle_tool_call("mnemosyne_remember", {"content": "test"})
+
+    def test_hygiene_clean_rejects_invalid_candidates_json(self):
+        """Invalid hygiene payloads return the documented MCP error instead of raising."""
+        result = handle_tool_call(
+            "mnemosyne_hygiene_clean", {"candidates_json": "not-json"},
+        )
+
+        assert result == {"error": "candidates_json is not valid JSON"}
+
+    def test_hygiene_clean_parses_valid_candidates_json(self, monkeypatch):
+        """Valid JSON reaches the hygiene cleaner with parsed candidates."""
+        class _Memory:
+            class beam:
+                db_path = "test.db"
+
+        class _Result:
+            def to_dict(self):
+                return {"cleaned": 0}
+
+        captured = {}
+
+        def _clean_noise(**kwargs):
+            captured.update(kwargs)
+            return _Result()
+
+        from mnemosyne.core import hygiene
+
+        monkeypatch.setattr(mcp_tools, "_create_instance", lambda **_kwargs: _Memory())
+        monkeypatch.setattr(hygiene, "clean_noise", _clean_noise)
+
+        result = handle_tool_call(
+            "mnemosyne_hygiene_clean", {"candidates_json": "[]"},
+        )
+
+        assert result["status"] == "dry_run"
+        assert captured["candidates"] == []
 
     def test_unknown_tool(self):
         """Unknown tool raises ValueError."""

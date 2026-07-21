@@ -2789,6 +2789,8 @@ def register_memory_provider(ctx):
 # Plugin registration (used when loaded via Hermes plugin system)
 # ---------------------------------------------------------------------------
 
+_provider: Optional[Any] = None
+
 def register(ctx):
     """Called by Hermes plugin loader to register CLI commands and tools."""
     # Register the memory provider first so Hermes discovers it
@@ -2811,6 +2813,7 @@ def register(ctx):
     from .tools import ALL_TOOL_SCHEMAS
     from functools import partial
 
+    global _provider
     _provider = MnemosyneMemoryProvider()
     for _schema in ALL_TOOL_SCHEMAS:
         _name = _schema["name"]
