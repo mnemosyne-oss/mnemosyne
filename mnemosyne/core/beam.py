@@ -467,6 +467,7 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
         # Configurable so deployments with long consolidation write windows
         # can let tool calls ride them out instead of failing with
         # "database is locked" after a hardcoded 5s.

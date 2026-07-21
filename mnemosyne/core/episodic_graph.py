@@ -119,7 +119,7 @@ class EpisodicGraph:
                 location TEXT,
                 emotion TEXT,
                 time_scope TEXT,
-                memory_id TEXT,
+                memory_id TEXT REFERENCES working_memory(id) ON DELETE SET NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
