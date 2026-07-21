@@ -95,6 +95,34 @@ def test_uninstall_removes_profile_links(tmp_path):
     assert not link_a.is_symlink() and not link_a.exists()
 
 
+def test_wrapper_profile_links_point_to_base_wrapper_and_uninstall_leaves_foreign_link(tmp_path):
+    _skip_on_windows()
+    profile_a = _make_profile(tmp_path, "alice", "mnemosyne")
+    profile_b = _make_profile(tmp_path, "bob", "mnemosyne")
+    foreign = tmp_path / "other_provider"
+    foreign.mkdir()
+    foreign_link = profile_b / "plugins" / "mnemosyne"
+    foreign_link.parent.mkdir(parents=True)
+    os.symlink(str(foreign), str(foreign_link))
+
+    base_wrapper = install_plugin(
+        hermes_home_path=tmp_path,
+        mode="wrapper",
+        python=sys.executable,
+    )
+    wrapper_link = profile_a / "plugins" / "mnemosyne"
+
+    assert wrapper_link.is_symlink()
+    assert wrapper_link.resolve() == base_wrapper.resolve()
+    assert foreign_link.resolve() == foreign.resolve()
+
+    install_mod.uninstall_plugin(hermes_home_path=tmp_path)
+
+    assert not wrapper_link.is_symlink() and not wrapper_link.exists()
+    assert foreign_link.is_symlink()
+    assert foreign_link.resolve() == foreign.resolve()
+
+
 def test_link_profile_returns_none_on_symlink_error(tmp_path, monkeypatch):
     _skip_on_windows()
     profile_a = _make_profile(tmp_path, "alice", "mnemosyne")
