@@ -210,6 +210,11 @@ def _format_prefetch_content(content: str, limit: int) -> str:
     return f"{cut}..."
 
 
+# Minimum spacing between lazy re-attempts of a transiently-failed init
+# (see _maybe_retry_init). One minute keeps retry cost negligible while
+# recovering within a turn or two of a lock storm passing.
+_INIT_RETRY_INTERVAL_S = 60.0
+
 _PREFETCH_TOP_K = 5
 _PREFETCH_MIN_FRAGMENT_CHARS = 8
 _PREFETCH_FRAGMENT_STOPWORDS = frozenset({
@@ -545,6 +550,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # `_beam is None AND _init_error is not None` means a real failure that
         # users and operators need to see.
         self._init_error: Optional[BaseException] = None
+        # Lazy re-init after a TRANSIENT init failure (a SQLite lock held at
+        # the exact moment this session initialized). Holds the (session_id,
+        # kwargs) of the failed initialize() call plus the earliest monotonic
+        # time to try again; None means nothing to retry.
+        self._retry_init_args: Optional[tuple] = None
+        self._retry_init_at: float = 0.0
         self._session_id = "hermes_default"
         self._hermes_home = ""
         self._platform = "cli"
@@ -679,6 +690,29 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if len(msg) > 200:
             msg = msg[:200] + "..."
         return f"{type(self._init_error).__name__}: {msg}"
+
+    @staticmethod
+    def _is_transient_init_error(exc: BaseException) -> bool:
+        # The two SQLite signatures observed taking down live sessions
+        # (2026-07-09 and 2026-07-19 lock storms). Both clear on their own
+        # once the holding writer finishes, so a later retry can succeed.
+        msg = str(exc).lower()
+        return "database is locked" in msg or "disk i/o error" in msg
+
+    def _maybe_retry_init(self) -> None:
+        # Re-attempt a transiently-failed init from the per-turn surfaces.
+        # Observed live 2026-07-19: a ~2-minute lock storm at session start
+        # left an agent memory-less for hours while the DB was healthy again
+        # minutes later; a restart was the only recovery path.
+        if self._beam is not None or self._retry_init_args is None:
+            return
+        if time.monotonic() < self._retry_init_at:
+            return
+        session_id, kwargs = self._retry_init_args
+        logger.info(
+            "Mnemosyne retrying init after transient failure: %s", self._init_error
+        )
+        self.initialize(session_id, **kwargs)
 
     @property
     def name(self) -> str:
@@ -1007,6 +1041,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._beam = None
         self._surface_beam = None
         self._init_error = None
+        # A fresh initialize() supersedes any pending transient-failure retry;
+        # the except path below re-stashes if THIS attempt also fails.
+        self._retry_init_args = None
 
         self._agent_context = kwargs.get("agent_context", "primary")
         self._platform = kwargs.get("platform", "cli")
@@ -1091,6 +1128,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             logger.warning("Mnemosyne init failed: %s", e)
             self._beam = None
             self._init_error = e
+            # A transient SQLite failure (writer holding the lock at the exact
+            # moment this session initialized) must not disable memory for the
+            # session's whole lifetime. Stash the init args so the per-turn
+            # surfaces can re-attempt via _maybe_retry_init() once the
+            # contention passes. Non-transient failures (corrupt DB, missing
+            # extras, permissions, schema mismatch) keep the fail-once C27
+            # behavior: retrying those every minute would just spam the log.
+            if self._is_transient_init_error(e):
+                self._retry_init_args = (session_id, dict(kwargs))
+                self._retry_init_at = time.monotonic() + _INIT_RETRY_INTERVAL_S
 
         # C13: activate AFTER the BeamMemory init result is known. If
         # init succeeded (_beam is set) the provider is the live memory
@@ -1114,6 +1161,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             self._init_audit_log()
 
     def system_prompt_block(self) -> str:
+        self._maybe_retry_init()
         if self._beam:
             # Merge resolution (PR #106 + C27): keep PR #106's description
             # update that adds "identity" to the recognized memory kinds
@@ -1147,11 +1195,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # still returns "" because that is the documented contract for
         # cron/subagent/skill_loop sessions.
         if self._init_error is not None:
+            hint = (
+                "Init failed on transient database contention and will be retried "
+                "automatically; memory may recover later this session."
+                if self._retry_init_args is not None
+                else "Memory operations will fail this session. Resolve the underlying "
+                "issue (check ~/.hermes/logs/agent.log for the WARNING) and restart "
+                "Hermes to retry."
+            )
             return (
                 "# Mnemosyne Memory\n"
                 f"⚠️ UNAVAILABLE: {self._init_error_reason()}\n"
-                "Memory operations will fail this session. Resolve the underlying issue "
-                "(check ~/.hermes/logs/agent.log for the WARNING) and restart Hermes to retry."
+                f"{hint}"
             )
         return ""
 
@@ -1160,6 +1215,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         
         Only includes memories above a relevance threshold to prevent context pollution
         from low-quality matches. Scoped to the user's author_id when available."""
+        self._maybe_retry_init()
         if not self._beam or self._agent_context in self._skip_contexts:
             return ""
         try:
@@ -1277,6 +1333,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Persist the turn to Mnemosyne episodic memory."""
+        self._maybe_retry_init()
         if not self._beam or self._agent_context in self._skip_contexts:
             return
         started = time.perf_counter()
@@ -1422,6 +1479,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({"error": str(exc)})
         if tool_name == "mnemosyne_sleep" and self._reflect_disabled_for_cron and (self._agent_context or "").strip().lower() == "cron":
             return json.dumps(self._reflection_skip_response("reflect_disabled_for_cron", "tool"))
+        self._maybe_retry_init()
         if not self._beam:
             # C27: structured response carries the actual failure reason
             # instead of a generic "not initialized" string. Status field
