@@ -127,6 +127,7 @@ class PersonaAdapter:
         # We keep a record by writing into memoria_preferences as a tombstone.
         conn = self._conn()
         try:
+            # The tombstone insert and persona delete must be all-or-nothing.
             conn.execute("BEGIN IMMEDIATE")
             cur = conn.execute(
                 "SELECT topic, content, tier FROM memoria_persona WHERE id = ?",

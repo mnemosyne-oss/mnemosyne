@@ -8,6 +8,7 @@ import pytest
 
 from mnemosyne.core.beam import BeamMemory
 from mnemosyne_hermes.persona_adapter import PersonaAdapter, VALID_TIERS
+from hermes_memory_provider.persona_adapter import PersonaAdapter as LegacyPersonaAdapter
 
 
 @pytest.fixture
@@ -214,6 +215,33 @@ class TestPersonaDemote:
         conn = beam_with_memories.conn
         conn.execute(
             "CREATE TRIGGER fail_persona_delete BEFORE DELETE ON memoria_persona "
+            "BEGIN SELECT RAISE(ABORT, 'forced delete failure'); END"
+        )
+        conn.commit()
+
+        result = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_demote", {"persona_id": pid},
+        ))
+
+        assert result["status"] == "error"
+        assert conn.in_transaction is False
+        assert conn.execute("SELECT 1 FROM memoria_persona WHERE id = ?", (pid,)).fetchone()
+        assert conn.execute(
+            "SELECT 1 FROM memoria_preferences WHERE source_memory_id = ?",
+            (f"persona:{pid}",),
+        ).fetchone() is None
+
+    def test_legacy_demote_rolls_back_tombstone_when_delete_fails(self, beam_with_memories):
+        adapter = LegacyPersonaAdapter(beam_instance=beam_with_memories)
+        mid = _memory_id_by_content(beam_with_memories, "XYZ")
+        promoted = json.loads(adapter.handle_tool_call(
+            "mnemosyne_persona_promote",
+            {"memory_id": mid, "tier": "long_term"},
+        ))
+        pid = promoted["persona_id"]
+        conn = beam_with_memories.conn
+        conn.execute(
+            "CREATE TRIGGER fail_legacy_persona_delete BEFORE DELETE ON memoria_persona "
             "BEGIN SELECT RAISE(ABORT, 'forced delete failure'); END"
         )
         conn.commit()
