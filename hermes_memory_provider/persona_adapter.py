@@ -114,8 +114,8 @@ class PersonaAdapter:
             )
             persona_id = cur.lastrowid
             conn.commit()
-        except Exception:
-            logger.exception("Persona promotion failed; rolling back transaction")
+        except Exception as exc:
+            logger.error("Persona promotion failed; rolling back transaction: %s", exc)
             conn.rollback()
             raise
         return json.dumps({
@@ -159,8 +159,8 @@ class PersonaAdapter:
                 (persona_id,),
             )
             conn.commit()
-        except Exception:
-            logger.exception("Persona demotion failed; rolling back transaction")
+        except Exception as exc:
+            logger.error("Persona demotion failed; rolling back transaction: %s", exc)
             conn.rollback()
             raise
         return json.dumps({
@@ -225,8 +225,8 @@ class PersonaAdapter:
                     "error": f"Persona id {persona_id} not found.",
                 })
             conn.commit()
-        except Exception:
-            logger.exception("Persona reinforcement failed; rolling back transaction")
+        except Exception as exc:
+            logger.error("Persona reinforcement failed; rolling back transaction: %s", exc)
             conn.rollback()
             raise
         return json.dumps({

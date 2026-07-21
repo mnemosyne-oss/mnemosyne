@@ -1,6 +1,7 @@
 """Tests for the L3 persona adapter (v3.10.0)."""
 
 import json
+import logging
 import tempfile
 from pathlib import Path
 
@@ -75,6 +76,7 @@ class TestPersonaPromote:
         assert "not found" in result["error"]
 
     def test_promote_rolls_back_when_insert_fails(self, adapter, beam_with_memories, caplog):
+        caplog.set_level(logging.ERROR)
         mid = _memory_id_by_content(beam_with_memories, "XYZ")
         conn = beam_with_memories.conn
         conn.execute(
@@ -93,7 +95,8 @@ class TestPersonaPromote:
         assert "Persona promotion failed; rolling back transaction" in caplog.text
         assert "Persona tool mnemosyne_persona_promote failed" in caplog.text
 
-    def test_legacy_promote_rolls_back_when_insert_fails(self, beam_with_memories):
+    def test_legacy_promote_rolls_back_when_insert_fails(self, beam_with_memories, caplog):
+        caplog.set_level(logging.ERROR)
         adapter = LegacyPersonaAdapter(beam_instance=beam_with_memories)
         mid = _memory_id_by_content(beam_with_memories, "XYZ")
         conn = beam_with_memories.conn
@@ -110,6 +113,8 @@ class TestPersonaPromote:
         assert result["status"] == "error"
         assert conn.in_transaction is False
         assert conn.execute("SELECT 1 FROM memoria_persona").fetchone() is None
+        assert "Persona promotion failed; rolling back transaction" in caplog.text
+        assert "Persona tool mnemosyne_persona_promote failed" in caplog.text
 
 
 class TestPersonaList:
@@ -205,7 +210,8 @@ class TestPersonaReinforce:
         assert result["status"] == "error"
         assert adapter._conn().in_transaction is False
 
-    def test_reinforce_rolls_back_when_update_fails(self, adapter, beam_with_memories):
+    def test_reinforce_rolls_back_when_update_fails(self, adapter, beam_with_memories, caplog):
+        caplog.set_level(logging.ERROR)
         mid = _memory_id_by_content(beam_with_memories, "XYZ")
         promoted = json.loads(adapter.handle_tool_call(
             "mnemosyne_persona_promote", {"memory_id": mid, "tier": "long_term"},
@@ -227,6 +233,8 @@ class TestPersonaReinforce:
             "SELECT reinforcement_count FROM memoria_persona WHERE id = ?",
             (promoted["persona_id"],),
         ).fetchone()[0] == 0
+        assert "Persona reinforcement failed; rolling back transaction" in caplog.text
+        assert "Persona tool mnemosyne_persona_reinforce failed" in caplog.text
 
     def test_legacy_reinforce_rolls_back_when_update_fails(self, beam_with_memories):
         adapter = LegacyPersonaAdapter(beam_instance=beam_with_memories)
