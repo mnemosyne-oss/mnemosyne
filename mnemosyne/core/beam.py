@@ -480,8 +480,16 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
             try:
                 conn.enable_load_extension(True)
                 sqlite_vec.load(conn)
+                conn._mnemosyne_vec_loaded = True
             except Exception:
-                pass  # Some environments don't support load_extension
+                conn._mnemosyne_vec_loaded = False
+                logger.warning(
+                    "sqlite-vec package is installed but load_extension() failed. "
+                    "Vector search will be unavailable. This usually means the "
+                    "Python build does not support extension loading."
+                )
+        else:
+            conn._mnemosyne_vec_loaded = False
         _thread_local.conn = conn
         _thread_local.db_path = str(path)
     return _thread_local.conn
@@ -787,8 +795,18 @@ def init_beam(db_path: Path = None):
                         embedding {effective_vec_type}[{EMBEDDING_DIM}]
                     )
                 """)
-            except sqlite3.OperationalError:
-                pass  # May already exist or extension not loadable
+            except sqlite3.OperationalError as e:
+                if getattr(conn, "_mnemosyne_vec_loaded", False):
+                    logger.warning(
+                        "sqlite-vec loaded but vec table creation failed: %s. "
+                        "This may indicate a version mismatch.", e,
+                    )
+                else:
+                    logger.warning(
+                        "sqlite-vec tables not created: extension not loaded. "
+                        "Vector search will be unavailable. Install sqlite-vec "
+                        "and ensure your Python build supports load_extension()."
+                    )
 
     # --- FTS5 VIRTUAL TABLE for episodic ---
     cursor.execute("""
