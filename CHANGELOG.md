@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
+## [3.16.0] - 2026-07-21
+
+### Fixed
+
+- **Instruction extraction inverted “whenever” into “never” (#507).** English instruction keywords now require a word boundary, preventing positive “whenever” statements from being stored as prohibitions.
+
 ## [3.15.0] - 2026-07-20
 
 ### Fixed
