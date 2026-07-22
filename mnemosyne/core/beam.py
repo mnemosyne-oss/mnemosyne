@@ -6697,10 +6697,15 @@ class BeamMemory:
         if use_intent and classify_intent is not None:
             intent = classify_intent(query)
             if intent.category != "general" and adjust_weights is not None:
+                vec_weight, fts_weight, importance_weight = _normalize_weights(
+                    kwargs.pop("vec_weight", None),
+                    kwargs.pop("fts_weight", None),
+                    kwargs.pop("importance_weight", None),
+                )
                 vw, fw, iw = adjust_weights(
-                    base_vec=kwargs.pop("vec_weight", 0.5),
-                    base_fts=kwargs.pop("fts_weight", 0.3),
-                    base_importance=kwargs.pop("importance_weight", 0.2),
+                    base_vec=vec_weight,
+                    base_fts=fts_weight,
+                    base_importance=importance_weight,
                     intent=intent,
                 )
                 kwargs["vec_weight"] = vw
