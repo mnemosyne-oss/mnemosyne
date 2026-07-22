@@ -1,106 +1,115 @@
-"""Tests for validate(delete) cascade on the MCP tool deletion path.
-
-The mcp_tools.py _handle_validate() path with action="delete" previously
-used a bare DELETE FROM working_memory, leaving orphaned child rows in
-memory_embeddings, annotations, and vec_working.
-
-These tests pin:
-  - validate(delete) cascades to memory_embeddings and annotations
-  - vec_working deletion is guarded (missing table doesn't crash)
-  - orphan rows are cleaned when parent is deleted
-  - valid child rows for other memories are preserved
-
-Note: memory_embeddings is NOT auto-created on CI (no sqlite-vec),
-so tests manually insert embeddings rather than relying on remember().
-"""
+"""Regression tests for MCP validate(delete) child cleanup and rollback."""
 
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from mnemosyne.core.beam import BeamMemory
+from mnemosyne.mcp_tools import handle_tool_call
 
 
 @pytest.fixture
-def temp_db(tmp_path: Path) -> Path:
-    return tmp_path / "validate_delete_test.db"
+def beam(tmp_path: Path) -> BeamMemory:
+    return BeamMemory(session_id="validate-delete", db_path=tmp_path / "validate_delete_test.db")
 
 
-def _seed_embedding(conn, memory_id: str, vector: str = "[0.1, 0.2]"):
-    """Insert a memory_embeddings row (handles optional-table environments)."""
-    try:
-        conn.execute(
-            "INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)",
-            (memory_id, vector),
+def _seed_children(beam: BeamMemory, memory_id: str) -> None:
+    """Add child records that the MCP delete handler must remove."""
+    beam.conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)",
+        (memory_id, "[0.1, 0.2]"),
+    )
+    beam.conn.execute(
+        "INSERT INTO annotations "
+        "(memory_id, kind, value, source, confidence, created_at) "
+        "VALUES (?, 'fact', 'test annotation', 'test', 1.0, CURRENT_TIMESTAMP)",
+        (memory_id,),
+    )
+    beam.conn.commit()
+
+
+def _validate_delete(beam: BeamMemory, memory_id: str) -> dict:
+    """Dispatch the public MCP tool through its production handler."""
+    memory = SimpleNamespace(beam=beam)
+    with patch("mnemosyne.mcp_tools._create_instance", return_value=memory):
+        return handle_tool_call(
+            "mnemosyne_validate",
+            {"memory_id": memory_id, "action": "delete"},
         )
-    except Exception:
-        pass  # table may not exist in this env
 
 
-def test_validate_delete_cascades_to_embeddings_and_annotations(temp_db):
-    """Deleting a memory must cascade to child rows."""
-    beam = BeamMemory(session_id="val-cascade", db_path=temp_db)
-    conn = beam.conn
-
-    mid = beam.remember("test cascade", source="test", importance=0.5)
-    _seed_embedding(conn, mid)
-
-    # Simulate validate(delete) cascade
-    conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (mid,))
-    conn.execute("DELETE FROM annotations WHERE memory_id = ?", (mid,))
-    conn.execute("DELETE FROM working_memory WHERE id = ?", (mid,))
-    conn.commit()
-
-    assert conn.execute("SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?", (mid,)).fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM annotations WHERE memory_id = ?", (mid,)).fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid,)).fetchone()[0] == 0
+def _count(beam: BeamMemory, table: str, memory_id: str) -> int:
+    return beam.conn.execute(
+        f"SELECT COUNT(*) FROM {table} WHERE memory_id = ?", (memory_id,)
+    ).fetchone()[0]
 
 
-def test_validate_delete_preserves_other_memories(temp_db):
-    """Deleting one memory must not affect child rows of other memories."""
-    beam = BeamMemory(session_id="val-preserve", db_path=temp_db)
-    conn = beam.conn
+def test_mcp_validate_delete_cascades_only_target_children(beam: BeamMemory):
+    """The public MCP dispatch deletes target children and preserves others."""
+    keep_id = beam.remember("keep this memory", source="test", importance=0.5)
+    delete_id = beam.remember("delete this memory", source="test", importance=0.5)
+    _seed_children(beam, keep_id)
+    _seed_children(beam, delete_id)
+    keep_annotation_count = _count(beam, "annotations", keep_id)
 
-    mid_a = beam.remember("keep me", source="test", importance=0.5)
-    mid_b = beam.remember("delete me", source="test", importance=0.5)
-    _seed_embedding(conn, mid_a)
-    _seed_embedding(conn, mid_b)
+    result = _validate_delete(beam, delete_id)
 
-    # Delete mid_b only
-    conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (mid_b,))
-    conn.execute("DELETE FROM annotations WHERE memory_id = ?", (mid_b,))
-    conn.execute("DELETE FROM working_memory WHERE id = ?", (mid_b,))
-    conn.commit()
-
-    # mid_a's embedding must survive
-    assert conn.execute(
-        "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?", (mid_a,)
-    ).fetchone()[0] >= 1
-    assert conn.execute("SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid_a,)).fetchone()[0] == 1
-    # mid_b must be gone
-    assert conn.execute("SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid_b,)).fetchone()[0] == 0
+    assert result["status"] == "validation_delete"
+    assert _count(beam, "memory_embeddings", delete_id) == 0
+    assert _count(beam, "annotations", delete_id) == 0
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (delete_id,)
+    ).fetchone()[0] == 0
+    assert _count(beam, "memory_embeddings", keep_id) == 1
+    assert _count(beam, "annotations", keep_id) == keep_annotation_count
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (keep_id,)
+    ).fetchone()[0] == 1
 
 
-def test_validate_delete_missing_vec_working_table(temp_db):
-    """Missing vec_working table must not crash the cascade."""
-    beam = BeamMemory(session_id="val-vec", db_path=temp_db)
-    conn = beam.conn
+def test_mcp_validate_delete_rolls_back_on_child_failure(beam: BeamMemory):
+    """A failed child delete leaves no partial cleanup or stale transaction."""
+    memory_id = beam.remember("must survive failed delete", source="test", importance=0.5)
+    _seed_children(beam, memory_id)
+    annotation_count = _count(beam, "annotations", memory_id)
+    beam.conn.execute(
+        "CREATE TRIGGER fail_annotation_delete "
+        "BEFORE DELETE ON annotations "
+        "BEGIN SELECT RAISE(ABORT, 'forced annotation failure'); END"
+    )
+    beam.conn.commit()
 
-    mid = beam.remember("vec guard test", source="test", importance=0.5)
-    _seed_embedding(conn, mid)
+    result = _validate_delete(beam, memory_id)
 
-    # Drop vec_working if it exists (simulate unavailable sqlite-vec)
-    conn.execute("DROP TABLE IF EXISTS vec_working")
-    conn.commit()
+    assert result["error"] == "validation_failed"
+    assert "forced annotation failure" in result["reason"]
+    assert not beam.conn.in_transaction
+    assert _count(beam, "memory_embeddings", memory_id) == 1
+    assert _count(beam, "annotations", memory_id) == annotation_count
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
+    ).fetchone()[0] == 1
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM memory_validations WHERE memory_id = ?", (memory_id,)
+    ).fetchone()[0] == 0
 
-    # Cascade should not crash — vec_working is optional
-    conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (mid,))
-    conn.execute("DELETE FROM annotations WHERE memory_id = ?", (mid,))
-    conn.execute("DELETE FROM working_memory WHERE id = ?", (mid,))
-    conn.commit()
 
-    # Everything cleaned
-    assert conn.execute("SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?", (mid,)).fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid,)).fetchone()[0] == 0
+def test_mcp_validate_delete_handles_missing_vec_working(beam: BeamMemory):
+    """The production MCP dispatch tolerates an unavailable sqlite-vec table."""
+    memory_id = beam.remember("delete without vec", source="test", importance=0.5)
+    _seed_children(beam, memory_id)
+    beam.conn.execute("DROP TABLE IF EXISTS vec_working")
+    beam.conn.commit()
+
+    result = _validate_delete(beam, memory_id)
+
+    assert result["status"] == "validation_delete"
+    assert _count(beam, "memory_embeddings", memory_id) == 0
+    assert _count(beam, "annotations", memory_id) == 0
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
+    ).fetchone()[0] == 0
