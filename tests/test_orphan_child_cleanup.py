@@ -98,6 +98,58 @@ def test_mcp_validate_delete_rolls_back_on_child_failure(beam: BeamMemory):
     ).fetchone()[0] == 0
 
 
+def test_mcp_validate_delete_removes_vec_working_row(beam: BeamMemory):
+    """The production MCP dispatch removes the target's vector row when present."""
+    memory_id = beam.remember("delete with vec", source="test", importance=0.5)
+    _seed_children(beam, memory_id)
+    rowid = beam.conn.execute(
+        "SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)
+    ).fetchone()[0]
+    beam.conn.execute("DROP TABLE IF EXISTS vec_working")
+    beam.conn.execute("CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY)")
+    beam.conn.execute("INSERT INTO vec_working (rowid) VALUES (?)", (rowid,))
+    beam.conn.commit()
+
+    result = _validate_delete(beam, memory_id)
+
+    assert result["status"] == "validation_delete"
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM vec_working WHERE rowid = ?", (rowid,)
+    ).fetchone()[0] == 0
+
+
+def test_mcp_validate_update_rolls_back_when_validation_log_fails(beam: BeamMemory):
+    """All validation actions roll back when writing the audit log fails."""
+    memory_id = beam.remember("original content", source="test", importance=0.5)
+    beam.conn.execute(
+        "CREATE TRIGGER fail_validation_log "
+        "BEFORE INSERT ON memory_validations "
+        "BEGIN SELECT RAISE(ABORT, 'forced validation-log failure'); END"
+    )
+    beam.conn.commit()
+
+    memory = SimpleNamespace(beam=beam)
+    with patch("mnemosyne.mcp_tools._create_instance", return_value=memory):
+        result = handle_tool_call(
+            "mnemosyne_validate",
+            {
+                "memory_id": memory_id,
+                "action": "update",
+                "new_content": "updated content",
+            },
+        )
+
+    assert result["error"] == "validation_failed"
+    assert "forced validation-log failure" in result["reason"]
+    assert not beam.conn.in_transaction
+    assert beam.conn.execute(
+        "SELECT content FROM working_memory WHERE id = ?", (memory_id,)
+    ).fetchone()[0] == "original content"
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM memory_validations WHERE memory_id = ?", (memory_id,)
+    ).fetchone()[0] == 0
+
+
 def test_mcp_validate_delete_handles_missing_vec_working(beam: BeamMemory):
     """The production MCP dispatch tolerates an unavailable sqlite-vec table."""
     memory_id = beam.remember("delete without vec", source="test", importance=0.5)
