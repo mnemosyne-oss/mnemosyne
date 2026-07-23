@@ -36,6 +36,18 @@ def embeddings_mod(monkeypatch):
     monkeypatch.delenv("MNEMOSYNE_NO_EMBEDDINGS", raising=False)
     monkeypatch.delenv("MNEMOSYNE_SKIP_EMBEDDINGS", raising=False)
     monkeypatch.delenv("MNEMOSYNE_EMBEDDINGS_OFF", raising=False)
+    # Clear vars that could route traffic to the real API instead of the stub.
+    # In envs where MNEMOSYNE_EMBEDDINGS_VIA_API=true and
+    # MNEMOSYNE_EMBEDDING_API_KEY=sk-... are set, the module-level
+    # `_OPENAI_API_KEY = _get_api_key()` picks up real credentials on reload
+    # and `available_api()` returns True, causing embed_query to hit the real
+    # API instead of the local stub → connection refused / wrong host.
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDINGS_VIA_API", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    # Clear model/dim so only the stub-supplied values take effect after reload.
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_MODEL", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_DIM", raising=False)
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", url)
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_MODEL", "embeddinggemma-300m-q4")
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_DIM", "768")
@@ -86,6 +98,15 @@ def test_fastembed_path_applies_prefixes(monkeypatch):
             return [np.ones(768, dtype=np.float32) for _ in texts]
     monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_URL", raising=False)   # force non-API path
     monkeypatch.delenv("MNEMOSYNE_EMBEDDINGS_VIA_API", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    # The on-disk config may have embedding_api_url set to a local (non-openrouter)
+    # endpoint, which causes _is_api_model() to return True via the config branch
+    # even when all env vars are cleared.  Return None from _get_config_safe() so
+    # only env vars are consulted; and stub _get_api_key() so it cannot fall back
+    # to any key stored in the config file.
+    monkeypatch.setattr(emb, "_get_config_safe", lambda: None)
+    monkeypatch.setattr(emb, "_get_api_key", lambda: "")
     # CI globally disables local model loading to avoid downloads. This test
     # installs a fake already-loaded model, so it must explicitly exercise the
     # local branch rather than inherit that suite-level opt-out.

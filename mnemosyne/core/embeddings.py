@@ -6,10 +6,10 @@ Falls back to keyword-only if neither is available.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import ssl
-import sys
 import time
 import urllib.error
 import urllib.request
@@ -72,8 +72,10 @@ def _get_config_safe():
     try:
         if _default_config_path().exists():
             return get_config()
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "_get_config_safe: failed to load config: %s", exc
+        )
     return None
 
 def _get_api_key() -> str:
@@ -92,12 +94,6 @@ def _get_base_url() -> str:
 def _get_default_model() -> str:
     if "MNEMOSYNE_EMBEDDING_MODEL" in os.environ:
         return os.environ["MNEMOSYNE_EMBEDDING_MODEL"]
-    # In test context (pytest running), do NOT read from config.yaml:
-    # the dev machine's configured model would break tests that hardcode
-    # "BAAI/bge-small-en-v1.5" as the expected default. Tests that want
-    # a specific model must set MNEMOSYNE_EMBEDDING_MODEL via monkeypatch.
-    if "pytest" in sys.modules:
-        return "BAAI/bge-small-en-v1.5"
     cfg = _get_config_safe()
     cfg_model = cfg.get_str("embedding_model") if cfg else ""
     return cfg_model or "BAAI/bge-small-en-v1.5"
@@ -124,7 +120,6 @@ def _get_prefix(kind: str) -> str:
     prefix = os.environ.get(var, "")
     global _PREFIXES_LOGGED
     if prefix and not _PREFIXES_LOGGED:
-        import logging
         logging.getLogger(__name__).info(
             "embedding prefixes active: query=%r doc=%r",
             os.environ.get("MNEMOSYNE_EMBEDDING_QUERY_PREFIX", ""),
@@ -134,27 +129,34 @@ def _get_prefix(kind: str) -> str:
 
 
 def _is_disabled() -> bool:
-    """True when dense retrieval has been opted out via env var."""
+    """True when dense retrieval has been opted out via env var.
+
+    Any presence of the env var (even empty string) disables embeddings,
+    matching the original semantics before the truthy-only change.
+    """
     for var in ("MNEMOSYNE_NO_EMBEDDINGS", "MNEMOSYNE_SKIP_EMBEDDINGS", "MNEMOSYNE_EMBEDDINGS_OFF"):
-        v = os.environ.get(var, "").strip().lower()
-        if v in ("1", "true", "yes", "on"):
+        if bool(os.environ.get(var)):
             return True
     return False
 
 
 def _is_api_model(model_name: str) -> bool:
     """Check if the model should use the OpenAI-compatible API."""
-    if model_name.startswith("openai/") or "text-embedding" in model_name or model_name.startswith("text-embedding"):
+    if model_name.startswith("openai/") or model_name.startswith("text-embedding"):
         return True
     if "MNEMOSYNE_EMBEDDINGS_VIA_API" in os.environ:
         return os.environ["MNEMOSYNE_EMBEDDINGS_VIA_API"].strip().lower() in ("1", "true", "yes", "on")
     if "MNEMOSYNE_EMBEDDING_API_URL" in os.environ:
         base_url = os.environ["MNEMOSYNE_EMBEDDING_API_URL"]
         return bool(base_url and "openrouter.ai" not in base_url)
-    if "pytest" in sys.modules and "MNEMOSYNE_EMBEDDINGS_VIA_API" not in os.environ and "MNEMOSYNE_EMBEDDING_API_URL" not in os.environ:
-        return False
     cfg = _get_config_safe()
-    return cfg.get_bool("embeddings_via_api") if cfg else False
+    if cfg:
+        if cfg.get_bool("embeddings_via_api"):
+            return True
+        api_url = cfg.get_str("embedding_api_url", "")
+        if api_url and "openrouter.ai" not in api_url:
+            return True
+    return False
 
 
 def _get_embedding_dim(model_name: str) -> int:
@@ -215,11 +217,6 @@ def _get_embedding_dim(model_name: str) -> int:
     # 3. For custom/unknown models, check central config or default to 384
     cfg = _get_config_safe()
     cfg_dim = cfg.get_int("embedding_dim") if cfg else 0
-    if "pytest" in sys.modules and "MNEMOSYNE_EMBEDDING_DIM" not in os.environ:
-        if model_name == "custom-model":
-            return cfg_dim if cfg_dim > 0 else 384
-        return 384
-
     return cfg_dim if cfg_dim > 0 else 384
 
 
@@ -388,6 +385,8 @@ def available() -> bool:
 
 def available_api() -> bool:
     """Check if API-based embeddings are available."""
+    if _is_disabled():
+        return False
     return bool(_get_api_key())
 
 
