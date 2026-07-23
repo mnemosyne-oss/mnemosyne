@@ -42,6 +42,8 @@ __all__ = [
     "generate_migration_script",
     "generate_agent_instructions",
     "generate_docs_instructions",
+    "list_providers",
+    "import_from_provider",
 ]
 
 from .base import BaseImporter, ImporterResult, import_from_file

@@ -290,8 +290,9 @@ def cmd_diagnose(args):
             print("\n--- Auto-fix ---")
             fix_result = auto_fix(result.get("entries", []), dry_run=dry_run)
             if fix_result["fixed"]:
+                label = "Would fix" if dry_run else "Fixed"
                 for item in fix_result["fixed"]:
-                    print(f"  ✅ {item}")
+                    print(f"  ✅ {label}: {item}")
             if fix_result["failed"]:
                 for item in fix_result["failed"]:
                     print(f"  ❌ {item['label']}: {item['error']}")

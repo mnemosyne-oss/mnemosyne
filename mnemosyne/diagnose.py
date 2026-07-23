@@ -16,7 +16,6 @@ import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
 
 from mnemosyne.runtime_diagnostics import collect_runtime_diagnostics
 
@@ -70,7 +69,7 @@ def _safe_env(name: str) -> str:
     return "set" if val else "unset"
 
 
-def _memory_orphan_diagnostics(conn) -> Dict[str, int]:
+def _memory_orphan_diagnostics(conn) -> dict[str, int]:
     """Return read-only memory reference integrity diagnostics."""
     foreign_keys_enabled = conn.execute("PRAGMA foreign_keys").fetchone()[0]
     tables = {
@@ -142,7 +141,7 @@ def _memory_orphan_diagnostics(conn) -> Dict[str, int]:
 
 
 
-def _sqlite_integrity_diagnostics(conn) -> Dict[str, str]:
+def _sqlite_integrity_diagnostics(conn) -> dict[str, str]:
     """Return PII-safe SQLite integrity diagnostics."""
     try:
         rows = conn.execute("PRAGMA quick_check").fetchall()
@@ -152,7 +151,7 @@ def _sqlite_integrity_diagnostics(conn) -> Dict[str, str]:
     return {"quick_check": result, "detail": ""}
 
 
-def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, bank: str | None = None) -> Dict:
+def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, bank: str | None = None) -> dict:
     """
     Run full diagnostic scan and write PII-safe log.
     Returns summary dict for display.
@@ -167,7 +166,7 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, 
             When None, the default/profile-root DB is used.
     """
     log_path = _log_path()
-    entries: List[Dict] = []
+    entries: list[dict] = []
     resolved_bank: str | None = None
     resolved_db: str | None = None
 
@@ -385,7 +384,7 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, 
     return summary
 
 
-def auto_fix(entries: List[Dict] = None, dry_run: bool = False) -> Dict:
+def auto_fix(entries: list[dict] = None, dry_run: bool = False) -> dict:
     """
     Auto-install missing dependencies detected by diagnostics.
 
