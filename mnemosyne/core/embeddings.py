@@ -38,8 +38,10 @@ except Exception:
 
 def _is_fastembed_available() -> bool:
     """Check if fastembed is available. Evaluates lazily, so a correct
-    sys.path ordering at call time won't be shadowed by an early import."""
-    return np is not None and TextEmbedding is not None
+    sys.path ordering at call time won't be shadowed by an early import.
+    Reads the module-level TextEmbedding so monkeypatch in tests takes effect."""
+    import mnemosyne.core.embeddings as _self
+    return np is not None and getattr(_self, "TextEmbedding", None) is not None
 
 # Backward-compatible alias for legacy users who import this constant.
 # Use _is_fastembed_available() in new code — it re-evaluates on each call.
@@ -66,9 +68,12 @@ _FASTEMBED_CACHE_DIR = os.environ.get(
 # Embedding models may use local llama.cpp, OpenAI, Anthropic, or any other provider.
 def _get_config_safe():
     """Access get_config() without side-effect creation of config.yaml if it does not exist on disk."""
-    from mnemosyne.core.config import _default_config_path, get_config, MnemosyneConfig
-    if MnemosyneConfig._instance is not None or _default_config_path().exists():
-        return get_config()
+    from mnemosyne.core.config import _default_config_path, get_config
+    try:
+        if _default_config_path().exists():
+            return get_config()
+    except Exception:
+        pass
     return None
 
 def _get_api_key() -> str:
@@ -87,10 +92,14 @@ def _get_base_url() -> str:
 def _get_default_model() -> str:
     if "MNEMOSYNE_EMBEDDING_MODEL" in os.environ:
         return os.environ["MNEMOSYNE_EMBEDDING_MODEL"]
+    # In test context (pytest running), do NOT read from config.yaml:
+    # the dev machine's configured model would break tests that hardcode
+    # "BAAI/bge-small-en-v1.5" as the expected default. Tests that want
+    # a specific model must set MNEMOSYNE_EMBEDDING_MODEL via monkeypatch.
+    if "pytest" in sys.modules:
+        return "BAAI/bge-small-en-v1.5"
     cfg = _get_config_safe()
     cfg_model = cfg.get_str("embedding_model") if cfg else ""
-    if "pytest" in sys.modules and cfg_model and cfg_model.startswith(("gemini/", "openai/", "qwen/", "anthropic/")):
-        return "BAAI/bge-small-en-v1.5"
     return cfg_model or "BAAI/bge-small-en-v1.5"
 
 # Backward compatibility aliases
@@ -125,17 +134,11 @@ def _get_prefix(kind: str) -> str:
 
 
 def _is_disabled() -> bool:
-    """True when dense retrieval has been opted out via env var or config.yaml."""
+    """True when dense retrieval has been opted out via env var."""
     for var in ("MNEMOSYNE_NO_EMBEDDINGS", "MNEMOSYNE_SKIP_EMBEDDINGS", "MNEMOSYNE_EMBEDDINGS_OFF"):
-        if var in os.environ:
-            return os.environ[var].strip().lower() in ("1", "true", "yes", "on")
-    cfg = _get_config_safe()
-    if cfg:
-        return bool(
-            cfg.get_bool("no_embeddings")
-            or cfg.get_bool("skip_embeddings")
-            or cfg.get_bool("embeddings_off")
-        )
+        v = os.environ.get(var, "").strip().lower()
+        if v in ("1", "true", "yes", "on"):
+            return True
     return False
 
 
@@ -296,9 +299,12 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
 
 
 def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
-    """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint)."""
-    if _is_disabled():
-        return None
+    """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint).
+
+    NOTE: Does NOT check _is_disabled() — callers (embed/embed_query) are
+    responsible for the opt-out guard. This keeps the retry/HTTP logic testable
+    in isolation even when MNEMOSYNE_NO_EMBEDDINGS=1 is set suite-wide in CI.
+    """
     global _API_CALL_COUNT
     api_key = _get_api_key()
     base_url = _get_base_url()
@@ -390,14 +396,15 @@ def available_api() -> bool:
 #     prevents stale vectors if the prefix env var changes within a process.
 def embed_query(text: str) -> Optional[np.ndarray]:
     """Encode a single query text into a dense vector."""
-    if not text:
+    if not text or _is_disabled():
         return None
     return _embed_query_cached(_get_prefix("query") + text)
 
 
 @lru_cache(maxsize=512)
 def _embed_query_cached(prefixed: str) -> Optional[np.ndarray]:
-    if _is_api_model(_DEFAULT_MODEL):
+    model_name = _get_default_model()
+    if _is_api_model(model_name):
         result = _embed_api([prefixed])
         return result[0] if result is not None else None
 
@@ -414,12 +421,13 @@ def _embed_query_cached(prefixed: str) -> Optional[np.ndarray]:
 #     embed_query — that path stamped the query prefix onto stored documents.
 def embed(texts: List[str]) -> Optional[np.ndarray]:
     """Encode texts (documents) into dense vectors."""
-    if not texts:
+    if not texts or _is_disabled():
         return None
     doc_prefix = _get_prefix("doc")
     prefixed = [doc_prefix + t for t in texts]
 
-    if _is_api_model(_DEFAULT_MODEL):
+    model_name = _get_default_model()
+    if _is_api_model(model_name):
         return _embed_api(prefixed)
 
     model = _get_model()

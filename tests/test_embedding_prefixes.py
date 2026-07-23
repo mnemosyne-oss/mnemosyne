@@ -31,6 +31,11 @@ def embeddings_mod(monkeypatch):
     server = HTTPServer(("127.0.0.1", 0), StubHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_port}/v1"
+    # Clear any CI-level opt-out flags: this fixture starts a real stub HTTP
+    # server (no model download), so the opt-out must not interfere.
+    monkeypatch.delenv("MNEMOSYNE_NO_EMBEDDINGS", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_SKIP_EMBEDDINGS", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDINGS_OFF", raising=False)
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", url)
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_MODEL", "embeddinggemma-300m-q4")
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_DIM", "768")
