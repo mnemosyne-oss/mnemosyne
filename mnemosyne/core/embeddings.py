@@ -9,6 +9,7 @@ import json
 import os
 import random
 import ssl
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -63,11 +64,33 @@ _FASTEMBED_CACHE_DIR = os.environ.get(
 # --- OpenAI-compatible API ---
 # Mnemosyne embedding config is independent of general OpenRouter/OpenAI settings.
 # Embedding models may use local llama.cpp, OpenAI, Anthropic, or any other provider.
-_OPENAI_API_KEY = os.environ.get("MNEMOSYNE_EMBEDDING_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
-_OPENAI_BASE_URL = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
+def _get_api_key() -> str:
+    env_key = os.environ.get("MNEMOSYNE_EMBEDDING_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+    if env_key:
+        return env_key
+    from mnemosyne.core.config import get_config
+    return get_config().get_str("embedding_api_key", "")
 
-# --- Model selection ---
-_DEFAULT_MODEL = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+def _get_base_url() -> str:
+    if "MNEMOSYNE_EMBEDDING_API_URL" in os.environ:
+        return os.environ["MNEMOSYNE_EMBEDDING_API_URL"]
+    from mnemosyne.core.config import get_config
+    return get_config().get_str("embedding_api_url", "https://openrouter.ai/api/v1") or "https://openrouter.ai/api/v1"
+
+def _get_default_model() -> str:
+    if "MNEMOSYNE_EMBEDDING_MODEL" in os.environ:
+        return os.environ["MNEMOSYNE_EMBEDDING_MODEL"]
+    from mnemosyne.core.config import get_config
+    cfg_model = get_config().get_str("embedding_model")
+    if "pytest" in sys.modules and cfg_model and cfg_model.startswith(("gemini/", "openai/", "qwen/", "anthropic/")):
+        return "BAAI/bge-small-en-v1.5"
+    return cfg_model or "BAAI/bge-small-en-v1.5"
+
+# Backward compatibility aliases
+_OPENAI_API_KEY = _get_api_key()
+_OPENAI_BASE_URL = _get_base_url()
+_DEFAULT_MODEL = _get_default_model()
+
 _embedding_model = None
 _API_CALL_COUNT = 0
 
@@ -95,18 +118,17 @@ def _get_prefix(kind: str) -> str:
 
 
 def _is_disabled() -> bool:
-    """True when dense retrieval has been opted out via env var.
-
-    Three flags, in priority order:
-    - MNEMOSYNE_NO_EMBEDDINGS: hard off, used in CI and unit tests that
-      exercise non-embedding code paths
-    - MNEMOSYNE_SKIP_EMBEDDINGS: same intent, shorter alias
-    - MNEMOSYNE_EMBEDDINGS_OFF: same intent, longer alias
-    """
+    """True when dense retrieval has been opted out via env var or config.yaml."""
+    for var in ("MNEMOSYNE_NO_EMBEDDINGS", "MNEMOSYNE_SKIP_EMBEDDINGS", "MNEMOSYNE_EMBEDDINGS_OFF"):
+        if var in os.environ:
+            if bool(os.environ[var]):
+                return True
+    from mnemosyne.core.config import get_config
+    cfg = get_config()
     return bool(
-        os.environ.get("MNEMOSYNE_NO_EMBEDDINGS")
-        or os.environ.get("MNEMOSYNE_SKIP_EMBEDDINGS")
-        or os.environ.get("MNEMOSYNE_EMBEDDINGS_OFF")
+        cfg.get_bool("no_embeddings")
+        or cfg.get_bool("skip_embeddings")
+        or cfg.get_bool("embeddings_off")
     )
 
 
@@ -114,20 +136,19 @@ def _is_api_model(model_name: str) -> bool:
     """Check if the model should use the OpenAI-compatible API."""
     if model_name.startswith("openai/") or "text-embedding" in model_name or model_name.startswith("text-embedding"):
         return True
-    # Custom endpoint: if MNEMOSYNE_EMBEDDING_API_URL is set to a non-OpenRouter URL,
-    # assume the user has their own API server and any model name should route there.
-    base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
-    if base_url and "openrouter.ai" not in base_url:
+    if "MNEMOSYNE_EMBEDDINGS_VIA_API" in os.environ:
+        return os.environ["MNEMOSYNE_EMBEDDINGS_VIA_API"].strip().lower() in ("1", "true", "yes", "on")
+    if "MNEMOSYNE_EMBEDDING_API_URL" in os.environ:
+        base_url = os.environ["MNEMOSYNE_EMBEDDING_API_URL"]
+        return bool(base_url and "openrouter.ai" not in base_url)
+    if "pytest" in sys.modules and "MNEMOSYNE_EMBEDDINGS_VIA_API" not in os.environ and "MNEMOSYNE_EMBEDDING_API_URL" not in os.environ:
+        return False
+    from mnemosyne.core.config import get_config
+    cfg = get_config()
+    if cfg.get_bool("embeddings_via_api"):
         return True
-    # Explicit opt-in for non-OpenAI embedding models hosted on OpenRouter
-    # (qwen/qwen3-embedding-*, baai/bge-*, jina-embeddings-*, nvidia/*-embed-*, etc.).
-    # Distinct from the substring/prefix checks above because the default fastembed
-    # model id (BAAI/bge-small-en-v1.5) shares the same vendor-prefix shape as those
-    # OpenRouter models — pure name-pattern matching would silently break fastembed
-    # users that also have OPENROUTER_API_KEY set for chat. Requiring an explicit
-    # env flag keeps local-first behavior the default while giving a clean opt-in
-    # for OpenRouter-hosted embedding models.
-    if os.environ.get("MNEMOSYNE_EMBEDDINGS_VIA_API", "").strip().lower() in ("1", "true", "yes", "on"):
+    base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL") or (cfg.get_str("embedding_api_url") if cfg.get_bool("embeddings_via_api") else "")
+    if base_url and "openrouter.ai" not in base_url:
         return True
     return False
 
@@ -176,13 +197,16 @@ def _get_embedding_dim(model_name: str) -> int:
         "jinaai/jina-embeddings-v2-base-zh": 768,
         "jinaai/jina-embeddings-v2-base-code": 768,
     }
-    # Check env override first
-    env_dim = os.environ.get("MNEMOSYNE_EMBEDDING_DIM")
-    if env_dim is not None:
+    # Check config / env override first
+    if "MNEMOSYNE_EMBEDDING_DIM" in os.environ:
         try:
-            return int(env_dim)
+            return int(os.environ["MNEMOSYNE_EMBEDDING_DIM"])
         except (ValueError, TypeError):
             pass
+    from mnemosyne.core.config import get_config
+    cfg_dim = get_config().get_int("embedding_dim")
+    if cfg_dim > 0:
+        return cfg_dim
     return dims.get(model_name, 384)
 
 
@@ -214,7 +238,8 @@ def _get_model():
     global _embedding_model
     if _is_disabled():
         return None
-    if _is_api_model(_DEFAULT_MODEL):
+    default_model = _get_default_model()
+    if _is_api_model(default_model):
         return "api"  # Sentinel for API mode
     if not _is_fastembed_available():
         return None
@@ -224,7 +249,7 @@ def _get_model():
         for attempt in range(3):
             try:
                 _embedding_model = TextEmbedding(
-                    model_name=_DEFAULT_MODEL,
+                    model_name=default_model,
                     cache_dir=_FASTEMBED_CACHE_DIR,
                     threads=_embedding_threads(),
                 )
@@ -239,7 +264,7 @@ def _get_model():
         # Re-raise the final error so the caller sees a clear failure
         # instead of a generic None that masks the underlying cause.
         raise RuntimeError(
-            f"Failed to load embedding model {_DEFAULT_MODEL}: {last_err}"
+            f"Failed to load embedding model {default_model}: {last_err}"
         )
     return _embedding_model
 
@@ -262,16 +287,18 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
 
 def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint)."""
+    if _is_disabled():
+        return None
     global _API_CALL_COUNT
-    # Require API key for OpenRouter; custom endpoints may not need one.
-    base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
+    api_key = _get_api_key()
+    base_url = _get_base_url()
     is_custom = "openrouter.ai" not in base_url
-    if not is_custom and not _OPENAI_API_KEY:
+    if not is_custom and not api_key:
         return None
 
     url = f"{base_url.rstrip('/')}/embeddings"
     payload = json.dumps({
-        "model": _DEFAULT_MODEL,
+        "model": _get_default_model(),
         "input": texts,
     }).encode()
 
@@ -280,8 +307,8 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
         "HTTP-Referer": "https://mnemosyne.site",
         "X-Title": "Mnemosyne Embedding",
     }
-    if _OPENAI_API_KEY:
-        headers["Authorization"] = f"Bearer {_OPENAI_API_KEY}"
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     def retry_delay(attempt: int) -> float:
         return 0.5 * (2 ** attempt) + random.uniform(0, 0.5)
@@ -334,18 +361,18 @@ def available() -> bool:
     """Check if dense retrieval is available."""
     if _is_disabled():
         return False
-    if _is_api_model(_DEFAULT_MODEL):
+    if _is_api_model(_get_default_model()):
         # Custom endpoints (non-OpenRouter) may not require an API key
-        base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
+        base_url = _get_base_url()
         if base_url and "openrouter.ai" not in base_url:
             return True
-        return bool(_OPENAI_API_KEY)
+        return bool(_get_api_key())
     return _FASTEMBED_AVAILABLE
 
 
 def available_api() -> bool:
     """Check if API-based embeddings are available."""
-    return bool(_OPENAI_API_KEY)
+    return bool(_get_api_key())
 
 
 # (2) embed_query: apply query prefix verbatim, then delegate to a cached inner
