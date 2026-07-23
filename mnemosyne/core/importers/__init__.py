@@ -23,6 +23,29 @@ Agentic migration:
     hermes mnemosyne import --from zep --agentic
 """
 
+__all__ = [
+    "AgenticImporter",
+    "BaseImporter",
+    "CogneeImporter",
+    "HindsightImporter",
+    "HolographicImporter",
+    "HonchoImporter",
+    "ImporterResult",
+    "LettaImporter",
+    "Mem0Importer",
+    "SuperMemoryImporter",
+    "ZepImporter",
+    "generate_agent_instructions",
+    "generate_docs_instructions",
+    "generate_migration_script",
+    "import_from_file",
+    "import_from_hindsight",
+    "import_from_holographic",
+    "import_from_mem0",
+    "import_from_provider",
+    "list_providers",
+]
+
 from .base import BaseImporter, ImporterResult, import_from_file
 from .mem0 import Mem0Importer, import_from_mem0
 from .letta import LettaImporter

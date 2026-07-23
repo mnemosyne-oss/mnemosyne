@@ -23,7 +23,7 @@ import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 # Keys that require a process restart to take effect.
 # Changing them via config.yaml at runtime will warn but not apply.
-REQUIRES_RESTART: Set[str] = {
+REQUIRES_RESTART: set[str] = {
     "data_dir",
     "db_path",
     "home",
@@ -59,7 +59,7 @@ REQUIRES_RESTART: Set[str] = {
 
 # Mapping from config key (snake_case, no MNEMOSYNE_ prefix) to env var name.
 # This is the canonical bridge between config.yaml keys and env vars.
-ENV_VAR_MAP: Dict[str, str] = {
+ENV_VAR_MAP: dict[str, str] = {
     # Paths
     "data_dir": "MNEMOSYNE_DATA_DIR",
     "home": "MNEMOSYNE_HOME",
@@ -121,25 +121,11 @@ ENV_VAR_MAP: Dict[str, str] = {
     "llm_api_key": "MNEMOSYNE_LLM_API_KEY",
     "llm_model": "MNEMOSYNE_LLM_MODEL",
     "llm_timeout": "MNEMOSYNE_LLM_TIMEOUT",
-    "llm_fallback_models": "MNEMOSYNE_LLM_FALLBACK_MODELS",
-    "llm_fallback_base_url": "MNEMOSYNE_LLM_FALLBACK_BASE_URL",
-    "llm_fallback_api_key": "MNEMOSYNE_LLM_FALLBACK_API_KEY",
     "force_local": "MNEMOSYNE_FORCE_LOCAL",
-    "sleep_prompt": "MNEMOSYNE_SLEEP_PROMPT",
     "host_llm_enabled": "MNEMOSYNE_HOST_LLM_ENABLED",
-    "host_llm_provider": "MNEMOSYNE_HOST_LLM_PROVIDER",
-    "host_llm_model": "MNEMOSYNE_HOST_LLM_MODEL",
     "host_llm_n_ctx": "MNEMOSYNE_HOST_LLM_N_CTX",
-    # Conflict detection
     "llm_conflict_detection": "MNEMOSYNE_LLM_CONFLICT_DETECTION",
-    "conflict_llm_base_url": "MNEMOSYNE_CONFLICT_LLM_BASE_URL",
-    "conflict_llm_api_key": "MNEMOSYNE_CONFLICT_LLM_API_KEY",
-    "conflict_llm_model": "MNEMOSYNE_CONFLICT_LLM_MODEL",
     # Sync
-    "sync_remote": "MNEMOSYNE_SYNC_REMOTE",
-    "sync_host": "MNEMOSYNE_SYNC_HOST",
-    "sync_port": "MNEMOSYNE_SYNC_PORT",
-    "sync_key": "MNEMOSYNE_SYNC_KEY",
     "sync_encrypt": "MNEMOSYNE_SYNC_ENCRYPT",
     "sync_roles": "MNEMOSYNE_SYNC_ROLES",
     # Provider
@@ -158,47 +144,35 @@ ENV_VAR_MAP: Dict[str, str] = {
     # Model refresh
     "sleep_model_refresh_enabled": "MNEMOSYNE_SLEEP_MODEL_REFRESH_ENABLED",
     "sleep_model_refresh_auto_apply": "MNEMOSYNE_SLEEP_MODEL_REFRESH_AUTO_APPLY",
-    "sleep_model_refresh_categories": "MNEMOSYNE_SLEEP_MODEL_REFRESH_CATEGORIES",
-    "sleep_model_refresh_max_tokens": "MNEMOSYNE_SLEEP_MODEL_REFRESH_MAX_TOKENS",
-    "sleep_model_refresh_temperature": "MNEMOSYNE_SLEEP_MODEL_REFRESH_TEMPERATURE",
-    "sleep_model_refresh_auto_apply_min_confidence": "MNEMOSYNE_SLEEP_MODEL_REFRESH_AUTO_APPLY_MIN_CONFIDENCE",
-    "sleep_model_refresh_min_evidence": "MNEMOSYNE_SLEEP_MODEL_REFRESH_MIN_EVIDENCE",
-    "sleep_model_refresh_conflict_min_confidence": "MNEMOSYNE_SLEEP_MODEL_REFRESH_CONFLICT_MIN_CONFIDENCE",
-    "sleep_model_refresh_conflict_min_evidence": "MNEMOSYNE_SLEEP_MODEL_REFRESH_CONFLICT_MIN_EVIDENCE",
     # SHMR
     "shmr_batch_size": "MNEMOSYNE_SHMR_BATCH_SIZE",
     "shmr_max_iterations": "MNEMOSYNE_SHMR_MAX_ITERATIONS",
     "shmr_similarity_threshold": "MNEMOSYNE_SHMR_SIMILARITY_THRESHOLD",
     "shmr_harmony_threshold": "MNEMOSYNE_SHMR_HARMONY_THRESHOLD",
-    "shmr_model": "MNEMOSYNE_SHMR_MODEL",
     "shmr_min_cluster_size": "MNEMOSYNE_SHMR_MIN_CLUSTER_SIZE",
     "shmr_temperature": "MNEMOSYNE_SHMR_TEMPERATURE",
     # Migrations
     "auto_migrate": "MNEMOSYNE_AUTO_MIGRATE",
     # MCP
     "default_scope": "MNEMOSYNE_DEFAULT_SCOPE",
-    "default_owner": "MNEMOSYNE_DEFAULT_OWNER",
     # Filters
     "ignore_patterns": "MNEMOSYNE_IGNORE_PATTERNS",
     "write_classifier": "MNEMOSYNE_WRITE_CLASSIFIER",
 }
 
-# Reverse map: env var name → config key
-CONFIG_KEY_MAP: Dict[str, str] = {v: k for k, v in ENV_VAR_MAP.items()}
 
-# Sensible defaults for every known config key.
-# These are written to config.yaml on first access (seed).
-# They match the hardcoded defaults in beam.py and other modules.
-DEFAULTS: Dict[str, Any] = {
-    # Paths — empty means use the codebase default
-    "data_dir": "",
-    "home": "",
-    "db_path": "",
-    "backup_dir": "",
-    "blob_dir": "",
-    "shared_db_path": "",
+CONFIG_KEY_MAP: dict[str, str] = {v: k for k, v in ENV_VAR_MAP.items()}
+
+DEFAULTS: dict[str, Any] = {
+    # Paths
+    "data_dir": None,
+    "home": None,
+    "db_path": None,
+    "backup_dir": None,
+    "blob_dir": None,
+    "shared_db_path": None,
     # Embeddings
-    "embedding_model": "BAAI/bge-small-en-v1.5",
+    "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
     "embedding_dim": 384,
     "embedding_api_key": "",
     "embedding_api_url": "",
@@ -207,12 +181,12 @@ DEFAULTS: Dict[str, Any] = {
     "skip_embeddings": False,
     "embeddings_off": False,
     "fastembed_cache_dir": "",
-    "vec_type": "int8",
+    "vec_type": "json",
     "vec_weight": 0.5,
     # Recall
     "fts_weight": 0.3,
     "importance_weight": 0.2,
-    "temporal_halflife_hours": 168,
+    "temporal_halflife_hours": 24.0,
     "recency_halflife": 168,
     "recall_extra_stopwords": "",
     "cross_session": False,
@@ -251,25 +225,11 @@ DEFAULTS: Dict[str, Any] = {
     "llm_api_key": "",
     "llm_model": "",
     "llm_timeout": 60,
-    "llm_fallback_models": "",
-    "llm_fallback_base_url": "",
-    "llm_fallback_api_key": "",
     "force_local": False,
-    "sleep_prompt": "",
     "host_llm_enabled": False,
-    "host_llm_provider": "",
-    "host_llm_model": "",
     "host_llm_n_ctx": 2048,
-    # Conflict detection
     "llm_conflict_detection": False,
-    "conflict_llm_base_url": "",
-    "conflict_llm_api_key": "",
-    "conflict_llm_model": "",
     # Sync
-    "sync_remote": "",
-    "sync_host": "127.0.0.1",
-    "sync_port": 8765,
-    "sync_key": "",
     "sync_encrypt": False,
     "sync_roles": "user",
     # Provider
@@ -288,26 +248,17 @@ DEFAULTS: Dict[str, Any] = {
     # Model refresh
     "sleep_model_refresh_enabled": True,
     "sleep_model_refresh_auto_apply": True,
-    "sleep_model_refresh_categories": "user,workflow,project",
-    "sleep_model_refresh_max_tokens": 1024,
-    "sleep_model_refresh_temperature": 0.3,
-    "sleep_model_refresh_auto_apply_min_confidence": 0.7,
-    "sleep_model_refresh_min_evidence": 3,
-    "sleep_model_refresh_conflict_min_confidence": 0.8,
-    "sleep_model_refresh_conflict_min_evidence": 5,
     # SHMR
     "shmr_batch_size": 50,
     "shmr_max_iterations": 10,
     "shmr_similarity_threshold": 0.7,
     "shmr_harmony_threshold": 0.5,
-    "shmr_model": "",
     "shmr_min_cluster_size": 3,
     "shmr_temperature": 0.3,
     # Migrations
     "auto_migrate": True,
     # MCP
     "default_scope": "session",
-    "default_owner": "",
     # Filters
     "ignore_patterns": "",
     "write_classifier": "",
@@ -343,9 +294,9 @@ class MnemosyneConfig:
 
     def __init__(self, config_path: Optional[Path] = None):
         self._config_path = config_path or _default_config_path()
-        self._yaml_cache: Dict[str, Any] = {}
+        self._yaml_cache: dict[str, Any] = {}
         self._yaml_mtime: float = 0.0
-        self._yaml_lock = threading.Lock()
+        self._yaml_lock = threading.RLock()
 
         # Auto-seed config.yaml on first access if it doesn't exist
         if not self._config_path.exists():
@@ -372,9 +323,8 @@ class MnemosyneConfig:
 
         This ensures that users with existing env var configurations don't
         get silently overridden by the auto-seeded defaults. The resulting
-        config.yaml reflects exactly what's already running.
-
-        Does NOT overwrite an existing file.
+        config.yaml reflects exactly what's already running. The file
+        does NOT overwrite an existing file.
         Returns without error if the file already exists.
         """
         if self._config_path.exists():
@@ -383,7 +333,7 @@ class MnemosyneConfig:
         import yaml
         try:
             # Build the seed data: env var value if set, otherwise default
-            seed_data: Dict[str, Any] = {}
+            seed_data: dict[str, Any] = {}
             for key, default_val in DEFAULTS.items():
                 env_var = ENV_VAR_MAP.get(key)
                 if env_var and env_var in os.environ:
@@ -492,284 +442,202 @@ class MnemosyneConfig:
                 self._yaml_cache = {}
                 self._yaml_mtime = 0.0
 
-    def _flatten_yaml(self, data: Dict, prefix: str = "") -> Dict[str, Any]:
+    def _flatten_yaml(self, data: dict, prefix: str = "") -> dict[str, Any]:
         """Flatten nested YAML into dot-separated keys.
 
         Example: {memory: {mnemosyne: {wm_max_items: 5000}}}
         → {"memory.mnemosyne.wm_max_items": 5000}
         Also extracts the leaf key: {"wm_max_items": 5000}
         """
-        flat = {}
-        for key, val in data.items():
+        result: dict[str, Any] = {}
+        for key, value in data.items():
             full_key = f"{prefix}.{key}" if prefix else key
-            if isinstance(val, dict):
-                flat.update(self._flatten_yaml(val, full_key))
+            if isinstance(value, dict):
+                result.update(self._flatten_yaml(value, full_key))
+                # Also store the leaf key for direct access
+                result[key] = value
             else:
-                flat[full_key] = val
-                # Also store the leaf key (last segment)
-                leaf = key
-                flat.setdefault(leaf, val)
-        return flat
+                result[full_key] = value
+                result[key] = value
+        return result
 
-    def _maybe_reload(self) -> None:
-        """Re-read config.yaml if it changed on disk since last load.
-
-        Cheap stat() check — no lock contention on the hot path when
-        the file hasn't changed.
-        """
-        try:
-            if not self._config_path.exists():
-                return
-            if self._config_path.stat().st_mtime != self._yaml_mtime:
-                self._load_yaml()
-        except OSError:
-            pass
-
-    # -------------------------------------------------------------------
-    # Public API
-    # -------------------------------------------------------------------
-
-    def reload(self) -> Set[str]:
-        """Re-read config.yaml. Returns set of changed keys.
-
-        Also checks for file mtime changes to skip unnecessary reloads.
-        """
-        old_values = dict(self._yaml_cache)
-        self._yaml_mtime = 0.0  # force reload
+    def _read_yaml(self, key: str, default: Any = None) -> Any:
+        """Read from YAML cache (dot-notation or leaf key)."""
         self._load_yaml()
-
-        changed = set()
-        for key in set(list(old_values.keys()) + list(self._yaml_cache.keys())):
-            old_val = old_values.get(key)
-            new_val = self._yaml_cache.get(key)
-            if old_val != new_val:
-                changed.add(key)
-
-        # Warn about requires_restart keys
-        for key in changed:
-            config_key = self._yaml_to_config_key(key)
-            if config_key and config_key in REQUIRES_RESTART:
-                logger.warning(
-                    "Config key '%s' requires restart to take effect. "
-                    "The new value will apply on next process start.",
-                    config_key,
-                )
-
-        return changed
+        return self._yaml_cache.get(key, default)
 
     def get(self, key: str, default: Any = None) -> Any:
-        """Get a config value.
+        """Get a config value with precedence: YAML > env var > default."""
+        # 1. YAML cache
+        yaml_val = self._read_yaml(key)
+        if yaml_val is not None:
+            return yaml_val
 
-        Precedence: config.yaml > env var > default.
-
-        Args:
-            key: Config key (snake_case, no MNEMOSYNE_ prefix).
-                 e.g. "wm_max_items", "vec_type", "llm_enabled".
-            default: Fallback if not found in YAML or env.
-        """
-        # 1. Check YAML cache.  Auto-reload if the file mtime changed
-        # so that `mnemosyne config set` + provider reads work without
-        # an explicit reload call.
-        self._maybe_reload()
-        if key in self._yaml_cache:
-            return self._yaml_cache[key]
-
-        # 2. Check env var
+        # 2. Environment variable
         env_var = ENV_VAR_MAP.get(key)
-        if env_var:
-            val = os.environ.get(env_var)
-            if val is not None:
-                return val
+        if env_var and env_var in os.environ:
+            env_val = os.environ[env_var]
+            # Try to coerce to the default's type
+            default_val = DEFAULTS.get(key)
+            if isinstance(default_val, bool):
+                return env_val.strip().lower() in ("1", "true", "yes", "on")
+            if isinstance(default_val, int):
+                try:
+                    return int(env_val)
+                except ValueError:
+                    return default_val
+            if isinstance(default_val, float):
+                try:
+                    return float(env_val)
+                except ValueError:
+                    return default_val
+            return env_val
 
-        # 3. Default
-        return default
+        # 3. Hardcoded default — prefer DEFAULTS when caller wants it,
+        # but otherwise return None to preserve the documented contract
+        # that get() without an explicit default returns None for
+        # unset values (so callers can distinguish "defaulted" from "set").
+        return default if default is not None else None
 
-    def get_str(self, key: str, default: str = "") -> str:
-        """Get a string config value."""
+    def get_bool(self, key: str, default: bool = False) -> bool:
+        """Get a boolean config value with type coercion."""
         val = self.get(key, default)
-        return str(val) if val is not None else default
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.strip().lower() in ("1", "true", "yes", "on")
+        if isinstance(val, int):
+            return val != 0
+        return bool(val)
 
     def get_int(self, key: str, default: int = 0) -> int:
-        """Get an int config value."""
-        val = self.get(key)
-        if val is None:
-            return default
+        """Get an integer config value with type coercion."""
+        val = self.get(key, default)
         try:
             return int(val)
         except (ValueError, TypeError):
             return default
 
     def get_float(self, key: str, default: float = 0.0) -> float:
-        """Get a float config value."""
-        val = self.get(key)
-        if val is None:
-            return default
+        """Get a float config value with type coercion."""
+        val = self.get(key, default)
         try:
             return float(val)
         except (ValueError, TypeError):
             return default
 
-    def get_bool(self, key: str, default: bool = False) -> bool:
-        """Get a boolean config value.
-
-        Accepts: 1/true/yes/on (case-insensitive) as True.
-        """
-        val = self.get(key)
-        if val is None:
-            return default
-        if isinstance(val, bool):
-            return val
-        return str(val).strip().lower() in ("1", "true", "yes", "on")
+    def get_str(self, key: str, default: str = "") -> str:
+        """Get a string config value."""
+        val = self.get(key, default)
+        return str(val) if val is not None else ""
 
     def resolve_beam_runtime(self) -> BeamRuntimeConfig:
         """Resolve Beam's hot-reloadable runtime settings with typed values."""
         return BeamRuntimeConfig(cross_session=self.get_bool("cross_session", False))
 
     def set(self, key: str, value: Any) -> None:
-        """Write a config value to config.yaml.
-
-        Creates the file if it doesn't exist.
-        """
-        self._load_yaml()
-
-        # Read existing YAML
-        import yaml
-        existing: Dict[str, Any] = {}
-        if self._config_path.exists():
-            try:
-                with open(self._config_path, "r") as f:
-                    existing = yaml.safe_load(f) or {}
-            except Exception:
-                existing = {}
-
-        # Set the key (flat structure for now)
-        existing[key] = value
-
-        # Ensure parent dir
-        self._config_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Write back
-        with open(self._config_path, "w") as f:
-            yaml.dump(existing, f, default_flow_style=False, sort_keys=True)
-
-        # Refresh cache
-        self._yaml_mtime = 0.0
-        self._load_yaml()
-
-        # Warn about requires_restart
-        if key in REQUIRES_RESTART:
-            logger.warning(
-                "Config key '%s' requires restart to take effect.", key
-            )
-
-    def set_many(self, items: Dict[str, Any]) -> None:
-        """Write multiple config values to config.yaml in a single read-modify-write.
-
-        Avoids the per-key overhead of calling set() in a loop.
-        """
-        self._load_yaml()
-
-        import yaml
-        existing: Dict[str, Any] = {}
-        if self._config_path.exists():
-            try:
-                with open(self._config_path, "r") as f:
-                    existing = yaml.safe_load(f) or {}
-            except Exception:
-                existing = {}
-
-        existing.update(items)
-
-        self._config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._config_path, "w") as f:
-            yaml.dump(existing, f, default_flow_style=False, sort_keys=True)
-
-        self._yaml_mtime = 0.0
-        self._load_yaml()
-
-        for key in items:
+        """Set a config key in YAML (persisted to disk)."""
+        with self._yaml_lock:
+            self._load_yaml()
+            self._yaml_cache[key] = value
+            self._write_yaml()
             if key in REQUIRES_RESTART:
                 logger.warning(
                     "Config key '%s' requires restart to take effect.", key
                 )
 
-    def migrate_from_env(self) -> List[str]:
-        """Export current env vars to config.yaml.
+    def set_many(self, items: dict[str, Any]) -> None:
+        """Set multiple config keys at once."""
+        with self._yaml_lock:
+            self._load_yaml()
+            self._yaml_cache.update(items)
+            self._write_yaml()
+            for key in items:
+                if key in REQUIRES_RESTART:
+                    logger.warning(
+                        "Config key '%s' requires restart to take effect.", key
+                    )
 
-        Reads all MNEMOSYNE_* env vars and writes their values to config.yaml.
-        Does not unset the env vars — they remain as lower-priority fallbacks.
+    def _write_yaml(self) -> None:
+        """Write the current YAML cache to disk."""
+        import yaml
+        
+        # Rebuild nested structure from flattened cache to avoid duplicate keys
+        def unflatten(flat: dict[str, Any]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in sorted(flat.items()):
+                parts = key.split('.')
+                current = result
+                for i, part in enumerate(parts[:-1]):
+                    if part not in current or not isinstance(current[part], dict):
+                        current[part] = {}
+                    current = current[part]
+                current[parts[-1]] = value
+            return result
+        
+        nested = unflatten(self._yaml_cache)
+        
+        with open(self._config_path, "w") as f:
+            f.write("# Mnemosyne config — edit freely, hot-reload with `mnemosyne config reload`\n")
+            f.write("# Precedence: config.yaml > env vars > hardcoded defaults\n\n")
+            yaml.dump(nested, f, default_flow_style=False, sort_keys=True)
+        self._yaml_mtime = self._config_path.stat().st_mtime
 
-        Returns list of keys that were migrated.
-        """
-        migrated = []
-        for config_key, env_var in ENV_VAR_MAP.items():
-            val = os.environ.get(env_var)
-            if val is not None and val != "":
-                self.set(config_key, val)
-                migrated.append(config_key)
+    def reload(self) -> set[str]:
+        """Reload config from disk. Returns set of changed keys."""
+        with self._yaml_lock:
+            old_cache = dict(self._yaml_cache)
+            self._load_yaml()
+            new_cache = self._yaml_cache
+            all_keys = set(old_cache) | set(new_cache)
+            return {k for k in all_keys if old_cache.get(k) != new_cache.get(k)}
 
-        logger.info("Migrated %d env vars to config.yaml", len(migrated))
-        return migrated
+    def migrate_from_env(self) -> list[str]:
+        """Migrate all known env vars to config.yaml.
+        Returns list of keys that were set."""
+        updates = {
+            key: os.environ[env_var]
+            for key, env_var in ENV_VAR_MAP.items()
+            if env_var in os.environ
+        }
+        if updates:
+            self.set_many(updates)
+        return list(updates)
 
-    def _yaml_to_config_key(self, yaml_key: str) -> Optional[str]:
-        """Map a YAML key (possibly dot-separated) to a config key."""
-        # Direct match
-        if yaml_key in ENV_VAR_MAP:
-            return yaml_key
-        # Try the last segment of a dot-separated key
-        if "." in yaml_key:
-            leaf = yaml_key.rsplit(".", 1)[-1]
-            if leaf in ENV_VAR_MAP:
-                return leaf
-        return None
+    def all_keys(self) -> list[str]:
+        """Return all known config keys (from schema + YAML + env)."""
+        keys: set[str] = set(DEFAULTS.keys())
+        keys.update(self._yaml_cache.keys())
+        for env_var in ENV_VAR_MAP.values():
+            if env_var in os.environ:
+                keys.add(CONFIG_KEY_MAP.get(env_var, env_var))
+        return sorted(keys)
 
-    def all_keys(self) -> List[str]:
-        """Return all known config keys."""
-        return sorted(ENV_VAR_MAP.keys())
-
-    def dump(self) -> Dict[str, Any]:
-        """Return all config values as a dict (for inspection)."""
-        result = {}
+    def dump(self) -> dict[str, Any]:
+        """Dump all resolved config values (YAML > env > defaults)."""
+        result: dict[str, Any] = {}
         for key in self.all_keys():
             result[key] = self.get(key)
         return result
 
+    def requires_restart(self, key: str) -> bool:
+        """Check if a key requires a process restart to take effect."""
+        return key in REQUIRES_RESTART
 
-# ---------------------------------------------------------------------------
-# Module-level convenience
-# ---------------------------------------------------------------------------
 
-def get_config() -> MnemosyneConfig:
-    """Get the shared MnemosyneConfig singleton."""
+def get_config(config_path: Optional[Path] = None) -> MnemosyneConfig:
+    """Get the singleton MnemosyneConfig instance."""
+    if config_path is not None:
+        return MnemosyneConfig(config_path)
     return MnemosyneConfig.get_instance()
 
 
-def get(key: str, default: Any = None) -> Any:
-    """Shortcut: get a config value from the shared instance."""
-    return get_config().get(key, default)
-
-
-def get_int(key: str, default: int = 0) -> int:
-    return get_config().get_int(key, default)
-
-
-def get_float(key: str, default: float = 0.0) -> float:
-    return get_config().get_float(key, default)
-
-
-def get_bool(key: str, default: bool = False) -> bool:
-    return get_config().get_bool(key, default)
-
-
-def get_str(key: str, default: str = "") -> str:
-    return get_config().get_str(key, default)
+def reload() -> set[str]:
+    """Reload the singleton config from disk. Returns changed keys."""
+    config = get_config()
+    return config.reload()
 
 
 def resolve_beam_runtime() -> BeamRuntimeConfig:
     """Resolve the typed, hot-reloadable Beam runtime settings."""
     return get_config().resolve_beam_runtime()
-
-
-def reload() -> Set[str]:
-    """Shortcut: reload the shared config instance."""
-    return get_config().reload()

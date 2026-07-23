@@ -357,7 +357,7 @@ async def lifespan(app):
 def create_app(banks: List[str], default_bank: str):
     """Create the FastAPI application."""
     try:
-        from fastapi import FastAPI, Request, Query
+        from fastapi import FastAPI, Request
         from fastapi.responses import HTMLResponse, JSONResponse
     except ImportError:
         raise RuntimeError("Memory browser requires fastapi and uvicorn. Install: pip install fastapi uvicorn")

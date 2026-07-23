@@ -43,11 +43,9 @@ except ImportError:
 # Binary vector compression (Phase 2 -- Moorcheh ITS)
 try:
     from mnemosyne.core.binary_vectors import (
-        BinaryVectorStore,
         maximally_informative_binarization as _mib,
         hamming_distance as _hamming,
         EMBEDDING_DIM,
-        BYTES_PER_VECTOR,
     )
 except ImportError:
     _mib = None
@@ -5728,9 +5726,6 @@ class BeamMemory:
                 )
         broad_multi_hit_query = len(query_words) >= 4 and len(matched_query_tokens) >= 2
         for row in rows:
-            content_lower = row["content"].lower()
-            content_words_list = content_lower.split()
-            content_words_set = set(content_words_list)
             if wm_ranks and row["id"] in wm_ranks:
                 normalized = 1.0 - ((wm_ranks[row["id"]] - min_rank) / rng)
                 lexical = _lexical_relevance(query_words, row["content"], query_lower)
@@ -6063,11 +6058,9 @@ class BeamMemory:
 
         # ---- Pre-compute query binary vector (Phase 5 binary voice) ----
         query_bv = None
-        query_emb_for_bv = None
         if embeddings_available and _mib is not None:
             emb_result = _get_query_embedding()
             if emb_result is not None:
-                query_emb_for_bv = emb_result
                 query_bv = _mib(emb_result)
 
         # ---- Episodic memory (vec + FTS5 hybrid) ----
@@ -6186,7 +6179,6 @@ class BeamMemory:
             fact_bonus = 0.0
             binary_bonus = 0.0
             memory_id = row["id"]
-            content_lower = row["content"].lower()
             bv = row["binary_vector"]
             lexical = _lexical_relevance(query_words, row["content"], query_lower)
             # FTS rank says a candidate matched *a* term; it does not mean the
@@ -8493,7 +8485,7 @@ class BeamMemory:
 
         # Cross-session MEMORIA dedup: clean up redundant entries across sessions
         if not dry_run:
-            dedup_result = self._deduplicate_memoria_cross_session()
+            self._deduplicate_memoria_cross_session()
 
         return {
             "status": "dry_run" if dry_run else ("consolidated" if items_consolidated else "no_op"),

@@ -371,7 +371,7 @@ class CompressionPlugin(MnemosynePlugin):
             return
         self._caveman_import_attempted = True
         try:
-            from rust_cave_001 import compress  # noqa: F811
+            from rust_cave_001 import compress  # noqa: F401
             self._caveman_available = True
         except ImportError:
             logger.debug("CompressionPlugin: rust_cave_001 not installed")

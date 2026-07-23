@@ -203,7 +203,7 @@ def cmd_recall(args):
         print(f"  Content: {content[:150]}{'...' if len(content) > 150 else ''}")
         print(f"  Score: {score:.3f}")
         if r.get("entity_match"):
-            print(f"  [entity match]")
+            print("  [entity match]")
         print()
 
 
@@ -270,7 +270,6 @@ def cmd_diagnose(args):
     fix_mode = "--fix" in args
     dry_run = "--dry-run" in args
     repair_vec_working = "--repair-vec-working" in args
-    clean_args = [a for a in args if not a.startswith("--")]
 
     try:
         from mnemosyne.diagnose import run_diagnostics, auto_fix
@@ -291,9 +290,11 @@ def cmd_diagnose(args):
             print("\n--- Auto-fix ---")
             fix_result = auto_fix(result.get("entries", []), dry_run=dry_run)
             if fix_result["fixed"]:
-                label = "Would fix" if dry_run else "Fixed"
                 for item in fix_result["fixed"]:
-                    print(f"  ✅ {item}")
+                    if dry_run:
+                        print(f"  ✅ {item}")
+                    else:
+                        print(f"  ✅ Fixed: {item}")
             if fix_result["failed"]:
                 for item in fix_result["failed"]:
                     print(f"  ❌ {item['label']}: {item['error']}")
