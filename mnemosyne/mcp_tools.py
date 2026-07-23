@@ -28,7 +28,7 @@ except ImportError:
     ErrorData = None
 
 from mnemosyne.core.memory import Mnemosyne
-from mnemosyne.core.beam import BeamMemory
+from mnemosyne.core.beam import BeamMemory, _guarded_transaction
 
 from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
 from mnemosyne.batch_tool import (
@@ -510,52 +510,52 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
     prev_content = existing[2]
 
     try:
-        if action == "delete":
-            # Cascade delete child rows before removing parent
-            conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
-            conn.execute("DELETE FROM annotations WHERE memory_id = ?", (memory_id,))
-            # vec_working is optional (sqlite-vec may be unavailable)
-            row = conn.execute("SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)).fetchone()
-            if row is not None:
-                try:
-                    conn.execute("DELETE FROM vec_working WHERE rowid = ?", (row["rowid"],))
-                except sqlite3.OperationalError as vec_err:
-                    if "no such table" not in str(vec_err).lower():
-                        raise
-            conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
-        elif action == "update":
+        with _guarded_transaction(conn):
+            if action == "delete":
+                # Cascade delete child rows before removing parent.
+                conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+                conn.execute("DELETE FROM annotations WHERE memory_id = ?", (memory_id,))
+                # vec_working is optional (sqlite-vec may be unavailable).
+                row = conn.execute("SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)).fetchone()
+                if row is not None:
+                    try:
+                        conn.execute("DELETE FROM vec_working WHERE rowid = ?", (row["rowid"],))
+                    except sqlite3.OperationalError as vec_err:
+                        if "no such table" not in str(vec_err).lower():
+                            raise
+                conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
+            elif action == "update":
+                conn.execute(
+                    "UPDATE working_memory SET content = ?, validator = ?, "
+                    "validated_at = CURRENT_TIMESTAMP, "
+                    "validation_count = COALESCE(validation_count, 0) + 1 "
+                    "WHERE id = ?",
+                    (new_content, validator, memory_id),
+                )
+            elif action == "invalidate":
+                conn.execute(
+                    "UPDATE working_memory SET valid_until = CURRENT_TIMESTAMP, "
+                    "validator = ?, validated_at = CURRENT_TIMESTAMP, "
+                    "validation_count = COALESCE(validation_count, 0) + 1 "
+                    "WHERE id = ?",
+                    (validator, memory_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE working_memory SET validator = ?, "
+                    "validated_at = CURRENT_TIMESTAMP, "
+                    "validation_count = COALESCE(validation_count, 0) + 1 "
+                    "WHERE id = ?",
+                    (validator, memory_id),
+                )
             conn.execute(
-                "UPDATE working_memory SET content = ?, validator = ?, "
-                "validated_at = CURRENT_TIMESTAMP, "
-                "validation_count = COALESCE(validation_count, 0) + 1 "
-                "WHERE id = ?",
-                (new_content, validator, memory_id),
+                "INSERT INTO memory_validations "
+                "(memory_id, validator, action, new_content, note) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (memory_id, validator, action,
+                 new_content if action == "update" else None,
+                 note or None),
             )
-        elif action == "invalidate":
-            conn.execute(
-                "UPDATE working_memory SET valid_until = CURRENT_TIMESTAMP, "
-                "validator = ?, validated_at = CURRENT_TIMESTAMP, "
-                "validation_count = COALESCE(validation_count, 0) + 1 "
-                "WHERE id = ?",
-                (validator, memory_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE working_memory SET validator = ?, "
-                "validated_at = CURRENT_TIMESTAMP, "
-                "validation_count = COALESCE(validation_count, 0) + 1 "
-                "WHERE id = ?",
-                (validator, memory_id),
-            )
-        conn.execute(
-            "INSERT INTO memory_validations "
-            "(memory_id, validator, action, new_content, note) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (memory_id, validator, action,
-             new_content if action == "update" else None,
-             note or None),
-        )
-        conn.commit()
     except Exception as exc:
         return {"error": "validation_failed", "reason": str(exc), "memory_id": memory_id}
 
