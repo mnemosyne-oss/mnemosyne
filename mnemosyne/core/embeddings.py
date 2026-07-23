@@ -135,9 +135,13 @@ def _is_api_model(model_name: str) -> bool:
 def _get_embedding_dim(model_name: str) -> int:
     """Return the embedding dimension for a given model.
 
-    Supports English, Chinese, and multilingual embedding models.
-    Falls back to 384 (bge-small dimension) for unknown models.
-    Override with MNEMOSYNE_EMBEDDING_DIM env var for unsupported models.
+    Resolution order: an explicit MNEMOSYNE_EMBEDDING_DIM wins (and must be a
+    valid integer); otherwise a known model resolves via the table below; an
+    unknown model with no explicit dimension raises ValueError rather than
+    silently assuming 384 -- a vec0 table is dimensioned at creation, so a wrong
+    guess bakes the wrong dimension into a fresh database and corrupts vector
+    search. Embeddings-disabled invocations keep the 384 fallback (the dimension
+    is unused there).
     """
     dims = {
         # --- English BGE ---
@@ -176,14 +180,36 @@ def _get_embedding_dim(model_name: str) -> int:
         "jinaai/jina-embeddings-v2-base-zh": 768,
         "jinaai/jina-embeddings-v2-base-code": 768,
     }
-    # Check env override first
+    # Explicit override wins. An explicit-but-invalid value is a configuration
+    # error -- raise rather than silently fall through to a guess.
     env_dim = os.environ.get("MNEMOSYNE_EMBEDDING_DIM")
     if env_dim is not None:
         try:
             return int(env_dim)
         except (ValueError, TypeError):
-            pass
-    return dims.get(model_name, 384)
+            raise ValueError(
+                f"MNEMOSYNE_EMBEDDING_DIM={env_dim!r} is not a valid integer; "
+                f"set it to the embedding model's output dimension."
+            )
+    if model_name in dims:
+        return dims[model_name]
+    # Unknown model with no explicit dimension. Silently assuming 384 (bge-small's
+    # dimension) bakes the wrong dimension into a fresh vec0 table and corrupts
+    # every insert/recall when the model's true dimension differs -- the root
+    # cause behind the recurring per-model additions to this table. Refuse to
+    # guess and point at the override.
+    if _is_disabled():
+        # Embeddings turned off (CI / opt-out): the dimension is unused, so keep
+        # the 384 fallback rather than failing an unused code path.
+        return 384
+    raise ValueError(
+        f"Unknown embedding model {model_name!r}: not in the built-in dimension "
+        f"table and MNEMOSYNE_EMBEDDING_DIM is unset. A vec0 table is dimensioned "
+        f"at creation, so silently assuming 384 would bake in the wrong dimension "
+        f"and corrupt vector search. Set MNEMOSYNE_EMBEDDING_DIM=<N> to the "
+        f"model's output dimension (e.g. 1024 for mxbai-embed-large), or add the "
+        f"model to the table in _get_embedding_dim()."
+    )
 
 
 def _embedding_threads() -> int:

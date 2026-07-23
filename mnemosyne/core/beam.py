@@ -257,18 +257,12 @@ def _default_db_path() -> Path:
     """Return the current default DB path, honoring runtime env changes."""
     return _default_data_dir() / "mnemosyne.db"
 
-# Config
-# Priority: 1) MNEMOSYNE_EMBEDDING_DIM env var (explicit override)
-#           2) Auto-derive from embedding model via _embeddings module
-#           3) 384 (bge-small-en-v1.5 default)
-_emb_dim_env = os.environ.get("MNEMOSYNE_EMBEDDING_DIM")
-if _emb_dim_env is not None:
-    try:
-        EMBEDDING_DIM = int(_emb_dim_env)
-    except (ValueError, TypeError):
-        EMBEDDING_DIM = 384
-else:
-    EMBEDDING_DIM = _embeddings.EMBEDDING_DIM
+# Config — the embedding dimension has ONE authoritative resolver:
+# mnemosyne.core.embeddings._get_embedding_dim (honors MNEMOSYNE_EMBEDDING_DIM,
+# the known-model table, and raises on an unknown model with no explicit
+# dimension instead of silently assuming 384). Beam must not re-derive it;
+# delegating keeps a single source of truth so the two cannot drift apart.
+EMBEDDING_DIM = _embeddings.EMBEDDING_DIM
 WORKING_MEMORY_MAX_ITEMS = int(os.environ.get("MNEMOSYNE_WM_MAX_ITEMS", "10000"))
 WORKING_MEMORY_TTL_HOURS = int(os.environ.get("MNEMOSYNE_WM_TTL_HOURS", "168"))
 WM_BUMP_CAP_HOURS = int(os.environ.get("MNEMOSYNE_WM_BUMP_CAP_HOURS", "24"))

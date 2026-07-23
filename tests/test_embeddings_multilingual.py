@@ -1,6 +1,8 @@
 """Tests for embedding multilingual model dimension detection and API model routing."""
 import os
 
+import pytest
+
 from mnemosyne.core import embeddings
 
 
@@ -67,10 +69,32 @@ def test_get_embedding_dim_env_override():
         del os.environ["MNEMOSYNE_EMBEDDING_DIM"]
 
 
-def test_get_embedding_dim_unknown_model_fallback():
-    """Unknown models fall back to 384 (bge-small default)."""
+def test_get_embedding_dim_unknown_model_raises(monkeypatch):
+    """An unlisted model with no MNEMOSYNE_EMBEDDING_DIM override raises instead
+    of silently assuming 384 (which corrupts vector search when the model's true
+    dimension differs)."""
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_DIM", raising=False)
+    for k in ("MNEMOSYNE_NO_EMBEDDINGS", "MNEMOSYNE_SKIP_EMBEDDINGS", "MNEMOSYNE_EMBEDDINGS_OFF"):
+        monkeypatch.delenv(k, raising=False)
+    with pytest.raises(ValueError):
+        embeddings._get_embedding_dim("some/unknown-model")
+    with pytest.raises(ValueError):
+        embeddings._get_embedding_dim("")
+
+
+def test_get_embedding_dim_unknown_model_disabled_falls_back(monkeypatch):
+    """With embeddings disabled, the dimension is unused — keep the 384 fallback
+    so CI/opt-out invocations still import cleanly."""
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_DIM", raising=False)
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     assert embeddings._get_embedding_dim("some/unknown-model") == 384
-    assert embeddings._get_embedding_dim("") == 384
+
+
+def test_get_embedding_dim_invalid_explicit_raises(monkeypatch):
+    """An explicit but non-integer MNEMOSYNE_EMBEDDING_DIM is a config error."""
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_DIM", "not-a-number")
+    with pytest.raises(ValueError):
+        embeddings._get_embedding_dim("some/unknown-model")
 
 
 def test_get_embedding_dim_openai_models():
