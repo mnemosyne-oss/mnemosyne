@@ -384,7 +384,7 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, 
     return summary
 
 
-def auto_fix(entries: list[dict] = None, dry_run: bool = False) -> dict:
+def auto_fix(entries: list[dict] | None = None, dry_run: bool = False) -> dict:
     """
     Auto-install missing dependencies detected by diagnostics.
 

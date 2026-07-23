@@ -83,74 +83,77 @@ ENV_VAR_MAP: dict[str, str] = {
     "fts_weight": "MNEMOSYNE_FTS_WEIGHT",
     "importance_weight": "MNEMOSYNE_IMPORTANCE_WEIGHT",
     "temporal_halflife_hours": "MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS",
-    # LLM / consolidation
+    "recency_halflife": "MNEMOSYNE_RECENCY_HALFLIFE",
+    "recall_extra_stopwords": "MNEMOSYNE_RECALL_EXTRA_STOPWORDS",
+    "cross_session": "MNEMOSYNE_CROSS_SESSION",
+    "polyphonic_recall": "MNEMOSYNE_POLYPHONIC_RECALL",
+    "query_intent": "MNEMOSYNE_QUERY_INTENT",
+    "fact_recall_enabled": "MNEMOSYNE_FACT_RECALL_ENABLED",
+    "enhanced_recall": "MNEMOSYNE_ENHANCED_RECALL",
+    "proactive_linking": "MNEMOSYNE_PROACTIVE_LINKING",
+    "lenient_fact_match": "MNEMOSYNE_LENIENT_FACT_MATCH",
+    "recall_diagnostics": "MNEMOSYNE_RECALL_DIAGNOSTICS",
+    # Tiers
+    "wm_max_items": "MNEMOSYNE_WM_MAX_ITEMS",
+    "wm_ttl_hours": "MNEMOSYNE_WM_TTL_HOURS",
+    "wm_bump_cap_hours": "MNEMOSYNE_WM_BUMP_CAP_HOURS",
+    "wm_pinned_ids": "MNEMOSYNE_WM_PINNED_IDS",
+    "ep_limit": "MNEMOSYNE_EP_LIMIT",
+    "sleep_batch": "MNEMOSYNE_SLEEP_BATCH",
+    "sp_max": "MNEMOSYNE_SP_MAX",
+    "tier2_days": "MNEMOSYNE_TIER2_DAYS",
+    "tier3_days": "MNEMOSYNE_TIER3_DAYS",
+    "tier1_weight": "MNEMOSYNE_TIER1_WEIGHT",
+    "tier2_weight": "MNEMOSYNE_TIER2_WEIGHT",
+    "tier3_weight": "MNEMOSYNE_TIER3_WEIGHT",
+    # Compression
+    "smart_compress": "MNEMOSYNE_SMART_COMPRESS",
+    "tier3_max_chars": "MNEMOSYNE_TIER3_MAX_CHARS",
+    "degrade_batch": "MNEMOSYNE_DEGRADE_BATCH",
+    # LLM
+    "llm_enabled": "MNEMOSYNE_LLM_ENABLED",
+    "llm_max_tokens": "MNEMOSYNE_LLM_MAX_TOKENS",
+    "llm_n_threads": "MNEMOSYNE_LLM_N_THREADS",
+    "llm_n_ctx": "MNEMOSYNE_LLM_N_CTX",
     "llm_repo": "MNEMOSYNE_LLM_REPO",
     "llm_file": "MNEMOSYNE_LLM_FILE",
-    "llm_ctx": "MNEMOSYNE_LLM_CTX",
-    "llm_threads": "MNEMOSYNE_LLM_THREADS",
-    "llm_batch": "MNEMOSYNE_LLM_BATCH",
-    "llm_temp": "MNEMOSYNE_LLM_TEMP",
-    "llm_top_p": "MNEMOSYNE_LLM_TOP_P",
-    "llm_top_k": "MNEMOSYNE_LLM_TOP_K",
-    "llm_repeat_penalty": "MNEMOSYNE_LLM_REPEAT_PENALTY",
-    "llm_n_gpu_layers": "MNEMOSYNE_LLM_N_GPU_LAYERS",
-    "llm_offload_kqv": "MNEMOSYNE_LLM_OFFLOAD_KQV",
-    "llm_flash_attn": "MNEMOSYNE_LLM_FLASH_ATTN",
-    "llm_mmap": "MNEMOSYNE_LLM_MMAP",
-    "llm_split_mode": "MNEMOSYNE_LLM_SPLIT_MODE",
-    "llm_main_gpu": "MNEMOSYNE_LLM_MAIN_GPU",
-    "llm_use_mlock": "MNEMOSYNE_LLM_USE_MLOCK",
-    "llm_mmap_disable": "MNEMOSYNE_LLM_MMAP_DISABLE",
-    "llm_extra_args": "MNEMOSYNE_LLM_EXTRA_ARGS",
-    "llm_enabled": "MNEMOSYNE_LLM_ENABLED",
     "llm_base_url": "MNEMOSYNE_LLM_BASE_URL",
     "llm_api_key": "MNEMOSYNE_LLM_API_KEY",
     "llm_model": "MNEMOSYNE_LLM_MODEL",
-    "shmr_max_clusters": "MNEMOSYNE_SHMR_MAX_CLUSTERS",
-    "shmr_max_items_per_cluster": "MNEMOSYNE_SHMR_MAX_ITEMS_PER_CLUSTER",
-    "shmr_prompt_template": "MNEMOSYNE_SHMR_PROMPT_TEMPLATE",
-    "shmr_min_cluster_size": "MNEMOSYNE_SHMR_MIN_CLUSTER_SIZE",
-    "shmr_llm_timeout": "MNEMOSYNE_SHMR_LLM_TIMEOUT",
-    # Working memory
-    "wm_max_items": "MNEMOSYNE_WM_MAX_ITEMS",
-    "wm_importance_floor": "MNEMOSYNE_WM_IMPORTANCE_FLOOR",
-    "wm_max_chars": "MNEMOSYNE_WM_MAX_CHARS",
-    "wm_dedup_enabled": "MNEMOSYNE_WM_DEDUP_ENABLED",
-    "wm_dedup_threshold": "MNEMOSYNE_WM_DEDUP_THRESHOLD",
-    "wm_dedup_window": "MNEMOSYNE_WM_DEDUP_WINDOW",
-    "wm_evict_policy": "MNEMOSYNE_WM_EVICT_POLICY",
-    "wm_promote_threshold": "MNEMOSYNE_WM_PROMOTE_THRESHOLD",
-    "wm_temporal_decay": "MNEMOSYNE_WM_TEMPORAL_DECAY",
-    # Episodic
-    "ep_gist_model": "MNEMOSYNE_EP_GIST_MODEL",
-    "ep_gist_prompt": "MNEMOSYNE_EP_GIST_PROMPT",
-    "ep_gist_max_chars": "MNEMOSYNE_EP_GIST_MAX_CHARS",
-    "ep_gist_min_chars": "MNEMOSYNE_EP_GIST_MIN_CHARS",
-    "ep_embedding_batch": "MNEMOSYNE_EP_EMBEDDING_BATCH",
-    "ep_gist_interval": "MNEMOSYNE_EP_GIST_INTERVAL",
-    "ep_max_gists_per_session": "MNEMOSYNE_EP_MAX_GISTS_PER_SESSION",
-    # Memory consolidation
-    "sleep_interval": "MNEMOSYNE_SLEEP_INTERVAL",
-    "sleep_max_age": "MNEMOSYNE_SLEEP_MAX_age",
-    "sleep_min_items": "MNEMOSYNE_SLEEP_MIN_ITEMS",
-    "sleep_force": "MNEMOSYNE_SLEEP_FORCE",
-    # Hybrid recall
-    "binary_bonus": "MNEMOSYNE_BINARY_BONUS",
-    "binary_threshold": "MNEMOSYNE_BINARY_THRESHOLD",
-    "binary_bonus_weight": "MNEMOSYNE_BINARY_BONUS_WEIGHT",
+    "llm_timeout": "MNEMOSYNE_LLM_TIMEOUT",
+    "force_local": "MNEMOSYNE_FORCE_LOCAL",
+    "host_llm_enabled": "MNEMOSYNE_HOST_LLM_ENABLED",
+    "host_llm_n_ctx": "MNEMOSYNE_HOST_LLM_N_CTX",
+    "llm_conflict_detection": "MNEMOSYNE_LLM_CONFLICT_DETECTION",
     # Sync
+    "sync_encrypt": "MNEMOSYNE_SYNC_ENCRYPT",
     "sync_roles": "MNEMOSYNE_SYNC_ROLES",
+    # Provider
+    "auto_sleep_enabled": "MNEMOSYNE_AUTO_SLEEP_ENABLED",
+    "reflect_disabled_for_cron": "MNEMOSYNE_REFLECT_DISABLED_FOR_CRON",
+    "reflect_max_calls_per_session": "MNEMOSYNE_REFLECT_MAX_CALLS_PER_SESSION",
     "skip_contexts": "MNEMOSYNE_SKIP_CONTEXTS",
-    "sync_remote": "MNEMOSYNE_SYNC_REMOTE",
-    "sync_port": "MNEMOSYNE_SYNC_PORT",
-    "sync_host": "MNEMOSYNE_SYNC_HOST",
-    # Authentication
-    "author_id": "MNEMOSYNE_AUTHOR_ID",
-    "author_type": "MNEMOSYNE_AUTHOR_TYPE",
-    "channel_id": "MNEMOSYNE_CHANNEL_ID",
-    "mcp_bank": "MNEMOSYNE_MCP_BANK",
-    "default_owner": "MNEMOSYNE_DEFAULT_OWNER",
-    # Default scope for remember()
+    "prefetch_content_chars": "MNEMOSYNE_PREFETCH_CONTENT_CHARS",
+    "sync_turn_user_limit": "MNEMOSYNE_SYNC_TURN_USER_LIMIT",
+    "sync_turn_assistant_limit": "MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT",
+    # Persona
+    "persona_enabled": "MNEMOSYNE_PERSONA_ENABLED",
+    "persona_token_cap": "MNEMOSYNE_PERSONA_TOKEN_CAP",
+    "persona_interval": "MNEMOSYNE_PERSONA_INTERVAL",
+    "persona_daily_sync_hour": "MNEMOSYNE_PERSONA_DAILY_SYNC_HOUR",
+    # Model refresh
+    "sleep_model_refresh_enabled": "MNEMOSYNE_SLEEP_MODEL_REFRESH_ENABLED",
+    "sleep_model_refresh_auto_apply": "MNEMOSYNE_SLEEP_MODEL_REFRESH_AUTO_APPLY",
+    # SHMR
+    "shmr_batch_size": "MNEMOSYNE_SHMR_BATCH_SIZE",
+    "shmr_max_iterations": "MNEMOSYNE_SHMR_MAX_ITERATIONS",
+    "shmr_similarity_threshold": "MNEMOSYNE_SHMR_SIMILARITY_THRESHOLD",
+    "shmr_harmony_threshold": "MNEMOSYNE_SHMR_HARMONY_THRESHOLD",
+    "shmr_min_cluster_size": "MNEMOSYNE_SHMR_MIN_CLUSTER_SIZE",
+    "shmr_temperature": "MNEMOSYNE_SHMR_TEMPERATURE",
+    # Migrations
+    "auto_migrate": "MNEMOSYNE_AUTO_MIGRATE",
+    # MCP
     "default_scope": "MNEMOSYNE_DEFAULT_SCOPE",
     # Filters
     "ignore_patterns": "MNEMOSYNE_IGNORE_PATTERNS",
@@ -184,74 +187,77 @@ DEFAULTS: dict[str, Any] = {
     "fts_weight": 0.3,
     "importance_weight": 0.2,
     "temporal_halflife_hours": 24.0,
-    # LLM / consolidation
-    "llm_repo": None,
-    "llm_file": None,
-    "llm_ctx": 4096,
-    "llm_threads": 4,
-    "llm_batch": 512,
-    "llm_temp": 0.3,
-    "llm_top_p": 0.95,
-    "llm_top_k": 40,
-    "llm_repeat_penalty": 1.1,
-    "llm_n_gpu_layers": -1,
-    "llm_offload_kqv": True,
-    "llm_flash_attn": True,
-    "llm_mmap": True,
-    "llm_split_mode": "none",
-    "llm_main_gpu": 0,
-    "llm_use_mlock": True,
-    "llm_mmap_disable": False,
-    "llm_extra_args": "",
-    "llm_enabled": True,
-    "llm_base_url": "http://localhost:11434/v1",
-    "llm_api_key": "",
-    "llm_model": "nemotron-3-ultra",
-    "shmr_max_clusters": 8,
-    "shmr_max_items_per_cluster": 25,
-    "shmr_prompt_template": "",
-    "shmr_min_cluster_size": 2,
-    "shmr_llm_timeout": 30.0,
-    # Working memory
+    "recency_halflife": 168,
+    "recall_extra_stopwords": "",
+    "cross_session": False,
+    "polyphonic_recall": False,
+    "query_intent": True,
+    "fact_recall_enabled": True,
+    "enhanced_recall": False,
+    "proactive_linking": True,
+    "lenient_fact_match": False,
+    "recall_diagnostics": False,
+    # Tiers
     "wm_max_items": 10000,
-    "wm_importance_floor": 0.05,
-    "wm_max_chars": 12000,
-    "wm_dedup_enabled": True,
-    "wm_dedup_threshold": 0.95,
-    "wm_dedup_window": 2000,
-    "wm_evict_policy": "importance",
-    "wm_promote_threshold": 0.7,
-    "wm_temporal_decay": 0.01,
-    # Episodic
-    "ep_gist_model": "",
-    "ep_gist_prompt": "",
-    "ep_gist_max_chars": 500,
-    "ep_gist_min_chars": 50,
-    "ep_embedding_batch": 32,
-    "ep_gist_interval": 300,
-    "ep_max_gists_per_session": 50,
-    # Memory consolidation
-    "sleep_interval": 3600,
-    "sleep_max_age": 86400,
-    "sleep_min_items": 5,
-    "sleep_force": False,
-    # Hybrid recall
-    "binary_bonus": True,
-    "binary_threshold": 0.25,
-    "binary_bonus_weight": 1.0,
+    "wm_ttl_hours": 168,
+    "wm_bump_cap_hours": 24,
+    "wm_pinned_ids": "",
+    "ep_limit": 50000,
+    "sleep_batch": 5000,
+    "sp_max": 1000,
+    "tier2_days": 30,
+    "tier3_days": 180,
+    "tier1_weight": 1.0,
+    "tier2_weight": 0.5,
+    "tier3_weight": 0.25,
+    # Compression
+    "smart_compress": True,
+    "tier3_max_chars": 300,
+    "degrade_batch": 100,
+    # LLM
+    "llm_enabled": False,
+    "llm_max_tokens": 512,
+    "llm_n_threads": 4,
+    "llm_n_ctx": 2048,
+    "llm_repo": "",
+    "llm_file": "",
+    "llm_base_url": "",
+    "llm_api_key": "",
+    "llm_model": "",
+    "llm_timeout": 60,
+    "force_local": False,
+    "host_llm_enabled": False,
+    "host_llm_n_ctx": 2048,
+    "llm_conflict_detection": False,
     # Sync
-    "sync_roles": "user,assistant",
-    "skip_contexts": "",
-    "sync_remote": None,
-    "sync_port": 8080,
-    "sync_host": "0.0.0.0",
-    # Authentication
-    "author_id": None,
-    "author_type": None,
-    "channel_id": None,
-    "mcp_bank": "default",
-    "default_owner": None,
-    # Default scope for remember()
+    "sync_encrypt": False,
+    "sync_roles": "user",
+    # Provider
+    "auto_sleep_enabled": True,
+    "reflect_disabled_for_cron": True,
+    "reflect_max_calls_per_session": 3,
+    "skip_contexts": "cron,flush,subagent,background,skill_loop",
+    "prefetch_content_chars": 2000,
+    "sync_turn_user_limit": 10,
+    "sync_turn_assistant_limit": 10,
+    # Persona
+    "persona_enabled": True,
+    "persona_token_cap": 500,
+    "persona_interval": 10,
+    "persona_daily_sync_hour": 3,
+    # Model refresh
+    "sleep_model_refresh_enabled": True,
+    "sleep_model_refresh_auto_apply": True,
+    # SHMR
+    "shmr_batch_size": 50,
+    "shmr_max_iterations": 10,
+    "shmr_similarity_threshold": 0.7,
+    "shmr_harmony_threshold": 0.5,
+    "shmr_min_cluster_size": 3,
+    "shmr_temperature": 0.3,
+    # Migrations
+    "auto_migrate": True,
+    # MCP
     "default_scope": "session",
     # Filters
     "ignore_patterns": "",
@@ -290,7 +296,7 @@ class MnemosyneConfig:
         self._config_path = config_path or _default_config_path()
         self._yaml_cache: dict[str, Any] = {}
         self._yaml_mtime: float = 0.0
-        self._yaml_lock = threading.Lock()
+        self._yaml_lock = threading.RLock()
 
         # Auto-seed config.yaml on first access if it doesn't exist
         if not self._config_path.exists():
@@ -522,6 +528,10 @@ class MnemosyneConfig:
         val = self.get(key, default)
         return str(val) if val is not None else ""
 
+    def resolve_beam_runtime(self) -> BeamRuntimeConfig:
+        """Resolve Beam's hot-reloadable runtime settings with typed values."""
+        return BeamRuntimeConfig(cross_session=self.get_bool("cross_session", False))
+
     def set(self, key: str, value: Any) -> None:
         """Set a config key in YAML (persisted to disk)."""
         with self._yaml_lock:
@@ -539,29 +549,48 @@ class MnemosyneConfig:
     def _write_yaml(self) -> None:
         """Write the current YAML cache to disk."""
         import yaml
+        
+        # Rebuild nested structure from flattened cache to avoid duplicate keys
+        def unflatten(flat: dict[str, Any]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in sorted(flat.items()):
+                parts = key.split('.')
+                current = result
+                for i, part in enumerate(parts[:-1]):
+                    if part not in current or not isinstance(current[part], dict):
+                        current[part] = {}
+                    current = current[part]
+                current[parts[-1]] = value
+            return result
+        
+        nested = unflatten(self._yaml_cache)
+        
         with open(self._config_path, "w") as f:
             f.write("# Mnemosyne config — edit freely, hot-reload with `mnemosyne config reload`\n")
             f.write("# Precedence: config.yaml > env vars > hardcoded defaults\n\n")
-            yaml.dump(self._yaml_cache, f, default_flow_style=False, sort_keys=True)
+            yaml.dump(nested, f, default_flow_style=False, sort_keys=True)
         self._yaml_mtime = self._config_path.stat().st_mtime
 
     def reload(self) -> set[str]:
         """Reload config from disk. Returns set of changed keys."""
         with self._yaml_lock:
-            old_keys = set(self._yaml_cache.keys())
+            old_cache = dict(self._yaml_cache)
             self._load_yaml()
-            new_keys = set(self._yaml_cache.keys())
-            return old_keys.symmetric_difference(new_keys)
+            new_cache = self._yaml_cache
+            all_keys = set(old_cache) | set(new_cache)
+            return {k for k in all_keys if old_cache.get(k) != new_cache.get(k)}
 
     def migrate_from_env(self) -> list[str]:
         """Migrate all known env vars to config.yaml.
         Returns list of keys that were set."""
-        migrated: list[str] = []
-        for key, env_var in ENV_VAR_MAP.items():
-            if env_var in os.environ:
-                self.set(key, os.environ[env_var])
-                migrated.append(key)
-        return migrated
+        updates = {
+            key: os.environ[env_var]
+            for key, env_var in ENV_VAR_MAP.items()
+            if env_var in os.environ
+        }
+        if updates:
+            self.set_many(updates)
+        return list(updates)
 
     def all_keys(self) -> list[str]:
         """Return all known config keys (from schema + YAML + env)."""
@@ -595,3 +624,8 @@ def reload() -> set[str]:
     """Reload the singleton config from disk. Returns changed keys."""
     config = get_config()
     return config.reload()
+
+
+def resolve_beam_runtime() -> BeamRuntimeConfig:
+    """Resolve the typed, hot-reloadable Beam runtime settings."""
+    return get_config().resolve_beam_runtime()
