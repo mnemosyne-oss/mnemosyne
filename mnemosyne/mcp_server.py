@@ -311,6 +311,8 @@ def _load_dotenv(env_file_path: Optional[str] = None) -> Optional[str]:
                 break
             except Exception as exc:
                 logger.warning("Failed to parse env file %s: %s", p, exc)
+                if env_file_path and p == Path(env_file_path).expanduser():
+                    return None
     return loaded_path
 
 
