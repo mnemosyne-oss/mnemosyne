@@ -1362,6 +1362,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._agent_context = "primary"
         self._turn_count = 0
         self._sync_turn_lock = threading.Lock()
+        # Serialize all Beam/SQLite access between the main thread and the
+        # auto_sleep daemon thread.  Without this, concurrent connections to
+        # the same WAL database can trigger a NULL-pointer SEGV in
+        # sqlite3_clear_bindings when a checkpoint invalidates an active
+        # statement on the other connection (#498).
+        self._beam_access_lock = threading.Lock()
         self._sync_turn_telemetry: Dict[str, Any] = {
             "pending_queue_length": 0,
             "max_queue_length": 0,
@@ -2201,7 +2207,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # sessions) should never bypass session scoping.
             if author_id:
                 recall_kwargs["author_id"] = author_id
-            results = self._beam.recall(**recall_kwargs)
+            with self._beam_access_lock:
+                results = self._beam.recall(**recall_kwargs)
             if not results:
                 return ""
             # Filter out low-relevance results to prevent context pollution.
@@ -2304,27 +2311,28 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 in_flight,
             )
         try:
-            if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
-                user_limit = _sync_turn_user_limit()
-                uc = user_content[:user_limit] if user_limit > 0 else user_content
-                self._beam.remember(
-                    content=f"[USER] {uc}",
-                    source="conversation",
-                    importance=0.5,
-                    scope=self._default_scope,
-                    extract_entities=True,
-                )
-                self._capture_identity_signals(user_content)
-            if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
-                assistant_limit = _sync_turn_assistant_limit()
-                ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
-                self._beam.remember(
-                    content=f"[ASSISTANT] {ac}",
-                    source="conversation",
-                    importance=0.15,
-                    scope=self._default_scope,
-                    extract_entities=True,
-                )
+            with self._beam_access_lock:
+                if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
+                    user_limit = _sync_turn_user_limit()
+                    uc = user_content[:user_limit] if user_limit > 0 else user_content
+                    self._beam.remember(
+                        content=f"[USER] {uc}",
+                        source="conversation",
+                        importance=0.5,
+                        scope=self._default_scope,
+                        extract_entities=True,
+                    )
+                    self._capture_identity_signals(user_content)
+                if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
+                    assistant_limit = _sync_turn_assistant_limit()
+                    ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
+                    self._beam.remember(
+                        content=f"[ASSISTANT] {ac}",
+                        source="conversation",
+                        importance=0.15,
+                        scope=self._default_scope,
+                        extract_entities=True,
+                    )
             self._turn_count += 1
             if self._auto_sleep_enabled and self._turn_count % 10 == 0:
                 self._maybe_auto_sleep()
@@ -2415,6 +2423,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 # main thread's sync_turn() writes, causing episodic INSERT
                 # failures (commit rolled back by concurrent main-thread writes).
                 beam_ref = self._beam
+                beam_lock = self._beam_access_lock
                 def _sleep_isolated():
                     try:
                         BeamClass = _get_beam_class()
@@ -2425,7 +2434,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             author_type=beam_ref.author_type,
                             channel_id=beam_ref.channel_id,
                         )
-                        sleep_beam.sleep()
+                        with beam_lock:
+                            sleep_beam.sleep()
                     except Exception as inner:
                         logger.debug("Mnemosyne auto-sleep worker failed: %s", inner)
                 sleep_thread = threading.Thread(target=_sleep_isolated, daemon=True)
