@@ -178,7 +178,7 @@ def test_optional_sqlite_vec_load_disables_extensions_after_success(monkeypatch)
     fake_sqlite_vec = types.SimpleNamespace(load=lambda _conn: calls.append("load"))
 
     class TrackingConnection:
-        def enable_load_extension(self, enabled):
+        def enable_load_extension(self, enabled) -> None:
             calls.append(enabled)
 
     monkeypatch.setitem(sys.modules, "sqlite_vec", fake_sqlite_vec)
@@ -192,7 +192,7 @@ def test_optional_sqlite_vec_load_fails_closed_when_disable_fails(monkeypatch):
     fake_sqlite_vec = types.SimpleNamespace(load=lambda _conn: calls.append("load"))
 
     class DisableFailingConnection:
-        def enable_load_extension(self, enabled):
+        def enable_load_extension(self, enabled) -> None:
             calls.append(enabled)
             if not enabled:
                 raise sqlite3.OperationalError("disable failed")
@@ -202,6 +202,37 @@ def test_optional_sqlite_vec_load_fails_closed_when_disable_fails(monkeypatch):
     with pytest.raises(doctor._SQLiteVecExtensionDisableError):
         doctor._load_optional_sqlite_vec(cast(sqlite3.Connection, DisableFailingConnection()))
     assert calls == [True, "load", False]
+
+
+def test_optional_sqlite_vec_load_falls_back_when_enabling_extensions_is_unsupported(monkeypatch):
+    calls: list[bool] = []
+    fake_sqlite_vec = types.SimpleNamespace(load=lambda _conn: pytest.fail("load should not run"))
+
+    class UnsupportedConnection:
+        def enable_load_extension(self, enabled) -> None:
+            calls.append(enabled)
+            raise sqlite3.OperationalError("extension loading unsupported")
+
+    monkeypatch.setitem(sys.modules, "sqlite_vec", fake_sqlite_vec)
+
+    assert doctor._load_optional_sqlite_vec(cast(sqlite3.Connection, UnsupportedConnection())) is False
+    assert calls == [True]
+
+
+def test_optional_sqlite_vec_load_fails_closed_when_load_and_disable_fail(monkeypatch):
+    fake_sqlite_vec = types.SimpleNamespace(
+        load=lambda _conn: (_ for _ in ()).throw(sqlite3.OperationalError("load failed"))
+    )
+
+    class LoadAndDisableFailingConnection:
+        def enable_load_extension(self, enabled) -> None:
+            if not enabled:
+                raise sqlite3.OperationalError("disable failed")
+
+    monkeypatch.setitem(sys.modules, "sqlite_vec", fake_sqlite_vec)
+
+    with pytest.raises(doctor._SQLiteVecExtensionDisableError):
+        doctor._load_optional_sqlite_vec(cast(sqlite3.Connection, LoadAndDisableFailingConnection()))
 
 
 def test_build_doctor_report_fails_closed_when_extensions_cannot_be_disabled(tmp_path, monkeypatch):
@@ -218,6 +249,7 @@ def test_build_doctor_report_fails_closed_when_extensions_cannot_be_disabled(tmp
     assert report.sqlite_health["status"] == "unavailable"
     assert report.reference_contracts["status"] == "unavailable"
     assert report.vector_coverage["status"] == "unavailable"
+    assert report.hygiene_summary["status"] == "unavailable"
 
 
 def test_build_doctor_report_uses_optional_sqlite_vec_for_real_vec0_tables(tmp_path):
@@ -235,7 +267,11 @@ def test_build_doctor_report_uses_optional_sqlite_vec_for_real_vec0_tables(tmp_p
 
     report = build_doctor_report("work", db_path)
 
-    vec_table = next(table for table in report.schema_fingerprint.tables if table.name == "vec_working")
+    vec_table = next(
+        (table for table in report.schema_fingerprint.tables if table.name == "vec_working"),
+        None,
+    )
+    assert vec_table is not None
     assert vec_table.status == STATUS_OK
     assert report.sqlite_health["vec0"]["status"] == "available"
     assert not any(finding.code == "sqlite.vec0_capability" for finding in report.findings)

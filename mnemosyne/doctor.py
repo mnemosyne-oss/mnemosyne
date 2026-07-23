@@ -226,18 +226,21 @@ def _load_optional_sqlite_vec(conn: sqlite3.Connection) -> bool:
     ``present_but_unloadable`` capability report remains the safe fallback.
     """
 
+    extension_loading_enabled = False
     try:
         import sqlite_vec
 
         conn.enable_load_extension(True)
+        extension_loading_enabled = True
         sqlite_vec.load(conn)
     except Exception:
         return False
     finally:
-        try:
-            conn.enable_load_extension(False)
-        except Exception as error:
-            raise _SQLiteVecExtensionDisableError from error
+        if extension_loading_enabled:
+            try:
+                conn.enable_load_extension(False)
+            except Exception as error:
+                raise _SQLiteVecExtensionDisableError from error
     return True
 
 
