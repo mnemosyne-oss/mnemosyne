@@ -64,24 +64,31 @@ _FASTEMBED_CACHE_DIR = os.environ.get(
 # --- OpenAI-compatible API ---
 # Mnemosyne embedding config is independent of general OpenRouter/OpenAI settings.
 # Embedding models may use local llama.cpp, OpenAI, Anthropic, or any other provider.
+def _get_config_safe():
+    """Access get_config() without side-effect creation of config.yaml if it does not exist on disk."""
+    from mnemosyne.core.config import _default_config_path, get_config, MnemosyneConfig
+    if MnemosyneConfig._instance is not None or _default_config_path().exists():
+        return get_config()
+    return None
+
 def _get_api_key() -> str:
-    env_key = os.environ.get("MNEMOSYNE_EMBEDDING_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+    env_key = os.environ.get("MNEMOSYNE_EMBEDDING_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
     if env_key:
         return env_key
-    from mnemosyne.core.config import get_config
-    return get_config().get_str("embedding_api_key", "")
+    cfg = _get_config_safe()
+    return cfg.get_str("embedding_api_key", "") if cfg else ""
 
 def _get_base_url() -> str:
     if "MNEMOSYNE_EMBEDDING_API_URL" in os.environ:
         return os.environ["MNEMOSYNE_EMBEDDING_API_URL"]
-    from mnemosyne.core.config import get_config
-    return get_config().get_str("embedding_api_url", "https://openrouter.ai/api/v1") or "https://openrouter.ai/api/v1"
+    cfg = _get_config_safe()
+    return cfg.get_str("embedding_api_url", "https://openrouter.ai/api/v1") if cfg else "https://openrouter.ai/api/v1"
 
 def _get_default_model() -> str:
     if "MNEMOSYNE_EMBEDDING_MODEL" in os.environ:
         return os.environ["MNEMOSYNE_EMBEDDING_MODEL"]
-    from mnemosyne.core.config import get_config
-    cfg_model = get_config().get_str("embedding_model")
+    cfg = _get_config_safe()
+    cfg_model = cfg.get_str("embedding_model") if cfg else ""
     if "pytest" in sys.modules and cfg_model and cfg_model.startswith(("gemini/", "openai/", "qwen/", "anthropic/")):
         return "BAAI/bge-small-en-v1.5"
     return cfg_model or "BAAI/bge-small-en-v1.5"
@@ -121,15 +128,15 @@ def _is_disabled() -> bool:
     """True when dense retrieval has been opted out via env var or config.yaml."""
     for var in ("MNEMOSYNE_NO_EMBEDDINGS", "MNEMOSYNE_SKIP_EMBEDDINGS", "MNEMOSYNE_EMBEDDINGS_OFF"):
         if var in os.environ:
-            if bool(os.environ[var]):
-                return True
-    from mnemosyne.core.config import get_config
-    cfg = get_config()
-    return bool(
-        cfg.get_bool("no_embeddings")
-        or cfg.get_bool("skip_embeddings")
-        or cfg.get_bool("embeddings_off")
-    )
+            return os.environ[var].strip().lower() in ("1", "true", "yes", "on")
+    cfg = _get_config_safe()
+    if cfg:
+        return bool(
+            cfg.get_bool("no_embeddings")
+            or cfg.get_bool("skip_embeddings")
+            or cfg.get_bool("embeddings_off")
+        )
+    return False
 
 
 def _is_api_model(model_name: str) -> bool:
@@ -143,14 +150,8 @@ def _is_api_model(model_name: str) -> bool:
         return bool(base_url and "openrouter.ai" not in base_url)
     if "pytest" in sys.modules and "MNEMOSYNE_EMBEDDINGS_VIA_API" not in os.environ and "MNEMOSYNE_EMBEDDING_API_URL" not in os.environ:
         return False
-    from mnemosyne.core.config import get_config
-    cfg = get_config()
-    if cfg.get_bool("embeddings_via_api"):
-        return True
-    base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL") or (cfg.get_str("embedding_api_url") if cfg.get_bool("embeddings_via_api") else "")
-    if base_url and "openrouter.ai" not in base_url:
-        return True
-    return False
+    cfg = _get_config_safe()
+    return cfg.get_bool("embeddings_via_api") if cfg else False
 
 
 def _get_embedding_dim(model_name: str) -> int:
@@ -209,9 +210,8 @@ def _get_embedding_dim(model_name: str) -> int:
         return dims[model_name]
 
     # 3. For custom/unknown models, check central config or default to 384
-    from mnemosyne.core.config import get_config
-    cfg = get_config()
-    cfg_dim = cfg.get_int("embedding_dim")
+    cfg = _get_config_safe()
+    cfg_dim = cfg.get_int("embedding_dim") if cfg else 0
     if "pytest" in sys.modules and "MNEMOSYNE_EMBEDDING_DIM" not in os.environ:
         if model_name == "custom-model":
             return cfg_dim if cfg_dim > 0 else 384
