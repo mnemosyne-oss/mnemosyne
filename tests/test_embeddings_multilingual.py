@@ -97,6 +97,15 @@ def test_get_embedding_dim_invalid_explicit_raises(monkeypatch):
         embeddings._get_embedding_dim("some/unknown-model")
 
 
+def test_get_embedding_dim_non_positive_explicit_raises(monkeypatch):
+    """MNEMOSYNE_EMBEDDING_DIM must be a positive integer; 0 and negatives are
+    not usable vector dimensions."""
+    for bad in ("0", "-1", "-384"):
+        monkeypatch.setenv("MNEMOSYNE_EMBEDDING_DIM", bad)
+        with pytest.raises(ValueError):
+            embeddings._get_embedding_dim("some/unknown-model")
+
+
 def test_get_embedding_dim_openai_models():
     """OpenAI API embedding models have correct dimensions."""
     assert embeddings._get_embedding_dim("openai/text-embedding-3-small") == 1536

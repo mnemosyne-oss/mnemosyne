@@ -185,12 +185,18 @@ def _get_embedding_dim(model_name: str) -> int:
     env_dim = os.environ.get("MNEMOSYNE_EMBEDDING_DIM")
     if env_dim is not None:
         try:
-            return int(env_dim)
+            value = int(env_dim)
         except (ValueError, TypeError):
             raise ValueError(
                 f"MNEMOSYNE_EMBEDDING_DIM={env_dim!r} is not a valid integer; "
                 f"set it to the embedding model's output dimension."
             )
+        if value <= 0:
+            raise ValueError(
+                f"MNEMOSYNE_EMBEDDING_DIM={value} must be a positive integer; "
+                f"vector dimensions are >= 1."
+            )
+        return value
     if model_name in dims:
         return dims[model_name]
     # Unknown model with no explicit dimension. Silently assuming 384 (bge-small's
