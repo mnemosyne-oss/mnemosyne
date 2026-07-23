@@ -5,12 +5,21 @@ import sqlite3
 from mnemosyne.core.beam import BeamMemory
 
 
+def _use_empty_config(tmp_path, monkeypatch):
+    """Keep env-fallback regressions independent of the developer's config."""
+    data_dir = tmp_path / "config-data"
+    data_dir.mkdir()
+    (data_dir / "config.yaml").write_text("")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+
+
 def _contents(results):
     return [r.get("content", "") for r in results]
 
 
 def test_cross_session_recall_does_not_bind_session_params_when_filter_disabled(tmp_path, monkeypatch):
     """MNEMOSYNE_CROSS_SESSION=1 should not leave stale bind params behind."""
+    _use_empty_config(tmp_path, monkeypatch)
     monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION", "1")
     db_path = tmp_path / "mnemosyne.db"
 
@@ -30,6 +39,7 @@ def test_cross_session_recall_does_not_bind_session_params_when_filter_disabled(
 
 def test_non_cross_session_recall_still_shows_only_session_and_global_scope(tmp_path, monkeypatch):
     """The issue #421 fix must preserve default session/global visibility."""
+    _use_empty_config(tmp_path, monkeypatch)
     monkeypatch.delenv("MNEMOSYNE_CROSS_SESSION", raising=False)
     db_path = tmp_path / "mnemosyne.db"
 

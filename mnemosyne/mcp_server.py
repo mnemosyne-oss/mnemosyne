@@ -30,6 +30,7 @@ import os
 import json
 import asyncio
 import logging
+from pathlib import Path
 from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -263,11 +264,64 @@ async def _run_sse(port: int = 8080, host: str = "127.0.0.1") -> None:
 # CLI Entry Point
 # ---------------------------------------------------------------------------
 
+def _load_dotenv(env_file_path: Optional[str] = None) -> Optional[str]:
+    """Auto-load .env file into os.environ for MCP server execution.
+
+    Search order:
+    1. Explicit env_file_path passed via --env-file
+    2. $HERMES_HOME/.env or ~/.hermes/.env
+    3. $MNEMOSYNE_HOME/.env or ~/.mnemosyne/.env
+    4. ./.env (current working directory)
+
+    Returns the path of the loaded .env file, or None if no file was loaded.
+    """
+    candidates = []
+    if env_file_path:
+        candidates.append(Path(env_file_path).expanduser())
+
+    hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+    candidates.append(Path(hermes_home) / ".env")
+
+    mnemosyne_home = os.environ.get("MNEMOSYNE_HOME", os.path.expanduser("~/.mnemosyne"))
+    candidates.append(Path(mnemosyne_home) / ".env")
+
+    try:
+        candidates.append(Path.cwd() / ".env")
+    except Exception:
+        pass
+
+    loaded_path = None
+    for p in candidates:
+        if p.is_file():
+            try:
+                for line in p.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("export "):
+                        line = line[7:].strip()
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+                loaded_path = str(p)
+                logger.info("Loaded MCP environment from %s", loaded_path)
+                break
+            except Exception as exc:
+                logger.warning("Failed to parse env file %s: %s", p, exc)
+                if env_file_path and p == Path(env_file_path).expanduser():
+                    return None
+    return loaded_path
+
+
 def run_mcp_server(
     transport: str = "stdio",
     port: int = 8080,
     bank: Optional[str] = None,
     host: str = "127.0.0.1",
+    env_file: Optional[str] = None,
 ) -> None:
     """
     Run the Mnemosyne MCP server.
@@ -278,7 +332,10 @@ def run_mcp_server(
         bank: Default bank for operations (optional)
         host: Bind address for SSE transport (default: 127.0.0.1 -- loopback
             only). Non-loopback hosts require MNEMOSYNE_MCP_TOKEN.
+        env_file: Path to optional .env file to load before starting.
     """
+    _load_dotenv(env_file)
+
     if bank:
         os.environ["MNEMOSYNE_MCP_BANK"] = bank
 
@@ -323,9 +380,24 @@ def main(argv: Optional[list[str]] = None) -> None:
         default=None,
         help="Default memory bank"
     )
+    parser.add_argument(
+        "--env-file",
+        type=str,
+        default=None,
+        help="Path to .env file to load before starting server"
+    )
     args = parser.parse_args(argv)
 
-    run_mcp_server(transport=args.transport, port=args.port, bank=args.bank, host=args.host)
+    kwargs = {
+        "transport": args.transport,
+        "port": args.port,
+        "bank": args.bank,
+        "host": args.host,
+    }
+    if args.env_file is not None:
+        kwargs["env_file"] = args.env_file
+
+    run_mcp_server(**kwargs)
 
 
 if __name__ == "__main__":

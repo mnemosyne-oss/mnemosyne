@@ -23,6 +23,8 @@ import hashlib
 import threading
 import math
 
+from mnemosyne.core.config import resolve_beam_runtime
+
 logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Any, Set, Union, Tuple, Callable
@@ -398,34 +400,29 @@ def _warn_about_veracity_weight_overrides(force: bool = False) -> bool:
 _warn_about_veracity_weight_overrides()
 
 
-# Cross-session recall toggle. When enabled via MNEMOSYNE_CROSS_SESSION=1,
-# the session filter (session_id = ? OR scope = 'global') is replaced with
-# (1=1), making all working and episodic memories visible across sessions.
-# Default off preserves backward compatibility.
-_CROSS_SESSION = os.environ.get("MNEMOSYNE_CROSS_SESSION", "0") == "1"
-
-
+# Cross-session recall toggle. The typed config resolver keeps the documented
+# config.yaml > env > default precedence and observes hot reloads.
 def _cross_session_enabled() -> bool:
     """Return whether session scoping should be disabled for recall."""
-    return _CROSS_SESSION or os.environ.get("MNEMOSYNE_CROSS_SESSION", "0") == "1"
+    return resolve_beam_runtime().cross_session
 
 
-def _session_scope_filter(extra_col: str = "") -> str:
-    """Return a WHERE clause for session scoping.
-
-    When cross-session recall is enabled, returns (1=1) to disable filtering.
-    Otherwise returns (session_id = ? OR scope = 'global'[ OR col = ?]).
-    """
-    if _cross_session_enabled():
+def _session_scope_filter(extra_col: str = "", *, cross_session: Optional[bool] = None) -> str:
+    """Return a WHERE clause for session scoping from one runtime snapshot."""
+    if cross_session is None:
+        cross_session = _cross_session_enabled()
+    if cross_session:
         return "(1=1)"
     if extra_col:
         return f"(session_id = ? OR scope = 'global' OR {extra_col} = ?)"
     return "(session_id = ? OR scope = 'global')"
 
 
-def _session_scope_params(session_id: str, extra_value=None) -> list:
-    """Return bind params matching _session_scope_filter()."""
-    if _cross_session_enabled():
+def _session_scope_params(session_id: str, extra_value=None, *, cross_session: Optional[bool] = None) -> list:
+    """Return bind params matching a scope filter from one runtime snapshot."""
+    if cross_session is None:
+        cross_session = _cross_session_enabled()
+    if cross_session:
         return []
     if extra_value is not None:
         return [session_id, extra_value]
@@ -5413,7 +5410,8 @@ class BeamMemory:
                vec_weight: float = None,
                fts_weight: float = None,
                importance_weight: float = None,
-               explain: bool = False) -> List[Dict]:
+               explain: bool = False,
+               _cross_session: Optional[bool] = None) -> List[Dict]:
         """
         Hybrid recall across working_memory + episodic_memory.
         Uses sqlite-vec + FTS5 for episodic, FTS5 for working.
@@ -5465,6 +5463,8 @@ class BeamMemory:
             Flag unset or "0" (default): the existing linear scorer
             below runs unchanged. Zero behavior change for production.
         """
+        cross_session = _cross_session_enabled() if _cross_session is None else _cross_session
+
         # E5 feature flag -- read per call so operators can toggle
         # without rebuilding BeamMemory (critical for A/B experiments
         # in the same process). All recall filter kwargs flow through
@@ -5479,6 +5479,7 @@ class BeamMemory:
                 author_id=author_id, author_type=author_type,
                 channel_id=channel_id,
                 veracity=veracity, memory_type=memory_type,
+                cross_session=cross_session,
             )
             if explain:
                 return {
@@ -5614,13 +5615,13 @@ class BeamMemory:
         # Session scope: channel filter only when explicitly specified.
         # Author-only searches have no session/channel restriction.
         if channel_id:
-            wm_where_clauses.append(_session_scope_filter("channel_id"))
-            wm_params.extend(_session_scope_params(self.session_id, channel_id))
+            wm_where_clauses.append(_session_scope_filter("channel_id", cross_session=cross_session))
+            wm_params.extend(_session_scope_params(self.session_id, channel_id, cross_session=cross_session))
         elif author_id or author_type:
             wm_where_clauses.append("(1=1)")
         else:
-            wm_where_clauses.append(_session_scope_filter())
-            wm_params.extend(_session_scope_params(self.session_id))
+            wm_where_clauses.append(_session_scope_filter(cross_session=cross_session))
+            wm_params.extend(_session_scope_params(self.session_id, cross_session=cross_session))
         
         if from_date:
             wm_where_clauses.append("timestamp >= ?")
@@ -5872,14 +5873,14 @@ class BeamMemory:
             # Also check episodic memory for entity matches
             em_placeholders = ",".join("?" * len(entity_memory_ids))
             if channel_id:
-                em_entity_scope = _session_scope_filter("channel_id")
-                em_entity_params = [*tuple(entity_memory_ids), *_session_scope_params(self.session_id, channel_id)]
+                em_entity_scope = _session_scope_filter("channel_id", cross_session=cross_session)
+                em_entity_params = [*tuple(entity_memory_ids), *_session_scope_params(self.session_id, channel_id, cross_session=cross_session)]
             elif author_id or author_type:
                 em_entity_scope = "(1=1)"
                 em_entity_params = [*tuple(entity_memory_ids)]
             else:
-                em_entity_scope = _session_scope_filter()
-                em_entity_params = [*tuple(entity_memory_ids), *_session_scope_params(self.session_id)]
+                em_entity_scope = _session_scope_filter(cross_session=cross_session)
+                em_entity_params = [*tuple(entity_memory_ids), *_session_scope_params(self.session_id, cross_session=cross_session)]
             em_entity_params.extend([datetime.now().isoformat()])
             cursor.execute(f"""
                 SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, veracity, memory_type
@@ -5994,14 +5995,14 @@ class BeamMemory:
             
             # Also check episodic memory for fact matches
             if channel_id:
-                fact_em_scope = _session_scope_filter("channel_id")
-                fact_em_params = [*tuple(fact_memory_ids), *_session_scope_params(self.session_id, channel_id)]
+                fact_em_scope = _session_scope_filter("channel_id", cross_session=cross_session)
+                fact_em_params = [*tuple(fact_memory_ids), *_session_scope_params(self.session_id, channel_id, cross_session=cross_session)]
             elif author_id or author_type:
                 fact_em_scope = "(1=1)"
                 fact_em_params = [*tuple(fact_memory_ids)]
             else:
-                fact_em_scope = _session_scope_filter()
-                fact_em_params = [*tuple(fact_memory_ids), *_session_scope_params(self.session_id)]
+                fact_em_scope = _session_scope_filter(cross_session=cross_session)
+                fact_em_params = [*tuple(fact_memory_ids), *_session_scope_params(self.session_id, cross_session=cross_session)]
             fact_em_params.extend([datetime.now().isoformat()])
             cursor.execute(f"""
                 SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, veracity, memory_type
@@ -6117,13 +6118,13 @@ class BeamMemory:
         # Session scope: channel filter only when explicitly specified.
         # Author-only searches have no session/channel restriction.
         if channel_id:
-            em_where_clauses.append(_session_scope_filter("channel_id"))
-            em_params.extend(_session_scope_params(self.session_id, channel_id))
+            em_where_clauses.append(_session_scope_filter("channel_id", cross_session=cross_session))
+            em_params.extend(_session_scope_params(self.session_id, channel_id, cross_session=cross_session))
         elif author_id or author_type:
             em_where_clauses.append("(1=1)")
         else:
-            em_where_clauses.append(_session_scope_filter())
-            em_params.extend(_session_scope_params(self.session_id))
+            em_where_clauses.append(_session_scope_filter(cross_session=cross_session))
+            em_params.extend(_session_scope_params(self.session_id, cross_session=cross_session))
         
         if from_date:
             em_where_clauses.append("timestamp >= ?")
@@ -6560,18 +6561,18 @@ class BeamMemory:
         em_ids = [r["id"] for r in final_results if r.get("tier") == "episodic"]
         cursor = self.conn.cursor()
         if channel_id:
-            rec_scope = _session_scope_filter("channel_id")
+            rec_scope = _session_scope_filter("channel_id", cross_session=cross_session)
         elif author_id or author_type:
             rec_scope = "(1=1)"
         else:
-            rec_scope = _session_scope_filter()
+            rec_scope = _session_scope_filter(cross_session=cross_session)
         if wm_ids:
             placeholders = ",".join("?" * len(wm_ids))
             rec_params = [now_iso, *tuple(wm_ids)]
             if channel_id:
-                rec_params.extend(_session_scope_params(self.session_id, channel_id))
+                rec_params.extend(_session_scope_params(self.session_id, channel_id, cross_session=cross_session))
             elif not (author_id or author_type):
-                rec_params.extend(_session_scope_params(self.session_id))
+                rec_params.extend(_session_scope_params(self.session_id, cross_session=cross_session))
             cursor.execute(f"""
                 UPDATE working_memory
                 SET recall_count = recall_count + 1, last_recalled = ?
@@ -6581,9 +6582,9 @@ class BeamMemory:
             placeholders = ",".join("?" * len(em_ids))
             rec_params = [now_iso, *tuple(em_ids)]
             if channel_id:
-                rec_params.extend(_session_scope_params(self.session_id, channel_id))
+                rec_params.extend(_session_scope_params(self.session_id, channel_id, cross_session=cross_session))
             elif not (author_id or author_type):
-                rec_params.extend(_session_scope_params(self.session_id))
+                rec_params.extend(_session_scope_params(self.session_id, cross_session=cross_session))
             cursor.execute(f"""
                 UPDATE episodic_memory
                 SET recall_count = recall_count + 1, last_recalled = ?
@@ -6697,10 +6698,15 @@ class BeamMemory:
         if use_intent and classify_intent is not None:
             intent = classify_intent(query)
             if intent.category != "general" and adjust_weights is not None:
+                vec_weight, fts_weight, importance_weight = _normalize_weights(
+                    kwargs.pop("vec_weight", None),
+                    kwargs.pop("fts_weight", None),
+                    kwargs.pop("importance_weight", None),
+                )
                 vw, fw, iw = adjust_weights(
-                    base_vec=kwargs.pop("vec_weight", 0.5),
-                    base_fts=kwargs.pop("fts_weight", 0.3),
-                    base_importance=kwargs.pop("importance_weight", 0.2),
+                    base_vec=vec_weight,
+                    base_fts=fts_weight,
+                    base_importance=importance_weight,
                     intent=intent,
                 )
                 kwargs["vec_weight"] = vw
@@ -6711,19 +6717,25 @@ class BeamMemory:
         if use_synonyms and expand_query is not None:
             expanded_query = expand_query(query)
 
-        # 3. Query cache check (Tier 1-4)
+        # 3. Query cache check (Tier 1-4). Scope cache entries by the
+        # resolved runtime snapshot, otherwise a hot config reload can expose
+        # results cached under a different session/isolation policy.
+        runtime = resolve_beam_runtime()
+        cache_key = f"{self.session_id}\x1f{int(runtime.cross_session)}\x1f{original_query}"
         cached = None
         if use_cache and QueryCache is not None:
             if not hasattr(self, '_query_cache'):
                 cache_db = self.db_path.parent / "query_cache.db"
                 self._query_cache = QueryCache(db_path=cache_db)
-            cached = self._query_cache.get(original_query)
+            cached = self._query_cache.get(cache_key)
 
         if cached is not None:
             return cached[:top_k]
 
         # 4. Run base recall with expanded query
-        results = self.recall(expanded_query, top_k=top_k * 2, **kwargs)
+        results = self.recall(
+            expanded_query, top_k=top_k * 2, _cross_session=runtime.cross_session, **kwargs
+        )
 
         # 5. Weibull re-scoring (if not already using temporal_weight)
         if use_weibull and weibull_boost is not None:
@@ -6809,7 +6821,7 @@ class BeamMemory:
 
         # 9. Cache results
         if use_cache and hasattr(self, '_query_cache') and self._query_cache is not None:
-            self._query_cache.put(original_query, results)
+            self._query_cache.put(cache_key, results)
 
         return results
 
@@ -7040,7 +7052,8 @@ class BeamMemory:
                            author_type: Optional[str] = None,
                            channel_id: Optional[str] = None,
                            veracity: Optional[str] = None,
-                           memory_type: Optional[str] = None) -> List[Dict]:
+                           memory_type: Optional[str] = None,
+                           cross_session: Optional[bool] = None) -> List[Dict]:
         """[E5] Polyphonic recall path.
 
         Delegates to PolyphonicRecallEngine when MNEMOSYNE_POLYPHONIC_RECALL=1.
@@ -7067,6 +7080,8 @@ class BeamMemory:
         surfaced by other voices. Known limitation, documented in
         CHANGELOG.
         """
+        if cross_session is None:
+            cross_session = _cross_session_enabled()
         engine = self._get_polyphonic_engine()
 
         query_embedding = None
@@ -7113,6 +7128,7 @@ class BeamMemory:
                 source=source, topic=topic, author_id=author_id,
                 author_type=author_type, channel_id=channel_id,
                 veracity=veracity, memory_type=memory_type, now_iso=now_iso,
+                cross_session=cross_session,
             ):
                 continue
 
@@ -7163,18 +7179,18 @@ class BeamMemory:
         # gap; rebuilding from `final` post-dedup is the right shape, so
         # add the scope guard here too.
         if channel_id:
-            rec_scope = _session_scope_filter("channel_id")
+            rec_scope = _session_scope_filter("channel_id", cross_session=cross_session)
         elif author_id or author_type:
             rec_scope = "(1=1)"
         else:
-            rec_scope = _session_scope_filter()
+            rec_scope = _session_scope_filter(cross_session=cross_session)
 
         def _rec_scope_params() -> List:
             if channel_id:
-                return _session_scope_params(self.session_id, channel_id)
+                return _session_scope_params(self.session_id, channel_id, cross_session=cross_session)
             if author_id or author_type:
                 return []
-            return _session_scope_params(self.session_id)
+            return _session_scope_params(self.session_id, cross_session=cross_session)
 
         # Update recall_count / last_recalled for engine results too --
         # the linear path updates them and downstream features (decay
@@ -7253,13 +7269,14 @@ class BeamMemory:
                                        channel_id: Optional[str],
                                        veracity: Optional[str],
                                        memory_type: Optional[str],
-                                       now_iso: str) -> bool:
+                                       now_iso: str,
+                                       cross_session: bool) -> bool:
         """Mirror the linear path's filter set for the engine path.
         Always-on filters: session scope, valid_until, superseded_by.
         Conditional filters: caller-supplied kwargs.
         """
         # Session scope filter (honors MNEMOSYNE_CROSS_SESSION).
-        if not _cross_session_enabled():
+        if not cross_session:
             row_session = row_dict.get("session_id") if "session_id" in row_dict else None
             row_scope = row_dict.get("scope") or "session"
             if row_scope != "global" and row_session is not None and row_session != self.session_id:
