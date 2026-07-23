@@ -493,8 +493,11 @@ class MnemosyneConfig:
                     return default_val
             return env_val
 
-        # 3. Hardcoded default
-        return default if default is not None else DEFAULTS.get(key)
+        # 3. Hardcoded default — prefer DEFAULTS when caller wants it,
+        # but otherwise return None to preserve the documented contract
+        # that get() without an explicit default returns None for
+        # unset values (so callers can distinguish "defaulted" from "set").
+        return default if default is not None else None
 
     def get_bool(self, key: str, default: bool = False) -> bool:
         """Get a boolean config value with type coercion."""
