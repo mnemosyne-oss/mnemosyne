@@ -538,6 +538,10 @@ class MnemosyneConfig:
             self._load_yaml()
             self._yaml_cache[key] = value
             self._write_yaml()
+            if key in REQUIRES_RESTART:
+                logger.warning(
+                    "Config key '%s' requires restart to take effect.", key
+                )
 
     def set_many(self, items: dict[str, Any]) -> None:
         """Set multiple config keys at once."""
@@ -545,6 +549,11 @@ class MnemosyneConfig:
             self._load_yaml()
             self._yaml_cache.update(items)
             self._write_yaml()
+            for key in items:
+                if key in REQUIRES_RESTART:
+                    logger.warning(
+                        "Config key '%s' requires restart to take effect.", key
+                    )
 
     def _write_yaml(self) -> None:
         """Write the current YAML cache to disk."""
