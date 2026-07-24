@@ -79,34 +79,6 @@ def test_get_provider_class_returns_real_class():
     assert hasattr(cls, "_sanitize_bank_name")
 
 
-def test_get_provider_class_standalone_fallback(monkeypatch):
-    """When the package has no parent package (standalone CLI load),
-    the helper must fall back to absolute import and succeed."""
-    # Monkey-patch the import shim to simulate the standalone case
-    import builtins
-    orig_import = builtins.__import__
-
-    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-        # Simulate relative import failure for the mnemosyne_hermes package
-        # when loaded standalone
-        if level > 0 and name == "" and globals and globals.get("__name__") == "_clitest_standalone":
-            raise ImportError("attempted relative import with no known parent package")
-        return orig_import(name, globals, locals, fromlist, level)
-
-    # Simulate the standalone module context
-    fake_globals = {"__name__": "_clitest_standalone", "__package__": None}
-    # We can't easily simulate this without actually loading the module
-    # via spec_from_file_location, so we'll verify the fallback directly
-    # by calling the helper and checking that it returns the class even
-    # under the normal package-import path
-    del fake_globals
-    del fake_import
-    del orig_import
-    cls = _get_provider_class()
-    assert cls is not None
-    assert hasattr(cls, "_sanitize_bank_name")
-
-
 def test_standalone_load_via_spec_resolves_profile_bank(tmp_path, monkeypatch):
     """End-to-end standalone load: CLI module loaded from file path
     (no __package__) resolves the active profile bank."""
