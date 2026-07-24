@@ -2265,6 +2265,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         """Initialize sync_turn telemetry for tests that construct via __new__."""
         if not hasattr(self, "_sync_turn_lock"):
             self._sync_turn_lock = threading.Lock()
+        if not hasattr(self, "_beam_access_lock"):
+            self._beam_access_lock = threading.Lock()
         if not hasattr(self, "_sync_turn_telemetry"):
             self._sync_turn_telemetry = {
                 "pending_queue_length": 0,
