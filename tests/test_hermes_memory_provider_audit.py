@@ -101,6 +101,9 @@ class TestAuditIntegration:
         result = _call(provider, "mnemosyne_invalidate", {"memory_id": "nonexistent-id"})
         assert result["status"] == "memory_not_found"
         assert result["memory_id"] == "nonexistent-id"
+        events = provider._audit.query(limit=10)
+        assert len(events) == 1
+        assert json.loads(events[0]["metadata_json"]) == {"invalidated": False}
 
     def test_invalidate_success_returns_status(self, tmp_path):
         provider = _provider(tmp_path)
@@ -111,6 +114,42 @@ class TestAuditIntegration:
         result = _call(provider, "mnemosyne_invalidate", {"memory_id": stored["memory_id"]})
         assert result["status"] == "invalidated"
         assert result["memory_id"] == stored["memory_id"]
+        row = provider._beam.conn.execute(
+            "SELECT valid_until FROM working_memory WHERE id = ?",
+            (stored["memory_id"],),
+        ).fetchone()
+        assert row is not None
+        assert row[0] is not None
+        events = provider._audit.query(limit=10)
+        assert json.loads(events[0]["metadata_json"]) == {"invalidated": True}
+
+    def test_invalidate_with_replacement_persists_link_and_audit_metadata(self, tmp_path):
+        provider = _provider(tmp_path)
+        original = _call(provider, "mnemosyne_remember", {
+            "content": "original fact",
+            "source": "fact",
+        })
+        replacement = _call(provider, "mnemosyne_remember", {
+            "content": "replacement fact",
+            "source": "fact",
+        })
+        result = _call(provider, "mnemosyne_invalidate", {
+            "memory_id": original["memory_id"],
+            "replacement_id": replacement["memory_id"],
+        })
+        assert result["status"] == "invalidated"
+        row = provider._beam.conn.execute(
+            "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?",
+            (original["memory_id"],),
+        ).fetchone()
+        assert row is not None
+        assert row[0] is not None
+        assert row[1] == replacement["memory_id"]
+        events = provider._audit.query(limit=10)
+        assert json.loads(events[0]["metadata_json"]) == {
+            "replacement_id": replacement["memory_id"],
+            "invalidated": True,
+        }
 
     def test_sleep_creates_audit_event(self, tmp_path):
         provider = _provider(tmp_path)
