@@ -88,3 +88,19 @@ def test_init_beam_creates_vec_tables_when_dim_matches(tmp_path, monkeypatch):
         "SELECT sql FROM sqlite_master WHERE name = 'vec_working'"
     ).fetchone()
     assert working is not None and "[768]" in working[0]
+
+
+def test_dim_mismatch_message_is_self_healing():
+    """The mismatch message must say it is NOT corruption and give the exact
+    self-heal commands, so it is not misread as 'the database is corrupt'.
+
+    The original failure mode: users (and agent frameworks) read 'dimension
+    mismatch' as corruption and abandon the store instead of reindexing. The
+    message is a pure function so it can be unit-tested without sqlite-vec.
+    """
+    msg = beam._dim_mismatch_message(existing_dim=768, configured_dim=384)
+    low = msg.lower()
+    assert "not database corruption" in low, msg
+    assert "mnemosyne reindex" in low, msg
+    assert "mnemosyne_embedding_dim=" in low, msg
+    assert "768" in msg and "384" in msg, msg

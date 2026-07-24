@@ -559,6 +559,32 @@ def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
     return None
 
 
+def _dim_mismatch_message(existing_dim: int, configured_dim: int) -> str:
+    """Build the embedding-dimension-mismatch message.
+
+    Extracted as a pure function so the wording -- explicitly NOT corruption plus
+    the exact self-heal commands -- is unit-testable without a sqlite-vec
+    database. The phrasing matters: 'dimension mismatch' is otherwise misread as
+    'database corrupt', and users (and agent frameworks) abandon the store
+    instead of reindexing.
+    """
+    return (
+        f"Embedding dimension mismatch — NOT database corruption: your memories "
+        f"are intact, only the vector index is affected (recall falls back to "
+        f"keyword search until this is fixed). This database stores "
+        f"{existing_dim}-dim vectors but this process is configured for "
+        f"{configured_dim}-dim (MNEMOSYNE_EMBEDDING_DIM / "
+        f"MNEMOSYNE_EMBEDDING_MODEL); sqlite-vec tables were left untouched. To "
+        f"self-heal, choose ONE:\n"
+        f"  * Keep the existing {existing_dim}-dim vectors: relaunch with "
+        f"MNEMOSYNE_EMBEDDING_DIM={existing_dim} (and the matching model).\n"
+        f"  * Re-embed all memories at {configured_dim}-dim: run "
+        f"`MNEMOSYNE_EMBEDDING_DIM={configured_dim} mnemosyne reindex` (it backs "
+        f"up first).\n"
+        f"Run `mnemosyne doctor` to re-check."
+    )
+
+
 def init_beam(db_path: Path = None):
     """Initialize BEAM schema."""
     conn = _get_connection(db_path)
@@ -769,17 +795,7 @@ def init_beam(db_path: Path = None):
         existing_dim = _existing_vec_dim(conn)
         if existing_dim is not None and existing_dim != EMBEDDING_DIM:
             vec_dim_mismatch = True
-            logger.error(
-                "Embedding dimension mismatch: this database stores %d-dimensional "
-                "vectors, but the process is configured for %d "
-                "(MNEMOSYNE_EMBEDDING_DIM / embedding model). Not creating "
-                "sqlite-vec tables at the wrong dimension. Set "
-                "MNEMOSYNE_EMBEDDING_DIM / MNEMOSYNE_EMBEDDING_MODEL to match the "
-                "stored data, or run `mnemosyne reindex` to rebuild all vectors at "
-                "the configured dimension.",
-                existing_dim,
-                EMBEDDING_DIM,
-            )
+            logger.error(_dim_mismatch_message(existing_dim, EMBEDDING_DIM))
         else:
             try:
                 cursor.execute(f"""
