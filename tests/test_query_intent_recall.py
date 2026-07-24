@@ -64,3 +64,56 @@ def test_explicit_recall_weights_override_query_intent(monkeypatch):
             importance_weight=0.1,
         )
         assert results
+
+
+def test_public_enhanced_recall_resolves_weight_defaults_and_overrides(monkeypatch):
+    from mnemosyne.core import beam as beam_module
+    from mnemosyne.core.memory import Mnemosyne
+
+    observed_base_weights = []
+    original_adjust_weights = beam_module.adjust_weights
+
+    def capture_adjust_weights(*args, **kwargs):
+        observed_base_weights.append(
+            (kwargs["base_vec"], kwargs["base_fts"], kwargs["base_importance"])
+        )
+        return original_adjust_weights(*args, **kwargs)
+
+    monkeypatch.setattr(beam_module, "adjust_weights", capture_adjust_weights)
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.delenv("MNEMOSYNE_VEC_WEIGHT", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_FTS_WEIGHT", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_IMPORTANCE_WEIGHT", raising=False)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "mnemosyne.db"
+        memory = Mnemosyne(session_id="test", db_path=db_path)
+        try:
+            memory.remember("The sprint ends on March 29.", scope="global")
+
+            default_results = memory.recall("When does the sprint end?", top_k=3)
+            explicit_results = memory.recall(
+                "What is the sprint deadline?",
+                top_k=3,
+                vec_weight=0.0,
+                fts_weight=1.0,
+                importance_weight=0.0,
+            )
+            monkeypatch.setenv("MNEMOSYNE_VEC_WEIGHT", "0.2")
+            monkeypatch.setenv("MNEMOSYNE_FTS_WEIGHT", "0.7")
+            monkeypatch.setenv("MNEMOSYNE_IMPORTANCE_WEIGHT", "0.1")
+            configured_results = memory.recall("When is the sprint due?", top_k=3)
+
+            assert default_results[0]["content"] == "The sprint ends on March 29."
+            assert explicit_results[0]["content"] == "The sprint ends on March 29."
+            assert configured_results[0]["content"] == "The sprint ends on March 29."
+            assert [
+                tuple(round(weight, 6) for weight in weights)
+                for weights in observed_base_weights
+            ] == [
+                (0.5, 0.3, 0.2),
+                (0.0, 1.0, 0.0),
+                (0.2, 0.7, 0.1),
+            ]
+        finally:
+            memory.conn.close()

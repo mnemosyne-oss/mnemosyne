@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -324,6 +325,13 @@ def _default_config_path() -> Path:
     return Path.home() / ".hermes" / "mnemosyne" / "config.yaml"
 
 
+@dataclass(frozen=True)
+class BeamRuntimeConfig:
+    """Typed runtime settings consumed by Beam on each configuration lookup."""
+
+    cross_session: bool
+
+
 class MnemosyneConfig:
     """Central config reader with YAML + env var + defaults precedence.
 
@@ -613,6 +621,10 @@ class MnemosyneConfig:
             return val
         return str(val).strip().lower() in ("1", "true", "yes", "on")
 
+    def resolve_beam_runtime(self) -> BeamRuntimeConfig:
+        """Resolve Beam's hot-reloadable runtime settings with typed values."""
+        return BeamRuntimeConfig(cross_session=self.get_bool("cross_session", False))
+
     def set(self, key: str, value: Any) -> None:
         """Write a config value to config.yaml.
 
@@ -751,6 +763,11 @@ def get_bool(key: str, default: bool = False) -> bool:
 
 def get_str(key: str, default: str = "") -> str:
     return get_config().get_str(key, default)
+
+
+def resolve_beam_runtime() -> BeamRuntimeConfig:
+    """Resolve the typed, hot-reloadable Beam runtime settings."""
+    return get_config().resolve_beam_runtime()
 
 
 def reload() -> Set[str]:

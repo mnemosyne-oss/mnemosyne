@@ -66,6 +66,11 @@ _RUNTIME_ABSOLUTE_PATH = re.compile(
     r"(?<![A-Za-z0-9_.-])(?:~[\\/]|(?:[A-Za-z]:)?[\\/])[^\s`<>\"']+"
 )
 
+
+class _SQLiteVecExtensionDisableError(RuntimeError):
+    """The connection cannot safely continue after extension loading was enabled."""
+
+
 # Adapter SQL is deliberately limited to these known contracts. Catalog
 # metadata only proves that one of these names exists; it never turns an
 # arbitrary application table into a doctor query target.
@@ -211,6 +216,32 @@ def open_readonly_doctor_db(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA query_only=ON")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def _load_optional_sqlite_vec(conn: sqlite3.Connection) -> bool:
+    """Load the bundled sqlite-vec module into an already read-only connection.
+
+    The Doctor must remain usable when the optional dependency is absent or
+    incompatible with the host SQLite build.  In that case, its existing
+    ``present_but_unloadable`` capability report remains the safe fallback.
+    """
+
+    extension_loading_enabled = False
+    try:
+        import sqlite_vec
+
+        conn.enable_load_extension(True)
+        extension_loading_enabled = True
+        sqlite_vec.load(conn)
+    except Exception:
+        return False
+    finally:
+        if extension_loading_enabled:
+            try:
+                conn.enable_load_extension(False)
+            except Exception as error:
+                raise _SQLiteVecExtensionDisableError from error
+    return True
 
 
 def safe_preview(value: Any, max_length: int = 120) -> str:
@@ -626,6 +657,15 @@ def build_doctor_report(
         report.hygiene_summary = dict(unavailable, candidates=[])
         return report
     try:
+        try:
+            _load_optional_sqlite_vec(conn)
+        except _SQLiteVecExtensionDisableError:
+            unavailable = {"status": "unavailable", "error_class": "sqlite_error"}
+            report.sqlite_health = dict(unavailable)
+            report.reference_contracts = dict(unavailable)
+            report.vector_coverage = dict(unavailable)
+            report.hygiene_summary = dict(unavailable, candidates=[])
+            return report
         report.schema_fingerprint = inspect_schema_fingerprint(conn, scan_limit=scan_limit)
         sqlite_health = SQLiteHealthAdapter(conn, scan_limit=scan_limit).inspect()
         reference_contracts = ReferenceContractRegistry(conn, scan_limit=scan_limit).inspect()

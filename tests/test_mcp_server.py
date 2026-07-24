@@ -11,6 +11,8 @@ import sys
 import pytest
 from unittest.mock import MagicMock, patch
 
+import mnemosyne.mcp_tools as mcp_tools
+
 # Test tool schemas
 from mnemosyne.mcp_tools import (
     TOOLS, get_tool_definitions, handle_tool_call, _create_instance,
@@ -446,6 +448,105 @@ class TestToolHandlers:
         with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
             with pytest.raises(RuntimeError, match="DB locked"):
                 handle_tool_call("mnemosyne_remember", {"content": "test"})
+
+    def test_hygiene_clean_rejects_invalid_candidates_json(self):
+        """Invalid hygiene payloads return the documented MCP error instead of raising."""
+        result = handle_tool_call(
+            "mnemosyne_hygiene_clean", {"candidates_json": "not-json"},
+        )
+
+        assert result == {"error": "candidates_json is not valid JSON"}
+
+    @pytest.mark.parametrize(
+        "candidates_json",
+        [
+            "null",
+            "{}",
+            "[{}]",
+            json.dumps([{"memory_id": "memory-1", "table_name": "unknown"}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "noise_score": float("nan")}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "noise_score": 1.1}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "noise_score": True}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "noise_score": 10**1000}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "importance": float("inf")}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "importance": 1.1}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "importance": True}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "importance": 10**1000}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "content_length": -1}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "content_length": 1.5}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "content_length": True}]),
+            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "suggested_action": "destroy"}]),
+        ],
+    )
+    def test_hygiene_clean_rejects_malformed_candidates(self, candidates_json, monkeypatch):
+        """Malformed candidate payloads return MCP errors before opening a memory instance."""
+        monkeypatch.setattr(
+            mcp_tools,
+            "_create_instance",
+            lambda **_kwargs: pytest.fail("malformed payload must not initialize memory"),
+        )
+        result = handle_tool_call(
+            "mnemosyne_hygiene_clean", {"candidates_json": candidates_json},
+        )
+
+        assert result == {"error": "candidates_json must be a list of valid hygiene candidates"}
+
+    def test_hygiene_clean_parses_valid_candidates_json(self, monkeypatch):
+        """Valid JSON reaches the hygiene cleaner with mapped candidate fields."""
+        class _Memory:
+            class beam:
+                db_path = "test.db"
+
+        class _Result:
+            def to_dict(self):
+                return {"cleaned": 1}
+
+        captured = {}
+
+        def _clean_noise(**kwargs):
+            captured.update(kwargs)
+            return _Result()
+
+        from mnemosyne.core import hygiene
+
+        monkeypatch.setattr(mcp_tools, "_create_instance", lambda **_kwargs: _Memory())
+        monkeypatch.setattr(hygiene, "clean_noise", _clean_noise)
+
+        candidates_json = json.dumps([{
+            "memory_id": "memory-1",
+            "table_name": "working_memory",
+            "content_preview": "done",
+            "noise_score": 0.9,
+            "noise_reasons": ["short acknowledgement"],
+            "secret_flags": [],
+            "importance": 0.2,
+            "source": "test",
+            "timestamp": "2026-07-21T00:00:00Z",
+            "suggested_action": "archive",
+            "content_length": 4,
+        }])
+        result = handle_tool_call(
+            "mnemosyne_hygiene_clean",
+            {"candidates_json": candidates_json, "action": "archive", "confirm": True},
+        )
+
+        assert result == {"status": "applied", "result": {"cleaned": 1}, "bank": "default"}
+        assert captured["db_path"] == "test.db"
+        assert captured["action"] == "archive"
+        assert captured["confirm"] is True
+        assert captured["dry_run"] is False
+        candidate = captured["candidates"][0]
+        assert candidate.memory_id == "memory-1"
+        assert candidate.table_name == "working_memory"
+        assert candidate.content_preview == "done"
+        assert candidate.noise_score == 0.9
+        assert candidate.noise_reasons == ["short acknowledgement"]
+        assert candidate.secret_flags == []
+        assert candidate.importance == 0.2
+        assert candidate.source == "test"
+        assert candidate.timestamp == "2026-07-21T00:00:00Z"
+        assert candidate.suggested_action == "archive"
+        assert candidate.content_length == 4
 
     def test_unknown_tool(self):
         """Unknown tool raises ValueError."""
