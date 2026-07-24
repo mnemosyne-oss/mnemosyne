@@ -96,6 +96,22 @@ class TestAuditIntegration:
         assert events[0]["action"] == "invalidate"
         assert events[0]["memory_id"] == stored["memory_id"]
 
+    def test_invalidate_not_found_returns_status(self, tmp_path):
+        provider = _provider(tmp_path)
+        result = _call(provider, "mnemosyne_invalidate", {"memory_id": "nonexistent-id"})
+        assert result["status"] == "memory_not_found"
+        assert result["memory_id"] == "nonexistent-id"
+
+    def test_invalidate_success_returns_status(self, tmp_path):
+        provider = _provider(tmp_path)
+        stored = _call(provider, "mnemosyne_remember", {
+            "content": "will be invalidated",
+            "source": "fact",
+        })
+        result = _call(provider, "mnemosyne_invalidate", {"memory_id": stored["memory_id"]})
+        assert result["status"] == "invalidated"
+        assert result["memory_id"] == stored["memory_id"]
+
     def test_sleep_creates_audit_event(self, tmp_path):
         provider = _provider(tmp_path)
         _call(provider, "mnemosyne_remember", {
