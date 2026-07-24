@@ -2913,13 +2913,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         replacement_id = args.get("replacement_id", None) or None
         if not memory_id:
             return json.dumps({"error": "memory_id is required"})
-        self._beam.invalidate(memory_id, replacement_id=replacement_id if replacement_id else None)
+        ok = self._beam.invalidate(memory_id, replacement_id=replacement_id)
         self._audit_event(
             "invalidate", memory_id=memory_id, bank="private",
             source_tool="mnemosyne_invalidate",
-            metadata={"replacement_id": replacement_id} if replacement_id else None,
+            metadata={"replacement_id": replacement_id, "invalidated": ok} if replacement_id else {"invalidated": ok},
         )
-        return json.dumps({"status": "invalidated", "memory_id": memory_id})
+        if ok:
+            return json.dumps({"status": "invalidated", "memory_id": memory_id})
+        return json.dumps({"status": "memory_not_found", "memory_id": memory_id})
 
     def _handle_validate(self, args: Dict[str, Any]) -> str:
         """Collaborative attestation: any agent can attest, update, invalidate,
