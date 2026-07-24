@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from mnemosyne.core.beam import BeamMemory
@@ -111,7 +112,9 @@ class TestAuditIntegration:
             "content": "will be invalidated",
             "source": "fact",
         })
+        before_invalidate = datetime.now()
         result = _call(provider, "mnemosyne_invalidate", {"memory_id": stored["memory_id"]})
+        after_invalidate = datetime.now()
         assert result["status"] == "invalidated"
         assert result["memory_id"] == stored["memory_id"]
         row = provider._beam.conn.execute(
@@ -119,7 +122,10 @@ class TestAuditIntegration:
             (stored["memory_id"],),
         ).fetchone()
         assert row is not None
-        assert row[0] is not None
+        valid_until = datetime.fromisoformat(row[0])
+        assert before_invalidate <= valid_until <= after_invalidate
+        context_ids = {memory["id"] for memory in provider._beam.get_context(limit=10)}
+        assert stored["memory_id"] not in context_ids
         events = provider._audit.query(limit=10)
         assert json.loads(events[0]["metadata_json"]) == {"invalidated": True}
 
@@ -133,18 +139,24 @@ class TestAuditIntegration:
             "content": "replacement fact",
             "source": "fact",
         })
+        before_invalidate = datetime.now()
         result = _call(provider, "mnemosyne_invalidate", {
             "memory_id": original["memory_id"],
             "replacement_id": replacement["memory_id"],
         })
+        after_invalidate = datetime.now()
         assert result["status"] == "invalidated"
         row = provider._beam.conn.execute(
             "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?",
             (original["memory_id"],),
         ).fetchone()
         assert row is not None
-        assert row[0] is not None
+        valid_until = datetime.fromisoformat(row[0])
+        assert before_invalidate <= valid_until <= after_invalidate
         assert row[1] == replacement["memory_id"]
+        context_ids = {memory["id"] for memory in provider._beam.get_context(limit=10)}
+        assert original["memory_id"] not in context_ids
+        assert replacement["memory_id"] in context_ids
         events = provider._audit.query(limit=10)
         assert json.loads(events[0]["metadata_json"]) == {
             "replacement_id": replacement["memory_id"],
