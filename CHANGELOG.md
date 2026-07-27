@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
+## [Unreleased]
+
+### Added
+
+- **`memory.mnemosyne.polyphonic_recall` config key for the Hermes providers.** Routes recall through the polyphonic engine so working memory gets a vector voice. Default `false` — current behavior is unchanged — with an explicit `MNEMOSYNE_POLYPHONIC_RECALL` env var still taking precedence. Enable it when paraphrased queries fail to retrieve recent memories: the linear scorer only vector-searches episodic memory (`Uses sqlite-vec + FTS5 for episodic, FTS5 for working` — `BeamMemory.recall`) and every memory starts in working memory, so until `sleep()` promotes it a memory is reachable by literal keyword overlap only — even when the stored embedding is a strong match (0.61 cosine in the reproduction, ranked #1 by the underlying `vec_working` KNN). Values written by the provider are refreshed on re-initialization rather than mistaken for an operator override.
+
 ## [3.15.0] - 2026-07-20
 
 ### Fixed

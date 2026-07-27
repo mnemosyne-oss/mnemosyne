@@ -516,6 +516,27 @@ def _parse_env_optional_int(key: str, default: Optional[int]) -> Optional[int]:
     return _coerce_optional_int(os.environ.get(key), default)
 
 
+_POLYPHONIC_ENV = "MNEMOSYNE_POLYPHONIC_RECALL"
+
+# Last value this process wrote to _POLYPHONIC_ENV. Used to tell a
+# provider-managed value (safe to refresh on re-initialization) apart from an
+# operator-supplied one (must never be clobbered). Comparing against the
+# written value keeps this independent of import order, so an env var loaded
+# from .env after this module is imported still counts as external.
+#
+# _polyphonic_lock serializes the read-check-write below across threads.
+# Hermes' MemoryManager runs background sync/prefetch work on daemon
+# threads, so two provider instances in one profile process can call
+# _apply_provider_config() concurrently. In practice both always resolve
+# the same target (kwargs are never used for this key in the framework;
+# every instance in a process reads the same config.yaml), so the race is
+# a redundant identical write rather than a wrong one -- but making the
+# check-then-write atomic removes the question entirely rather than
+# relying on that being true forever.
+_provider_managed_polyphonic: Optional[str] = None
+_polyphonic_lock = threading.Lock()
+
+
 class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     """Mnemosyne native memory — local SQLite with vector + FTS5 hybrid search."""
 
@@ -803,6 +824,34 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             else:
                 self._profile_isolation_enabled = bool(profile_isolation)
 
+        # polyphonic_recall: route recall through the multi-voice engine so
+        # working memory is searched by vector similarity, not FTS5 alone.
+        # Default OFF, preserving the linear scorer's current behavior.
+        # Opting in matters because the linear scorer only vector-searches
+        # episodic memory ("Uses sqlite-vec + FTS5 for episodic, FTS5 for
+        # working" -- BeamMemory.recall), and every memory starts in working
+        # memory, so until consolidation promotes it a paraphrased question
+        # cannot retrieve it: recall("plant based diet") misses a stored
+        # "X is vegan" fact whose embedding is a 0.61 cosine match.
+        # An explicit MNEMOSYNE_POLYPHONIC_RECALL env var always wins; a value
+        # this provider wrote earlier is refreshed, so re-initializing with a
+        # different config (session switch, second profile in-process) applies.
+        global _provider_managed_polyphonic
+        with _polyphonic_lock:
+            _current_polyphonic = os.environ.get(_POLYPHONIC_ENV)
+            if _current_polyphonic is None or _current_polyphonic == _provider_managed_polyphonic:
+                polyphonic = kwargs.get("polyphonic_recall")
+                if polyphonic is None:
+                    polyphonic = self._read_config_key("polyphonic_recall")
+                if polyphonic is None:
+                    polyphonic = False
+                if isinstance(polyphonic, str):
+                    polyphonic_enabled = polyphonic.strip().lower() in ("true", "1", "yes", "on")
+                else:
+                    polyphonic_enabled = bool(polyphonic)
+                _provider_managed_polyphonic = "1" if polyphonic_enabled else "0"
+                os.environ[_POLYPHONIC_ENV] = _provider_managed_polyphonic
+
         shared_surface_path = kwargs.get("shared_surface_path")
         if shared_surface_path is None:
             shared_surface_path = self._read_config_key("shared_surface_path")
@@ -941,6 +990,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             {"key": "vector_type", "description": "Vector storage type (note: not yet wired to BeamMemory at runtime; reserved for future use)", "choices": ["float32", "int8", "bit"], "default": "int8"},
             {"key": "ignore_patterns", "description": "Regex patterns to filter from memory storage (one per line in config, or comma-separated). Memories matching any pattern are skipped.", "default": []},
             {"key": "profile_isolation", "description": "Enable per-profile memory isolation via Mnemosyne banks. Each Hermes profile gets its own SQLite database under mnemosyne/data/banks/<profile>/. Default false for backward compatibility.", "default": False},
+            {"key": "polyphonic_recall", "description": "Route recall through the polyphonic (multi-voice) engine so working memory is searched by vector similarity, not FTS5 keywords alone. Default false, preserving the linear scorer. Enable it if paraphrased queries fail to retrieve memories that have not yet been consolidated into episodic storage — those are only reachable by literal keyword overlap on the linear path. Also configurable via MNEMOSYNE_POLYPHONIC_RECALL env var, which takes precedence.", "default": False},
             {"key": "shared_surface_path", "description": "SQLite path for shared surface memories. Default is <mnemosyne>/data/shared/mnemosyne.db.", "default": "data/shared/mnemosyne.db"},
             {"key": "shared_surface_read", "description": "When true, mnemosyne_recall merges shared-surface results into private bank recall, tagging each result with its bank ('private' or 'surface'). Default false.", "default": False},
             {"key": "skip_contexts", "description": "Agent contexts where Mnemosyne should skip initialization. Comma-separated list. Defaults to 'cron,flush,subagent,background,skill_loop'. Set to empty string to enable all contexts. Also configurable via MNEMOSYNE_SKIP_CONTEXTS env var.", "default": "cron,flush,subagent,background,skill_loop"},
