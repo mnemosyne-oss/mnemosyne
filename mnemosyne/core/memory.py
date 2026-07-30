@@ -585,18 +585,33 @@ class Mnemosyne:
         if not updates:
             return False
 
-        params.extend([memory_id, self.session_id])
+        # Use BEAM's scope-aware public read as the authorization boundary.
+        # The legacy table has no scope column, so it can only be updated by
+        # id after a working-memory row is visible to this session.
+        visible_memory = self.beam.get(memory_id)
+        beam_authorized = (
+            visible_memory is not None
+            and visible_memory["memory_store"] == "working"
+        )
+
+        # Keep legacy rows synchronized after a BEAM-authorized update. If a
+        # database contains an old legacy-only row, retain its session-scoped
+        # compatibility path.
+        params.extend([memory_id] if beam_authorized else [memory_id, self.session_id])
+        legacy_where = "id = ?" if beam_authorized else "id = ? AND session_id = ?"
         cursor.execute(
-            f"UPDATE memories SET {', '.join(updates)} WHERE id = ? AND session_id = ?",
+            f"UPDATE memories SET {', '.join(updates)} WHERE {legacy_where}",
             params
         )
+        legacy_updated = cursor.rowcount > 0
         self.conn.commit()
 
-        # Sync BEAM working_memory
-        self.beam.update_working(memory_id, content=content, importance=importance)
+        beam_updated = self.beam.update_working(
+            memory_id, content=content, importance=importance
+        )
 
         self._emit_wrapper("MEMORY_UPDATED", memory_id, content=content, importance=importance)
-        return cursor.rowcount > 0
+        return legacy_updated or beam_updated
 
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """Mark a memory as expired or superseded. Delegates to BEAM."""
