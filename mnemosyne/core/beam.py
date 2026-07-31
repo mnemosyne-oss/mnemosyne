@@ -5479,6 +5479,10 @@ class BeamMemory:
         )
         primary_rows = primary.get("results", []) if isinstance(primary, dict) else primary
         candidate_rows = candidates.get("results", []) if isinstance(candidates, dict) else candidates
+        # Only storage-backed tiers can receive a verified source-session backfill.
+        candidate_rows = [
+            row for row in candidate_rows if row.get("tier") in {"working", "episodic"}
+        ]
         # Keep consolidated originals available to normal recall for provenance,
         # but do not let them compete with hot memories in supplemental packs.
         # The candidate rows already passed recall()'s visibility filters.

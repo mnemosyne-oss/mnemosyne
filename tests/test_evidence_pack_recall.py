@@ -277,3 +277,16 @@ def test_provenance_backfill_keeps_same_ids_separate_by_tier(tmp_path: Path, mon
     packed = beam.recall_with_evidence_pack("q", top_k=1, candidate_k=2, pack_k=1)
     assert packed["primary"][0]["session_id"] == "primary-session"
     assert packed["evidence_pack"][0]["session_id"] == "candidate-session"
+
+
+def test_evidence_pack_excludes_synthetic_candidate_tiers(tmp_path: Path, monkeypatch):
+    beam = BeamMemory(session_id="reader", db_path=tmp_path / "synthetic-tier.db")
+    calls = iter([
+        [],
+        [{"id": "memoria_source_test", "tier": "memoria", "session_id": "reader"}],
+    ])
+    monkeypatch.setattr(beam, "recall", lambda *args, **kwargs: next(calls))
+
+    packed = beam.recall_with_evidence_pack("q", top_k=1, candidate_k=2, pack_k=1)
+
+    assert packed == {"primary": [], "evidence_pack": []}
