@@ -5465,6 +5465,10 @@ class BeamMemory:
             raise ValueError("candidate_k must be at least top_k")
         if pack_k < 0:
             raise ValueError("pack_k must be non-negative")
+        if pack_k > 0 and candidate_k <= top_k:
+            raise ValueError("candidate_k must exceed top_k when pack_k is positive")
+        if kwargs.get("explain"):
+            raise ValueError("explain is not supported by recall_with_evidence_pack")
         if {"_track_recall", "_include_vector_only_candidates"}.intersection(kwargs):
             raise ValueError("internal recall controls are managed by recall_with_evidence_pack")
 

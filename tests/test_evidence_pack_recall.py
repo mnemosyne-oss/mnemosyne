@@ -25,10 +25,16 @@ def test_evidence_pack_rejects_invalid_internal_controls(tmp_path: Path):
     beam = BeamMemory(session_id="guards", db_path=tmp_path / "guards.db")
     with pytest.raises(ValueError, match="candidate_k"):
         beam.recall_with_evidence_pack("q", top_k=2, candidate_k=1)
+    with pytest.raises(ValueError, match="candidate_k must exceed"):
+        beam.recall_with_evidence_pack("q", top_k=2, candidate_k=2, pack_k=1)
     with pytest.raises(ValueError, match="pack_k"):
         beam.recall_with_evidence_pack("q", pack_k=-1)
+    with pytest.raises(ValueError, match="explain"):
+        beam.recall_with_evidence_pack("q", explain=True)
     with pytest.raises(ValueError, match="internal recall controls"):
         beam.recall_with_evidence_pack("q", _track_recall=False)
+    with pytest.raises(ValueError, match="internal recall controls"):
+        beam.recall_with_evidence_pack("q", _include_vector_only_candidates=True)
 
 
 def test_candidate_only_recall_does_not_mutate_usage_state(tmp_path: Path):
@@ -116,20 +122,23 @@ def test_evidence_pack_does_not_leak_other_session_rows(tmp_path: Path):
     assert other_id not in returned_ids
 
 
-def test_cross_session_scope_can_produce_a_supplemental_pack(tmp_path: Path):
+def test_cross_session_scope_can_produce_a_bounded_supplemental_pack(tmp_path: Path):
     db_path = tmp_path / "cross-session-pack.db"
     reader = BeamMemory(session_id="reader", db_path=db_path)
     first = BeamMemory(session_id="first", db_path=db_path)
     second = BeamMemory(session_id="second", db_path=db_path)
+    third = BeamMemory(session_id="third", db_path=db_path)
     first.remember("Orion cross session alpha", source="test", importance=0.8, scope="global")
     second_id = second.remember("Orion cross session beta", source="test", importance=0.8, scope="global")
+    third_id = third.remember("Orion cross session gamma", source="test", importance=0.8, scope="global")
 
     packed = reader.recall_with_evidence_pack(
-        "Orion cross session", top_k=1, candidate_k=5, pack_k=5, _cross_session=True
+        "Orion cross session", top_k=1, candidate_k=5, pack_k=2, _cross_session=True
     )
-    assert len(packed["evidence_pack"]) == 1
-    assert [row["evidence_rank"] for row in packed["evidence_pack"]] == [2]
-    assert second_id in {row["id"] for row in packed["primary"] + packed["evidence_pack"]}
+    assert len(packed["evidence_pack"]) == 2
+    assert {row["evidence_rank"] for row in packed["evidence_pack"]} == {2, 3}
+    returned_ids = {row["id"] for row in packed["primary"] + packed["evidence_pack"]}
+    assert {second_id, third_id}.issubset(returned_ids)
 
 
 def test_evidence_pack_excludes_consolidated_working_candidates(tmp_path: Path):
