@@ -5448,6 +5448,58 @@ class BeamMemory:
             return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_preferences"}
         return {"context": "", "facts": [], "source": "fallback"}
 
+    def recall_with_evidence_pack(
+        self, query: str, top_k: int = 10, *, candidate_k: int = 20,
+        pack_k: int = 5, **kwargs: Any,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return normal recall plus bounded supplemental evidence.
+
+        The primary call preserves the public ``recall()`` behavior. The wider
+        candidate call reuses its exact visibility scope and filters but does
+        not update recall-use telemetry. Consequently, session-scoped calls
+        normally return an empty pack; multi-session evidence requires an
+        already-authorized cross-session/global recall scope. This method is
+        opt-in and never exposes the raw candidate pool.
+        """
+        if candidate_k < top_k:
+            raise ValueError("candidate_k must be at least top_k")
+        if pack_k < 0:
+            raise ValueError("pack_k must be non-negative")
+        if {"_track_recall", "_include_vector_only_candidates"}.intersection(kwargs):
+            raise ValueError("internal recall controls are managed by recall_with_evidence_pack")
+
+        primary = self.recall(query, top_k=top_k, **kwargs)
+        candidates = self.recall(
+            query, top_k=candidate_k, _track_recall=False,
+            _include_vector_only_candidates=True, **kwargs
+        )
+        primary_rows = primary.get("results", []) if isinstance(primary, dict) else primary
+        candidate_rows = candidates.get("results", []) if isinstance(candidates, dict) else candidates
+        all_rows = primary_rows + candidate_rows
+        sessions: dict[tuple[str, str], str] = {}
+        for table, tier in (("working_memory", "working"), ("episodic_memory", "episodic")):
+            ids = list({str(row["id"]) for row in all_rows if row.get("tier") == tier and row.get("id") is not None})
+            if not ids:
+                continue
+            placeholders = ",".join("?" * len(ids))
+            rows = self.conn.execute(
+                f"SELECT id, session_id FROM {table} WHERE id IN ({placeholders})", ids
+            ).fetchall()
+            sessions.update(
+                {
+                    (tier, str(row["id"])): str(row["session_id"])
+                    for row in rows
+                    if row["session_id"] is not None
+                }
+            )
+        for row in all_rows:
+            session_id = sessions.get((str(row.get("tier")), str(row.get("id"))))
+            if session_id is not None:
+                row["session_id"] = session_id
+
+        from mnemosyne.core.evidence_packs import build_evidence_pack
+        return build_evidence_pack(primary_rows, candidate_rows, max_items=pack_k)
+
     def recall(self, query: str, top_k: int = 40, *,
                from_date: Optional[str] = None, to_date: Optional[str] = None,
                source: Optional[str] = None, topic: Optional[str] = None,
@@ -5463,7 +5515,9 @@ class BeamMemory:
                fts_weight: float = None,
                importance_weight: float = None,
                explain: bool = False,
-               _cross_session: Optional[bool] = None) -> List[Dict]:
+               _cross_session: Optional[bool] = None,
+               _track_recall: bool = True,
+               _include_vector_only_candidates: bool = False) -> List[Dict]:
         """
         Hybrid recall across working_memory + episodic_memory.
         Uses sqlite-vec + FTS5 for episodic, FTS5 for working.
@@ -5708,6 +5762,9 @@ class BeamMemory:
 
         # ---- Working memory (vector search) ----
         wm_vec_sims = {}
+        # Kept only for the opt-in evidence-pack candidate path. Primary
+        # recall remains lexical-gated and therefore ranking-identical.
+        wm_vec_ranks = {}
         if embeddings_available:
             try:
                 emb_result = _get_query_embedding()
@@ -5716,8 +5773,9 @@ class BeamMemory:
                                               k=max(top_k, 20) if _BEAM_MODE else max(top_k * 3, 50),
                                               where_sql=wm_where,
                                               where_params=tuple(wm_params))
-                    for vr in wm_vec:
+                    for vec_rank, vr in enumerate(wm_vec, start=1):
                         wm_vec_sims[vr["id"]] = vr["sim"]
+                        wm_vec_ranks[vr["id"]] = vec_rank
                         wm_ids.add(vr["id"])  # Merge vector results with FTS5 results
             except Exception:
                 logger.info("Regex extraction failed, skipping", exc_info=True)
@@ -5797,7 +5855,25 @@ class BeamMemory:
             else:
                 relevance = _lexical_relevance(query_words, row["content"], query_lower)
                 row_min_relevance = single_token_relevance if broad_multi_hit_query else min_relevance
-            if relevance >= row_min_relevance or (wm_ranks and len(query_words) <= 1 and relevance > 0):
+            vec_sim = wm_vec_sims.get(row["id"], 0.0)
+            vector_only_rank_eligible = (
+                _include_vector_only_candidates
+                and row["id"] in wm_vec_sims
+                and row["id"] not in wm_ranks
+                and wm_vec_ranks.get(row["id"], top_k + 1) <= top_k
+                # The evidence-only semantic path needs an absolute quality
+                # floor as well as a relative vector rank.  0.84 preserves the
+                # validated multi-session evidence while rejecting arbitrary
+                # nearest neighbours in small banks.
+                and vec_sim >= 0.84
+            )
+            if vector_only_rank_eligible:
+                relevance = max(relevance, vec_sim)
+            if (
+                relevance >= row_min_relevance
+                or (wm_ranks and len(query_words) <= 1 and relevance > 0)
+                or vector_only_rank_eligible
+            ):
                 decay = _recency_decay(row["timestamp"])
                 # Phase 4: configurable scoring for working memory
                 # keyword_share = (1 - importance_weight) * 0.6, recency_share = (1 - importance_weight) * 0.4
@@ -6618,7 +6694,7 @@ class BeamMemory:
             rec_scope = "(1=1)"
         else:
             rec_scope = _session_scope_filter(cross_session=cross_session)
-        if wm_ids:
+        if _track_recall and wm_ids:
             placeholders = ",".join("?" * len(wm_ids))
             rec_params = [now_iso, *tuple(wm_ids)]
             if channel_id:
@@ -6630,7 +6706,7 @@ class BeamMemory:
                 SET recall_count = recall_count + 1, last_recalled = ?
                 WHERE id IN ({placeholders}) AND {rec_scope}
             """, (*rec_params,))
-        if em_ids:
+        if _track_recall and em_ids:
             placeholders = ",".join("?" * len(em_ids))
             rec_params = [now_iso, *tuple(em_ids)]
             if channel_id:
