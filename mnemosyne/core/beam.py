@@ -5475,6 +5475,29 @@ class BeamMemory:
         )
         primary_rows = primary.get("results", []) if isinstance(primary, dict) else primary
         candidate_rows = candidates.get("results", []) if isinstance(candidates, dict) else candidates
+        # Keep consolidated originals available to normal recall for provenance,
+        # but do not let them compete with hot memories in supplemental packs.
+        # The candidate rows already passed recall()'s visibility filters.
+        working_candidate_ids = {
+            str(row["id"])
+            for row in candidate_rows
+            if row.get("tier") == "working" and row.get("id") is not None
+        }
+        if working_candidate_ids:
+            placeholders = ",".join("?" * len(working_candidate_ids))
+            consolidated_ids = {
+                str(row["id"])
+                for row in self.conn.execute(
+                    f"SELECT id FROM working_memory WHERE id IN ({placeholders}) "
+                    "AND consolidated_at IS NOT NULL",
+                    tuple(working_candidate_ids),
+                ).fetchall()
+            }
+            candidate_rows = [
+                row
+                for row in candidate_rows
+                if not (row.get("tier") == "working" and str(row.get("id")) in consolidated_ids)
+            ]
         all_rows = primary_rows + candidate_rows
         sessions: dict[tuple[str, str], str] = {}
         for table, tier in (("working_memory", "working"), ("episodic_memory", "episodic")):
@@ -5586,6 +5609,8 @@ class BeamMemory:
                 channel_id=channel_id,
                 veracity=veracity, memory_type=memory_type,
                 cross_session=cross_session,
+                _track_recall=_track_recall,
+                _include_vector_only_candidates=_include_vector_only_candidates,
             )
             if explain:
                 return {
@@ -5789,7 +5814,8 @@ class BeamMemory:
         # avoids double-counting against the kept-row accumulators.
         _wm_fallback_used = not wm_ids
         if _wm_fallback_used:
-            _recall_diag.record_fallback_used(wm=True)
+            if _track_recall:
+                _recall_diag.record_fallback_used(wm=True)
 
         if wm_ids:
             placeholders = ",".join("?" * len(wm_ids))
@@ -6423,7 +6449,8 @@ class BeamMemory:
             # rather than vec/FTS. High em_fallback_rate during a
             # benchmark means recall scores aren't measuring what
             # the experiment thinks they're measuring.
-            _recall_diag.record_fallback_used(em=True)
+            if _track_recall:
+                _recall_diag.record_fallback_used(em=True)
             cursor = self.conn.cursor()
             cursor.execute(f"""
                 SELECT rowid, id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, memory_type, binary_vector
@@ -6720,32 +6747,33 @@ class BeamMemory:
             """, (*rec_params,))
         self.conn.commit()
 
-        # [C4] Final tier-attribution records. Each counter holds the
-        # number of kept rows attributed to that tier on this call.
-        # Summing across tiers gives total kept rows for the call.
-        # `truly_empty` is gated on whether ANY layer (primary OR
-        # fallback) produced candidates -- distinct from "final
-        # results empty after top_k slicing / post-filter dropouts."
-        _recall_diag.record_tier_hits("wm_fts", _wm_fts_kept)
-        _recall_diag.record_tier_hits("wm_vec", _wm_vec_kept)
-        _recall_diag.record_tier_hits("wm_fallback", _wm_fallback_kept)
-        _recall_diag.record_tier_hits("em_fts", _em_fts_kept)
-        _recall_diag.record_tier_hits("em_vec", _em_vec_kept)
-        _recall_diag.record_tier_hits("em_fallback", _em_fallback_kept)
-        # truly_empty = final results empty AND no tier attributed
-        # a kept row. Distinguishes "post-filter dropouts" (some
-        # tier counted hits but they got filtered) from "no signal
-        # anywhere" (zero kept across all tiers). top_k=0 callers
-        # also land here, but that's an artifact of the caller's
-        # choice, not a recall failure -- operators wanting to
-        # exclude artifact cases can check top_k > 0 from their
-        # side.
-        _total_kept = (
-            _wm_fts_kept + _wm_vec_kept + _wm_fallback_kept
-            + _em_fts_kept + _em_vec_kept + _em_fallback_kept
-        )
-        _truly_empty = (len(final_results) == 0) and (_total_kept == 0)
-        _recall_diag.record_call(truly_empty=_truly_empty)
+        if _track_recall:
+            # [C4] Final tier-attribution records. Each counter holds the
+            # number of kept rows attributed to that tier on this call.
+            # Summing across tiers gives total kept rows for the call.
+            # `truly_empty` is gated on whether ANY layer (primary OR
+            # fallback) produced candidates -- distinct from "final
+            # results empty after top_k slicing / post-filter dropouts."
+            _recall_diag.record_tier_hits("wm_fts", _wm_fts_kept)
+            _recall_diag.record_tier_hits("wm_vec", _wm_vec_kept)
+            _recall_diag.record_tier_hits("wm_fallback", _wm_fallback_kept)
+            _recall_diag.record_tier_hits("em_fts", _em_fts_kept)
+            _recall_diag.record_tier_hits("em_vec", _em_vec_kept)
+            _recall_diag.record_tier_hits("em_fallback", _em_fallback_kept)
+            # truly_empty = final results empty AND no tier attributed
+            # a kept row. Distinguishes "post-filter dropouts" (some
+            # tier counted hits but they got filtered) from "no signal
+            # anywhere" (zero kept across all tiers). top_k=0 callers
+            # also land here, but that's an artifact of the caller's
+            # choice, not a recall failure -- operators wanting to
+            # exclude artifact cases can check top_k > 0 from their
+            # side.
+            _total_kept = (
+                _wm_fts_kept + _wm_vec_kept + _wm_fallback_kept
+                + _em_fts_kept + _em_vec_kept + _em_fallback_kept
+            )
+            _truly_empty = (len(final_results) == 0) and (_total_kept == 0)
+            _recall_diag.record_call(truly_empty=_truly_empty)
 
         # [Fact Recall Integration] Optionally merge LLM-extracted facts
         # into the standard recall output. Gated behind
@@ -7319,7 +7347,9 @@ class BeamMemory:
                            channel_id: Optional[str] = None,
                            veracity: Optional[str] = None,
                            memory_type: Optional[str] = None,
-                           cross_session: Optional[bool] = None) -> List[Dict]:
+                           cross_session: Optional[bool] = None,
+                           _track_recall: bool = True,
+                           _include_vector_only_candidates: bool = False) -> List[Dict]:
         """[E5] Polyphonic recall path.
 
         Delegates to PolyphonicRecallEngine when MNEMOSYNE_POLYPHONIC_RECALL=1.
@@ -7462,7 +7492,11 @@ class BeamMemory:
         # the linear path updates them and downstream features (decay
         # scheduling, importance reinforcement) depend on the signal.
         # /review caught the missing update as a silent telemetry loss.
-        if recalled_episodic_ids:
+        # Polyphonic recall is vector-backed by design, so vector-only
+        # candidates are already available on this path. Keep the private
+        # flag in the signature for parity with recall()'s internal caller.
+        del _include_vector_only_candidates
+        if _track_recall and recalled_episodic_ids:
             placeholders = ",".join("?" * len(recalled_episodic_ids))
             params = [now_iso, *recalled_episodic_ids, *_rec_scope_params()]
             self.conn.execute(
@@ -7470,7 +7504,7 @@ class BeamMemory:
                 f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
                 tuple(params),
             )
-        if recalled_working_ids:
+        if _track_recall and recalled_working_ids:
             placeholders = ",".join("?" * len(recalled_working_ids))
             params = [now_iso, *recalled_working_ids, *_rec_scope_params()]
             self.conn.execute(
@@ -7478,7 +7512,7 @@ class BeamMemory:
                 f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
                 tuple(params),
             )
-        if recalled_episodic_ids or recalled_working_ids:
+        if _track_recall and (recalled_episodic_ids or recalled_working_ids):
             self.conn.commit()
 
         # --- MEMORIA structured fact supplement (polyphonic path) ---

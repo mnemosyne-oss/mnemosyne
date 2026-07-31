@@ -98,6 +98,32 @@ def test_candidate_without_stable_id_is_not_emitted():
     assert packed["evidence_pack"] == []
 
 
+def test_candidate_with_empty_id_is_not_emitted():
+    packed = build_evidence_pack([], [{"id": "", "session_id": "s", "timestamp": "2024-05-01"}])
+    assert packed["evidence_pack"] == []
+
+
+def test_tier_qualified_ids_are_distinct_candidates():
+    primary = [{"id": "shared", "tier": "working", "session_id": "primary", "timestamp": 1}]
+    candidates = [{"id": "shared", "tier": "episodic", "session_id": "candidate", "timestamp": 2}]
+
+    packed = build_evidence_pack(primary, candidates)
+
+    assert [row["id"] for row in packed["evidence_pack"]] == ["shared"]
+    assert packed["evidence_pack"][0]["tier"] == "episodic"
+
+
+def test_invalid_candidate_does_not_hide_later_valid_same_id():
+    packed = build_evidence_pack(
+        [],
+        [
+            {"id": "shared", "tier": "working", "timestamp": 1},
+            {"id": "shared", "tier": "working", "session_id": "valid", "timestamp": 2},
+        ],
+    )
+    assert [row["session_id"] for row in packed["evidence_pack"]] == ["valid"]
+
+
 def test_zero_capacity_returns_no_supplemental_evidence():
     packed = build_evidence_pack([], [_row("c", "s", "2024-05-01")], max_items=0)
     assert packed == {"primary": [], "evidence_pack": []}

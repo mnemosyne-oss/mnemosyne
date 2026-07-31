@@ -78,16 +78,14 @@ def build_evidence_pack(
     for candidate_rank, raw_row in enumerate(candidates, start=1):
         if len(selected) >= max_items:
             break
-        row = deepcopy(dict(raw_row))
-        row_id = row.get("id")
+        row_id = raw_row.get("id")
         # A pack needs a stable provenance handle. Do not invent one.
-        if row_id is None:
+        if row_id in (None, ""):
             continue
-        row_identity = _row_identity(row)
+        row_identity = _row_identity(raw_row)
         if row_identity in seen_ids:
             continue
-        seen_ids.add(row_identity)
-        group_value = row.get(group_key)
+        group_value = raw_row.get(group_key)
         # Evidence packs must preserve session provenance. Unknown tiers or
         # incomplete rows fail closed rather than appearing as unique groups.
         if group_value in (None, ""):
@@ -95,6 +93,8 @@ def build_evidence_pack(
         group = ("group", str(group_value))
         if group in seen_groups:
             continue
+        row = deepcopy(dict(raw_row))
+        seen_ids.add(row_identity)
         seen_groups.add(group)
         row["evidence_rank"] = candidate_rank
         selected.append(row)

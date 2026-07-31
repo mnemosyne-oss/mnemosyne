@@ -8,6 +8,7 @@ import pytest
 
 from mnemosyne.core.beam import BeamMemory
 from mnemosyne.core import beam as beam_module
+from mnemosyne.core.recall_diagnostics import get_recall_diagnostics, reset_recall_diagnostics
 
 
 def _state(db_path: Path, memory_id: str) -> tuple[int, str | None]:
@@ -94,7 +95,8 @@ def test_evidence_pack_keeps_primary_ranking_and_bounds_supplement(tmp_path: Pat
     packed = beam.recall_with_evidence_pack("Orion evidence", top_k=2, candidate_k=4, pack_k=1)
 
     assert [row["id"] for row in packed["primary"]] == [row["id"] for row in primary]
-    assert len(packed["evidence_pack"]) <= 1
+    # Primary already claims this only session, so no supplemental group remains.
+    assert packed["evidence_pack"] == []
     assert {row["id"] for row in packed["primary"]}.isdisjoint(
         {row["id"] for row in packed["evidence_pack"]}
     )
@@ -128,6 +130,72 @@ def test_cross_session_scope_can_produce_a_supplemental_pack(tmp_path: Path):
     assert len(packed["evidence_pack"]) == 1
     assert [row["evidence_rank"] for row in packed["evidence_pack"]] == [2]
     assert second_id in {row["id"] for row in packed["primary"] + packed["evidence_pack"]}
+
+
+def test_evidence_pack_excludes_consolidated_working_candidates(tmp_path: Path):
+    db_path = tmp_path / "consolidated-evidence.db"
+    reader = BeamMemory(session_id="reader", db_path=db_path)
+    primary = BeamMemory(session_id="primary", db_path=db_path)
+    consolidated = BeamMemory(session_id="consolidated", db_path=db_path)
+    hot = BeamMemory(session_id="hot", db_path=db_path)
+    primary.remember("Orion consolidated evidence primary", source="test", importance=0.9, scope="global")
+    consolidated_id = consolidated.remember(
+        "Orion consolidated evidence historical", source="test", importance=0.8, scope="global"
+    )
+    hot_id = hot.remember("Orion consolidated evidence hot", source="test", importance=0.7, scope="global")
+    reader.conn.execute(
+        "UPDATE working_memory SET consolidated_at = ? WHERE id = ?",
+        ("2026-01-01T00:00:00", consolidated_id),
+    )
+    reader.conn.commit()
+
+    packed = reader.recall_with_evidence_pack(
+        "Orion consolidated evidence", top_k=1, candidate_k=5, pack_k=5, _cross_session=True
+    )
+    evidence_ids = {row["id"] for row in packed["evidence_pack"]}
+    assert consolidated_id not in evidence_ids
+    assert hot_id in evidence_ids
+
+
+def test_candidate_only_linear_recall_does_not_mutate_diagnostics(tmp_path: Path):
+    db_path = tmp_path / "diagnostics.db"
+    beam = BeamMemory(session_id="diagnostics", db_path=db_path)
+    beam.remember("Orion diagnostics candidate fixture", source="test", importance=0.8)
+    reset_recall_diagnostics()
+
+    before = get_recall_diagnostics()
+    beam.recall("Orion diagnostics", top_k=5, _track_recall=False)
+    after = get_recall_diagnostics()
+    assert after["totals"] == before["totals"]
+    assert after["by_tier"] == before["by_tier"]
+
+
+def test_evidence_pack_polyphonic_candidate_only_pass_is_telemetry_neutral(tmp_path: Path, monkeypatch):
+    from mnemosyne.core.polyphonic_recall import PolyphonicResult
+
+    class FakeEngine:
+        def __init__(self, results):
+            self.results = results
+
+        def recall(self, *, query, query_embedding, top_k):
+            return self.results
+
+    db_path = tmp_path / "polyphonic-telemetry.db"
+    beam = BeamMemory(session_id="polyphonic", db_path=db_path)
+    memory_id = beam.remember("Orion polyphonic candidate fixture", source="test", importance=0.8)
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+    monkeypatch.setattr(
+        beam,
+        "_get_polyphonic_engine",
+        lambda: FakeEngine([PolyphonicResult(memory_id=memory_id, combined_score=0.9, voice_scores={}, metadata={})]),
+    )
+
+    before = _state(db_path, memory_id)
+    beam.recall_with_evidence_pack("Orion polyphonic", top_k=1, candidate_k=2, pack_k=1)
+    after = _state(db_path, memory_id)
+    # The public primary call records one use; the wider internal candidate call records none.
+    assert after[0] == before[0] + 1
+    assert after[1] is not None
 
 
 def test_vector_only_candidate_is_opt_in(tmp_path: Path, monkeypatch):
