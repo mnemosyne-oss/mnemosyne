@@ -28,8 +28,10 @@ LABEL org.opencontainers.image.description="Universal memory layer MCP server fo
 LABEL org.opencontainers.image.source="https://github.com/AxDSan/mnemosyne"
 LABEL org.opencontainers.image.licenses="MIT"
 
-# Install Mnemosyne with MCP + SSE extras
-RUN pip install --no-cache-dir "mnemosyne-memory[mcp]"
+# Install this checkout with MCP + SSE extras so locally built images contain
+# the source that was used to build them.
+COPY . /opt/mnemosyne
+RUN pip install --no-cache-dir "/opt/mnemosyne[mcp]"
 
 # Default data directory (overridable via MNEMOSYNE_DATA_DIR env var)
 ENV MNEMOSYNE_DATA_DIR=/data
