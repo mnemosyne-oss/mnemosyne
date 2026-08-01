@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 import importlib.util
 
 import pytest
@@ -45,6 +45,56 @@ async def _streamable_http_client(app):
             base_url="http://127.0.0.1:8000",
         ) as client:
             yield client
+
+
+def _get_scope(session_id: str) -> dict[str, object]:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"127.0.0.1:8000"),
+            (b"accept", b"text/event-stream"),
+            (b"mcp-session-id", session_id.encode("latin-1")),
+        ],
+        "client": ("127.0.0.1", 1234),
+        "server": ("127.0.0.1", 8000),
+        "root_path": "",
+    }
+
+
+async def _capture_response_start(app, scope: dict[str, object]) -> list[dict[str, object]]:
+    messages: list[dict[str, object]] = []
+    response_started = asyncio.Event()
+    request_sent = False
+    disconnected = asyncio.Event()
+
+    async def receive() -> dict[str, object]:
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, object]) -> None:
+        messages.append(message)
+        if message["type"] == "http.response.start":
+            response_started.set()
+
+    task = asyncio.create_task(app(scope, receive, send))
+    try:
+        await asyncio.wait_for(response_started.wait(), timeout=1)
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+    return messages
 
 
 def test_streamable_http_initializes_lists_tools_calls_stats_and_terminates(
@@ -106,6 +156,25 @@ def test_streamable_http_non_loopback_requires_bearer_token(
         _build_streamable_http_app(host="0.0.0.0")
 
 
+def test_streamable_http_get_accepts_initialized_session() -> None:
+    """An initialized session accepts a server-initiated GET SSE stream."""
+    from mnemosyne.mcp_server import _build_streamable_http_app
+
+    app = _build_streamable_http_app(host="127.0.0.1")
+
+    async def exercise() -> list[dict[str, object]]:
+        async with _streamable_http_client(app) as client:
+            response = await client.post("/mcp", headers=_mcp_headers(), json=_initialize_request())
+            assert response.status_code == 200
+            return await _capture_response_start(app, _get_scope(response.headers["mcp-session-id"]))
+
+    messages = asyncio.run(exercise())
+    response_start = next(message for message in messages if message["type"] == "http.response.start")
+    assert response_start["status"] == 200
+    headers = dict(response_start["headers"])
+    assert headers[b"content-type"].startswith(b"text/event-stream")
+
+
 def test_streamable_http_delete_removes_session_from_manager() -> None:
     """Explicit DELETE removes the terminated session from SDK registries."""
     from mnemosyne.mcp_server import _build_streamable_http_app
@@ -130,6 +199,31 @@ def test_streamable_http_delete_removes_session_from_manager() -> None:
             assert session_id not in manager._session_owners
 
     asyncio.run(exercise())
+
+
+def test_streamable_http_idle_session_is_reaped() -> None:
+    """An idle Streamable HTTP session expires and then returns 404."""
+    from mnemosyne.mcp_server import _build_streamable_http_app
+
+    app = _build_streamable_http_app(host="127.0.0.1", session_idle_timeout=0.05)
+
+    async def exercise() -> object:
+        async with _streamable_http_client(app) as client:
+            response = await client.post("/mcp", headers=_mcp_headers(), json=_initialize_request())
+            assert response.status_code == 200
+            session_headers = {**_mcp_headers(), "Mcp-Session-Id": response.headers["mcp-session-id"]}
+            tools = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+            response = None
+            for _ in range(20):
+                await asyncio.sleep(0.05)
+                response = await client.post("/mcp", headers=session_headers, json=tools)
+                if response.status_code == 404:
+                    break
+            return response
+
+    response = asyncio.run(exercise())
+    assert response is not None
+    assert response.status_code == 404
 
 
 def test_streamable_http_loopback_rejects_dns_rebinding_headers() -> None:
@@ -171,6 +265,29 @@ def test_streamable_http_non_loopback_rejects_missing_bearer_token(
     assert response.status_code == 401
     assert response.headers["www-authenticate"] == "Bearer"
     assert response.json() == {"error": "missing bearer token"}
+
+
+def test_streamable_http_non_loopback_rejects_invalid_bearer_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-empty but incorrect bearer token is rejected."""
+    from mnemosyne.mcp_server import _build_streamable_http_app
+
+    monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "test-token")
+    app = _build_streamable_http_app(host="0.0.0.0")
+
+    async def exercise():
+        async with _streamable_http_client(app) as client:
+            return await client.post(
+                "/mcp",
+                headers={"Authorization": "Bearer wrong-token"},
+                json={},
+            )
+
+    response = asyncio.run(exercise())
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.json() == {"error": "invalid bearer token"}
 
 
 def test_streamable_http_rejects_unknown_session_id() -> None:

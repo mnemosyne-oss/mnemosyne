@@ -94,10 +94,11 @@ The built-in help lists only `hygiene audit|clean`; `status` and `restore` exist
 
 | Command | Usage |
 |---|---|
-| `mcp` | `mcp [--transport stdio\|sse\|streamable-http] [--port 8080] [--bank NAME]`. Starts the MCP server |
+| `mcp` | `mcp [--transport stdio\|sse\|streamable-http] [--host HOST] [--port 8080] [--bank NAME]`. Starts the MCP server |
 
 stdio is the default transport. A non-loopback network transport bind requires
 `MNEMOSYNE_MCP_TOKEN`.
+The host defaults to `127.0.0.1`.
 
 ## Aliases
 

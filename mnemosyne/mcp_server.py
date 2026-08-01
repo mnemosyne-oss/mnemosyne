@@ -253,15 +253,26 @@ def _build_authenticated_mcp_app(routes, host: str, transport_name: str):
     return Starlette(routes=routes, middleware=middleware)
 
 
-def _build_streamable_http_app(host: str = "127.0.0.1"):
+def _build_streamable_http_app(
+    host: str = "127.0.0.1",
+    *,
+    session_idle_timeout: float = 1800,
+):
     """Build a stateful Streamable HTTP app mounted at ``/mcp``."""
     if not _MCP_AVAILABLE:
         raise RuntimeError("MCP not installed. Run: pip install mnemosyne-memory[mcp]")
 
     from contextlib import asynccontextmanager
-    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-    from mcp.server.transport_security import TransportSecuritySettings
-    from starlette.routing import Route
+
+    try:
+        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+        from mcp.server.transport_security import TransportSecuritySettings
+        from starlette.routing import Route
+    except ImportError as exc:
+        raise RuntimeError(
+            "Streamable HTTP transport requires starlette and a recent MCP SDK. "
+            "Run: pip install starlette uvicorn 'mcp>=2.0.0,<3'"
+        ) from exc
 
     security_settings = None
     if _is_loopback(host):
@@ -284,7 +295,7 @@ def _build_streamable_http_app(host: str = "127.0.0.1"):
     manager = StreamableHTTPSessionManager(
         _build_mcp_server(),
         security_settings=security_settings,
-        session_idle_timeout=1800,
+        session_idle_timeout=session_idle_timeout,
     )
 
     @asynccontextmanager
@@ -309,12 +320,16 @@ def _build_streamable_http_app(host: str = "127.0.0.1"):
             await manager.handle_request(scope, receive, send)
         finally:
             if session_id is not None:
-                transport = manager._server_instances.get(session_id)
-                if transport is not None and transport.is_terminated:
-                    # MCP SDK 2.0.0 terminates on DELETE but does not
-                    # unregister the transport or its authorization owner.
-                    manager._server_instances.pop(session_id, None)
-                    manager._session_owners.pop(session_id, None)
+                # MCP SDK 2.x does not consistently unregister a transport
+                # after DELETE. These private registries are guarded because
+                # cleanup is best effort across supported SDK releases.
+                server_instances = getattr(manager, "_server_instances", None)
+                session_owners = getattr(manager, "_session_owners", None)
+                if isinstance(server_instances, dict) and isinstance(session_owners, dict):
+                    transport = server_instances.get(session_id)
+                    if transport is not None and getattr(transport, "is_terminated", False):
+                        server_instances.pop(session_id, None)
+                        session_owners.pop(session_id, None)
 
     class _StreamableHTTPRoute:
         """Keep the ASGI handler on the exact Streamable HTTP endpoint."""

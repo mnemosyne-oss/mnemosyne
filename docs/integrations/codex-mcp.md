@@ -34,7 +34,8 @@ proxy or private tunnel; the bearer token must not travel over plain HTTP. Start
 the service with a token when it is bound outside loopback:
 
 ```bash
-MNEMOSYNE_MCP_TOKEN="$MNEMOSYNE_MCP_TOKEN" mnemosyne mcp \
+export MNEMOSYNE_MCP_TOKEN="replace-with-a-random-secret"
+mnemosyne mcp \
   --transport streamable-http --host 0.0.0.0 --port 8080
 ```
 
