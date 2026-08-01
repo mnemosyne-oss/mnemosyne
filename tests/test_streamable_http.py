@@ -214,6 +214,8 @@ def test_streamable_http_idle_session_is_reaped() -> None:
             session_id = response.headers["mcp-session-id"]
             session_headers = {**_mcp_headers(), "Mcp-Session-Id": session_id}
             manager = app.state.streamable_http_manager
+            assert session_id in manager._server_instances
+            # Loopback requests are anonymous, so no session owner is stored.
             tools = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
             deadline = asyncio.get_running_loop().time() + 2
             while session_id in manager._server_instances:
@@ -221,6 +223,7 @@ def test_streamable_http_idle_session_is_reaped() -> None:
                     raise AssertionError("idle session was not reaped")
                 await asyncio.sleep(0.01)
 
+            assert session_id not in manager._server_instances
             assert session_id not in manager._session_owners
             return await client.post("/mcp", headers=session_headers, json=tools)
 

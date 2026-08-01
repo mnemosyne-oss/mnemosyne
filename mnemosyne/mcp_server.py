@@ -202,7 +202,7 @@ def _build_sse_app(host: str = "127.0.0.1"):
     return _build_authenticated_mcp_app(routes, host=host, transport_name="SSE")
 
 
-def _build_authenticated_mcp_app(routes, host: str, transport_name: str):
+def _build_authenticated_mcp_app(routes, host: str, transport_name: str, lifespan=None):
     """Wrap MCP ASGI routes with the shared non-buffering bearer middleware."""
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
@@ -250,7 +250,7 @@ def _build_authenticated_mcp_app(routes, host: str, transport_name: str):
         logger.info("MCP %s bearer-token auth enabled (host=%s).", transport_name, host)
     else:
         logger.info("MCP %s running loopback-only (host=%s); no auth required.", transport_name, host)
-    return Starlette(routes=routes, middleware=middleware)
+    return Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
 
 
 def _build_streamable_http_app(
@@ -350,9 +350,9 @@ def _build_streamable_http_app(
         ],
         host=host,
         transport_name="Streamable HTTP",
+        lifespan=lifespan,
     )
     app.state.streamable_http_manager = manager
-    app.router.lifespan_context = lifespan
     return app
 
 
