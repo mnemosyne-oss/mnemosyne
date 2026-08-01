@@ -238,20 +238,31 @@ def test_streamable_http_loopback_rejects_dns_rebinding_headers() -> None:
 
     app = _build_streamable_http_app(host="127.0.0.1")
 
-    async def exercise():
+    async def exercise() -> tuple[object, object]:
         async with _streamable_http_client(app) as client:
-            return await client.post(
+            invalid_host = await client.post(
                 "/mcp",
                 headers={
                     **_mcp_headers(),
                     "Host": "evil.example",
+                    "Origin": "http://127.0.0.1:8000",
+                },
+                json=_initialize_request(),
+            )
+            invalid_origin = await client.post(
+                "/mcp",
+                headers={
+                    **_mcp_headers(),
+                    "Host": "127.0.0.1:8000",
                     "Origin": "http://evil.example",
                 },
                 json=_initialize_request(),
             )
+            return invalid_host, invalid_origin
 
-    response = asyncio.run(exercise())
-    assert response.status_code == 421
+    invalid_host, invalid_origin = asyncio.run(exercise())
+    assert invalid_host.status_code == 421
+    assert invalid_origin.status_code == 403
 
 
 def test_streamable_http_non_loopback_rejects_missing_bearer_token(
@@ -294,6 +305,36 @@ def test_streamable_http_non_loopback_rejects_invalid_bearer_token(
     assert response.status_code == 401
     assert response.headers["www-authenticate"] == "Bearer"
     assert response.json() == {"error": "invalid bearer token"}
+
+
+def test_streamable_http_non_loopback_accepts_valid_bearer_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid bearer token initializes and operates an MCP session."""
+    from mnemosyne.mcp_server import _build_streamable_http_app
+
+    monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "test-token")
+    app = _build_streamable_http_app(host="0.0.0.0")
+
+    async def exercise() -> tuple[object, object]:
+        async with _streamable_http_client(app) as client:
+            headers = {**_mcp_headers(), "Authorization": "bearer test-token"}
+            initialized = await client.post(
+                "/mcp", headers=headers, json=_initialize_request()
+            )
+            session_id = initialized.headers["mcp-session-id"]
+            tools = await client.post(
+                "/mcp",
+                headers={**headers, "Mcp-Session-Id": session_id},
+                json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            )
+            return initialized, tools
+
+    initialized, tools = asyncio.run(exercise())
+    assert initialized.status_code == 200
+    assert initialized.headers["mcp-session-id"]
+    assert tools.status_code == 200
+    assert "mnemosyne_stats" in tools.text
 
 
 def test_streamable_http_rejects_unknown_session_id() -> None:

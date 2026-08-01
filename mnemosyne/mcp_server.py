@@ -228,7 +228,8 @@ def _build_authenticated_mcp_app(routes, host: str, transport_name: str, lifespa
                     (v.decode("latin-1") for k, v in scope.get("headers", []) if k == b"authorization"),
                     "",
                 )
-                if not header.startswith("Bearer "):
+                scheme, _, credentials = header.partition(" ")
+                if scheme.casefold() != "bearer":
                     response = JSONResponse(
                         {"error": "missing bearer token"},
                         status_code=401,
@@ -236,7 +237,7 @@ def _build_authenticated_mcp_app(routes, host: str, transport_name: str, lifespa
                     )
                     await response(scope, receive, send)
                     return
-                if not hmac.compare_digest(header[len("Bearer "):].strip(), expected):
+                if not hmac.compare_digest(credentials.strip(), expected):
                     response = JSONResponse(
                         {"error": "invalid bearer token"},
                         status_code=401,
@@ -280,15 +281,23 @@ def _build_streamable_http_app(
             enable_dns_rebinding_protection=True,
             allowed_hosts=[
                 "127.0.0.1:*",
+                "127.0.0.1",
                 "localhost:*",
+                "localhost",
                 "[::1]:*",
+                "[::1]",
                 "ip6-localhost:*",
+                "ip6-localhost",
             ],
             allowed_origins=[
                 "http://127.0.0.1:*",
+                "http://127.0.0.1",
                 "http://localhost:*",
+                "http://localhost",
                 "http://[::1]:*",
+                "http://[::1]",
                 "http://ip6-localhost:*",
+                "http://ip6-localhost",
             ],
         )
 
