@@ -76,7 +76,7 @@
 | **OpenClaw** | Native provider | `pip install mnemosyne-memory[openclaw]` |
 | **Hermes Agent** | MCP + Plugin | Native -- ships enabled |
 | **Hermes Tweet** | Companion plugin | Add [Hermes Tweet](https://github.com/Xquik-dev/hermes-tweet) when remembered sessions need X/Twitter post, account, trend, or search context |
-| **Any MCP client** | MCP (stdio/SSE) | One config line |
+| **Any MCP client** | MCP (stdio/SSE/Streamable HTTP) | One config line |
 | **Any Python agent** | Direct SDK | `import mnemosyne` |
 
 See [docs/integrations/](docs/integrations/README.md) for complete setup guides per platform.
@@ -176,8 +176,9 @@ If Mnemosyne is installed in an isolated venv, activate that venv or invoke its 
 
 ```bash
 # MCP server (works with any MCP client)
-mnemosyne mcp                          # stdio (default)
-mnemosyne mcp --transport sse --port 8080  # SSE (web clients)
+mnemosyne mcp                              # stdio (default)
+mnemosyne mcp --transport sse --port 8080  # legacy SSE (web clients)
+mnemosyne mcp --transport streamable-http --port 8080  # Streamable HTTP at /mcp
 
 # Direct memory ops
 mnemosyne store "User likes dark mode"

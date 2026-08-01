@@ -25,6 +25,16 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 - **File-import dry run.** File-import `--dry-run` now passes through the core, MCP, both Hermes providers, and CLI surfaces to clone-based validation without changing the active database or audit data. Dry-run responses report `"status": "dry_run"` so clients cannot mistake simulated import statistics for a completed import.
 - **Model-refresh confidence: NaN cleared every gate and legacy text crashed sleep mid-batch.** JSON round-trips NaN and Infinity, and `parse_model_update_proposals` clamped NaN to 1.0 (`min` and `max` keep their first argument when a NaN comparison is False), so a NaN-confidence proposal became a top-importance memory; the auto-apply gate's `confidence < minimum` check is also False for NaN, so the same proposal reached the canonical store regardless of threshold. Separately, `apply_model_refresh_proposal` and sleep()'s proposal-remember call site converted stored confidence with a bare `float()`, so a legacy bank's text value (for example `"high"`) raised ValueError. The sleep call site runs after the claim commit, so that raise stranded the group's `consolidation_claimed_at` and orphaned every later group's claimed rows. Non-numeric and non-finite confidence now degrades per site: skipped at parse, 0.0 at the auto-apply gate, 0.5 at apply and at proposal importance. Finite values outside [0.0, 1.0] clamp to the domain bound on every path before auto-apply threshold checks and canonical storage, so a persisted 2.0 cannot remain unbounded. Hardening split out of #546 per review.
 
+## [3.16.0] - 2026-08-01
+
+### Added
+
+- **Streamable HTTP MCP transport.** `mnemosyne mcp --transport streamable-http`
+  serves stateful MCP Streamable HTTP at `/mcp`, alongside the existing stdio
+  and legacy SSE transports. It uses the MCP SDK session manager for session
+  creation, routing, and explicit DELETE termination; network-exposed binds
+  retain the existing `MNEMOSYNE_MCP_TOKEN` bearer-token requirement.
+
 ## [3.15.1] - 2026-07-30
 
 ### Fixed

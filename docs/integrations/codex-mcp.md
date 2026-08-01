@@ -26,6 +26,27 @@ pip install "mnemosyne-memory[mcp]"
 
 3. Restart Codex CLI. Tools appear automatically.
 
+## Remote Streamable HTTP
+
+For a running Mnemosyne service, use its Streamable HTTP endpoint rather than
+spawning a local stdio process. Put the service behind a TLS-terminating reverse
+proxy or private tunnel; the bearer token must not travel over plain HTTP. Start
+the service with a token when it is bound outside loopback:
+
+```bash
+MNEMOSYNE_MCP_TOKEN="$MNEMOSYNE_MCP_TOKEN" mnemosyne mcp \
+  --transport streamable-http --host 0.0.0.0 --port 8080
+```
+
+Then configure Codex with the `/mcp` URL and the environment variable holding
+the same bearer token:
+
+```toml
+[mcp_servers.mnemosyne]
+url = "https://mnemosyne.example.com/mcp"
+bearer_token_env_var = "MNEMOSYNE_MCP_TOKEN"
+```
+
 ## Usage
 
 Ask Codex:

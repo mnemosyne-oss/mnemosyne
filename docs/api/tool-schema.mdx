@@ -13,7 +13,7 @@ generated_at: "auto"
 > Source: `mnemosyne/tool_schemas.py` and `mnemosyne/mcp_tools.py`.
 > Regenerate with `python3 scripts/generate-docs.py`.
 
-Mnemosyne declares **36 tools**. Of those, **28 are callable over MCP** (stdio and SSE), and **8 are implemented only in the Hermes provider** and are not reachable through the MCP server.
+Mnemosyne declares **36 tools**. Of those, **28 are callable over MCP** (stdio, SSE, and Streamable HTTP), and **8 are implemented only in the Hermes provider** and are not reachable through the MCP server.
 
 The split is real and worth respecting: calling a plugin-only tool over MCP raises `Unknown tool`. The counts above are derived from `mnemosyne/mcp_tools.py::_TOOL_HANDLERS`, so they cannot drift from the code.
 

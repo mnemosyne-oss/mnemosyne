@@ -1,5 +1,5 @@
 """
-Mnemosyne MCP Server -- stdio and SSE transports.
+Mnemosyne MCP Server -- stdio, legacy SSE, and Streamable HTTP transports.
 
 Usage:
     # stdio (default) -- for Claude Desktop, etc.
@@ -12,11 +12,14 @@ Usage:
     MNEMOSYNE_MCP_TOKEN=my-secret-token mnemosyne mcp \\
         --transport sse --host 0.0.0.0 --port 8080
 
+    # Streamable HTTP on loopback -- DNS-rebinding protection enabled
+    mnemosyne mcp --transport streamable-http --port 8080
+
     # Specific bank
     mnemosyne mcp --bank project_a
 
 Security note (S1, 2026-05-12):
-    The SSE transport defaults to host=127.0.0.1 (loopback only). Binding
+    Network MCP transports default to host=127.0.0.1 (loopback only). Binding
     to a non-loopback address (0.0.0.0, a LAN IP, etc.) requires the env
     var MNEMOSYNE_MCP_TOKEN to be set; clients must then send
     ``Authorization: Bearer <token>`` on every request. Without the token
@@ -65,8 +68,8 @@ def _is_loopback(host: str) -> bool:
     return host.strip().lower() in _LOOPBACK_HOSTS
 
 
-def _resolve_sse_auth(host: str) -> Tuple[bool, Optional[str]]:
-    """Decide whether SSE needs bearer-token auth and what the token is.
+def _resolve_mcp_auth(host: str) -> Tuple[bool, Optional[str]]:
+    """Decide whether a network-exposed MCP transport needs bearer auth.
 
     Returns (require_auth, token). Raises RuntimeError when host is
     non-loopback and the MNEMOSYNE_MCP_TOKEN env var is unset/empty --
@@ -77,13 +80,18 @@ def _resolve_sse_auth(host: str) -> Tuple[bool, Optional[str]]:
     token = (os.environ.get(_TOKEN_ENV) or "").strip()
     if not token:
         raise RuntimeError(
-            f"Refusing to bind MCP SSE on non-loopback host {host!r} without "
+            f"Refusing to bind MCP transport on non-loopback host {host!r} without "
             f"authentication. Set the {_TOKEN_ENV} env var to a strong random "
             f"secret and have clients send 'Authorization: Bearer <token>' on "
             f"each request. Or bind to 127.0.0.1 (the default) for local-only "
             f"use."
         )
     return (True, token)
+
+
+def _resolve_sse_auth(host: str) -> Tuple[bool, Optional[str]]:
+    """Backward-compatible name for the shared MCP transport auth policy."""
+    return _resolve_mcp_auth(host)
 
 
 # ---------------------------------------------------------------------------
@@ -164,17 +172,13 @@ def _build_sse_app(host: str = "127.0.0.1"):
 
     try:
         from mcp.server.sse import SseServerTransport
-        from starlette.applications import Starlette
         from starlette.routing import Mount, Route
-        from starlette.middleware import Middleware
         from starlette.responses import JSONResponse
     except ImportError:
         raise RuntimeError(
             "SSE transport requires starlette and uvicorn. "
             "Run: pip install starlette uvicorn"
         )
-
-    require_auth, token = _resolve_sse_auth(host)
 
     # Trailing slash required: SseServerTransport emits POST URIs as
     # /messages/ and Starlette Mount path-prefix matching needs it to
@@ -187,23 +191,31 @@ def _build_sse_app(host: str = "127.0.0.1"):
             await server.run(streams[0], streams[1], server.create_initialization_options())
         return JSONResponse({})
 
+    routes = [
+        Route("/sse", endpoint=handle_sse, methods=["GET"]),
+        # transport.handle_post_message is an ASGI callable, not a
+        # request-response endpoint. Mount (not Route) is required so
+        # Starlette passes scope/receive/send directly without wrapping
+        # the response. The trailing slash must match the transport path.
+        Mount("/messages/", app=transport.handle_post_message),
+    ]
+    return _build_authenticated_mcp_app(routes, host=host, transport_name="SSE")
+
+
+def _build_authenticated_mcp_app(routes, host: str, transport_name: str):
+    """Wrap MCP ASGI routes with the shared non-buffering bearer middleware."""
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.responses import JSONResponse
+
+    require_auth, token = _resolve_mcp_auth(host)
     middleware = []
     if require_auth:
+        assert token is not None
         expected = token
 
         class _BearerTokenMiddleware:
-            """Pure-ASGI bearer auth middleware.
-
-            BaseHTTPMiddleware buffers the full response body before
-            forwarding it to the client. SseServerTransport writes
-            directly to the raw ASGI send callable, so
-            BaseHTTPMiddleware raises:
-              AssertionError: Unexpected message: http.response.start
-            on every SSE connect, terminating the stream immediately.
-
-            This pure-ASGI implementation forwards scope/receive/send
-            untouched after auth so SSE frames are never buffered.
-            """
+            """Pure-ASGI bearer authentication safe for streamed responses."""
 
             def __init__(self, app):
                 self.app = app
@@ -212,62 +224,125 @@ def _build_sse_app(host: str = "127.0.0.1"):
                 if scope.get("type") != "http":
                     await self.app(scope, receive, send)
                     return
-                header = ""
-                for k, v in scope.get("headers", []):
-                    if k == b"authorization":
-                        header = v.decode("latin-1")
-                        break
+                header = next(
+                    (v.decode("latin-1") for k, v in scope.get("headers", []) if k == b"authorization"),
+                    "",
+                )
                 if not header.startswith("Bearer "):
-                    resp = JSONResponse(
+                    response = JSONResponse(
                         {"error": "missing bearer token"},
                         status_code=401,
                         headers={"WWW-Authenticate": "Bearer"},
                     )
-                    await resp(scope, receive, send)
+                    await response(scope, receive, send)
                     return
-                presented = header[len("Bearer "):].strip()
-                if not hmac.compare_digest(presented, expected):
-                    resp = JSONResponse(
+                if not hmac.compare_digest(header[len("Bearer "):].strip(), expected):
+                    response = JSONResponse(
                         {"error": "invalid bearer token"},
                         status_code=401,
                         headers={"WWW-Authenticate": "Bearer"},
                     )
-                    await resp(scope, receive, send)
+                    await response(scope, receive, send)
                     return
                 await self.app(scope, receive, send)
 
         middleware.append(Middleware(_BearerTokenMiddleware))
-        logger.info(
-            "MCP SSE bearer-token auth enabled (host=%s). Clients must send "
-            "'Authorization: Bearer <token>' on every request.",
-            host,
-        )
+        logger.info("MCP %s bearer-token auth enabled (host=%s).", transport_name, host)
     else:
-        logger.info(
-            "MCP SSE running loopback-only (host=%s); no auth required.",
-            host,
+        logger.info("MCP %s running loopback-only (host=%s); no auth required.", transport_name, host)
+    return Starlette(routes=routes, middleware=middleware)
+
+
+def _build_streamable_http_app(host: str = "127.0.0.1"):
+    """Build a stateful Streamable HTTP app mounted at ``/mcp``."""
+    if not _MCP_AVAILABLE:
+        raise RuntimeError("MCP not installed. Run: pip install mnemosyne-memory[mcp]")
+
+    from contextlib import asynccontextmanager
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+    from mcp.server.transport_security import TransportSecuritySettings
+    from starlette.routing import Route
+
+    security_settings = None
+    if _is_loopback(host):
+        security_settings = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[
+                "127.0.0.1:*",
+                "localhost:*",
+                "[::1]:*",
+                "ip6-localhost:*",
+            ],
+            allowed_origins=[
+                "http://127.0.0.1:*",
+                "http://localhost:*",
+                "http://[::1]:*",
+                "http://ip6-localhost:*",
+            ],
         )
 
-    starlette_app = Starlette(
-        routes=[
-            Route("/sse", endpoint=handle_sse, methods=["GET"]),
-            # transport.handle_post_message is an ASGI callable, not a
-            # request-response endpoint. Mount (not Route) is required so
-            # Starlette passes scope/receive/send directly without wrapping
-            # the response. The trailing slash must match the transport path.
-            Mount("/messages/", app=transport.handle_post_message),
-        ],
-        middleware=middleware,
+    manager = StreamableHTTPSessionManager(
+        _build_mcp_server(),
+        security_settings=security_settings,
+        session_idle_timeout=1800,
     )
-    return starlette_app
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        async with manager.run():
+            yield
+
+    async def handle_streamable_http_request(scope, receive, send):
+        """Delegate requests and remove transports terminated by DELETE."""
+        session_id = None
+        if scope.get("method") == "DELETE":
+            session_id = next(
+                (
+                    value.decode("latin-1")
+                    for name, value in scope.get("headers", [])
+                    if name == b"mcp-session-id"
+                ),
+                None,
+            )
+
+        try:
+            await manager.handle_request(scope, receive, send)
+        finally:
+            if session_id is not None:
+                transport = manager._server_instances.get(session_id)
+                if transport is not None and transport.is_terminated:
+                    # MCP SDK 2.0.0 terminates on DELETE but does not
+                    # unregister the transport or its authorization owner.
+                    manager._server_instances.pop(session_id, None)
+                    manager._session_owners.pop(session_id, None)
+
+    class _StreamableHTTPRoute:
+        """Keep the ASGI handler on the exact Streamable HTTP endpoint."""
+
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            await self.app(scope, receive, send)
+
+    app = _build_authenticated_mcp_app(
+        [
+            Route(
+                "/mcp",
+                endpoint=_StreamableHTTPRoute(handle_streamable_http_request),
+                methods=["GET", "POST", "DELETE"],
+            )
+        ],
+        host=host,
+        transport_name="Streamable HTTP",
+    )
+    app.state.streamable_http_manager = manager
+    app.router.lifespan_context = lifespan
+    return app
 
 
 async def _run_sse(port: int = 8080, host: str = "127.0.0.1") -> None:
-    """Run MCP server over SSE transport.
-
-    Default host is 127.0.0.1 (loopback only). Binding non-loopback
-    requires MNEMOSYNE_MCP_TOKEN -- see _resolve_sse_auth.
-    """
+    """Run MCP server over legacy SSE transport."""
     try:
         import uvicorn
     except ImportError:
@@ -277,6 +352,21 @@ async def _run_sse(port: int = 8080, host: str = "127.0.0.1") -> None:
         )
 
     app = _build_sse_app(host=host)
+    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    await uvicorn.Server(config).serve()
+
+
+async def _run_streamable_http(port: int = 8080, host: str = "127.0.0.1") -> None:
+    """Run MCP server over stateful Streamable HTTP at ``/mcp``."""
+    try:
+        import uvicorn
+    except ImportError:
+        raise RuntimeError(
+            "Streamable HTTP transport requires starlette and uvicorn. "
+            "Run: pip install starlette uvicorn"
+        )
+
+    app = _build_streamable_http_app(host=host)
     config = uvicorn.Config(app, host=host, port=port, log_level="info")
     await uvicorn.Server(config).serve()
 
@@ -348,10 +438,10 @@ def run_mcp_server(
     Run the Mnemosyne MCP server.
 
     Args:
-        transport: "stdio" or "sse"
-        port: Port for SSE transport (ignored for stdio)
+        transport: "stdio", "sse", or "streamable-http"
+        port: Port for network transports (ignored for stdio)
         bank: Default bank for operations (optional)
-        host: Bind address for SSE transport (default: 127.0.0.1 -- loopback
+        host: Bind address for network transports (default: 127.0.0.1 -- loopback
             only). Non-loopback hosts require MNEMOSYNE_MCP_TOKEN.
         env_file: Path to optional .env file to load before starting.
     """
@@ -364,8 +454,12 @@ def run_mcp_server(
         asyncio.run(_run_stdio())
     elif transport == "sse":
         asyncio.run(_run_sse(port=port, host=host))
+    elif transport == "streamable-http":
+        asyncio.run(_run_streamable_http(port=port, host=host))
     else:
-        raise ValueError(f"Unknown transport: {transport}. Use 'stdio' or 'sse'.")
+        raise ValueError(
+            f"Unknown transport: {transport}. Use 'stdio', 'sse', or 'streamable-http'."
+        )
 
 
 def main(argv: Optional[list[str]] = None) -> None:
@@ -375,7 +469,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Mnemosyne MCP Server")
     parser.add_argument(
         "--transport",
-        choices=["stdio", "sse"],
+        choices=["stdio", "sse", "streamable-http"],
         default="stdio",
         help="Transport protocol (default: stdio)"
     )
@@ -384,7 +478,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         type=str,
         default="127.0.0.1",
         help=(
-            "Bind address for SSE transport (default: 127.0.0.1 -- loopback "
+            "Bind address for network MCP transports (default: 127.0.0.1 -- loopback "
             "only). Use 0.0.0.0 to expose on LAN; this requires the "
             "MNEMOSYNE_MCP_TOKEN env var to be set."
         ),
@@ -393,7 +487,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         "--port",
         type=int,
         default=8080,
-        help="Port for SSE transport (default: 8080)"
+        help="Port for network MCP transports (default: 8080)"
     )
     parser.add_argument(
         "--bank",

@@ -1,0 +1,210 @@
+"""Regression tests for the Streamable HTTP MCP transport."""
+
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager
+import importlib.util
+
+import pytest
+
+
+pytestmark = pytest.mark.skipif(
+    any(importlib.util.find_spec(dependency) is None for dependency in ("mcp", "starlette", "httpx")),
+    reason="Streamable HTTP tests require MCP, Starlette, and HTTPX",
+)
+
+
+def _mcp_headers() -> dict[str, str]:
+    return {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+
+
+def _initialize_request() -> dict[str, object]:
+    return {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "pytest", "version": "1"},
+        },
+    }
+
+
+@asynccontextmanager
+async def _streamable_http_client(app):
+    import httpx
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1:8000",
+        ) as client:
+            yield client
+
+
+def test_streamable_http_initializes_lists_tools_calls_stats_and_terminates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A Streamable HTTP session handles the standard MCP lifecycle at /mcp."""
+    from mnemosyne.mcp_server import _build_streamable_http_app
+
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    app = _build_streamable_http_app(host="127.0.0.1")
+
+    async def exercise() -> None:
+        async with _streamable_http_client(app) as client:
+            response = await client.post("/mcp", headers=_mcp_headers(), json=_initialize_request())
+            assert response.status_code == 200
+            session_id = response.headers["mcp-session-id"]
+            assert response.headers["content-type"].startswith("text/event-stream")
+
+            session_headers = {**_mcp_headers(), "Mcp-Session-Id": session_id}
+            initialized = {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {},
+            }
+            response = await client.post("/mcp", headers=session_headers, json=initialized)
+            assert response.status_code == 202
+
+            tools = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+            response = await client.post("/mcp", headers=session_headers, json=tools)
+            assert response.status_code == 200
+            assert "mnemosyne_stats" in response.text
+
+            stats = {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "mnemosyne_stats", "arguments": {}},
+            }
+            response = await client.post("/mcp", headers=session_headers, json=stats)
+            assert response.status_code == 200
+            assert "mnemosyne" in response.text
+
+            assert (await client.delete("/mcp", headers=session_headers)).status_code == 200
+            assert (await client.post("/mcp", headers=session_headers, json=tools)).status_code == 404
+
+    asyncio.run(exercise())
+
+
+def test_streamable_http_non_loopback_requires_bearer_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Network-exposed Streamable HTTP follows the existing SSE token policy."""
+    from mnemosyne.mcp_server import _build_streamable_http_app
+
+    monkeypatch.delenv("MNEMOSYNE_MCP_TOKEN", raising=False)
+    with pytest.raises(RuntimeError, match="MNEMOSYNE_MCP_TOKEN"):
+        _build_streamable_http_app(host="0.0.0.0")
+
+
+def test_streamable_http_delete_removes_session_from_manager() -> None:
+    """Explicit DELETE removes the terminated session from SDK registries."""
+    from mnemosyne.mcp_server import _build_streamable_http_app
+
+    app = _build_streamable_http_app(host="127.0.0.1")
+
+    async def exercise() -> None:
+        async with _streamable_http_client(app) as client:
+            response = await client.post("/mcp", headers=_mcp_headers(), json=_initialize_request())
+            assert response.status_code == 200
+            session_id = response.headers["mcp-session-id"]
+            manager = app.state.streamable_http_manager
+            assert session_id in manager._server_instances
+            assert manager.session_idle_timeout == 1800
+
+            response = await client.delete(
+                "/mcp", headers={**_mcp_headers(), "Mcp-Session-Id": session_id}
+            )
+            assert response.status_code == 200
+
+            assert session_id not in manager._server_instances
+            assert session_id not in manager._session_owners
+
+    asyncio.run(exercise())
+
+
+def test_streamable_http_loopback_rejects_dns_rebinding_headers() -> None:
+    """Loopback Streamable HTTP rejects hostile Host and Origin headers."""
+    from mnemosyne.mcp_server import _build_streamable_http_app
+
+    app = _build_streamable_http_app(host="127.0.0.1")
+
+    async def exercise():
+        async with _streamable_http_client(app) as client:
+            return await client.post(
+                "/mcp",
+                headers={
+                    **_mcp_headers(),
+                    "Host": "evil.example",
+                    "Origin": "http://evil.example",
+                },
+                json=_initialize_request(),
+            )
+
+    response = asyncio.run(exercise())
+    assert response.status_code == 421
+
+
+def test_streamable_http_non_loopback_rejects_missing_bearer_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared pure-ASGI middleware protects the /mcp route."""
+    from mnemosyne.mcp_server import _build_streamable_http_app
+
+    monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "test-token")
+    app = _build_streamable_http_app(host="0.0.0.0")
+
+    async def exercise():
+        async with _streamable_http_client(app) as client:
+            return await client.post("/mcp", json={})
+
+    response = asyncio.run(exercise())
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert response.json() == {"error": "missing bearer token"}
+
+
+def test_streamable_http_rejects_unknown_session_id() -> None:
+    """Requests carrying a nonexistent MCP session ID return 404."""
+    from mnemosyne.mcp_server import _build_streamable_http_app
+
+    app = _build_streamable_http_app(host="127.0.0.1")
+
+    async def exercise():
+        async with _streamable_http_client(app) as client:
+            return await client.post(
+                "/mcp",
+                headers={**_mcp_headers(), "Mcp-Session-Id": "does-not-exist"},
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            )
+
+    response = asyncio.run(exercise())
+    assert response.status_code == 404
+
+
+def test_streamable_http_initializations_receive_independent_session_ids() -> None:
+    """The SDK manager creates an independent transport for every MCP session."""
+    from mnemosyne.mcp_server import _build_streamable_http_app
+
+    app = _build_streamable_http_app(host="127.0.0.1")
+
+    async def exercise():
+        async with _streamable_http_client(app) as client:
+            return (
+                await client.post("/mcp", headers=_mcp_headers(), json=_initialize_request()),
+                await client.post("/mcp", headers=_mcp_headers(), json=_initialize_request()),
+            )
+
+    first, second = asyncio.run(exercise())
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.headers["mcp-session-id"] != second.headers["mcp-session-id"]
