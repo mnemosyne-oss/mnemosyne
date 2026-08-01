@@ -211,15 +211,18 @@ def test_streamable_http_idle_session_is_reaped() -> None:
         async with _streamable_http_client(app) as client:
             response = await client.post("/mcp", headers=_mcp_headers(), json=_initialize_request())
             assert response.status_code == 200
-            session_headers = {**_mcp_headers(), "Mcp-Session-Id": response.headers["mcp-session-id"]}
+            session_id = response.headers["mcp-session-id"]
+            session_headers = {**_mcp_headers(), "Mcp-Session-Id": session_id}
+            manager = app.state.streamable_http_manager
             tools = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
-            response = None
-            for _ in range(20):
-                await asyncio.sleep(0.05)
-                response = await client.post("/mcp", headers=session_headers, json=tools)
-                if response.status_code == 404:
-                    break
-            return response
+            deadline = asyncio.get_running_loop().time() + 2
+            while session_id in manager._server_instances:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise AssertionError("idle session was not reaped")
+                await asyncio.sleep(0.01)
+
+            assert session_id not in manager._session_owners
+            return await client.post("/mcp", headers=session_headers, json=tools)
 
     response = asyncio.run(exercise())
     assert response is not None
