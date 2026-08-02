@@ -218,6 +218,26 @@ def test_provider_session_switch_preserves_initialized_gateway_scope(provider_mo
         assert beam.channel_id == "hermes_gateway-topic"
 
 
+def test_packaged_retry_rebinds_failed_session_to_switched_gateway_scope(provider_modules):
+    """A transient packaged-init retry must target the latest session, not A."""
+    module = provider_modules["mnemosyne_hermes"]
+    provider = module.MnemosyneMemoryProvider()
+    provider._gateway_session_key = "gateway-topic"
+    provider._retry_init_args = ("SESS-A", {"gateway_session_key": "gateway-topic"})
+    provider._retry_init_at = 0
+    calls = []
+
+    def fake_initialize(session_id, **kwargs):
+        calls.append((session_id, kwargs))
+        provider._beam = object()
+
+    provider.initialize = fake_initialize
+    provider.on_session_switch("SESS-B")
+    provider._maybe_retry_init()
+
+    assert calls == [("SESS-B", {"gateway_session_key": "gateway-topic"})]
+
+
 def test_provider_session_switch_preserves_explicit_channel(provider_modules):
     for module in provider_modules.values():
         provider = module.MnemosyneMemoryProvider()

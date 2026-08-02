@@ -85,6 +85,10 @@ The provider follows Hermes session changes without requiring a provider restart
 session is rebound before the next memory operation, keeping writes and tool calls
 attributed to the current conversation.
 
+Transient initialization retries are supported by the packaged `mnemosyne_hermes`
+entry point. The legacy root provider does not schedule retries; callers that need
+automatic recovery should use the packaged entry point.
+
 ---
 
 ## Quickstart

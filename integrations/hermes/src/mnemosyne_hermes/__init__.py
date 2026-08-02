@@ -1050,11 +1050,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             except Exception:
                 logger.debug("Mnemosyne: could not close prior wrapper", exc_info=True)
         self._memory = None
-        if self._audit is not None:
-            try:
-                self._audit.close()
-            except Exception:
-                logger.debug("Mnemosyne: could not close prior audit log", exc_info=True)
         self._audit = None
         self._beam = None
         self._surface_beam = None
@@ -1405,9 +1400,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         scope=self._default_scope,
                         extract_entities=True,
                     )
-                self._turn_count += 1
-                should_auto_sleep = self._auto_sleep_enabled and self._turn_count % 10 == 0
-            if should_auto_sleep:
+            self._turn_count += 1
+            if self._auto_sleep_enabled and self._turn_count % 10 == 0:
                 self._maybe_auto_sleep()
             with self._sync_turn_lock:
                 self._sync_turn_telemetry["completed"] += 1
@@ -2863,11 +2857,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             except Exception:
                 logger.debug("Mnemosyne: could not close wrapper", exc_info=True)
         self._memory = None
-        if self._audit is not None:
-            try:
-                self._audit.close()
-            except Exception:
-                logger.debug("Mnemosyne: could not close audit log", exc_info=True)
         self._audit = None
         self._beam = None
 
