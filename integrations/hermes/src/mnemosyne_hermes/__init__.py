@@ -607,6 +607,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Profile memory isolation: when enabled, each Hermes profile gets its own
         # Mnemosyne bank (separate SQLite DB). Default OFF for backward compatibility.
         self._profile_isolation_enabled = False
+        self._memory: Optional[Any] = None
         self._gateway_session_key = ""
         self._channel_id_explicit = False
         # Default scope for remember() calls when not explicitly specified.
@@ -1043,6 +1044,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # _beam active, causing system_prompt_block() to report "Active"
         # and handle_tool_call() to silently write into the wrong session.
         # _init_error reset complements this for the failure-recovery case.
+        if self._memory is not None:
+            try:
+                self._memory.close()
+            except Exception:
+                logger.debug("Mnemosyne: could not close prior wrapper", exc_info=True)
+        self._memory = None
         self._beam = None
         self._surface_beam = None
         self._init_error = None
@@ -1107,6 +1114,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     bank=bank_name,
                     channel_id=kwargs.get("channel_id", ""),
                 )
+                self._memory = mem
                 self._beam = mem.beam
                 logger.info(
                     "Mnemosyne initialized (profile isolation ON): session=%s, bank=%s, db=%s",
@@ -2836,6 +2844,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 unregister_hermes_host_llm()
             except Exception as exc:
                 logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
+        if self._memory is not None:
+            try:
+                self._memory.close()
+            except Exception:
+                logger.debug("Mnemosyne: could not close wrapper", exc_info=True)
+        self._memory = None
         self._beam = None
 
         # C13: decrement this instance's contribution to the module-level

@@ -182,6 +182,24 @@ def test_provider_session_switch_rebinds_both_provider_copies(provider_modules):
         assert provider._reflect_calls_this_session == 0
 
 
+def test_profile_isolation_wrapper_rebinds_after_initialize(tmp_path, provider_modules):
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            "SESS-A",
+            hermes_home=str(tmp_path / module.__name__),
+            profile_isolation=True,
+        )
+
+        try:
+            assert provider._memory is not None
+            provider.on_session_switch("SESS-B")
+            assert provider._memory.session_id == "hermes_SESS-B"
+            assert provider._memory.beam.session_id == "hermes_SESS-B"
+        finally:
+            provider.shutdown()
+
+
 def test_provider_session_switch_preserves_initialized_gateway_scope(provider_modules):
     for module in provider_modules.values():
         provider = module.MnemosyneMemoryProvider()

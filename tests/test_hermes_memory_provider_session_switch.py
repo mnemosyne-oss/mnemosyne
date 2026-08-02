@@ -68,4 +68,7 @@ def test_initialize_gateway_scope_survives_switch_without_gateway_kwarg(tmp_path
         assert provider._beam.session_id == "hermes_gateway-topic"
         assert provider._beam.channel_id == "hermes_gateway-topic"
     finally:
-        provider._beam.conn.close()
+        beam = provider._beam
+        provider.shutdown()
+        if beam is not None:
+            beam.conn.close()
