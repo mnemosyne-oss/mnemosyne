@@ -200,6 +200,25 @@ def test_profile_isolation_wrapper_rebinds_after_initialize(tmp_path, provider_m
             provider.shutdown()
 
 
+def test_packaged_retry_rebinds_to_switched_session(provider_modules):
+    provider = provider_modules["mnemosyne_hermes"].MnemosyneMemoryProvider()
+    provider._beam = None
+    provider._gateway_session_key = "gateway-topic"
+    provider._retry_init_args = ("SESS-A", {"gateway_session_key": "gateway-topic"})
+    provider._retry_init_at = 0
+    retried = []
+
+    def fake_initialize(session_id, **kwargs):
+        retried.append((session_id, kwargs))
+        provider._beam = object()
+
+    provider.initialize = fake_initialize
+    provider.on_session_switch("SESS-B")
+    provider._maybe_retry_init()
+
+    assert retried == [("SESS-B", {"gateway_session_key": "gateway-topic"})]
+
+
 def test_provider_session_switch_preserves_initialized_gateway_scope(provider_modules):
     for module in provider_modules.values():
         provider = module.MnemosyneMemoryProvider()
