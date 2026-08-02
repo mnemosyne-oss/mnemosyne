@@ -3670,6 +3670,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         stable_scope = self._gateway_session_key or new_session_id
         provider_session_id = f"hermes_{stable_scope}"
         with self._ensure_beam_access_lock():
+            retry_args = getattr(self, "_retry_init_args", None)
+            if retry_args is not None:
+                _, retry_kwargs = retry_args
+                retry_kwargs = dict(retry_kwargs)
+                retry_kwargs["gateway_session_key"] = self._gateway_session_key
+                self._retry_init_args = (new_session_id, retry_kwargs)
             previous_session_id = self._session_id
             beam = self._beam
             if beam is not None:
