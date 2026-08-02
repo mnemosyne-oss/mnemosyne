@@ -265,6 +265,48 @@ def test_streamable_http_loopback_rejects_dns_rebinding_headers() -> None:
     assert invalid_origin.status_code == 403
 
 
+@pytest.mark.parametrize(
+    ("host_header", "origin_header"),
+    [
+        ("localhost", "http://localhost"),
+        ("[::1]", "http://[::1]"),
+        ("ip6-localhost", "http://ip6-localhost"),
+    ],
+)
+def test_streamable_http_loopback_allows_unported_host_origin_pairs(
+    host_header: str,
+    origin_header: str,
+) -> None:
+    """Loopback Streamable HTTP accepts every supported hostname spelling."""
+    from mnemosyne.mcp_server import _build_streamable_http_app
+
+    app = _build_streamable_http_app(host="127.0.0.1")
+
+    async def exercise() -> None:
+        async with _streamable_http_client(app) as client:
+            headers = {
+                **_mcp_headers(),
+                "Host": host_header,
+                "Origin": origin_header,
+            }
+            response = await client.post(
+                "/mcp",
+                headers=headers,
+                json=_initialize_request(),
+            )
+            assert response.status_code == 200
+            session_id = response.headers["mcp-session-id"]
+            assert session_id
+
+            cleanup = await client.delete(
+                "/mcp",
+                headers={**headers, "Mcp-Session-Id": session_id},
+            )
+            assert cleanup.status_code == 200
+
+    asyncio.run(exercise())
+
+
 def test_streamable_http_non_loopback_rejects_missing_bearer_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
