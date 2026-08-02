@@ -3664,12 +3664,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         provider_session_id = f"hermes_{stable_scope}"
         with self._ensure_beam_access_lock():
             previous_session_id = self._session_id
-            for memory in (self._beam, self._memory):
-                if memory is None:
-                    continue
+            beam = self._beam
+            if beam is not None:
+                beam.session_id = provider_session_id
+                # Move only the channel_id that BeamMemory derived from the
+                # session. Explicit channel IDs belong to the caller.
+                if not self._channel_id_explicit:
+                    beam.channel_id = provider_session_id
+
+            # Keep any profile-isolation wrapper aligned with its BeamMemory.
+            memory = getattr(self, "_memory", None)
+            if memory is not None:
                 memory.session_id = provider_session_id
-                # Move only channel IDs derived from the session. Explicit
-                # channel IDs belong to the caller.
                 if not self._channel_id_explicit:
                     memory.channel_id = provider_session_id
 
