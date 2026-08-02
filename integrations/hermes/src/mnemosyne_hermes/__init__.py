@@ -2696,6 +2696,52 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._turn_count = turn_number
 
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Rebind session-scoped state after Hermes rotates the active session."""
+        del parent_session_id, rewound
+        if not new_session_id:
+            return
+
+        stable_scope = kwargs.get("gateway_session_key") or new_session_id
+        provider_session_id = f"hermes_{stable_scope}"
+        with self._ensure_beam_access_lock():
+            previous_session_id = self._session_id
+            beam = self._beam
+            if beam is not None:
+                beam.session_id = provider_session_id
+                # BeamMemory defaults channel_id to the session id. Preserve
+                # an explicitly configured channel while moving the default.
+                if getattr(beam, "channel_id", None) == previous_session_id:
+                    beam.channel_id = provider_session_id
+
+            # The root plugin keeps a wrapper for profile-isolated banks. Keep
+            # its session metadata aligned with the BeamMemory it exposes.
+            memory = getattr(self, "_memory", None)
+            if memory is not None:
+                memory.session_id = provider_session_id
+                if getattr(memory, "channel_id", None) == previous_session_id:
+                    memory.channel_id = provider_session_id
+
+            self._session_id = provider_session_id
+            if reset:
+                self._turn_count = 0
+                self._reflect_calls_this_session = 0
+
+        logger.debug(
+            "Mnemosyne session switched: %s -> %s%s",
+            previous_session_id,
+            provider_session_id,
+            " (state reset)" if reset else "",
+        )
+
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         # Bound the consolidation call so a slow LLM (e.g., a Hermes-routed
         # network call) cannot block Hermes shutdown indefinitely. Mirrors
