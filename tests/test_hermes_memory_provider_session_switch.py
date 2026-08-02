@@ -47,3 +47,25 @@ def test_sync_turn_writes_to_the_new_session_after_switch(tmp_path):
         assert provider._reflect_calls_this_session == 0
     finally:
         beam.conn.close()
+
+
+def test_initialize_gateway_scope_survives_switch_without_gateway_kwarg(tmp_path):
+    provider = MnemosyneMemoryProvider()
+    provider.initialize(
+        "SESS-A",
+        hermes_home=str(tmp_path),
+        gateway_session_key="gateway-topic",
+    )
+
+    try:
+        assert provider._session_id == "hermes_gateway-topic"
+        assert provider._beam.session_id == "hermes_gateway-topic"
+        assert provider._beam.channel_id == "hermes_gateway-topic"
+
+        provider.on_session_switch("transient-child-session")
+
+        assert provider._session_id == "hermes_gateway-topic"
+        assert provider._beam.session_id == "hermes_gateway-topic"
+        assert provider._beam.channel_id == "hermes_gateway-topic"
+    finally:
+        provider._beam.conn.close()

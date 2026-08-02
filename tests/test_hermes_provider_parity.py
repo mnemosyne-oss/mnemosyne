@@ -182,6 +182,24 @@ def test_provider_session_switch_rebinds_both_provider_copies(provider_modules):
         assert provider._reflect_calls_this_session == 0
 
 
+def test_provider_session_switch_preserves_initialized_gateway_scope(provider_modules):
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        beam = _SessionScopedBeam()
+        provider._beam = beam
+        provider._session_id = "hermes_gateway-topic"
+        provider._gateway_session_key = "gateway-topic"
+        provider._channel_id_explicit = False
+        beam.session_id = provider._session_id
+        beam.channel_id = provider._session_id
+
+        provider.on_session_switch("transient-child-session")
+
+        assert provider._session_id == "hermes_gateway-topic"
+        assert beam.session_id == "hermes_gateway-topic"
+        assert beam.channel_id == "hermes_gateway-topic"
+
+
 def test_provider_session_switch_preserves_explicit_channel(provider_modules):
     for module in provider_modules.values():
         provider = module.MnemosyneMemoryProvider()
@@ -189,12 +207,29 @@ def test_provider_session_switch_preserves_explicit_channel(provider_modules):
         beam.channel_id = "telegram:topic-42"
         provider._beam = beam
         provider._session_id = "hermes_SESS-A"
+        provider._channel_id_explicit = True
 
         provider.on_session_switch("SESS-B")
 
         assert provider._session_id == "hermes_SESS-B"
         assert beam.session_id == "hermes_SESS-B"
         assert beam.channel_id == "telegram:topic-42"
+
+
+def test_provider_session_switch_preserves_explicit_channel_collision(provider_modules):
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        beam = _SessionScopedBeam()
+        beam.channel_id = "hermes_SESS-A"
+        provider._beam = beam
+        provider._session_id = "hermes_SESS-A"
+        provider._channel_id_explicit = True
+
+        provider.on_session_switch("SESS-B")
+
+        assert provider._session_id == "hermes_SESS-B"
+        assert beam.session_id == "hermes_SESS-B"
+        assert beam.channel_id == "hermes_SESS-A"
 
 
 @pytest.mark.parametrize("configured", [False, "false", 0])

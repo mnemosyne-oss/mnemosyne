@@ -607,6 +607,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Profile memory isolation: when enabled, each Hermes profile gets its own
         # Mnemosyne bank (separate SQLite DB). Default OFF for backward compatibility.
         self._profile_isolation_enabled = False
+        self._gateway_session_key = ""
+        self._channel_id_explicit = False
         # Default scope for remember() calls when not explicitly specified.
         # "session" (default) scopes to current session; "global" persists across sessions.
         self._default_scope = "session"
@@ -1052,6 +1054,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._platform = kwargs.get("platform", "cli")
         self._hermes_home = kwargs.get("hermes_home", "")
         self._agent_identity = kwargs.get("agent_identity", None) or ""
+        self._gateway_session_key = kwargs.get("gateway_session_key") or ""
+        self._channel_id_explicit = bool(kwargs.get("channel_id"))
 
         # Apply provider-specific config from kwargs (Hermes-passed) or config.yaml fallback
         self._apply_provider_config(kwargs)
@@ -1088,7 +1092,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # stay isolated per-thread while scope='global' memories still surface
         # everywhere.  Falls back to the Hermes agent session_id for CLI and
         # non-gateway use (no behavior change for those paths).
-        stable_scope = kwargs.get("gateway_session_key") or session_id
+        stable_scope = self._gateway_session_key or session_id
         self._session_id = f"hermes_{stable_scope}"
 
         try:
@@ -2710,24 +2714,24 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if not new_session_id:
             return
 
-        stable_scope = kwargs.get("gateway_session_key") or new_session_id
+        self._gateway_session_key = kwargs.get("gateway_session_key") or self._gateway_session_key
+        stable_scope = self._gateway_session_key or new_session_id
         provider_session_id = f"hermes_{stable_scope}"
         with self._ensure_beam_access_lock():
             previous_session_id = self._session_id
             beam = self._beam
             if beam is not None:
                 beam.session_id = provider_session_id
-                # BeamMemory defaults channel_id to the session id. Preserve
-                # an explicitly configured channel while moving the default.
-                if getattr(beam, "channel_id", None) == previous_session_id:
+                # Move only the channel_id that BeamMemory derived from the
+                # session. Explicit channel IDs belong to the caller.
+                if not self._channel_id_explicit:
                     beam.channel_id = provider_session_id
 
-            # The root plugin keeps a wrapper for profile-isolated banks. Keep
-            # its session metadata aligned with the BeamMemory it exposes.
+            # Keep any profile-isolation wrapper aligned with its BeamMemory.
             memory = getattr(self, "_memory", None)
             if memory is not None:
                 memory.session_id = provider_session_id
-                if getattr(memory, "channel_id", None) == previous_session_id:
+                if not self._channel_id_explicit:
                     memory.channel_id = provider_session_id
 
             self._session_id = provider_session_id
