@@ -1741,7 +1741,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _reserve_reflection_budget(self, trigger: str) -> Optional[Dict[str, Any]]:
         """Return a structured skip payload, or reserve one reflection call."""
         context = (self._agent_context or "").strip().lower()
-        with self._reflect_budget_lock:
+        with self._ensure_beam_access_lock():
             if self._reflect_disabled_for_cron and context == "cron":
                 return self._reflection_skip_response("reflect_disabled_for_cron", trigger)
             max_calls = self._reflect_max_calls_per_session
@@ -1864,6 +1864,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             except Exception:
                 logger.debug("Mnemosyne: could not close prior wrapper", exc_info=True)
         self._memory = None
+        if self._audit is not None:
+            try:
+                self._audit.close()
+            except Exception:
+                logger.debug("Mnemosyne: could not close audit log", exc_info=True)
         self._audit = None
         self._beam = None
         self._surface_beam = None
@@ -2348,8 +2353,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         scope=self._default_scope,
                         extract_entities=True,
                     )
-            self._turn_count += 1
-            if self._auto_sleep_enabled and self._turn_count % 10 == 0:
+            with self._ensure_beam_access_lock():
+                self._turn_count += 1
+                should_auto_sleep = self._auto_sleep_enabled and self._turn_count % 10 == 0
+            if should_auto_sleep:
                 self._maybe_auto_sleep()
             with self._sync_turn_lock:
                 self._sync_turn_telemetry["completed"] += 1
@@ -3644,7 +3651,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         })
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        self._turn_count = turn_number
+        with self._ensure_beam_access_lock():
+            self._turn_count = turn_number
 
     def on_session_switch(
         self,
@@ -3798,6 +3806,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             except Exception:
                 logger.debug("Mnemosyne: could not close wrapper", exc_info=True)
         self._memory = None
+        if self._audit is not None:
+            try:
+                self._audit.close()
+            except Exception:
+                logger.debug("Mnemosyne: could not close audit log", exc_info=True)
         self._audit = None
         self._beam = None
 

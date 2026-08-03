@@ -3,9 +3,21 @@
 from __future__ import annotations
 
 import sqlite3
+from unittest.mock import Mock
 
 from hermes_memory_provider import MnemosyneMemoryProvider
 from mnemosyne.core.beam import BeamMemory
+
+
+def test_shutdown_closes_root_audit_log():
+    provider = MnemosyneMemoryProvider()
+    audit = Mock()
+    provider._audit = audit
+
+    provider.shutdown()
+
+    audit.close.assert_called_once_with()
+    assert provider._audit is None
 
 
 def test_sync_turn_writes_to_the_new_session_after_switch(tmp_path):

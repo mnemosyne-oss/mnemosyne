@@ -1400,8 +1400,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         scope=self._default_scope,
                         extract_entities=True,
                     )
-            self._turn_count += 1
-            if self._auto_sleep_enabled and self._turn_count % 10 == 0:
+            with self._ensure_beam_access_lock():
+                self._turn_count += 1
+                should_auto_sleep = self._auto_sleep_enabled and self._turn_count % 10 == 0
+            if should_auto_sleep:
                 self._maybe_auto_sleep()
             with self._sync_turn_lock:
                 self._sync_turn_telemetry["completed"] += 1
@@ -2707,7 +2709,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         })
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        self._turn_count = turn_number
+        with self._ensure_beam_access_lock():
+            self._turn_count = turn_number
 
     def on_session_switch(
         self,
