@@ -1400,7 +1400,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         scope=self._default_scope,
                         extract_entities=True,
                     )
-            with self._ensure_beam_access_lock():
                 self._turn_count += 1
                 should_auto_sleep = self._auto_sleep_enabled and self._turn_count % 10 == 0
             if should_auto_sleep:

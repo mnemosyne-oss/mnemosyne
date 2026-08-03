@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from unittest.mock import Mock
 
 from hermes_memory_provider import MnemosyneMemoryProvider
@@ -18,6 +19,55 @@ def test_shutdown_closes_root_audit_log():
 
     audit.close.assert_called_once_with()
     assert provider._audit is None
+
+
+def test_session_switch_waits_for_inflight_turn_before_resetting_counter():
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingBeam:
+        session_id = "hermes_SESS-A"
+        channel_id = "hermes_SESS-A"
+
+        def remember(self, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+
+    provider = MnemosyneMemoryProvider()
+    provider._beam = BlockingBeam()
+    provider._session_id = "hermes_SESS-A"
+    provider._skip_contexts = set()
+    provider._agent_context = "primary"
+    provider._sync_roles = {"user"}
+    provider._auto_sleep_enabled = False
+    provider._default_scope = "default"
+    provider._should_filter = lambda _content: False
+    provider._capture_identity_signals = lambda _content: None
+
+    turn = threading.Thread(
+        target=provider.sync_turn,
+        args=("user text before switch", ""),
+    )
+    turn.start()
+    assert started.wait(timeout=5)
+
+    switched = threading.Thread(
+        target=provider.on_session_switch,
+        args=("SESS-B",),
+        kwargs={"reset": True},
+    )
+    switched.start()
+    switched.join(timeout=0.05)
+    assert switched.is_alive()
+
+    release.set()
+    turn.join(timeout=5)
+    switched.join(timeout=5)
+
+    assert not turn.is_alive()
+    assert not switched.is_alive()
+    assert provider._session_id == "hermes_SESS-B"
+    assert provider._turn_count == 0
 
 
 def test_sync_turn_writes_to_the_new_session_after_switch(tmp_path):
