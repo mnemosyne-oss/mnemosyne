@@ -7,6 +7,7 @@ import json
 import sys
 import threading
 import types
+from unittest.mock import Mock
 from pathlib import Path
 
 import pytest
@@ -216,6 +217,58 @@ def test_initialized_explicit_channel_survives_session_switch(tmp_path, provider
             assert provider._beam.channel_id == "caller-channel"
         finally:
             provider.shutdown()
+
+
+def test_session_end_worker_keeps_pre_switch_session_snapshot(provider_modules, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    class Beam:
+        session_id = "hermes_SESS-A"
+        db_path = "memory.db"
+        author_id = "author"
+        author_type = "agent"
+        channel_id = "channel"
+
+    class SleepBeam:
+        calls = []
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs["session_id"]
+            type(self).calls.append(self.session_id)
+
+        def sleep(self):
+            started.set()
+            assert release.wait(timeout=5)
+
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        provider._beam = Beam()
+        provider._reserve_reflection_budget = lambda _reason: None
+        provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 0.01
+        SleepBeam.calls = []
+        monkeypatch.setattr(module, "_get_beam_class", lambda: SleepBeam)
+
+        provider.on_session_end([])
+        provider.on_session_switch("SESS-B")
+        release.set()
+        if provider._session_end_thread is not None:
+            provider._session_end_thread.join(timeout=5)
+
+        assert SleepBeam.calls == ["hermes_SESS-A"]
+        started.clear()
+        release.clear()
+
+
+def test_packaged_shutdown_closes_audit_log(provider_modules):
+    provider = provider_modules["mnemosyne_hermes"].MnemosyneMemoryProvider()
+    audit = Mock()
+    provider._audit = audit
+
+    provider.shutdown()
+
+    audit.close.assert_called_once_with()
+    assert provider._audit is None
 
 
 def test_provider_session_switch_preserves_initialized_gateway_scope(provider_modules):

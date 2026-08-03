@@ -2785,14 +2785,25 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 return
             logger.info("Mnemosyne session end — running consolidation")
             timeout = self.SESSION_END_SLEEP_TIMEOUT_SECONDS
-            beam = self._beam
+            with self._ensure_beam_access_lock():
+                beam = self._beam
+                if beam is None:
+                    return
+                sleep_args = {
+                    "session_id": beam.session_id,
+                    "db_path": beam.db_path,
+                    "author_id": beam.author_id,
+                    "author_type": beam.author_type,
+                    "channel_id": beam.channel_id,
+                }
 
             def _sleep_with_logging():
                 # Wrap the target so exceptions get logged at the same
                 # severity the previous synchronous version used, instead
                 # of bubbling out as an uncaught daemon-thread traceback.
                 try:
-                    beam.sleep()
+                    BeamClass = _get_beam_class()
+                    BeamClass(**sleep_args).sleep()
                 except Exception as inner:
                     logger.debug("Mnemosyne session-end sleep failed: %s", inner)
 
@@ -2866,6 +2877,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             except Exception:
                 logger.debug("Mnemosyne: could not close wrapper", exc_info=True)
         self._memory = None
+        if self._audit is not None:
+            try:
+                self._audit.close()
+            except Exception:
+                logger.debug("Mnemosyne: could not close audit log", exc_info=True)
         self._audit = None
         self._beam = None
 

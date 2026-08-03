@@ -3717,7 +3717,17 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 return
             logger.info("Mnemosyne session end — running consolidation")
             timeout = self.SESSION_END_SLEEP_TIMEOUT_SECONDS
-            beam_ref = self._beam
+            with self._ensure_beam_access_lock():
+                beam_ref = self._beam
+                if beam_ref is None:
+                    return
+                sleep_args = {
+                    "session_id": beam_ref.session_id,
+                    "db_path": beam_ref.db_path,
+                    "author_id": beam_ref.author_id,
+                    "author_type": beam_ref.author_type,
+                    "channel_id": beam_ref.channel_id,
+                }
 
             def _sleep_with_logging():
                 # Wrap the target so exceptions get logged at the same
@@ -3728,13 +3738,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 # the main thread's writes.
                 try:
                     BeamClass = _get_beam_class()
-                    sleep_beam = BeamClass(
-                        session_id=beam_ref.session_id,
-                        db_path=beam_ref.db_path,
-                        author_id=beam_ref.author_id,
-                        author_type=beam_ref.author_type,
-                        channel_id=beam_ref.channel_id,
-                    )
+                    sleep_beam = BeamClass(**sleep_args)
                     sleep_beam.sleep()
                 except Exception as inner:
                     logger.debug("Mnemosyne session-end sleep failed: %s", inner)
