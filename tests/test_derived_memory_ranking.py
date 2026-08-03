@@ -25,6 +25,7 @@ import — the tests set them with ``monkeypatch`` after import and after the
 snapshotted at import time (the bug class in issue #482).
 """
 
+import gc
 import sqlite3
 import tempfile
 from datetime import datetime, timedelta
@@ -32,11 +33,37 @@ from pathlib import Path
 
 import pytest
 
+from mnemosyne.core import beam as beam_module
 from mnemosyne.core.beam import (
     BeamMemory,
     cap_proposal_importance,
     resolve_consolidation_tier,
 )
+
+
+@pytest.fixture(autouse=True)
+def _close_thread_local_connection():
+    """Close the module's thread-local sqlite connection after each test.
+
+    Every ``BeamMemory(db_path=...)`` here uses a fresh temp path, so each
+    test replaces the cached ``_thread_local.conn`` and strands the previous
+    connection in a reference cycle. Refcounting alone does not release the
+    file descriptors; they linger until a gc pass. Left alone, this module
+    leaks ~5 fds per test, and a gc pass landing inside test_repair.py's
+    fd-count assertions (``assert len(os.listdir("/proc/self/fd")) ==
+    fd_before``) makes the count *drop* mid-test and fail — observed on the
+    CI 3.13 matrix job as ``assert 66 == 179``.
+    """
+    yield
+    conn = getattr(beam_module._thread_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+        beam_module._thread_local.conn = None
+        beam_module._thread_local.db_path = None
+    gc.collect()
 
 
 @pytest.fixture
