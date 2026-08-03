@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections import Counter
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -28,6 +29,17 @@ RAW_SECRET = "repair-output-private-secret-79d1"  # nosec - redaction fixture
 RAW_CONTENT = "Only the hidden cobalt-archive content may contain this phrase."
 RAW_EMBEDDING = "[0.125, 0.875]"
 RAW_BLOB_HEX = "DEADBEEF"
+
+
+def _fd_target_counts() -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            continue
+        counts[target] += 1
+    return counts
 
 
 def _create_db(path: Path, *, with_vector_cache: bool = False) -> None:
@@ -667,11 +679,7 @@ def test_sidecar_created_after_preflight_is_rejected_before_inode_binding(tmp_pa
     journal_bytes = b"sidecar created after the initial preflight check"
     before = _hash(db_path)
     backup = tmp_path / "must-not-exist.sqlite"
-    fd_targets_before = {
-        os.readlink(f"/proc/self/fd/{fd}")
-        for fd in os.listdir("/proc/self/fd")
-        if os.path.exists(f"/proc/self/fd/{fd}")
-    }
+    fd_targets_before = _fd_target_counts()
     real_gate = repair._verify_report_gate
 
     def create_sidecar_after_preflight(*args, conn=None, **kwargs):
@@ -697,15 +705,55 @@ def test_sidecar_created_after_preflight_is_rejected_before_inode_binding(tmp_pa
     assert journal.read_bytes() == journal_bytes
     assert not backup.exists()
     assert not list(tmp_path.glob(".mnemosyne-repair-*"))
-    fd_targets_after = {
-        os.readlink(f"/proc/self/fd/{fd}")
-        for fd in os.listdir("/proc/self/fd")
-        if os.path.exists(f"/proc/self/fd/{fd}")
-    }
-    leaked_targets = {
-        target for target in fd_targets_after - fd_targets_before if str(tmp_path) in target
-    }
+    fd_targets_after = _fd_target_counts()
+    leaked_targets = (fd_targets_after - fd_targets_before)
+    leaked_targets = Counter(
+        {target: count for target, count in leaked_targets.items() if str(tmp_path) in target}
+    )
     assert not leaked_targets
+
+
+def test_sidecar_rejection_detects_duplicate_repair_fd(tmp_path, monkeypatch):
+    """Descriptor accounting catches a leaked FD for an already-open target."""
+
+    db_path = tmp_path / "memory.db"
+    _create_db(db_path)
+    _insert_memory(db_path, "selected")
+    report_path = _write_manifest(db_path, tmp_path)
+    journal = db_path.with_name(db_path.name + "-journal")
+    journal.write_bytes(b"sidecar")
+    backup = tmp_path / "must-not-exist.sqlite"
+    existing_fd = os.open(db_path, os.O_RDONLY)
+    leaked_fd = None
+    real_gate = repair._verify_report_gate
+
+    def leak_fd_after_gate(*args, conn=None, **kwargs):
+        nonlocal leaked_fd
+        result = real_gate(*args, conn=conn, **kwargs)
+        if conn is None:
+            leaked_fd = os.open(db_path, os.O_RDONLY)
+        return result
+
+    monkeypatch.setattr(repair, "_verify_report_gate", leak_fd_after_gate)
+    before = _fd_target_counts()
+    try:
+        with pytest.raises(RepairError, match="sidecars prevent"):
+            run_repair(
+                db_path=db_path,
+                bank_name="default",
+                report_path=report_path,
+                selections=["working_memory:selected"],
+                action="expire",
+                apply=True,
+                backup_path=backup,
+            )
+
+        delta = _fd_target_counts() - before
+        assert delta[str(db_path)] == 1
+    finally:
+        os.close(existing_fd)
+        if leaked_fd is not None:
+            os.close(leaked_fd)
 
 
 def test_backup_parent_swap_cannot_redirect_fd_anchored_backup(tmp_path, monkeypatch):
