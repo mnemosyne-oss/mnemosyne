@@ -200,6 +200,24 @@ def test_profile_isolation_wrapper_rebinds_after_initialize(tmp_path, provider_m
             provider.shutdown()
 
 
+def test_initialized_explicit_channel_survives_session_switch(tmp_path, provider_modules):
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            "SESS-A",
+            hermes_home=str(tmp_path / module.__name__),
+            channel_id="caller-channel",
+        )
+
+        try:
+            provider.on_session_switch("SESS-B")
+            assert provider._session_id == "hermes_SESS-B"
+            assert provider._beam.session_id == "hermes_SESS-B"
+            assert provider._beam.channel_id == "caller-channel"
+        finally:
+            provider.shutdown()
+
+
 def test_provider_session_switch_preserves_initialized_gateway_scope(provider_modules):
     for module in provider_modules.values():
         provider = module.MnemosyneMemoryProvider()
@@ -236,6 +254,41 @@ def test_packaged_retry_rebinds_failed_session_to_switched_gateway_scope(provide
     provider._maybe_retry_init()
 
     assert calls == [("SESS-B", {"gateway_session_key": "gateway-topic"})]
+
+
+def test_packaged_retry_cannot_publish_old_session_after_switch(provider_modules):
+    module = provider_modules["mnemosyne_hermes"]
+    provider = module.MnemosyneMemoryProvider()
+    provider._retry_init_args = ("SESS-A", {"gateway_session_key": "gateway-topic"})
+    provider._retry_init_at = 0
+    init_started = threading.Event()
+    release_init = threading.Event()
+
+    def blocked_initialize(session_id, **kwargs):
+        del kwargs
+        init_started.set()
+        assert release_init.wait(timeout=5)
+        provider._beam = _SessionScopedBeam()
+        provider._session_id = f"hermes_{session_id}"
+
+    provider.initialize = blocked_initialize
+    retry = threading.Thread(target=provider._maybe_retry_init)
+    retry.start()
+    assert init_started.wait(timeout=5)
+
+    switch = threading.Thread(target=provider.on_session_switch, args=("SESS-B",))
+    switch.start()
+    switch.join(timeout=0.05)
+    assert switch.is_alive()
+
+    release_init.set()
+    retry.join(timeout=5)
+    switch.join(timeout=5)
+
+    assert not retry.is_alive()
+    assert not switch.is_alive()
+    assert provider._session_id == "hermes_SESS-B"
+    assert provider._beam.session_id == "hermes_SESS-B"
 
 
 def test_provider_session_switch_preserves_explicit_channel(provider_modules):

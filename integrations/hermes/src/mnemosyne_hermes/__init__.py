@@ -710,15 +710,19 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Observed live 2026-07-19: a ~2-minute lock storm at session start
         # left an agent memory-less for hours while the DB was healthy again
         # minutes later; a restart was the only recovery path.
-        if self._beam is not None or self._retry_init_args is None:
-            return
-        if time.monotonic() < self._retry_init_at:
-            return
-        session_id, kwargs = self._retry_init_args
-        logger.info(
-            "Mnemosyne retrying init after transient failure: %s", self._init_error
-        )
-        self.initialize(session_id, **kwargs)
+        with self._ensure_beam_access_lock():
+            if self._beam is not None or self._retry_init_args is None:
+                return
+            if time.monotonic() < self._retry_init_at:
+                return
+            session_id, kwargs = self._retry_init_args
+            logger.info(
+                "Mnemosyne retrying init after transient failure: %s", self._init_error
+            )
+            # Keep initialization serialized with on_session_switch(). This
+            # prevents a retry that already selected session A from publishing
+            # A after a concurrent switch to session B.
+            self.initialize(session_id, **kwargs)
 
     @property
     def name(self) -> str:
@@ -1128,7 +1132,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     if self._hermes_home
                     else None
                 )
-                self._beam = BeamMemory(session_id=self._session_id, db_path=db_path)
+                self._beam = BeamMemory(
+                    session_id=self._session_id,
+                    channel_id=kwargs.get("channel_id", ""),
+                    db_path=db_path,
+                )
                 logger.info(
                     "Mnemosyne initialized: session=%s, db=%s",
                     self._session_id, db_path or "default",

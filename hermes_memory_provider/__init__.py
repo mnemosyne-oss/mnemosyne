@@ -1935,7 +1935,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 )
             else:
                 BeamMemory = _get_beam_class()
-                self._beam = BeamMemory(session_id=self._session_id)
+                self._beam = BeamMemory(
+                    session_id=self._session_id,
+                    channel_id=kwargs.get("channel_id", ""),
+                )
                 logger.info("Mnemosyne initialized: session=%s", self._session_id)
 
         except Exception as e:
