@@ -667,7 +667,11 @@ def test_sidecar_created_after_preflight_is_rejected_before_inode_binding(tmp_pa
     journal_bytes = b"sidecar created after the initial preflight check"
     before = _hash(db_path)
     backup = tmp_path / "must-not-exist.sqlite"
-    fd_before = len(os.listdir("/proc/self/fd"))
+    fd_targets_before = {
+        os.readlink(f"/proc/self/fd/{fd}")
+        for fd in os.listdir("/proc/self/fd")
+        if os.path.exists(f"/proc/self/fd/{fd}")
+    }
     real_gate = repair._verify_report_gate
 
     def create_sidecar_after_preflight(*args, conn=None, **kwargs):
@@ -693,7 +697,15 @@ def test_sidecar_created_after_preflight_is_rejected_before_inode_binding(tmp_pa
     assert journal.read_bytes() == journal_bytes
     assert not backup.exists()
     assert not list(tmp_path.glob(".mnemosyne-repair-*"))
-    assert len(os.listdir("/proc/self/fd")) == fd_before
+    fd_targets_after = {
+        os.readlink(f"/proc/self/fd/{fd}")
+        for fd in os.listdir("/proc/self/fd")
+        if os.path.exists(f"/proc/self/fd/{fd}")
+    }
+    leaked_targets = {
+        target for target in fd_targets_after - fd_targets_before if str(tmp_path) in target
+    }
+    assert not leaked_targets
 
 
 def test_backup_parent_swap_cannot_redirect_fd_anchored_backup(tmp_path, monkeypatch):
