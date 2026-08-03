@@ -451,4 +451,3 @@ class TestRecallRankingEffect:
             "documented residual: at 800h the recency discount lets even a "
             f"tier-3 summary win ({old_summary} vs {old_source})"
         )
-
