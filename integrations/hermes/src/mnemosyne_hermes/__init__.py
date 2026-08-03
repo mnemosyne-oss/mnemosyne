@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -233,6 +234,45 @@ _PREFETCH_DEDUP_STOPWORDS = _PREFETCH_FRAGMENT_STOPWORDS | frozenset({
     "like", "more", "need", "needs", "than", "them", "they", "want", "wants",
     "when", "where", "which", "while", "would", "yourself",
 })
+
+
+def _parse_bounded_int_env(key: str, default: int, minimum: int) -> int:
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", key, raw, default)
+        return default
+
+
+def _parse_unit_float_env(key: str, default: float) -> float:
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError("value must be finite")
+        return min(1.0, max(0.0, value))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", key, raw, default)
+        return default
+
+
+def _prefetch_min_distinctive_tokens() -> int:
+    return _parse_bounded_int_env("MNEMOSYNE_PREFETCH_MIN_DISTINCTIVE_TOKENS", 2, 1)
+
+
+def _prefetch_min_query_coverage() -> float:
+    return _parse_unit_float_env("MNEMOSYNE_PREFETCH_MIN_QUERY_COVERAGE", 0.30)
+
+
+def _prefetch_canonical_rare_token_max_frequency() -> int:
+    return _parse_bounded_int_env("MNEMOSYNE_PREFETCH_CANONICAL_RARE_TOKEN_MAX_FREQUENCY", 1, 0)
+
+
 def _parse_token_set_env(key: str, default: Set[str]) -> Set[str]:
     """Read a comma/space-separated token set from env.
 
@@ -252,18 +292,25 @@ def _parse_token_set_env(key: str, default: Set[str]) -> Set[str]:
 
 
 # Generic schema/system labels do not, by themselves, prove a canonical fact is
-# relevant to a turn. Deployments can extend this list with local owner/assistant
-# names using MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS.
+# relevant to a turn. Deployments can replace this list with
+# MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS or extend the effective list with
+# MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS.
 _PREFETCH_CANONICAL_GENERIC_TOKEN_DEFAULTS = {
-    "user", "owner", "assistant", "agent", "system", "profile", "identity", "default"
+    "user", "owner", "assistant", "agent", "system", "profile", "identity", "default",
+    "preference", "preferences", "recommendation", "recommendations",
 }
 
 
 def _prefetch_canonical_generic_tokens() -> Set[str]:
-    return _parse_token_set_env(
+    configured = _parse_token_set_env(
         "MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS",
         _PREFETCH_CANONICAL_GENERIC_TOKEN_DEFAULTS,
     )
+    extras = _parse_token_set_env(
+        "MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS",
+        set(),
+    )
+    return configured | extras
 
 
 def _is_low_quality_prefetch(content: str) -> bool:
@@ -300,13 +347,8 @@ def _prefetch_tokens(content: str) -> Set[str]:
     return tokens
 
 
-def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: int = 3) -> List[Dict[str, Any]]:
-    """Return canonical facts relevant enough for automatic memory-context injection.
-
-    Canonical rows are small, owner-scoped, and single-source-of-truth, so a
-    lightweight lexical pass over current slots is enough and avoids LLM/reranker
-    cost. Importance cannot rescue a row here; it must share query terms.
-    """
+def _canonical_recall_rows(store: Any, owner_id: str, query: str, *, limit: int = 3) -> List[Dict[str, Any]]:
+    """Return canonical facts using the established explicit-recall contract."""
     query_tokens = _prefetch_tokens(query)
     if not query_tokens:
         return []
@@ -314,24 +356,17 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
         rows = store.list(owner_id)
     except Exception:
         return []
+    generic_tokens = _prefetch_canonical_generic_tokens()
     candidates: List[Dict[str, Any]] = []
     for row in rows:
         body = str(row.get("body") or "").strip()
         if not body:
             continue
-        # Score canonical relevance from the fact body itself. Category/name
-        # labels such as "identity" or "profile" are schema metadata; counting
-        # them as topical evidence made generic identity slots inject into
-        # unrelated professional-identity questions.
         row_tokens = _prefetch_tokens(body)
         overlap = query_tokens & row_tokens
-        generic_tokens = _prefetch_canonical_generic_tokens()
         distinctive_overlap = overlap - generic_tokens
         if not distinctive_overlap:
             continue
-        # One distinctive token can be enough for canonical slots such as
-        # profile URLs; broad queries need a little more coverage. Generic
-        # owner/system words do not count toward the minimum overlap.
         coverage = len(overlap) / max(len(query_tokens), 1)
         distinctive_coverage = len(distinctive_overlap) / max(len(query_tokens - generic_tokens), 1)
         if len(distinctive_overlap) < 2 and max(coverage, distinctive_coverage) < 0.30:
@@ -350,7 +385,96 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
             "canonical_category": row.get("category"),
             "canonical_name": row.get("name"),
         })
+    candidates.sort(
+        key=lambda r: (float(r.get("score") or 0.0), float(r.get("keyword_score") or 0.0)),
+        reverse=True,
+    )
+    return candidates[:limit]
+
+
+def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: int = 3) -> List[Dict[str, Any]]:
+    """Return canonical facts relevant enough for automatic memory-context injection.
+
+    Canonical rows are small, owner-scoped, and single-source-of-truth, so a
+    lightweight lexical pass over current slots is enough and avoids LLM/reranker
+    cost. Importance cannot rescue a row here; it must share query terms.
+    """
+    query_tokens = _prefetch_tokens(query)
+    if not query_tokens:
+        return []
+    try:
+        rows = store.list(owner_id)
+    except Exception:
+        return []
+    generic_tokens = _prefetch_canonical_generic_tokens()
+    tokenized_rows: List[tuple[Dict[str, Any], str, Set[str]]] = []
+    token_document_frequency: Dict[str, int] = {}
+    for row in rows:
+        body = str(row.get("body") or "").strip()
+        if not body:
+            continue
+        # Score canonical relevance from the fact body itself. Category/name
+        # labels such as "identity" or "profile" are schema metadata; counting
+        # them as topical evidence made generic identity slots inject into
+        # unrelated professional-identity questions.
+        row_tokens = _prefetch_tokens(body)
+        tokenized_rows.append((row, body, row_tokens))
+        for token in row_tokens - generic_tokens:
+            token_document_frequency[token] = token_document_frequency.get(token, 0) + 1
+
+    # A single lexical overlap is useful only when the token is genuinely rare
+    # across the owner's canonical surface. Otherwise broad words such as
+    # "approval", "family", or a local owner's name can inject several
+    # unrelated high-trust facts and crowd out precise episodic recall.
+    rare_document_frequency = _prefetch_canonical_rare_token_max_frequency()
+    minimum_overlap = _prefetch_min_distinctive_tokens()
+    minimum_coverage = _prefetch_min_query_coverage()
+    candidates: List[Dict[str, Any]] = []
+    for row, body, row_tokens in tokenized_rows:
+        overlap = query_tokens & row_tokens
+        distinctive_overlap = overlap - generic_tokens
+        if not distinctive_overlap:
+            continue
+        # One distinctive token can be enough for canonical slots such as
+        # profile URLs; broad queries need a little more coverage. Generic
+        # owner/system words do not count toward the minimum overlap.
+        coverage = len(overlap) / max(len(query_tokens), 1)
+        distinctive_coverage = len(distinctive_overlap) / max(len(query_tokens - generic_tokens), 1)
+        if len(distinctive_overlap) == 1:
+            only_token = next(iter(distinctive_overlap))
+            if (
+                max(coverage, distinctive_coverage) < minimum_coverage
+                or token_document_frequency.get(only_token, 0) > rare_document_frequency
+            ):
+                continue
+        elif len(distinctive_overlap) < minimum_overlap:
+            continue
+        score = min(1.0, 0.72 + coverage * 0.24 + min(len(overlap), 3) * 0.03)
+        candidates.append({
+            "content": body,
+            "source": f"canonical:{row.get('category') or 'fact'}",
+            "timestamp": row.get("valid_from") or row.get("created_at") or "",
+            "importance": 0.95,
+            "score": score,
+            "keyword_score": max(0.35, coverage),
+            "fact_match": True,
+            "trust_tier": "CANONICAL",
+            "tier": "canonical",
+            "canonical_category": row.get("category"),
+            "canonical_name": row.get("name"),
+            "_prefetch_overlap_count": len(distinctive_overlap),
+        })
+    # When one fact has materially stronger lexical evidence, do not let
+    # weaker one-token candidates ride alongside it merely because their lone
+    # token happens to be unique in a small canonical collection.
+    if any(int(r.get("_prefetch_overlap_count") or 0) >= minimum_overlap for r in candidates):
+        candidates = [
+            r for r in candidates
+            if int(r.get("_prefetch_overlap_count") or 0) >= minimum_overlap
+        ]
     candidates.sort(key=lambda r: (float(r.get("score") or 0.0), float(r.get("keyword_score") or 0.0)), reverse=True)
+    for candidate in candidates:
+        candidate.pop("_prefetch_overlap_count", None)
     return candidates[:limit]
 
 
@@ -396,6 +520,17 @@ def _prefetch_adjusted_score(row: Dict[str, Any]) -> float:
     signal = _prefetch_topic_signal(row)
     importance = min(max(float(row.get("importance") or 0.0), 0.0), 1.0)
     return (score * 0.65 + signal * 0.35 + importance * 0.05) * _prefetch_source_quality(row)
+
+
+def _prefetch_has_distinctive_lexical_evidence(query: str, content: str) -> bool:
+    """Require multiple shared topical terms with meaningful query coverage."""
+    generic_tokens = _prefetch_canonical_generic_tokens()
+    query_tokens = _prefetch_tokens(query) - generic_tokens
+    overlap = query_tokens & _prefetch_tokens(content)
+    return (
+        len(overlap) >= _prefetch_min_distinctive_tokens()
+        and (len(overlap) / max(len(query_tokens), 1)) >= _prefetch_min_query_coverage()
+    )
 
 
 def _semantic_dedup_prefetch(rows: List[Dict[str, Any]], threshold: float = 0.72) -> List[Dict[str, Any]]:
@@ -1263,6 +1398,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     continue
                 if _prefetch_source_quality(r) <= 0:
                     continue
+                # Silent context injection is deliberately more conservative
+                # than explicit recall. One broad shared word (for example
+                # "coffee", "light", or "preference") is not enough evidence
+                # to inject a high-importance but unrelated memory. Explicit
+                # mnemosyne_recall remains available for semantic exploration.
+                if not _prefetch_has_distinctive_lexical_evidence(query, r.get("content", "")):
+                    continue
                 signal = _prefetch_topic_signal(r)
                 score = float(r.get("score") or 0.0)
                 importance = float(r.get("importance") or 0.0)
@@ -1784,7 +1926,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 from mnemosyne.core.canonical import CanonicalStore
                 store = CanonicalStore(db_path=self._beam.db_path, conn=self._beam.conn)
                 self._beam.canonical = store
-            canonical_rows = _canonical_prefetch_rows(store, self._canonical_owner(), query, limit=max(2, min(top_k, 5)))
+            canonical_rows = _canonical_recall_rows(store, self._canonical_owner(), query, limit=max(2, min(top_k, 5)))
         except Exception:
             canonical_rows = []
         if canonical_rows:

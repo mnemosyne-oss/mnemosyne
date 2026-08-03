@@ -150,6 +150,11 @@ No required config. Everything defaults to `~/.mnemosyne/`. Optional overrides:
 | `MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT` | `800` | Assistant content truncation in `sync_turn()` (`0` = no limit) |
 | `MNEMOSYNE_FACT_RECALL_ENABLED` | `false` | Merge LLM-extracted facts into standard recall |
 | `MNEMOSYNE_PREFETCH_CONTENT_CHARS` | `0` | Per-memory prefetch content cap (`0` = full content) |
+| `MNEMOSYNE_PREFETCH_MIN_DISTINCTIVE_TOKENS` | `2` | Shared non-generic terms required for automatic prefetch injection |
+| `MNEMOSYNE_PREFETCH_MIN_QUERY_COVERAGE` | `0.30` | Minimum fraction of non-generic query terms covered by a prefetched memory |
+| `MNEMOSYNE_PREFETCH_CANONICAL_RARE_TOKEN_MAX_FREQUENCY` | `1` | Maximum canonical document frequency that permits a one-token match (`0` disables the exception) |
+| `MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS` | built-in generic-token set | Complete replacement for the canonical generic-token set |
+| `MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS` | _(empty)_ | Extra owner/deployment terms added to the configured generic-token set |
 | `MNEMOSYNE_DEFAULT_SCOPE` | `session` | Default scope for remember (`global` enables cross-session immediate recall) |
 
 Or in `~/.hermes/config.yaml`:
