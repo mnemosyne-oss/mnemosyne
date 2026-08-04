@@ -503,8 +503,12 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
 # A wrapper launcher is a short shell script; cap the read so a stray binary
 # named `hermes` on PATH can never be slurped into memory.
 _MAX_LAUNCHER_BYTES = 64 * 1024
+# A quoted target may contain spaces (`/Users/Ada Lovelace/.hermes/...`); only an
+# unquoted one is whitespace-delimited. One alternative per quoting style, rather
+# than an optional quote plus a shared body, which would stop at the first space
+# and then fail to match its own closing quote.
 _LAUNCHER_EXEC_RE = re.compile(
-    r"""^\s*exec\s+(?P<quote>["']?)(?P<target>/[^"'\s]+)(?P=quote)""",
+    r"""^\s*exec\s+(?:"(?P<dquoted>/[^"]+)"|'(?P<squoted>/[^']+)'|(?P<bare>/[^"'\s]+))""",
     re.MULTILINE,
 )
 
@@ -526,19 +530,21 @@ def _launcher_exec_target(launcher: Path) -> Optional[Path]:
     that is not an absolute path (``exec python -m ...``), leaving the caller
     on its existing path.
     """
+    # One bounded read from one handle. Checking the size with stat() and then
+    # reopening to read would let a launcher swapped between the two calls be
+    # read without a limit.
     try:
-        if launcher.stat().st_size > _MAX_LAUNCHER_BYTES:
-            return None
         with launcher.open("rb") as handle:
-            if handle.read(2) != b"#!":
-                return None
-        text = launcher.read_text(encoding="utf-8", errors="replace")
+            content = handle.read(_MAX_LAUNCHER_BYTES + 1)
     except OSError:
         return None
-    match = _LAUNCHER_EXEC_RE.search(text)
+    if len(content) > _MAX_LAUNCHER_BYTES or not content.startswith(b"#!"):
+        return None
+    match = _LAUNCHER_EXEC_RE.search(content.decode("utf-8", errors="replace"))
     if not match:
         return None
-    return Path(match.group("target"))
+    target = match.group("dquoted") or match.group("squoted") or match.group("bare")
+    return Path(target)
 
 
 def _resolve_launcher(hermes_bin: str) -> Path:

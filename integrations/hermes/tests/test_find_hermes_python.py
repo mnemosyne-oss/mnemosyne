@@ -115,6 +115,52 @@ def test_unparseable_launcher_falls_back_to_known_hermes_root(hermes_world):
     assert install._find_hermes_python() == hermes_world.venv_python
 
 
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_quoted_launcher_target_may_contain_spaces(tmp_path, monkeypatch, quote):
+    """A venv under a path with a space must still be followed, not skipped."""
+    venv = tmp_path / "Ada Lovelace" / ".hermes" / "hermes-agent" / "venv"
+    venv_python = _make_venv(venv)
+    _write_executable(venv / "bin" / "hermes", "#!/bin/sh\nexit 0\n")
+
+    shims = tmp_path / "shims"
+    _write_executable(
+        shims / "hermes",
+        f"#!/usr/bin/env bash\nexec {quote}{venv / 'bin' / 'hermes'}{quote} \"$@\"\n",
+    )
+    shim_python = _write_executable(shims / "python", "#!/bin/sh\nexit 0\n")
+
+    # No known root: if the exec line fails to parse, the shim sibling is all
+    # that is left, which is the failure this guards against.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-home"))
+    monkeypatch.setenv("PATH", str(shims))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+
+    found = install._find_hermes_python()
+
+    assert found == venv_python
+    assert found != shim_python
+
+
+def test_oversized_launcher_is_not_read(tmp_path):
+    """A stray binary named `hermes` must not be slurped in and parsed."""
+    launcher = _write_executable(
+        tmp_path / "hermes",
+        "#!/bin/sh\n" + "# padding\n" * 20_000 + 'exec "/opt/hermes/venv/bin/hermes" "$@"\n',
+    )
+    assert launcher.stat().st_size > install._MAX_LAUNCHER_BYTES
+
+    assert install._launcher_exec_target(launcher) is None
+
+
+def test_launcher_without_shebang_is_ignored(tmp_path):
+    binary = tmp_path / "hermes"
+    binary.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 64)
+
+    assert install._launcher_exec_target(binary) is None
+
+
 def test_explicit_python_is_authoritative(hermes_world, tmp_path):
     """--python wins over every probe, including a valid PATH venv."""
     chosen = _make_venv(tmp_path / "chosen")
