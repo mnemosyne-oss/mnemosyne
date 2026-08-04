@@ -300,6 +300,13 @@ _PREFETCH_CANONICAL_GENERIC_TOKEN_DEFAULTS = {
     "preference", "preferences", "recommendation", "recommendations",
 }
 
+# Explicit recall keeps the pre-hardening generic-token contract. The extra
+# preference/recommendation terms and prefetch environment tuning below are
+# intentionally limited to silent automatic context injection.
+_CANONICAL_RECALL_GENERIC_TOKENS = {
+    "user", "owner", "assistant", "agent", "system", "profile", "identity", "default",
+}
+
 
 def _prefetch_canonical_generic_tokens() -> Set[str]:
     configured = _parse_token_set_env(
@@ -356,7 +363,7 @@ def _canonical_recall_rows(store: Any, owner_id: str, query: str, *, limit: int 
         rows = store.list(owner_id)
     except Exception:
         return []
-    generic_tokens = _prefetch_canonical_generic_tokens()
+    generic_tokens = _CANONICAL_RECALL_GENERIC_TOKENS
     candidates: List[Dict[str, Any]] = []
     for row in rows:
         body = str(row.get("body") or "").strip()

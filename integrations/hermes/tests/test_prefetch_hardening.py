@@ -234,6 +234,27 @@ def test_explicit_recall_preserves_broad_canonical_merge():
     assert {row["canonical_name"] for row in response["results"]} == {"geology-a", "geology-b"}
 
 
+def test_explicit_recall_does_not_apply_prefetch_specific_generic_tokens():
+    p = _provider([])
+    store = FakeCanonicalStore([
+        {
+            "name": "selection-lens",
+            "body": "SampleOwner recommendations emphasize reliability.",
+            "category": "model:user",
+        },
+    ])
+    p._beam.canonical = store
+
+    assert _canonical_prefetch_rows(store, "default", "recommendations") == []
+
+    response = json.loads(p.handle_tool_call(
+        "mnemosyne_recall",
+        {"query": "recommendations", "limit": 5},
+    ))
+
+    assert [row["canonical_name"] for row in response["results"]] == ["selection-lens"]
+
+
 def test_canonical_prefetch_can_disable_single_token_exception(monkeypatch):
     monkeypatch.setenv("MNEMOSYNE_PREFETCH_CANONICAL_RARE_TOKEN_MAX_FREQUENCY", "0")
     store = FakeCanonicalStore([
