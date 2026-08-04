@@ -41,30 +41,84 @@ cd mnemosyne
 pip install -e "integrations/hermes[dev]"
 ```
 
-> **Docker users:** Inside the official Hermes Docker container, the Hermes home directory is `/opt/data/` (the mounted volume), not `~/.hermes/`. For image-based or read-only Hermes venv installs, prefer the persistent wrapper mode so the plugin discovery directory survives image rebuilds:
+> **Docker users: use persistent side-venv wrapper mode.** This is the canonical Docker installation. Inside the official Hermes container, the mounted Hermes home is `/opt/data/`, not `~/.hermes/`. Keep the side venv on that mounted volume so both it and the wrapper survive image rebuilds:
 >
 > ```bash
-> # Inside the container, pointing at a side/persistent venv that has mnemosyne-hermes installed
+> # Run inside the container once. Choose a persistent path on the mounted volume.
+> VENV=/opt/data/venvs/mnemosyne
+> python3 -m venv "$VENV"
+> "$VENV/bin/python" -m pip install --upgrade mnemosyne-hermes
+>
 > export HERMES_HOME=/opt/data
-> /path/to/venv/bin/mnemosyne-hermes install --mode wrapper --python /path/to/venv/bin/python
-> /path/to/venv/bin/mnemosyne-hermes status
+> export MNEMOSYNE_DATA_DIR=/opt/data
+> "$VENV/bin/mnemosyne-hermes" install --mode wrapper --python "$VENV/bin/python"
+> "$VENV/bin/mnemosyne-hermes" status
 > hermes config set memory.provider mnemosyne
 > hermes gateway restart
 > ```
 >
-> The default `install` mode still creates the historical plugin symlink. Wrapper mode creates a real directory under `$HERMES_HOME/plugins/mnemosyne/` and imports `mnemosyne_hermes` from the selected Python environment. Skip the manual link and activation steps below; the installer handles plugin registration. Verify the active provider after restarting.
+> Wrapper mode creates a real directory at `$HERMES_HOME/plugins/mnemosyne/`. Its bootstrap adds the selected side venv's site-packages to `sys.path` before importing `mnemosyne_hermes`. Do not use the manual symlink instructions below for this installation.
+>
+> **Multiple profiles, one side venv:** after `status` confirms the base wrapper, profiles that use the same persistent side venv may each symlink their `plugins/mnemosyne` directory to that tested base wrapper. If a profile's `config.yaml` already selects `memory.provider: mnemosyne` before the base wrapper install, the installer creates the link automatically. It skips an existing profile target unless run with `--force`.
+>
+> To add a profile manually, refuse to overwrite an existing plugin target:
+>
+> ```bash
+> # Each profile must select memory.provider: mnemosyne in its own Hermes config.
+> PROFILE=/opt/data/profiles/work
+> TARGET="$PROFILE/plugins/mnemosyne"
+> mkdir -p "$PROFILE/plugins"
+> if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
+>   printf 'Refusing to replace existing plugin target: %s\n' "$TARGET" >&2
+>   exit 1
+> fi
+> ln -s /opt/data/plugins/mnemosyne "$TARGET"
+> ```
+>
+> A profile-local wrapper is an equivalent runtime alternative when independent plugin directories are preferred. Use it instead of the base-wrapper link for that profile:
+>
+> ```bash
+> HERMES_HOME=/opt/data/profiles/work "$VENV/bin/mnemosyne-hermes" install --mode wrapper --python "$VENV/bin/python"
+> HERMES_HOME=/opt/data/profiles/work "$VENV/bin/mnemosyne-hermes" status
+> ```
+>
+> For an existing target, use `--force` only after confirming it is the Mnemosyne link or wrapper you intend to replace. Do not force-replace an unknown plugin target.
+>
+> Do not mix the two strategies for one profile. A later base-home `install --force` can replace a profile-local wrapper with a link to the base wrapper.
+>
+> **Never symlink a profile directly to `site-packages/mnemosyne_hermes`.** That bypasses the wrapper's `sys.path` bootstrap and can leave fresh Hermes profiles unable to import the provider.
 
-### Step 2: Link the plugin
+### Step 2: Link the plugin in a local mutable environment
 
-Hermes discovers plugins by scanning a folder on disk, not by reading pip's metadata. Link the installed package into the plugins directory so Hermes can find it:
+For a non-Docker local installation, the supported installer default is symlink mode:
 
 ```bash
-# Auto-detect the installed package path and symlink it
-mkdir -p ~/.hermes/plugins/mnemosyne
-ln -sfn "$(~/.hermes/hermes-agent/venv/bin/python -c 'import pathlib, mnemosyne_hermes; print(pathlib.Path(mnemosyne_hermes.__file__).resolve().parent)')"/* ~/.hermes/plugins/mnemosyne/
+mnemosyne-hermes install
 ```
 
-If you installed in a custom venv (e.g. `~/.hermes-venv`), replace `~/.hermes/hermes-agent/venv/bin/python` with the Python binary inside that venv.
+This creates the historical plugin symlink. Use wrapper mode above for Docker and persistent side venv deployments.
+
+#### Legacy manual symlink fallback
+
+Hermes discovers directory plugins by scanning a folder on disk, not by reading pip metadata. Use the following manual fallback only for a local, mutable venv that is not using wrapper mode and has no existing plugin target. If you previously ran `mnemosyne-hermes install`, run `mnemosyne-hermes uninstall` first. Do not use this block as a troubleshooting step on top of an installer-managed symlink:
+
+```bash
+TARGET="$HOME/.hermes/plugins/mnemosyne"
+if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
+  printf 'Refusing to replace existing plugin target: %s\n' "$TARGET" >&2
+  exit 1
+fi
+PKG="$(~/.hermes/hermes-agent/venv/bin/python -c 'import pathlib, mnemosyne_hermes; print(pathlib.Path(mnemosyne_hermes.__file__).resolve().parent)')"
+if [ ! -d "$PKG" ]; then
+  printf 'Could not locate mnemosyne_hermes in the selected venv\n' >&2
+  exit 1
+fi
+mkdir -p "$TARGET"
+# Symlink the installed package contents into the manual plugin directory.
+ln -s "$PKG"/* "$TARGET/"
+```
+
+If you installed in a custom venv (for example, `~/.hermes-venv`), replace `~/.hermes/hermes-agent/venv/bin/python` with the Python binary inside that venv. Do not combine this manual mode with a wrapper directory, and do not use it to link Docker profiles to the side venv's `site-packages` package.
 
 ### Step 3: Activate
 
@@ -194,10 +248,12 @@ VENV=/path/to/venv             # The same side venv passed to the wrapper instal
 hermes memory off  # Disable the external provider; built-in memory remains active
 hermes gateway restart  # Run from a shell outside the gateway process
 "$VENV/bin/mnemosyne-hermes" uninstall
+# For every profile-local wrapper, repeat the uninstall first, with that profile's Hermes home.
+HERMES_HOME=/opt/data/profiles/work "$VENV/bin/mnemosyne-hermes" uninstall
 "$VENV/bin/python" -m pip uninstall mnemosyne-hermes
 ```
 
-`mnemosyne-hermes uninstall` removes the plugin registration at `$HERMES_HOME/plugins/mnemosyne`.
+`mnemosyne-hermes uninstall` removes the plugin registration at `$HERMES_HOME/plugins/mnemosyne`. Remove every profile-local wrapper before uninstalling the side-venv package.
 
 ### Activated local environment
 

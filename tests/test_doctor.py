@@ -332,6 +332,33 @@ def test_runtime_diagnostics_marks_sqlite_vec_available_only_after_loading(monke
     )
 
 
+def test_runtime_diagnostics_reports_embedding_model_and_dim(monkeypatch):
+    """The doctor surface reports the configured embedding model AND its
+    resolved dimension, and the doctor's sanitization boundary surfaces
+    embeddings_dim (it is allowlisted), so operators can verify
+    MNEMOSYNE_EMBEDDING_DIM / model-table resolution without a traceback."""
+    from mnemosyne import doctor, runtime_diagnostics
+    from mnemosyne.core import embeddings
+
+    # Control the dimension so the test asserts exact propagation rather than
+    # just "some positive integer".
+    monkeypatch.setattr(embeddings, "EMBEDDING_DIM", 123)
+
+    result = runtime_diagnostics.collect_runtime_diagnostics()
+    checks = {entry["check"]: entry for entry in result["checks"]}
+
+    assert checks["embeddings_model"]["status"] == "OK"
+    dim = checks["embeddings_dim"]
+    assert dim["status"] == "OK"
+    assert dim["detail"] == "123"
+
+    # The doctor surfaces embeddings_dim through its sanitization boundary
+    # (it is in _RUNTIME_CHECK_NAMES); an allowlist regression would silently
+    # drop it.
+    sanitized = doctor._sanitize_runtime_diagnostics(result)
+    assert any(entry["check"] == "embeddings_dim" for entry in sanitized["checks"])
+
+
 @pytest.mark.parametrize(
     ("raw_python_path", "safe_python_executable"),
     [

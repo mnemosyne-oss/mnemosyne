@@ -279,6 +279,128 @@ def test_wm_vec_search_falls_back_when_vec_working_missing_row(temp_db):
     assert results[0]["sim"] == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize("vec_type", ["float32", "int8", "bit"])
+def test_wm_vec_search_overfetches_and_returns_partial_results_when_exhausted(temp_db, monkeypatch, vec_type):
+    np = pytest.importorskip("numpy")
+    beam = BeamMemory(session_id="target-session", db_path=temp_db)
+    _require_vec_working(beam.conn)
+    beam.conn.execute("DROP TABLE vec_working")
+    beam.conn.execute(
+        f"CREATE VIRTUAL TABLE vec_working USING vec0(embedding {vec_type}[{beam_module.EMBEDDING_DIM}])"
+    )
+    now = datetime.now().isoformat()
+    exact = _unit_embedding()
+    target = np.array([0.9, 0.1] + [0.0] * (beam_module.EMBEDDING_DIM - 2), dtype=np.float32)
+
+    rows = [
+        (f"excluded-{i}", f"excluded {i}", "test", now, "other-session", "session", 0.5)
+        for i in range(1201)
+    ]
+    rows.append(("global-target", "global target", "test", now, "target-session", "global", 0.5))
+    beam.conn.executemany(
+        """
+        INSERT INTO working_memory
+            (id, content, source, timestamp, session_id, scope, importance)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    for memory_id, *_rest in rows[:-1]:
+        rowid = beam.conn.execute("SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)).fetchone()["rowid"]
+        beam_module._vec_table_insert(beam.conn, "vec_working", rowid, exact, commit=False)
+    target_rowid = beam.conn.execute(
+        "SELECT rowid FROM working_memory WHERE id = 'global-target'"
+    ).fetchone()["rowid"]
+    beam_module._vec_table_insert(beam.conn, "vec_working", target_rowid, target, commit=False)
+    beam.conn.commit()
+
+    def fail_fallback(*_args, **_kwargs):
+        raise AssertionError("memory_embeddings fallback should not be invoked")
+
+    monkeypatch.setattr(beam_module, "_wm_vec_search_fallback", fail_fallback)
+
+    results = _wm_vec_search(
+        beam.conn,
+        exact,
+        k=5,
+        where_sql=(
+            "(valid_until IS NULL OR valid_until > ?) AND superseded_by IS NULL "
+            "AND (session_id = ? OR scope = 'global')"
+        ),
+        where_params=(now, "target-session"),
+    )
+
+    assert [r["id"] for r in results] == ["global-target"]
+    assert len(results) < 5  # The exhausted table has fewer eligible rows than the requested k.
+
+
+def test_wm_vec_search_amortizes_vec_working_count_until_database_changes(temp_db):
+    beam = BeamMemory(session_id="count-cache", db_path=temp_db)
+    _require_vec_working(beam.conn)
+    embedding = _unit_embedding()
+    now = datetime.now().isoformat()
+
+    def insert_memory(conn, memory_id):
+        conn.execute(
+            """
+            INSERT INTO working_memory
+                (id, content, source, timestamp, session_id, scope, importance)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (memory_id, memory_id, "test", now, "count-cache", "session", 0.5),
+        )
+        rowid = conn.execute("SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)).fetchone()["rowid"]
+        beam_module._vec_table_insert(conn, "vec_working", rowid, embedding)
+
+    insert_memory(beam.conn, "first")
+    statements = []
+    beam.conn.set_trace_callback(statements.append)
+    try:
+        for _ in range(2):
+            results = beam_module._wm_vec_search_sqlite(
+                beam.conn,
+                embedding,
+                k=5,
+                where_sql="session_id = ?",
+                where_params=("count-cache",),
+            )
+            assert [r["id"] for r in results] == ["first"]
+
+        assert sum("SELECT COUNT(*) FROM vec_working" in sql for sql in statements) == 1
+
+        insert_memory(beam.conn, "second")
+        results = beam_module._wm_vec_search_sqlite(
+            beam.conn,
+            embedding,
+            k=5,
+            where_sql="session_id = ?",
+            where_params=("count-cache",),
+        )
+        assert {r["id"] for r in results} == {"first", "second"}
+        assert sum("SELECT COUNT(*) FROM vec_working" in sql for sql in statements) == 2
+
+        external = sqlite3.connect(str(temp_db), factory=beam_module._BeamConnection)
+        external.row_factory = sqlite3.Row
+        try:
+            external.enable_load_extension(True)
+            beam_module.sqlite_vec.load(external)
+            insert_memory(external, "external")
+        finally:
+            external.close()
+
+        results = beam_module._wm_vec_search_sqlite(
+            beam.conn,
+            embedding,
+            k=5,
+            where_sql="session_id = ?",
+            where_params=("count-cache",),
+        )
+        assert {r["id"] for r in results} == {"first", "second", "external"}
+        assert sum("SELECT COUNT(*) FROM vec_working" in sql for sql in statements) == 3
+    finally:
+        beam.conn.set_trace_callback(None)
+
+
 def test_vec_working_coverage_reports_missing_and_repair_fills_gap(temp_db):
     beam = BeamMemory(session_id="vec-working-coverage", db_path=temp_db)
     _require_vec_working(beam.conn)

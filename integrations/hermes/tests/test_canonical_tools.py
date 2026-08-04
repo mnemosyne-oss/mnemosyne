@@ -139,3 +139,17 @@ def test_active_adapter_exposes_canonical_tool_schemas():
 
     assert "mnemosyne_remember_canonical" in names
     assert "mnemosyne_recall_canonical" in names
+
+
+def test_invalidate_reports_not_found_when_no_row_matched(tmp_path):
+    provider = _provider(tmp_path, profile="profile_a")
+    try:
+        assert provider._beam.invalidate("missing-memory-id") is False
+        result = json.loads(provider.handle_tool_call(
+            "mnemosyne_invalidate",
+            {"memory_id": "missing-memory-id"},
+        ))
+        assert result["status"] == "memory_not_found"
+        assert result["memory_id"] == "missing-memory-id"
+    finally:
+        _close(provider)

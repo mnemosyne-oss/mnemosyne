@@ -467,6 +467,7 @@ _RUNTIME_CHECK_NAMES = frozenset(
         "ctransformers",
         "embeddings_available",
         "embeddings_model",
+        "embeddings_dim",
         "sqlite_vec_available",
         "sqlite_vec_warning",
     }

@@ -68,11 +68,13 @@ Mnemosyne is intentionally minimal. Every addition is weighed against these prin
 
 ### Review Process
 
-There is no formal review board. Pull requests are reviewed by the maintainer and merged when they:
+Pull requests are reviewed by the maintainers and merged when they:
 
 - Pass existing tests
 - Follow the principles above
 - Include a clear description of what changed and why
+
+See [MAINTAINERS.md](MAINTAINERS.md) for the canonical decision framework, including who has authority over which areas of the codebase.
 
 ## Areas of Interest
 

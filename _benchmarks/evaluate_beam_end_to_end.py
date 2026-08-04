@@ -365,7 +365,7 @@ def _extract_facts(content: str, source: str = "unknown") -> list[dict]:
     facts = []
     
     # Pattern 1: Version numbers ("Flask 2.3.1", "v0.6.2", "Python 3.11")
-    ver_matches = re.findall(r'([A-Z][a-zA-Z]+(?:\s*[A-Z][a-zA-Z]+)*)\s+v?(\d+\.\d+(?:\.\d+)?)', content)
+    ver_matches = re.findall(r'([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*)\s+v?(\d+\.\d+(?:\.\d+)?)', content)
     for name, ver in ver_matches[:3]:
         facts.append({
             "content": f"FACT version: {name.strip()} {ver}",

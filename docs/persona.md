@@ -2,9 +2,9 @@
 
 **Status:** partially wired. Read [What is not wired](#what-is-not-wired) before relying on this.
 
-The persona tier holds a small set of durable behavioural facts about the user that are injected into every prompt regardless of semantic relevance. Ordinary memories compete for a place in recall results; persona facts do not compete, they are always present.
+The persona tier holds a small set of durable behavioural facts about the user. It is a store, not a prompt channel: promotion writes a row to the `memoria_persona` table, while [prompt injection](#prompt-injection) reads the opt-in `persona.md` file and never queries the table. Promoting a fact changes nothing about your prompts until something regenerates that file.
 
-That is the whole point of the tier, and also its cost: everything here consumes prompt budget on every single turn, so the tier is meant to stay small.
+The intended role is a set of facts that are always present rather than competing for recall, and that role has a cost: anything that reaches the injected file consumes prompt budget on every turn, so the tier is meant to stay small.
 
 ---
 
@@ -32,7 +32,7 @@ Indexed on `(session_id, tier)` and `(tier, topic)`.
 
 Three values are accepted: `permanent`, `long_term` (the default on promote), and `working`.
 
-**Tier affects ordering only.** Listing sorts `permanent` before `long_term` before `working`, then by `reinforcement_count` descending. That ordering is what determines which facts survive the token cap, so tier is effectively an injection priority.
+**Tier affects `mnemosyne_persona_list` ordering only.** Listing sorts `permanent` before `long_term` before `working`, then by `reinforcement_count` descending. Nothing else consults the tier: the prompt path reads `persona.md` and never queries this table.
 
 Tier does **not** cause retention or expiry. There is no code anywhere that deletes, ages out, or reduces the confidence of a `memoria_persona` row. The only writes are insert on promote, delete on demote, and the reinforcement counter update. Descriptions elsewhere in the codebase that call `permanent` "never evicted" or `long_term` "reinforcement-driven decay" describe an intended design, not current behaviour: nothing is evicted, because no eviction exists.
 
@@ -44,7 +44,7 @@ Implemented by `PersonaAdapter` in `hermes_memory_provider/persona_adapter.py`, 
 |---|---|
 | **promote** | Reads content from `working_memory`, falling back to `episodic_memory`. Derives `topic` from `memoria_timelines` via `source_memory_id`, else `"general"`. Errors if the content is empty. Default tier `long_term`. |
 | **demote** | Not a plain delete. Inserts a tombstone into `memoria_preferences` recording `[demoted from <tier>] <content>` and the reason, then deletes the `memoria_persona` row. Both in one transaction. |
-| **list** | Optional `tier` and `topic` filters. Returns rows in injection priority order. |
+| **list** | Optional `tier` and `topic` filters. Returns rows in tier order (`permanent` first), then by `reinforcement_count` descending. |
 | **reinforce** | `reinforcement_count += 1` and `last_reinforced_at = CURRENT_TIMESTAMP`. Returns an error if the id does not exist. |
 
 Reinforcement feeds two consumers: the list ordering above, and the regeneration trigger, which uses `MAX(last_reinforced_at)` as its watermark.

@@ -981,11 +981,12 @@ def init_beam(db_path: Path = None):
         _add_column_if_missing(conn, table, 'source_memory_id', 'TEXT')
 
     # --- L3 Persona (v3.10.0) ---
-    # Always-on persona tier with explicit retention classification.
+    # Explicit persona store with tier classification.
     # Tier values: 'permanent', 'long_term' (default), 'working'.
-    # Tier controls injection priority only. No eviction or decay is
-    # implemented for this table: the only writes are insert on promote,
-    # delete on demote, and the reinforcement counter bump.
+    # Tier orders persona_list output and affects nothing else; the system
+    # prompt path reads the opt-in persona.md file, not this table. No
+    # eviction or decay is implemented for this table: the only writes are
+    # insert on promote, delete on demote, and the reinforcement counter bump.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS memoria_persona (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1262,6 +1263,7 @@ class _BeamConnection(sqlite3.Connection):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._defer_commit = False
+        self._vec_working_count_cache: Optional[Tuple[int, int, int]] = None
 
     def commit(self) -> None:
         if self._defer_commit:
@@ -2881,39 +2883,53 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
         emb_arr = emb_arr / query_norm
     emb_json = json.dumps(emb_arr.tolist())
     k = int(k)
+    # sqlite-vec applies its KNN `k` limit before the relational working-memory
+    # filters below. With many thread-scoped rows, asking for only the caller's
+    # final `k` can select rows from other sessions, filter them all out, and
+    # incorrectly trigger the expensive JSON-vector compatibility scan. Widen
+    # the candidate neighborhood until enough filtered rows are found or the
+    # vector table is exhausted, then return only the requested result count.
     try:
-        if vec_type == "bit":
-            rows = conn.execute(f"""
-                SELECT wm.id, vw.distance
-                FROM vec_working vw
-                JOIN working_memory wm ON wm.rowid = vw.rowid
-                WHERE vw.embedding MATCH vec_quantize_binary(?)
-                  AND k={k}
-                  AND {where_sql}
-                ORDER BY vw.distance
-            """, (emb_json, *where_params)).fetchall()
-        elif vec_type == "int8":
-            rows = conn.execute(f"""
-                SELECT wm.id, vw.distance
-                FROM vec_working vw
-                JOIN working_memory wm ON wm.rowid = vw.rowid
-                WHERE vw.embedding MATCH vec_quantize_int8(?, "unit")
-                  AND k={k}
-                  AND {where_sql}
-                ORDER BY vw.distance
-            """, (emb_json, *where_params)).fetchall()
+        # COUNT(*) on a vec0 virtual table is a full scan. Cache it across
+        # read-only searches, invalidating on both external commits
+        # (data_version) and writes through this connection (total_changes).
+        count_stamp = (
+            int(conn.execute("PRAGMA data_version").fetchone()[0]),
+            int(conn.total_changes),
+        )
+        cached_count = getattr(conn, "_vec_working_count_cache", None)
+        if cached_count is not None and cached_count[:2] == count_stamp:
+            total_vectors = cached_count[2]
         else:
-            rows = conn.execute(f"""
-                SELECT wm.id, vw.distance
-                FROM vec_working vw
-                JOIN working_memory wm ON wm.rowid = vw.rowid
-                WHERE vw.embedding MATCH ?
-                  AND k={k}
-                  AND {where_sql}
-                ORDER BY vw.distance
-            """, (emb_json, *where_params)).fetchall()
+            total_vectors = int(conn.execute("SELECT COUNT(*) FROM vec_working").fetchone()[0])
+            if isinstance(conn, _BeamConnection):
+                conn._vec_working_count_cache = (*count_stamp, total_vectors)
     except Exception:
         return []
+    if total_vectors == 0:
+        return []
+    scan_k = min(total_vectors, max(k * 25, 500))
+    match_expr = {
+        "bit": "vec_quantize_binary(?)",
+        "int8": "vec_quantize_int8(?, 'unit')",
+    }.get(vec_type, "?")
+    rows = []
+    while True:
+        try:
+            rows = conn.execute(f"""
+                SELECT wm.id, vw.distance
+                FROM vec_working vw
+                JOIN working_memory wm ON wm.rowid = vw.rowid
+                WHERE vw.embedding MATCH {match_expr}
+                  AND k = ?
+                  AND {where_sql}
+                ORDER BY vw.distance
+            """, (emb_json, scan_k, *where_params)).fetchall()
+        except Exception:
+            return []
+        if len(rows) >= k or scan_k >= total_vectors:
+            break
+        scan_k = min(total_vectors, scan_k * 2)
     results = []
     for row in rows:
         distance = float(row["distance"])
@@ -8632,7 +8648,15 @@ class BeamMemory:
                         proposal_id = self.remember(
                             model_refresh.proposal_to_memory_content(proposal),
                             source="sleep_model_refresh_proposal",
-                            importance=float(proposal.get("confidence") or 0.5),
+                            # Convert defensively: this runs AFTER the claim
+                            # commit, so a raise here strands this group's
+                            # consolidation_claimed_at and orphans every
+                            # later group's claim. Proposals normally arrive
+                            # sanitized by parse_model_update_proposals, but
+                            # that invariant lives a module away.
+                            importance=model_refresh.coerce_confidence(
+                                proposal.get("confidence"), 0.5
+                            ),
                             metadata=metadata,
                             scope="session",
                             veracity="inferred",

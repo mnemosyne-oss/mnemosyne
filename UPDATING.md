@@ -27,6 +27,32 @@ Already on v3.0.0? See [Upgrading to v3.0.0](#upgrading-to-v300-memoria-architec
 
 ---
 
+## Current / Unreleased — Hermes wrapper install safety
+
+### Updating a Hermes wrapper install
+
+For a persistent wrapper (the Docker/read-only deployment path), keep wrapper
+mode and name the Python environment that contains the selected package:
+
+```bash
+mnemosyne-hermes install --mode wrapper --python /path/to/venv/bin/python --force
+```
+
+`--force` refreshes a wrapper only after that Python can resolve its
+site-packages and import `mnemosyne_hermes`; an invalid `--python` leaves the
+existing wrapper and opted-in profile links in place. Editable installs in the
+selected environment are supported. To intentionally replace a wrapper with
+the historical symlink install, acknowledge the mode change:
+
+```bash
+mnemosyne-hermes install --mode symlink --force --migrate-wrapper-to-symlink
+```
+
+That migration stops using the wrapper's selected Python. The installer warns
+before making the change; without the explicit flag it refuses the replacement.
+
+---
+
 ## PEP 668: externally-managed-environment on Debian / Ubuntu
 
 Debian 13 (and Ubuntu 24.04+) ship Python with PEP 668 protection.
@@ -163,6 +189,11 @@ For the new plugin features:
 
 ```bash
 pipx install "mnemosyne-hermes[all]"
+```
+
+For existing symlink installs only:
+
+```bash
 mnemosyne-hermes install --force
 ```
 
@@ -302,8 +333,6 @@ pip install --upgrade mnemosyne-memory==3.11.0
 No manual migration. Sync role default changed to `["user"]` — if you
 want assistant-turn autosave, set `memory.mnemosyne.sync_roles:
 ["user", "assistant"]` in `config.yaml`.
-
----
 
 ## Upgrading to v3.6.0 — Canonical Facts + API Embedding Fallback
 

@@ -1,0 +1,20 @@
+# Mnemosyne CODEOWNERS
+# These owners will be the default owners for everything in the repo.
+# The Project Lead has final say on core architecture (see MAINTAINERS.md).
+
+# Default: both maintainers review
+*                           @AxDSan @dplush
+
+# Core architecture (Project Lead retains final authority)
+mnemosyne/core/beam.py      @AxDSan
+mnemosyne/core/banks.py     @AxDSan
+mnemosyne/core/profiles.py  @AxDSan
+
+# Integrations and tooling (Co-Maintainer can drive)
+hermes_memory_provider/     @dplush @AxDSan
+integrations/               @dplush @AxDSan
+scripts/                    @dplush @AxDSan
+
+# Docs and tests (either can approve)
+docs/                       @AxDSan @dplush
+tests/                      @AxDSan @dplush

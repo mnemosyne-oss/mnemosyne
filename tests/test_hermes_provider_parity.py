@@ -119,6 +119,36 @@ def test_provider_tool_schemas_match(provider_modules):
     assert _json_stable(root_tools) == _json_stable(integration_tools)
 
 
+def test_persona_schemas_match_canonical(provider_modules):
+    """The two shipped persona tool surfaces must equal the canonical schemas.
+
+    The surface-to-surface check above kept both copies in lockstep while they
+    drifted together from mnemosyne/tool_schemas.py: the provider copies kept
+    promising auto-injection, eviction, and decay after the canonical promote
+    description was corrected. Pin every persona schema to the canonical
+    definition so a wording fix cannot land in one place again.
+    """
+    from mnemosyne import tool_schemas as canonical
+
+    canonical_by_name = {
+        schema["name"]: schema
+        for schema in (
+            canonical.PERSONA_PROMOTE_SCHEMA,
+            canonical.PERSONA_DEMOTE_SCHEMA,
+            canonical.PERSONA_LIST_SCHEMA,
+            canonical.PERSONA_REINFORCE_SCHEMA,
+        )
+    }
+    for name, module in provider_modules.items():
+        surface = {
+            schema["name"]: schema
+            for schema in module.ALL_TOOL_SCHEMAS
+            if schema["name"] in canonical_by_name
+        }
+        assert set(surface) == set(canonical_by_name), name
+        assert _json_stable(surface) == _json_stable(canonical_by_name), name
+
+
 def test_provider_config_defaults_match(provider_modules):
     root_config = _config_schema(provider_modules["hermes_memory_provider"])
     integration_config = _config_schema(provider_modules["mnemosyne_hermes"])

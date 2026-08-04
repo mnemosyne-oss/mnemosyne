@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
 from mnemosyne_hermes import install
 
 
@@ -299,6 +298,10 @@ def test_plugin_state_reports_non_executable_wrapper_interpreter_without_raising
 
 
 def test_check_wrapper_import_returns_error_when_interpreter_cannot_launch(tmp_path, monkeypatch):
+    package = tmp_path / "mnemosyne_hermes"
+    package.mkdir()
+    (package / "__init__.py").write_text("__version__ = 'test'\n", encoding="utf-8")
+
     def raise_permission_error(*args, **kwargs):
         raise PermissionError("permission denied")
 
@@ -309,6 +312,46 @@ def test_check_wrapper_import_returns_error_when_interpreter_cannot_launch(tmp_p
     assert ok is False
     assert error == f"could not run wrapper Python {Path(sys.executable)}: permission denied"
     assert invalid_runtime is True
+
+
+def test_check_wrapper_import_isolates_selected_site_from_pythonpath(monkeypatch):
+    site_packages = install._site_packages_for_python(Path(sys.executable))
+    observed = {}
+    monkeypatch.setenv("PYTHONPATH", "/untrusted/pythonpath")
+    monkeypatch.setenv("PYTHONOPTIMIZE", "2")
+    monkeypatch.setenv("PYTHONNOUSERSITE", "1")
+
+    def successful_probe(command, **kwargs):
+        observed["command"] = command
+        observed["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(command, 0, "ok\n", "")
+
+    monkeypatch.setattr(install.subprocess, "run", successful_probe)
+
+    ok, error, invalid_runtime = install._check_wrapper_import(site_packages, Path(sys.executable))
+
+    assert ok is True
+    assert error is None
+    assert invalid_runtime is False
+    assert "PYTHONPATH" not in observed["env"]
+    assert "PYTHONOPTIMIZE" not in observed["env"]
+    assert observed["env"]["PYTHONNOUSERSITE"] == "1"
+    assert observed["command"][1] == "-S"
+    assert "site.addsitedir" in observed["command"][3]
+    assert "assert " not in observed["command"][3]
+
+
+def test_check_wrapper_import_accepts_direct_package_without_dist_metadata(tmp_path):
+    site_packages = tmp_path / "site-packages"
+    package = site_packages / "mnemosyne_hermes"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("__version__ = 'test'\n", encoding="utf-8")
+
+    ok, error, invalid_runtime = install._check_wrapper_import(site_packages, Path(sys.executable))
+
+    assert ok is True
+    assert error is None
+    assert invalid_runtime is False
 
 
 def test_plugin_state_classifies_timed_out_wrapper_import_as_stale(tmp_path, monkeypatch):
@@ -359,3 +402,80 @@ def test_install_plugin_rejects_unknown_mode(tmp_path):
         assert "mode must be" in str(exc)
     else:
         raise AssertionError("install_plugin should reject unknown modes")
+
+
+def test_cli_requires_explicit_flag_to_migrate_wrapper_to_symlink(tmp_path, monkeypatch, capsys):
+    if sys.platform.startswith("win32"):
+        pytest.skip("POSIX symlink test")
+    target = install.install_plugin(
+        hermes_home_path=tmp_path,
+        mode="wrapper",
+        python=sys.executable,
+    )
+    original_init = (target / "__init__.py").read_bytes()
+    monkeypatch.setattr(install, "check_mnemosyne_core", lambda: True)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda: None)
+
+    rejected = install.main(
+        ["--hermes-home", str(tmp_path), "install", "--force", "--no-bootstrap"]
+    )
+
+    assert rejected == 1
+    assert target.is_dir() and not target.is_symlink()
+    assert (target / "__init__.py").read_bytes() == original_init
+    assert "migrate-wrapper-to-symlink" in capsys.readouterr().err
+
+    migrated = install.main(
+        [
+            "--hermes-home",
+            str(tmp_path),
+            "install",
+            "--force",
+            "--no-bootstrap",
+            "--migrate-wrapper-to-symlink",
+        ]
+    )
+
+    assert migrated == 0
+    assert target.is_symlink()
+    assert "Migrating existing Mnemosyne wrapper to a symlink" in capsys.readouterr().out
+
+
+def test_dry_run_reports_refused_wrapper_migration(tmp_path, monkeypatch, capsys):
+    if sys.platform.startswith("win32"):
+        pytest.skip("POSIX symlink test")
+    target = install.install_plugin(
+        hermes_home_path=tmp_path,
+        mode="wrapper",
+        python=sys.executable,
+    )
+    original_init = (target / "__init__.py").read_bytes()
+    monkeypatch.setattr(install, "_find_hermes_python", lambda: None)
+
+    rc = install.main(
+        ["--hermes-home", str(tmp_path), "install", "--force", "--dry-run", "--no-bootstrap"]
+    )
+
+    assert rc == 1
+    assert "Will refuse to replace the existing wrapper" in capsys.readouterr().out
+    assert target.is_dir() and not target.is_symlink()
+    assert (target / "__init__.py").read_bytes() == original_init
+
+
+def test_dry_run_rejects_invalid_wrapper_migration_flag_combination(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(install, "_find_hermes_python", lambda: None)
+
+    rc = install.main(
+        ["--hermes-home", str(tmp_path), "install", "--dry-run", "--migrate-wrapper-to-symlink"]
+    )
+
+    assert rc == 1
+    assert "unless --mode symlink and --force are both set" in capsys.readouterr().out
+
+
+def test_install_help_describes_required_wrapper_migration_flags(capsys):
+    with pytest.raises(SystemExit, match="0"):
+        install.main(["install", "--help"])
+
+    help_text = capsys.readouterr().out
+    assert "With --mode symlink and --force" in help_text

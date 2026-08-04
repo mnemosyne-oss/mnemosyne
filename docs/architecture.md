@@ -153,7 +153,7 @@ columns without a migration step. Most DDL lives in `init_beam` in
 | `memoria_instructions` | Standing instructions extracted from conversation |
 | `memoria_preferences` | Extracted user preferences |
 | `memoria_kg` | MEMORIA knowledge-graph rows |
-| `memoria_persona` | L3 persona tier, always injected into the prompt |
+| `memoria_persona` | L3 persona store; the prompt path reads the opt-in `persona.md` file, not this table |
 
 **Self-harmonizing reasoning (SHMR)**
 

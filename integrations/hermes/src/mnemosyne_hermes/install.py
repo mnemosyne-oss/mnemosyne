@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -322,34 +323,44 @@ def _check_wrapper_import(
     site_packages: Path, python: Path | None = None
 ) -> tuple[bool, str | None, bool]:
     """Return import success, error text, and whether the runtime is invalid."""
-    if not site_packages.exists():
+    if not site_packages.is_dir():
         return False, f"site-packages target missing: {site_packages}", False
     runner = python or Path(sys.executable)
     if not runner.is_file():
         return False, f"wrapper Python missing: {runner}", True
     if not os.access(runner, os.X_OK):
         return False, f"wrapper Python is not executable: {runner}", True
-    package_init = site_packages / "mnemosyne_hermes" / "__init__.py"
-    origin_check = ""
-    if package_init.is_file():
-        origin_check = (
-            f"expected = Path({str(package_init)!r}).resolve(); "
-            "actual = Path(mnemosyne_hermes.__file__).resolve(); "
-            "assert actual == expected, f'package origin mismatch: {actual} != {expected}'; "
-        )
     code = (
-        "import sys; from pathlib import Path; "
-        f"sys.path.insert(0, {str(site_packages)!r}); "
-        "import mnemosyne_hermes; "
-        + origin_check
-        + "print(getattr(mnemosyne_hermes, '__version__', 'unknown'))"
+        "import site\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"selected_site = Path({str(site_packages)!r}).resolve()\n"
+        "site.addsitedir(str(selected_site))\n"
+        "import mnemosyne_hermes\n"
+        "origin = getattr(mnemosyne_hermes, '__file__', None)\n"
+        "if not origin:\n"
+        "    raise SystemExit('mnemosyne_hermes package has no file origin')\n"
+        "actual = Path(origin).resolve()\n"
+        "if not actual.is_file():\n"
+        "    raise SystemExit(f'mnemosyne_hermes package origin is not a file: {actual}')\n"
+        + "print(getattr(mnemosyne_hermes, '__version__', 'unknown'))\n"
     )
     try:
         result = subprocess.run(
-            [str(runner), "-c", code],
+            [str(runner), "-S", "-c", code],
             capture_output=True,
             text=True,
             timeout=10,
+            # -S and a selected site directory isolate imports from the runner's
+            # ambient site/user directories. Filtering PYTHONPATH prevents a
+            # caller-controlled package shadowing that contract; filtering
+            # PYTHONOPTIMIZE keeps assertion elision from changing probe behavior.
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if key not in {"PYTHONPATH", "PYTHONOPTIMIZE"}
+            },
+            cwd=site_packages,
         )
     except OSError as exc:
         return False, f"could not run wrapper Python {runner}: {exc}", True
@@ -774,8 +785,10 @@ def _unlink_all_profiles(
             continue
 
 
-def _prepare_plugin_target(base: Path, target: Path, *, force: bool) -> None:
-    """Migrate legacy plugin names and remove an existing target when forced."""
+def _prepare_plugin_target(
+    base: Path, target: Path, *, force: bool, remove_target: bool = True
+) -> None:
+    """Migrate legacy names and, optionally, remove an existing plugin target."""
     old_plugin_dir = base / "plugins" / "hermes-mnemosyne"
     if old_plugin_dir.is_symlink() or old_plugin_dir.exists():
         if old_plugin_dir.is_symlink() or os.path.islink(str(old_plugin_dir)):
@@ -800,14 +813,91 @@ def _prepare_plugin_target(base: Path, target: Path, *, force: bool) -> None:
             raise FileExistsError(
                 f"{target} already exists. Re-run with --force to replace it."
             )
-        if target.is_symlink():
-            target.unlink()
-        elif target.is_dir():
-            shutil.rmtree(target)
-        else:
-            target.unlink()
+        if remove_target:
+            if target.is_symlink():
+                target.unlink()
+            elif target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
 
     target.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _is_wrapper_plugin_target(target: Path) -> bool:
+    """Return whether ``target`` is a generated Mnemosyne wrapper directory."""
+    if target.is_symlink() or not target.is_dir():
+        return False
+    if (target / "mnemosyne-wrapper.json").exists():
+        return True
+    python, site_packages = _extract_wrapper_metadata(target / "__init__.py")
+    return python is not None or site_packages is not None
+
+
+def _validated_wrapper_environment(
+    python: str | Path | None,
+) -> tuple[Path, Path]:
+    """Validate the selected wrapper runtime before touching an installed plugin."""
+    wrapper_python = Path(python).expanduser() if python else Path(sys.executable)
+    if not wrapper_python.is_file():
+        raise FileNotFoundError(f"Python interpreter not found: {wrapper_python}")
+    site_packages = _site_packages_for_python(wrapper_python)
+    import_ok, import_error, _invalid_runtime = _check_wrapper_import(site_packages, wrapper_python)
+    if not import_ok:
+        raise RuntimeError(
+            f"Selected Python environment cannot import mnemosyne_hermes: {import_error}"
+        )
+    return wrapper_python, site_packages
+
+
+def _replace_plugin_target_with_staged(target: Path, staged: Path) -> None:
+    """Swap a fully written wrapper into place, restoring the old target on error."""
+    previous: Path | None = None
+    previous_parent: Path | None = None
+    if target.is_symlink() or target.exists():
+        previous_parent = Path(
+            tempfile.mkdtemp(prefix=f".{target.name}.previous-", dir=target.parent)
+        )
+        previous = previous_parent / target.name
+        target.replace(previous)
+    try:
+        staged.replace(target)
+    except Exception:
+        restored_previous = False
+        if previous is not None and not target.exists() and not target.is_symlink():
+            try:
+                previous.replace(target)
+            except OSError:
+                # Preserve the failed swap as the primary exception. Keeping the
+                # backup is safer than masking it with a rollback cleanup error.
+                print(
+                    f"⚠ Wrapper rollback failed; previous plugin retained at: {previous}",
+                    file=sys.stderr,
+                )
+            else:
+                restored_previous = True
+        if restored_previous and previous_parent is not None:
+            try:
+                previous_parent.rmdir()
+            except OSError:
+                pass
+        raise
+    else:
+        if previous is not None:
+            try:
+                if previous.is_symlink():
+                    previous.unlink()
+                elif previous.is_dir():
+                    shutil.rmtree(previous)
+                else:
+                    previous.unlink()
+            except OSError:
+                pass
+        if previous_parent is not None:
+            try:
+                previous_parent.rmdir()
+            except OSError:
+                pass
 
 
 def _write_wrapper_plugin(target: Path, *, python: Path, site_packages: Path) -> None:
@@ -830,6 +920,7 @@ import importlib
 import json
 import os
 from pathlib import Path
+import site as site_module
 import sys
 
 
@@ -862,6 +953,12 @@ def activate() -> dict[str, object]:
     package_init = package_root / "__init__.py"
     expected_root = package_root.resolve() if package_init.is_file() else None
     site = str(site_path)
+    while site in sys.path:
+        sys.path.remove(site)
+    # Process .pth files from the selected runtime as well as direct packages.
+    # Setuptools' PEP 660 editable installs use a .pth-installed finder, so a
+    # bare sys.path insertion would make a valid selected environment fail.
+    site_module.addsitedir(site)
     while site in sys.path:
         sys.path.remove(site)
     sys.path.insert(0, site)
@@ -939,16 +1036,19 @@ def install_plugin(
     force: bool = False,
     mode: str = "symlink",
     python: str | Path | None = None,
+    migrate_wrapper_to_symlink: bool = False,
 ) -> Path:
     """Install the Mnemosyne provider into Hermes' user plugin directory.
 
     ``mode='symlink'`` keeps the historical behavior. ``mode='wrapper'``
-    creates a real persistent plugin directory containing a tiny shim that adds
-    the selected interpreter's site-packages path to ``sys.path`` and imports
-    ``mnemosyne_hermes`` from there.
+    creates a real persistent plugin directory containing a tiny shim that
+    activates the selected interpreter's site-packages (including editable
+    install ``.pth`` files) and imports ``mnemosyne_hermes`` from there.
     """
     if mode not in {"symlink", "wrapper"}:
         raise ValueError("mode must be 'symlink' or 'wrapper'")
+    if migrate_wrapper_to_symlink and (mode != "symlink" or not force):
+        raise ValueError("migrate_wrapper_to_symlink requires mode='symlink' and force=True")
 
     source = _resolve_package_dir()
     if not source.is_dir():
@@ -956,24 +1056,41 @@ def install_plugin(
 
     base = Path(hermes_home_path).expanduser() if hermes_home_path else hermes_home()
     target = plugin_target_dir(hermes_home_path)
-    _prepare_plugin_target(base, target, force=force)
+    if (
+        mode == "symlink"
+        and force
+        and _is_wrapper_plugin_target(target)
+        and not migrate_wrapper_to_symlink
+    ):
+        raise RuntimeError(
+            "Refusing to replace an existing wrapper with a symlink. "
+            "Re-run with --migrate-wrapper-to-symlink --force to migrate intentionally."
+        )
 
     if mode == "symlink":
+        if migrate_wrapper_to_symlink and _is_wrapper_plugin_target(target):
+            print(
+                "  ⚠ Migrating existing Mnemosyne wrapper to a symlink; "
+                "the wrapper's selected Python will no longer be used."
+            )
+        _prepare_plugin_target(base, target, force=force)
         os.symlink(str(source), str(target))
         _link_all_profiles(source, hermes_home_path=hermes_home_path, force=force)
         return target
 
-    wrapper_python = Path(python).expanduser() if python else Path(sys.executable)
-    if not wrapper_python.is_file():
-        raise FileNotFoundError(f"Python interpreter not found: {wrapper_python}")
-    site_packages = _site_packages_for_python(wrapper_python)
-    import_ok, import_error, _invalid_runtime = _check_wrapper_import(site_packages, wrapper_python)
-    if not import_ok:
-        raise RuntimeError(
-            "Selected Python environment cannot import mnemosyne_hermes: "
-            f"{import_error}"
-        )
-    _write_wrapper_plugin(target, python=wrapper_python, site_packages=site_packages)
+    # Validate and fully write the replacement before removing a working wrapper.
+    # In particular, a bad --python or a selected environment missing this package
+    # must leave the existing wrapper and every profile link untouched.
+    wrapper_python, site_packages = _validated_wrapper_environment(python)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging_parent = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
+    staged = staging_parent / target.name
+    try:
+        _write_wrapper_plugin(staged, python=wrapper_python, site_packages=site_packages)
+        _prepare_plugin_target(base, target, force=force, remove_target=False)
+        _replace_plugin_target_with_staged(target, staged)
+    finally:
+        shutil.rmtree(staging_parent, ignore_errors=True)
     _link_all_profiles(target, hermes_home_path=hermes_home_path, force=force)
     return target
 
@@ -1148,6 +1265,14 @@ def _parser() -> argparse.ArgumentParser:
         dest="python",
         help="Python interpreter whose site-packages the wrapper should import from.",
     )
+    install.add_argument(
+        "--migrate-wrapper-to-symlink",
+        action="store_true",
+        help=(
+            "With --mode symlink and --force, intentionally replace an existing "
+            "wrapper with the default symlink install."
+        ),
+    )
     subparsers.add_parser(
         "uninstall",
         help="Remove Mnemosyne from Hermes' memory provider plugin directory.",
@@ -1184,6 +1309,7 @@ def run_install(
     no_bootstrap: bool = False,
     mode: str = "symlink",
     python: str | Path | None = None,
+    migrate_wrapper_to_symlink: bool = False,
 ) -> int:
     """Core install logic — check deps, bootstrap Hermes venv if needed, create symlink.
 
@@ -1233,6 +1359,7 @@ def run_install(
         force=force,
         mode=mode,
         python=python,
+        migrate_wrapper_to_symlink=migrate_wrapper_to_symlink,
     )
     skill_result = install_bundled_skill(
         hermes_home_path=hermes_home_path,
@@ -1267,6 +1394,19 @@ def main(argv: list[str] | None = None) -> int:
             hermes_python = _find_hermes_python()
             target = plugin_target_dir(args.hermes_home)
             if getattr(args, "dry_run", False):
+                invalid_wrapper_migration_args = (
+                    getattr(args, "migrate_wrapper_to_symlink", False)
+                    and (
+                        getattr(args, "mode", "symlink") != "symlink"
+                        or not getattr(args, "force", False)
+                    )
+                )
+                refuses_wrapper_migration = (
+                    getattr(args, "mode", "symlink") == "symlink"
+                    and getattr(args, "force", False)
+                    and _is_wrapper_plugin_target(target)
+                    and not getattr(args, "migrate_wrapper_to_symlink", False)
+                )
                 skill = skill_state(hermes_home_path=args.hermes_home)
                 skill_plan = install_bundled_skill(
                     hermes_home_path=args.hermes_home,
@@ -1286,9 +1426,21 @@ def main(argv: list[str] | None = None) -> int:
                     if wrapper_python.is_file():
                         print(f"  Wrapper site-packages: {_site_packages_for_python(wrapper_python)}")
                 print(f"  Will force: {bool(getattr(args, 'force', False))}")
+                if getattr(args, "migrate_wrapper_to_symlink", False):
+                    print("  Will allow wrapper-to-symlink migration: yes")
+                if invalid_wrapper_migration_args:
+                    print(
+                        "  Will refuse --migrate-wrapper-to-symlink unless "
+                        "--mode symlink and --force are both set."
+                    )
+                if refuses_wrapper_migration:
+                    print(
+                        "  Will refuse to replace the existing wrapper without "
+                        "--migrate-wrapper-to-symlink."
+                    )
                 if hermes_python:
                     print(f"  Will bootstrap: {not getattr(args, 'no_bootstrap', False)}")
-                return 0
+                return 1 if invalid_wrapper_migration_args or refuses_wrapper_migration else 0
 
             return run_install(
                 force=getattr(args, "force", False),
@@ -1296,6 +1448,7 @@ def main(argv: list[str] | None = None) -> int:
                 no_bootstrap=getattr(args, "no_bootstrap", False),
                 mode=getattr(args, "mode", "symlink"),
                 python=getattr(args, "python", None),
+                migrate_wrapper_to_symlink=getattr(args, "migrate_wrapper_to_symlink", False),
             )
 
         if command == "uninstall":

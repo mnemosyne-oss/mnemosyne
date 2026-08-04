@@ -39,7 +39,7 @@ generator instead.
 |---|---|
 | [Memory Hygiene](hygiene.md) | Noise scoring, the audit and clean workflow, secret detection, and how to prevent noise being stored |
 | [Configuration Profiles](profiles.md) | The eight built-in profiles, what distinguishes them, validation rules, and the `vec_type` restart trap |
-| [L3 Persona Tier](persona.md) | Always-injected behavioural facts. Includes an explicit list of what is not yet wired |
+| [L3 Persona Tier](persona.md) | Durable behavioural facts promoted into a store; prompt injection reads an opt-in `persona.md` file. Includes an explicit list of what is not yet wired |
 | [SHMR](shmr.md) | Self-harmonizing memory reasoning. Library only; nothing calls it yet |
 
 ## Reference and analysis
