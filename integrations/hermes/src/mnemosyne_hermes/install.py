@@ -499,6 +499,37 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
         message="Plugin is installed and discoverable.",
     )
 
+def _resolve_hermes_bin(hermes_bin: str) -> Path | None:
+    """Resolve the real Hermes executable from a launcher on PATH.
+
+    If the launcher is a symlink, follow it. If it is a wrapper script that
+    execs another binary (common for PATH shims), read the exec target so the
+    Python beside the *real* Hermes binary is used rather than the python
+    beside the shim.
+    """
+    path = Path(hermes_bin)
+    if path.is_symlink():
+        return path.resolve()
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    # Matches shell wrappers like:
+    #   exec "/path/to/hermes" "$@"
+    #   exec /path/to/hermes "$@"
+    match = re.search(
+        r'^\s*exec\s+(?:"([^"]+)"|\'([^\']+)\'|(\S+))',
+        source,
+        flags=re.MULTILINE,
+    )
+    if not match:
+        return None
+    target = Path(next(g for g in match.groups() if g)).expanduser()
+    if target.is_file():
+        return target.resolve()
+    return None
+
+
 def _find_hermes_python() -> Optional[Path]:
     """Try to find Hermes' python executable for dep validation.
 
@@ -515,17 +546,19 @@ def _find_hermes_python() -> Optional[Path]:
     #    actual venv and produced "loaded but no provider instance found").
     hermes_bin = shutil.which("hermes")
     if hermes_bin:
-        # NOTE: resolve the *launcher* symlink (hermes -> venv/bin/hermes) to
-        # find the venv bin dir, but do NOT resolve the python symlink itself.
-        # A venv's bin/python is a symlink to the base interpreter; running the
-        # venv path activates the venv site-packages, running the resolved base
-        # path does NOT. Returning the resolved base interpreter would silently
-        # drop the provider deps again.
-        bin_dir = Path(hermes_bin).resolve().parent
-        for py_name in ("python", "python3"):
-            candidate = bin_dir / py_name
-            if candidate.is_file():
-                return candidate
+        resolved = _resolve_hermes_bin(hermes_bin)
+        if resolved:
+            # NOTE: resolve the *launcher* symlink (hermes -> venv/bin/hermes)
+            # to find the venv bin dir, but do NOT resolve the python symlink
+            # itself. A venv's bin/python is a symlink to the base interpreter;
+            # running the venv path activates the venv site-packages, while
+            # running the resolved base path does NOT. Returning the resolved
+            # base interpreter would silently drop the provider deps again.
+            bin_dir = resolved.parent
+            for py_name in ("python", "python3"):
+                candidate = bin_dir / py_name
+                if candidate.is_file():
+                    return candidate
 
     # 2. Check known hermes-agent checkout / install roots with a venv.
     for root in [

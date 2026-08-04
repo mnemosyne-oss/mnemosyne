@@ -31,6 +31,39 @@ def _make_profile(hermes_home, name, provider):
     return profile
 
 
+def test_find_hermes_python_follows_wrapper_script_to_real_venv(tmp_path, monkeypatch):
+    """A PATH shim that execs the real Hermes binary must not pick a stray python beside the shim."""
+    # Real Hermes venv layout.
+    real_venv = tmp_path / "hermes-agent" / "venv"
+    real_bin = real_venv / "bin"
+    real_bin.mkdir(parents=True)
+    real_hermes = real_bin / "hermes"
+    real_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_hermes.chmod(0o755)
+    real_python = real_bin / "python"
+    real_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_python.chmod(0o755)
+
+    # PATH shim in ~/.local/bin that execs the real Hermes binary.
+    shim_dir = tmp_path / ".local" / "bin"
+    shim_dir.mkdir(parents=True)
+    shim = shim_dir / "hermes"
+    shim.write_text(
+        f'#!/usr/bin/env bash\nexec "{real_hermes}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+
+    # A decoy python next to the shim: this is the bug case.
+    decoy_python = shim_dir / "python"
+    decoy_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    decoy_python.chmod(0o755)
+
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+    found = install_mod._find_hermes_python()
+    assert found == real_python
+
+
 def test_default_install_links_single_home(tmp_path):
     _skip_on_windows()
 
