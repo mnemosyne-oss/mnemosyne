@@ -64,6 +64,10 @@ def collect_runtime_diagnostics() -> dict[str, Any]:
 
         add("core", "embeddings_available", "YES" if _embeddings.available() else "NO")
         add("core", "embeddings_model", "OK", _embeddings._DEFAULT_MODEL)
+        # Surface the resolved dimension so operators can confirm their
+        # MNEMOSYNE_EMBEDDING_DIM / model-table resolution via the doctor,
+        # complementing the fail-loud unknown-model resolver.
+        add("core", "embeddings_dim", "OK", str(_embeddings.EMBEDDING_DIM))
     except Exception:
         add("core", "embeddings_available", "ERROR", "embeddings capability unavailable")
 

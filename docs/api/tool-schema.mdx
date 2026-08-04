@@ -341,7 +341,7 @@ List L3 persona facts, optionally filtered by tier and/or topic. Returns persona
 
 ### 3. `mnemosyne_persona_promote`
 
-Promote a working or episodic memory into the L3 persona tier. Persona facts are always auto-injected into the system prompt regardless of semantic relevance. Tier values: 'permanent' (never evicted, requires explicit demotion), 'long_term' (default; reinforcement-driven decay), 'working' (transient). Returns the new persona id.
+Promote a working or episodic memory into the L3 persona store (the memoria_persona table). Tier values: 'permanent', 'long_term' (default), 'working'. Tier is a classification label: it orders mnemosyne_persona_list output (permanent first) and affects nothing else. No automatic eviction or decay is implemented, and a fact leaves the store only by explicit demotion. Persona facts are not read by the system prompt path, which uses the opt-in persona.md file. Returns the new persona id.
 
 | Parameter | Type | Required | Default |
 |-----------|------|----------|---------|
@@ -351,7 +351,7 @@ Promote a working or episodic memory into the L3 persona tier. Persona facts are
 
 ### 4. `mnemosyne_persona_reinforce`
 
-Bump the reinforcement_count and last_reinforced_at on a persona fact. Use when the persona rule was just applied -- signals 'this rule is in active use'. Reinforcement count breaks ties in injection order; it does not feed any decay logic, because none is implemented.
+Bump the reinforcement_count and last_reinforced_at on a persona fact. Use when the persona rule was just applied -- signals 'this rule is in active use'. Reinforcement count breaks ties in mnemosyne_persona_list ordering; it does not feed any decay logic, because none is implemented.
 
 | Parameter | Type | Required | Default |
 |-----------|------|----------|---------|

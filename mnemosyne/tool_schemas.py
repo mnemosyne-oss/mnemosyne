@@ -661,11 +661,14 @@ SYNC_STATUS_SCHEMA = {
 PERSONA_PROMOTE_SCHEMA = {
     "name": "mnemosyne_persona_promote",
     "description": (
-        "Promote a working or episodic memory into the L3 persona tier. "
-        "Persona facts are always auto-injected into the system prompt regardless "
-        "of semantic relevance. Tier values: 'permanent' (never evicted, requires "
-        "explicit demotion), 'long_term' (default; reinforcement-driven decay), "
-        "'working' (transient). Returns the new persona id."
+        "Promote a working or episodic memory into the L3 persona store "
+        "(the memoria_persona table). Tier values: 'permanent', 'long_term' "
+        "(default), 'working'. Tier is a classification label: it orders "
+        "mnemosyne_persona_list output (permanent first) and affects nothing "
+        "else. No automatic eviction or decay is implemented, and a fact "
+        "leaves the store only by explicit demotion. Persona facts are not "
+        "read by the system prompt path, which uses the opt-in persona.md "
+        "file. Returns the new persona id."
     ),
     "parameters": {
         "type": "object",
@@ -678,7 +681,7 @@ PERSONA_PROMOTE_SCHEMA = {
                 "type": "string",
                 "enum": ["permanent", "long_term", "working"],
                 "default": "long_term",
-                "description": "Retention tier for the promoted persona fact.",
+                "description": "Classification tier for the promoted persona fact; affects mnemosyne_persona_list ordering only.",
             },
             "reason": {
                 "type": "string",
@@ -742,7 +745,8 @@ PERSONA_REINFORCE_SCHEMA = {
     "description": (
         "Bump the reinforcement_count and last_reinforced_at on a persona fact. "
         "Use when the persona rule was just applied -- signals 'this rule is in "
-        "active use'. Reinforcement count breaks ties in injection order; it does not feed any decay logic, because none is implemented."
+        "active use'. Reinforcement count breaks ties in mnemosyne_persona_list "
+        "ordering; it does not feed any decay logic, because none is implemented."
     ),
     "parameters": {
         "type": "object",

@@ -981,11 +981,12 @@ def init_beam(db_path: Path = None):
         _add_column_if_missing(conn, table, 'source_memory_id', 'TEXT')
 
     # --- L3 Persona (v3.10.0) ---
-    # Always-on persona tier with explicit retention classification.
+    # Explicit persona store with tier classification.
     # Tier values: 'permanent', 'long_term' (default), 'working'.
-    # Tier controls injection priority only. No eviction or decay is
-    # implemented for this table: the only writes are insert on promote,
-    # delete on demote, and the reinforcement counter bump.
+    # Tier orders persona_list output and affects nothing else; the system
+    # prompt path reads the opt-in persona.md file, not this table. No
+    # eviction or decay is implemented for this table: the only writes are
+    # insert on promote, delete on demote, and the reinforcement counter bump.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS memoria_persona (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

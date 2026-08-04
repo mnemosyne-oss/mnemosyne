@@ -186,7 +186,7 @@ class PersonaAdapter:
             sql += " WHERE " + " AND ".join(clauses)
         # Custom tier ordering: permanent > long_term > working. Alphabetical
         # sort would put 'long_term' before 'permanent', which is wrong for
-        # always-on injection priority.
+        # the tier-first list ordering the tool schema documents.
         sql += (
             " ORDER BY CASE tier "
             "WHEN 'permanent' THEN 0 "
