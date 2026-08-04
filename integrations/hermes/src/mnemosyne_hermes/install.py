@@ -538,19 +538,16 @@ def _resolve_exec_target(raw_target: str, wrapper: Path) -> Path | None:
         return None
 
     if target.is_absolute():
-        return target
+        return target if target.is_file() else None
 
-    # Relative path such as ./bin/hermes
-    candidate = wrapper.parent / target
-    if candidate.is_file():
-        return candidate
+    if os.path.dirname(str(target)):
+        # Explicit relative path such as ./bin/hermes or ../bin/hermes.
+        candidate = wrapper.parent / target
+        return candidate if candidate.is_file() else None
 
-    # Bare command name such as hermes
+    # Bare command name such as hermes: resolve via PATH lookup.
     found = shutil.which(raw_target)
-    if found:
-        return Path(found)
-
-    return None
+    return Path(found) if found else None
 
 
 def _resolve_hermes_bin(hermes_bin: str) -> Path | None:

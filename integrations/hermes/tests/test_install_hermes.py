@@ -170,11 +170,19 @@ def test_resolve_hermes_bin_resolves_bare_exec_target_via_path(tmp_path, monkeyp
     )
     shim.chmod(0o755)
 
+    # Decoy executable next to the wrapper. A bare command name must NOT be
+    # resolved relative to the wrapper directory; it should use PATH.
+    decoy = shim_dir / "hermes"
+    decoy.write_text("#!/bin/sh\n", encoding="utf-8")
+    decoy.chmod(0o755)
+
     _isolate_hermes_python_sources(tmp_path, monkeypatch)
     # Place the real hermes earlier on PATH so the bare exec target resolves to it.
     monkeypatch.setenv("PATH", str(real_bin), prepend=":")
 
-    assert install_mod._resolve_hermes_bin(str(shim)) == real_hermes
+    result = install_mod._resolve_hermes_bin(str(shim))
+    assert result == real_hermes
+    assert result != decoy
 
 
 def test_resolve_hermes_bin_returns_none_for_broken_symlink(tmp_path, monkeypatch):
