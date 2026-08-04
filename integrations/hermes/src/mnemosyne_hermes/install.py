@@ -509,7 +509,13 @@ def _resolve_hermes_bin(hermes_bin: str) -> Path | None:
     """
     path = Path(hermes_bin)
     if path.is_symlink():
-        return path.resolve()
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError):
+            return None
+        if resolved.is_file() and os.access(resolved, os.X_OK):
+            return resolved
+        return None
     try:
         source = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -525,8 +531,11 @@ def _resolve_hermes_bin(hermes_bin: str) -> Path | None:
     if not match:
         return None
     target = Path(next(g for g in match.groups() if g)).expanduser()
-    if target.is_file():
-        return target.resolve()
+    if target.is_file() and os.access(target, os.X_OK):
+        try:
+            return target.resolve()
+        except (OSError, RuntimeError):
+            return None
     return None
 
 

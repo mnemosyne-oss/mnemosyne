@@ -64,6 +64,46 @@ def test_find_hermes_python_follows_wrapper_script_to_real_venv(tmp_path, monkey
     assert found == real_python
 
 
+def test_resolve_hermes_bin_returns_none_for_broken_symlink(tmp_path, monkeypatch):
+    _skip_on_windows()
+
+    shim = tmp_path / "hermes"
+    shim.symlink_to(tmp_path / "missing" / "hermes")
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+
+    assert install_mod._resolve_hermes_bin(str(shim)) is None
+    assert install_mod._find_hermes_python() is None
+
+
+def test_resolve_hermes_bin_returns_none_for_non_executable_symlink_target(
+    tmp_path, monkeypatch
+):
+    _skip_on_windows()
+
+    real = tmp_path / "real_hermes"
+    real.write_text("#!/bin/sh\n", encoding="utf-8")
+    real.chmod(0o644)
+
+    shim = tmp_path / "hermes"
+    shim.symlink_to(real)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+
+    assert install_mod._resolve_hermes_bin(str(shim)) is None
+    assert install_mod._find_hermes_python() is None
+
+
+def test_resolve_hermes_bin_returns_none_for_symlink_loop(tmp_path, monkeypatch):
+    _skip_on_windows()
+
+    a = tmp_path / "hermes_a"
+    b = tmp_path / "hermes_b"
+    a.symlink_to(b)
+    b.symlink_to(a)
+
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(a))
+    assert install_mod._resolve_hermes_bin(str(a)) is None
+
+
 def test_default_install_links_single_home(tmp_path):
     _skip_on_windows()
 
