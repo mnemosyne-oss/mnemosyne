@@ -22,6 +22,13 @@ def _source() -> Path:
     return install_mod._resolve_package_dir()
 
 
+def _isolate_hermes_python_sources(tmp_path, monkeypatch):
+    """Patch fallback interpreter sources so tests only see the mocked hermes launcher."""
+    monkeypatch.setattr(install_mod, "hermes_home", lambda: tmp_path / "no_hermes_home")
+    monkeypatch.setattr(install_mod.sys, "prefix", install_mod.sys.base_prefix)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+
+
 def _make_profile(hermes_home, name, provider):
     profile = hermes_home / "profiles" / name
     profile.mkdir(parents=True)
@@ -64,11 +71,119 @@ def test_find_hermes_python_follows_wrapper_script_to_real_venv(tmp_path, monkey
     assert found == real_python
 
 
+def test_resolve_hermes_bin_returns_direct_executable_for_plain_entrypoint(
+    tmp_path, monkeypatch
+):
+    _skip_on_windows()
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    hermes = bin_dir / "hermes"
+    hermes.write_text("#!/usr/bin/env python3\nimport hermes.cli\n", encoding="utf-8")
+    hermes.chmod(0o755)
+    python = bin_dir / "python"
+    python.write_text("#!/bin/sh\n", encoding="utf-8")
+    python.chmod(0o755)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(hermes))
+
+    assert install_mod._resolve_hermes_bin(str(hermes)) == hermes
+    assert install_mod._find_hermes_python() == python
+
+
+def test_resolve_hermes_bin_follows_symlink_to_wrapper_script_to_real_venv(
+    tmp_path, monkeypatch
+):
+    _skip_on_windows()
+
+    real_venv = tmp_path / "hermes-agent" / "venv"
+    real_bin = real_venv / "bin"
+    real_bin.mkdir(parents=True)
+    real_hermes = real_bin / "hermes"
+    real_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_hermes.chmod(0o755)
+    real_python = real_bin / "python"
+    real_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_python.chmod(0o755)
+
+    shim_dir = tmp_path / ".local" / "bin"
+    shim_dir.mkdir(parents=True)
+    shim = shim_dir / "hermes"
+    shim.write_text(
+        f'#!/usr/bin/env bash\nexec "{real_hermes}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+
+    launcher = tmp_path / "hermes"
+    launcher.symlink_to(shim)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(launcher))
+
+    assert install_mod._resolve_hermes_bin(str(launcher)) == real_hermes
+    assert install_mod._find_hermes_python() == real_python
+
+
+def test_resolve_hermes_bin_resolves_relative_exec_target(tmp_path, monkeypatch):
+    _skip_on_windows()
+
+    real_bin = tmp_path / "bin"
+    real_bin.mkdir(parents=True)
+    real_hermes = real_bin / "hermes"
+    real_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_hermes.chmod(0o755)
+    real_python = real_bin / "python"
+    real_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_python.chmod(0o755)
+
+    shim = tmp_path / "hermes"
+    shim.write_text(
+        '#!/usr/bin/env bash\nexec "./bin/hermes" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+
+    assert install_mod._resolve_hermes_bin(str(shim)) == real_hermes
+    assert install_mod._find_hermes_python() == real_python
+
+
+def test_resolve_hermes_bin_resolves_bare_exec_target_via_path(tmp_path, monkeypatch):
+    _skip_on_windows()
+
+    real_bin = tmp_path / "real" / "bin"
+    real_bin.mkdir(parents=True)
+    real_hermes = real_bin / "hermes"
+    real_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_hermes.chmod(0o755)
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir(parents=True)
+    shim = shim_dir / "hermes-launcher"
+    shim.write_text(
+        '#!/usr/bin/env bash\nexec hermes "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    # Place the real hermes earlier on PATH so the bare exec target resolves to it.
+    monkeypatch.setenv("PATH", str(real_bin), prepend=":")
+
+    assert install_mod._resolve_hermes_bin(str(shim)) == real_hermes
+
+
 def test_resolve_hermes_bin_returns_none_for_broken_symlink(tmp_path, monkeypatch):
     _skip_on_windows()
 
     shim = tmp_path / "hermes"
     shim.symlink_to(tmp_path / "missing" / "hermes")
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
     monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
 
     assert install_mod._resolve_hermes_bin(str(shim)) is None
@@ -86,6 +201,8 @@ def test_resolve_hermes_bin_returns_none_for_non_executable_symlink_target(
 
     shim = tmp_path / "hermes"
     shim.symlink_to(real)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
     monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
 
     assert install_mod._resolve_hermes_bin(str(shim)) is None
@@ -100,8 +217,25 @@ def test_resolve_hermes_bin_returns_none_for_symlink_loop(tmp_path, monkeypatch)
     a.symlink_to(b)
     b.symlink_to(a)
 
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
     monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(a))
     assert install_mod._resolve_hermes_bin(str(a)) is None
+
+
+def test_resolve_hermes_bin_returns_none_for_wrapper_loop(tmp_path, monkeypatch):
+    _skip_on_windows()
+
+    shim = tmp_path / "hermes"
+    shim.write_text(
+        f'#!/usr/bin/env bash\nexec "{shim}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+
+    assert install_mod._resolve_hermes_bin(str(shim)) is None
 
 
 def test_default_install_links_single_home(tmp_path):

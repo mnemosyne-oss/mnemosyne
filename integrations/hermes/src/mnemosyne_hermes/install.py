@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import importlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -21,6 +22,9 @@ PLUGIN_NAME = "mnemosyne"
 SKILL_NAME = "mnemosyne-memory-override"
 SKILL_CATEGORY = "memory"
 BUNDLED_SKILL_RESOURCE = ("skills", SKILL_NAME, "SKILL.md")
+
+_MAX_HERMES_BIN_DEPTH = 10
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -499,26 +503,15 @@ def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
         message="Plugin is installed and discoverable.",
     )
 
-def _resolve_hermes_bin(hermes_bin: str) -> Path | None:
-    """Resolve the real Hermes executable from a launcher on PATH.
+_MAX_WRAPPER_READ_BYTES = 4096
 
-    If the launcher is a symlink, follow it. If it is a wrapper script that
-    execs another binary (common for PATH shims), read the exec target so the
-    Python beside the *real* Hermes binary is used rather than the python
-    beside the shim.
-    """
-    path = Path(hermes_bin)
-    if path.is_symlink():
-        try:
-            resolved = path.resolve()
-        except (OSError, RuntimeError):
-            return None
-        if resolved.is_file() and os.access(resolved, os.X_OK):
-            return resolved
-        return None
+
+def _read_wrapper_exec_target(path: Path) -> str | None:
+    """Return the first `exec` target from a shell wrapper script, or None."""
     try:
-        source = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            source = fh.read(_MAX_WRAPPER_READ_BYTES)
+    except (OSError, UnicodeDecodeError):
         return None
     # Matches shell wrappers like:
     #   exec "/path/to/hermes" "$@"
@@ -530,12 +523,91 @@ def _resolve_hermes_bin(hermes_bin: str) -> Path | None:
     )
     if not match:
         return None
-    target = Path(next(g for g in match.groups() if g)).expanduser()
-    if target.is_file() and os.access(target, os.X_OK):
+    return next(g for g in match.groups() if g)
+
+
+def _resolve_exec_target(raw_target: str, wrapper: Path) -> Path | None:
+    """Normalize an exec target from a wrapper script.
+
+    Absolute paths are returned as-is. Relative paths are resolved against the
+    wrapper's directory. Bare command names are resolved via PATH lookup.
+    """
+    try:
+        target = Path(raw_target).expanduser()
+    except (OSError, RuntimeError):
+        return None
+
+    if target.is_absolute():
+        return target
+
+    # Relative path such as ./bin/hermes
+    candidate = wrapper.parent / target
+    if candidate.is_file():
+        return candidate
+
+    # Bare command name such as hermes
+    found = shutil.which(raw_target)
+    if found:
+        return Path(found)
+
+    return None
+
+
+def _resolve_hermes_bin(hermes_bin: str) -> Path | None:
+    """Resolve the real Hermes executable from a launcher on PATH.
+
+    Follows symlinks and shell wrappers that `exec` another binary (common for
+    PATH shims), tracking visited paths to avoid symlink loops. A direct
+    executable that is not a wrapper is returned as well, preserving discovery
+    for pipx / package entry points.
+
+    Returns None when resolution fails or the target is not executable.
+    """
+    path = Path(hermes_bin)
+    seen: set[Path] = set()
+
+    for _ in range(_MAX_HERMES_BIN_DEPTH):
         try:
-            return target.resolve()
-        except (OSError, RuntimeError):
+            canonical = path.resolve()
+        except (OSError, RuntimeError) as exc:
+            LOGGER.debug(
+                "Failed to resolve Hermes launcher %r: %s", hermes_bin, exc
+            )
             return None
+
+        if canonical in seen:
+            LOGGER.debug("Hermes launcher %r has a symlink loop", hermes_bin)
+            return None
+        seen.add(canonical)
+
+        if not canonical.is_file() or not os.access(canonical, os.X_OK):
+            LOGGER.debug(
+                "Hermes launcher %r resolves to non-executable %r",
+                hermes_bin,
+                canonical,
+            )
+            return None
+
+        exec_target = _read_wrapper_exec_target(canonical)
+        if not exec_target:
+            return canonical
+
+        next_path = _resolve_exec_target(exec_target, canonical)
+        if next_path is None:
+            LOGGER.debug(
+                "Hermes wrapper %r execs an invalid target %r",
+                hermes_bin,
+                exec_target,
+            )
+            return None
+
+        path = next_path
+
+    LOGGER.debug(
+        "Hermes launcher %r exceeded maximum resolution depth (%d)",
+        hermes_bin,
+        _MAX_HERMES_BIN_DEPTH,
+    )
     return None
 
 
@@ -566,7 +638,7 @@ def _find_hermes_python() -> Optional[Path]:
             bin_dir = resolved.parent
             for py_name in ("python", "python3"):
                 candidate = bin_dir / py_name
-                if candidate.is_file():
+                if candidate.is_file() and os.access(candidate, os.X_OK):
                     return candidate
 
     # 2. Check known hermes-agent checkout / install roots with a venv.
