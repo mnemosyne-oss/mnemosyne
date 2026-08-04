@@ -106,6 +106,27 @@ hermes memory status
 #   Plugin:    installed ✓
 ```
 
+#### Selecting Hermes' interpreter
+
+`mnemosyne-hermes install` finds Hermes' Python by following the `hermes` launcher
+on PATH, including through a shell-wrapper launcher, and accepts the interpreter
+sitting beside it only when that directory is a real virtual environment. It then
+falls back to the known install roots (`$HERMES_HOME/hermes-agent`,
+`~/hermes-agent`, `/opt/hermes/hermes-agent`, `/usr/local/lib/hermes-agent`,
+`/usr/lib/hermes-agent`).
+
+Pass `--python` to skip discovery entirely when your layout is unusual or the
+wrong interpreter is being picked:
+
+```bash
+mnemosyne-hermes install --python /path/to/hermes/venv/bin/python
+mnemosyne-hermes install --dry-run          # shows which interpreter would be used
+```
+
+`--python` is authoritative in both install modes: it overrides discovery for a
+symlink install, and selects the site-packages a `--mode wrapper` install imports
+from.
+
 The installer also deploys the bundled `mnemosyne-memory-override` skill to
 `$HERMES_HOME/skills/memory/mnemosyne-memory-override/SKILL.md`. The skill is a
 behavioral guardrail that nudges agents away from the legacy `memory` tool for
