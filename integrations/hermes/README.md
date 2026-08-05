@@ -78,6 +78,17 @@ Returned context can include prior decisions, constraints, failure modes, projec
 
 `mnemosyne_sleep` compresses old working memories into episodic summaries. Think of it as a nightly cleanup that knows what to keep and what to summarize. The working set stays small. Recall stays sharp. Long-running agents don't drown in their own history.
 
+### Session lifecycle
+
+The provider follows Hermes session changes without requiring a provider restart. After
+`/new`, `/resume`, `/branch`, undo, or context compression, the active `BeamMemory`
+session is rebound before the next memory operation, keeping writes and tool calls
+attributed to the current conversation.
+
+Transient initialization retries are supported by the packaged `mnemosyne_hermes`
+entry point. The legacy root provider does not schedule retries; callers that need
+automatic recovery should use the packaged entry point.
+
 ---
 
 ## Quickstart

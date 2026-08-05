@@ -1417,6 +1417,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Profile memory isolation: when enabled, each Hermes profile gets its own
         # Mnemosyne bank (separate SQLite DB). Default OFF for backward compatibility.
         self._profile_isolation_enabled = False
+        self._gateway_session_key = ""
+        self._channel_id_explicit = False
         # Default scope for remember() calls when not explicitly specified.
         # "session" (default) scopes to current session; "global" persists across sessions.
         self._default_scope = "session"
@@ -1739,13 +1741,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _reserve_reflection_budget(self, trigger: str) -> Optional[Dict[str, Any]]:
         """Return a structured skip payload, or reserve one reflection call."""
         context = (self._agent_context or "").strip().lower()
-        with self._reflect_budget_lock:
-            if self._reflect_disabled_for_cron and context == "cron":
-                return self._reflection_skip_response("reflect_disabled_for_cron", trigger)
-            max_calls = self._reflect_max_calls_per_session
-            if max_calls is not None and self._reflect_calls_this_session >= max_calls:
-                return self._reflection_skip_response("reflect_budget_exhausted", trigger)
-            self._reflect_calls_this_session += 1
+        with self._ensure_beam_access_lock():
+            return self._reserve_reflection_budget_locked(trigger, context)
+
+    def _reserve_reflection_budget_locked(self, trigger: str, context: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Reserve one reflection call while the Beam access lock is held."""
+        context = context or (self._agent_context or "").strip().lower()
+        if self._reflect_disabled_for_cron and context == "cron":
+            return self._reflection_skip_response("reflect_disabled_for_cron", trigger)
+        max_calls = self._reflect_max_calls_per_session
+        if max_calls is not None and self._reflect_calls_this_session >= max_calls:
+            return self._reflection_skip_response("reflect_budget_exhausted", trigger)
+        self._reflect_calls_this_session += 1
         return None
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
@@ -1862,6 +1869,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             except Exception:
                 logger.debug("Mnemosyne: could not close prior wrapper", exc_info=True)
         self._memory = None
+        if self._audit is not None:
+            try:
+                self._audit.close()
+            except Exception:
+                logger.debug("Mnemosyne: could not close audit log", exc_info=True)
+        self._audit = None
         self._beam = None
         self._surface_beam = None
         self._init_error = None
@@ -1870,6 +1883,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._platform = kwargs.get("platform", "cli")
         self._hermes_home = kwargs.get("hermes_home", "")
         self._agent_identity = kwargs.get("agent_identity", None) or ""
+        self._gateway_session_key = kwargs.get("gateway_session_key") or ""
+        self._channel_id_explicit = bool(kwargs.get("channel_id"))
 
         # Apply provider-specific config from kwargs (Hermes-passed) or config.yaml fallback
         self._apply_provider_config(kwargs)
@@ -1902,7 +1917,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # stay isolated per-thread while scope='global' memories still surface
         # everywhere.  Falls back to the Hermes agent session_id for CLI and
         # non-gateway use (no behavior change for those paths).
-        stable_scope = kwargs.get("gateway_session_key") or session_id
+        stable_scope = self._gateway_session_key or session_id
         self._session_id = f"hermes_{stable_scope}"
 
         try:
@@ -1925,7 +1940,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 )
             else:
                 BeamMemory = _get_beam_class()
-                self._beam = BeamMemory(session_id=self._session_id)
+                beam_kwargs = {"session_id": self._session_id}
+                if kwargs.get("channel_id"):
+                    beam_kwargs["channel_id"] = kwargs["channel_id"]
+                self._beam = BeamMemory(**beam_kwargs)
                 logger.info("Mnemosyne initialized: session=%s", self._session_id)
 
         except Exception as e:
@@ -2343,8 +2361,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         scope=self._default_scope,
                         extract_entities=True,
                     )
-            self._turn_count += 1
-            if self._auto_sleep_enabled and self._turn_count % 10 == 0:
+                self._turn_count += 1
+                should_auto_sleep = self._auto_sleep_enabled and self._turn_count % 10 == 0
+            if should_auto_sleep:
                 self._maybe_auto_sleep()
             with self._sync_turn_lock:
                 self._sync_turn_telemetry["completed"] += 1
@@ -2420,11 +2439,21 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 if eligible == 0:
                     return
 
-                skip = self._reserve_reflection_budget("auto_sleep")
-                if skip is not None:
-                    logger.info("Mnemosyne auto-sleep skipped: %s", json.dumps(skip))
-                    return
-
+                with self._ensure_beam_access_lock():
+                    skip = self._reserve_reflection_budget_locked("auto_sleep")
+                    if skip is not None:
+                        logger.info("Mnemosyne auto-sleep skipped: %s", json.dumps(skip))
+                        return
+                    beam_ref = self._beam
+                    if beam_ref is None:
+                        return
+                    sleep_args = {
+                        "session_id": beam_ref.session_id,
+                        "db_path": beam_ref.db_path,
+                        "author_id": beam_ref.author_id,
+                        "author_type": beam_ref.author_type,
+                        "channel_id": beam_ref.channel_id,
+                    }
                 logger.info("Mnemosyne auto-sleep: working=%d, eligible=%d > threshold=%d", working, eligible, self._auto_sleep_threshold)
                 # Use session-scoped sleep to avoid timeout on large databases.
                 # Create a SEPARATE BeamMemory instance for the daemon thread
@@ -2432,17 +2461,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 # Reusing self._beam.conn from a daemon thread races with the
                 # main thread's sync_turn() writes, causing episodic INSERT
                 # failures (commit rolled back by concurrent main-thread writes).
-                beam_ref = self._beam
                 beam_lock = self._ensure_beam_access_lock()
                 def _sleep_isolated():
                     try:
                         BeamClass = _get_beam_class()
                         sleep_beam = BeamClass(
-                            session_id=beam_ref.session_id,
-                            db_path=beam_ref.db_path,
-                            author_id=beam_ref.author_id,
-                            author_type=beam_ref.author_type,
-                            channel_id=beam_ref.channel_id,
+                            **sleep_args,
                         )
                         with beam_lock:
                             sleep_beam.sleep()
@@ -3640,7 +3664,54 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         })
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        self._turn_count = turn_number
+        with self._ensure_beam_access_lock():
+            self._turn_count = turn_number
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Rebind session-scoped state after Hermes rotates the active session."""
+        del parent_session_id, rewound
+        if not new_session_id:
+            return
+
+        self._gateway_session_key = kwargs.get("gateway_session_key") or self._gateway_session_key
+        stable_scope = self._gateway_session_key or new_session_id
+        provider_session_id = f"hermes_{stable_scope}"
+        with self._ensure_beam_access_lock():
+            previous_session_id = self._session_id
+            beam = self._beam
+            if beam is not None:
+                beam.session_id = provider_session_id
+                # Move only the channel_id that BeamMemory derived from the
+                # session. Explicit channel IDs belong to the caller.
+                if not self._channel_id_explicit:
+                    beam.channel_id = provider_session_id
+
+            # Keep any profile-isolation wrapper aligned with its BeamMemory.
+            memory = getattr(self, "_memory", None)
+            if memory is not None:
+                memory.session_id = provider_session_id
+                if not self._channel_id_explicit:
+                    memory.channel_id = provider_session_id
+
+            self._session_id = provider_session_id
+            if reset:
+                self._turn_count = 0
+                self._reflect_calls_this_session = 0
+
+        logger.debug(
+            "Mnemosyne session switched: %s -> %s%s",
+            previous_session_id,
+            provider_session_id,
+            " (state reset)" if reset else "",
+        )
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         # Bound the consolidation call so a slow LLM (e.g., a Hermes-routed
@@ -3651,13 +3722,23 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if not self._beam:
             return
         try:
-            skip = self._reserve_reflection_budget("session_end")
-            if skip is not None:
-                logger.info("Mnemosyne session-end sleep skipped: %s", json.dumps(skip))
-                return
             logger.info("Mnemosyne session end — running consolidation")
             timeout = self.SESSION_END_SLEEP_TIMEOUT_SECONDS
-            beam_ref = self._beam
+            with self._ensure_beam_access_lock():
+                skip = self._reserve_reflection_budget_locked("session_end")
+                if skip is not None:
+                    logger.info("Mnemosyne session-end sleep skipped: %s", json.dumps(skip))
+                    return
+                beam_ref = self._beam
+                if beam_ref is None:
+                    return
+                sleep_args = {
+                    "session_id": beam_ref.session_id,
+                    "db_path": beam_ref.db_path,
+                    "author_id": beam_ref.author_id,
+                    "author_type": beam_ref.author_type,
+                    "channel_id": beam_ref.channel_id,
+                }
 
             def _sleep_with_logging():
                 # Wrap the target so exceptions get logged at the same
@@ -3668,13 +3749,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 # the main thread's writes.
                 try:
                     BeamClass = _get_beam_class()
-                    sleep_beam = BeamClass(
-                        session_id=beam_ref.session_id,
-                        db_path=beam_ref.db_path,
-                        author_id=beam_ref.author_id,
-                        author_type=beam_ref.author_type,
-                        channel_id=beam_ref.channel_id,
-                    )
+                    sleep_beam = BeamClass(**sleep_args)
                     sleep_beam.sleep()
                 except Exception as inner:
                     logger.debug("Mnemosyne session-end sleep failed: %s", inner)
@@ -3748,6 +3823,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             except Exception:
                 logger.debug("Mnemosyne: could not close wrapper", exc_info=True)
         self._memory = None
+        if self._audit is not None:
+            try:
+                self._audit.close()
+            except Exception:
+                logger.debug("Mnemosyne: could not close audit log", exc_info=True)
+        self._audit = None
         self._beam = None
 
         # C13: decrement this instance's contribution to the module-level

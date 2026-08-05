@@ -7,6 +7,7 @@ import json
 import sys
 import threading
 import types
+from unittest.mock import Mock
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,12 @@ def _provider_for_config(module, hermes_home: Path):
     return provider
 
 
+class _SessionScopedBeam:
+    def __init__(self):
+        self.session_id = "hermes_SESS-A"
+        self.channel_id = self.session_id
+
+
 def _json_stable(value):
     return json.loads(json.dumps(value, sort_keys=True))
 
@@ -176,6 +183,413 @@ def test_auto_sleep_env_can_disable_default(monkeypatch, provider_modules, value
     for module in provider_modules.values():
         provider = module.MnemosyneMemoryProvider()
         assert provider._auto_sleep_enabled is False
+
+
+def test_provider_session_switch_rebinds_both_provider_copies(provider_modules):
+    """Both distributed provider entry points must honor Hermes' lifecycle hook."""
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        beam = _SessionScopedBeam()
+        wrapper = _SessionScopedBeam()
+        provider._beam = beam
+        provider._memory = wrapper
+        provider._session_id = "hermes_SESS-A"
+        provider._turn_count = 8
+        provider._reflect_calls_this_session = 2
+
+        provider.on_session_switch(
+            "SESS-B",
+            parent_session_id="SESS-A",
+            reset=True,
+            rewound=False,
+        )
+
+        assert provider._session_id == "hermes_SESS-B"
+        assert beam.session_id == "hermes_SESS-B"
+        assert beam.channel_id == "hermes_SESS-B"
+        assert wrapper.session_id == "hermes_SESS-B"
+        assert wrapper.channel_id == "hermes_SESS-B"
+        assert provider._turn_count == 0
+        assert provider._reflect_calls_this_session == 0
+
+
+def test_profile_isolation_wrapper_rebinds_after_initialize(tmp_path, provider_modules):
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            "SESS-A",
+            hermes_home=str(tmp_path / module.__name__),
+            profile_isolation=True,
+        )
+
+        try:
+            assert provider._memory is not None
+            provider.on_session_switch("SESS-B")
+            assert provider._memory.session_id == "hermes_SESS-B"
+            assert provider._memory.beam.session_id == "hermes_SESS-B"
+        finally:
+            provider.shutdown()
+
+
+def test_initialized_explicit_channel_survives_session_switch(tmp_path, provider_modules):
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            "SESS-A",
+            hermes_home=str(tmp_path / module.__name__),
+            channel_id="caller-channel",
+        )
+
+        try:
+            provider.on_session_switch("SESS-B")
+            assert provider._session_id == "hermes_SESS-B"
+            assert provider._beam.session_id == "hermes_SESS-B"
+            assert provider._beam.channel_id == "caller-channel"
+        finally:
+            provider.shutdown()
+
+
+def test_session_end_worker_keeps_pre_switch_session_snapshot(provider_modules, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    class Beam:
+        session_id = "hermes_SESS-A"
+        db_path = "memory.db"
+        author_id = "author"
+        author_type = "agent"
+        channel_id = "channel"
+
+    class SleepBeam:
+        calls = []
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs["session_id"]
+            type(self).calls.append(self.session_id)
+
+        def sleep(self):
+            started.set()
+            assert release.wait(timeout=5)
+
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        provider._beam = Beam()
+        provider._reserve_reflection_budget_locked = lambda _reason: None
+        provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 0.01
+        SleepBeam.calls = []
+        monkeypatch.setattr(module, "_get_beam_class", lambda: SleepBeam)
+
+        provider.on_session_end([])
+        provider.on_session_switch("SESS-B")
+        release.set()
+        if provider._session_end_thread is not None:
+            provider._session_end_thread.join(timeout=5)
+
+        assert SleepBeam.calls == ["hermes_SESS-A"]
+        started.clear()
+        release.clear()
+
+
+def test_session_end_reservation_and_snapshot_share_lock(provider_modules, monkeypatch):
+    reservation_entered = threading.Event()
+    release_reservation = threading.Event()
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+
+    class SourceBeam:
+        session_id = "hermes_SESS-A"
+        db_path = "memory.db"
+        author_id = "author"
+        author_type = "agent"
+        channel_id = "channel"
+
+    class SleepBeam:
+        calls = []
+
+        def __init__(self, **kwargs):
+            type(self).calls.append(kwargs.copy())
+
+        def sleep(self):
+            worker_started.set()
+            assert release_worker.wait(timeout=5)
+
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        provider._beam = SourceBeam()
+        provider._beam_access_lock = threading.Lock()
+        provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 1
+        SleepBeam.calls = []
+
+        def reserve_locked(_reason, *, _provider=provider):
+            reservation_entered.set()
+            assert release_reservation.wait(timeout=5)
+            return None
+
+        provider._reserve_reflection_budget_locked = reserve_locked
+        monkeypatch.setattr(module, "_get_beam_class", lambda: SleepBeam)
+
+        end_thread = threading.Thread(target=provider.on_session_end, args=([],))
+        end_thread.start()
+        assert reservation_entered.wait(timeout=5)
+
+        switch_done = threading.Event()
+        switch_thread = threading.Thread(
+            target=lambda: (provider.on_session_switch("SESS-B"), switch_done.set())
+        )
+        switch_thread.start()
+        assert not switch_done.wait(timeout=0.1)
+
+        release_reservation.set()
+        assert worker_started.wait(timeout=5)
+        release_worker.set()
+        end_thread.join(timeout=5)
+        switch_thread.join(timeout=5)
+
+        assert not end_thread.is_alive()
+        assert switch_done.is_set()
+        assert SleepBeam.calls == [
+            {
+                "session_id": "hermes_SESS-A",
+                "db_path": "memory.db",
+                "author_id": "author",
+                "author_type": "agent",
+                "channel_id": "channel",
+            }
+        ]
+        reservation_entered.clear()
+        release_reservation.clear()
+        worker_started.clear()
+        release_worker.clear()
+
+
+def test_auto_sleep_reservation_and_snapshot_share_lock(provider_modules, monkeypatch):
+    reservation_entered = threading.Event()
+    release_reservation = threading.Event()
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    thread_errors = []
+
+    class SourceBeam:
+        session_id = "hermes_SESS-A"
+        db_path = "memory.db"
+        author_id = "author"
+        author_type = "agent"
+        channel_id = "channel"
+
+        def get_working_stats(self):
+            return {"total": 2}
+
+        def _count_unconsolidated_before(self, _cutoff):
+            return 1
+
+        def sleep(self):
+            raise AssertionError("auto-sleep must use a worker-local Beam")
+
+        def sleep_all_sessions(self):
+            raise AssertionError("auto-sleep must use a worker-local Beam")
+
+    class WorkerBeam:
+        calls = []
+
+        def __init__(self, **kwargs):
+            type(self).calls.append(kwargs.copy())
+
+        def sleep(self):
+            worker_started.set()
+            assert release_worker.wait(timeout=5)
+
+        def sleep_all_sessions(self):
+            worker_started.set()
+            assert release_worker.wait(timeout=5)
+
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+        provider._beam = SourceBeam()
+        provider._beam_access_lock = threading.Lock()
+        provider._auto_sleep_threshold = 1
+        provider._auto_sleep_enabled = True
+        provider._AUTO_SLEEP_TIMEOUT_SECONDS = 1
+        provider._gateway_session_key = ""
+        provider._session_id = "hermes_SESS-A"
+        provider._channel_id_explicit = False
+        provider._turn_count = 0
+        provider._reflect_calls_this_session = 0
+        WorkerBeam.calls = []
+
+        def reserve_locked(_reason, *, _provider=provider):
+            reservation_entered.set()
+            assert release_reservation.wait(timeout=5)
+            return None
+
+        provider._reserve_reflection_budget_locked = reserve_locked
+        monkeypatch.setattr(module, "_get_beam_class", lambda: WorkerBeam)
+
+        def run_auto_sleep():
+            try:
+                provider._maybe_auto_sleep()
+            except BaseException as exc:
+                thread_errors.append(exc)
+
+        auto_sleep_thread = threading.Thread(target=run_auto_sleep)
+        auto_sleep_thread.start()
+        assert reservation_entered.wait(timeout=5), thread_errors
+        assert not thread_errors
+
+        switch_done = threading.Event()
+        switch_thread = threading.Thread(
+            target=lambda: (provider.on_session_switch("SESS-B"), switch_done.set())
+        )
+        switch_thread.start()
+        assert not switch_done.wait(timeout=0.1)
+
+        release_reservation.set()
+        assert worker_started.wait(timeout=5)
+        release_worker.set()
+        auto_sleep_thread.join(timeout=5)
+        switch_thread.join(timeout=5)
+
+        assert not auto_sleep_thread.is_alive()
+        assert switch_done.is_set()
+        assert WorkerBeam.calls == [
+            {
+                "session_id": "hermes_SESS-A",
+                "db_path": "memory.db",
+                "author_id": "author",
+                "author_type": "agent",
+                "channel_id": "channel",
+            }
+        ]
+        reservation_entered.clear()
+        release_reservation.clear()
+        worker_started.clear()
+        release_worker.clear()
+
+
+def test_packaged_shutdown_closes_audit_log(provider_modules):
+    provider = provider_modules["mnemosyne_hermes"].MnemosyneMemoryProvider()
+    audit = Mock()
+    provider._audit = audit
+
+    provider.shutdown()
+
+    audit.close.assert_called_once_with()
+    assert provider._audit is None
+
+
+def test_packaged_reinitialize_closes_audit_log(provider_modules):
+    provider = provider_modules["mnemosyne_hermes"].MnemosyneMemoryProvider()
+    audit = Mock()
+    provider._audit = audit
+
+    provider.initialize("SESS-B", agent_context="subagent")
+
+    audit.close.assert_called_once_with()
+    assert provider._audit is None
+
+
+def test_provider_session_switch_preserves_initialized_gateway_scope(provider_modules):
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        beam = _SessionScopedBeam()
+        provider._beam = beam
+        provider._session_id = "hermes_gateway-topic"
+        provider._gateway_session_key = "gateway-topic"
+        provider._channel_id_explicit = False
+        beam.session_id = provider._session_id
+        beam.channel_id = provider._session_id
+
+        provider.on_session_switch("transient-child-session")
+
+        assert provider._session_id == "hermes_gateway-topic"
+        assert beam.session_id == "hermes_gateway-topic"
+        assert beam.channel_id == "hermes_gateway-topic"
+
+
+def test_packaged_retry_rebinds_failed_session_to_switched_gateway_scope(provider_modules):
+    """A transient packaged-init retry must target the latest session, not A."""
+    module = provider_modules["mnemosyne_hermes"]
+    provider = module.MnemosyneMemoryProvider()
+    provider._gateway_session_key = "gateway-topic"
+    provider._retry_init_args = ("SESS-A", {"gateway_session_key": "gateway-topic"})
+    provider._retry_init_at = 0
+    calls = []
+
+    def fake_initialize(session_id, **kwargs):
+        calls.append((session_id, kwargs))
+        provider._beam = object()
+
+    provider.initialize = fake_initialize
+    provider.on_session_switch("SESS-B")
+    provider._maybe_retry_init()
+
+    assert calls == [("SESS-B", {"gateway_session_key": "gateway-topic"})]
+
+
+def test_packaged_retry_cannot_publish_old_session_after_switch(provider_modules):
+    module = provider_modules["mnemosyne_hermes"]
+    provider = module.MnemosyneMemoryProvider()
+    provider._retry_init_args = ("SESS-A", {"gateway_session_key": "gateway-topic"})
+    provider._retry_init_at = 0
+    init_started = threading.Event()
+    release_init = threading.Event()
+
+    def blocked_initialize(session_id, **kwargs):
+        del kwargs
+        init_started.set()
+        assert release_init.wait(timeout=5)
+        provider._beam = _SessionScopedBeam()
+        provider._session_id = f"hermes_{session_id}"
+
+    provider.initialize = blocked_initialize
+    retry = threading.Thread(target=provider._maybe_retry_init)
+    retry.start()
+    assert init_started.wait(timeout=5)
+
+    switch = threading.Thread(target=provider.on_session_switch, args=("SESS-B",))
+    switch.start()
+    switch.join(timeout=0.05)
+    assert switch.is_alive()
+
+    release_init.set()
+    retry.join(timeout=5)
+    switch.join(timeout=5)
+
+    assert not retry.is_alive()
+    assert not switch.is_alive()
+    assert provider._session_id == "hermes_SESS-B"
+    assert provider._beam.session_id == "hermes_SESS-B"
+
+
+def test_provider_session_switch_preserves_explicit_channel(provider_modules):
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        beam = _SessionScopedBeam()
+        beam.channel_id = "telegram:topic-42"
+        provider._beam = beam
+        provider._session_id = "hermes_SESS-A"
+        provider._channel_id_explicit = True
+
+        provider.on_session_switch("SESS-B")
+
+        assert provider._session_id == "hermes_SESS-B"
+        assert beam.session_id == "hermes_SESS-B"
+        assert beam.channel_id == "telegram:topic-42"
+
+
+def test_provider_session_switch_preserves_explicit_channel_collision(provider_modules):
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        beam = _SessionScopedBeam()
+        beam.channel_id = "hermes_SESS-A"
+        provider._beam = beam
+        provider._session_id = "hermes_SESS-A"
+        provider._channel_id_explicit = True
+
+        provider.on_session_switch("SESS-B")
+
+        assert provider._session_id == "hermes_SESS-B"
+        assert beam.session_id == "hermes_SESS-B"
+        assert beam.channel_id == "hermes_SESS-A"
 
 
 @pytest.mark.parametrize("configured", [False, "false", 0])
@@ -719,7 +1133,7 @@ def test_packaged_provider_auto_sleep_uses_worker_local_beam(monkeypatch, provid
     provider._beam = SourceBeam()
     provider._auto_sleep_threshold = 1
     provider._beam_access_lock = threading.Lock()
-    provider._reserve_reflection_budget = lambda _reason: None
+    provider._reserve_reflection_budget_locked = lambda _reason: None
     monkeypatch.setattr(module, "_get_beam_class", lambda: WorkerBeam)
     monkeypatch.setattr(module, "threading", types.SimpleNamespace(Thread=InlineThread))
 
