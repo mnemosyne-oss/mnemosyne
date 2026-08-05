@@ -242,6 +242,91 @@ class TestToolHandlers:
         assert kwargs["extract_entities"] is False
         assert kwargs["extract"] is False
 
+    def test_shared_remember_uses_policies_in_shared_db_without_private_leak(
+        self, monkeypatch, tmp_path
+    ):
+        """Shared extraction stays in the surface DB and keeps its stable ID."""
+        shared_path = tmp_path / "shared" / "mnemosyne.db"
+        private_dir = tmp_path / "private"
+        monkeypatch.setenv("MNEMOSYNE_SHARED_DB_PATH", str(shared_path))
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(private_dir))
+        monkeypatch.setenv("MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES", "true")
+        monkeypatch.setenv("MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES", "true")
+
+        with patch(
+            "mnemosyne.core.extraction.extract_facts_safe",
+            return_value=["The shared surface uses stable identifiers"],
+        ):
+            shared = handle_tool_call(
+                "mnemosyne_shared_remember",
+                {"content": "Alice maintains the shared surface", "kind": "meta"},
+            )
+            duplicate = handle_tool_call(
+                "mnemosyne_shared_remember",
+                {"content": "Alice maintains the shared surface", "kind": "meta"},
+            )
+            private = handle_tool_call(
+                "mnemosyne_remember",
+                {"content": "Alice maintains the private bank"},
+            )
+
+        assert shared["status"] == "stored_shared"
+        assert duplicate["status"] == "stored_shared"
+        assert shared["memory_id"] == duplicate["memory_id"]
+        assert private["status"] == "stored"
+
+        conn = sqlite3.connect(shared_path)
+        try:
+            fact = conn.execute(
+                "SELECT memory_id, value FROM annotations WHERE memory_id = ? AND kind = 'fact'",
+                (shared["memory_id"],),
+            ).fetchone()
+            triple = conn.execute(
+                "SELECT source_msg_id, object FROM facts WHERE source_msg_id = ?",
+                (shared["memory_id"],),
+            ).fetchone()
+            private_leaks = conn.execute(
+                "SELECT COUNT(*) FROM working_memory WHERE content LIKE '%private bank%'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        private_conn = sqlite3.connect(private_dir / "mnemosyne.db")
+        try:
+            private_rows = private_conn.execute(
+                "SELECT COUNT(*) FROM working_memory WHERE content LIKE '%private bank%'"
+            ).fetchone()[0]
+        finally:
+            private_conn.close()
+
+        assert fact == (shared["memory_id"], "The shared surface uses stable identifiers")
+        assert triple == (shared["memory_id"], "The shared surface uses stable identifiers")
+        assert private_leaks == 0
+        assert private_rows == 1
+
+    @pytest.mark.parametrize(
+        ("env_var", "argument"),
+        [
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES", "extract_entities"),
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES", "extract"),
+        ],
+    )
+    def test_shared_remember_policy_overrides_explicit_false(
+        self, monkeypatch, env_var, argument
+    ):
+        """Shared writes use the same configured-policy precedence as private writes."""
+        surface = MagicMock()
+        surface._find_duplicate.return_value = None
+        surface.remember.return_value = "sf-test"
+        monkeypatch.setenv(env_var, "true")
+
+        with patch("mnemosyne.mcp_tools._create_surface_instance", return_value=surface):
+            handle_tool_call(
+                "mnemosyne_shared_remember",
+                {"content": "shared policy precedence", argument: False},
+            )
+
+        assert surface.remember.call_args.kwargs[argument] is True
+
     @pytest.mark.parametrize(
         ("env_var", "argument"),
         [

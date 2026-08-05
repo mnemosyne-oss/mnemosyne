@@ -105,7 +105,10 @@ SHARED_REMEMBER_SCHEMA = {
     "description": (
         "Store compact cross-agent surface memory in a dedicated shared Mnemosyne DB. "
         "Use only for stable user/system/workflow metadata or general preferences. "
-        "Normal mnemosyne_remember writes stay private."
+        "Normal mnemosyne_remember writes stay private. Extraction flags follow "
+        "MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES and "
+        "MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES with the same tri-state semantics "
+        "as mnemosyne_remember."
     ),
     "parameters": {
         "type": "object",
@@ -115,6 +118,14 @@ SHARED_REMEMBER_SCHEMA = {
             "importance": {"type": "number", "description": "Importance 0.0-1.0. Default 0.8.", "default": 0.8},
             "veracity": {"type": "string", "description": "stated | inferred | tool | imported | unknown", "default": "unknown"},
             "metadata": {"type": "object", "description": "Optional metadata object.", "default": {}},
+            "extract_entities": {
+                "type": "boolean",
+                "description": "Extract named entities. When omitted, uses MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES if configured; otherwise omitted means false and an explicit JSON boolean wins. A configured server policy overrides the caller.",
+            },
+            "extract": {
+                "type": "boolean",
+                "description": "Extract subject-predicate-object fact triples. When omitted, uses MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES if configured; otherwise omitted means false and an explicit JSON boolean wins. A configured server policy overrides the caller.",
+            },
         },
         "required": ["content"],
     },

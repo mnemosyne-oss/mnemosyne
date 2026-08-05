@@ -246,6 +246,16 @@ def _resolve_mcp_bool(
     return value
 
 
+def resolve_mcp_extraction_flags(arguments: Dict[str, Any]) -> tuple[bool, bool]:
+    """Resolve entity and triple extraction using the MCP tri-state policy."""
+    return (
+        _resolve_mcp_bool(
+            arguments, "extract_entities", _MCP_DEFAULT_EXTRACT_ENTITIES_ENV
+        ),
+        _resolve_mcp_bool(arguments, "extract", _MCP_DEFAULT_EXTRACT_TRIPLES_ENV),
+    )
+
+
 def _resolve_mcp_extraction_policies() -> tuple[bool | None, bool | None]:
     """Validate and return the server policies for entity and triple extraction."""
     return (
@@ -322,12 +332,7 @@ def _handle_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
     source = arguments.get("source", "mcp")
     importance = arguments.get("importance", 0.5)
     metadata = arguments.get("metadata", {})
-    extract_entities = _resolve_mcp_bool(
-        arguments, "extract_entities", _MCP_DEFAULT_EXTRACT_ENTITIES_ENV
-    )
-    extract = _resolve_mcp_bool(
-        arguments, "extract", _MCP_DEFAULT_EXTRACT_TRIPLES_ENV
-    )
+    extract_entities, extract = resolve_mcp_extraction_flags(arguments)
     scope = arguments.get("scope", _resolve_default_scope())
     valid_until = arguments.get("valid_until") or None
     veracity = arguments.get("veracity", "unknown")
@@ -487,6 +492,7 @@ def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
     metadata = arguments.get("metadata") or {}
     if not isinstance(metadata, dict):
         return {"error": "metadata must be an object"}
+    extract_entities, extract = resolve_mcp_extraction_flags(arguments)
 
     surface_beam = _create_surface_instance()
     import hashlib
@@ -509,6 +515,8 @@ def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
         metadata=meta,
         scope="global",
         memory_id=stable_id,
+        extract_entities=extract_entities,
+        extract=extract,
     )
 
     return {

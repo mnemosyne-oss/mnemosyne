@@ -1873,6 +1873,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _handle_shared_remember(self, args: Dict[str, Any]) -> str:
         from mnemosyne.core.veracity_consolidation import clamp_veracity
+        from mnemosyne.mcp_tools import resolve_mcp_extraction_flags
         err = self._require_surface_beam()
         if err:
             return json.dumps({"error": err})
@@ -1888,6 +1889,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         metadata = args.get("metadata") or {}
         if not isinstance(metadata, dict):
             return json.dumps({"error": "metadata must be an object"})
+        extract_entities, extract = resolve_mcp_extraction_flags(args)
         veracity = clamp_veracity(args.get("veracity"), context="mnemosyne_shared_remember")
         surface_content = self._surface_label(content, kind)
         stable_id = "sf_" + self._surface_hash(surface_content)
@@ -1902,6 +1904,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             scope="global",
             memory_id=stable_id,
             veracity=veracity,
+            extract_entities=extract_entities,
+            extract=extract,
         )
         self._audit_event(
             "shared_remember", memory_id=memory_id, bank="surface",

@@ -59,6 +59,45 @@ def test_shared_remember_stores_global_surface_memory(tmp_path, monkeypatch):
     assert row[2] == "global"
 
 
+def test_shared_remember_uses_mcp_policies_for_surface_annotations_and_triples(
+    tmp_path, monkeypatch
+):
+    """Hermes shared writes honor policy defaults in the configured shared DB."""
+    provider, _ = _provider(tmp_path, monkeypatch)
+    monkeypatch.setenv("MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES", "true")
+    monkeypatch.setenv("MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES", "true")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            "mnemosyne.core.extraction.extract_facts_safe",
+            lambda _content: ["The Hermes surface uses stable identifiers"],
+        )
+        first = _call(provider, "mnemosyne_shared_remember", {
+            "content": "Hermes shares durable workflow metadata",
+            "kind": "meta",
+        })
+        second = _call(provider, "mnemosyne_shared_remember", {
+            "content": "Hermes shares durable workflow metadata",
+            "kind": "meta",
+        })
+
+    assert first["status"] == "stored_shared"
+    assert second["status"] == "existing_shared"
+    assert first["memory_id"] == second["memory_id"]
+    fact = provider._surface_beam.conn.execute(
+        "SELECT memory_id, value FROM annotations WHERE memory_id = ? AND kind = 'fact'",
+        (first["memory_id"],),
+    ).fetchone()
+    triple = provider._surface_beam.conn.execute(
+        "SELECT source_msg_id, object FROM facts WHERE source_msg_id = ?",
+        (first["memory_id"],),
+    ).fetchone()
+    assert fact is not None
+    assert triple is not None
+    assert tuple(fact) == (first["memory_id"], "The Hermes surface uses stable identifiers")
+    assert tuple(triple) == (first["memory_id"], "The Hermes surface uses stable identifiers")
+
+
 def test_shared_remember_is_idempotent_for_same_content(tmp_path, monkeypatch):
     provider, _ = _provider(tmp_path, monkeypatch)
     args = {"content": "Surface meta: Mob project lives at /tmp/mob", "kind": "meta"}
@@ -134,4 +173,3 @@ def test_private_remember_does_not_write_shared_db(tmp_path, monkeypatch):
 
     assert private["status"] == "stored"
     assert shared_count == 0
-

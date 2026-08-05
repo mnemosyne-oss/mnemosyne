@@ -27,7 +27,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Changed
 
-- MCP remember and batch extraction policies now support strict tri-state server defaults with caller-preserving omission semantics.
+- MCP remember, batch, and shared-surface extraction policies now support strict tri-state server defaults with caller-preserving omission semantics across MCP and Hermes writes.
 
 ## [3.16.0] - 2026-08-01
 

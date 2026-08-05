@@ -234,7 +234,7 @@ Search only the shared Mnemosyne surface DB.
 
 ### 21. `mnemosyne_shared_remember`
 
-Store compact cross-agent surface memory in a dedicated shared Mnemosyne DB. Use only for stable user/system/workflow metadata or general preferences. Normal mnemosyne_remember writes stay private.
+Store compact cross-agent surface memory in a dedicated shared Mnemosyne DB. Use only for stable user/system/workflow metadata or general preferences. Normal mnemosyne_remember writes stay private. Extraction flags follow MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES and MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES with the same tri-state semantics as mnemosyne_remember.
 
 | Parameter | Type | Required | Default |
 |-----------|------|----------|---------|
@@ -243,6 +243,8 @@ Store compact cross-agent surface memory in a dedicated shared Mnemosyne DB. Use
 | `importance` | `number` | no | `0.8` |
 | `veracity` | `string` | no | `unknown` |
 | `metadata` | `object` | no | `{}` |
+| `extract_entities` | `boolean` | no | *(none)* |
+| `extract` | `boolean` | no | *(none)* |
 
 ### 22. `mnemosyne_shared_stats`
 
