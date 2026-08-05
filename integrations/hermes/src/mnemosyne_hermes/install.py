@@ -578,7 +578,11 @@ def _is_venv_bin_dir(bin_dir: Path) -> bool:
 def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[Path]:
     """Try to find Hermes' python executable for dep validation.
 
-    Returns None when we can't find it (user runs manually).
+    Returns None when no *validated* Hermes runtime is found. A candidate is
+    never returned on the strength of sitting next to the launcher alone: the
+    caller bootstraps into whatever this returns, and an unvalidated shim
+    sibling is typically the user's Homebrew or system interpreter (#618). The
+    caller is expected to stop and point at ``--python`` rather than guess.
 
     NOTE: none of the branches below resolve the python symlink they return. A
     venv's bin/python is a symlink to the base interpreter; running the venv
@@ -607,21 +611,18 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
     #    venv. Without that check a shell-wrapper launcher makes any shim
     #    directory look like Hermes' venv, and `~/.local/bin/python` (commonly
     #    a Homebrew or system symlink) gets `mnemosyne-hermes[all]` installed
-    #    into it while the installer reports success (#618).
-    unvalidated_sibling: Optional[Path] = None
+    #    into it while the installer reports success (#618). An unvalidated
+    #    sibling is discarded outright rather than kept as a fallback: the only
+    #    layout it uniquely covers is a non-venv system install, which is
+    #    exactly where bootstrapping does the most damage.
     hermes_bin = shutil.which("hermes")
     if hermes_bin:
         bin_dir = _resolve_launcher(hermes_bin).parent
-        for py_name in ("python", "python3"):
-            candidate = bin_dir / py_name
-            if candidate.is_file():
-                if _is_venv_bin_dir(bin_dir):
+        if _is_venv_bin_dir(bin_dir):
+            for py_name in ("python", "python3"):
+                candidate = bin_dir / py_name
+                if candidate.is_file():
                     return candidate
-                # Keep it as a fallback rather than discarding it: a genuine
-                # system-wide install has no pyvenv.cfg anywhere, and rejecting
-                # it outright would leave those users with no candidate at all.
-                unvalidated_sibling = candidate
-                break
 
     # 2. Check known hermes-agent checkout / install roots with a venv.
     for root in [
@@ -649,10 +650,9 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
         if candidate.is_file():
             return candidate
 
-    # 5. Last resort: a launcher sibling that is not in a venv. Reached only
-    #    when every known Hermes root missed, so it cannot shadow a real
-    #    install the way it did before.
-    return unvalidated_sibling
+    # Nothing validated. Better to stop and let the caller ask for --python
+    # than to bootstrap into an interpreter that only looked plausible.
+    return None
 
 
 def _bootstrap_hermes_venv(hermes_python: Path) -> bool:
@@ -1484,6 +1484,27 @@ def run_install(
     # Symlink installs need Hermes' own Python to contain the package. Wrapper
     # installs validate the explicitly selected interpreter in install_plugin().
     hermes_python = _find_hermes_python(explicit_python=python) if mode == "symlink" else None
+    if mode == "symlink" and hermes_python is None:
+        # Discovery found no validated Hermes runtime, so there is nothing safe
+        # to bootstrap into. Before #618 this path guessed at the launcher's
+        # sibling, which is typically the user's Homebrew or system interpreter.
+        print(
+            "\n  ⚠ Could not identify Hermes' Python.\n"
+            "     No `hermes` launcher on PATH resolved into a virtual environment,\n"
+            "     and no Hermes install root contains one.\n\n"
+            "  Point the installer at it directly:\n"
+            "    mnemosyne-hermes install --python /path/to/hermes/venv/bin/python\n\n"
+            "  `mnemosyne-hermes install --dry-run` shows what discovery found.",
+            file=sys.stderr,
+        )
+        # --no-bootstrap already means "do not touch Hermes' venv", so there is
+        # no wrong-interpreter install to prevent and the run continues without
+        # dependency validation, as it did before. Failing here instead would
+        # also preempt the guard that refuses to replace an existing wrapper
+        # install, turning a data-safety message into a discovery message.
+        if not no_bootstrap:
+            return 1
+        print("     Continuing without dependency validation (--no-bootstrap).", file=sys.stderr)
     # Compare the paths as selected, not resolved. A venv's bin/python resolves
     # to its base interpreter, so resolving both sides reports a venv and the
     # base install as the same runtime and skips the check that bootstraps

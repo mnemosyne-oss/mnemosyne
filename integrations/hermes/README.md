@@ -111,9 +111,15 @@ hermes memory status
 `mnemosyne-hermes install` finds Hermes' Python by following the `hermes` launcher
 on PATH, including through a shell-wrapper launcher, and accepts the interpreter
 sitting beside it only when that directory is a real virtual environment. It then
-falls back to the known install roots (`$HERMES_HOME/hermes-agent`,
-`~/hermes-agent`, `/opt/hermes/hermes-agent`, `/usr/local/lib/hermes-agent`,
+checks the known install roots (`$HERMES_HOME/hermes-agent`, `~/hermes-agent`,
+`/opt/hermes/hermes-agent`, `/usr/local/lib/hermes-agent`,
 `/usr/lib/hermes-agent`).
+
+If none of those yields a virtual environment, the install stops rather than
+guessing. An interpreter that merely sits next to the launcher is usually a
+Homebrew or system Python, and installing `mnemosyne-hermes[all]` into it leaves
+Hermes' own environment untouched while reporting success. A Hermes installed
+outside a virtual environment therefore needs `--python`.
 
 Pass `--python` to skip discovery entirely when your layout is unusual or the
 wrong interpreter is being picked:

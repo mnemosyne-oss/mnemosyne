@@ -203,8 +203,13 @@ def test_path_sibling_is_used_when_it_is_a_real_venv(tmp_path, monkeypatch):
     assert install._find_hermes_python() == venv_python
 
 
-def test_non_venv_launcher_sibling_is_last_resort(tmp_path, monkeypatch):
-    """A system install with no venv anywhere still returns its sibling python."""
+def test_unvalidated_launcher_sibling_is_never_returned(tmp_path, monkeypatch):
+    """No validated venv means no candidate at all, not a plausible-looking guess.
+
+    The sibling here is the shape of a Homebrew or system interpreter sitting
+    next to a launcher. Returning it is what let `mnemosyne-hermes[all]` be
+    installed into an unrelated Python, so discovery gives up instead.
+    """
     system_bin = tmp_path / "usr" / "bin"
     _write_executable(system_bin / "hermes", "#!/bin/sh\nexit 0\n")
     system_python = _write_executable(system_bin / "python", "#!/bin/sh\nexit 0\n")
@@ -215,7 +220,109 @@ def test_non_venv_launcher_sibling_is_last_resort(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "prefix", sys.base_prefix)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
 
-    assert install._find_hermes_python() == system_python
+    found = install._find_hermes_python()
+
+    assert found is None
+    assert found != system_python
+
+
+def test_run_install_fails_clearly_when_nothing_validates(tmp_path, monkeypatch, capsys):
+    """The no-validated-venv path must stop and name --python, not install anyway."""
+    system_bin = tmp_path / "usr" / "bin"
+    _write_executable(system_bin / "hermes", "#!/bin/sh\nexit 0\n")
+    _write_executable(system_bin / "python", "#!/bin/sh\nexit 0\n")
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-home"))
+    monkeypatch.setenv("PATH", str(system_bin))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+    monkeypatch.setattr(install, "check_mnemosyne_core", lambda: True)
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("must not act without a validated Hermes runtime")
+
+    monkeypatch.setattr(install, "_bootstrap_hermes_venv", _fail)
+    monkeypatch.setattr(install, "install_plugin", _fail)
+    monkeypatch.setattr(install, "install_bundled_skill", _fail)
+
+    rc = install.run_install(hermes_home_path=tmp_path / "empty-home")
+
+    assert rc == 1
+    assert "--python" in capsys.readouterr().err
+
+
+def test_no_bootstrap_continues_without_a_validated_interpreter(tmp_path, monkeypatch, capsys):
+    """--no-bootstrap already forbids touching Hermes' venv, so nothing to prevent.
+
+    Failing here would also preempt the guard that refuses to replace an
+    existing wrapper install, replacing a data-safety message with a discovery
+    one.
+    """
+    system_bin = tmp_path / "usr" / "bin"
+    _write_executable(system_bin / "hermes", "#!/bin/sh\nexit 0\n")
+    _write_executable(system_bin / "python", "#!/bin/sh\nexit 0\n")
+
+    class _SkillResult:
+        message = "skipped"
+
+    link = tmp_path / "plugin-link"
+    link.symlink_to(tmp_path)
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-home"))
+    monkeypatch.setenv("PATH", str(system_bin))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+    monkeypatch.setattr(install, "check_mnemosyne_core", lambda: True)
+    monkeypatch.setattr(install, "install_plugin", lambda **kwargs: link)
+    monkeypatch.setattr(install, "install_bundled_skill", lambda **kwargs: _SkillResult())
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("--no-bootstrap must never bootstrap")
+
+    monkeypatch.setattr(install, "_bootstrap_hermes_venv", _fail)
+
+    rc = install.run_install(hermes_home_path=tmp_path / "empty-home", no_bootstrap=True)
+
+    assert rc == 0
+    assert "Continuing without dependency validation" in capsys.readouterr().err
+
+
+def test_wrapper_mode_is_unaffected_by_failed_discovery(tmp_path, monkeypatch):
+    """Wrapper installs validate their own interpreter and must not be blocked."""
+    system_bin = tmp_path / "usr" / "bin"
+    _write_executable(system_bin / "hermes", "#!/bin/sh\nexit 0\n")
+
+    class _SkillResult:
+        message = "skipped"
+
+    target = tmp_path / "wrapper-target"
+    target.mkdir()
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-home"))
+    monkeypatch.setenv("PATH", str(system_bin))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+    monkeypatch.setattr(install, "check_mnemosyne_core", lambda: True)
+    monkeypatch.setattr(install, "install_plugin", lambda **kwargs: target)
+    monkeypatch.setattr(install, "install_bundled_skill", lambda **kwargs: _SkillResult())
+    monkeypatch.setattr(
+        install,
+        "plugin_state",
+        lambda **kwargs: install.PluginState(
+            status="installed",
+            installed=True,
+            target=target,
+            mode="wrapper",
+            message="ok",
+        ),
+    )
+
+    rc = install.run_install(hermes_home_path=tmp_path / "empty-home", mode="wrapper")
+
+    assert rc == 0
 
 
 def test_run_install_bootstraps_hermes_venv_not_path_sibling(
