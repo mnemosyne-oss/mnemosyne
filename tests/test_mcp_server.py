@@ -4,6 +4,7 @@ Tests for Mnemosyne MCP Server (Phase 6)
 Run with: pytest tests/test_mcp_server.py -v
 """
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -265,6 +266,10 @@ class TestToolHandlers:
                 "mnemosyne_shared_remember",
                 {"content": "Alice maintains the shared surface", "kind": "meta"},
             )
+            prefixed = handle_tool_call(
+                "mnemosyne_shared_remember",
+                {"content": "Surface meta: Alice maintains the shared surface", "kind": "meta"},
+            )
             private = handle_tool_call(
                 "mnemosyne_remember",
                 {"content": "Alice maintains the private bank"},
@@ -273,6 +278,12 @@ class TestToolHandlers:
         assert shared["status"] == "stored_shared"
         assert duplicate["status"] == "stored_shared"
         assert shared["memory_id"] == duplicate["memory_id"]
+        expected_surface = "Surface meta: Alice maintains the shared surface"
+        expected_hash = hashlib.sha256(
+            f"surface:v1:{' '.join(expected_surface.lower().split())}".encode("utf-8")
+        ).hexdigest()[:24]
+        assert shared["memory_id"] == "sf_" + expected_hash
+        assert prefixed["memory_id"] == shared["memory_id"]
         assert private["status"] == "stored"
 
         conn = sqlite3.connect(shared_path)
@@ -281,6 +292,10 @@ class TestToolHandlers:
                 "SELECT memory_id, value FROM annotations WHERE memory_id = ? AND kind = 'fact'",
                 (shared["memory_id"],),
             ).fetchone()
+            entities = conn.execute(
+                "SELECT memory_id, value FROM annotations WHERE memory_id = ? AND kind = 'mentions'",
+                (shared["memory_id"],),
+            ).fetchall()
             triple = conn.execute(
                 "SELECT source_msg_id, object FROM facts WHERE source_msg_id = ?",
                 (shared["memory_id"],),
@@ -299,6 +314,7 @@ class TestToolHandlers:
             private_conn.close()
 
         assert fact == (shared["memory_id"], "The shared surface uses stable identifiers")
+        assert (shared["memory_id"], "Alice") in entities
         assert triple == (shared["memory_id"], "The shared surface uses stable identifiers")
         assert private_leaks == 0
         assert private_rows == 1

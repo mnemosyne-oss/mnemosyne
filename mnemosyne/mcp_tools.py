@@ -496,8 +496,6 @@ def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
     surface_beam = _create_surface_instance()
     import hashlib
-    normalized = " ".join(str(content).lower().split())
-    content_hash = hashlib.sha256(f"surface:v1:{normalized}".encode("utf-8")).hexdigest()[:24]
     prefixes = ("surface meta:", "surface preference:", "surface correction:", "surface identity:", "surface fact:")
     if content.lower().startswith(prefixes):
         surface_content = content
@@ -505,6 +503,8 @@ def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
         label_map = {"meta": "Surface meta", "preference": "Surface preference",
                      "correction": "Surface correction", "identity": "Surface identity"}
         surface_content = f"{label_map.get(kind, 'Surface meta')}: {content}"
+    normalized = " ".join(str(surface_content).lower().split())
+    content_hash = hashlib.sha256(f"surface:v1:{normalized}".encode("utf-8")).hexdigest()[:24]
     stable_id = "sf_" + content_hash
     meta = dict(metadata)
     meta.update({"shared_memory": True, "surface_kind": kind, "write_path": "mcp_tool"})
