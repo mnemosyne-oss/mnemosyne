@@ -23,7 +23,7 @@ The split is real and worth respecting: calling a plugin-only tool over MCP rais
 
 ### 1. `mnemosyne_batch`
 
-Apply multiple Mnemosyne memory mutations atomically in one tool call. Supported v1 actions: remember, update, forget, invalidate. All operations are validated before mutation; on failure the whole batch rolls back. Destructive actions require exact memory IDs. Recall/search/canonical/persona/shared-surface operations are not included in v1.
+Apply multiple Mnemosyne memory mutations atomically in one tool call. Supported v1 actions: remember, update, forget, invalidate. All operations are validated before mutation; on failure the whole batch rolls back. Destructive actions require exact memory IDs. Recall/search/canonical/persona/shared-surface operations are not included in v1. For remember operations, extraction flags follow the corresponding MCP server policy when configured, including overriding explicit per-operation values; otherwise omission is false and explicit JSON booleans are preserved.
 
 | Parameter | Type | Required | Default |
 |-----------|------|----------|---------|
@@ -169,7 +169,7 @@ Read CANONICAL self-facts for the current profile. With category+name: return th
 
 ### 14. `mnemosyne_remember`
 
-Store a durable memory in Mnemosyne. Use for ANY fact, preference, identity, insight, or context that should persist across sessions. Higher importance (0.0-1.0) surfaces the memory more often. Use scope='global' for user-level facts; scope='session' for conversation-specific context. Use valid_until (ISO date YYYY-MM-DD) for time-bound facts. Use extract_entities=True to extract named entities for fuzzy recall (e.g. 'Abdias' and 'Abdias J.' will match). Use extract=True to also pull subject-predicate-object fact triples via LLM for fact-aware recall. Use veracity to tag confidence: 'stated' for direct user assertions, 'tool' for deterministic tool output, 'inferred' for derived guesses; 'unknown' (default) gets no recall boost.
+Store a durable memory in Mnemosyne. Use for ANY fact, preference, identity, insight, or context that should persist across sessions. Higher importance (0.0-1.0) surfaces the memory more often. Use scope='global' for user-level facts; scope='session' for conversation-specific context. Use valid_until (ISO date YYYY-MM-DD) for time-bound facts. Use extract_entities=True to extract named entities for fuzzy recall (e.g. 'Abdias' and 'Abdias J.' will match). Use extract=True to also pull subject-predicate-object fact triples via LLM for fact-aware recall. Use veracity to tag confidence: 'stated' for direct user assertions, 'tool' for deterministic tool output, 'inferred' for derived guesses; 'unknown' (default) gets no recall boost. When these extraction arguments are omitted over MCP, the server uses MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES and MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES when configured; an unset server policy means omitted is false and an explicit JSON boolean wins. A configured server policy overrides the caller, including explicit false or true. Configured values must be one of 1/true/yes/on or 0/false/no/off.
 
 | Parameter | Type | Required | Default |
 |-----------|------|----------|---------|
@@ -178,8 +178,8 @@ Store a durable memory in Mnemosyne. Use for ANY fact, preference, identity, ins
 | `source` | `string` | no | `user` |
 | `scope` | `string` | no | `session` |
 | `valid_until` | `string` | no | *(unset)* |
-| `extract_entities` | `boolean` | no | `false` |
-| `extract` | `boolean` | no | `false` |
+| `extract_entities` | `boolean` | no | *(none)* |
+| `extract` | `boolean` | no | *(none)* |
 | `metadata` | `object` | no | `{}` |
 | `veracity` | `string` | no | `unknown` |
 

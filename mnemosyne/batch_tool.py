@@ -111,6 +111,8 @@ def apply_beam_batch(
     remember_source_tool: str = "mnemosyne_batch",
     audit_event: Callable[..., Any] | None = None,
     extract_defaults_global: bool = False,
+    extract_entities_default: bool | None = None,
+    extract_triples_default: bool | None = None,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     audit_events: list[tuple[str, dict[str, Any]]] = []
@@ -126,6 +128,8 @@ def apply_beam_batch(
                     remember_source_tool=remember_source_tool,
                     audit_events=audit_events,
                     extract_defaults_global=extract_defaults_global,
+                    extract_entities_default=extract_entities_default,
+                    extract_triples_default=extract_triples_default,
                 ))
     except Exception as exc:
         logger.exception(
@@ -154,13 +158,18 @@ def _apply_one(
     remember_source_tool: str,
     audit_events: list[tuple[str, dict[str, Any]]],
     extract_defaults_global: bool,
+    extract_entities_default: bool | None,
+    extract_triples_default: bool | None,
 ) -> dict[str, Any]:
     index = op["index"]
     action = op["action"]
     payload = op["payload"]
 
     if action == "remember":
-        extract = bool(payload.get("extract", False))
+        extract = _resolve_batch_bool(payload, "extract", extract_triples_default)
+        extract_entities = _resolve_batch_bool(
+            payload, "extract_entities", extract_entities_default
+        )
         scope = payload.get("scope", "global" if extract_defaults_global and extract else default_scope)
         metadata = payload.get("metadata") or None
         veracity = clamp_veracity(payload.get("veracity"), context="mnemosyne_batch")
@@ -171,7 +180,7 @@ def _apply_one(
             source=payload.get("source", remember_source_default),
             scope=scope,
             valid_until=payload.get("valid_until") or None,
-            extract_entities=bool(payload.get("extract_entities", False)),
+            extract_entities=extract_entities,
             extract=extract,
             metadata=metadata,
             veracity=veracity,
@@ -224,3 +233,18 @@ def _dry_run_result(op: dict[str, Any]) -> dict[str, Any]:
 
 def _non_empty_string(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _resolve_batch_bool(
+    payload: dict[str, Any], argument: str, policy: bool | None
+) -> bool:
+    """Resolve a batch remember flag without coercing invalid caller values."""
+    if policy is not None:
+        return policy
+    value = payload.get(argument, False)
+    if not isinstance(value, bool):
+        raise BatchOperationError(
+            f"{argument} must be a JSON boolean when its server policy is unset; "
+            f"got {value!r}"
+        )
+    return value

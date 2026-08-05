@@ -24,7 +24,13 @@ REMEMBER_SCHEMA = {
         "Use extract=True to also pull subject-predicate-object fact triples via LLM "
         "for fact-aware recall. Use veracity to tag confidence: 'stated' for direct "
         "user assertions, 'tool' for deterministic tool output, 'inferred' for derived "
-        "guesses; 'unknown' (default) gets no recall boost."
+        "guesses; 'unknown' (default) gets no recall boost. When these extraction "
+        "arguments are omitted over MCP, the server uses "
+        "MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES and "
+        "MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES when configured; an unset server "
+        "policy means omitted is false and an explicit JSON boolean wins. A "
+        "configured server policy overrides the caller, including explicit false or true. "
+        "Configured values must be one of 1/true/yes/on or 0/false/no/off."
     ),
     "parameters": {
         "type": "object",
@@ -34,8 +40,14 @@ REMEMBER_SCHEMA = {
             "source": {"type": "string", "description": "Source tag: preference, fact, insight, identity, task, etc.", "default": "user"},
             "scope": {"type": "string", "description": "'session' (default) or 'global'.", "default": "session"},
             "valid_until": {"type": "string", "description": "Optional expiry date YYYY-MM-DD.", "default": ""},
-            "extract_entities": {"type": "boolean", "description": "Extract named entities for fuzzy recall. Default False.", "default": False},
-            "extract": {"type": "boolean", "description": "Extract subject-predicate-object fact triples via LLM for fact-aware recall. Default False.", "default": False},
+            "extract_entities": {
+                "type": "boolean",
+                "description": "Extract named entities for fuzzy recall. When omitted over MCP, uses MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES if configured; otherwise omitted means false and an explicit JSON boolean wins. A configured server policy overrides the caller.",
+            },
+            "extract": {
+                "type": "boolean",
+                "description": "Extract subject-predicate-object fact triples via LLM for fact-aware recall. When omitted over MCP, uses MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES if configured; otherwise omitted means false and an explicit JSON boolean wins. A configured server policy overrides the caller.",
+            },
             "metadata": {"type": "object", "description": "Optional dict of additional fields (source_doc, tags, page, etc.). Default empty.", "default": {}},
             "veracity": {"type": "string", "description": "Confidence label: 'stated' | 'inferred' | 'tool' | 'imported' | 'unknown'. Default 'unknown'.", "default": "unknown"},
         },
@@ -453,7 +465,10 @@ BATCH_SCHEMA = {
         "Apply multiple Mnemosyne memory mutations atomically in one tool call. "
         "Supported v1 actions: remember, update, forget, invalidate. "
         "All operations are validated before mutation; on failure the whole batch rolls back. "
-        "Destructive actions require exact memory IDs. Recall/search/canonical/persona/shared-surface operations are not included in v1."
+        "Destructive actions require exact memory IDs. Recall/search/canonical/persona/shared-surface operations are not included in v1. "
+        "For remember operations, extraction flags follow the corresponding MCP server policy "
+        "when configured, including overriding explicit per-operation values; otherwise omission "
+        "is false and explicit JSON booleans are preserved."
     ),
     "parameters": {
         "type": "object",
@@ -473,8 +488,14 @@ BATCH_SCHEMA = {
                         "scope": {"type": "string"},
                         "valid_until": {"type": "string"},
                         "metadata": {"type": "object"},
-                        "extract_entities": {"type": "boolean"},
-                        "extract": {"type": "boolean"},
+                        "extract_entities": {
+                            "type": "boolean",
+                            "description": "For remember operations, uses MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES when configured; otherwise omitted means false and an explicit JSON boolean wins.",
+                        },
+                        "extract": {
+                            "type": "boolean",
+                            "description": "For remember operations, uses MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES when configured; otherwise omitted means false and an explicit JSON boolean wins.",
+                        },
                         "veracity": {"type": "string"},
                         "replacement_id": {"type": "string"},
                     },

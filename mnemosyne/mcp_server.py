@@ -51,7 +51,11 @@ except ImportError:
     TextContent = None
     CallToolResult = None
 
-from mnemosyne.mcp_tools import get_tool_definitions, handle_tool_call
+from mnemosyne.mcp_tools import (
+    get_tool_definitions,
+    handle_tool_call,
+    validate_mcp_extraction_policies,
+)
 
 # ---------------------------------------------------------------------------
 # Security helpers (S1)
@@ -116,6 +120,7 @@ def _build_mcp_server() -> Server:
     ``.name`` and ``.arguments``. The handler returns a ``CallToolResult``
     instead of a raw list of ``TextContent``.
     """
+    validate_mcp_extraction_policies()
     from mcp.types import CallToolResult, ListToolsResult, Tool
 
     async def _on_list_tools(ctx, params):  # noqa: ARG001 — ctx/params unused
