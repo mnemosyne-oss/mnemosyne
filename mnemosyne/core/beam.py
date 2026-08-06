@@ -351,9 +351,13 @@ def cap_proposal_importance(confidence, cap: Optional[float] = None) -> float:
     stays in the proposal metadata that the review/auto-apply flow reads.
 
     `cap=None` reads MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP. Missing/None confidence
-    falls back to 0.5, matching the pre-cap default. Unparseable caps fall back
-    to the default cap, and both the cap and the result are clamped to [0, 1] --
-    recall scoring and the injection gate assume importance sits in that range.
+    falls back to 0.5, matching the pre-cap default. Unparseable and non-finite
+    caps fall back to the default cap -- `float()` accepts "nan"/"inf", and
+    left alone a NaN cap collapses the min/max clamp to 0.0 (every NaN
+    comparison is False) while +inf disables the cap entirely, the opposite of
+    the documented invalid-value fallback. Both the cap and the result are
+    clamped to [0, 1] -- recall scoring and the injection gate assume
+    importance sits in that range.
     """
     if cap is None:
         try:
@@ -362,10 +366,19 @@ def cap_proposal_importance(confidence, cap: Optional[float] = None) -> float:
                 str(DEFAULT_PROPOSAL_IMPORTANCE_CAP)))
         except (TypeError, ValueError):
             cap = DEFAULT_PROPOSAL_IMPORTANCE_CAP
-    cap = min(1.0, max(0.0, float(cap)))
+    cap = float(cap)
+    if not math.isfinite(cap):
+        cap = DEFAULT_PROPOSAL_IMPORTANCE_CAP
+    cap = min(1.0, max(0.0, cap))
     try:
         raw = float(confidence) if confidence is not None else 0.5
     except (TypeError, ValueError):
+        raw = 0.5
+    if not math.isfinite(raw):
+        # Same failure mode as the cap: NaN survives min/max clamping
+        # (every comparison is False), inf pins to the cap silently.
+        # The sleep path pre-coerces via coerce_confidence(), but this
+        # function is also a public API -- fail to the documented default.
         raw = 0.5
     return min(1.0, max(0.0, min(raw, cap)))
 
