@@ -153,8 +153,8 @@ No required config. Everything defaults to `~/.mnemosyne/`. Optional overrides:
 | `MNEMOSYNE_PREFETCH_MIN_DISTINCTIVE_TOKENS` | `2` | Shared non-generic terms required for automatic prefetch injection |
 | `MNEMOSYNE_PREFETCH_MIN_QUERY_COVERAGE` | `0.30` | Minimum fraction of non-generic query terms covered by a prefetched memory |
 | `MNEMOSYNE_PREFETCH_CANONICAL_RARE_TOKEN_MAX_FREQUENCY` | `1` | Maximum canonical document frequency that permits a one-token match (`0` disables the exception) |
-| `MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS` | built-in generic-token set | Complete replacement for the canonical generic-token set |
-| `MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS` | _(empty)_ | Extra owner/deployment terms added to the configured generic-token set |
+| `MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS` | path-specific built-in canonical set | Complete replacement for the canonical generic-token set used by automatic and explicit canonical lookup; does not affect working/episodic prefetch |
+| `MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS` | _(empty)_ | Extra owner/deployment terms added to automatic canonical prefetch only |
 | `MNEMOSYNE_DEFAULT_SCOPE` | `session` | Default scope for remember (`global` enables cross-session immediate recall) |
 
 Or in `~/.hermes/config.yaml`:

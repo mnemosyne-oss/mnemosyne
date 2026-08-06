@@ -291,18 +291,25 @@ def _parse_token_set_env(key: str, default: Set[str]) -> Set[str]:
     return tokens or set(default)
 
 
-# Generic schema/system labels do not, by themselves, prove a canonical fact is
-# relevant to a turn. Deployments can replace this list with
-# MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS or extend the effective list with
-# MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS.
-_PREFETCH_CANONICAL_GENERIC_TOKEN_DEFAULTS = {
+# Generic schema/system labels do not, by themselves, prove a memory is
+# relevant to a turn. This fixed set governs ordinary working/episodic
+# automatic prefetch; canonical-specific deployment tuning must not alter that
+# established path.
+_PREFETCH_LEXICAL_GENERIC_TOKENS = {
     "user", "owner", "assistant", "agent", "system", "profile", "identity", "default",
     "preference", "preferences", "recommendation", "recommendations",
 }
 
-# Explicit recall keeps the pre-hardening generic-token contract. The extra
-# preference/recommendation terms and prefetch environment tuning below are
-# intentionally limited to silent automatic context injection.
+# Canonical automatic prefetch starts from the same conservative defaults, but
+# deployments can replace this list with
+# MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS or extend the effective list with
+# MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS.
+_PREFETCH_CANONICAL_GENERIC_TOKEN_DEFAULTS = set(_PREFETCH_LEXICAL_GENERIC_TOKENS)
+
+# Explicit recall keeps the pre-hardening default generic-token contract while
+# continuing to honor the established canonical replacement variable. The new
+# preference/recommendation defaults and additive tuning remain limited to
+# silent automatic context injection.
 _CANONICAL_RECALL_GENERIC_TOKENS = {
     "user", "owner", "assistant", "agent", "system", "profile", "identity", "default",
 }
@@ -318,6 +325,14 @@ def _prefetch_canonical_generic_tokens() -> Set[str]:
         set(),
     )
     return configured | extras
+
+
+def _canonical_recall_generic_tokens() -> Set[str]:
+    """Return the historical configured token set for explicit canonical recall."""
+    return _parse_token_set_env(
+        "MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS",
+        _CANONICAL_RECALL_GENERIC_TOKENS,
+    )
 
 
 def _is_low_quality_prefetch(content: str) -> bool:
@@ -363,7 +378,7 @@ def _canonical_recall_rows(store: Any, owner_id: str, query: str, *, limit: int 
         rows = store.list(owner_id)
     except Exception:
         return []
-    generic_tokens = _CANONICAL_RECALL_GENERIC_TOKENS
+    generic_tokens = _canonical_recall_generic_tokens()
     candidates: List[Dict[str, Any]] = []
     for row in rows:
         body = str(row.get("body") or "").strip()
@@ -531,7 +546,7 @@ def _prefetch_adjusted_score(row: Dict[str, Any]) -> float:
 
 def _prefetch_has_distinctive_lexical_evidence(query: str, content: str) -> bool:
     """Require multiple shared topical terms with meaningful query coverage."""
-    generic_tokens = _prefetch_canonical_generic_tokens()
+    generic_tokens = _PREFETCH_LEXICAL_GENERIC_TOKENS
     query_tokens = _prefetch_tokens(query) - generic_tokens
     overlap = query_tokens & _prefetch_tokens(content)
     return (

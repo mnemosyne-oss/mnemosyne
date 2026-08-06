@@ -113,6 +113,22 @@ def test_prefetch_requires_two_distinctive_lexical_terms(monkeypatch):
     assert "Cedar Bakery" in bakery
 
 
+def test_canonical_generic_override_does_not_change_normal_prefetch(monkeypatch):
+    monkeypatch.setenv(
+        "MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS",
+        "cedar,bakery",
+    )
+    p = _provider([
+        {"content": "SampleOwner prefers Cedar Bakery over Harbor Bakery.", "source": "preference",
+         "timestamp": "2026-06-11T09:01:00Z", "importance": 0.9, "score": 0.8,
+         "keyword_score": 0.8, "trust_tier": "STATED"},
+    ])
+
+    block = p.prefetch("Cedar Bakery preference")
+
+    assert "Cedar Bakery" in block
+
+
 def test_prefetch_generic_token_configuration_replaces_defaults(monkeypatch):
     monkeypatch.setenv("MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS", "sampleowner,assistant")
 
@@ -253,6 +269,25 @@ def test_explicit_recall_does_not_apply_prefetch_specific_generic_tokens():
     ))
 
     assert [row["canonical_name"] for row in response["results"]] == ["selection-lens"]
+
+
+def test_explicit_recall_honors_configured_canonical_generic_tokens(monkeypatch):
+    monkeypatch.setenv("MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS", "sampleowner")
+    p = _provider([])
+    p._beam.canonical = FakeCanonicalStore([
+        {
+            "name": "budget-lens",
+            "body": "SampleOwner budget approach.",
+            "category": "model:user",
+        },
+    ])
+
+    response = json.loads(p.handle_tool_call(
+        "mnemosyne_recall",
+        {"query": "SampleOwner", "limit": 5},
+    ))
+
+    assert response["results"] == []
 
 
 def test_canonical_prefetch_can_disable_single_token_exception(monkeypatch):
