@@ -241,11 +241,40 @@ class TestProposalImportanceCap:
         monkeypatch.setenv("MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP", "5.0")
         assert cap_proposal_importance(0.95) == 0.95
 
+    @pytest.mark.parametrize("bad_cap", ["nan", "NaN", "inf", "Infinity", "-inf"])
+    def test_non_finite_cap_falls_back_to_default(self, monkeypatch, bad_cap):
+        """float() parses "nan"/"inf" without raising, so non-finite caps
+        slip past the ValueError fallback. Left alone, NaN collapses the
+        min/max clamp to 0.0 (every NaN comparison is False) and +inf
+        removes the cap entirely -- both must instead behave like the
+        documented invalid-value fallback (default cap 0.5)."""
+        monkeypatch.setenv("MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP", bad_cap)
+        assert cap_proposal_importance(0.95) == 0.5
+        assert cap_proposal_importance(0.3) == 0.3
+
+    @pytest.mark.parametrize("bad_cap", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_explicit_cap_argument_falls_back(self, monkeypatch, bad_cap):
+        monkeypatch.delenv("MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP", raising=False)
+        assert cap_proposal_importance(0.95, cap=bad_cap) == 0.5
+
+    @pytest.mark.parametrize("bad_conf", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_confidence_falls_back_to_default(self, monkeypatch, bad_conf):
+        """Direct callers can pass a non-finite confidence (the sleep path
+        pre-coerces, but this is a public function). It must degrade to the
+        documented 0.5 default, never survive as NaN or pin to the cap."""
+        monkeypatch.delenv("MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP", raising=False)
+        result = cap_proposal_importance(bad_conf)
+        assert result == 0.5
+
     def test_sleep_stores_capped_proposal_importance(self, temp_db, monkeypatch):
         """End-to-end: a sleep pass with a stubbed proposal generator stores
-        proposal rows at capped importance while metadata keeps raw confidence."""
+        proposal rows at capped importance while metadata keeps raw confidence.
+        Auto-apply is disabled via the real production setting
+        (MNEMOSYNE_SLEEP_MODEL_REFRESH_AUTO_APPLY, read by
+        model_refresh.auto_apply_enabled) so the proposal row stays pending
+        for inspection."""
         monkeypatch.delenv("MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP", raising=False)
-        monkeypatch.setenv("MNEMOSYNE_MODEL_REFRESH_AUTO_APPLY", "0")
+        monkeypatch.setenv("MNEMOSYNE_SLEEP_MODEL_REFRESH_AUTO_APPLY", "0")
 
         from mnemosyne.core import model_refresh
 
@@ -289,6 +318,66 @@ class TestProposalImportanceCap:
             assert r["importance"] <= 0.5, f"proposal importance {r['importance']} exceeds cap"
             meta = json.loads(r["metadata_json"])
             assert float(meta.get("confidence", 0)) == 0.95, "raw confidence must survive in metadata"
+
+    def test_sleep_auto_applied_proposal_row_is_still_capped(self, temp_db, monkeypatch):
+        """Auto-apply ON (the production default): a proposal citing valid
+        in-batch evidence is applied to the canonical store, and its working
+        memory row STILL carries capped importance -- the cap governs the
+        review artifact's retrieval rank regardless of resolution status,
+        while the canonical store receives the raw confidence."""
+        monkeypatch.delenv("MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_SLEEP_MODEL_REFRESH_AUTO_APPLY", raising=False)
+
+        from mnemosyne.core import model_refresh
+
+        def fake_proposals(items):
+            return [{
+                "category": "project",
+                "name": "auto_apply_slot",
+                "body": "durable canonical body for auto apply",
+                "confidence": 0.95,
+                # Cite real rows from this sleep batch so the
+                # evidence-subset and min-evidence gates pass.
+                "evidence_ids": [str(item["id"]) for item in items[:3]],
+                "action": "update",
+                "reason": "durable project fact",
+            }]
+
+        monkeypatch.setattr(model_refresh, "infer_model_update_proposals", fake_proposals)
+
+        beam = BeamMemory(db_path=str(temp_db), session_id="t506b")
+        import sqlite3 as _sq
+        from datetime import datetime, timedelta
+        conn = _sq.connect(str(temp_db))
+        ts = (datetime.now() - timedelta(hours=200)).isoformat()
+        conn.executemany(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+            [(f"t506b-{i}", f"content {i}", "conversation", ts, "t506b") for i in range(6)],
+        )
+        conn.commit()
+        conn.close()
+
+        beam.sleep()
+
+        import json
+        conn = _sq.connect(str(temp_db))
+        conn.row_factory = _sq.Row
+        rows = conn.execute(
+            "SELECT importance, metadata_json FROM working_memory WHERE source = 'sleep_model_refresh_proposal'"
+        ).fetchall()
+        canonical = conn.execute(
+            "SELECT body, confidence FROM canonical_facts WHERE name = 'auto_apply_slot' AND valid_until IS NULL"
+        ).fetchall()
+        conn.close()
+
+        assert rows, "sleep() stored no proposal rows"
+        applied = [r for r in rows if json.loads(r["metadata_json"]).get("status") == "applied"]
+        assert applied, f"no proposal auto-applied; statuses: {[json.loads(r['metadata_json']).get('status') for r in rows]}"
+        for r in applied:
+            assert r["importance"] <= 0.5, f"auto-applied proposal importance {r['importance']} exceeds cap"
+        assert canonical, "auto-apply did not write the canonical slot"
+        assert canonical[0]["body"] == "durable canonical body for auto apply"
+        assert float(canonical[0]["confidence"]) == pytest.approx(0.95)
 
 
 # --- Recall-side assertions -------------------------------------------------
