@@ -115,11 +115,22 @@ checks the known install roots (`$HERMES_HOME/hermes-agent`, `~/hermes-agent`,
 `/opt/hermes/hermes-agent`, `/usr/local/lib/hermes-agent`,
 `/usr/lib/hermes-agent`).
 
-If none of those yields a virtual environment, the install stops rather than
-guessing. An interpreter that merely sits next to the launcher is usually a
-Homebrew or system Python, and installing `mnemosyne-hermes[all]` into it leaves
-Hermes' own environment untouched while reporting success. A Hermes installed
-outside a virtual environment therefore needs `--python`.
+On the default path, if none of those yields a virtual environment the install
+stops rather than guessing. An interpreter that merely sits next to the launcher
+is usually a Homebrew or system Python, and installing `mnemosyne-hermes[all]`
+into it leaves Hermes' own environment untouched while reporting success. A
+Hermes installed outside a virtual environment therefore needs `--python`.
+
+`--no-bootstrap` is the deliberate exception. It already means "do not install
+anything into Hermes' venv", so there is no wrong-interpreter install left to
+prevent. When discovery finds nothing there, the installer says so, skips
+dependency validation, and continues. The plugin is linked, but nothing has
+confirmed that Hermes can import it, so a `--no-bootstrap` install is not a
+validated one. Verify it separately:
+
+```bash
+hermes memory status
+```
 
 Pass `--python` to skip discovery entirely when your layout is unusual or the
 wrong interpreter is being picked:
