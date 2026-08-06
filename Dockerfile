@@ -31,7 +31,7 @@ LABEL org.opencontainers.image.licenses="MIT"
 # Install this checkout with MCP + SSE extras so locally built images contain
 # the source that was used to build them.
 COPY . /opt/mnemosyne
-RUN pip install --no-cache-dir "/opt/mnemosyne[mcp]"
+RUN pip install --no-cache-dir "/opt/mnemosyne[mcp]" "numpy>=1.24" "sqlite-vec>=0.1.0"
 
 # Default data directory (overridable via MNEMOSYNE_DATA_DIR env var)
 ENV MNEMOSYNE_DATA_DIR=/data
