@@ -128,6 +128,8 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
@@ -188,8 +190,11 @@ jobs:
           print('embedding model cached')
           "
 
-      - name: Run tests
-        run: pytest tests/ integrations/hermes/tests/test_wrapper_bootstrap.py -v --tb=short
+      - name: Run core tests
+        run: pytest tests/ -v --tb=short
+
+      - name: Run Hermes integration tests
+        run: pytest integrations/hermes/tests/ -v --tb=short
 
   build:
     runs-on: ubuntu-latest
