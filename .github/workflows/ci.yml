@@ -189,7 +189,7 @@ jobs:
           "
 
       - name: Run tests
-        run: pytest tests/ integrations/hermes/tests/test_wrapper_bootstrap.py -v --tb=short
+        run: pytest tests/ integrations/hermes/tests/test_wrapper_bootstrap.py integrations/hermes/tests/test_find_hermes_python.py -v --tb=short
 
   build:
     runs-on: ubuntu-latest

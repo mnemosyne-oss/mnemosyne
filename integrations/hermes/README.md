@@ -106,6 +106,44 @@ hermes memory status
 #   Plugin:    installed ✓
 ```
 
+#### Selecting Hermes' interpreter
+
+`mnemosyne-hermes install` finds Hermes' Python by following the `hermes` launcher
+on PATH, including through a shell-wrapper launcher, and accepts the interpreter
+sitting beside it only when that directory is a real virtual environment. It then
+checks the known install roots (`$HERMES_HOME/hermes-agent`, `~/hermes-agent`,
+`/opt/hermes/hermes-agent`, `/usr/local/lib/hermes-agent`,
+`/usr/lib/hermes-agent`).
+
+On the default path, if none of those yields a virtual environment the install
+stops rather than guessing. An interpreter that merely sits next to the launcher
+is usually a Homebrew or system Python, and installing `mnemosyne-hermes[all]`
+into it leaves Hermes' own environment untouched while reporting success. A
+Hermes installed outside a virtual environment therefore needs `--python`.
+
+`--no-bootstrap` is the deliberate exception. It already means "do not install
+anything into Hermes' venv", so there is no wrong-interpreter install left to
+prevent. When discovery finds nothing there, the installer says so, skips
+dependency validation, and continues. The plugin is linked, but nothing has
+confirmed that Hermes can import it, so a `--no-bootstrap` install is not a
+validated one. Verify it separately:
+
+```bash
+hermes memory status
+```
+
+Pass `--python` to skip discovery entirely when your layout is unusual or the
+wrong interpreter is being picked:
+
+```bash
+mnemosyne-hermes install --python /path/to/hermes/venv/bin/python
+mnemosyne-hermes install --dry-run          # shows which interpreter would be used
+```
+
+`--python` is authoritative in both install modes: it overrides discovery for a
+symlink install, and selects the site-packages a `--mode wrapper` install imports
+from.
+
 The installer also deploys the bundled `mnemosyne-memory-override` skill to
 `$HERMES_HOME/skills/memory/mnemosyne-memory-override/SKILL.md`. The skill is a
 behavioral guardrail that nudges agents away from the legacy `memory` tool for

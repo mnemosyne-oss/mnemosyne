@@ -98,7 +98,7 @@ def test_install_bundled_skill_force_overwrites_existing_with_backup(tmp_path):
 
 
 def test_install_dry_run_reports_skill_action_without_writing(tmp_path, capsys, monkeypatch):
-    monkeypatch.setattr(install, "_find_hermes_python", lambda: None)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: None)
 
     rc = install.main(["--hermes-home", str(tmp_path), "install", "--dry-run"])
     out = capsys.readouterr().out
@@ -115,7 +115,7 @@ def test_status_reports_skill_state(tmp_path, capsys, monkeypatch):
     (target / "__init__.py").write_text("class MnemosyneMemoryProvider: pass\n")
     install.install_bundled_skill(hermes_home_path=tmp_path)
     monkeypatch.setattr(install, "check_mnemosyne_core", lambda: True)
-    monkeypatch.setattr(install, "_find_hermes_python", lambda: None)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: None)
 
     rc = install.main(["--hermes-home", str(tmp_path), "status"])
     out = capsys.readouterr().out
@@ -419,7 +419,7 @@ def test_cli_requires_explicit_flag_to_migrate_wrapper_to_symlink(tmp_path, monk
     )
     original_init = (target / "__init__.py").read_bytes()
     monkeypatch.setattr(install, "check_mnemosyne_core", lambda: True)
-    monkeypatch.setattr(install, "_find_hermes_python", lambda: None)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: None)
 
     rejected = install.main(
         ["--hermes-home", str(tmp_path), "install", "--force", "--no-bootstrap"]
@@ -455,7 +455,7 @@ def test_dry_run_reports_refused_wrapper_migration(tmp_path, monkeypatch, capsys
         python=sys.executable,
     )
     original_init = (target / "__init__.py").read_bytes()
-    monkeypatch.setattr(install, "_find_hermes_python", lambda: None)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: None)
 
     rc = install.main(
         ["--hermes-home", str(tmp_path), "install", "--force", "--dry-run", "--no-bootstrap"]
@@ -468,7 +468,7 @@ def test_dry_run_reports_refused_wrapper_migration(tmp_path, monkeypatch, capsys
 
 
 def test_dry_run_rejects_invalid_wrapper_migration_flag_combination(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(install, "_find_hermes_python", lambda: None)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: None)
 
     rc = install.main(
         ["--hermes-home", str(tmp_path), "install", "--dry-run", "--migrate-wrapper-to-symlink"]
