@@ -383,6 +383,33 @@ def test_run_install_bootstraps_hermes_venv_not_path_sibling(
     assert hermes_world.shim_python not in bootstrapped
 
 
+def test_dry_run_reports_explicitly_selected_interpreter(tmp_path, monkeypatch, capsys):
+    """`install --dry-run --python X` must report X, not what discovery would pick.
+
+    Covers the `main()` dry-run route rather than `run_install()`. The launcher
+    here sits in a genuine venv, so discovery would return it if `--python` were
+    not threaded through, which is what this pins down.
+    """
+    chosen = _make_venv(tmp_path / "chosen")
+
+    launcher_venv = tmp_path / "path-venv"
+    discovered = _make_venv(launcher_venv)
+    _write_executable(launcher_venv / "bin" / "hermes", "#!/bin/sh\nexit 0\n")
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PATH", str(launcher_venv / "bin"))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+
+    rc = install.main(["install", "--dry-run", "--python", str(chosen)])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"Hermes Python: {chosen}" in out
+    assert str(discovered) not in out
+
+
 def test_run_install_honours_explicit_python(hermes_world, tmp_path, monkeypatch):
     """--python reaches discovery in symlink mode, not just wrapper mode."""
     bootstrapped: list[Path] = []
