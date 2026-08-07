@@ -290,6 +290,25 @@ def test_explicit_recall_honors_configured_canonical_generic_tokens(monkeypatch)
     assert response["results"] == []
 
 
+def test_explicit_recall_override_can_include_prefetch_specific_generic_token(monkeypatch):
+    monkeypatch.setenv("MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS", "recommendations")
+    p = _provider([])
+    p._beam.canonical = FakeCanonicalStore([
+        {
+            "name": "selection-lens",
+            "body": "SampleOwner recommendations emphasize reliability.",
+            "category": "model:user",
+        },
+    ])
+
+    response = json.loads(p.handle_tool_call(
+        "mnemosyne_recall",
+        {"query": "recommendations", "limit": 5},
+    ))
+
+    assert response["results"] == []
+
+
 def test_canonical_prefetch_can_disable_single_token_exception(monkeypatch):
     monkeypatch.setenv("MNEMOSYNE_PREFETCH_CANONICAL_RARE_TOKEN_MAX_FREQUENCY", "0")
     store = FakeCanonicalStore([
