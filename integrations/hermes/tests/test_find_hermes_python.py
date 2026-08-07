@@ -226,6 +226,35 @@ def test_unvalidated_launcher_sibling_is_never_returned(tmp_path, monkeypatch):
     assert found != system_python
 
 
+def test_known_root_without_pyvenv_cfg_is_rejected(tmp_path, monkeypatch):
+    """A directory named `venv` is not evidence that it is one.
+
+    Held to the same bar as the launcher sibling: a half-removed environment,
+    or one whose base interpreter is gone, still has bin/python sitting there.
+    """
+    home = tmp_path / "hermes-home"
+    bin_dir = home / "hermes-agent" / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    damaged = _write_executable(bin_dir / "python", "#!/bin/sh\nexit 0\n")
+    assert not (bin_dir.parent / "pyvenv.cfg").exists()
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+
+    found = install._find_hermes_python()
+
+    assert found is None
+    assert found != damaged
+
+    # Same layout, now a real venv: the root is found again, so the rejection
+    # above is the missing pyvenv.cfg and not the path shape.
+    (bin_dir.parent / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    assert install._find_hermes_python() == damaged
+
+
 def test_run_install_fails_clearly_when_nothing_validates(tmp_path, monkeypatch, capsys):
     """The no-validated-venv path must stop and name --python, not install anyway."""
     system_bin = tmp_path / "usr" / "bin"
