@@ -116,6 +116,96 @@ def test_successful_invalidate_clears_persisted_enhanced_recall_cache(monkeypatc
             _close_memory(memory)
 
 
+def test_successful_forget_working_clears_persisted_enhanced_recall_cache(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    memory = forgetter = fresh = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=db_path)
+        memory_id = memory.remember("issue 553 forget cache sentinel", source="test")
+        warm = _call(memory, "issue 553 forget cache sentinel", top_k=3)
+        assert memory_id in {result["id"] for result in warm}
+        assert memory._query_cache is not None
+        warm_cache_stats = memory._query_cache.stats()
+        assert _call(memory, "issue 553 forget cache sentinel", top_k=3) == warm
+        assert memory._query_cache.stats()["hits"] == warm_cache_stats["hits"] + 1
+        cache_version = memory._query_cache.stats()["version"]
+
+        assert memory.forget_working("missing-memory") is False
+        assert memory._query_cache.stats()["version"] == cache_version
+
+        local_id = memory.remember("issue 553 local-cache forget sentinel", source="test")
+        local_warm = _call(memory, "issue 553 local-cache forget sentinel", top_k=3)
+        assert local_id in {result["id"] for result in local_warm}
+        local_version = memory._query_cache.stats()["version"]
+        assert memory.forget_working(local_id) is True
+        assert memory._query_cache.stats()["version"] == local_version + 1
+        assert local_id not in {
+            result["id"]
+            for result in _call(memory, "issue 553 local-cache forget sentinel", top_k=3)
+        }
+
+        forgetter = BeamMemory(session_id="session-a", db_path=db_path)
+        assert not hasattr(forgetter, "_query_cache")
+        assert forgetter.forget_working(memory_id) is True
+
+        fresh = BeamMemory(session_id="session-a", db_path=db_path)
+        assert memory_id not in {
+            result["id"] for result in _call(fresh, "issue 553 forget cache sentinel", top_k=3)
+        }
+    finally:
+        try:
+            _close_memory(fresh)
+        finally:
+            try:
+                _close_memory(forgetter)
+            finally:
+                _close_memory(memory)
+
+
+def test_failed_cross_session_forget_keeps_cache_and_memory(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    owner = other = None
+    try:
+        db_path = tmp_path / "memories.db"
+        owner = BeamMemory(session_id="session-a", db_path=db_path)
+        memory_id = owner.remember("issue 553 private forget sentinel", source="test")
+        assert memory_id in {
+            row["id"] for row in _call(owner, "issue 553 private forget sentinel", top_k=3)
+        }
+
+        other = BeamMemory(session_id="session-b", db_path=db_path)
+        other_warm = _call(other, "issue 553 private forget sentinel", top_k=3)
+        assert memory_id not in {result["id"] for result in other_warm}
+        assert other._query_cache is not None
+        cache_version = other._query_cache.stats()["version"]
+        assert other.forget_working(memory_id) is False
+        assert other._query_cache.stats()["version"] == cache_version
+        assert memory_id not in {
+            result["id"]
+            for result in _call(other, "issue 553 private forget sentinel", top_k=3)
+        }
+        assert owner.get(memory_id) is not None
+        assert memory_id in {
+            row["id"] for row in _call(owner, "issue 553 private forget sentinel", top_k=3)
+        }
+    finally:
+        _close_memory(other)
+        _close_memory(owner)
+
+
 def test_invalidate_without_local_query_cache_clears_persisted_enhanced_recall_cache(
     monkeypatch, tmp_path: Path
 ):

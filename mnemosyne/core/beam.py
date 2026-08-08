@@ -4545,7 +4545,10 @@ class BeamMemory:
                     "DELETE FROM annotations WHERE memory_id = ?", (memory_id,)
                 )
                 cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
-        return wm_rows > 0
+        forgotten = wm_rows > 0
+        if forgotten:
+            self._invalidate_query_cache()
+        return forgotten
 
     # ------------------------------------------------------------------
     # Episodic Memory
