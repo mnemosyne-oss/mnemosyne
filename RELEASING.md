@@ -1,11 +1,13 @@
 # Releasing Mnemosyne
 
-> **Use `scripts/release.py`.** A release touches three repositories and
-> several places that will not tell you when they are wrong. Doing it by
-> hand is how `__version__` reached 3.15.1 with no tag, `CHANGELOG` grew a
-> dated `[3.15.0]` heading for a version that never shipped, the docs hero
-> read 3.14.0, and the marketing site's release card read 3.15.0. Four
-> surfaces, three answers.
+> **Core `mnemosyne-memory` releases use `scripts/release.py`.** It is not
+> for the standalone `mnemosyne-hermes` distribution, which has its own
+> `0.x` version and release gate below. A core release touches three
+> repositories and several places that will not tell you when they are wrong.
+> Doing it by hand is how `__version__` reached 3.15.1 with no tag,
+> `CHANGELOG` grew a dated `[3.15.0]` heading for a version that never
+> shipped, the docs hero read 3.14.0, and the marketing site's release card
+> read 3.15.0. Four surfaces, three answers.
 >
 > ```bash
 > python3 scripts/release.py check 3.16.0      # what is not ready
@@ -22,6 +24,9 @@
 | | `CHANGELOG.md`, `[Unreleased]` promoted to a dated section | `prepare` |
 | | `hermes_memory_provider/plugin.yaml` `version` | `prepare` |
 | | `docs/api/*.mdx` regenerated so they carry the new version | `prepare` |
+| `mnemosyne` standalone Hermes package | `integrations/hermes/pyproject.toml` `[project].version` | prepared with the packaged manifest |
+| | `integrations/hermes/plugin.yaml` source plugin manifest `version` | must exactly equal the standalone distribution version, runtime version, and packaged `integrations/hermes/src/mnemosyne_hermes/plugin.yaml` |
+| | `integrations/hermes/src/mnemosyne_hermes/plugin.yaml` `version` | must exactly match the standalone distribution |
 | `mnemosyne-docs` | `version.txt`, which drives the landing hero | `prepare` |
 | | `content/api/tool-schema.mdx` | `prepare`, via the docs generator |
 | `mnemosyne-website` | `public/llms.txt` "Latest stable" | `prepare` |
@@ -74,7 +79,31 @@ Mnemosyne follows **strict SemVer** (MAJOR.MINOR.PATCH).
 
 Release on main branch only. No release branches for older minors (yet).
 
-## Release Process
+### Standalone Hermes package releases
+
+`mnemosyne-hermes` is a separate `0.x` distribution. Its release version is
+the static `[project].version` in `integrations/hermes/pyproject.toml`; the
+packaged `src/mnemosyne_hermes/plugin.yaml` must carry exactly the same value.
+`integrations/hermes/plugin.yaml` must exactly equal that standalone
+distribution version, the runtime version, and the packaged manifest version.
+
+The `v0.*` tag path intentionally selects only
+`build-and-release-hermes` in `.github/workflows/release.yml`; the core release
+job explicitly excludes it. Do not change that routing for a routine standalone
+release.
+
+AJ owns release authority for this package. A contributor may prepare and test
+the version bump, but AJ performs the tag, GitHub Release, and PyPI publication.
+Before AJ does so, verify the intended `v<standalone-version>` tag maps to
+the standalone version (for example, `0.6.0` maps to `v0.6.0`). The pre-push
+hook and the standalone workflow job both verify that tag against
+`integrations/hermes/pyproject.toml` `[project].version` before build or
+publication; `v0.*` tags are compared only with prior standalone `v0.*` tags.
+The workflow then builds from `integrations/hermes`. After the workflow
+completes, verify both the GitHub release assets and the `mnemosyne-hermes`
+PyPI project show that exact version.
+
+## Core Release Process
 
 ### 1. Bump the version
 
@@ -112,11 +141,14 @@ The auto-generated notes from `generate_release_notes: true` are a starting poin
 
 ## Git Hook (auto-enforced)
 
-A pre-push hook in <code>.githooks/pre-push</code> validates:
+A pre-push hook in <code>.githooks/pre-push</code> validates each pushed tag:
 
 1. Tag format: `vMAJOR.MINOR.PATCH` (e.g. `v3.1.2`, not `v3.1` or `v3.1.2-beta`)
-2. Tag matches <code>__version__</code> in <code>mnemosyne/__init__.py</code> (without the `v`)
-3. Major bumps cannot skip the minor/patch sequence (no `v3.1.2 → v4.0.0` without a prior 3.x.y release — this prevents accidental jumps)
+2. A `v0.*` standalone tag matches `[project].version` in
+   <code>integrations/hermes/pyproject.toml</code>; other tags match
+   <code>__version__</code> in <code>mnemosyne/__init__.py</code> (without `v`)
+3. Each tag is monotonic only within its own namespace: `v0.*` standalone tags
+   or non-`v0` core tags, respectively
 
 Install with:
 

@@ -1,10 +1,11 @@
 #!/bin/bash
-# Mnemosyne pre-push hook — validates tags against __version__ and SemVer rules.
+# Mnemosyne pre-push hook — validates release tags against their package version.
 # Install: git config core.hooksPath .githooks
 
 set -euo pipefail
 
-VERSION_FILE="mnemosyne/__init__.py"
+CORE_VERSION_FILE="mnemosyne/__init__.py"
+HERMES_PROJECT_FILE="integrations/hermes/pyproject.toml"
 
 # Only run during tag pushes
 refs=()
@@ -18,17 +19,104 @@ if [ ${#refs[@]} -eq 0 ]; then
     exit 0
 fi
 
-# Parse version from __init__.py
-if [ ! -f "$VERSION_FILE" ]; then
-    echo "ERROR: $VERSION_FILE not found. Run from repo root."
-    exit 1
-fi
+core_version() {
+    if [ ! -f "$CORE_VERSION_FILE" ]; then
+        echo "ERROR: $CORE_VERSION_FILE not found. Run from repo root."
+        exit 1
+    fi
 
-pkg_version=$(grep -E "^__version__\s*=" "$VERSION_FILE" | sed -E "s/__version__\s*=\s*['\"]([^'\"]+)['\"].*/\1/")
-if [ -z "$pkg_version" ]; then
-    echo "ERROR: Could not extract __version__ from $VERSION_FILE"
-    exit 1
-fi
+    local version
+    version=$(grep -E "^__version__\s*=" "$CORE_VERSION_FILE" | sed -E "s/__version__\s*=\s*['\"]([^'\"]+)['\"].*/\1/")
+    if [ -z "$version" ]; then
+        echo "ERROR: Could not extract __version__ from $CORE_VERSION_FILE"
+        exit 1
+    fi
+    printf '%s\n' "$version"
+}
+
+hermes_version() {
+    if [ ! -f "$HERMES_PROJECT_FILE" ]; then
+        echo "ERROR: $HERMES_PROJECT_FILE not found. Run from repo root."
+        exit 1
+    fi
+
+    python3 - "$HERMES_PROJECT_FILE" <<'PY'
+import re
+import sys
+
+
+path = sys.argv[1]
+section = None
+seen_project = False
+versions = []
+header = re.compile(r"^\[([^]]+)\]\s*(?:#.*)?$")
+assignment = re.compile(r"^version\s*=\s*(.*?)\s*$")
+static_string = re.compile(r"^(?:\"([^\"\n]*)\"|'([^'\n]*)')\s*(?:#.*)?$")
+
+try:
+    with open(path, encoding="utf-8") as project_file:
+        for line_number, raw_line in enumerate(project_file, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            table = header.match(line)
+            if table:
+                section = table.group(1)
+                if section == "project":
+                    seen_project = True
+                continue
+
+            if section != "project":
+                continue
+
+            version_field = assignment.match(line)
+            if not version_field:
+                continue
+
+            value = static_string.match(version_field.group(1))
+            if not value:
+                raise ValueError(
+                    "[project].version on line {} must be a non-empty static string".format(
+                        line_number
+                    )
+                )
+            version = value.group(1) if value.group(1) is not None else value.group(2)
+            if not version:
+                raise ValueError(
+                    "[project].version on line {} must be a non-empty static string".format(
+                        line_number
+                    )
+                )
+            versions.append(version)
+except (OSError, UnicodeError, ValueError) as error:
+    print("ERROR: Could not read [project].version from {}: {}".format(path, error), file=sys.stderr)
+    raise SystemExit(1)
+
+if not seen_project:
+    print(
+        "ERROR: Could not read [project].version from {}: [project] section is missing".format(path),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+if not versions:
+    print(
+        "ERROR: Could not read [project].version from {}: version field is missing".format(path),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+if len(versions) > 1:
+    detail = "conflicting" if len(set(versions)) > 1 else "duplicate"
+    print(
+        "ERROR: Could not read [project].version from {}: {} version fields".format(
+            path, detail
+        ),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+print(versions[0])
+PY
+}
 
 for tag in "${refs[@]}"; do
     # Validate format: vMAJOR.MINOR.PATCH
@@ -39,38 +127,39 @@ for tag in "${refs[@]}"; do
         exit 1
     fi
 
-    # Strip 'v' prefix for comparison
     tag_version="${tag#v}"
+    if [[ "$tag" == v0.* ]]; then
+        version_file="$HERMES_PROJECT_FILE"
+        pkg_version=$(hermes_version)
+        tag_namespace='v0.* standalone'
+        latest_existing=$(git tag --list 'v0.*' --sort=-v:refname 2>/dev/null | head -1 || echo "")
+    else
+        version_file="$CORE_VERSION_FILE"
+        pkg_version=$(core_version)
+        tag_namespace='core (non-v0)'
+        latest_existing=$(git tag --list 'v[1-9]*' --sort=-v:refname 2>/dev/null | head -1 || echo "")
+    fi
 
-    # Must match __version__
     if [ "$tag_version" != "$pkg_version" ]; then
-        echo "ERROR: Tag version '$tag_version' does not match __version__ in $VERSION_FILE"
-        echo "  Tag:         $tag"
-        echo "  __version__: $pkg_version"
+        echo "ERROR: Tag version '$tag_version' does not match the release version in $version_file"
+        echo "  Tag:     $tag"
+        echo "  Version: $pkg_version"
         echo ""
-        echo "  Fix: Update mnemosyne/__init__.py or use the correct tag."
+        echo "  Fix: Update the package version or use the correct tag."
         exit 1
     fi
 
-    # Extract components
-    major=$(echo "$tag_version" | cut -d. -f1)
-    minor=$(echo "$tag_version" | cut -d. -f2)
-    patch=$(echo "$tag_version" | cut -d. -f3)
-
-    # Check that the tag isn't backtracking (new tag must be >= all existing tags)
-    # Uses git tag sorting (version sort, so v3.1.9 < v3.1.10)
-    latest_existing=$(git tag --sort=-v:refname 2>/dev/null | head -1 || echo "")
+    # Compare only releases in the selected package namespace.
     if [ -n "$latest_existing" ]; then
         latest_ver="${latest_existing#v}"
-        # Only compare if the new tag would go backwards
         if [ "$(printf '%s\n' "$tag_version" "$latest_ver" | sort -V | head -1)" = "$tag_version" ] && [ "$tag_version" != "$latest_ver" ]; then
-            echo "ERROR: Tag '$tag_version' is behind existing tag '$latest_ver'"
-            echo "  New tag must be greater than the latest existing tag."
+            echo "ERROR: Tag '$tag_version' is behind existing $tag_namespace tag '$latest_existing'"
+            echo "  New tag must be greater than the latest existing tag in that namespace."
             exit 1
         fi
     fi
 
-    echo "✓ Tag '$tag' matches __version__ ('$pkg_version')"
+    echo "✓ Tag '$tag' matches the release version ('$pkg_version') in $version_file"
 done
 
 exit 0

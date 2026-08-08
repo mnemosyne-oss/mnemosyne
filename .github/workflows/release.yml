@@ -56,6 +56,26 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Validate standalone tag version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+
+          tag = os.environ["RELEASE_TAG"]
+          expected = tag.removeprefix("v")
+          with open("pyproject.toml", "rb") as project_file:
+              version = tomllib.load(project_file)["project"]["version"]
+          if version != expected:
+              raise SystemExit(
+                  f"Standalone tag {tag!r} does not match "
+                  f"integrations/hermes/pyproject.toml [project].version {version!r}"
+              )
+          print(f"Validated standalone tag {tag} against package version {version}")
+          PY
+
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
