@@ -1111,6 +1111,64 @@ print(json.dumps({"result": result, "after": after}))
         sse_route = next(route for route in app.routes if getattr(route, "path", None) == "/sse")
         assert any(cell.cell_contents is build.return_value for cell in (sse_route.endpoint.__closure__ or ()))
 
+    def test_sse_messages_transport_uses_matching_mount_path(self):
+        """The advertised POST URI and mounted raw ASGI app must agree."""
+        from mnemosyne import mcp_server
+        from starlette.routing import Mount
+        from unittest.mock import AsyncMock, patch
+
+        handle_post_message = AsyncMock()
+        transport = type("FakeTransport", (), {"handle_post_message": handle_post_message})()
+        transport_factory = patch("mcp.server.sse.SseServerTransport")
+        with (
+            patch.object(mcp_server, "_build_mcp_server", return_value=object()),
+            transport_factory as build_transport,
+        ):
+            build_transport.return_value = transport
+            app = mcp_server._build_sse_app(host="127.0.0.1")
+
+        build_transport.assert_called_once_with("/messages/")
+        message_mount = next(
+            route
+            for route in app.routes
+            if isinstance(route, Mount) and route.path == "/messages"
+        )
+        assert message_mount.app is handle_post_message
+
+    def test_sse_messages_invalid_session_returns_clean_error(self):
+        """An invalid session POST must return an error without a second ASGI response."""
+        from mnemosyne import mcp_server
+        from starlette.testclient import TestClient
+        from unittest.mock import patch
+
+        with patch.object(mcp_server, "_build_mcp_server", return_value=object()):
+            app = mcp_server._build_sse_app(host="127.0.0.1")
+
+        response = TestClient(app).post(
+            "/messages/?session_id=missing",
+            json={"jsonrpc": "2.0", "method": "ping"},
+        )
+
+        assert response.status_code == 400
+        assert response.text == "Invalid session ID"
+
+    def test_sse_messages_missing_session_returns_clean_error(self):
+        """A valid-but-missing session must return 404 without an ASGI exception."""
+        from mnemosyne import mcp_server
+        from starlette.testclient import TestClient
+        from unittest.mock import patch
+
+        with patch.object(mcp_server, "_build_mcp_server", return_value=object()):
+            app = mcp_server._build_sse_app(host="127.0.0.1")
+
+        response = TestClient(app).post(
+            "/messages/?session_id=00000000-0000-0000-0000-000000000000",
+            json={"jsonrpc": "2.0", "method": "ping"},
+        )
+
+        assert response.status_code == 404
+        assert response.text == "Could not find session"
+
     def test_build_mcp_server_list_tools_returns_listtoolsresult(self):
         """SDK 2.x contract: the tools/list callback must return a ListToolsResult.
 
