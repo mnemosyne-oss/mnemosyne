@@ -36,6 +36,23 @@ if _env_repo and _env_file:
 LLM_BASE_URL = os.environ.get("MNEMOSYNE_LLM_BASE_URL", "").rstrip("/")
 LLM_API_KEY = os.environ.get("MNEMOSYNE_LLM_API_KEY", "")
 LLM_REMOTE_MODEL = os.environ.get("MNEMOSYNE_LLM_MODEL", "")
+
+# Optional named provider preset. When MNEMOSYNE_LLM_PROVIDER names a known
+# preset (see mnemosyne.core.llm_providers), it fills in the OpenAI-compatible
+# base URL and a default model for the selected MNEMOSYNE_LLM_REGION. Explicit
+# MNEMOSYNE_LLM_BASE_URL / MNEMOSYNE_LLM_MODEL always win, so existing
+# raw-env-var configurations behave exactly as before.
+LLM_PROVIDER = os.environ.get("MNEMOSYNE_LLM_PROVIDER", "").strip()
+LLM_REGION = os.environ.get("MNEMOSYNE_LLM_REGION", "").strip()
+if LLM_PROVIDER:
+    from mnemosyne.core.llm_providers import resolve_provider_defaults
+
+    _preset_base_url, _preset_model = resolve_provider_defaults(LLM_PROVIDER, LLM_REGION)
+    if not LLM_BASE_URL and _preset_base_url:
+        LLM_BASE_URL = _preset_base_url.rstrip("/")
+    if not LLM_REMOTE_MODEL and _preset_model:
+        LLM_REMOTE_MODEL = _preset_model
+
 LLM_TIMEOUT = float(os.environ.get("MNEMOSYNE_LLM_TIMEOUT", "60"))
 
 # Retryable errors only: 404/400 (model-not-found), 5xx, connection. Not 401/403/429.

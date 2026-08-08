@@ -143,6 +143,33 @@ When `MNEMOSYNE_LLM_BASE_URL` is set, Mnemosyne uses the remote endpoint for con
 
 Works with: llama.cpp server, vLLM, Ollama, LM Studio, or any OpenAI-compatible API.
 
+#### Provider presets
+
+Instead of memorizing per-region base URLs, name a provider preset and let
+Mnemosyne resolve the OpenAI-compatible base URL and a default model:
+
+| Variable | Default | Description |
+|---|---|---|
+| `MNEMOSYNE_LLM_PROVIDER` | *(none)* | Named provider preset. Currently: `minimax`. |
+| `MNEMOSYNE_LLM_REGION` | *(provider default)* | Region within the preset. For `minimax`: `global_en` (default) or `cn_zh`. |
+
+Explicit `MNEMOSYNE_LLM_BASE_URL` / `MNEMOSYNE_LLM_MODEL` always take precedence
+over a preset, so existing configurations are unchanged.
+
+**MiniMax** (`MNEMOSYNE_LLM_PROVIDER=minimax`):
+
+| Region | OpenAI-compatible base URL | Anthropic-compatible base URL |
+|---|---|---|
+| `global_en` | `https://api.minimax.io/v1` | `https://api.minimax.io/anthropic` |
+| `cn_zh` | `https://api.minimaxi.com/v1` | `https://api.minimaxi.com/anthropic` |
+
+| Model | Context window | Input / output (USD / 1M tokens) | Input modalities | Thinking |
+|---|---|---|---|---|
+| `MiniMax-M3` (default) | 1,000,000 | 0.6 / 2.4 | text, image, video | adaptive, disabled |
+| `MiniMax-M2.7` | 204,800 | 0.3 / 1.2 | text | always_on |
+
+Set `MNEMOSYNE_LLM_MODEL=MiniMax-M2.7` to select the non-default model.
+
 ### Host LLM Adapter (Hermes / agent integration)
 
 Route consolidation and fact extraction through a host-provided LLM (e.g., Hermes' authenticated `agent.auxiliary_client.call_llm`). Useful for OAuth-backed providers like `openai-codex` that don't fit the URL+API-key remote shape.
