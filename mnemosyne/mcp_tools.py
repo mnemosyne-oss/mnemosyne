@@ -208,6 +208,67 @@ def _resolve_default_scope() -> str:
     return "session"
 
 
+_MCP_DEFAULT_EXTRACT_ENTITIES_ENV = "MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES"
+_MCP_DEFAULT_EXTRACT_TRIPLES_ENV = "MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES"
+_MCP_BOOL_TRUE = frozenset({"1", "true", "yes", "on"})
+_MCP_BOOL_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def _resolve_mcp_default_bool(env_var: str) -> bool | None:
+    """Resolve a tri-state MCP boolean policy from the server environment."""
+    raw = os.environ.get(env_var)
+    if raw is None:
+        return None
+    normalized = raw.strip().lower()
+    if normalized in _MCP_BOOL_TRUE:
+        return True
+    if normalized in _MCP_BOOL_FALSE:
+        return False
+    allowed = "1, true, yes, on, 0, false, no, off"
+    raise ValueError(
+        f"{env_var} must be a strict boolean ({allowed}); got {raw!r}"
+    )
+
+
+def _resolve_mcp_bool(
+    arguments: Dict[str, Any], argument: str, env_var: str
+) -> bool:
+    """Resolve one MCP boolean, preserving caller omission when policy is absent."""
+    policy = _resolve_mcp_default_bool(env_var)
+    if policy is not None:
+        return policy
+    value = arguments.get(argument, False)
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"{argument} must be a JSON boolean when {env_var} is unset; "
+            f"got {value!r}"
+        )
+    return value
+
+
+def resolve_mcp_extraction_flags(arguments: Dict[str, Any]) -> tuple[bool, bool]:
+    """Resolve entity and triple extraction using the MCP tri-state policy."""
+    return (
+        _resolve_mcp_bool(
+            arguments, "extract_entities", _MCP_DEFAULT_EXTRACT_ENTITIES_ENV
+        ),
+        _resolve_mcp_bool(arguments, "extract", _MCP_DEFAULT_EXTRACT_TRIPLES_ENV),
+    )
+
+
+def _resolve_mcp_extraction_policies() -> tuple[bool | None, bool | None]:
+    """Validate and return the server policies for entity and triple extraction."""
+    return (
+        _resolve_mcp_default_bool(_MCP_DEFAULT_EXTRACT_ENTITIES_ENV),
+        _resolve_mcp_default_bool(_MCP_DEFAULT_EXTRACT_TRIPLES_ENV),
+    )
+
+
+def validate_mcp_extraction_policies() -> None:
+    """Fail early when either configured MCP extraction policy is invalid."""
+    _resolve_mcp_extraction_policies()
+
+
 def _serialize(obj):
     """Recursively convert non-serializable objects (datetime, etc.) to strings."""
     if hasattr(obj, "isoformat"):
@@ -271,8 +332,7 @@ def _handle_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
     source = arguments.get("source", "mcp")
     importance = arguments.get("importance", 0.5)
     metadata = arguments.get("metadata", {})
-    extract_entities = arguments.get("extract_entities", False)
-    extract = arguments.get("extract", False)
+    extract_entities, extract = resolve_mcp_extraction_flags(arguments)
     scope = arguments.get("scope", _resolve_default_scope())
     valid_until = arguments.get("valid_until") or None
     veracity = arguments.get("veracity", "unknown")
@@ -301,10 +361,35 @@ def _handle_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 def _handle_batch(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_batch tool call."""
+    extract_entities_policy, extract_triples_policy = _resolve_mcp_extraction_policies()
     try:
         normalized = validate_batch_operations(arguments.get("operations"))
     except BatchValidationError as exc:
         return batch_validation_error_payload(exc)
+
+    for op in normalized:
+        if op["action"] != "remember":
+            continue
+        payload = op["payload"]
+        for argument, policy, env_var in (
+            (
+                "extract_entities",
+                extract_entities_policy,
+                _MCP_DEFAULT_EXTRACT_ENTITIES_ENV,
+            ),
+            ("extract", extract_triples_policy, _MCP_DEFAULT_EXTRACT_TRIPLES_ENV),
+        ):
+            if policy is None and argument in payload and not isinstance(
+                payload[argument], bool
+            ):
+                return batch_validation_error_payload(
+                    BatchValidationError(
+                        f"{argument} must be a JSON boolean when {env_var} is unset; "
+                        f"got {payload[argument]!r}",
+                        op["index"],
+                        op["action"],
+                    )
+                )
 
     if bool(arguments.get("dry_run", False)):
         return dry_run_batch(normalized)
@@ -324,6 +409,8 @@ def _handle_batch(arguments: Dict[str, Any]) -> Dict[str, Any]:
         default_scope=_resolve_default_scope(),
         remember_source_default="mcp",
         audit_event=lambda name, **kwargs: audit_events.append({"event": name, **kwargs}),
+        extract_entities_default=extract_entities_policy,
+        extract_triples_default=extract_triples_policy,
     )
     if result.get("status") == "ok":
         adapter.replay_wrapper_events()
@@ -405,11 +492,10 @@ def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
     metadata = arguments.get("metadata") or {}
     if not isinstance(metadata, dict):
         return {"error": "metadata must be an object"}
+    extract_entities, extract = resolve_mcp_extraction_flags(arguments)
 
     surface_beam = _create_surface_instance()
     import hashlib
-    normalized = " ".join(str(content).lower().split())
-    content_hash = hashlib.sha256(f"surface:v1:{normalized}".encode("utf-8")).hexdigest()[:24]
     prefixes = ("surface meta:", "surface preference:", "surface correction:", "surface identity:", "surface fact:")
     if content.lower().startswith(prefixes):
         surface_content = content
@@ -417,6 +503,8 @@ def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
         label_map = {"meta": "Surface meta", "preference": "Surface preference",
                      "correction": "Surface correction", "identity": "Surface identity"}
         surface_content = f"{label_map.get(kind, 'Surface meta')}: {content}"
+    normalized = " ".join(str(surface_content).lower().split())
+    content_hash = hashlib.sha256(f"surface:v1:{normalized}".encode("utf-8")).hexdigest()[:24]
     stable_id = "sf_" + content_hash
     meta = dict(metadata)
     meta.update({"shared_memory": True, "surface_kind": kind, "write_path": "mcp_tool"})
@@ -427,6 +515,8 @@ def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
         metadata=meta,
         scope="global",
         memory_id=stable_id,
+        extract_entities=extract_entities,
+        extract=extract,
     )
 
     return {

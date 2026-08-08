@@ -172,6 +172,13 @@ memory:
 
 **Multi-agent:** `shared_remember`, `shared_recall`, `shared_forget`, `shared_stats`
 
+`shared_remember` accepts the optional `extract_entities` and `extract` flags.
+When either flag is omitted, Hermes follows the MCP server policies
+`MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES` and
+`MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES`: an unset policy preserves the caller
+value (omission is false), while a configured strict boolean overrides the
+caller. Shared writes keep their dedicated surface database and stable IDs.
+
 **Working notes:** `scratchpad_write`, `scratchpad_read`, `scratchpad_clear`
 
 **Ops:** `export`, `import`, `diagnose`

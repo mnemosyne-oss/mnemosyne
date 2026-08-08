@@ -487,7 +487,9 @@ ENV_ONLY_DESCRIPTIONS = {
     "MNEMOSYNE_IMPORTED_WEIGHT": "Veracity multiplier for imported memories.",
     "MNEMOSYNE_INFERRED_WEIGHT": "Veracity multiplier for inferred memories.",
     "MNEMOSYNE_MCP_BANK": "Memory bank used by the MCP server.",
-    "MNEMOSYNE_MCP_TOKEN": "Bearer token for MCP SSE auth. Required for any non-loopback bind.",
+    "MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES": "Tri-state MCP policy for entity extraction: unset preserves caller behavior (omitted is false); when set, strict 1/true/yes/on or 0/false/no/off overrides the caller; invalid values fail at MCP startup or first use.",
+    "MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES": "Tri-state MCP policy for triple extraction: unset preserves caller behavior (omitted is false); when set, strict 1/true/yes/on or 0/false/no/off overrides the caller; invalid values fail at MCP startup or first use.",
+    "MNEMOSYNE_MCP_TOKEN": "Bearer token for network MCP transport auth. Required for any non-loopback bind.",
     "MNEMOSYNE_PERSONA_FILE": "Path to an external persona facts file.",
     "MNEMOSYNE_PREFETCH_MODEL_SLOT_LIMIT": "Maximum canonical slots prefetched per turn.",
     "MNEMOSYNE_PREFETCH_MODEL_SLOT_MIN_OVERLAP": "Minimum token overlap for a canonical slot to count as relevant.",
@@ -544,7 +546,7 @@ def _render_tool_schema(tools, version: str) -> str:
         "> Regenerate with `python3 scripts/generate-docs.py`.",
         "",
         f"Mnemosyne declares **{len(tools)} tools**. Of those, **{len(mcp)} are callable over MCP** "
-        f"(stdio and SSE), and **{len(plugin_only)} are implemented only in the Hermes provider** "
+        f"(stdio, SSE, and Streamable HTTP), and **{len(plugin_only)} are implemented only in the Hermes provider** "
         "and are not reachable through the MCP server.",
         "",
         "The split is real and worth respecting: calling a plugin-only tool over MCP raises "

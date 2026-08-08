@@ -158,6 +158,16 @@ def test_type_renderer_escapes_union_pipes_for_markdown_tables():
     )
 
 
+def test_generated_mcp_docs_describe_current_transport_and_policy_contract():
+    """PR #599's generated reference must name Streamable HTTP and tri-state policy."""
+    tool_docs = (REPO / "docs/api/tool-schema.mdx").read_text()
+    config_docs = (REPO / "docs/api/configuration.mdx").read_text()
+    assert "(stdio, SSE, and Streamable HTTP)" in tool_docs
+    assert "configured server policy overrides the caller" in tool_docs
+    assert "MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES" in config_docs
+    assert "strict 1/true/yes/on or 0/false/no/off" in config_docs
+
+
 @pytest.mark.parametrize("module", ["mnemosyne.mcp_server", "mnemosyne.mcp_tools"])
 def test_mcp_modules_import(module):
     """Catch an incompatible mcp SDK at test time rather than at first use.

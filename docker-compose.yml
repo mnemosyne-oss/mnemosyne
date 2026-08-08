@@ -10,6 +10,8 @@ services:
     environment:
       - MNEMOSYNE_DATA_DIR=/data
       - MNEMOSYNE_MCP_TOKEN=${MNEMOSYNE_MCP_TOKEN:-}
+      - MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES
+      - MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES
     command: ["--transport", "sse", "--host", "0.0.0.0", "--port", "8080"]
 
 volumes:

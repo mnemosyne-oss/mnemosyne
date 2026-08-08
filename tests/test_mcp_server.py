@@ -4,6 +4,7 @@ Tests for Mnemosyne MCP Server (Phase 6)
 Run with: pytest tests/test_mcp_server.py -v
 """
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -83,6 +84,10 @@ class TestToolSchemas:
         assert "extract_entities" in schema["properties"]
         assert "extract" in schema["properties"]
         assert "veracity" in schema["properties"]
+        assert "default" not in schema["properties"]["extract_entities"]
+        assert "default" not in schema["properties"]["extract"]
+        assert "MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES" in remember_tool["description"]
+        assert "MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES" in remember_tool["description"]
 
     def test_recall_schema_has_required_fields(self):
         """mnemosyne_recall requires 'query'."""
@@ -112,6 +117,13 @@ class TestToolSchemas:
         assert schema["properties"]["operations"]["maxItems"] == 50
         for context_field in ("bank", "author_id", "author_type", "channel_id"):
             assert context_field in schema["properties"]
+        remember_fields = schema["properties"]["operations"]["items"]["properties"]
+        assert "MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES" in remember_fields[
+            "extract_entities"
+        ]["description"]
+        assert "MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES" in remember_fields[
+            "extract"
+        ]["description"]
 
 
 class TestToolHandlers:
@@ -216,6 +228,369 @@ class TestToolHandlers:
         assert result["status"] == "stored"
         assert result["bank"] == "personal"
         assert create_instance.call_args.kwargs["bank"] == "personal"
+
+    def test_handle_remember_extraction_defaults_are_off(
+        self, mock_mnemosyne, monkeypatch
+    ):
+        """MCP extraction defaults remain disabled when the env vars are unset."""
+        monkeypatch.delenv("MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES", raising=False)
+
+        with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
+            handle_tool_call("mnemosyne_remember", {"content": "Test memory"})
+
+        kwargs = mock_mnemosyne.remember.call_args.kwargs
+        assert kwargs["extract_entities"] is False
+        assert kwargs["extract"] is False
+
+    def test_shared_remember_uses_policies_in_shared_db_without_private_leak(
+        self, monkeypatch, tmp_path
+    ):
+        """Shared extraction stays in the surface DB and keeps its stable ID."""
+        shared_path = tmp_path / "shared" / "mnemosyne.db"
+        private_dir = tmp_path / "private"
+        monkeypatch.setenv("MNEMOSYNE_SHARED_DB_PATH", str(shared_path))
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(private_dir))
+        monkeypatch.setenv("MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES", "true")
+        monkeypatch.setenv("MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES", "true")
+
+        with patch(
+            "mnemosyne.core.extraction.extract_facts_safe",
+            return_value=["The shared surface uses stable identifiers"],
+        ):
+            shared = handle_tool_call(
+                "mnemosyne_shared_remember",
+                {"content": "Alice maintains the shared surface", "kind": "meta"},
+            )
+            duplicate = handle_tool_call(
+                "mnemosyne_shared_remember",
+                {"content": "Alice maintains the shared surface", "kind": "meta"},
+            )
+            prefixed = handle_tool_call(
+                "mnemosyne_shared_remember",
+                {"content": "Surface meta: Alice maintains the shared surface", "kind": "meta"},
+            )
+            private = handle_tool_call(
+                "mnemosyne_remember",
+                {"content": "Alice maintains the private bank"},
+            )
+
+        assert shared["status"] == "stored_shared"
+        assert duplicate["status"] == "stored_shared"
+        assert shared["memory_id"] == duplicate["memory_id"]
+        expected_surface = "Surface meta: Alice maintains the shared surface"
+        expected_hash = hashlib.sha256(
+            f"surface:v1:{' '.join(expected_surface.lower().split())}".encode("utf-8")
+        ).hexdigest()[:24]
+        assert shared["memory_id"] == "sf_" + expected_hash
+        assert prefixed["memory_id"] == shared["memory_id"]
+        assert private["status"] == "stored"
+
+        conn = sqlite3.connect(shared_path)
+        try:
+            fact = conn.execute(
+                "SELECT memory_id, value FROM annotations WHERE memory_id = ? AND kind = 'fact'",
+                (shared["memory_id"],),
+            ).fetchone()
+            entities = conn.execute(
+                "SELECT memory_id, value FROM annotations WHERE memory_id = ? AND kind = 'mentions'",
+                (shared["memory_id"],),
+            ).fetchall()
+            triple = conn.execute(
+                "SELECT source_msg_id, object FROM facts WHERE source_msg_id = ?",
+                (shared["memory_id"],),
+            ).fetchone()
+            private_leaks = conn.execute(
+                "SELECT COUNT(*) FROM working_memory WHERE content LIKE '%private bank%'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        private_conn = sqlite3.connect(private_dir / "mnemosyne.db")
+        try:
+            private_rows = private_conn.execute(
+                "SELECT COUNT(*) FROM working_memory WHERE content LIKE '%private bank%'"
+            ).fetchone()[0]
+        finally:
+            private_conn.close()
+
+        assert fact == (shared["memory_id"], "The shared surface uses stable identifiers")
+        assert (shared["memory_id"], "Alice") in entities
+        assert triple == (shared["memory_id"], "The shared surface uses stable identifiers")
+        assert private_leaks == 0
+        assert private_rows == 1
+
+    @pytest.mark.parametrize(
+        ("env_var", "argument"),
+        [
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES", "extract_entities"),
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES", "extract"),
+        ],
+    )
+    def test_shared_remember_policy_overrides_explicit_false(
+        self, monkeypatch, env_var, argument
+    ):
+        """Shared writes use the same configured-policy precedence as private writes."""
+        surface = MagicMock()
+        surface._find_duplicate.return_value = None
+        surface.remember.return_value = "sf-test"
+        monkeypatch.setenv(env_var, "true")
+
+        with patch("mnemosyne.mcp_tools._create_surface_instance", return_value=surface):
+            handle_tool_call(
+                "mnemosyne_shared_remember",
+                {"content": "shared policy precedence", argument: False},
+            )
+
+        assert surface.remember.call_args.kwargs[argument] is True
+
+    @pytest.mark.parametrize(
+        ("env_var", "argument"),
+        [
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES", "extract_entities"),
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES", "extract"),
+        ],
+    )
+    def test_handle_remember_uses_each_enabled_extraction_default_independently(
+        self, mock_mnemosyne, monkeypatch, env_var, argument
+    ):
+        """Each MCP extraction default enables only its matching argument."""
+        monkeypatch.delenv("MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES", raising=False)
+        monkeypatch.setenv(env_var, "true")
+
+        with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
+            handle_tool_call("mnemosyne_remember", {"content": "Test memory"})
+
+        kwargs = mock_mnemosyne.remember.call_args.kwargs
+        assert kwargs[argument] is True
+        other_argument = (
+            "extract" if argument == "extract_entities" else "extract_entities"
+        )
+        assert kwargs[other_argument] is False
+
+    @pytest.mark.parametrize(
+        ("env_var", "argument"),
+        [
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES", "extract_entities"),
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES", "extract"),
+        ],
+    )
+    def test_handle_remember_server_policy_overrides_explicit_false(
+        self, mock_mnemosyne, monkeypatch, env_var, argument
+    ):
+        """A configured server policy overrides an explicit caller false."""
+        monkeypatch.setenv(env_var, "true")
+
+        with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
+            handle_tool_call(
+                "mnemosyne_remember",
+                {"content": "Test memory", argument: False},
+            )
+
+        assert mock_mnemosyne.remember.call_args.kwargs[argument] is True
+
+    @pytest.mark.parametrize(
+        ("env_var", "argument"),
+        [
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES", "extract_entities"),
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES", "extract"),
+        ],
+    )
+    @pytest.mark.parametrize("policy", [None, "false", "true"])
+    @pytest.mark.parametrize(
+        ("caller_provided", "caller_value"),
+        [(False, None), (True, False), (True, True)],
+    )
+    def test_handle_remember_tri_state_precedence(
+        self,
+        mock_mnemosyne,
+        monkeypatch,
+        env_var,
+        argument,
+        policy,
+        caller_provided,
+        caller_value,
+    ):
+        """Absent, false, and true server policies preserve their precedence contract."""
+        for name in (
+            "MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES",
+            "MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        if policy is not None:
+            monkeypatch.setenv(env_var, policy)
+
+        arguments = {"content": "Test memory"}
+        if caller_provided:
+            arguments[argument] = caller_value
+
+        with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
+            handle_tool_call("mnemosyne_remember", arguments)
+
+        expected = caller_value if policy is None and caller_provided else policy == "true"
+        assert mock_mnemosyne.remember.call_args.kwargs[argument] is expected
+
+    @pytest.mark.parametrize(
+        ("env_var", "argument"),
+        [
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES", "extract_entities"),
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES", "extract"),
+        ],
+    )
+    @pytest.mark.parametrize("policy", [None, "false", "true"])
+    @pytest.mark.parametrize(
+        ("caller_provided", "caller_value"),
+        [(False, None), (True, False), (True, True)],
+    )
+    def test_handle_batch_remember_tri_state_precedence(
+        self,
+        monkeypatch,
+        env_var,
+        argument,
+        policy,
+        caller_provided,
+        caller_value,
+    ):
+        """Batch remember uses the same tri-state policy as single remember."""
+        for name in (
+            "MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES",
+            "MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        if policy is not None:
+            monkeypatch.setenv(env_var, policy)
+
+        memory = MagicMock()
+        connection = sqlite3.connect(":memory:")
+        memory.beam.conn = connection
+        memory.conn = connection
+        memory.remember.return_value = "batch-memory-id"
+        operation = {"action": "remember", "content": "Batch memory"}
+        if caller_provided:
+            operation[argument] = caller_value
+
+        try:
+            with patch("mnemosyne.mcp_tools._create_instance", return_value=memory):
+                result = handle_tool_call(
+                    "mnemosyne_batch", {"operations": [operation]}
+                )
+        finally:
+            connection.close()
+
+        assert result["status"] == "ok"
+        expected = caller_value if policy is None and caller_provided else policy == "true"
+        assert memory.remember.call_args.kwargs[argument] is expected
+
+    @pytest.mark.parametrize(
+        ("env_var", "argument"),
+        [
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES", "extract_entities"),
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES", "extract"),
+        ],
+    )
+    @pytest.mark.parametrize("invalid_value", ["false", 0, None])
+    def test_handle_remember_rejects_invalid_caller_boolean_when_policy_unset(
+        self, mock_mnemosyne, monkeypatch, env_var, argument, invalid_value
+    ):
+        """MCP must not coerce invalid explicit booleans with bool(value)."""
+        monkeypatch.delenv(env_var, raising=False)
+
+        with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
+            with pytest.raises(ValueError, match=argument):
+                handle_tool_call(
+                    "mnemosyne_remember",
+                    {"content": "Test memory", argument: invalid_value},
+                )
+        mock_mnemosyne.remember.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("env_var", "argument"),
+        [
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES", "extract_entities"),
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES", "extract"),
+        ],
+    )
+    @pytest.mark.parametrize("invalid_value", ["false", 0, None])
+    def test_handle_batch_rejects_invalid_caller_boolean_when_policy_unset(
+        self, monkeypatch, env_var, argument, invalid_value
+    ):
+        """Batch remember rejects invalid explicit booleans before mutation."""
+        monkeypatch.delenv(env_var, raising=False)
+
+        result = handle_tool_call(
+            "mnemosyne_batch",
+            {
+                "operations": [
+                    {"action": "remember", "content": "Batch memory", argument: invalid_value}
+                ]
+            },
+        )
+
+        assert result["status"] == "error"
+        assert argument in result["error"]
+        assert result["failed_index"] == 0
+
+    @pytest.mark.parametrize(
+        ("env_var", "argument"),
+        [
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES", "extract_entities"),
+            ("MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES", "extract"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("raw_value", "expected"),
+        [
+            ("1", True),
+            ("true", True),
+            ("yes", True),
+            ("on", True),
+            ("0", False),
+            ("false", False),
+            ("no", False),
+            ("off", False),
+        ],
+    )
+    def test_mcp_extraction_env_accepts_only_documented_boolean_spellings(
+        self, mock_mnemosyne, monkeypatch, env_var, argument, raw_value, expected
+    ):
+        """All documented strict env spellings map to their boolean value."""
+        for name in (
+            "MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES",
+            "MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(env_var, raw_value)
+
+        with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne):
+            handle_tool_call("mnemosyne_remember", {"content": "Test memory"})
+
+        assert mock_mnemosyne.remember.call_args.kwargs[argument] is expected
+
+    @pytest.mark.parametrize(
+        "tool_name",
+        ["mnemosyne_remember", "mnemosyne_batch"],
+    )
+    @pytest.mark.parametrize(
+        "env_var",
+        [
+            "MNEMOSYNE_MCP_DEFAULT_EXTRACT_ENTITIES",
+            "MNEMOSYNE_MCP_DEFAULT_EXTRACT_TRIPLES",
+        ],
+    )
+    @pytest.mark.parametrize("invalid_value", ["maybe", "", "2"])
+    def test_invalid_mcp_extraction_env_fails_clearly(
+        self, monkeypatch, tool_name, env_var, invalid_value
+    ):
+        """Invalid configured policies fail on the first affected use."""
+        monkeypatch.setenv(env_var, invalid_value)
+        arguments = {"content": "Test memory"}
+        if tool_name == "mnemosyne_batch":
+            arguments = {
+                "operations": [{"action": "remember", "content": "Batch memory"}]
+            }
+
+        with pytest.raises(ValueError, match=env_var):
+            handle_tool_call(tool_name, arguments)
 
     def test_handle_batch_multiple_remember(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))

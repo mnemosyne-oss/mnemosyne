@@ -54,11 +54,11 @@ classifiers = [
 [project.optional-dependencies]
 llm = ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20"]
 embeddings = ["fastembed>=0.3.0", "sqlite-vec>=0.1.0"]
-mcp = ["mcp>=2.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'"]
+mcp = ["mcp>=2.0.0,<3.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'"]
 openclaw = ["openclaw>=0.1.0; python_version >= '3.10'"]
 sync = ["cryptography>=41.0"]
 test = ["pytest>=7.0"]
-all = ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20", "fastembed>=0.3.0", "sqlite-vec>=0.1.0", "mcp>=2.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'", "cryptography>=41.0"]
+all = ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20", "fastembed>=0.3.0", "sqlite-vec>=0.1.0", "mcp>=2.0.0,<3.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'", "cryptography>=41.0"]
 dev = ["pytest>=7.0", "build", "twine", "ruff==0.15.22"]
 
 [project.urls]
