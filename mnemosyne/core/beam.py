@@ -5732,6 +5732,37 @@ class BeamMemory:
                 veracity=veracity, memory_type=memory_type,
                 cross_session=cross_session,
             )
+            # [C4] Polyphonic path diagnostics. The linear-path recording
+            # below (record_call / record_tier_hits at the end of recall())
+            # is unreachable when POLYPHONIC_RECALL=1 because this branch
+            # returns first, so every production recall under the polyphonic
+            # engine stayed invisible to mnemosyne_recall_diagnostics. Record
+            # here instead. Voice -> tier mapping is approximate: vector->
+            # wm_vec, graph->em_vec, fact->em_fts, temporal->wm_fts.
+            # Diagnostics are read-only signal; they never alter recall
+            # behavior.
+            from mnemosyne.core.recall_diagnostics import get_diagnostics as _get_recall_diag
+            _recall_diag = _get_recall_diag()
+            _voice_tier_map = {
+                "vector": "wm_vec",
+                "graph": "em_vec",
+                "fact": "em_fts",
+                "temporal": "wm_fts",
+            }
+            _tier_kept = {
+                "wm_fts": 0, "wm_vec": 0, "wm_fallback": 0,
+                "em_fts": 0, "em_vec": 0, "em_fallback": 0,
+            }
+            _kept = 0
+            for _r in poly_results:
+                _kept += 1
+                _vs = _r.get("voice_scores") or {}
+                for _v, _t in _voice_tier_map.items():
+                    if _vs.get(_v):
+                        _tier_kept[_t] += 1
+            for _t, _n in _tier_kept.items():
+                _recall_diag.record_tier_hits(_t, _n)
+            _recall_diag.record_call(truly_empty=(_kept == 0))
             if explain:
                 return {
                     "query": query,

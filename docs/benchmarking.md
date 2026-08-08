@@ -209,6 +209,8 @@ High `fallback_rate` (>30%) on a benchmark run is a red flag -- it means most re
 
 Call `reset_recall_diagnostics()` at the start of each phase to keep counters clean per-run.
 
+> **Polyphonic recall caveat:** when `MNEMOSYNE_POLYPHONIC_RECALL=1`, recall delegates to the polyphonic engine and the linear-path recording block is bypassed. Since v3.16.0 the polyphonic branch records diagnostics itself, mapping engine voices to tiers (`vector`→`wm_vec`, `graph`→`em_vec`, `fact`→`em_fts`, `temporal`→`wm_fts`). The `by_tier` counters reflect that approximate mapping; `fallback_rate` stays `0` on the polyphonic path because the engine has no substring-fallback tier.
+
 ### Extraction diagnostics
 
 ```python
