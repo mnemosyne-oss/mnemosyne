@@ -299,15 +299,15 @@ results = beam.recall("editor preferences", top_k=5)
 |---------|-----------|------|-------|--------|-------------|-----------|----------|
 | **Local-first** | ✅ SQLite | ⚠️ Hybrid | ❌ Docker+PG | ⚠️ PG+worker | ❌ SaaS | ✅ SQLite | ✅ Embedded |
 | **Zero deps** | ✅ pip only | ❌ Qdrant/PG | ❌ PG+vector | ❌ PG+3 LLMs | ❌ SaaS infra | ✅ pip only | ✅ pip only |
-| **MCP server** | ✅ Built-in | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
+| **MCP server** | ✅ Built-in | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ |
 | **Python SDK** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Multi-platform** | ✅ 8+ targets | ⚠️ 3 adapters | ❌ Agent-only | ⚠️ 4 adapters | ✅ MCP | ❌ Agent-only | ❌ Library only |
+| **Multi-platform** | ✅ 8+ targets | ⚠️ 3 adapters | ❌ Agent-only | ⚠️ 4 adapters | ✅ MCP | ✅ MCP, 56+ direct integrations | ❌ Library only |
 | **Open source** | ✅ MIT | ✅ Apache 2.0 | ✅ OSS | ⚠️ AGPL | ❌ Proprietary | ✅ MIT | ✅ Apache 2.0 |
-| **Benchmark** | **65.2% BEAM / 98.9% LongMem** | 49% LongMem | 83.2% LoCoMo | **90.4% LongMem** | 85.2% MemoryBench | 73.4% BEAM | N/A (vector DB) |
+| **Benchmark** | **65.2% BEAM / 87.4% LongMem** | 49% LongMem | 83.2% LoCoMo | 90.4% LongMem | 85.2% MemoryBench | **73.4% BEAM / 94.6% LongMem** | N/A (vector DB) |
 | **Self-hosted** | ✅ Yes | ✅ Optional | ✅ Optional | ✅ Yes | ❌ Enterprise | ✅ Yes | ✅ Yes |
 | **Integration template** | ✅ Published | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **Memory architecture** | BEAM (3-tier) | Session + facts | OS-virtual context | Peer + reasoning | 5-layer stack | Episodic + semantic | Vector store only |
-| **Purpose** | Full memory system | Memory API | Agent runtime | Managed memory | Consumer + agent | Research memory | Vector database |
+| **Memory architecture** | BEAM (3-tier) | Session + facts | OS-virtual context | Peer + reasoning | 5-layer stack | Episodic + semantic + Graph + BM25 | Vector store only |
+| **Purpose** | Full memory system | Memory API | Agent runtime | Managed memory | Consumer + agent | Full memory system | Vector database |
 
 ---
 
