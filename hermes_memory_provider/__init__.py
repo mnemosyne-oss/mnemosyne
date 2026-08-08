@@ -3839,5 +3839,10 @@ def register(ctx):
             sys.path.insert(0, _repo_root)
         from hermes_plugin import register as _plugin_register
         _plugin_register(ctx)
-    except Exception:
-        pass  # Graceful degradation — CLI still works without plugin tools
+    except Exception as _e:
+        logger.warning(
+            "hermes_plugin registration failed (hooks may be missing): %s. "
+            "This is NOT graceful degradation — plugin hooks (pre_llm_call memory "
+            "injection, tools) will be unavailable. Check hermes_plugin module.",
+            _e,
+        )
