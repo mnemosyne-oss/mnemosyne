@@ -92,6 +92,15 @@ hermes config set memory.provider mnemosyne
 hermes memory status
 ```
 
+To install only at the selected Hermes home without linking opted-in child
+profiles, use:
+
+```bash
+mnemosyne-hermes install --no-profile-links
+```
+
+The default continues to link opted-in child profiles for backward compatibility.
+
 That's it. The entry point in `mnemosyne-hermes` registers with Hermes' memory
 provider discovery system (`hermes_agent.memory_providers`). No symlinks. No
 directory copying. No plugin.yaml gymnastics. The provider surfaces

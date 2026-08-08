@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -47,6 +48,16 @@ class _WrapperMetadata:
     python: Path | None = None
     site_packages: Path | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class _ProfileLinkSnapshot:
+    """Identity of a recognized profile symlink at discovery time."""
+
+    path: Path
+    link_target: str
+    device: int
+    inode: int
 
 
 @dataclass(frozen=True)
@@ -253,6 +264,45 @@ def _provider_init_is_valid(init_file: Path) -> bool:
     try:
         source = init_file.read_text(errors="replace")
         return "register_memory_provider" in source or "MnemosyneMemoryProvider" in source
+    except Exception:
+        return False
+
+
+def _provider_init_is_mnemosyne(init_file: Path) -> bool:
+    """Return whether a plugin has installer-owned Mnemosyne identity markers."""
+    try:
+        plugin_yaml = init_file.with_name("plugin.yaml").read_text(errors="replace")
+        if not re.search(
+            r"^\s*name:\s*['\"]?hermes-mnemosyne['\"]?\s*$",
+            plugin_yaml,
+            flags=re.MULTILINE,
+        ):
+            return False
+
+        wrapper_manifest = init_file.with_name("mnemosyne-wrapper.json")
+        if wrapper_manifest.is_file():
+            metadata = _wrapper_metadata(init_file.parent, init_file)
+            return (
+                metadata.error is None
+                and metadata.python is not None
+                and metadata.site_packages is not None
+            )
+
+        source = init_file.read_text(errors="replace")
+        legacy_python, legacy_site = _extract_wrapper_metadata(init_file)
+        if (
+            legacy_python is not None
+            and legacy_python.is_absolute()
+            and legacy_site is not None
+            and legacy_site.is_absolute()
+            and re.search(
+                r"^from\s+mnemosyne_hermes\s+import\s+\*(?:\s+#.*)?$",
+                source,
+                flags=re.MULTILINE,
+            )
+        ):
+            return True
+        return False
     except Exception:
         return False
 
@@ -726,6 +776,82 @@ def _link_all_profiles(
     return linked
 
 
+def _profile_links_preference_path(hermes_home_path: str | Path | None = None) -> Path:
+    """Return the installer-managed profile-link preference for a Hermes home."""
+    base = Path(hermes_home_path).expanduser() if hermes_home_path else hermes_home()
+    return base / "plugins" / ".mnemosyne-profile-links.json"
+
+
+def _atomic_write_profile_links_preference(path: Path, payload: bytes) -> None:
+    """Replace the profile-link preference without truncating an existing file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.staging-", dir=path.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        temporary.write_bytes(payload)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_profile_links_preference(
+    enabled: bool,
+    *,
+    hermes_home_path: str | Path | None = None,
+) -> None:
+    """Persist the selected profile-link behavior for later upgrades."""
+    path = _profile_links_preference_path(hermes_home_path)
+    payload = (json.dumps({"link_profiles": enabled}) + "\n").encode("utf-8")
+    _atomic_write_profile_links_preference(path, payload)
+
+
+def _restore_profile_links_preference(path: Path, previous: bytes | None) -> None:
+    """Restore a preference snapshot after a failed plugin replacement."""
+    if previous is None:
+        path.unlink(missing_ok=True)
+        return
+    _atomic_write_profile_links_preference(path, previous)
+
+
+def profile_links_enabled(*, hermes_home_path: str | Path | None = None) -> bool:
+    """Return the selected profile-link behavior for a Hermes home.
+
+    New installs persist the explicit selection, which lets upgrades distinguish
+    the default enabled behavior from an explicit root-only installation even
+    when no opted-in child profile exists yet. Existing installs without the
+    preference file retain the legacy observed-link fallback.
+    """
+    try:
+        preference = json.loads(
+            _profile_links_preference_path(hermes_home_path).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        preference = None
+    if isinstance(preference, dict) and isinstance(preference.get("link_profiles"), bool):
+        return preference["link_profiles"]
+
+    target = plugin_target_dir(hermes_home_path)
+    if not (target.is_symlink() or target.exists()):
+        return False
+    try:
+        expected = target.resolve()
+    except OSError:
+        return False
+    for profile_home in _iter_mnemosyne_profiles(hermes_home_path):
+        profile_target = profile_home / "plugins" / PLUGIN_NAME
+        if not profile_target.is_symlink():
+            continue
+        try:
+            if profile_target.resolve() == expected:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _verify_links(*, hermes_home_path: str | Path | None = None) -> bool:
     """Print PASS/FAIL for each home that should have a resolvable plugin link.
 
@@ -752,38 +878,162 @@ def _verify_links(*, hermes_home_path: str | Path | None = None) -> bool:
     return all_ok
 
 
-def _unlink_all_profiles(
+def _snapshot_profile_link(path: Path) -> _ProfileLinkSnapshot | None:
+    """Capture one stable symlink identity, or None if it changes while read."""
+    try:
+        before = path.lstat()
+        if not stat.S_ISLNK(before.st_mode):
+            return None
+        link_target = os.readlink(path)
+        after = path.lstat()
+    except OSError:
+        return None
+    if (
+        not stat.S_ISLNK(after.st_mode)
+        or before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+    ):
+        return None
+    return _ProfileLinkSnapshot(
+        path=path,
+        link_target=link_target,
+        device=after.st_dev,
+        inode=after.st_ino,
+    )
+
+
+def _same_profile_link_identity(
+    left: _ProfileLinkSnapshot, right: _ProfileLinkSnapshot
+) -> bool:
+    """Return whether two snapshots identify the same symlink object."""
+    return (
+        left.link_target == right.link_target
+        and left.device == right.device
+        and left.inode == right.inode
+    )
+
+
+def _recognized_profile_links(
     *,
     hermes_home_path: str | Path | None = None,
     recognized_targets: tuple[Path, ...] = (),
-) -> None:
-    """Remove profile links that resolve to a recognized Mnemosyne target.
+) -> list[_ProfileLinkSnapshot]:
+    """Return profile links that currently resolve to a recognized target.
 
-    Links are removed even if the profile no longer opts in, but unrelated
-    links and real directories are left untouched.
+    Profiles are considered even if they no longer opt in, but unrelated links
+    and real directories are ignored.
     """
     base = Path(hermes_home_path).expanduser() if hermes_home_path else hermes_home()
     profiles_dir = base / "profiles"
     if not profiles_dir.is_dir():
-        return
+        return []
     recognized = {_resolve_package_dir().resolve()}
     for target in recognized_targets:
         try:
             recognized.add(target.resolve())
         except OSError:
             continue
+    links: list[_ProfileLinkSnapshot] = []
     for child in sorted(profiles_dir.iterdir()):
         if child.is_symlink():
             continue
         target = child / "plugins" / PLUGIN_NAME
-        if not target.is_symlink():
+        before = _snapshot_profile_link(target)
+        if before is None:
             continue
         try:
-            if target.resolve() in recognized:
-                target.unlink()
-                print(f"  Removed profile link: {target}")
+            resolved = target.resolve()
         except OSError:
             continue
+        after = _snapshot_profile_link(target)
+        if (
+            after is not None
+            and _same_profile_link_identity(before, after)
+            and resolved in recognized
+        ):
+            links.append(after)
+    return links
+
+
+def _unlink_profile_links(links: list[_ProfileLinkSnapshot]) -> None:
+    """Quarantine each candidate, then remove only the snapshotted symlink."""
+    for snapshot in links:
+        target = snapshot.path
+        if _snapshot_profile_link(target) is None:
+            continue
+        quarantine_parent: Path | None = None
+        quarantined: Path | None = None
+        moved = False
+        try:
+            quarantine_parent = Path(
+                tempfile.mkdtemp(prefix=f".{target.name}.unlink-", dir=target.parent)
+            )
+            quarantined = quarantine_parent / target.name
+            target.replace(quarantined)
+            moved = True
+            quarantined_snapshot = _snapshot_profile_link(quarantined)
+            if quarantined_snapshot is not None and _same_profile_link_identity(
+                snapshot, quarantined_snapshot
+            ):
+                quarantined.unlink()
+                moved = False
+                print(f"  Removed profile link: {target}")
+            elif not target.is_symlink() and not target.exists():
+                quarantined.replace(target)
+                moved = False
+        except OSError:
+            raise
+        finally:
+            if moved and quarantined is not None:
+                try:
+                    if not target.is_symlink() and not target.exists():
+                        quarantined.replace(target)
+                        moved = False
+                except OSError:
+                    pass
+            if moved and quarantined is not None:
+                print(
+                    f"  Profile entry changed during cleanup; preserved at: {quarantined}",
+                    file=sys.stderr,
+                )
+            if quarantine_parent is not None:
+                try:
+                    quarantine_parent.rmdir()
+                except OSError:
+                    pass
+
+
+def _unlink_all_profiles(
+    *,
+    hermes_home_path: str | Path | None = None,
+    recognized_targets: tuple[Path, ...] = (),
+) -> None:
+    """Remove profile links that resolve to a recognized Mnemosyne target."""
+    _unlink_profile_links(
+        _recognized_profile_links(
+            hermes_home_path=hermes_home_path,
+            recognized_targets=recognized_targets,
+        )
+    )
+
+
+def _unlink_profile_links_or_restore_preference(
+    links: list[_ProfileLinkSnapshot],
+    preference_path: Path,
+    previous_preference: bytes | None,
+) -> None:
+    """Fail root-only cleanup and restore its preference when link removal fails."""
+    try:
+        _unlink_profile_links(links)
+    except OSError:
+        try:
+            _restore_profile_links_preference(preference_path, previous_preference)
+        except OSError:
+            print(
+                f"⚠ Profile-link preference rollback failed; inspect: {preference_path}",
+                file=sys.stderr,
+            )
+        raise
 
 
 def _prepare_plugin_target(
@@ -1079,6 +1329,7 @@ def install_plugin(
     mode: str = "symlink",
     python: str | Path | None = None,
     migrate_wrapper_to_symlink: bool = False,
+    link_profiles: bool = True,
 ) -> Path:
     """Install the Mnemosyne provider into Hermes' user plugin directory.
 
@@ -1086,6 +1337,9 @@ def install_plugin(
     creates a real persistent plugin directory containing a tiny shim that
     activates the selected interpreter's site-packages (including editable
     install ``.pth`` files) and imports ``mnemosyne_hermes`` from there.
+    ``link_profiles`` preserves the historical
+    opted-in profile fan-out by default; set it False to install only at the
+    selected Hermes home.
     """
     if mode not in {"symlink", "wrapper"}:
         raise ValueError("mode must be 'symlink' or 'wrapper'")
@@ -1109,15 +1363,63 @@ def install_plugin(
             "Re-run with --migrate-wrapper-to-symlink --force to migrate intentionally."
         )
 
+    recognized_profile_targets = [source]
+    # Preserve a validated previous provider target before --force replaces it.
+    if _provider_init_is_mnemosyne(target / "__init__.py"):
+        try:
+            recognized_profile_targets.append(target.resolve())
+        except OSError:
+            pass
+        wrapper_metadata = _wrapper_metadata(target, target / "__init__.py")
+        if wrapper_metadata.error is None and wrapper_metadata.site_packages is not None:
+            recognized_profile_targets.append(
+                wrapper_metadata.site_packages / "mnemosyne_hermes"
+            )
+    profile_links_to_unlink = (
+        _recognized_profile_links(
+            hermes_home_path=hermes_home_path,
+            recognized_targets=tuple(recognized_profile_targets),
+        )
+        if not link_profiles
+        else []
+    )
+    preference_path = _profile_links_preference_path(hermes_home_path)
+    try:
+        previous_preference = preference_path.read_bytes()
+    except FileNotFoundError:
+        previous_preference = None
+        if profile_links_enabled(hermes_home_path=hermes_home_path):
+            # Preserve an effective legacy opt-in even if replacing the root
+            # target changes the no-file fallback before cleanup can fail.
+            previous_preference = b'{"link_profiles": true}\n'
+
     if mode == "symlink":
         if migrate_wrapper_to_symlink and _is_wrapper_plugin_target(target):
             print(
                 "  ⚠ Migrating existing Mnemosyne wrapper to a symlink; "
                 "the wrapper's selected Python will no longer be used."
             )
-        _prepare_plugin_target(base, target, force=force)
-        os.symlink(str(source), str(target))
-        _link_all_profiles(source, hermes_home_path=hermes_home_path, force=force)
+        _write_profile_links_preference(link_profiles, hermes_home_path=hermes_home_path)
+        try:
+            _prepare_plugin_target(base, target, force=force)
+            os.symlink(str(source), str(target))
+        except Exception:
+            try:
+                _restore_profile_links_preference(preference_path, previous_preference)
+            except OSError:
+                print(
+                    f"⚠ Profile-link preference rollback failed; inspect: {preference_path}",
+                    file=sys.stderr,
+                )
+            raise
+        if link_profiles:
+            _link_all_profiles(source, hermes_home_path=hermes_home_path, force=force)
+        else:
+            _unlink_profile_links_or_restore_preference(
+                profile_links_to_unlink,
+                preference_path,
+                previous_preference,
+            )
         return target
 
     # Validate and fully write the replacement before removing a working wrapper.
@@ -1127,13 +1429,33 @@ def install_plugin(
     target.parent.mkdir(parents=True, exist_ok=True)
     staging_parent = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
     staged = staging_parent / target.name
+    preference_written = False
     try:
         _write_wrapper_plugin(staged, python=wrapper_python, site_packages=site_packages)
+        _write_profile_links_preference(link_profiles, hermes_home_path=hermes_home_path)
+        preference_written = True
         _prepare_plugin_target(base, target, force=force, remove_target=False)
         _replace_plugin_target_with_staged(target, staged)
+    except Exception:
+        if preference_written:
+            try:
+                _restore_profile_links_preference(preference_path, previous_preference)
+            except OSError:
+                print(
+                    f"⚠ Profile-link preference rollback failed; inspect: {preference_path}",
+                    file=sys.stderr,
+                )
+        raise
     finally:
         shutil.rmtree(staging_parent, ignore_errors=True)
-    _link_all_profiles(target, hermes_home_path=hermes_home_path, force=force)
+    if link_profiles:
+        _link_all_profiles(target, hermes_home_path=hermes_home_path, force=force)
+    else:
+        _unlink_profile_links_or_restore_preference(
+            profile_links_to_unlink,
+            preference_path,
+            previous_preference,
+        )
     return target
 
 
@@ -1148,6 +1470,7 @@ def uninstall_plugin(*, hermes_home_path: str | Path | None = None) -> Path:
         target.unlink()
     elif target.exists():
         shutil.rmtree(target)
+    _profile_links_preference_path(hermes_home_path).unlink(missing_ok=True)
     return target
 
 
@@ -1213,6 +1536,14 @@ def cleanup_plugin(
                         actions.append("Reset config: memory.provider from 'mnemosyne' to unset")
         except Exception:
             pass
+
+    preference_path = _profile_links_preference_path(hermes_home_path)
+    if preference_path.exists():
+        if dry_run:
+            actions.append(f"Would remove: {preference_path}")
+        else:
+            preference_path.unlink()
+            actions.append(f"Removed: {preference_path}")
 
     return actions
 
@@ -1324,6 +1655,13 @@ def _parser() -> argparse.ArgumentParser:
             "wrapper with the default symlink install."
         ),
     )
+    install.add_argument(
+        "--no-profile-links",
+        dest="link_profiles",
+        action="store_false",
+        default=True,
+        help="Install only at the selected Hermes home; do not link opted-in child profiles.",
+    )
     subparsers.add_parser(
         "uninstall",
         help="Remove Mnemosyne from Hermes' memory provider plugin directory.",
@@ -1362,6 +1700,7 @@ def run_install(
     mode: str = "symlink",
     python: str | Path | None = None,
     migrate_wrapper_to_symlink: bool = False,
+    link_profiles: bool = True,
 ) -> int:
     """Core install logic — check deps, bootstrap Hermes venv if needed, create symlink.
 
@@ -1412,6 +1751,7 @@ def run_install(
         mode=mode,
         python=python,
         migrate_wrapper_to_symlink=migrate_wrapper_to_symlink,
+        link_profiles=link_profiles,
     )
     skill_result = install_bundled_skill(
         hermes_home_path=hermes_home_path,
@@ -1473,6 +1813,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  Hermes Python: {hermes_python or 'not found'}")
                 print(f"  Currently installed: {'yes' if is_installed(hermes_home_path=args.hermes_home) else 'no'}")
                 print(f"  Install mode: {getattr(args, 'mode', 'symlink')}")
+                print(f"  Will link opted-in profiles: {bool(getattr(args, 'link_profiles', True))}")
                 print(f"  Skill target file: {skill.target}")
                 print(f"  Skill state: {skill.status}")
                 print(f"  Skill action: {skill_plan.message}")
@@ -1505,6 +1846,7 @@ def main(argv: list[str] | None = None) -> int:
                 mode=getattr(args, "mode", "symlink"),
                 python=getattr(args, "python", None),
                 migrate_wrapper_to_symlink=getattr(args, "migrate_wrapper_to_symlink", False),
+                link_profiles=getattr(args, "link_profiles", True),
             )
 
         if command == "uninstall":

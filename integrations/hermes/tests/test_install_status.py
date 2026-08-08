@@ -109,6 +109,36 @@ def test_install_dry_run_reports_skill_action_without_writing(tmp_path, capsys, 
     assert not install.skill_target_file(tmp_path).exists()
 
 
+def test_install_dry_run_reports_when_profile_links_are_disabled(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(install, "_find_hermes_python", lambda: None)
+
+    rc = install.main(
+        ["--hermes-home", str(tmp_path), "install", "--no-profile-links", "--dry-run"]
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Will link opted-in profiles: False" in out
+
+
+def test_install_cli_passes_no_profile_links_to_installer(tmp_path, monkeypatch):
+    received = {}
+
+    def fake_run_install(**kwargs):
+        received.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(install, "run_install", fake_run_install)
+
+    rc = install.main(
+        ["--hermes-home", str(tmp_path), "install", "--no-profile-links"]
+    )
+
+    assert rc == 0
+    assert received["hermes_home_path"] == str(tmp_path)
+    assert received["link_profiles"] is False
+
+
 def test_status_reports_skill_state(tmp_path, capsys, monkeypatch):
     target = tmp_path / "plugins" / "mnemosyne"
     target.mkdir(parents=True)
