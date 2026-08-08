@@ -34,6 +34,10 @@ provides_tools:
   - mnemosyne_persona_list
   - mnemosyne_persona_reinforce
   - mnemosyne_triple_end
+  - mnemosyne_shared_remember
+  - mnemosyne_shared_recall
+  - mnemosyne_shared_forget
+  - mnemosyne_shared_stats
 provides_hooks:
   - pre_llm_call
   - on_session_start
