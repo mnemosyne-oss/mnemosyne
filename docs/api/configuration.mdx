@@ -2,7 +2,7 @@
 title: "Configuration"
 version: 3.16.0
 config_key_count: 106
-env_only_count: 44
+env_only_count: 45
 generated_at: "auto"
 ---
 
@@ -24,7 +24,7 @@ Keys marked **restart** are read once at startup. Changing them at runtime warns
 and does not take effect until the process restarts.
 
 There are **106 configuration keys**. A further
-**44 environment variables** are read directly from the
+**45 environment variables** are read directly from the
 environment and are **not** settable in `config.yaml`; they are listed separately below.
 
 ---
@@ -168,7 +168,7 @@ This list is derived by scanning the package for `os.environ.get("MNEMOSYNE_..."
 
 ---
 
-## Environment-only variables (44)
+## Environment-only variables (45)
 
 These are read with `os.environ` at their point of use and bypass
 `MnemosyneConfig` entirely. They cannot be set in `config.yaml`.
