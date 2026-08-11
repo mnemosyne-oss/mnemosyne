@@ -325,13 +325,13 @@ def resolve_consolidation_tier(tier: Optional[int] = None) -> int:
     values fall back to the default. Result is clamped to {1, 2, 3}, the tiers
     `degrade_episodic()` and the recall weight map understand.
     """
-    if tier is None:
-        try:
-            tier = int(os.environ.get(
-                "MNEMOSYNE_CONSOLIDATION_TIER", str(DEFAULT_CONSOLIDATION_TIER)))
-        except (TypeError, ValueError):
-            tier = DEFAULT_CONSOLIDATION_TIER
-    return min(3, max(1, int(tier)))
+    raw = tier if tier is not None else os.environ.get(
+        "MNEMOSYNE_CONSOLIDATION_TIER", str(DEFAULT_CONSOLIDATION_TIER))
+    try:
+        resolved = int(raw)
+    except (TypeError, ValueError):
+        resolved = DEFAULT_CONSOLIDATION_TIER
+    return min(3, max(1, resolved))
 
 
 def cap_proposal_importance(confidence, cap: Optional[float] = None) -> float:
@@ -352,14 +352,13 @@ def cap_proposal_importance(confidence, cap: Optional[float] = None) -> float:
     clamped to [0, 1] -- recall scoring and the injection gate assume
     importance sits in that range.
     """
-    if cap is None:
-        try:
-            cap = float(os.environ.get(
-                "MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP",
-                str(DEFAULT_PROPOSAL_IMPORTANCE_CAP)))
-        except (TypeError, ValueError):
-            cap = DEFAULT_PROPOSAL_IMPORTANCE_CAP
-    cap = float(cap)
+    raw_cap = cap if cap is not None else os.environ.get(
+        "MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP",
+        str(DEFAULT_PROPOSAL_IMPORTANCE_CAP))
+    try:
+        cap = float(raw_cap)
+    except (TypeError, ValueError, OverflowError):
+        cap = DEFAULT_PROPOSAL_IMPORTANCE_CAP
     if not math.isfinite(cap):
         cap = DEFAULT_PROPOSAL_IMPORTANCE_CAP
     cap = min(1.0, max(0.0, cap))

@@ -102,6 +102,13 @@ class TestConsolidationTier:
         monkeypatch.setenv("MNEMOSYNE_CONSOLIDATION_TIER", "2")  # must be ignored
         assert resolve_consolidation_tier(given) == expected
 
+    @pytest.mark.parametrize("bad_tier", ["not-a-number", "", "2.5", object()])
+    def test_invalid_explicit_tier_falls_back_to_default(self, monkeypatch, bad_tier):
+        """An unparseable EXPLICIT tier must fall back to the documented
+        default, not raise out of the consolidation path."""
+        monkeypatch.delenv("MNEMOSYNE_CONSOLIDATION_TIER", raising=False)
+        assert resolve_consolidation_tier(bad_tier) == 3
+
     def test_default_tier_is_3(self, temp_db, monkeypatch):
         monkeypatch.delenv("MNEMOSYNE_CONSOLIDATION_TIER", raising=False)
         beam = BeamMemory(db_path=str(temp_db), session_id="t506")
@@ -256,6 +263,14 @@ class TestProposalImportanceCap:
     def test_non_finite_explicit_cap_argument_falls_back(self, monkeypatch, bad_cap):
         monkeypatch.delenv("MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP", raising=False)
         assert cap_proposal_importance(0.95, cap=bad_cap) == 0.5
+
+    @pytest.mark.parametrize("bad_cap", ["not-a-number", "", object()])
+    def test_invalid_explicit_cap_argument_falls_back(self, monkeypatch, bad_cap):
+        """An unparseable EXPLICIT cap must fall back to the documented
+        default cap, not raise out of proposal ingestion."""
+        monkeypatch.delenv("MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP", raising=False)
+        assert cap_proposal_importance(0.95, cap=bad_cap) == 0.5
+        assert cap_proposal_importance(0.3, cap=bad_cap) == 0.3
 
     @pytest.mark.parametrize("bad_conf", [float("nan"), float("inf"), float("-inf")])
     def test_non_finite_confidence_falls_back_to_default(self, monkeypatch, bad_conf):
