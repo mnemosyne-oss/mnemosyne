@@ -109,6 +109,19 @@ class TestConsolidationTier:
         monkeypatch.delenv("MNEMOSYNE_CONSOLIDATION_TIER", raising=False)
         assert resolve_consolidation_tier(bad_tier) == 3
 
+    @pytest.mark.parametrize("odd_tier,expected", [
+        (float("inf"), 3),    # int(inf) raises OverflowError -> default
+        (float("-inf"), 3),   # same
+        (float("nan"), 3),    # int(nan) raises ValueError -> default
+        (10**1000, 3),        # huge int converts fine, clamps to 3
+        (-10**1000, 1),       # clamps to 1
+    ])
+    def test_extreme_explicit_tier_values(self, monkeypatch, odd_tier, expected):
+        """Non-finite floats must fall back (int() raises on them); huge
+        finite ints just clamp."""
+        monkeypatch.delenv("MNEMOSYNE_CONSOLIDATION_TIER", raising=False)
+        assert resolve_consolidation_tier(odd_tier) == expected
+
     def test_default_tier_is_3(self, temp_db, monkeypatch):
         monkeypatch.delenv("MNEMOSYNE_CONSOLIDATION_TIER", raising=False)
         beam = BeamMemory(db_path=str(temp_db), session_id="t506")
@@ -271,6 +284,29 @@ class TestProposalImportanceCap:
         monkeypatch.delenv("MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP", raising=False)
         assert cap_proposal_importance(0.95, cap=bad_cap) == 0.5
         assert cap_proposal_importance(0.3, cap=bad_cap) == 0.3
+
+    def test_overflowing_cap_argument_falls_back(self, monkeypatch):
+        """float() on an int too large for a double raises OverflowError,
+        which must hit the documented fallback rather than propagate."""
+        monkeypatch.delenv("MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP", raising=False)
+        assert cap_proposal_importance(0.95, cap=10**1000) == 0.5
+
+    def test_overflowing_confidence_falls_back(self, monkeypatch):
+        monkeypatch.delenv("MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP", raising=False)
+        assert cap_proposal_importance(10**1000) == 0.5
+
+    @pytest.mark.parametrize("conf,expected", [
+        (1.7, 0.5),    # above [0,1]: pinned by the default cap
+        (-0.3, 0.0),   # below [0,1]: clamped to the floor
+        ("9" * 400, 0.5),  # float(str) yields inf -> non-finite fallback 0.5
+    ])
+    def test_out_of_range_confidence_is_clamped(self, monkeypatch, conf, expected):
+        """Confidence outside [0,1] must land inside [0,1] after cap+clamp —
+        recall scoring and the injection gate assume that range."""
+        monkeypatch.delenv("MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP", raising=False)
+        result = cap_proposal_importance(conf)
+        assert result == expected
+        assert 0.0 <= result <= 1.0
 
     @pytest.mark.parametrize("bad_conf", [float("nan"), float("inf"), float("-inf")])
     def test_non_finite_confidence_falls_back_to_default(self, monkeypatch, bad_conf):

@@ -329,7 +329,9 @@ def resolve_consolidation_tier(tier: Optional[int] = None) -> int:
         "MNEMOSYNE_CONSOLIDATION_TIER", str(DEFAULT_CONSOLIDATION_TIER))
     try:
         resolved = int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: int(float("inf")) raises rather than returning
+        # a large int, unlike int() on huge-but-finite floats.
         resolved = DEFAULT_CONSOLIDATION_TIER
     return min(3, max(1, resolved))
 
@@ -364,7 +366,9 @@ def cap_proposal_importance(confidence, cap: Optional[float] = None) -> float:
     cap = min(1.0, max(0.0, cap))
     try:
         raw = float(confidence) if confidence is not None else 0.5
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: float() on an int too large for a double raises
+        # rather than returning inf.
         raw = 0.5
     if not math.isfinite(raw):
         # Same failure mode as the cap: NaN survives min/max clamping
