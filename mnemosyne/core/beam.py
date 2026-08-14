@@ -2932,21 +2932,50 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
     # can't resolve the parameter value. We inline k safely since it's
     # always an integer computed internally.
     k = int(k)
-    if vec_type == "bit":
-        rows = conn.execute(
-            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_binary(?) AND k={k} ORDER BY distance",
-            (emb_json,)
-        ).fetchall()
-    elif vec_type == "int8":
-        rows = conn.execute(
-            f'SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_int8(?, "unit") AND k={k} ORDER BY distance',
-            (emb_json,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH ? AND k={k} ORDER BY distance",
-            (emb_json,)
-        ).fetchall()
+    try:
+        if vec_type == "bit":
+            rows = conn.execute(
+                f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_binary(?) AND k={k} ORDER BY distance",
+                (emb_json,)
+            ).fetchall()
+        elif vec_type == "int8":
+            rows = conn.execute(
+                f'SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_int8(?, "unit") AND k={k} ORDER BY distance',
+                (emb_json,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH ? AND k={k} ORDER BY distance",
+                (emb_json,)
+            ).fetchall()
+    except sqlite3.OperationalError as exc:
+        # Degrade, don't crash: the write path already drops mismatched
+        # vectors with a warning and the working-memory KNN
+        # (_wm_vec_search_sqlite) returns [] on the same condition; this is
+        # the episodic voice's equivalent. Most often the query embedding's
+        # dimension disagrees with the table's because the process resolved a
+        # different EMBEDDING_DIM than the one that dimensioned the store --
+        # recall falls back to the non-vector voices for this call instead of
+        # taking down the agent process. _dim_mismatch_message() carries the
+        # self-heal guidance; keep this pointer short and point at it.
+        try:
+            existing_dim = _existing_vec_dim(conn)
+        except Exception:
+            existing_dim = None
+        if existing_dim is not None and existing_dim != EMBEDDING_DIM:
+            logger.error(
+                "Dimension mismatch querying vec_episodes (query configured "
+                "%s-dim, table is %s-dim); vector recall disabled for this "
+                "call, falling back to other recall voices. %s",
+                EMBEDDING_DIM, existing_dim,
+                _dim_mismatch_message(existing_dim, EMBEDDING_DIM),
+            )
+        else:
+            logger.warning(
+                "vec_episodes query failed (%s): %s; vector recall disabled "
+                "for this call.", type(exc).__name__, exc,
+            )
+        return []
     return [{"rowid": r["rowid"], "distance": r["distance"]} for r in rows]
 
 
