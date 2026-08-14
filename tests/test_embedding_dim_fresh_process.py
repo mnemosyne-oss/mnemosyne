@@ -31,12 +31,20 @@ INTEGRATION_SRC = PROJECT_ROOT / "integrations" / "hermes" / "src"
 _ERROR_MARKERS = ("Unknown embedding model", "MNEMOSYNE_EMBEDDING_DIM")
 
 
-def _run_fresh(code: str, tmp_path: Path, *, pythonpath: str | None = None, **env_overrides: str):
+def _run_fresh(
+    code: str,
+    tmp_path: Path,
+    *,
+    pythonpath: str | None = None,
+    timeout: float = 120.0,
+    **env_overrides: str,
+):
     """Run ``code`` in a fresh interpreter with an isolated data dir.
 
     ``MNEMOSYNE_EMBEDDING_DIM`` is removed so the unknown-model path is
     exercised (no explicit override). The data dir points under ``tmp_path``
-    so we can assert no database was written.
+    so we can assert no database was written. ``timeout`` bounds the child so
+    a hung interpreter fails the test instead of stalling the run.
     """
     env = os.environ.copy()
     env["MNEMOSYNE_DATA_DIR"] = str(tmp_path / "data")
@@ -57,6 +65,7 @@ def _run_fresh(code: str, tmp_path: Path, *, pythonpath: str | None = None, **en
         capture_output=True,
         env=env,
         check=False,
+        timeout=timeout,
     )
 
 
@@ -147,12 +156,13 @@ def _fake_endpoint_code(dim: int) -> str:
         import threading
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
-        REQUESTS = {{"n": 0}}
+        REQUESTS = {{"n": 0, "log": []}}
 
         class _FakeEmbeddings(BaseHTTPRequestHandler):
             # OpenAI-compatible /embeddings endpoint serving {dim}-dim vectors only.
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                REQUESTS["log"].append({{"model": body.get("model"), "input": body["input"]}})
                 n = len(body["input"])
                 payload = json.dumps({{
                     "data": [{{"embedding": [0.01] * {dim}, "index": i}} for i in range(n)]
@@ -176,8 +186,12 @@ def _fake_endpoint_code(dim: int) -> str:
         beam.init_beam()
         remember("dimension end to end probe", source="e2e-dim")
         print("REQUESTS", REQUESTS["n"])  # before recall: survives a recall crash
+        print("WRITE_MODEL", REQUESTS["log"][0]["model"])
+        print("WRITE_INPUT", json.dumps(REQUESTS["log"][0]["input"]))
         results = recall("dimension end to end probe", top_k=3)
         print("REQUESTS_TOTAL", REQUESTS["n"])
+        print("QUERY_MODEL", REQUESTS["log"][-1]["model"])
+        print("QUERY_INPUT", REQUESTS["log"][-1]["input"][0])
         print("RECALL", len(results))
         if beam._SQLITE_VEC_AVAILABLE:
             import sqlite_vec
@@ -218,6 +232,15 @@ def test_unknown_model_with_explicit_dim_boots_end_to_end(tmp_path):
     # query; the write-side REQUESTS marker is also checked below).
     assert int(re.search(r"REQUESTS_TOTAL (\d+)", out).group(1)) >= 2, out + result.stderr
     assert int(re.search(r"REQUESTS (\d+)", out).group(1)) >= 1, out + result.stderr
+    # Both calls asked the endpoint for the configured model, and the write
+    # side carried the remembered content (the query side carries the query,
+    # possibly prefixed by the model's query prefix).
+    assert re.search(r"^WRITE_MODEL mixedbread-ai/mxbai-embed-large-v1$", out, re.M), out
+    assert re.search(r"^QUERY_MODEL mixedbread-ai/mxbai-embed-large-v1$", out, re.M), out
+    write_input = re.search(r"^WRITE_INPUT (.+)$", out, re.M)
+    assert write_input and "dimension end to end probe" in write_input.group(1), out
+    query_input = re.search(r"^QUERY_INPUT (.+)$", out, re.M)
+    assert query_input and "dimension end to end probe" in query_input.group(1), out
     # Recall returned the probe.
     assert re.search(r"RECALL [1-9]", out), out + result.stderr
     # The vec0 tables must carry the explicit dimension, not a guessed 384,
@@ -229,11 +252,10 @@ def test_unknown_model_with_explicit_dim_boots_end_to_end(tmp_path):
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
         dims = {
-            table: int(re.search(r"\[(\d+)\]", sql).group(1))
-            for (sql,) in conn.execute(
-                "SELECT sql FROM sqlite_master WHERE tbl_name IN ('vec_episodes','vec_working')"
+            name: int(re.search(r"\[(\d+)\]", sql).group(1))
+            for name, sql in conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('vec_episodes','vec_working')"
             )
-            for table in (re.search(r"vec_\w+", sql).group(0),)
         }
         assert dims == {"vec_episodes": 1024, "vec_working": 1024}, dims
         vec_rows = conn.execute("SELECT COUNT(*) FROM vec_working").fetchone()[0]
@@ -251,19 +273,24 @@ def test_endpoint_serving_wrong_dim_leaves_vec_store_empty(tmp_path):
     surfaces as a non-zero exit: sqlite-vec rejects the 384-dim query against
     the 1024-dim table and the recall path does not swallow that error. Both
     outcomes are pinned so neither regresses silently."""
+    # Skip before launching the child: without sqlite-vec there is no vec0
+    # table, the mismatched query degrades instead of raising, and this
+    # scenario's premise (a 1024-dim table to mismatch against) is absent.
+    sqlite_vec = pytest.importorskip("sqlite_vec")  # noqa: F841
     result = _run_fresh(
         _fake_endpoint_code(384),
         tmp_path,
         MNEMOSYNE_EMBEDDING_MODEL="mixedbread-ai/mxbai-embed-large-v1",
         MNEMOSYNE_EMBEDDING_DIM="1024",
     )
-    # The endpoint was consulted for the write before the query failed.
-    assert int(re.search(r"REQUESTS (\d+)", result.stdout).group(1)) >= 1, result.stdout + result.stderr
     # Query-side mismatch is loud: recall with a 384-dim query against the
     # 1024-dim vec0 table raises (documented current behavior, pinned here).
+    # Assert the exit first so a quiet failure surfaces stderr, not a regex
+    # miss on markers that a crash before their print would cause.
     assert result.returncode != 0, "mismatched-dim query unexpectedly succeeded:\n" + result.stdout
-    assert "Dimension mismatch" in result.stderr, result.stderr
-    sqlite_vec = pytest.importorskip("sqlite_vec")  # noqa: F841
+    assert re.search(r"dimension mismatch", result.stderr, re.I), result.stderr
+    # The endpoint was consulted for the write before the query failed.
+    assert int(re.search(r"REQUESTS (\d+)", result.stdout).group(1)) >= 1, result.stdout + result.stderr
     conn = sqlite3.connect(tmp_path / "data" / "mnemosyne.db")
     try:
         conn.enable_load_extension(True)
