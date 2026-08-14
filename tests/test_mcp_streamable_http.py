@@ -231,6 +231,51 @@ class TestStreamableHttpBearerRejection:
         resp = TestClient(authed_app).post("/mcp", json={})
         assert resp.headers.get("www-authenticate") == "Bearer"
 
+    def test_valid_bearer_completes_initialize_and_tools_list(self, authed_app):
+        """A valid bearer completes MCP operations behind the middleware.
+
+        Drives the full token-gated non-loopback app through an initialize
+        handshake and a tools/list call, asserting JSON-RPC success plus the
+        operation result. The rejection tests above are the isolation control
+        proving the middleware is what blocks unauthorized requests.
+        """
+        from starlette.testclient import TestClient
+
+        headers = {
+            "Authorization": "Bearer supersecret",
+            "Accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": "2025-03-26",
+        }
+        # One lifespan per app instance: the session manager's run() can only
+        # be entered once, so the handshake and the follow-up share the block.
+        with TestClient(authed_app, base_url="http://localhost:8080") as client:
+            init = client.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "initialize",
+                    "id": 1,
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {"name": "e2e", "version": "0"},
+                    },
+                },
+                headers=headers,
+            )
+            assert init.status_code == 200
+            session_id = init.headers.get("mcp-session-id")
+            assert session_id, "initialize must mint a session id"
+            assert "serverInfo" in init.text
+
+            listed = client.post(
+                "/mcp",
+                json={"jsonrpc": "2.0", "method": "tools/list", "id": 2},
+                headers={**headers, "Mcp-Session-Id": session_id},
+            )
+        assert listed.status_code == 200
+        assert "tools" in listed.text
+
     def _drive_middleware(self, header_value: bytes):
         """Run the bearer middleware directly against a stub downstream app.
 

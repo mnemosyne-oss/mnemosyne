@@ -9,7 +9,8 @@ Usage:
     mnemosyne mcp --transport sse --port 8080
 
     # Streamable HTTP on loopback -- native MCP http transport, single
-    # POST /mcp endpoint (no separate /messages route to proxy)
+    # configurable endpoint (default /mcp) handling GET/POST/DELETE
+    # (no separate /messages route to proxy)
     mnemosyne mcp --transport streamable-http --port 8080
 
     # SSE or Streamable HTTP exposed on LAN -- REQUIRES bearer token
