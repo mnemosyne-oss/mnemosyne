@@ -128,10 +128,22 @@ class _BearerTokenMiddleware:
     """
 
     def __init__(self, app, token: str):
+        """Wrap ``app`` and require ``token`` as the bearer credential.
+
+        The token is stored as bytes so presented credentials can be
+        compared safely with ``hmac.compare_digest`` (which raises on
+        non-ASCII str, turning a bad request into a 500).
+        """
         self.app = app
         self.expected = token.encode("utf-8")
 
     async def __call__(self, scope, receive, send):
+        """Enforce bearer auth on HTTP requests, passing non-HTTP scope through.
+
+        Missing, non-Bearer, or mismatched credentials yield HTTP 401 with a
+        ``WWW-Authenticate: Bearer`` challenge; valid credentials are
+        forwarded to the wrapped app untouched.
+        """
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
