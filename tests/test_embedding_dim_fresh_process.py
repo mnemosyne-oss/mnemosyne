@@ -15,6 +15,8 @@ actionable configuration failure for an unknown model with no explicit
 from __future__ import annotations
 
 import os
+import re
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -131,7 +133,41 @@ def test_unknown_model_parity_across_surfaces(tmp_path, code, pythonpath, fail_f
         assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("blank", ["", "  "], ids=["empty", "whitespace"])
+def test_unknown_model_with_explicit_dim_boots_end_to_end(tmp_path):
+    """The success half of the #521 contract, at process scope: an unknown model
+    plus an explicit positive MNEMOSYNE_EMBEDDING_DIM boots cleanly through
+    init_beam() and bakes the explicit dimension into the vec0 tables.
+
+    This is the mxbai-via-custom-endpoint production scenario: the fail-loud
+    resolver exists so this path carries the operator's dimension, not a guess.
+    The boot assertions always run; the vec0-dimension check runs only where
+    sqlite-vec is installed (the repo's importorskip convention) because the
+    tables are not created without it."""
+    result = _run_fresh(
+        "from mnemosyne.core import beam; beam.init_beam()",
+        tmp_path,
+        MNEMOSYNE_EMBEDDING_MODEL="mixedbread-ai/mxbai-embed-large-v1",
+        MNEMOSYNE_EMBEDDING_DIM="1024",
+    )
+    assert result.returncode == 0, result.stderr
+    # The vec0 tables must carry the explicit dimension, not a guessed 384.
+    # sqlite_master needs no extension load to read the stored DDL.
+    sqlite_vec = pytest.importorskip("sqlite_vec")  # noqa: F841
+    conn = sqlite3.connect(tmp_path / "data" / "mnemosyne.db")
+    try:
+        dims = {
+            table: int(re.search(r"\[(\d+)\]", sql).group(1))
+            for (sql,) in conn.execute(
+                "SELECT sql FROM sqlite_master WHERE tbl_name IN ('vec_episodes','vec_working')"
+            )
+            for table in (re.search(r"vec_\w+", sql).group(0),)
+        }
+        assert dims == {"vec_episodes": 1024, "vec_working": 1024}, dims
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("blank", ["", "  ", "\t"], ids=["empty", "whitespace", "tab"])
 def test_blank_embedding_model_env_falls_back_to_default(tmp_path, blank):
     """A blank (empty or whitespace-only) MNEMOSYNE_EMBEDDING_MODEL (routine in
     Docker Compose `- VAR=${X}` with X unset, and .env files) normalizes to the
@@ -139,9 +175,13 @@ def test_blank_embedding_model_env_falls_back_to_default(tmp_path, blank):
     that would be unknown and raise at import under the fail-loud rule. Mirrors
     the .strip() blank handling used for MNEMOSYNE_EMBEDDING_DIM."""
     result = _run_fresh(
-        "from mnemosyne.core import beam; print(beam.EMBEDDING_DIM)",
+        "from mnemosyne.core import beam, embeddings; "
+        "print(embeddings._DEFAULT_MODEL, beam.EMBEDDING_DIM)",
         tmp_path,
         MNEMOSYNE_EMBEDDING_MODEL=blank,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "384", result.stderr
+    # Assert the default model too, not just its 384 dimension, so a hard-coded
+    # fallback dim with a different default model cannot pass (CodeRabbit, #521).
+    # Resolved in the subprocess: the parent's env is not under test here.
+    assert result.stdout.strip() == "BAAI/bge-small-en-v1.5 384", result.stdout

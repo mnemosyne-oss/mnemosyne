@@ -15,6 +15,8 @@ Mnemosyne is designed as a native memory backend for the [Hermes Agent Framework
 
 > **Fail-loud is surface-specific.** With an unknown embedding model and no `MNEMOSYNE_EMBEDDING_DIM`, a **direct core or MCP-provider** process imports `embeddings` eagerly and exits at import with an actionable error. The **`mnemosyne-hermes` wrapper** imports core lazily and captures init failures, so the provider reports unavailable and affected tools return an error reason instead of the agent process exiting.
 
+> **Privacy note on remote embedding endpoints.** `MNEMOSYNE_EMBEDDING_API_URL` sends the text of your memories (working-memory content, summaries, annotations) to that endpoint for vectorization. For privacy-sensitive or local-first deployments prefer a local-embedding profile (`[embeddings]` or `[all]`); use a remote endpoint only when you accept that the embedding provider sees your content.
+
 **Hardware guidance:** Core alone runs on a Raspberry Pi 4 (4 GB) with ~300 MB free for LLM, but it is not a valid `mnemosyne-hermes` wrapper profile. `[embeddings]` needs at least 2 GB free RAM. `[all]` recommends 8 GB+.
 
 ## Setup
