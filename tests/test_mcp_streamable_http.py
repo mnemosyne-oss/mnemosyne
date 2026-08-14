@@ -12,6 +12,7 @@ Run with: pytest tests/test_mcp_streamable_http.py -v
 """
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -49,6 +50,12 @@ class TestResolveHttpAuth:
         require_auth, token = _resolve_http_auth("localhost")
         assert require_auth is False
         assert token is None
+
+    def test_ipv6_loopback_skips_auth(self, monkeypatch):
+        """::1 is loopback too: no token, no auth required."""
+        monkeypatch.delenv("MNEMOSYNE_MCP_TOKEN", raising=False)
+        from mnemosyne.mcp_server import _resolve_http_auth
+        assert _resolve_http_auth("::1") == (False, None)
 
     def test_non_loopback_without_token_raises(self, monkeypatch):
         """0.0.0.0 with no token must refuse to start. The error message
@@ -117,14 +124,11 @@ class TestBuildStreamableHttpApp:
     def test_loopback_app_has_no_auth_middleware(self, monkeypatch):
         """Loopback bind: app should not carry the bearer middleware."""
         monkeypatch.delenv("MNEMOSYNE_MCP_TOKEN", raising=False)
-        from mnemosyne.mcp_server import _build_streamable_http_app
+        from mnemosyne.mcp_server import _BearerTokenMiddleware, _build_streamable_http_app
         app = _build_streamable_http_app(host="127.0.0.1")
-        names = [
-            type(m.cls).__name__ if hasattr(m, "cls") else str(m)
-            for m in app.user_middleware
-        ]
-        assert not any("Bearer" in n for n in names), (
-            f"loopback app should not have bearer middleware, got: {names}"
+        middleware_classes = [m.cls for m in app.user_middleware]
+        assert not any(c is _BearerTokenMiddleware for c in middleware_classes), (
+            "loopback app should not install bearer middleware"
         )
 
     def test_non_loopback_without_token_raises(self, monkeypatch):
@@ -226,6 +230,54 @@ class TestStreamableHttpBearerRejection:
         from starlette.testclient import TestClient
         resp = TestClient(authed_app).post("/mcp", json={})
         assert resp.headers.get("www-authenticate") == "Bearer"
+
+    def _drive_middleware(self, header_value: bytes):
+        """Run the bearer middleware directly against a stub downstream app.
+
+        Driving the ASGI callable directly keeps positive/negative credential
+        coverage deterministic (no HTTP client header-encoding in the way).
+        """
+        from mnemosyne.mcp_server import _BearerTokenMiddleware
+
+        async def _run():
+            reached = {"ok": False}
+
+            async def downstream(scope, receive, send):
+                reached["ok"] = True
+
+            async def receive():
+                return {}
+
+            responses = []
+
+            async def send(message):
+                responses.append(message)
+
+            middleware = _BearerTokenMiddleware(downstream, token="supersecret")
+            scope = {"type": "http", "headers": [(b"authorization", header_value)]}
+            await middleware(scope, receive, send)
+            return reached, responses
+
+        return asyncio.run(_run())
+
+    def test_valid_credential_is_forwarded(self):
+        """The correct credential is not rejected."""
+        reached, responses = self._drive_middleware(b"Bearer supersecret")
+        assert reached["ok"] is True
+        assert responses == []
+
+    def test_lowercase_bearer_scheme_accepted(self):
+        """RFC 6750 auth-scheme tokens are case-insensitive."""
+        reached, responses = self._drive_middleware(b"bearer supersecret")
+        assert reached["ok"] is True
+        assert responses == []
+
+    def test_non_ascii_credential_returns_401(self):
+        """A non-ASCII credential yields 401, not a 500 from compare_digest."""
+        reached, responses = self._drive_middleware(b"Bearer \xff")
+        assert reached["ok"] is False
+        start = next(m for m in responses if m["type"] == "http.response.start")
+        assert start["status"] == 401
 
 
 # ---------------------------------------------------------------------------

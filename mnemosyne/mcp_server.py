@@ -129,18 +129,18 @@ class _BearerTokenMiddleware:
 
     def __init__(self, app, token: str):
         self.app = app
-        self.expected = token
+        self.expected = token.encode("utf-8")
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
-        header = ""
+        header = None
         for k, v in scope.get("headers", []):
             if k == b"authorization":
-                header = v.decode("latin-1")
+                header = v
                 break
-        if not header.startswith("Bearer "):
+        if header is None:
             resp = JSONResponse(
                 {"error": "missing bearer token"},
                 status_code=401,
@@ -148,8 +148,21 @@ class _BearerTokenMiddleware:
             )
             await resp(scope, receive, send)
             return
-        presented = header[len("Bearer "):].strip()
-        if not hmac.compare_digest(presented, self.expected):
+        # Work in bytes end-to-end: hmac.compare_digest raises TypeError on
+        # non-ASCII str, so a credential like ``Bearer \xff`` would otherwise
+        # turn into a 500. The scheme is matched case-insensitively per RFC
+        # 6750 (the auth-scheme token is case-insensitive).
+        scheme, _, presented = header.partition(b" ")
+        if scheme.lower() != b"bearer":
+            resp = JSONResponse(
+                {"error": "missing bearer token"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await resp(scope, receive, send)
+            return
+        presented = presented.strip()
+        if not presented or not hmac.compare_digest(presented, self.expected):
             resp = JSONResponse(
                 {"error": "invalid bearer token"},
                 status_code=401,

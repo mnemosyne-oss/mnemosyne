@@ -126,7 +126,7 @@ You should see `mnemosyne_remember` and `mnemosyne_recall` calls succeed.
 ## MCP vs. Provider Plugin
 
 Mnemosyne ships an MCP server (`mnemosyne mcp`, stdio + SSE + Streamable HTTP
-transports) that exposes **35 tools** — usable with any MCP-compatible client
+transports) that exposes **29 tools** — usable with any MCP-compatible client
 (Claude Desktop, etc.):
 
 ```bash

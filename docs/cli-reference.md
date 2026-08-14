@@ -94,7 +94,7 @@ The built-in help lists only `hygiene audit|clean`; `status` and `restore` exist
 
 | Command | Usage |
 |---|---|
-| `mcp` | `mcp [--transport stdio\|sse\|streamable-http] [--port 8080] [--path /mcp] [--json-response] [--bank NAME]`. Starts the MCP server |
+| `mcp` | `mcp [--transport stdio\|sse\|streamable-http\|http] [--host 127.0.0.1] [--port 8080] [--path /mcp] [--json-response] [--env-file FILE] [--bank NAME]`. Starts the MCP server |
 
 stdio is the default transport. `sse` and `streamable-http` are HTTP transports; a non-loopback bind requires `MNEMOSYNE_MCP_TOKEN`. `streamable-http` (alias `http`) is the native MCP Streamable HTTP transport: clients POST JSON-RPC straight to `--path` (default `/mcp`) with no separate `/messages` route to proxy. Add `--json-response` to force JSON-only responses instead of the default SSE-upgrade streaming.
 
