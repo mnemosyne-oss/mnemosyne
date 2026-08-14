@@ -161,6 +161,9 @@ def _fake_endpoint_code(dim: int) -> str:
         class _FakeEmbeddings(BaseHTTPRequestHandler):
             # OpenAI-compatible /embeddings endpoint serving {dim}-dim vectors only.
             def do_POST(self):
+                if self.path.rstrip("/") != "/v1/embeddings":
+                    self.send_error(404, f"unexpected route: {{self.path}}")
+                    return
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 REQUESTS["log"].append({{"model": body.get("model"), "input": body["input"]}})
                 n = len(body["input"])
@@ -193,6 +196,10 @@ def _fake_endpoint_code(dim: int) -> str:
         print("QUERY_MODEL", REQUESTS["log"][-1]["model"])
         print("QUERY_INPUT", REQUESTS["log"][-1]["input"][0])
         print("RECALL", len(results))
+        print("RECALL_CONTENT", json.dumps([
+            (r.get("content") if isinstance(r, dict) else getattr(r, "content", "")) or ""
+            for r in results
+        ]))
         if beam._SQLITE_VEC_AVAILABLE:
             import sqlite_vec
             conn = sqlite3.connect(beam._default_db_path())
@@ -243,6 +250,8 @@ def test_unknown_model_with_explicit_dim_boots_end_to_end(tmp_path):
     assert query_input and "dimension end to end probe" in query_input.group(1), out
     # Recall returned the probe.
     assert re.search(r"RECALL [1-9]", out), out + result.stderr
+    recall_content = re.search(r"^RECALL_CONTENT (.+)$", out, re.M)
+    assert recall_content and "dimension end to end probe" in recall_content.group(1), out
     # The vec0 tables must carry the explicit dimension, not a guessed 384,
     # and the stored vector must have landed in the 1024-dim table (not the
     # float-JSON fallback). sqlite_master needs no extension load to read DDL.
