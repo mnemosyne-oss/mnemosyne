@@ -125,13 +125,14 @@ You should see `mnemosyne_remember` and `mnemosyne_recall` calls succeed.
 
 ## MCP vs. Provider Plugin
 
-Mnemosyne ships an MCP server (`mnemosyne mcp`, stdio + SSE transports) that
-exposes **35 tools** — usable with any MCP-compatible client (Claude Desktop,
-etc.):
+Mnemosyne ships an MCP server (`mnemosyne mcp`, stdio + SSE + Streamable HTTP
+transports) that exposes **35 tools** — usable with any MCP-compatible client
+(Claude Desktop, etc.):
 
 ```bash
 mnemosyne mcp                              # stdio transport
 mnemosyne mcp --transport sse --port 8080  # SSE transport
+mnemosyne mcp --transport streamable-http --port 8080  # native MCP http transport
 ```
 
 **For Hermes, prefer the provider plugin over MCP.** The provider plugin

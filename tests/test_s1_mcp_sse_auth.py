@@ -112,7 +112,8 @@ class TestMainHostArg:
         with patch("mnemosyne.mcp_server.run_mcp_server") as runner:
             main(["--transport", "sse", "--port", "9000"])
         runner.assert_called_once_with(
-            transport="sse", port=9000, bank=None, host="127.0.0.1"
+            transport="sse", port=9000, bank=None, host="127.0.0.1",
+            path="/mcp", json_response=False,
         )
 
     def test_explicit_host_arg(self):
@@ -121,7 +122,8 @@ class TestMainHostArg:
         with patch("mnemosyne.mcp_server.run_mcp_server") as runner:
             main(["--transport", "sse", "--host", "0.0.0.0", "--port", "9001"])
         runner.assert_called_once_with(
-            transport="sse", port=9001, bank=None, host="0.0.0.0"
+            transport="sse", port=9001, bank=None, host="0.0.0.0",
+            path="/mcp", json_response=False,
         )
 
     def test_run_mcp_server_default_host_is_loopback(self):

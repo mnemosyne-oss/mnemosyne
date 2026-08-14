@@ -556,7 +556,7 @@ def _render_tool_schema(tools, version: str) -> str:
         "> Regenerate with `python3 scripts/generate-docs.py`.",
         "",
         f"Mnemosyne declares **{len(tools)} tools**. Of those, **{len(mcp)} are callable over MCP** "
-        f"(stdio and SSE), and **{len(plugin_only)} are implemented only in the Hermes provider** "
+        f"(stdio, SSE and Streamable HTTP), and **{len(plugin_only)} are implemented only in the Hermes provider** "
         "and are not reachable through the MCP server.",
         "",
         "The split is real and worth respecting: calling a plugin-only tool over MCP raises "

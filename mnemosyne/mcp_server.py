@@ -1,5 +1,5 @@
 """
-Mnemosyne MCP Server -- stdio and SSE transports.
+Mnemosyne MCP Server -- stdio, SSE and Streamable HTTP transports.
 
 Usage:
     # stdio (default) -- for Claude Desktop, etc.
@@ -8,15 +8,28 @@ Usage:
     # SSE on loopback -- safe default, no auth required
     mnemosyne mcp --transport sse --port 8080
 
-    # SSE exposed on LAN -- REQUIRES bearer token via env var
+    # Streamable HTTP on loopback -- native MCP http transport, single
+    # POST /mcp endpoint (no separate /messages route to proxy)
+    mnemosyne mcp --transport streamable-http --port 8080
+
+    # SSE or Streamable HTTP exposed on LAN -- REQUIRES bearer token
+    # via env var
     MNEMOSYNE_MCP_TOKEN=my-secret-token mnemosyne mcp \\
         --transport sse --host 0.0.0.0 --port 8080
+    MNEMOSYNE_MCP_TOKEN=my-secret-token mnemosyne mcp \\
+        --transport streamable-http --host 0.0.0.0 --port 8080
+
+    # Custom streamable HTTP endpoint path (default: /mcp)
+    mnemosyne mcp --transport streamable-http --path /mcp --port 8080
+
+    # JSON-only streamable HTTP (no SSE upgrade)
+    mnemosyne mcp --transport streamable-http --json-response --port 8080
 
     # Specific bank
     mnemosyne mcp --bank project_a
 
 Security note (S1, 2026-05-12):
-    The SSE transport defaults to host=127.0.0.1 (loopback only). Binding
+    The HTTP transports default to host=127.0.0.1 (loopback only). Binding
     to a non-loopback address (0.0.0.0, a LAN IP, etc.) requires the env
     var MNEMOSYNE_MCP_TOKEN to be set; clients must then send
     ``Authorization: Bearer <token>`` on every request. Without the token
@@ -48,6 +61,14 @@ except ImportError:
     TextContent = None
     CallToolResult = None
 
+# Guarded import -- starlette is only needed by the HTTP transports. The
+# bearer middleware is only ever instantiated by the app builders, which
+# raise a friendly error when starlette is missing.
+try:
+    from starlette.responses import JSONResponse
+except ImportError:
+    JSONResponse = None
+
 from mnemosyne.mcp_tools import get_tool_definitions, handle_tool_call
 
 # ---------------------------------------------------------------------------
@@ -65,8 +86,10 @@ def _is_loopback(host: str) -> bool:
     return host.strip().lower() in _LOOPBACK_HOSTS
 
 
-def _resolve_sse_auth(host: str) -> Tuple[bool, Optional[str]]:
-    """Decide whether SSE needs bearer-token auth and what the token is.
+def _resolve_http_auth(host: str) -> Tuple[bool, Optional[str]]:
+    """Decide whether an HTTP transport needs bearer-token auth and the token.
+
+    Applies to both the SSE and Streamable HTTP transports.
 
     Returns (require_auth, token). Raises RuntimeError when host is
     non-loopback and the MNEMOSYNE_MCP_TOKEN env var is unset/empty --
@@ -77,13 +100,64 @@ def _resolve_sse_auth(host: str) -> Tuple[bool, Optional[str]]:
     token = (os.environ.get(_TOKEN_ENV) or "").strip()
     if not token:
         raise RuntimeError(
-            f"Refusing to bind MCP SSE on non-loopback host {host!r} without "
+            f"Refusing to bind MCP over HTTP on non-loopback host {host!r} without "
             f"authentication. Set the {_TOKEN_ENV} env var to a strong random "
             f"secret and have clients send 'Authorization: Bearer <token>' on "
             f"each request. Or bind to 127.0.0.1 (the default) for local-only "
             f"use."
         )
     return (True, token)
+
+
+# Backward-compatible alias for the pre-streamable-http name.
+_resolve_sse_auth = _resolve_http_auth
+
+
+class _BearerTokenMiddleware:
+    """Pure-ASGI bearer auth middleware.
+
+    BaseHTTPMiddleware buffers the full response body before forwarding it
+    to the client. SseServerTransport and the streamable-HTTP transport
+    write directly to the raw ASGI send callable, so BaseHTTPMiddleware
+    raises:
+      AssertionError: Unexpected message: http.response.start
+    on every streaming connection, terminating it immediately.
+
+    This pure-ASGI implementation forwards scope/receive/send untouched
+    after auth so SSE/streamable frames are never buffered.
+    """
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self.expected = token
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        header = ""
+        for k, v in scope.get("headers", []):
+            if k == b"authorization":
+                header = v.decode("latin-1")
+                break
+        if not header.startswith("Bearer "):
+            resp = JSONResponse(
+                {"error": "missing bearer token"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await resp(scope, receive, send)
+            return
+        presented = header[len("Bearer "):].strip()
+        if not hmac.compare_digest(presented, self.expected):
+            resp = JSONResponse(
+                {"error": "invalid bearer token"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await resp(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +248,7 @@ def _build_sse_app(host: str = "127.0.0.1"):
             "Run: pip install starlette uvicorn"
         )
 
-    require_auth, token = _resolve_sse_auth(host)
+    require_auth, token = _resolve_http_auth(host)
 
     # Trailing slash required: SseServerTransport emits POST URIs as
     # /messages/ and Starlette Mount path-prefix matching needs it to
@@ -189,55 +263,7 @@ def _build_sse_app(host: str = "127.0.0.1"):
 
     middleware = []
     if require_auth:
-        assert token is not None
-        expected = token.encode("utf-8")
-
-        class _BearerTokenMiddleware:
-            """Pure-ASGI bearer auth middleware.
-
-            BaseHTTPMiddleware buffers the full response body before
-            forwarding it to the client. SseServerTransport writes
-            directly to the raw ASGI send callable, so
-            BaseHTTPMiddleware raises:
-              AssertionError: Unexpected message: http.response.start
-            on every SSE connect, terminating the stream immediately.
-
-            This pure-ASGI implementation forwards scope/receive/send
-            untouched after auth so SSE frames are never buffered.
-            """
-
-            def __init__(self, app):
-                self.app = app
-
-            async def __call__(self, scope, receive, send):
-                if scope.get("type") != "http":
-                    await self.app(scope, receive, send)
-                    return
-                header = b""
-                for k, v in scope.get("headers", []):
-                    if k == b"authorization":
-                        header = v
-                        break
-                if not header.startswith(b"Bearer "):
-                    resp = JSONResponse(
-                        {"error": "missing bearer token"},
-                        status_code=401,
-                        headers={"WWW-Authenticate": "Bearer"},
-                    )
-                    await resp(scope, receive, send)
-                    return
-                presented = header[len(b"Bearer "):].strip()
-                if not hmac.compare_digest(presented, expected):
-                    resp = JSONResponse(
-                        {"error": "invalid bearer token"},
-                        status_code=401,
-                        headers={"WWW-Authenticate": "Bearer"},
-                    )
-                    await resp(scope, receive, send)
-                    return
-                await self.app(scope, receive, send)
-
-        middleware.append(Middleware(_BearerTokenMiddleware))
+        middleware.append(Middleware(_BearerTokenMiddleware, token=token))
         logger.info(
             "MCP SSE bearer-token auth enabled (host=%s). Clients must send "
             "'Authorization: Bearer <token>' on every request.",
@@ -278,6 +304,84 @@ async def _run_sse(port: int = 8080, host: str = "127.0.0.1") -> None:
         )
 
     app = _build_sse_app(host=host)
+    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    await uvicorn.Server(config).serve()
+
+
+def _build_streamable_http_app(
+    host: str = "127.0.0.1",
+    path: str = "/mcp",
+    json_response: bool = False,
+):
+    """Build the Starlette app for the native Streamable HTTP transport.
+
+    Uses the ``mcp`` SDK 2.x ``Server.streamable_http_app()`` helper, which
+    wires a ``StreamableHTTPSessionManager`` with a single route at ``path``
+    handling GET/POST/DELETE. This is the modern MCP ``http`` transport: a
+    client POSTs JSON-RPC straight to ``path`` (no separate /messages route
+    to proxy) and the server responds with JSON or upgrades to an SSE stream
+    depending on the request's Accept header.
+
+    Split out from `_run_streamable_http` so the auth-gating +
+    middleware-installation logic is testable without spinning up uvicorn.
+
+    Returns the configured Starlette application. Raises RuntimeError if
+    host is non-loopback and MNEMOSYNE_MCP_TOKEN is unset.
+    """
+    if not _MCP_AVAILABLE:
+        raise RuntimeError("MCP not installed. Run: pip install mnemosyne-memory[mcp]")
+
+    require_auth, token = _resolve_http_auth(host)
+
+    server = _build_mcp_server()
+    app = server.streamable_http_app(
+        streamable_http_path=path,
+        json_response=json_response,
+        host=host,
+    )
+
+    if require_auth:
+        # add_middleware inserts outermost and is the supported Starlette
+        # API (mutating user_middleware directly would miss the lazy-built
+        # middleware stack).
+        app.add_middleware(_BearerTokenMiddleware, token=token)
+        logger.info(
+            "MCP Streamable HTTP bearer-token auth enabled (host=%s, path=%s). "
+            "Clients must send 'Authorization: Bearer <token>' on every request.",
+            host,
+            path,
+        )
+    else:
+        logger.info(
+            "MCP Streamable HTTP running loopback-only (host=%s, path=%s); "
+            "no auth required.",
+            host,
+            path,
+        )
+
+    return app
+
+
+async def _run_streamable_http(
+    port: int = 8080,
+    host: str = "127.0.0.1",
+    path: str = "/mcp",
+    json_response: bool = False,
+) -> None:
+    """Run MCP server over the Streamable HTTP transport.
+
+    Default host is 127.0.0.1 (loopback only). Binding non-loopback
+    requires MNEMOSYNE_MCP_TOKEN -- see _resolve_http_auth.
+    """
+    try:
+        import uvicorn
+    except ImportError:
+        raise RuntimeError(
+            "Streamable HTTP transport requires starlette and uvicorn. "
+            "Run: pip install starlette uvicorn"
+        )
+
+    app = _build_streamable_http_app(host=host, path=path, json_response=json_response)
     config = uvicorn.Config(app, host=host, port=port, log_level="info")
     await uvicorn.Server(config).serve()
 
@@ -344,17 +448,23 @@ def run_mcp_server(
     bank: Optional[str] = None,
     host: str = "127.0.0.1",
     env_file: Optional[str] = None,
+    path: str = "/mcp",
+    json_response: bool = False,
 ) -> None:
     """
     Run the Mnemosyne MCP server.
 
     Args:
-        transport: "stdio" or "sse"
-        port: Port for SSE transport (ignored for stdio)
+        transport: "stdio", "sse" or "streamable-http" ("http" accepted as
+            an alias for streamable-http)
+        port: Port for the HTTP transports (ignored for stdio)
         bank: Default bank for operations (optional)
-        host: Bind address for SSE transport (default: 127.0.0.1 -- loopback
-            only). Non-loopback hosts require MNEMOSYNE_MCP_TOKEN.
+        host: Bind address for the HTTP transports (default: 127.0.0.1 --
+            loopback only). Non-loopback hosts require MNEMOSYNE_MCP_TOKEN.
         env_file: Path to optional .env file to load before starting.
+        path: Endpoint path for streamable-http (default: /mcp)
+        json_response: Force JSON-only responses for streamable-http
+            (no SSE upgrade). Default: False.
     """
     _load_dotenv(env_file)
 
@@ -365,8 +475,17 @@ def run_mcp_server(
         asyncio.run(_run_stdio())
     elif transport == "sse":
         asyncio.run(_run_sse(port=port, host=host))
+    elif transport in ("streamable-http", "http"):
+        asyncio.run(
+            _run_streamable_http(
+                port=port, host=host, path=path, json_response=json_response
+            )
+        )
     else:
-        raise ValueError(f"Unknown transport: {transport}. Use 'stdio' or 'sse'.")
+        raise ValueError(
+            f"Unknown transport: {transport}. "
+            "Use 'stdio', 'sse' or 'streamable-http'."
+        )
 
 
 def main(argv: Optional[list[str]] = None) -> None:
@@ -376,37 +495,51 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Mnemosyne MCP Server")
     parser.add_argument(
         "--transport",
-        choices=["stdio", "sse"],
+        choices=["stdio", "sse", "streamable-http", "http"],
         default="stdio",
-        help="Transport protocol (default: stdio)"
+        help="Transport protocol (default: stdio)",
     )
     parser.add_argument(
         "--host",
         type=str,
         default="127.0.0.1",
         help=(
-            "Bind address for SSE transport (default: 127.0.0.1 -- loopback "
-            "only). Use 0.0.0.0 to expose on LAN; this requires the "
-            "MNEMOSYNE_MCP_TOKEN env var to be set."
+            "Bind address for SSE and streamable-http transports (default: "
+            "127.0.0.1 -- loopback only). Use 0.0.0.0 to expose on LAN; this "
+            "requires the MNEMOSYNE_MCP_TOKEN env var to be set."
         ),
     )
     parser.add_argument(
         "--port",
         type=int,
         default=8080,
-        help="Port for SSE transport (default: 8080)"
+        help="Port for SSE and streamable-http transports (default: 8080)",
+    )
+    parser.add_argument(
+        "--path",
+        type=str,
+        default="/mcp",
+        help="Endpoint path for streamable-http transport (default: /mcp)",
+    )
+    parser.add_argument(
+        "--json-response",
+        action="store_true",
+        help=(
+            "Force JSON-only responses on streamable-http (no SSE upgrade). "
+            "Default: streamable responses with SSE upgrade."
+        ),
     )
     parser.add_argument(
         "--bank",
         type=str,
         default=None,
-        help="Default memory bank"
+        help="Default memory bank",
     )
     parser.add_argument(
         "--env-file",
         type=str,
         default=None,
-        help="Path to .env file to load before starting server"
+        help="Path to .env file to load before starting server",
     )
     args = parser.parse_args(argv)
 
@@ -415,6 +548,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         "port": args.port,
         "bank": args.bank,
         "host": args.host,
+        "path": args.path,
+        "json_response": args.json_response,
     }
     if args.env_file is not None:
         kwargs["env_file"] = args.env_file

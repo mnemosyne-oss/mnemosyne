@@ -457,6 +457,7 @@ For integration with MCP-compatible clients:
 ```bash
 mnemosyne mcp                          # stdio transport
 mnemosyne mcp --transport sse --port 8080  # SSE transport
+mnemosyne mcp --transport streamable-http --port 8080  # native MCP http transport
 ```
 
 Mnemosyne does not currently expose a standalone REST API server.

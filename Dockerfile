@@ -15,6 +15,12 @@
 #     -e MNEMOSYNE_MCP_TOKEN=my-secret \
 #     mnemosyne-mcp --transport sse --host 0.0.0.0 --port 8080
 #
+# Run (Streamable HTTP — native MCP http transport, single POST /mcp endpoint):
+#   docker run -d --rm -p 8080:8080 \
+#     -v mnemosyne-data:/data \
+#     -e MNEMOSYNE_MCP_TOKEN=my-secret \
+#     mnemosyne-mcp --transport streamable-http --host 0.0.0.0 --port 8080
+#
 # With custom data directory:
 #   docker run -i --rm \
 #     -v /host/path/to/data:/data \

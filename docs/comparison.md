@@ -137,6 +137,7 @@ A representative subset:
 ```
 mnemosyne mcp                          # stdio transport (Claude Desktop, etc.)
 mnemosyne mcp --transport sse --port 8080  # SSE transport (web clients)
+mnemosyne mcp --transport streamable-http --port 8080  # native MCP http transport
 mnemosyne mcp --bank project_a            # scoped to a specific bank
 ```
 
@@ -160,7 +161,7 @@ Custom HTTP API on port 8888. Native `openclaw-hindsight` plugin exists for Open
 |---|---|---|
 | **Hermes** | Native (in-process, no serialization) | HTTP client |
 | **OpenClaw** | Planned (adapter not yet built) | Native plugin exists |
-| **MCP** | 28 tools, stdio + SSE | Custom HTTP API |
+| **MCP** | 28 tools, stdio + SSE + Streamable HTTP | Custom HTTP API |
 | **Cross-machine** | Export/import JSON only | Any agent with HTTP access to port 8888 |
 
 ---
@@ -247,7 +248,7 @@ Both systems are fully offline after initial setup. The difference is weight: Mn
 - You need the fastest possible recall latency for interactive agent loops
 - You're running on a resource-constrained environment (VPS, ephemeral VM, CI)
 - You're building a single-user, single-machine agent (Hermes, Claude Desktop, etc.)
-- You want an MCP-compatible memory layer (stdio + SSE)
+- You want an MCP-compatible memory layer (stdio + SSE + Streamable HTTP)
 - You want full control over the memory model and don't need automatic "magic"
 - You value fewer moving parts over sophisticated NLP
 - You want memory banks with per-bank SQLite isolation without standing up PostgreSQL
