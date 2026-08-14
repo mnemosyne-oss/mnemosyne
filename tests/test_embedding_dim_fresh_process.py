@@ -133,6 +133,63 @@ def test_unknown_model_parity_across_surfaces(tmp_path, code, pythonpath, fail_f
         assert result.returncode == 0, result.stderr
 
 
+def _fake_endpoint_code(dim: int) -> str:
+    """Subprocess source that serves an OpenAI-compatible /embeddings endpoint
+    returning only `dim`-dimensional vectors on an ephemeral local port, points
+    MNEMOSYNE_EMBEDDING_API_URL at it, then boots mnemosyne, writes one memory
+    and recalls it, printing REQUESTS / RECALL / VEC_ROWS markers for the
+    parent to assert on."""
+    return textwrap.dedent(
+        f"""
+        import json
+        import os
+        import sqlite3
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        REQUESTS = {{"n": 0}}
+
+        class _FakeEmbeddings(BaseHTTPRequestHandler):
+            # OpenAI-compatible /embeddings endpoint serving {dim}-dim vectors only.
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                n = len(body["input"])
+                payload = json.dumps({{
+                    "data": [{{"embedding": [0.01] * {dim}, "index": i}} for i in range(n)]
+                }}).encode()
+                REQUESTS["n"] += 1
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), _FakeEmbeddings)
+        os.environ["MNEMOSYNE_EMBEDDING_API_URL"] = f"http://127.0.0.1:{{server.server_port}}/v1"
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        from mnemosyne.core import beam
+        from mnemosyne.core.memory import recall, remember
+        beam.init_beam()
+        remember("dimension end to end probe", source="e2e-dim")
+        print("REQUESTS", REQUESTS["n"])  # before recall: survives a recall crash
+        results = recall("dimension end to end probe", top_k=3)
+        print("REQUESTS_TOTAL", REQUESTS["n"])
+        print("RECALL", len(results))
+        if beam._SQLITE_VEC_AVAILABLE:
+            import sqlite_vec
+            conn = sqlite3.connect(beam._default_db_path())
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            print("VEC_ROWS", conn.execute("SELECT COUNT(*) FROM vec_working").fetchone()[0])
+            conn.close()
+        """
+    )
+
+
 def test_unknown_model_with_explicit_dim_boots_end_to_end(tmp_path):
     """The success half of the #521 contract, at process scope: an unknown model
     plus an explicit positive MNEMOSYNE_EMBEDDING_DIM boots cleanly through
@@ -148,54 +205,8 @@ def test_unknown_model_with_explicit_dim_boots_end_to_end(tmp_path):
     the vec0-dimension checks run only where sqlite-vec is installed (the
     repo's importorskip convention) because the tables are not created
     without it."""
-    code = """
-        import json
-        import os
-        import sqlite3
-        import threading
-        from http.server import BaseHTTPRequestHandler, HTTPServer
-
-        REQUESTS = {"n": 0}
-
-        class _FakeEmbeddings(BaseHTTPRequestHandler):
-            # OpenAI-compatible /embeddings endpoint serving 1024-dim vectors only.
-            def do_POST(self):
-                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                n = len(body["input"])
-                payload = json.dumps({
-                    "data": [{"embedding": [0.01] * 1024, "index": i} for i in range(n)]
-                }).encode()
-                REQUESTS["n"] += 1
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
-
-            def log_message(self, *args):
-                pass
-
-        server = HTTPServer(("127.0.0.1", 0), _FakeEmbeddings)
-        os.environ["MNEMOSYNE_EMBEDDING_API_URL"] = f"http://127.0.0.1:{server.server_port}/v1"
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-
-        from mnemosyne.core import beam
-        from mnemosyne.core.memory import recall, remember
-        beam.init_beam()
-        remember("dimension end to end probe", source="e2e-dim")
-        results = recall("dimension end to end probe", top_k=3)
-        print("REQUESTS", REQUESTS["n"])
-        print("RECALL", len(results))
-        if beam._SQLITE_VEC_AVAILABLE:
-            import sqlite_vec
-            conn = sqlite3.connect(beam._default_db_path())
-            conn.enable_load_extension(True)
-            sqlite_vec.load(conn)
-            print("VEC_ROWS", conn.execute("SELECT COUNT(*) FROM vec_working").fetchone()[0])
-            conn.close()
-        """
     result = _run_fresh(
-        textwrap.dedent(code),
+        _fake_endpoint_code(1024),
         tmp_path,
         MNEMOSYNE_EMBEDDING_MODEL="mixedbread-ai/mxbai-embed-large-v1",
         MNEMOSYNE_EMBEDDING_DIM="1024",
@@ -203,8 +214,10 @@ def test_unknown_model_with_explicit_dim_boots_end_to_end(tmp_path):
     assert result.returncode == 0, result.stderr
     out = result.stdout
     # Write-side and query-side vectorization both went through the endpoint
-    # (>=2 embedding calls: one for the remembered content, one for the query).
-    assert int(re.search(r"REQUESTS (\d+)", out).group(1)) >= 2, out + result.stderr
+    # (>=2 embedding calls total: one for the remembered content, one for the
+    # query; the write-side REQUESTS marker is also checked below).
+    assert int(re.search(r"REQUESTS_TOTAL (\d+)", out).group(1)) >= 2, out + result.stderr
+    assert int(re.search(r"REQUESTS (\d+)", out).group(1)) >= 1, out + result.stderr
     # Recall returned the probe.
     assert re.search(r"RECALL [1-9]", out), out + result.stderr
     # The vec0 tables must carry the explicit dimension, not a guessed 384,
@@ -225,6 +238,38 @@ def test_unknown_model_with_explicit_dim_boots_end_to_end(tmp_path):
         assert dims == {"vec_episodes": 1024, "vec_working": 1024}, dims
         vec_rows = conn.execute("SELECT COUNT(*) FROM vec_working").fetchone()[0]
         assert vec_rows >= 1, "no vector stored in the 1024-dim vec0 table"
+    finally:
+        conn.close()
+
+
+def test_endpoint_serving_wrong_dim_leaves_vec_store_empty(tmp_path):
+    """The failure half of the explicit-dimension contract: when the endpoint's
+    true dimension (384) disagrees with the explicit MNEMOSYNE_EMBEDDING_DIM
+    (1024), the mismatched vector must NOT be stored — vec_working stays empty
+    (the write-side insert is discarded with a logged warning, it does not
+    corrupt the 1024-dim vec0 table). The mismatched query-side vector then
+    surfaces as a non-zero exit: sqlite-vec rejects the 384-dim query against
+    the 1024-dim table and the recall path does not swallow that error. Both
+    outcomes are pinned so neither regresses silently."""
+    result = _run_fresh(
+        _fake_endpoint_code(384),
+        tmp_path,
+        MNEMOSYNE_EMBEDDING_MODEL="mixedbread-ai/mxbai-embed-large-v1",
+        MNEMOSYNE_EMBEDDING_DIM="1024",
+    )
+    # The endpoint was consulted for the write before the query failed.
+    assert int(re.search(r"REQUESTS (\d+)", result.stdout).group(1)) >= 1, result.stdout + result.stderr
+    # Query-side mismatch is loud: recall with a 384-dim query against the
+    # 1024-dim vec0 table raises (documented current behavior, pinned here).
+    assert result.returncode != 0, "mismatched-dim query unexpectedly succeeded:\n" + result.stdout
+    assert "Dimension mismatch" in result.stderr, result.stderr
+    sqlite_vec = pytest.importorskip("sqlite_vec")  # noqa: F841
+    conn = sqlite3.connect(tmp_path / "data" / "mnemosyne.db")
+    try:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        vec_rows = conn.execute("SELECT COUNT(*) FROM vec_working").fetchone()[0]
+        assert vec_rows == 0, f"{vec_rows} mismatched-dim vectors reached the 1024-dim vec0 table"
     finally:
         conn.close()
 
