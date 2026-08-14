@@ -136,25 +136,85 @@ def test_unknown_model_parity_across_surfaces(tmp_path, code, pythonpath, fail_f
 def test_unknown_model_with_explicit_dim_boots_end_to_end(tmp_path):
     """The success half of the #521 contract, at process scope: an unknown model
     plus an explicit positive MNEMOSYNE_EMBEDDING_DIM boots cleanly through
-    init_beam() and bakes the explicit dimension into the vec0 tables.
+    init_beam(), bakes the explicit dimension into the vec0 tables, and
+    completes an embedding-backed write + recall through a local fake endpoint
+    that only ever serves 1024-dim vectors (the mxbai-via-custom-endpoint
+    production scenario).
 
-    This is the mxbai-via-custom-endpoint production scenario: the fail-loud
-    resolver exists so this path carries the operator's dimension, not a guess.
-    The boot assertions always run; the vec0-dimension check runs only where
-    sqlite-vec is installed (the repo's importorskip convention) because the
-    tables are not created without it."""
+    Both the document embedding (write) and the query embedding (recall) must
+    hit the endpoint, so a regression that stores or queries at any other
+    dimension cannot pass: the endpoint produces 1024-dim vectors only, and a
+    mismatched vec0 write would fail. Boot and endpoint assertions always run;
+    the vec0-dimension checks run only where sqlite-vec is installed (the
+    repo's importorskip convention) because the tables are not created
+    without it."""
+    code = """
+        import json
+        import os
+        import sqlite3
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        REQUESTS = {"n": 0}
+
+        class _FakeEmbeddings(BaseHTTPRequestHandler):
+            # OpenAI-compatible /embeddings endpoint serving 1024-dim vectors only.
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                n = len(body["input"])
+                payload = json.dumps({
+                    "data": [{"embedding": [0.01] * 1024, "index": i} for i in range(n)]
+                }).encode()
+                REQUESTS["n"] += 1
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), _FakeEmbeddings)
+        os.environ["MNEMOSYNE_EMBEDDING_API_URL"] = f"http://127.0.0.1:{server.server_port}/v1"
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        from mnemosyne.core import beam
+        from mnemosyne.core.memory import recall, remember
+        beam.init_beam()
+        remember("dimension end to end probe", source="e2e-dim")
+        results = recall("dimension end to end probe", top_k=3)
+        print("REQUESTS", REQUESTS["n"])
+        print("RECALL", len(results))
+        if beam._SQLITE_VEC_AVAILABLE:
+            import sqlite_vec
+            conn = sqlite3.connect(beam._default_db_path())
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            print("VEC_ROWS", conn.execute("SELECT COUNT(*) FROM vec_working").fetchone()[0])
+            conn.close()
+        """
     result = _run_fresh(
-        "from mnemosyne.core import beam; beam.init_beam()",
+        textwrap.dedent(code),
         tmp_path,
         MNEMOSYNE_EMBEDDING_MODEL="mixedbread-ai/mxbai-embed-large-v1",
         MNEMOSYNE_EMBEDDING_DIM="1024",
     )
     assert result.returncode == 0, result.stderr
-    # The vec0 tables must carry the explicit dimension, not a guessed 384.
-    # sqlite_master needs no extension load to read the stored DDL.
+    out = result.stdout
+    # Write-side and query-side vectorization both went through the endpoint
+    # (>=2 embedding calls: one for the remembered content, one for the query).
+    assert int(re.search(r"REQUESTS (\d+)", out).group(1)) >= 2, out + result.stderr
+    # Recall returned the probe.
+    assert re.search(r"RECALL [1-9]", out), out + result.stderr
+    # The vec0 tables must carry the explicit dimension, not a guessed 384,
+    # and the stored vector must have landed in the 1024-dim table (not the
+    # float-JSON fallback). sqlite_master needs no extension load to read DDL.
     sqlite_vec = pytest.importorskip("sqlite_vec")  # noqa: F841
     conn = sqlite3.connect(tmp_path / "data" / "mnemosyne.db")
     try:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
         dims = {
             table: int(re.search(r"\[(\d+)\]", sql).group(1))
             for (sql,) in conn.execute(
@@ -163,6 +223,8 @@ def test_unknown_model_with_explicit_dim_boots_end_to_end(tmp_path):
             for table in (re.search(r"vec_\w+", sql).group(0),)
         }
         assert dims == {"vec_episodes": 1024, "vec_working": 1024}, dims
+        vec_rows = conn.execute("SELECT COUNT(*) FROM vec_working").fetchone()[0]
+        assert vec_rows >= 1, "no vector stored in the 1024-dim vec0 table"
     finally:
         conn.close()
 

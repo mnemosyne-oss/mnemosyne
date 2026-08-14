@@ -88,7 +88,12 @@ def test_get_embedding_dim_unknown_model_raises(monkeypatch):
     # the operator-facing contract (names the model and the fix).
     with pytest.raises(ValueError, match="Unknown embedding model 'some/unknown-model'"):
         embeddings._get_embedding_dim("some/unknown-model")
-    with pytest.raises(ValueError, match="Unknown embedding model"):
+    # Full actionable message for the empty model too: the quoted empty value
+    # and the MNEMOSYNE_EMBEDDING_DIM remediation, not just the prefix.
+    with pytest.raises(
+        ValueError,
+        match=r"Unknown embedding model ''.*Set MNEMOSYNE_EMBEDDING_DIM=<N>",
+    ):
         embeddings._get_embedding_dim("")
 
 
