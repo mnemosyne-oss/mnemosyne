@@ -151,12 +151,21 @@ def _fake_endpoint_code(dim: int) -> str:
     return textwrap.dedent(
         f"""
         import json
+        import math
         import os
         import sqlite3
         import threading
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
         REQUESTS = {{"n": 0, "log": []}}
+
+        def _vec_for(text):
+            # Input-dependent, deterministic vectors: similar texts (similar
+            # character-weight sums) map to nearly-parallel vectors, different
+            # texts to near-orthogonal ones, so the KNN ranking is meaningful
+            # instead of identical vectors for every input.
+            seed = sum((i + 1) * ord(c) for i, c in enumerate(text))
+            return [math.sin(seed * 0.0001 + i * 0.01) for i in range({dim})]
 
         class _FakeEmbeddings(BaseHTTPRequestHandler):
             # OpenAI-compatible /embeddings endpoint serving {dim}-dim vectors only.
@@ -166,9 +175,8 @@ def _fake_endpoint_code(dim: int) -> str:
                     return
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 REQUESTS["log"].append({{"model": body.get("model"), "input": body["input"]}})
-                n = len(body["input"])
                 payload = json.dumps({{
-                    "data": [{{"embedding": [0.01] * {dim}, "index": i}} for i in range(n)]
+                    "data": [{{"embedding": _vec_for(t), "index": i}} for i, t in enumerate(body["input"])]
                 }}).encode()
                 REQUESTS["n"] += 1
                 self.send_response(200)
@@ -187,11 +195,12 @@ def _fake_endpoint_code(dim: int) -> str:
         from mnemosyne.core import beam
         from mnemosyne.core.memory import recall, remember
         beam.init_beam()
-        remember("dimension end to end probe", source="e2e-dim")
+        remember("dimension end to end document", source="e2e-dim")
+        remember("unrelated grocery list apples", source="e2e-dim")
         print("REQUESTS", REQUESTS["n"])  # before recall: survives a recall crash
         print("WRITE_MODEL", REQUESTS["log"][0]["model"])
         print("WRITE_INPUT", json.dumps(REQUESTS["log"][0]["input"]))
-        results = recall("dimension end to end probe", top_k=3)
+        results = recall("dimension end to end document", top_k=3)
         print("REQUESTS_TOTAL", REQUESTS["n"])
         print("QUERY_MODEL", REQUESTS["log"][-1]["model"])
         print("QUERY_INPUT", REQUESTS["log"][-1]["input"][0])
@@ -200,6 +209,7 @@ def _fake_endpoint_code(dim: int) -> str:
             (r.get("content") if isinstance(r, dict) else getattr(r, "content", "")) or ""
             for r in results
         ]))
+        print("RECALL_TOP", results[0].get("content", "") if results else "")
         if beam._SQLITE_VEC_AVAILABLE:
             import sqlite_vec
             conn = sqlite3.connect(beam._default_db_path())
@@ -246,7 +256,7 @@ def _fake_endpoint_recall_only_code(dim: int) -> str:
         from mnemosyne.core import beam
         from mnemosyne.core.memory import recall
         beam.init_beam()
-        results = recall("dimension end to end probe", top_k=3)
+        results = recall("dimension end to end document", top_k=3)
         print("RECALL", len(results))
         print("RECALL_CONTENT", json.dumps([
             (r.get("content") if isinstance(r, dict) else getattr(r, "content", "")) or ""
@@ -285,18 +295,23 @@ def test_unknown_model_with_explicit_dim_boots_end_to_end(tmp_path):
     assert int(re.search(r"REQUESTS_TOTAL (\d+)", out).group(1)) >= 2, out + result.stderr
     assert int(re.search(r"REQUESTS (\d+)", out).group(1)) >= 1, out + result.stderr
     # Both calls asked the endpoint for the configured model, and the write
-    # side carried the remembered content (the query side carries the query,
-    # possibly prefixed by the model's query prefix).
+    # side carried the remembered content while the query side carried the
+    # query (possibly prefixed by the model's query prefix).
     assert re.search(r"^WRITE_MODEL mixedbread-ai/mxbai-embed-large-v1$", out, re.M), out
     assert re.search(r"^QUERY_MODEL mixedbread-ai/mxbai-embed-large-v1$", out, re.M), out
     write_input = re.search(r"^WRITE_INPUT (.+)$", out, re.M)
-    assert write_input and "dimension end to end probe" in write_input.group(1), out
+    assert write_input and "dimension end to end document" in write_input.group(1), out
+    assert write_input and "grocery" not in write_input.group(1), out
     query_input = re.search(r"^QUERY_INPUT (.+)$", out, re.M)
-    assert query_input and "dimension end to end probe" in query_input.group(1), out
-    # Recall returned the probe.
+    assert query_input and "dimension end to end document" in query_input.group(1), out
+    # Recall returned the probe...
     assert re.search(r"RECALL [1-9]", out), out + result.stderr
     recall_content = re.search(r"^RECALL_CONTENT (.+)$", out, re.M)
-    assert recall_content and "dimension end to end probe" in recall_content.group(1), out
+    assert recall_content and "dimension end to end document" in recall_content.group(1), out
+    # ...and ranked the matching document above the unrelated distractor.
+    top = re.search(r"^RECALL_TOP (.+)$", out, re.M)
+    assert top and "dimension end to end document" in top.group(1), out
+    assert top and "grocery" not in top.group(1), out
     # The vec0 tables must carry the explicit dimension, not a guessed 384,
     # and the stored vector must have landed in the 1024-dim table (not the
     # float-JSON fallback). sqlite_master needs no extension load to read DDL.
@@ -343,7 +358,7 @@ def test_second_process_recalls_stored_memory_same_dim(tmp_path):
     out = reader.stdout
     assert re.search(r"RECALL [1-9]", out), out + reader.stderr
     recall_content = re.search(r"^RECALL_CONTENT (.+)$", out, re.M)
-    assert recall_content and "dimension end to end probe" in recall_content.group(1), out
+    assert recall_content and "dimension end to end document" in recall_content.group(1), out
 
 
 def test_endpoint_serving_wrong_dim_leaves_vec_store_empty(tmp_path):
