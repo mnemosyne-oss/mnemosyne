@@ -211,6 +211,51 @@ def _fake_endpoint_code(dim: int) -> str:
     )
 
 
+def _fake_endpoint_recall_only_code(dim: int) -> str:
+    """Same fake endpoint and boot, but only recalls: for a SECOND process
+    reopening a data directory written by a previous one."""
+    return textwrap.dedent(
+        f"""
+        import json
+        import os
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class _FakeEmbeddings(BaseHTTPRequestHandler):
+            def do_POST(self):
+                if self.path.rstrip("/") != "/v1/embeddings":
+                    self.send_error(404, f"unexpected route: {{self.path}}")
+                    return
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                payload = json.dumps({{
+                    "data": [{{"embedding": [0.01] * {dim}, "index": i}} for i in range(len(body["input"]))]
+                }}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), _FakeEmbeddings)
+        os.environ["MNEMOSYNE_EMBEDDING_API_URL"] = f"http://127.0.0.1:{{server.server_port}}/v1"
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        from mnemosyne.core import beam
+        from mnemosyne.core.memory import recall
+        beam.init_beam()
+        results = recall("dimension end to end probe", top_k=3)
+        print("RECALL", len(results))
+        print("RECALL_CONTENT", json.dumps([
+            (r.get("content") if isinstance(r, dict) else getattr(r, "content", "")) or ""
+            for r in results
+        ]))
+        """
+    )
+
+
 def test_unknown_model_with_explicit_dim_boots_end_to_end(tmp_path):
     """The success half of the #521 contract, at process scope: an unknown model
     plus an explicit positive MNEMOSYNE_EMBEDDING_DIM boots cleanly through
@@ -271,6 +316,34 @@ def test_unknown_model_with_explicit_dim_boots_end_to_end(tmp_path):
         assert vec_rows >= 1, "no vector stored in the 1024-dim vec0 table"
     finally:
         conn.close()
+
+
+def test_second_process_recalls_stored_memory_same_dim(tmp_path):
+    """Cross-process persistence: a SECOND fresh process reopening the same
+    data directory must recall the memory the first one stored, with the same
+    explicit dimension. The vec0 tables and their 1024-dim vectors were
+    created by the writer process; the reader proves they survive the process
+    boundary and serve a vector-backed recall (same-process recall alone, or
+    two readers in one process, would not)."""
+    writer = _run_fresh(
+        _fake_endpoint_code(1024),
+        tmp_path,
+        MNEMOSYNE_EMBEDDING_MODEL="mixedbread-ai/mxbai-embed-large-v1",
+        MNEMOSYNE_EMBEDDING_DIM="1024",
+    )
+    assert writer.returncode == 0, writer.stderr
+
+    reader = _run_fresh(
+        _fake_endpoint_recall_only_code(1024),
+        tmp_path,  # same MNEMOSYNE_DATA_DIR as the writer
+        MNEMOSYNE_EMBEDDING_MODEL="mixedbread-ai/mxbai-embed-large-v1",
+        MNEMOSYNE_EMBEDDING_DIM="1024",
+    )
+    assert reader.returncode == 0, reader.stderr
+    out = reader.stdout
+    assert re.search(r"RECALL [1-9]", out), out + reader.stderr
+    recall_content = re.search(r"^RECALL_CONTENT (.+)$", out, re.M)
+    assert recall_content and "dimension end to end probe" in recall_content.group(1), out
 
 
 def test_endpoint_serving_wrong_dim_leaves_vec_store_empty(tmp_path):
