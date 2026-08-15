@@ -102,15 +102,28 @@ class TestResolveHttpAuth:
 class TestResolveTransportSecurity:
     """`_resolve_transport_security` implements the Host/Origin contract."""
 
-    def test_loopback_returns_none(self, monkeypatch):
-        """Loopback keeps the SDK's built-in DNS-rebinding defaults."""
+    @pytest.fixture(autouse=True)
+    def _clean_policy_env(self, monkeypatch):
+        """Both policy vars start unset so assertions are environment-independent."""
+        monkeypatch.delenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_MCP_ALLOWED_ORIGINS", raising=False)
+
+    @pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
+    def test_loopback_forms_return_none(self, host, monkeypatch):
+        """Loopback forms keep the SDK's built-in DNS-rebinding defaults."""
         monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", "ignored.example.com")
         from mnemosyne.mcp_server import _resolve_transport_security
-        assert _resolve_transport_security("127.0.0.1") is None
+        assert _resolve_transport_security(host) is None
 
     def test_non_loopback_without_hosts_raises(self, monkeypatch):
         """Non-loopback is fail-closed: a Host policy is mandatory."""
-        monkeypatch.delenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", raising=False)
+        from mnemosyne.mcp_server import _resolve_transport_security
+        with pytest.raises(RuntimeError, match="MNEMOSYNE_MCP_ALLOWED_HOSTS"):
+            _resolve_transport_security("0.0.0.0")
+
+    def test_origins_alone_do_not_satisfy_host_policy(self, monkeypatch):
+        """Origins without a Host allowlist still refuse to start."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_ORIGINS", "https://app.example.com")
         from mnemosyne.mcp_server import _resolve_transport_security
         with pytest.raises(RuntimeError, match="MNEMOSYNE_MCP_ALLOWED_HOSTS"):
             _resolve_transport_security("0.0.0.0")

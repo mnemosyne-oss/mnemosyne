@@ -96,13 +96,18 @@ The built-in help lists only `hygiene audit|clean`; `status` and `restore` exist
 |---|---|
 | `mcp` | `mcp [--transport stdio\|sse\|streamable-http\|http] [--host 127.0.0.1] [--port 8080] [--path /mcp] [--json-response] [--env-file FILE] [--bank NAME]`. Starts the MCP server |
 
-stdio is the default transport. `sse` and `streamable-http` are HTTP transports; a non-loopback bind requires `MNEMOSYNE_MCP_TOKEN`. `streamable-http` (alias `http`) is the native MCP Streamable HTTP transport: clients POST JSON-RPC straight to `--path` (default `/mcp`) with no separate `/messages` route to proxy. Add `--json-response` to force JSON-only responses instead of the default SSE-upgrade streaming.
+stdio is the default transport. `sse` and `streamable-http` are HTTP transports; a non-loopback bind requires `MNEMOSYNE_MCP_TOKEN`. `streamable-http` (alias `http`) is the native MCP Streamable HTTP transport: clients POST JSON-RPC straight to `--path` (default `/mcp`) with no separate `/messages` route to proxy. Add `--json-response` to force JSON-only responses instead of the default SSE-upgrade streaming. A non-loopback `streamable-http` bind also requires `MNEMOSYNE_MCP_ALLOWED_HOSTS` (see below); `sse` requires only the token.
 
 ### Streamable HTTP Host/Origin policy
 
 The Streamable HTTP transport applies a Host/Origin policy on **non-loopback**
 binds (DNS-rebinding protection). Loopback binds (`127.0.0.1`, `localhost`,
 `::1`) keep the SDK's built-in defaults and ignore these variables.
+
+Streamable HTTP serves the existing local Mnemosyne/SQLite store — no external
+database is involved. Binding non-loopback exposes the selected local memory
+bank to network clients, so treat the token and the Host/Origin gates below as
+the boundary between the local store and the network.
 
 - `MNEMOSYNE_MCP_ALLOWED_HOSTS` — **required** to start a non-loopback server.
   Comma-separated `Host` header values clients will present. Each value is an
