@@ -2474,6 +2474,143 @@ class TestUpdateRefreshesDerivedState:
         )
 
 
+class TestUpdateCrossSessionAuthorization:
+    """update_working()/Mnemosyne.update() must follow the same authorization
+    pattern as get()/invalidate(): (session_id = ? OR scope = 'global').
+
+    Before the fix, both were session-locked, so a global-scope memory
+    (e.g. a durable user fact) could never be updated from a later session
+    -- update() reported "not_found" even though get() and invalidate()
+    could reach the row.
+    """
+
+    def test_update_global_memory_from_another_session(self, temp_db):
+        """A global-scope memory must be updatable from any session."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        mid = beam.remember(
+            "The speed of light is 299,792,458 m/s",
+            source="test", scope="global",
+        )
+        assert mid is not None
+
+        other = BeamMemory(session_id="s2", db_path=temp_db)
+        ok = other.update_working(
+            mid, content="The speed of light is exactly 299,792,458 m/s"
+        )
+        assert ok is True
+
+        row = other.get(mid)
+        assert row is not None
+        assert "exactly" in row["content"]
+
+    def test_update_session_memory_from_another_session_denied(self, temp_db):
+        """A session-scoped memory must NOT be updatable from another session."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        mid = beam.remember("private note for s1", source="test")
+        assert mid is not None
+
+        other = BeamMemory(session_id="s2", db_path=temp_db)
+        ok = other.update_working(mid, importance=0.99)
+        assert ok is False
+
+    def test_mnemosyne_update_global_memory_from_another_session(self, temp_db):
+        """Mnemosyne.update() must also allow cross-session updates of global memories."""
+        from mnemosyne.core.memory import Mnemosyne
+
+        mnem = Mnemosyne(session_id="s1", db_path=temp_db)
+        mid = mnem.remember("Krakatoa erupted in 1883", source="test", scope="global")
+        assert mid is not None
+
+        other = Mnemosyne(session_id="s2", db_path=temp_db)
+        ok = other.update(mid, importance=0.95)
+        assert ok is True
+
+        row = other.get(mid)
+        assert row is not None
+        assert row["importance"] == 0.95
+
+    def test_mnemosyne_update_session_memory_from_another_session_denied(
+        self, temp_db, monkeypatch
+    ):
+        """Mnemosyne.update() must deny cross-session updates of session-scoped
+        memories: False, content unchanged, and no MEMORY_UPDATED event."""
+        from mnemosyne.core.memory import Mnemosyne
+
+        mnem = Mnemosyne(session_id="s1", db_path=temp_db)
+        mid = mnem.remember("s1 private fact", source="test")
+        assert mid is not None
+
+        other = Mnemosyne(session_id="s2", db_path=temp_db)
+        events = []
+        monkeypatch.setattr(
+            other, "_emit_wrapper",
+            lambda *args, **kwargs: events.append((args, kwargs)),
+        )
+        ok = other.update(mid, content="tampered")
+        assert ok is False
+
+        row = mnem.get(mid)
+        assert row is not None
+        assert row["content"] == "s1 private fact"
+        assert events == []
+
+    def test_empty_and_unknown_updates_do_not_emit(self, temp_db, monkeypatch):
+        """Empty updates (no content, no importance) and unknown IDs must
+        return False without emitting MEMORY_UPDATED."""
+        from mnemosyne.core.memory import Mnemosyne
+
+        mnem = Mnemosyne(session_id="s1", db_path=temp_db)
+        mid = mnem.remember("something", source="test")
+        events = []
+        monkeypatch.setattr(
+            mnem, "_emit_wrapper",
+            lambda *args, **kwargs: events.append((args, kwargs)),
+        )
+
+        assert mnem.update(mid) is False
+        assert mnem.update("deadbeefdeadbeef", importance=0.9) is False
+        assert events == []
+
+    def test_scope_migration_backfills_legacy_rows_as_session(self, temp_db):
+        """Pre-scope rows must be backfilled as 'session' when the scope column
+        is added -- the ADD COLUMN default would otherwise mark them 'global',
+        making them writable from any other session."""
+        import sqlite3
+
+        conn = sqlite3.connect(str(temp_db))
+        conn.execute("""CREATE TABLE working_memory (
+            id TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            source TEXT,
+            timestamp TEXT,
+            session_id TEXT DEFAULT 'default',
+            importance REAL DEFAULT 0.5,
+            metadata_json TEXT,
+            veracity TEXT DEFAULT 'unknown',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute(
+            "INSERT INTO working_memory (id, content, session_id) "
+            "VALUES ('legacy1', 'old private note', 'session-a')"
+        )
+        conn.commit()
+        conn.close()
+
+        # Initializing BeamMemory runs the schema migrations.
+        BeamMemory(session_id="session-a", db_path=str(temp_db))
+
+        conn = sqlite3.connect(str(temp_db))
+        scope = conn.execute(
+            "SELECT scope FROM working_memory WHERE id = 'legacy1'"
+        ).fetchone()[0]
+        conn.close()
+        assert scope == "session", f"legacy row must be backfilled 'session', got {scope!r}"
+
+        # The backfilled row must NOT be writable from another session.
+        other = BeamMemory(session_id="session-b", db_path=str(temp_db))
+        assert other.update_working("legacy1", importance=0.99) is False
+
+
 class TestEmbeddingDimConfig:
     """Tests for MNEMOSYNE_EMBEDDING_DIM env var override.
 

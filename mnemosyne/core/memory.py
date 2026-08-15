@@ -614,35 +614,46 @@ class Mnemosyne:
 
     def update(self, memory_id: str, content: str = None,
                importance: float = None) -> bool:
-        """Update an existing memory in legacy table and BEAM."""
-        cursor = self.conn.cursor()
+        """Update an existing memory in BEAM working_memory (primary store).
 
+        Mirrors the legacy table best-effort when a legacy row exists.
+        Authorization follows the same pattern as get()/invalidate():
+        the caller may update its own session's memories or global-scoped
+        memories from any session.
+        """
+        if content is None and importance is None:
+            return False
+
+        # Primary store: BEAM working_memory.
+        beam_ok = self.beam.update_working(
+            memory_id, content=content, importance=importance
+        )
+
+        # Legacy mirror: best-effort, scoped to this session's rows only.
+        cursor = self.conn.cursor()
         updates = []
         params = []
-
         if content is not None:
             updates.append("content = ?")
             params.append(content)
-
         if importance is not None:
             updates.append("importance = ?")
             params.append(importance)
+        if updates:
+            params.extend([memory_id, self.session_id])
+            cursor.execute(
+                f"UPDATE memories SET {', '.join(updates)} "
+                "WHERE id = ? AND session_id = ?",
+                params
+            )
+            self.conn.commit()
 
-        if not updates:
-            return False
-
-        params.extend([memory_id, self.session_id])
-        cursor.execute(
-            f"UPDATE memories SET {', '.join(updates)} WHERE id = ? AND session_id = ?",
-            params
-        )
-        self.conn.commit()
-
-        # Sync BEAM working_memory
-        self.beam.update_working(memory_id, content=content, importance=importance)
-
-        self._emit_wrapper("MEMORY_UPDATED", memory_id, content=content, importance=importance)
-        return cursor.rowcount > 0
+        if beam_ok:
+            self._emit_wrapper(
+                "MEMORY_UPDATED", memory_id,
+                content=content, importance=importance,
+            )
+        return beam_ok
 
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """Mark a memory as expired or superseded. Delegates to BEAM."""

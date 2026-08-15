@@ -1083,10 +1083,18 @@ def init_beam(db_path: Path = None):
     # --- Migration: temporal validity + scope (v2.2) ---
     _add_column_if_missing(conn, "working_memory", "valid_until", "TIMESTAMP DEFAULT NULL")
     _add_column_if_missing(conn, "working_memory", "superseded_by", "TEXT DEFAULT NULL")
-    _add_column_if_missing(conn, "working_memory", "scope", "TEXT DEFAULT 'global'")
+    if _add_column_if_missing(conn, "working_memory", "scope", "TEXT DEFAULT 'session'"):
+        # Pre-scope rows only carried a session_id -- they were session-private.
+        # The ADD COLUMN default would backfill them as 'global', which would
+        # make them readable AND (with cross-session update authorization)
+        # writable from any other session. Normalize to 'session'.
+        conn.execute("UPDATE working_memory SET scope = 'session' WHERE scope = 'global'")
+        conn.commit()
     _add_column_if_missing(conn, "episodic_memory", "valid_until", "TIMESTAMP DEFAULT NULL")
     _add_column_if_missing(conn, "episodic_memory", "superseded_by", "TEXT DEFAULT NULL")
-    _add_column_if_missing(conn, "episodic_memory", "scope", "TEXT DEFAULT 'global'")
+    if _add_column_if_missing(conn, "episodic_memory", "scope", "TEXT DEFAULT 'session'"):
+        conn.execute("UPDATE episodic_memory SET scope = 'session' WHERE scope = 'global'")
+        conn.commit()
 
     # --- NAI-0 Covering Indexes (v2.5) ---
     cursor.execute("""CREATE INDEX IF NOT EXISTS idx_em_scope_imp
@@ -1384,14 +1392,19 @@ def _sanitize_utf8(text: str) -> str:
         return text.encode('utf-8', errors='replace').decode('utf-8')
 
 
-def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, col_type: str):
-    """Safely add a column if it doesn't already exist (SQLite migration helper)."""
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, col_type: str) -> bool:
+    """Safely add a column if it doesn't already exist (SQLite migration helper).
+
+    Returns True when the column was added, False when it already existed.
+    """
     cursor = conn.cursor()
     cursor.execute(f"PRAGMA table_info({table})")
     existing = {row[1] for row in cursor.fetchall()}
     if column not in existing:
         cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
         conn.commit()
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -4493,7 +4506,7 @@ class BeamMemory:
             return False
         params.extend([memory_id, self.session_id])
         cursor.execute(
-            f"UPDATE working_memory SET {', '.join(updates)} WHERE id = ? AND session_id = ?",
+            f"UPDATE working_memory SET {', '.join(updates)} WHERE id = ? AND (session_id = ? OR scope = 'global')",
             params
         )
         affected = cursor.rowcount
