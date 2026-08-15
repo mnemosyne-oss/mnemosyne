@@ -179,6 +179,8 @@ If Mnemosyne is installed in an isolated venv, activate that venv or invoke its 
 mnemosyne mcp                          # stdio (default)
 mnemosyne mcp --transport sse --port 8080  # SSE (web clients)
 mnemosyne mcp --transport streamable-http --port 8080  # Streamable HTTP (native MCP http)
+# A non-loopback streamable-http bind also requires MNEMOSYNE_MCP_ALLOWED_HOSTS
+# (and, for browser clients, MNEMOSYNE_MCP_ALLOWED_ORIGINS) -- see docs/cli-reference.md.
 
 # Direct memory ops
 mnemosyne store "User likes dark mode"

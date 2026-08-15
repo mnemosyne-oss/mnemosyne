@@ -95,6 +95,75 @@ class TestResolveHttpAuth:
 
 
 # ---------------------------------------------------------------------------
+# Host/Origin policy (DNS-rebinding protection)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveTransportSecurity:
+    """`_resolve_transport_security` implements the Host/Origin contract."""
+
+    def test_loopback_returns_none(self, monkeypatch):
+        """Loopback keeps the SDK's built-in DNS-rebinding defaults."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", "ignored.example.com")
+        from mnemosyne.mcp_server import _resolve_transport_security
+        assert _resolve_transport_security("127.0.0.1") is None
+
+    def test_non_loopback_without_hosts_raises(self, monkeypatch):
+        """Non-loopback is fail-closed: a Host policy is mandatory."""
+        monkeypatch.delenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", raising=False)
+        from mnemosyne.mcp_server import _resolve_transport_security
+        with pytest.raises(RuntimeError, match="MNEMOSYNE_MCP_ALLOWED_HOSTS"):
+            _resolve_transport_security("0.0.0.0")
+
+    def test_non_loopback_single_host(self, monkeypatch):
+        """A single Host value becomes a one-entry allowlist."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", "mnemosyne.k.example.com")
+        from mnemosyne.mcp_server import _resolve_transport_security
+        security = _resolve_transport_security("0.0.0.0")
+        assert security.enable_dns_rebinding_protection is True
+        assert security.allowed_hosts == ["mnemosyne.k.example.com"]
+        assert security.allowed_origins == []
+
+    def test_non_loopback_host_list_trimmed(self, monkeypatch):
+        """Comma-separated Hosts are split, trimmed, and empties dropped."""
+        monkeypatch.setenv(
+            "MNEMOSYNE_MCP_ALLOWED_HOSTS",
+            " a.example.com, b.example.com:* ,, c.example.com ",
+        )
+        from mnemosyne.mcp_server import _resolve_transport_security
+        security = _resolve_transport_security("0.0.0.0")
+        assert security.allowed_hosts == [
+            "a.example.com",
+            "b.example.com:*",
+            "c.example.com",
+        ]
+
+    def test_origins_optional_and_parsed(self, monkeypatch):
+        """Origins stay empty by default; when set they are parsed the same way."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", "mnemosyne.k.example.com:*")
+        monkeypatch.setenv(
+            "MNEMOSYNE_MCP_ALLOWED_ORIGINS",
+            "https://inspector.example.com, https://app.example.com",
+        )
+        from mnemosyne.mcp_server import _resolve_transport_security
+        security = _resolve_transport_security("0.0.0.0")
+        assert security.allowed_origins == [
+            "https://inspector.example.com",
+            "https://app.example.com",
+        ]
+
+    def test_parse_csv_env(self, monkeypatch):
+        """Single value, list, whitespace, and empties are handled."""
+        from mnemosyne.mcp_server import _parse_csv_env
+        monkeypatch.delenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", raising=False)
+        assert _parse_csv_env("MNEMOSYNE_MCP_ALLOWED_HOSTS") == []
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", "only.example.com")
+        assert _parse_csv_env("MNEMOSYNE_MCP_ALLOWED_HOSTS") == ["only.example.com"]
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", " a ,, b ,")
+        assert _parse_csv_env("MNEMOSYNE_MCP_ALLOWED_HOSTS") == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
 # App building (Starlette + middleware)
 # ---------------------------------------------------------------------------
 
@@ -139,8 +208,9 @@ class TestBuildStreamableHttpApp:
             _build_streamable_http_app(host="0.0.0.0")
 
     def test_non_loopback_with_token_installs_middleware(self, monkeypatch):
-        """0.0.0.0 with token: app carries the bearer middleware."""
+        """0.0.0.0 with token + host policy: app carries the bearer middleware."""
         monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "supersecret")
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", "localhost:*")
         from mnemosyne.mcp_server import _build_streamable_http_app
         app = _build_streamable_http_app(host="0.0.0.0")
         names = [m.cls.__name__ for m in app.user_middleware]
@@ -170,15 +240,51 @@ class TestBuildStreamableHttpApp:
             "streamable_http_path": "/custom",
             "json_response": True,
             "host": "127.0.0.1",
+            "transport_security": None,
         }
 
     def test_builder_uses_module_level_bearer_middleware(self, monkeypatch):
         """Auth wiring reuses the shared _BearerTokenMiddleware class."""
         monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "supersecret")
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", "localhost:*")
         from mnemosyne.mcp_server import _BearerTokenMiddleware, _build_streamable_http_app
         app = _build_streamable_http_app(host="0.0.0.0")
         middleware_classes = [m.cls for m in app.user_middleware]
         assert any(c is _BearerTokenMiddleware for c in middleware_classes)
+
+    def test_non_loopback_without_hosts_raises(self, monkeypatch):
+        """0.0.0.0 with a token but no Host policy refuses to start."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "supersecret")
+        monkeypatch.delenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", raising=False)
+        from mnemosyne.mcp_server import _build_streamable_http_app
+        with pytest.raises(RuntimeError, match="MNEMOSYNE_MCP_ALLOWED_HOSTS"):
+            _build_streamable_http_app(host="0.0.0.0")
+
+    def test_builder_forwards_transport_security(self, monkeypatch):
+        """Non-loopback forwards the operator's Host/Origin policy to the SDK."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "supersecret")
+        monkeypatch.setenv(
+            "MNEMOSYNE_MCP_ALLOWED_HOSTS", " a.example.com , b.example.com:* "
+        )
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_ORIGINS", "https://inspector.example.com")
+        from starlette.applications import Starlette
+        from mnemosyne import mcp_server
+
+        captured = {}
+
+        class _FakeServer:
+            def streamable_http_app(self, **kwargs):
+                captured.update(kwargs)
+                return Starlette(routes=[])
+
+        with patch.object(mcp_server, "_build_mcp_server", return_value=_FakeServer()):
+            mcp_server._build_streamable_http_app(host="0.0.0.0")
+
+        security = captured["transport_security"]
+        assert security is not None
+        assert security.enable_dns_rebinding_protection is True
+        assert security.allowed_hosts == ["a.example.com", "b.example.com:*"]
+        assert security.allowed_origins == ["https://inspector.example.com"]
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +302,7 @@ class TestStreamableHttpBearerRejection:
     @pytest.fixture
     def authed_app(self, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "supersecret")
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", "localhost:*")
         from mnemosyne.mcp_server import _build_streamable_http_app
         return _build_streamable_http_app(host="0.0.0.0")
 
@@ -402,6 +509,88 @@ class TestStreamableHttpLifecycle:
                 headers={"Accept": "application/json, text/event-stream"},
             )
         assert resp.status_code == 421
+
+    def test_non_loopback_disallowed_host_rejected_421(self, monkeypatch):
+        """A valid bearer still gets 421 when the Host is not allowlisted."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "supersecret")
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", "mnemosyne.k.example.com:*")
+        from mnemosyne.mcp_server import _build_streamable_http_app
+        from starlette.testclient import TestClient
+
+        app = _build_streamable_http_app(host="0.0.0.0")
+        with TestClient(app, base_url="http://evil.example.com:8080") as client:
+            resp = client.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "initialize",
+                    "id": 1,
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {"name": "e2e", "version": "0"},
+                    },
+                },
+                headers={
+                    "Authorization": "Bearer supersecret",
+                    "Accept": "application/json, text/event-stream",
+                    "MCP-Protocol-Version": "2025-03-26",
+                },
+            )
+        assert resp.status_code == 421
+
+    def test_non_loopback_disallowed_origin_rejected_403(self, monkeypatch):
+        """A browser Origin outside the allowlist is rejected with 403."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "supersecret")
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", "mnemosyne.k.example.com:*")
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_ORIGINS", "https://inspector.example.com")
+        from mnemosyne.mcp_server import _build_streamable_http_app
+        from starlette.testclient import TestClient
+
+        app = _build_streamable_http_app(host="0.0.0.0")
+        with TestClient(app, base_url="http://mnemosyne.k.example.com:8080") as client:
+            resp = client.post(
+                "/mcp",
+                json={"jsonrpc": "2.0", "method": "ping", "id": 1},
+                headers={
+                    "Authorization": "Bearer supersecret",
+                    "Accept": "application/json, text/event-stream",
+                    "Origin": "https://evil.example.com",
+                },
+            )
+        assert resp.status_code == 403
+
+    def test_non_loopback_allowed_host_and_origin_succeed(self, monkeypatch):
+        """An allowlisted browser Origin completes an MCP operation."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "supersecret")
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_HOSTS", "mnemosyne.k.example.com:*")
+        monkeypatch.setenv("MNEMOSYNE_MCP_ALLOWED_ORIGINS", "https://inspector.example.com")
+        from mnemosyne.mcp_server import _build_streamable_http_app
+        from starlette.testclient import TestClient
+
+        app = _build_streamable_http_app(host="0.0.0.0")
+        with TestClient(app, base_url="http://mnemosyne.k.example.com:8080") as client:
+            resp = client.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "initialize",
+                    "id": 1,
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {"name": "e2e", "version": "0"},
+                    },
+                },
+                headers={
+                    "Authorization": "Bearer supersecret",
+                    "Accept": "application/json, text/event-stream",
+                    "MCP-Protocol-Version": "2025-03-26",
+                    "Origin": "https://inspector.example.com",
+                },
+            )
+        assert resp.status_code == 200
+        assert "serverInfo" in resp.text
 
 
 # ---------------------------------------------------------------------------

@@ -98,6 +98,55 @@ The built-in help lists only `hygiene audit|clean`; `status` and `restore` exist
 
 stdio is the default transport. `sse` and `streamable-http` are HTTP transports; a non-loopback bind requires `MNEMOSYNE_MCP_TOKEN`. `streamable-http` (alias `http`) is the native MCP Streamable HTTP transport: clients POST JSON-RPC straight to `--path` (default `/mcp`) with no separate `/messages` route to proxy. Add `--json-response` to force JSON-only responses instead of the default SSE-upgrade streaming.
 
+### Streamable HTTP Host/Origin policy
+
+The Streamable HTTP transport applies a Host/Origin policy on **non-loopback**
+binds (DNS-rebinding protection). Loopback binds (`127.0.0.1`, `localhost`,
+`::1`) keep the SDK's built-in defaults and ignore these variables.
+
+- `MNEMOSYNE_MCP_ALLOWED_HOSTS` — **required** to start a non-loopback server.
+  Comma-separated `Host` header values clients will present. Each value is an
+  exact name or a `name:*` pattern covering any port. Any request whose `Host`
+  is not listed is rejected with HTTP 421.
+- `MNEMOSYNE_MCP_ALLOWED_ORIGINS` — **optional**. Comma-separated browser
+  `Origin` values to allow. Requests with **no** `Origin` header always pass;
+  any `Origin` not listed is rejected with HTTP 403.
+
+**Single value vs. list.** Both variables accept one value or several,
+comma-separated (whitespace is trimmed, empty entries ignored):
+
+```bash
+# single
+export MNEMOSYNE_MCP_ALLOWED_HOSTS="mnemosyne.k.example.com:*"
+# list
+export MNEMOSYNE_MCP_ALLOWED_HOSTS="mnemosyne.k.example.com:*, mnemosyne.example.org"
+export MNEMOSYNE_MCP_ALLOWED_ORIGINS="https://inspector.example.com, https://app.example.com"
+```
+
+**SDK / CLI clients** (curl, MCP SDKs, Claude Code, etc.) send no `Origin`
+header, so they are unaffected by `MNEMOSYNE_MCP_ALLOWED_ORIGINS`. They only
+need their `Host` listed. Include the port wildcard (`name:*`) because clients
+and load balancers frequently send `host:port`.
+
+**Browser clients** (e.g. MCP Inspector) send an `Origin` header, so in
+addition to a matching `Host` you must add the browser's origin to
+`MNEMOSYNE_MCP_ALLOWED_ORIGINS`, otherwise they get HTTP 403. Note the SDK does
+**not** support a bare `*` wildcard — list each origin explicitly.
+
+**Reverse proxies.** The `Host` header the server sees is whatever the proxy
+forwards (nginx `proxy_set_header Host $host` passes the original hostname).
+If multiple public hostnames or ports route to the same server, list each one;
+the same applies to `Origin` when browser clients arrive via different hosts.
+Bare `*` is never a valid entry.
+
+Example for a deployment behind an nginx ingress on one hostname:
+
+```bash
+MNEMOSYNE_MCP_TOKEN=<token> \
+MNEMOSYNE_MCP_ALLOWED_HOSTS="mnemosyne.k.example.com:*" \
+mnemosyne mcp --transport streamable-http --host 0.0.0.0 --port 8080
+```
+
 ## Aliases
 
 `remember`=`store`, `search`=`recall`, `edit`=`update`, `forget`=`delete`, `consolidate`=`sleep`, `sync-server`=`sync-serve`.

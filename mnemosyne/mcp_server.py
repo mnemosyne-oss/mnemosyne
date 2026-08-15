@@ -17,7 +17,8 @@ Usage:
     # via env var
     MNEMOSYNE_MCP_TOKEN=my-secret-token mnemosyne mcp \\
         --transport sse --host 0.0.0.0 --port 8080
-    MNEMOSYNE_MCP_TOKEN=my-secret-token mnemosyne mcp \\
+    MNEMOSYNE_MCP_TOKEN=my-secret-token \\
+    MNEMOSYNE_MCP_ALLOWED_HOSTS=mnemosyne.k.example.com:* mnemosyne mcp \\
         --transport streamable-http --host 0.0.0.0 --port 8080
 
     # Custom streamable HTTP endpoint path (default: /mcp)
@@ -37,6 +38,14 @@ Security note (S1, 2026-05-12):
     the server refuses to start. This prevents a LAN attacker from
     reading/writing/deleting the user's memory via an unauthenticated
     MCP endpoint.
+
+    The Streamable HTTP transport additionally applies a Host/Origin policy
+    on non-loopback binds (fail-closed): MNEMOSYNE_MCP_ALLOWED_HOSTS is
+    required (comma-separated exact names or ``name:*`` patterns), and
+    MNEMOSYNE_MCP_ALLOWED_ORIGINS optionally allowlists browser origins.
+    Requests without an Origin header (CLI/SDK clients) always pass the
+    origin check; any Origin not listed is rejected with HTTP 403. See
+    docs/cli-reference.md for the full contract.
 """
 
 import hmac
@@ -80,11 +89,60 @@ from mnemosyne.mcp_tools import get_tool_definitions, handle_tool_call
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "ip6-localhost"})
 
 _TOKEN_ENV = "MNEMOSYNE_MCP_TOKEN"
+_ALLOWED_HOSTS_ENV = "MNEMOSYNE_MCP_ALLOWED_HOSTS"
+_ALLOWED_ORIGINS_ENV = "MNEMOSYNE_MCP_ALLOWED_ORIGINS"
 
 
 def _is_loopback(host: str) -> bool:
     """Return True if `host` is a loopback bind that needs no auth."""
     return host.strip().lower() in _LOOPBACK_HOSTS
+
+
+def _parse_csv_env(name: str) -> list[str]:
+    """Parse a comma-separated env var into trimmed non-empty items.
+
+    Accepts a single value or a list: ``a.example.com`` and
+    ``a.example.com, b.example.com:*`` both work. Empty/unset returns ``[]``.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _resolve_transport_security(host: str):
+    """Resolve the Host/Origin policy for the Streamable HTTP transport.
+
+    Loopback binds return None so the mcp SDK keeps its built-in
+    DNS-rebinding protection (allowed Hosts/Origins fixed to
+    127.0.0.1/localhost/[::1]).
+
+    Non-loopback binds are fail-closed: the operator must declare the Host
+    header values clients will present via MNEMOSYNE_MCP_ALLOWED_HOSTS
+    (comma-separated; each value is an exact host or a ``name:*`` pattern
+    covering any port), otherwise startup is refused. Origins default to an
+    empty allowlist: requests that send no Origin header (CLI/SDK clients)
+    always pass, while any browser origin is rejected unless listed in
+    MNEMOSYNE_MCP_ALLOWED_ORIGINS.
+    """
+    if _is_loopback(host):
+        return None
+    allowed_hosts = _parse_csv_env(_ALLOWED_HOSTS_ENV)
+    if not allowed_hosts:
+        raise RuntimeError(
+            f"Refusing to bind MCP Streamable HTTP on non-loopback host {host!r} "
+            f"without a Host policy. Set the {_ALLOWED_HOSTS_ENV} env var to the "
+            f"comma-separated Host header values clients will present (exact names "
+            f"or 'name:*' patterns), e.g. 'mnemosyne.k.example.com:*'. Or bind to "
+            f"127.0.0.1 (the default) for local-only use."
+        )
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=_parse_csv_env(_ALLOWED_ORIGINS_ENV),
+    )
 
 
 def _resolve_http_auth(host: str) -> Tuple[bool, Optional[str]]:
@@ -351,19 +409,22 @@ def _build_streamable_http_app(
     Split out from `_run_streamable_http` so the auth-gating +
     middleware-installation logic is testable without spinning up uvicorn.
 
-    Returns the configured Starlette application. Raises RuntimeError if
-    host is non-loopback and MNEMOSYNE_MCP_TOKEN is unset.
+    Returns the configured Starlette application. Raises RuntimeError when
+    host is non-loopback and MNEMOSYNE_MCP_TOKEN or
+    MNEMOSYNE_MCP_ALLOWED_HOSTS is unset.
     """
     if not _MCP_AVAILABLE:
         raise RuntimeError("MCP not installed. Run: pip install mnemosyne-memory[mcp]")
 
     require_auth, token = _resolve_http_auth(host)
+    transport_security = _resolve_transport_security(host)
 
     server = _build_mcp_server()
     app = server.streamable_http_app(
         streamable_http_path=path,
         json_response=json_response,
         host=host,
+        transport_security=transport_security,
     )
 
     if require_auth:
