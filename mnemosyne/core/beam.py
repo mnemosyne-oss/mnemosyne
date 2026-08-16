@@ -2911,6 +2911,22 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     return plan
 
 
+def _is_query_dim_mismatch(exc: BaseException, query_dim: int, existing_dim: Optional[int]) -> bool:
+    """True only when sqlite-vec actually rejected the query vector for its
+    dimension.
+
+    An unrelated ``OperationalError`` (locked database, missing table) must not
+    be dressed up as a dimension mismatch with self-heal guidance, even when
+    the submitted and stored dimensions happen to disagree: classify on the
+    error's own signal, not on the dimension coincidence alone.
+    """
+    return (
+        existing_dim is not None
+        and query_dim != existing_dim
+        and "dimension mismatch" in str(exc).lower()
+    )
+
+
 def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -> List[Dict]:
     """Search sqlite-vec and return rowids with distances.
 
@@ -2965,7 +2981,7 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
             existing_dim = _existing_vec_dim(conn)
         except Exception:
             existing_dim = None
-        if existing_dim is not None and query_dim != existing_dim:
+        if _is_query_dim_mismatch(exc, query_dim, existing_dim):
             # Keep stored/query/configured dimensions separate: the reindex
             # guidance in _dim_mismatch_message is only correct when the
             # CONFIGURED dimension disagrees with the store. When config and
