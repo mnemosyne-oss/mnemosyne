@@ -2952,23 +2952,26 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
         # Degrade, don't crash: the write path already drops mismatched
         # vectors with a warning and the working-memory KNN
         # (_wm_vec_search_sqlite) returns [] on the same condition; this is
-        # the episodic voice's equivalent. Most often the query embedding's
-        # dimension disagrees with the table's because the process resolved a
-        # different EMBEDDING_DIM than the one that dimensioned the store --
-        # recall falls back to the non-vector voices for this call instead of
-        # taking down the agent process. _dim_mismatch_message() carries the
-        # self-heal guidance; keep this pointer short and point at it.
+        # the episodic voice's equivalent. Classify against the dimension of
+        # the query vector actually submitted, not the configured
+        # EMBEDDING_DIM: in the failure shape from the issue the table and the
+        # config agree (both 1024) while the endpoint serves a 384-dim query,
+        # and sqlite-vec rejects exactly that combination. Recall falls back
+        # to the non-vector voices for this call instead of taking down the
+        # agent process. _dim_mismatch_message() carries the self-heal
+        # guidance; keep this pointer short and point at it.
+        query_dim = len(embedding)
         try:
             existing_dim = _existing_vec_dim(conn)
         except Exception:
             existing_dim = None
-        if existing_dim is not None and existing_dim != EMBEDDING_DIM:
+        if existing_dim is not None and query_dim != existing_dim:
             logger.error(
-                "Dimension mismatch querying vec_episodes (query configured "
+                "Dimension mismatch querying vec_episodes (query vector is "
                 "%s-dim, table is %s-dim); vector recall disabled for this "
                 "call, falling back to other recall voices. %s",
-                EMBEDDING_DIM, existing_dim,
-                _dim_mismatch_message(existing_dim, EMBEDDING_DIM),
+                query_dim, existing_dim,
+                _dim_mismatch_message(existing_dim, query_dim),
             )
         else:
             logger.warning(
