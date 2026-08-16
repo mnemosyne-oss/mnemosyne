@@ -66,8 +66,15 @@ def test_vec_search_guidance_when_config_agrees_but_query_differs(tmp_path, monk
         rows = beam._vec_search(beam._get_connection(db), [0.01] * 384, k=5)
     assert rows == []
     logged = " ".join(r.message for r in caplog.records)
-    assert beam._dim_mismatch_message(1024, 384).strip() in logged, logged
+    # All three dimensions are reported separately and truthfully...
     assert "query vector is 384-dim" in logged, logged
+    assert "table is 1024-dim" in logged, logged
+    assert "process configured 1024-dim" in logged, logged
+    # ...and the guidance points at the embedding endpoint, NOT at a reindex:
+    # the store and the configuration agree, so reindex advice would be false.
+    assert "embedding endpoint/model served a 384-dim query vector" in logged, logged
+    assert "no reindex is needed" in logged, logged
+    assert "mnemosyne reindex" not in logged, logged
 
 
 def test_vec_search_generic_warning_when_table_dim_unreadable(tmp_path, monkeypatch, caplog):
@@ -147,3 +154,7 @@ def test_linear_recall_serves_lexical_candidates_under_mismatch(tmp_path, monkey
 
     results = mem.recall("quantum harmonic oscillator", top_k=5)
     assert results, "lexical voices must still serve recall under a dimension mismatch"
+    # The recalled rows must actually be the seeded memories, not just
+    # "something came back".
+    contents = [(r.get("content") or "") if isinstance(r, dict) else getattr(r, "content", "") for r in results]
+    assert any("quantum harmonic oscillator" in c for c in contents), contents
