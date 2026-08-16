@@ -2966,12 +2966,29 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
         except Exception:
             existing_dim = None
         if existing_dim is not None and query_dim != existing_dim:
+            # Keep stored/query/configured dimensions separate: the reindex
+            # guidance in _dim_mismatch_message is only correct when the
+            # CONFIGURED dimension disagrees with the store. When config and
+            # store agree, the embedding endpoint/model served a wrong-dim
+            # query vector and the store needs nothing -- pointing at a
+            # reindex there would be false and destructive advice.
+            if existing_dim != EMBEDDING_DIM:
+                guidance = _dim_mismatch_message(existing_dim, EMBEDDING_DIM)
+            else:
+                guidance = (
+                    f"The store and the process configuration agree at "
+                    f"{existing_dim}-dim; the embedding endpoint/model served "
+                    f"a {query_dim}-dim query vector. Point "
+                    f"MNEMOSYNE_EMBEDDING_API_URL / MNEMOSYNE_EMBEDDING_MODEL "
+                    f"at a {existing_dim}-dim model. The stored vectors are "
+                    f"fine; no reindex is needed."
+                )
             logger.error(
                 "Dimension mismatch querying vec_episodes (query vector is "
-                "%s-dim, table is %s-dim); vector recall disabled for this "
-                "call, falling back to other recall voices. %s",
-                query_dim, existing_dim,
-                _dim_mismatch_message(existing_dim, query_dim),
+                "%s-dim, table is %s-dim, process configured %s-dim); vector "
+                "recall disabled for this call, falling back to other recall "
+                "voices. %s",
+                query_dim, existing_dim, EMBEDDING_DIM, guidance,
             )
         else:
             logger.warning(
