@@ -49,16 +49,36 @@ def test_vec_search_degrades_on_dimension_mismatch_with_guidance(tmp_path, monke
     assert expected.strip() in logged, logged
 
 
-def test_vec_search_generic_operational_error_degrades(tmp_path, monkeypatch, caplog):
-    """An OperationalError that is not a table-vs-config dimension mismatch
-    (table and config agree) still degrades: warning + [], never a raise."""
+def test_vec_search_guidance_when_config_agrees_but_query_differs(tmp_path, monkeypatch, caplog):
+    """The issue's actual failure shape: table AND configured EMBEDDING_DIM
+    agree (both 1024) while the endpoint serves a 384-dim query vector. The
+    guidance branch must classify against the submitted query vector's
+    dimension, not the config, and emit the self-heal guidance."""
     if not beam._SQLITE_VEC_AVAILABLE:
         pytest.skip("sqlite-vec unavailable")
 
-    db = _store_at(monkeypatch, tmp_path, "agree.db", 768)
-    # Config agrees with the table (768), but the QUERY vector is 384-dim:
-    # the KNN still rejects it, taking the generic branch.
+    db = _store_at(monkeypatch, tmp_path, "agree.db", 1024)
+    # Config agrees with the table (1024): a config-vs-table comparison would
+    # take the generic branch and drop the guidance.
+    monkeypatch.setattr(beam, "EMBEDDING_DIM", 1024)
+
+    with caplog.at_level("ERROR", logger="mnemosyne.core.beam"):
+        rows = beam._vec_search(beam._get_connection(db), [0.01] * 384, k=5)
+    assert rows == []
+    logged = " ".join(r.message for r in caplog.records)
+    assert beam._dim_mismatch_message(1024, 384).strip() in logged, logged
+    assert "query vector is 384-dim" in logged, logged
+
+
+def test_vec_search_generic_warning_when_table_dim_unreadable(tmp_path, monkeypatch, caplog):
+    """When the table's declared dimension cannot be read, the mismatch
+    cannot be classified: degrade with the generic warning, never a raise."""
+    if not beam._SQLITE_VEC_AVAILABLE:
+        pytest.skip("sqlite-vec unavailable")
+
+    db = _store_at(monkeypatch, tmp_path, "unreadable.db", 768)
     monkeypatch.setattr(beam, "EMBEDDING_DIM", 768)
+    monkeypatch.setattr(beam, "_existing_vec_dim", lambda conn: None)
 
     with caplog.at_level("WARNING", logger="mnemosyne.core.beam"):
         rows = beam._vec_search(beam._get_connection(db), [0.01] * 384, k=5)
