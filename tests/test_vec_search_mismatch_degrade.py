@@ -77,6 +77,24 @@ def test_vec_search_guidance_when_config_agrees_but_query_differs(tmp_path, monk
     assert "mnemosyne reindex" not in logged, logged
 
 
+def test_classification_requires_dim_error_signal():
+    """Only sqlite-vec's own dimension-mismatch error may take the guidance
+    path. An unrelated OperationalError (locked database) must stay on the
+    generic warning path even when the submitted and stored dimensions
+    disagree, or it would emit false reindex guidance."""
+    import sqlite3
+
+    dim_error = sqlite3.OperationalError(
+        'Dimension mismatch for query vector for the "embedding" column. '
+        "Expected 1024 dimensions but received 384."
+    )
+    locked_error = sqlite3.OperationalError("database is locked")
+    assert beam._is_query_dim_mismatch(dim_error, 384, 1024) is True
+    assert beam._is_query_dim_mismatch(locked_error, 384, 1024) is False
+    assert beam._is_query_dim_mismatch(dim_error, 1024, 1024) is False
+    assert beam._is_query_dim_mismatch(dim_error, 384, None) is False
+
+
 def test_vec_search_generic_warning_when_table_dim_unreadable(tmp_path, monkeypatch, caplog):
     """When the table's declared dimension cannot be read, the mismatch
     cannot be classified: degrade with the generic warning, never a raise."""
