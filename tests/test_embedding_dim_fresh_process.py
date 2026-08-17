@@ -223,13 +223,26 @@ def _fake_endpoint_code(dim: int) -> str:
 
 def _fake_endpoint_recall_only_code(dim: int) -> str:
     """Same fake endpoint and boot, but only recalls: for a SECOND process
-    reopening a data directory written by a previous one."""
+    reopening a data directory written by a previous one.
+
+    The endpoint answers EVERY request with the vector the writer stored for
+    the probe document (same seeded function), so the reader's query
+    embedding is exactly the stored vector. The reader asserts the recalled
+    row's dense_score: nonzero only when the KNN ran over the REOPENED
+    vec_working table and matched, which FTS alone cannot produce."""
     return textwrap.dedent(
         f"""
         import json
+        import math
         import os
         import threading
         from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        def _vec_for(text):
+            seed = sum((i + 1) * ord(c) for i, c in enumerate(text))
+            return [math.sin(seed * 0.0001 + i * 0.01) for i in range({dim})]
+
+        _doc_vec = _vec_for("dimension end to end document")
 
         class _FakeEmbeddings(BaseHTTPRequestHandler):
             def do_POST(self):
@@ -238,7 +251,7 @@ def _fake_endpoint_recall_only_code(dim: int) -> str:
                     return
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 payload = json.dumps({{
-                    "data": [{{"embedding": [0.01] * {dim}, "index": i}} for i in range(len(body["input"]))]
+                    "data": [{{"embedding": _doc_vec, "index": i}} for i in range(len(body["input"]))]
                 }}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -262,6 +275,11 @@ def _fake_endpoint_recall_only_code(dim: int) -> str:
             (r.get("content") if isinstance(r, dict) else getattr(r, "content", "")) or ""
             for r in results
         ]))
+        print("RECALL_TOP", results[0].get("content", "") if results else "")
+        # dense_score is nonzero only when the KNN over the REOPENED
+        # vec_working table returned the row: FTS alone would still surface
+        # the document with dense_score 0.0.
+        print("DENSE", results[0].get("dense_score", -1) if results else -1)
         """
     )
 
@@ -359,20 +377,29 @@ def test_second_process_recalls_stored_memory_same_dim(tmp_path):
     assert re.search(r"RECALL [1-9]", out), out + reader.stderr
     recall_content = re.search(r"^RECALL_CONTENT (.+)$", out, re.M)
     assert recall_content and "dimension end to end document" in recall_content.group(1), out
+    top = re.search(r"^RECALL_TOP (.+)$", out, re.M)
+    assert top and "dimension end to end document" in top.group(1), out
+    assert top and "grocery" not in top.group(1), out
+    # Vector-backed proof: dense_score is nonzero only when the KNN over the
+    # reopened vec_working table returned the stored row (the endpoint serves
+    # exactly that vector, so the match is ~1.0). An FTS-only retrieval over a
+    # store that lost its vectors would report 0.0.
+    dense = re.search(r"^DENSE (\S+)$", out, re.M)
+    assert dense and float(dense.group(1)) > 0.9, out
 
 
-def test_endpoint_serving_wrong_dim_leaves_vec_store_empty(tmp_path):
-    """The failure half of the explicit-dimension contract: when the endpoint's
-    true dimension (384) disagrees with the explicit MNEMOSYNE_EMBEDDING_DIM
-    (1024), the mismatched vector must NOT be stored — vec_working stays empty
-    (the write-side insert is discarded with a logged warning, it does not
-    corrupt the 1024-dim vec0 table). The mismatched query-side vector then
-    surfaces as a non-zero exit: sqlite-vec rejects the 384-dim query against
-    the 1024-dim table and the recall path does not swallow that error. Both
-    outcomes are pinned so neither regresses silently."""
+def test_endpoint_serving_wrong_dim_degrades_and_serves_lexical_fallback(tmp_path):
+    """The failure half of the explicit-dimension contract, post-#754: when the
+    endpoint's true dimension (384) disagrees with the explicit
+    MNEMOSYNE_EMBEDDING_DIM (1024), the mismatched vectors must NOT be stored
+    (vec_working stays empty; the write-side insert is discarded with a logged
+    warning, never corrupting the 1024-dim vec0 table) and the mismatched
+    query degrades instead of crashing the process: recall() keeps serving the
+    stored memories through its lexical voices while an actionable dimension
+    diagnostic reaches stderr."""
     # Skip before launching the child: without sqlite-vec there is no vec0
-    # table, the mismatched query degrades instead of raising, and this
-    # scenario's premise (a 1024-dim table to mismatch against) is absent.
+    # table and this scenario's premise (a 1024-dim table to mismatch against)
+    # is absent.
     sqlite_vec = pytest.importorskip("sqlite_vec")  # noqa: F841
     result = _run_fresh(
         _fake_endpoint_code(384),
@@ -380,14 +407,18 @@ def test_endpoint_serving_wrong_dim_leaves_vec_store_empty(tmp_path):
         MNEMOSYNE_EMBEDDING_MODEL="mixedbread-ai/mxbai-embed-large-v1",
         MNEMOSYNE_EMBEDDING_DIM="1024",
     )
-    # Query-side mismatch is loud: recall with a 384-dim query against the
-    # 1024-dim vec0 table raises (documented current behavior, pinned here).
-    # Assert the exit first so a quiet failure surfaces stderr, not a regex
-    # miss on markers that a crash before their print would cause.
-    assert result.returncode != 0, "mismatched-dim query unexpectedly succeeded:\n" + result.stdout
+    # Degraded, not crashed: the process completes and the mismatch diagnostic
+    # (from #754's query-side guard) reaches stderr.
+    assert result.returncode == 0, "mismatched-dim query still crashes the process:\n" + result.stderr
     assert re.search(r"dimension mismatch", result.stderr, re.I), result.stderr
-    # The endpoint was consulted for the write before the query failed.
+    # Both the write-side and query-side embedding calls went to the endpoint.
     assert int(re.search(r"REQUESTS (\d+)", result.stdout).group(1)) >= 1, result.stdout + result.stderr
+    # The lexical voices still serve the stored memories.
+    out = result.stdout
+    assert re.search(r"RECALL [1-9]", out), out + result.stderr
+    recall_content = re.search(r"^RECALL_CONTENT (.+)$", out, re.M)
+    assert recall_content and "dimension end to end document" in recall_content.group(1), out
+    # And the mismatched vectors never reached the 1024-dim vec0 table.
     conn = sqlite3.connect(tmp_path / "data" / "mnemosyne.db")
     try:
         conn.enable_load_extension(True)

@@ -9,7 +9,7 @@ Mnemosyne is designed to work with zero configuration. All settings have sensibl
 | `MNEMOSYNE_EMBEDDING_API_URL` | `${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}` | Preferred name for custom embedding API endpoint. Falls back to `OPENROUTER_BASE_URL`. |
 | `MNEMOSYNE_EMBEDDING_API_KEY` | `${OPENROUTER_API_KEY:-${OPENAI_API_KEY:-}}` | Preferred name for embedding API key. Falls back to `OPENROUTER_API_KEY`, then `OPENAI_API_KEY`. |
 
-> **Privacy:** a remote embedding endpoint receives the text of your memories for vectorization. For privacy-sensitive or local-first deployments prefer local embeddings (the `[embeddings]` / `[all]` install profiles).
+> **Privacy:** a remote embedding endpoint receives the text of your memories and of your recall queries for vectorization. For privacy-sensitive or local-first deployments prefer local embeddings (the `[embeddings]` / `[all]` install profiles).
 
 ## Data Directory
 
