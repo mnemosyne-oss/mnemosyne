@@ -204,12 +204,12 @@ def _fake_endpoint_code(dim: int) -> str:
         print("REQUESTS_TOTAL", REQUESTS["n"])
         print("QUERY_MODEL", REQUESTS["log"][-1]["model"])
         print("QUERY_INPUT", REQUESTS["log"][-1]["input"][0])
+        def _content(r):
+            return (r.get("content") if isinstance(r, dict) else getattr(r, "content", "")) or ""
+
         print("RECALL", len(results))
-        print("RECALL_CONTENT", json.dumps([
-            (r.get("content") if isinstance(r, dict) else getattr(r, "content", "")) or ""
-            for r in results
-        ]))
-        print("RECALL_TOP", results[0].get("content", "") if results else "")
+        print("RECALL_CONTENT", json.dumps([_content(r) for r in results]))
+        print("RECALL_TOP", _content(results[0]) if results else "")
         if beam._SQLITE_VEC_AVAILABLE:
             import sqlite_vec
             conn = sqlite3.connect(beam._default_db_path())
@@ -270,12 +270,12 @@ def _fake_endpoint_recall_only_code(dim: int) -> str:
         from mnemosyne.core.memory import recall
         beam.init_beam()
         results = recall("dimension end to end document", top_k=3)
+        def _content(r):
+            return (r.get("content") if isinstance(r, dict) else getattr(r, "content", "")) or ""
+
         print("RECALL", len(results))
-        print("RECALL_CONTENT", json.dumps([
-            (r.get("content") if isinstance(r, dict) else getattr(r, "content", "")) or ""
-            for r in results
-        ]))
-        print("RECALL_TOP", results[0].get("content", "") if results else "")
+        print("RECALL_CONTENT", json.dumps([_content(r) for r in results]))
+        print("RECALL_TOP", _content(results[0]) if results else "")
         # dense_score is nonzero only when the KNN over the REOPENED
         # vec_working table returned the row: FTS alone would still surface
         # the document with dense_score 0.0.
@@ -358,6 +358,9 @@ def test_second_process_recalls_stored_memory_same_dim(tmp_path):
     created by the writer process; the reader proves they survive the process
     boundary and serve a vector-backed recall (same-process recall alone, or
     two readers in one process, would not)."""
+    # Skip before launching either child: the DENSE assertion below requires
+    # the reopened vec0 table, which does not exist without sqlite-vec.
+    pytest.importorskip("sqlite_vec")
     writer = _run_fresh(
         _fake_endpoint_code(1024),
         tmp_path,
@@ -411,6 +414,10 @@ def test_endpoint_serving_wrong_dim_degrades_and_serves_lexical_fallback(tmp_pat
     # (from #754's query-side guard) reaches stderr.
     assert result.returncode == 0, "mismatched-dim query still crashes the process:\n" + result.stderr
     assert re.search(r"dimension mismatch", result.stderr, re.I), result.stderr
+    # Query-side specific: the write-side warning also says "dimension
+    # mismatch", so pin the guard's own wording to catch the guidance branch
+    # regressing into the generic warning.
+    assert re.search(r"query vector is 384-dim", result.stderr), result.stderr
     # Both the write-side and query-side embedding calls went to the endpoint.
     assert int(re.search(r"REQUESTS (\d+)", result.stdout).group(1)) >= 1, result.stdout + result.stderr
     # The lexical voices still serve the stored memories.
