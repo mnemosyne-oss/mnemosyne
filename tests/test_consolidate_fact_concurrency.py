@@ -407,12 +407,14 @@ class TestReviewHardening:
         db_path = tmp_path / "pragma_check.db"
         cons = VeracityConsolidator(db_path=db_path)
 
-        # Verify journal_mode is WAL
+        # Verify journal_mode matches the configured mode (WAL unless
+        # MNEMOSYNE_JOURNAL_MODE overrides it)
+        from mnemosyne.core.journal import journal_mode
         mode = cons.conn.execute(
             "PRAGMA journal_mode"
         ).fetchone()[0]
-        assert mode.lower() == "wal", (
-            f"expected journal_mode=wal, got {mode!r} — "
+        assert mode.lower() == journal_mode(), (
+            f"expected journal_mode={journal_mode()}, got {mode!r} — "
             "VeracityConsolidator.__init__ didn't apply PRAGMA"
         )
 

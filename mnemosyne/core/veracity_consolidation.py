@@ -29,6 +29,7 @@ import sqlite3
 import json
 import threading
 import unicodedata
+from .journal import journal_mode
 from datetime import datetime
 from typing import Dict, List, Optional
 from dataclasses import dataclass
@@ -294,7 +295,7 @@ class VeracityConsolidator:
             # after #84. /review (Claude CRITICAL) caught the
             # branch-rebase dependency.
             try:
-                self.conn.execute("PRAGMA journal_mode=WAL")
+                self.conn.execute(f"PRAGMA journal_mode={journal_mode()}")
                 self.conn.execute("PRAGMA busy_timeout=5000")
             except sqlite3.Error:
                 # Best-effort: in-memory or otherwise-constrained

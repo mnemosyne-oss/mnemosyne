@@ -37,6 +37,7 @@ import threading
 from typing import List, Dict, Optional
 from pathlib import Path
 import sqlite3
+from .journal import journal_mode
 
 
 _OPAQUE_V2_KEY_RE = re.compile(r"v2:[0-9a-f]{64}")
@@ -102,7 +103,7 @@ class QueryCache:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(f"PRAGMA journal_mode={journal_mode()}")
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS query_cache (
                 normalized TEXT PRIMARY KEY,

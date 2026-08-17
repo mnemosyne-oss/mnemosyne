@@ -348,10 +348,11 @@ class TestReviewHardening:
         db_path = tmp_path / "pragma_check.db"
         cons = VeracityConsolidator(db_path=db_path)
 
+        from mnemosyne.core.journal import journal_mode
         mode = cons.conn.execute(
             "PRAGMA journal_mode"
         ).fetchone()[0]
-        assert mode.lower() == "wal", (
+        assert mode.lower() == journal_mode(), (
             f"expected journal_mode=wal, got {mode!r} — "
             "VeracityConsolidator.__init__ didn't apply PRAGMA"
         )
