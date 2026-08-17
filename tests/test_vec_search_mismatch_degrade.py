@@ -95,6 +95,26 @@ def test_classification_requires_dim_error_signal():
     assert beam._is_query_dim_mismatch(dim_error, 384, None) is False
 
 
+def test_vec_search_degrades_on_non_operational_sqlite_error(monkeypatch, caplog):
+    """A sqlite3.Error that is not an OperationalError (DatabaseError,
+    InternalError, ...) must also degrade: recall() does not guard this call,
+    so narrowing the guard to OperationalError alone would let siblings crash
+    the process again."""
+    import sqlite3
+
+    class _BoomConn:
+        def execute(self, *a, **k):
+            raise sqlite3.DatabaseError("disk I/O error")
+
+    monkeypatch.setattr(beam, "_effective_vec_type", lambda conn, table=None: "float32")
+    with caplog.at_level("WARNING", logger="mnemosyne.core.beam"):
+        rows = beam._vec_search(_BoomConn(), [0.01] * 768, k=5)
+    assert rows == []
+    assert any("vec_episodes query failed" in r.message for r in caplog.records), [
+        r.message for r in caplog.records
+    ]
+
+
 def test_vec_search_generic_warning_when_table_dim_unreadable(tmp_path, monkeypatch, caplog):
     """When the table's declared dimension cannot be read, the mismatch
     cannot be classified: degrade with the generic warning, never a raise."""
@@ -123,19 +143,22 @@ def test_vec_search_returns_stored_row_when_dimension_matches(tmp_path, monkeypa
     monkeypatch.setattr(beam, "EMBEDDING_DIM", 768)
     conn = beam._get_connection(db)
 
-    # Insert one working memory (rowid 1) and its 768-dim vector through the
-    # production helper (normalization + quantization), bypassing only the
-    # embedding layer: the KNN is what is under test.
-    conn.execute(
-        "INSERT INTO working_memory (id, content) VALUES ('probe-1', 'healthy retrieval probe')"
+    # Insert one episodic memory and its 768-dim vector through the production
+    # helper (normalization + quantization), bypassing only the embedding
+    # layer: the KNN is what is under test. vec_episodes rowids index
+    # episodic_memory, so the probe belongs there (a working_memory row would
+    # be an orphan vector).
+    cur = conn.execute(
+        "INSERT INTO episodic_memory (id, content) VALUES ('probe-ep', 'healthy retrieval probe')"
     )
+    probe_rowid = cur.lastrowid
     vec = [0.01] * 768
-    beam._vec_insert(conn, 1, vec)
+    beam._vec_insert(conn, probe_rowid, vec)
     conn.commit()
 
     with caplog.at_level("WARNING", logger="mnemosyne.core.beam"):
         rows = beam._vec_search(conn, vec, k=5)
-    assert [r["rowid"] for r in rows] == [1], rows
+    assert [r["rowid"] for r in rows] == [probe_rowid], rows
     assert not [r for r in caplog.records if "mismatch" in r.message.lower() or "failed" in r.message.lower()], [
         r.message for r in caplog.records
     ]
