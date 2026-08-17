@@ -2964,8 +2964,12 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
                 f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH ? AND k={k} ORDER BY distance",
                 (emb_json,)
             ).fetchall()
-    except sqlite3.OperationalError as exc:
-        # Degrade, don't crash: the write path already drops mismatched
+    except sqlite3.Error as exc:
+        # sqlite3.Error, not just OperationalError: recall() does not guard
+        # this call, so any sibling exception (DatabaseError,
+        # InternalError, ...) escaping here would take down the process the
+        # same way the dimension mismatch did. Degrade, don't crash: the
+        # write path already drops mismatched
         # vectors with a warning and the working-memory KNN
         # (_wm_vec_search_sqlite) returns [] on the same condition; this is
         # the episodic voice's equivalent. Classify against the dimension of
