@@ -914,6 +914,28 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # A after a concurrent switch to session B.
             self.initialize(session_id, **kwargs)
 
+    def _ensure_initialized_for_tools(self) -> None:
+        """Initialize on first tool use when PluginManager never called initialize().
+
+        Hermes can bind plugin tools to a provider that never received
+        MemoryManager.initialize(). Those calls then fail with
+        ``Mnemosyne not initialized`` even though the CLI and prefetch
+        path work. Skip-contexts stay skipped; real init errors stay visible.
+        """
+        if self._beam is not None:
+            return
+        if (self._agent_context or "").strip() in self._skip_contexts:
+            return
+        if self._init_error is not None:
+            return
+        self.initialize(
+            self._session_id or "hermes_default",
+            agent_context=self._agent_context or "primary",
+            platform=self._platform or "cli",
+            hermes_home=self._hermes_home or os.environ.get("HERMES_HOME", ""),
+            agent_identity=getattr(self, "_agent_identity", "") or "",
+        )
+
     @property
     def name(self) -> str:
         return "mnemosyne"
@@ -1900,8 +1922,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({"error": str(exc)})
         if tool_name == "mnemosyne_sleep" and self._reflect_disabled_for_cron and (self._agent_context or "").strip().lower() == "cron":
             return json.dumps(self._reflection_skip_response("reflect_disabled_for_cron", "tool"))
-        self._maybe_retry_init()
         try:
+            self._maybe_retry_init()
+            self._ensure_initialized_for_tools()
             # Tools use the durable session selected by on_session_switch().
             # Hold the same session lock for the complete dispatch so a write,
             # recall, or sleep cannot be re-attributed mid-operation.
@@ -3274,6 +3297,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 # Plugin registration (used when loaded via plugins.memory discovery)
 # ---------------------------------------------------------------------------
 
+_provider: Optional[Any] = None
+
+
+def _get_or_create_provider() -> MnemosyneMemoryProvider:
+    """One provider instance for MemoryManager and PluginManager tools."""
+    global _provider
+    if globals().get("_provider") is None:
+        _provider = MnemosyneMemoryProvider()
+    assert _provider is not None
+    return _provider
+
+
 def register_memory_provider(ctx):
     """Called by Hermes memory provider discovery system.
 
@@ -3282,7 +3317,7 @@ def register_memory_provider(ctx):
     """
     import sys as _sys
     try:
-        provider = MnemosyneMemoryProvider()
+        provider = _get_or_create_provider()
     except Exception as _exc:
         print(
             f"[mnemosyne-hermes] ERROR: MnemosyneMemoryProvider() failed: {_exc}",
@@ -3323,8 +3358,6 @@ def register_memory_provider(ctx):
 # Plugin registration (used when loaded via Hermes plugin system)
 # ---------------------------------------------------------------------------
 
-_provider: Optional[Any] = None
-
 def register(ctx):
     """Called by Hermes plugin loader to register CLI commands and tools."""
     # Register the memory provider first so Hermes discovers it
@@ -3348,7 +3381,7 @@ def register(ctx):
     from functools import partial
 
     global _provider
-    _provider = MnemosyneMemoryProvider()
+    _provider = _get_or_create_provider()
     for _schema in _provider.get_tool_schemas():
         _name = _schema["name"]
         # Sync tools route through SyncAdapter, persona tools through PersonaAdapter,
