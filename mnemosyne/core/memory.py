@@ -29,7 +29,7 @@ from mnemosyne.core import embeddings as _embeddings
 from mnemosyne.core import beam as beam_module
 from mnemosyne.core._connection_gc import collect_connection_cycles
 from mnemosyne.core.beam import BeamMemory, _BeamConnection, _deferred_commits, init_beam
-from .journal import journal_mode
+from mnemosyne.core.journal import journal_mode
 _thread_local = threading.local()
 
 # Default data directory

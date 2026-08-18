@@ -38,6 +38,7 @@ from typing import List
 import pytest
 
 from mnemosyne.core.veracity_consolidation import VeracityConsolidator
+from mnemosyne.core.journal import journal_mode
 
 
 @pytest.fixture
@@ -409,7 +410,6 @@ class TestReviewHardening:
 
         # Verify journal_mode matches the configured mode (WAL unless
         # MNEMOSYNE_JOURNAL_MODE overrides it)
-        from mnemosyne.core.journal import journal_mode
         mode = cons.conn.execute(
             "PRAGMA journal_mode"
         ).fetchone()[0]

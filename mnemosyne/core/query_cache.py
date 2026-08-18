@@ -37,7 +37,7 @@ import threading
 from typing import List, Dict, Optional
 from pathlib import Path
 import sqlite3
-from .journal import journal_mode
+from mnemosyne.core.journal import journal_mode
 
 
 _OPAQUE_V2_KEY_RE = re.compile(r"v2:[0-9a-f]{64}")

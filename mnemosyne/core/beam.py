@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 from mnemosyne.core._connection_gc import collect_connection_cycles
 from mnemosyne.core.config import resolve_beam_runtime
-from .journal import journal_mode
+from mnemosyne.core.journal import journal_mode
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta, timezone

@@ -353,7 +353,7 @@ class TestReviewHardening:
             "PRAGMA journal_mode"
         ).fetchone()[0]
         assert mode.lower() == journal_mode(), (
-            f"expected journal_mode=wal, got {mode!r} — "
+            f"expected journal_mode={journal_mode()}, got {mode!r} — "
             "VeracityConsolidator.__init__ didn't apply PRAGMA"
         )
 

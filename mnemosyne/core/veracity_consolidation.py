@@ -29,7 +29,7 @@ import sqlite3
 import json
 import threading
 import unicodedata
-from .journal import journal_mode
+from mnemosyne.core.journal import journal_mode
 from datetime import datetime
 from typing import Dict, List, Optional
 from dataclasses import dataclass
