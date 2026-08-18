@@ -77,6 +77,36 @@ def test_vec_search_guidance_when_config_agrees_but_query_differs(tmp_path, monk
     assert "mnemosyne reindex" not in logged, logged
 
 
+def test_vec_search_uses_vec_episodes_dim_in_mixed_schema(tmp_path, monkeypatch, caplog):
+    """Mixed/partially migrated stores can carry vec tables at different
+    dimensions. The episodic KNN's mismatch classification must read
+    vec_episodes' OWN dimension, not whichever vec table the generic lookup
+    happens to return first: a vec_working at 384 alongside a vec_episodes at
+    768 must not steer the guidance at 384."""
+    if not beam._SQLITE_VEC_AVAILABLE:
+        pytest.skip("sqlite-vec unavailable")
+
+    db = _store_at(monkeypatch, tmp_path, "mixed.db", 768)
+    conn = beam._get_connection(db)
+    # Partially migrated shape: rebuild vec_working at 384 while vec_episodes
+    # stays at 768 (same trick test_vec_dim_guard uses to simulate stores
+    # written under a different dimension).
+    conn.execute("DROP TABLE vec_working")
+    conn.commit()
+    monkeypatch.setattr(beam, "EMBEDDING_DIM", 384)
+    beam.init_beam(db)  # creates vec_working at 384; guard leaves vec_episodes
+    assert beam._existing_vec_dim(conn) in (384, 768)  # generic lookup is ambiguous here
+    assert beam._existing_vec_dim(conn, tables=("vec_episodes",)) == 768
+
+    monkeypatch.setattr(beam, "EMBEDDING_DIM", 768)
+    with caplog.at_level("ERROR", logger="mnemosyne.core.beam"):
+        rows = beam._vec_search(conn, [0.01] * 384, k=5)
+    assert rows == []
+    logged = " ".join(r.message for r in caplog.records)
+    assert "table is 768-dim" in logged, logged
+    assert "384-dim, table is 384" not in logged, logged
+
+
 def test_classification_requires_dim_error_signal():
     """Only sqlite-vec's own dimension-mismatch error may take the guidance
     path. An unrelated OperationalError (locked database) must stay on the
@@ -164,11 +194,14 @@ def test_vec_search_returns_stored_row_when_dimension_matches(tmp_path, monkeypa
     ]
 
 
-def test_linear_recall_serves_lexical_candidates_under_mismatch(tmp_path, monkeypatch):
+def test_linear_recall_serves_lexical_candidates_under_mismatch(tmp_path, monkeypatch, caplog):
     """End-to-end contract (MNEMOSYNE_POLYPHONIC_RECALL unset, linear path):
     with a dimension mismatch disabling the vector voices, recall() must still
-    return the FTS/keyword candidates. Importance is a scoring input here, not
-    an independent voice."""
+    return the FTS/keyword candidates, and the episodic KNN degradation must
+    actually have run (the vec_episodes mismatch diagnostic in the log), so
+    the lexical results are proven to be the fallback, not a vector path that
+    silently never executed. Importance is a scoring input here, not an
+    independent voice."""
     if not beam._SQLITE_VEC_AVAILABLE:
         pytest.skip("sqlite-vec unavailable")
 
@@ -184,18 +217,25 @@ def test_linear_recall_serves_lexical_candidates_under_mismatch(tmp_path, monkey
     )
 
     # The misconfiguration: query-time embedding resolves 384 against the
-    # 768-dim tables. Stub the query embedding to the wrong dimension rather
-    # than standing up an HTTP endpoint: the KNN rejection is identical.
+    # 768-dim tables. Stub available() too: under MNEMOSYNE_NO_EMBEDDINGS the
+    # vector voices are gated off before embed_query is ever consulted, and
+    # the KNN degradation path this test exists to prove would never run.
     import numpy as np
 
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
     monkeypatch.setattr(
         beam._embeddings, "embed_query", lambda q: np.array([0.01] * 384, dtype=np.float32)
     )
     monkeypatch.setattr(beam, "EMBEDDING_DIM", 384)
 
-    results = mem.recall("quantum harmonic oscillator", top_k=5)
+    with caplog.at_level("ERROR", logger="mnemosyne.core.beam"):
+        results = mem.recall("quantum harmonic oscillator", top_k=5)
     assert results, "lexical voices must still serve recall under a dimension mismatch"
     # The recalled rows must actually be the seeded memories, not just
     # "something came back".
     contents = [(r.get("content") or "") if isinstance(r, dict) else getattr(r, "content", "") for r in results]
     assert any("quantum harmonic oscillator" in c for c in contents), contents
+    # Proof the KNN degradation path ran (not that the vector voice was merely
+    # absent): the guard's own diagnostic names the table and the query dim.
+    logged = " ".join(r.message for r in caplog.records)
+    assert "query vector is 384-dim" in logged and "table is 768-dim" in logged, logged

@@ -557,7 +557,10 @@ def _detect_vec_type(conn: sqlite3.Connection) -> str:
     return "float32"
 
 
-def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
+def _existing_vec_dim(
+    conn: sqlite3.Connection,
+    tables: Tuple[str, ...] = ("vec_episodes", "vec_working", "vec_facts"),
+) -> Optional[int]:
     """Return the embedding dimension already declared by a sqlite-vec table in
     this database, or ``None`` if no ``vec0`` table exists yet.
 
@@ -567,11 +570,17 @@ def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
     source of truth for what the stored data actually is. Reads only
     ``sqlite_master`` (no extension required) so it is safe to call before the
     sqlite-vec tables are (re)created.
+
+    ``tables`` narrows the lookup: mixed or partially migrated stores can carry
+    vec tables at different dimensions, and a caller reasoning about one
+    specific table (e.g. the episodic KNN about ``vec_episodes``) must not be
+    told some other table's dimension.
     """
     try:
         rows = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' "
-            "AND name IN ('vec_episodes', 'vec_working', 'vec_facts')"
+            f"SELECT sql FROM sqlite_master WHERE type = 'table' "
+            f"AND name IN ({','.join('?' * len(tables))})",
+            tables,
         ).fetchall()
     except sqlite3.Error:
         return None
@@ -2982,7 +2991,10 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
         # guidance; keep this pointer short and point at it.
         query_dim = len(embedding)
         try:
-            existing_dim = _existing_vec_dim(conn)
+            # vec_episodes specifically: mixed or partially migrated stores
+            # can carry vec tables at different dimensions, and guidance
+            # about THIS table's KNN must be based on THIS table's DDL.
+            existing_dim = _existing_vec_dim(conn, tables=("vec_episodes",))
         except Exception:
             existing_dim = None
         if _is_query_dim_mismatch(exc, query_dim, existing_dim):
