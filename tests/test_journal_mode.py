@@ -59,6 +59,27 @@ def test_invalid_override_leaves_connection_on_wal(tmp_path, monkeypatch):
     assert str(mode).lower() == "wal"
 
 
+def test_each_store_initializer_applies_configured_mode(tmp_path, monkeypatch):
+    """Every independent store initializer must honor the override: memory
+    (Mnemosyne's connection), the query cache, and the veracity consolidator.
+    SyncEngine reuses the beam connection and owns no separate one, so it is
+    covered by the beam readback above."""
+    from mnemosyne.core.memory import _get_connection as memory_conn
+    from mnemosyne.core.query_cache import QueryCache
+    from mnemosyne.core.veracity_consolidation import VeracityConsolidator
+
+    monkeypatch.setenv("MNEMOSYNE_JOURNAL_MODE", "delete")
+
+    m = memory_conn(tmp_path / "memory.db")
+    assert str(m.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "delete"
+
+    qc = QueryCache(tmp_path / "cache.db")
+    assert str(qc._conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "delete"
+
+    vc = VeracityConsolidator(db_path=tmp_path / "veracity.db")
+    assert str(vc.conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "delete"
+
+
 def test_journal_module_has_no_import_cycle():
     """journal.py must stay dependency-free: every core store module imports
     it at module scope, so any import there would cycle."""
