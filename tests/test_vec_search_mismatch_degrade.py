@@ -114,8 +114,6 @@ def test_classification_requires_dim_error_signal():
     path. An unrelated OperationalError (locked database) must propagate even
     when the submitted and stored dimensions disagree, or a real storage
     failure would be misread as a mismatch."""
-    import sqlite3
-
     dim_error = sqlite3.OperationalError(
         'Dimension mismatch for query vector for the "embedding" column. '
         "Expected 1024 dimensions but received 384."
@@ -132,7 +130,6 @@ def test_vec_search_propagates_unrelated_sqlite_errors(monkeypatch):
     OperationalError / DatabaseError (locked database, disk I/O, corruption)
     must propagate unchanged: silently returning [] there would convert a
     real storage failure into an unexplained loss of the vector voice."""
-    import sqlite3
 
     class _BoomConn:
         def __init__(self, exc):
@@ -141,12 +138,12 @@ def test_vec_search_propagates_unrelated_sqlite_errors(monkeypatch):
         def execute(self, *a, **k):
             raise self._exc
 
+    monkeypatch.setattr(beam, "_effective_vec_type", lambda conn, table=None: "float32")
     for exc in (
         sqlite3.OperationalError("database is locked"),
         sqlite3.DatabaseError("disk I/O error"),
         sqlite3.DatabaseError("database disk image is malformed"),
     ):
-        monkeypatch.setattr(beam, "_effective_vec_type", lambda conn, table=None: "float32")
         with pytest.raises(type(exc)):
             beam._vec_search(_BoomConn(exc), [0.01] * 768, k=5)
 
@@ -160,9 +157,16 @@ def test_vec_search_degrades_on_confirmed_mismatch_for_every_vec_type(
     if not beam._SQLITE_VEC_AVAILABLE:
         pytest.skip("sqlite-vec unavailable")
 
+    # The declared vec0 type must match the query path: create the store
+    # under VEC_TYPE so the DDL itself carries the encoding, rather than
+    # monkeypatching _effective_vec_type against a table declared int8
+    # (sqlite-vec would then reject the vector TYPE, not the dimension).
+    monkeypatch.setattr(beam, "VEC_TYPE", vec_type)
     db = _store_at(monkeypatch, tmp_path, f"mismatch_{vec_type}.db", 768)
-    monkeypatch.setattr(beam, "EMBEDDING_DIM", 768)
-    monkeypatch.setattr(beam, "_effective_vec_type", lambda conn, table=None: vec_type)
+    # _detect_vec_type silently falls back (bit -> int8 -> float32) when the
+    # installed sqlite-vec rejects the requested encoding; assert the premise
+    # so the parametrization cannot quietly degrade into weaker runs.
+    assert beam._effective_vec_type(beam._get_connection(db)) == vec_type
 
     with caplog.at_level("ERROR", logger="mnemosyne.core.beam"):
         rows = beam._vec_search(beam._get_connection(db), [0.01] * 384, k=5)
