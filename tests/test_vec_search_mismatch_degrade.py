@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import sqlite3
+
 import pytest
 
 import mnemosyne.core.beam as beam
@@ -108,10 +110,10 @@ def test_vec_search_uses_vec_episodes_dim_in_mixed_schema(tmp_path, monkeypatch,
 
 
 def test_classification_requires_dim_error_signal():
-    """Only sqlite-vec's own dimension-mismatch error may take the guidance
-    path. An unrelated OperationalError (locked database) must stay on the
-    generic warning path even when the submitted and stored dimensions
-    disagree, or it would emit false reindex guidance."""
+    """Only sqlite-vec's own dimension-mismatch error may take the degrade
+    path. An unrelated OperationalError (locked database) must propagate even
+    when the submitted and stored dimensions disagree, or a real storage
+    failure would be misread as a mismatch."""
     import sqlite3
 
     dim_error = sqlite3.OperationalError(
@@ -125,42 +127,65 @@ def test_classification_requires_dim_error_signal():
     assert beam._is_query_dim_mismatch(dim_error, 384, None) is False
 
 
-def test_vec_search_degrades_on_non_operational_sqlite_error(monkeypatch, caplog):
-    """A sqlite3.Error that is not an OperationalError (DatabaseError,
-    InternalError, ...) must also degrade: recall() does not guard this call,
-    so narrowing the guard to OperationalError alone would let siblings crash
-    the process again."""
+def test_vec_search_propagates_unrelated_sqlite_errors(monkeypatch):
+    """Only a confirmed dimension mismatch may degrade. Unrelated
+    OperationalError / DatabaseError (locked database, disk I/O, corruption)
+    must propagate unchanged: silently returning [] there would convert a
+    real storage failure into an unexplained loss of the vector voice."""
     import sqlite3
 
     class _BoomConn:
+        def __init__(self, exc):
+            self._exc = exc
+
         def execute(self, *a, **k):
-            raise sqlite3.DatabaseError("disk I/O error")
+            raise self._exc
 
-    monkeypatch.setattr(beam, "_effective_vec_type", lambda conn, table=None: "float32")
-    with caplog.at_level("WARNING", logger="mnemosyne.core.beam"):
-        rows = beam._vec_search(_BoomConn(), [0.01] * 768, k=5)
+    for exc in (
+        sqlite3.OperationalError("database is locked"),
+        sqlite3.DatabaseError("disk I/O error"),
+        sqlite3.DatabaseError("database disk image is malformed"),
+    ):
+        monkeypatch.setattr(beam, "_effective_vec_type", lambda conn, table=None: "float32")
+        with pytest.raises(type(exc)):
+            beam._vec_search(_BoomConn(exc), [0.01] * 768, k=5)
+
+
+@pytest.mark.parametrize("vec_type", ["float32", "int8", "bit"])
+def test_vec_search_degrades_on_confirmed_mismatch_for_every_vec_type(
+    tmp_path, monkeypatch, caplog, vec_type
+):
+    """Confirmed dimension mismatches still fall back safely across all three
+    vec encodings: the KNN returns [] and the diagnostic names both dims."""
+    if not beam._SQLITE_VEC_AVAILABLE:
+        pytest.skip("sqlite-vec unavailable")
+
+    db = _store_at(monkeypatch, tmp_path, f"mismatch_{vec_type}.db", 768)
+    monkeypatch.setattr(beam, "EMBEDDING_DIM", 768)
+    monkeypatch.setattr(beam, "_effective_vec_type", lambda conn, table=None: vec_type)
+
+    with caplog.at_level("ERROR", logger="mnemosyne.core.beam"):
+        rows = beam._vec_search(beam._get_connection(db), [0.01] * 384, k=5)
     assert rows == []
-    assert any("vec_episodes query failed" in r.message for r in caplog.records), [
-        r.message for r in caplog.records
-    ]
+    logged = " ".join(r.message for r in caplog.records)
+    assert "query vector is 384-dim" in logged, logged
+    assert "table is 768-dim" in logged, logged
 
 
-def test_vec_search_generic_warning_when_table_dim_unreadable(tmp_path, monkeypatch, caplog):
+def test_vec_search_raises_when_table_dim_unreadable(tmp_path, monkeypatch, caplog):
     """When the table's declared dimension cannot be read, the mismatch
-    cannot be classified: degrade with the generic warning, never a raise."""
+    cannot be confirmed, so the error propagates rather than being silently
+    swallowed."""
     if not beam._SQLITE_VEC_AVAILABLE:
         pytest.skip("sqlite-vec unavailable")
 
     db = _store_at(monkeypatch, tmp_path, "unreadable.db", 768)
     monkeypatch.setattr(beam, "EMBEDDING_DIM", 768)
-    monkeypatch.setattr(beam, "_existing_vec_dim", lambda conn: None)
+    monkeypatch.setattr(beam, "_existing_vec_dim", lambda conn, tables=None: None)
 
-    with caplog.at_level("WARNING", logger="mnemosyne.core.beam"):
-        rows = beam._vec_search(beam._get_connection(db), [0.01] * 384, k=5)
-    assert rows == []
-    assert any("vec_episodes query failed" in r.message for r in caplog.records), [
-        r.message for r in caplog.records
-    ]
+    with caplog.at_level("ERROR", logger="mnemosyne.core.beam"):
+        with pytest.raises(sqlite3.Error):
+            beam._vec_search(beam._get_connection(db), [0.01] * 384, k=5)
 
 
 def test_vec_search_returns_stored_row_when_dimension_matches(tmp_path, monkeypatch, caplog):
