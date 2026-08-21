@@ -172,8 +172,9 @@ def test_vec_search_propagates_unrelated_sqlite_errors():
     there would convert a real storage failure into an unexplained loss of
     the vector voice."""
     for exc in _PROPAGATION_EXCS:
-        with pytest.raises(type(exc)):
+        with pytest.raises(type(exc)) as caught:
             beam._vec_search(_BoomConn(exc), [0.01] * 768, k=5)
+        assert caught.value is exc
 
 
 def test_vec_search_propagates_schema_probe_failures():
@@ -182,8 +183,9 @@ def test_vec_search_propagates_schema_probe_failures():
     and message, not be swallowed into a float32 fallback that later
     resurfaces as a misleading vector-type or dimension error."""
     for exc in _PROPAGATION_EXCS:
-        with pytest.raises(type(exc), match=str(exc)):
+        with pytest.raises(type(exc), match=str(exc)) as caught:
             beam._vec_search(_BoomConn(exc, fail_schema=True), [0.01] * 768, k=5)
+        assert caught.value is exc
 
 
 @pytest.mark.parametrize("vec_type", ["float32", "int8", "bit"])
