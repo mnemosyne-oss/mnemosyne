@@ -2455,13 +2455,35 @@ def _effective_vec_type(conn: sqlite3.Connection, table: str = "vec_episodes") -
             "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
             (table,)
         ).fetchone()
-        if row and "int8" in row[0]:
-            return "int8"
-        if row and "bit" in row[0]:
-            return "bit"
+        return _vec_type_from_ddl(row)
     except Exception:
         logger.info("Regex extraction failed, skipping", exc_info=True)
     return "float32"
+
+
+def _vec_type_from_ddl(row) -> str:
+    """Classify a vec0 table's quantization type from its sqlite_master row."""
+    if row and "int8" in row[0]:
+        return "int8"
+    if row and "bit" in row[0]:
+        return "bit"
+    return "float32"
+
+
+def _vec_table_type_strict(conn: sqlite3.Connection, table: str = "vec_episodes") -> str:
+    """Read a vec0 table's declared quantization type, propagating errors.
+
+    Unlike ``_effective_vec_type`` (which swallows every lookup failure and
+    falls back to float32), this is for the episodic KNN path where only a
+    confirmed query-vector dimension mismatch may degrade: a lock, I/O, or
+    corruption failure while reading the schema must surface unchanged, not
+    resurface later as a misleading vector-type/dimension error.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return _vec_type_from_ddl(row)
 
 
 def _vec_insert(
@@ -2963,7 +2985,7 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
     distances are commensurate with the stored int8 vectors (which are also
     unit-normalized at insert time — see _vec_insert).
     """
-    vec_type = _effective_vec_type(conn)
+    vec_type = _vec_table_type_strict(conn)
     # Normalize to unit length before quantization
     # (sqlite-vec 0.1.9 'unit' param fails at 1024-dim)
     import numpy as _np

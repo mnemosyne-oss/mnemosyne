@@ -125,27 +125,65 @@ def test_classification_requires_dim_error_signal():
     assert beam._is_query_dim_mismatch(dim_error, 384, None) is False
 
 
-def test_vec_search_propagates_unrelated_sqlite_errors(monkeypatch):
+class _ProbeResult:
+    """Cursor-like result for the sqlite_master probes (type read and
+    dimension read alike): a 768-dim float32 vec_episodes DDL."""
+
+    def fetchone(self):
+        return ("CREATE VIRTUAL TABLE vec_episodes USING vec0(embedding float32[768])",)
+
+    def fetchall(self):
+        return [self.fetchone()]
+
+
+class _BoomConn:
+    """Connection stub that fails on one side of the KNN only.
+
+    fail_schema=False: serves the sqlite_master probe (float32 DDL) and
+    raises `exc` on the KNN query itself. fail_schema=True: raises `exc` on
+    the schema probe, before any KNN query is built.
+    """
+
+    def __init__(self, exc, fail_schema=False):
+        self._exc = exc
+        self._fail_schema = fail_schema
+
+    def execute(self, sql, *a, **k):
+        if "sqlite_master" in sql:
+            if self._fail_schema:
+                raise self._exc
+            return _ProbeResult()
+        if self._fail_schema:
+            raise AssertionError("KNN query reached after schema probe failure")
+        raise self._exc
+
+
+_PROPAGATION_EXCS = (
+    sqlite3.OperationalError("database is locked"),
+    sqlite3.DatabaseError("disk I/O error"),
+    sqlite3.DatabaseError("database disk image is malformed"),
+)
+
+
+def test_vec_search_propagates_unrelated_sqlite_errors():
     """Only a confirmed dimension mismatch may degrade. Unrelated
     OperationalError / DatabaseError (locked database, disk I/O, corruption)
-    must propagate unchanged: silently returning [] there would convert a
-    real storage failure into an unexplained loss of the vector voice."""
-
-    class _BoomConn:
-        def __init__(self, exc):
-            self._exc = exc
-
-        def execute(self, *a, **k):
-            raise self._exc
-
-    monkeypatch.setattr(beam, "_effective_vec_type", lambda conn, table=None: "float32")
-    for exc in (
-        sqlite3.OperationalError("database is locked"),
-        sqlite3.DatabaseError("disk I/O error"),
-        sqlite3.DatabaseError("database disk image is malformed"),
-    ):
+    raised by the KNN itself must propagate unchanged: silently returning []
+    there would convert a real storage failure into an unexplained loss of
+    the vector voice."""
+    for exc in _PROPAGATION_EXCS:
         with pytest.raises(type(exc)):
             beam._vec_search(_BoomConn(exc), [0.01] * 768, k=5)
+
+
+def test_vec_search_propagates_schema_probe_failures():
+    """A lock / I/O / corruption failure in the pre-KNN schema lookup (the
+    strict vec_episodes type read) must surface with the original exception
+    and message, not be swallowed into a float32 fallback that later
+    resurfaces as a misleading vector-type or dimension error."""
+    for exc in _PROPAGATION_EXCS:
+        with pytest.raises(type(exc), match=str(exc)):
+            beam._vec_search(_BoomConn(exc, fail_schema=True), [0.01] * 768, k=5)
 
 
 @pytest.mark.parametrize("vec_type", ["float32", "int8", "bit"])
@@ -166,7 +204,7 @@ def test_vec_search_degrades_on_confirmed_mismatch_for_every_vec_type(
     # _detect_vec_type silently falls back (bit -> int8 -> float32) when the
     # installed sqlite-vec rejects the requested encoding; assert the premise
     # so the parametrization cannot quietly degrade into weaker runs.
-    assert beam._effective_vec_type(beam._get_connection(db)) == vec_type
+    assert beam._vec_table_type_strict(beam._get_connection(db)) == vec_type
 
     with caplog.at_level("ERROR", logger="mnemosyne.core.beam"):
         rows = beam._vec_search(beam._get_connection(db), [0.01] * 384, k=5)
