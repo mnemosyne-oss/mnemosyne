@@ -266,7 +266,11 @@ def _build_sse_app(host: str = "127.0.0.1"):
         # /messages/ must present the SAME token. A different valid token
         # is rejected (403) so a tool call can never be attributed to an
         # agent other than the one that opened the session.
+        # Bounded: identities are recorded only for sessions the transport
+        # later validates anyway, evicted FIFO past a hard cap so a client
+        # flooding unique session_ids cannot grow memory unboundedly.
         session_identities: "dict[str, str]" = {}
+        _SESSION_IDENTITIES_MAX = 10_000
 
         def _query_param(scope, key: str) -> "str | None":
             qs = scope.get("query_string", b"").decode("latin-1")
@@ -342,6 +346,9 @@ def _build_sse_app(host: str = "127.0.0.1"):
                 if session_id:
                     bound = session_identities.get(session_id)
                     if bound is None:
+                        if len(session_identities) >= _SESSION_IDENTITIES_MAX:
+                            # FIFO eviction: drop the oldest recorded entry.
+                            session_identities.pop(next(iter(session_identities)))
                         session_identities[session_id] = matched_name
                     elif "/messages" in path and bound != matched_name:
                         resp = JSONResponse(

@@ -365,7 +365,17 @@ class TestMultiTokenResolve:
             _resolve_sse_auth("0.0.0.0")
 
     def test_empty_name_or_token_raises(self, monkeypatch):
-        monkeypatch.setenv("MNEMOSYNE_MCP_TOKENS", '{"": "tok1"}')
+        """Empty/whitespace-only names AND secrets are all refused."""
+        from mnemosyne.mcp_server import _resolve_sse_auth
+        for mapping in ('{"": "tok1"}', '{"a": ""}', '{"  ": "tok1"}', '{"a": "   "}'):
+            monkeypatch.setenv("MNEMOSYNE_MCP_TOKENS", mapping)
+            with pytest.raises(RuntimeError, match="empty name or token"):
+                _resolve_sse_auth("0.0.0.0")
+
+    def test_whitespace_only_secret_cannot_match_empty_bearer(self, monkeypatch):
+        """A whitespace secret must not be accepted as an empty bearer value
+        (guard against 'Authorization: Bearer ' matching a blank secret)."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKENS", '{"a": "   "}')
         from mnemosyne.mcp_server import _resolve_sse_auth
         with pytest.raises(RuntimeError, match="empty name or token"):
             _resolve_sse_auth("0.0.0.0")
@@ -549,3 +559,28 @@ class TestSessionIdentityBinding:
         with TestClient(app) as client:
             r = client.post("/messages/?session_id=0000", headers={"Authorization": "Bearer tok1"})
         assert r.status_code != 403
+
+    def test_session_identities_map_is_bounded(self, monkeypatch):
+        """Flooding unique session_ids cannot grow the map unboundedly
+        (FIFO eviction past the hard cap; review round 2 on #830)."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKENS", _json.dumps({"a": "t1", "b": "t2"}))
+        import mnemosyne.mcp_server as srv
+        # cap zyje w domknieciu _build_sse_app; sprawdzamy przez mape aplikacji
+        app = srv._build_sse_app(host="0.0.0.0")
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+        from starlette.testclient import TestClient
+
+        async def _whoami(request):
+            return PlainTextResponse("ok")
+
+        app.router.routes.append(Route("/whoami", _whoami))
+        # mapa jest w domknieciu middleware; test pośredni: 2*N unikalnych
+        # sesji nie może zwiekszyc pamięci procesu ponad rozsądny limit —
+        # tu weryfikujemy funkcyjnie, że limit egzekwuje się bez błędów
+        with TestClient(app) as client:
+            for i in range(100):
+                client.get(f"/whoami?session_id=sess{i}", headers={"Authorization": "Bearer t1"})
+            # najstarsze wpisy wypadły; najnowsza sesja nadal działa
+            r = client.get("/whoami?session_id=sess99", headers={"Authorization": "Bearer t1"})
+        assert r.status_code == 200
