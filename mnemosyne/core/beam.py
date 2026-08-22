@@ -557,7 +557,10 @@ def _detect_vec_type(conn: sqlite3.Connection) -> str:
     return "float32"
 
 
-def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
+def _existing_vec_dim(
+    conn: sqlite3.Connection,
+    tables: Tuple[str, ...] = ("vec_episodes", "vec_working", "vec_facts"),
+) -> Optional[int]:
     """Return the embedding dimension already declared by a sqlite-vec table in
     this database, or ``None`` if no ``vec0`` table exists yet.
 
@@ -567,11 +570,17 @@ def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
     source of truth for what the stored data actually is. Reads only
     ``sqlite_master`` (no extension required) so it is safe to call before the
     sqlite-vec tables are (re)created.
+
+    ``tables`` narrows the lookup: mixed or partially migrated stores can carry
+    vec tables at different dimensions, and a caller reasoning about one
+    specific table (e.g. the episodic KNN about ``vec_episodes``) must not be
+    told some other table's dimension.
     """
     try:
         rows = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' "
-            "AND name IN ('vec_episodes', 'vec_working', 'vec_facts')"
+            f"SELECT sql FROM sqlite_master WHERE type = 'table' "
+            f"AND name IN ({','.join('?' * len(tables))})",
+            tables,
         ).fetchall()
     except sqlite3.Error:
         return None
@@ -2446,13 +2455,35 @@ def _effective_vec_type(conn: sqlite3.Connection, table: str = "vec_episodes") -
             "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
             (table,)
         ).fetchone()
-        if row and "int8" in row[0]:
-            return "int8"
-        if row and "bit" in row[0]:
-            return "bit"
+        return _vec_type_from_ddl(row)
     except Exception:
         logger.info("Regex extraction failed, skipping", exc_info=True)
     return "float32"
+
+
+def _vec_type_from_ddl(row) -> str:
+    """Classify a vec0 table's quantization type from its sqlite_master row."""
+    if row and "int8" in row[0]:
+        return "int8"
+    if row and "bit" in row[0]:
+        return "bit"
+    return "float32"
+
+
+def _vec_table_type_strict(conn: sqlite3.Connection, table: str = "vec_episodes") -> str:
+    """Read a vec0 table's declared quantization type, propagating errors.
+
+    Unlike ``_effective_vec_type`` (which swallows every lookup failure and
+    falls back to float32), this is for the episodic KNN path where only a
+    confirmed query-vector dimension mismatch may degrade: a lock, I/O, or
+    corruption failure while reading the schema must surface unchanged, not
+    resurface later as a misleading vector-type/dimension error.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return _vec_type_from_ddl(row)
 
 
 def _vec_insert(
@@ -2911,6 +2942,42 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     return plan
 
 
+def _is_query_dim_mismatch(exc: BaseException, query_dim: int, existing_dim: Optional[int]) -> bool:
+    """True only when sqlite-vec actually rejected the query vector for its
+    dimension.
+
+    An unrelated ``OperationalError`` (locked database, missing table) must not
+    be dressed up as a dimension mismatch with self-heal guidance, even when
+    the submitted and stored dimensions happen to disagree: classify on the
+    error's own signal, not on the dimension coincidence alone.
+    """
+    return (
+        existing_dim is not None
+        and query_dim != existing_dim
+        and "dimension mismatch" in str(exc).lower()
+    )
+
+
+def _query_dim_guidance(query_dim: int, existing_dim: int) -> str:
+    """Self-heal guidance for a confirmed query-side dimension mismatch.
+
+    The reindex steps from ``_dim_mismatch_message`` are only correct when
+    the CONFIGURED dimension disagrees with the store. When config and store
+    agree, the embedding endpoint served a wrong-dim query vector and the
+    store needs nothing: reindex advice there would be false and destructive.
+    """
+    if existing_dim != EMBEDDING_DIM:
+        return _dim_mismatch_message(existing_dim, EMBEDDING_DIM)
+    return (
+        f"The store and the process configuration agree at "
+        f"{existing_dim}-dim; the embedding endpoint/model served "
+        f"a {query_dim}-dim query vector. Point "
+        f"MNEMOSYNE_EMBEDDING_API_URL / MNEMOSYNE_EMBEDDING_MODEL "
+        f"at a {existing_dim}-dim model. The stored vectors are "
+        f"fine; no reindex is needed."
+    )
+
+
 def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -> List[Dict]:
     """Search sqlite-vec and return rowids with distances.
 
@@ -2918,7 +2985,7 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
     distances are commensurate with the stored int8 vectors (which are also
     unit-normalized at insert time — see _vec_insert).
     """
-    vec_type = _effective_vec_type(conn)
+    vec_type = _vec_table_type_strict(conn)
     # Normalize to unit length before quantization
     # (sqlite-vec 0.1.9 'unit' param fails at 1024-dim)
     import numpy as _np
@@ -2932,21 +2999,43 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
     # can't resolve the parameter value. We inline k safely since it's
     # always an integer computed internally.
     k = int(k)
-    if vec_type == "bit":
-        rows = conn.execute(
-            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_binary(?) AND k={k} ORDER BY distance",
-            (emb_json,)
-        ).fetchall()
-    elif vec_type == "int8":
-        rows = conn.execute(
-            f'SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_int8(?, "unit") AND k={k} ORDER BY distance',
-            (emb_json,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH ? AND k={k} ORDER BY distance",
-            (emb_json,)
-        ).fetchall()
+    try:
+        if vec_type == "bit":
+            rows = conn.execute(
+                f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_binary(?) AND k={k} ORDER BY distance",
+                (emb_json,)
+            ).fetchall()
+        elif vec_type == "int8":
+            rows = conn.execute(
+                f'SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_int8(?, "unit") AND k={k} ORDER BY distance',
+                (emb_json,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH ? AND k={k} ORDER BY distance",
+                (emb_json,)
+            ).fetchall()
+    except sqlite3.Error as exc:
+        # Degrade only on a confirmed sqlite-vec query dimension mismatch
+        # (see _is_query_dim_mismatch); every other sqlite3.Error (locked
+        # database, corruption, disk I/O) propagates unchanged, so a real
+        # storage failure is never silently converted into a loss of the
+        # vector voice. Classify against the query vector actually
+        # submitted, and against vec_episodes' own DDL: mixed or partially
+        # migrated stores can carry vec tables at different dimensions.
+        query_dim = len(embedding)
+        existing_dim = _existing_vec_dim(conn, tables=("vec_episodes",))
+        if not _is_query_dim_mismatch(exc, query_dim, existing_dim):
+            raise
+        logger.error(
+            "Dimension mismatch querying vec_episodes (query vector is "
+            "%s-dim, table is %s-dim, process configured %s-dim); vector "
+            "recall disabled for this call, falling back to other recall "
+            "voices. %s",
+            query_dim, existing_dim, EMBEDDING_DIM,
+            _query_dim_guidance(query_dim, existing_dim),
+        )
+        return []
     return [{"rowid": r["rowid"], "distance": r["distance"]} for r in rows]
 
 
