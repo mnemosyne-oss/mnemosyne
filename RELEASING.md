@@ -100,6 +100,80 @@ pip install --pre mnemosyne-memory
 The GitHub release is flagged as a pre-release automatically, so a beta never
 becomes the repository's "Latest release".
 
+### Beta lifecycle
+
+The mechanics above say how to cut a beta. This says how one ends, which is the
+part that drifts if nobody writes it down.
+
+**Name the questions at tag time.** A beta exists to answer specific doubts. Write
+them into the release notes when you cut `bN`, because a beta whose questions were
+never stated cannot be shown to have finished. For `4.0.0b1` they are:
+
+1. Does the embedding-dimension guard break people in ways we did not predict, and
+   is `MNEMOSYNE_EMBEDDING_DIM=<N>` actually sufficient to recover?
+2. Is the multimodal surface (`remember_media()`, the modality seam, the media
+   store) the right shape? New API is expensive to unship, and a beta is the last
+   cheap moment to change a signature.
+
+**A beta with no users is not a beta.** `pip install --pre` is opt-in, so silence is
+the default outcome, not a good one. Announce the beta and ask for one specific
+thing to be tried. If nobody opts in, promoting to final is a delayed release with
+extra steps and no evidence, so say that plainly rather than treating the quiet as
+a pass.
+
+#### What blocks promotion
+
+A **beta blocker** is any of:
+
+- A regression against the previous stable line in documented behavior.
+- A data-integrity or data-loss defect.
+- The documented migration does not work, or is incomplete.
+- A crash at import or first call in a supported configuration.
+
+Everything else ships in the final and is fixed in the following patch. A bug in a
+brand-new feature is not automatically a blocker; a thing that worked in 3.15.1 and
+no longer works always is.
+
+#### Weak signals, do not promote on these
+
+- **Time elapsed.** Two weeks measures nothing.
+- **Zero bug reports.** Usually means zero users, not zero bugs.
+- **Download counts.** `--pre` traffic is mostly CI and mirrors.
+
+#### Strong signals to promote
+
+- **Someone hit the breaking change and recovered using only the documented
+  migration.** This is the strongest single signal available, because it is the
+  specific risk the beta exists for. One real report beats a thousand silent
+  installs.
+- **Someone who did not write the new surface used it against their own data, and
+  the shape held.** If the first external use forces a signature change, the beta
+  did its job and you owe it another round.
+- **No issue opened during the window is a regression from the previous stable
+  line.** New-feature bugs are expected; regressions are the thing being tested for.
+
+#### The progression
+
+```
+bN   -> bN+1    a beta blocker was fixed. Evidence-based, not scheduled.
+bN   -> rc1     zero open blockers, no API signature change in the last beta,
+                and the migration exercised by someone other than you.
+rc1  -> final   the rc sat with no new blockers, and every downstream surface
+                in "Downstream surfaces" is updated and verified.
+```
+
+`b` and `rc` are a contract, not decoration: **`b` means the API may still change,
+`rc` means it will not.** Any API change after `rc1` forces `rc2` and resets the
+promise. If you would not defend that distinction to a user who pinned `rc1`, do
+not cut the rc yet.
+
+#### The failure mode
+
+The beta that never ends. It happens when promotion is left to feel finished rather
+than to a written test. If you cannot state which of the strong signals you have
+observed, you are not ready to promote, and the honest move is to say what evidence
+is still missing rather than to ship on fatigue.
+
 ### When to release
 
 - **Patches:** As soon as CI is green on main. Bug fixes don't wait.
