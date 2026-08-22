@@ -221,6 +221,29 @@ class TestScoreNoise:
         assert score >= 0.6
         assert "likely_dump" in reasons
 
+    @pytest.mark.parametrize("terminator", ["。", "！", "？", ".", "!", "?"])
+    def test_multiline_sentences_are_not_flagged_as_dump(self, terminator):
+        content = "\n".join(
+            [f"This is a complete sentence with useful content{terminator}"] * 60
+        )
+
+        _score, reasons = _score_noise(content, 0.5, "")
+
+        assert "likely_dump" not in reasons
+
+    def test_dotted_low_structure_content_is_flagged_as_dump(self):
+        lines = [
+            "/var/lib/mnemosyne/cache-v3.2/item.bin",
+            "using worker id node-01.v2",
+            "reading package-4.1.0.tar.gz",
+        ]
+        content = "\n".join(lines * 25)
+
+        score, reasons = _score_noise(content, 0.5, "")
+
+        assert score >= 0.6
+        assert "likely_dump" in reasons
+
 
 # ---------------------------------------------------------------------------
 # _suggest_action
