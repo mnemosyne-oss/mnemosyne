@@ -169,8 +169,16 @@ def _create_instance(session_id: str = None, author_id: str = None,
     # Importing core.memory initializes the legacy default database, so keep it
     # on this mutation-capable construction path rather than at MCP import time.
     from mnemosyne.core.memory import Mnemosyne
+    from mnemosyne.runtime_context import get_request_token_name
 
-    auth = author_id or os.environ.get("MNEMOSYNE_AUTHOR_ID")
+    # Identity priority: explicit tool-call arg > environment variable >
+    # authenticated multi-token name (SSE, MNEMOSYNE_MCP_TOKENS) -- the
+    # token name identifies the calling agent per issue #761.
+    auth = (
+        author_id
+        or os.environ.get("MNEMOSYNE_AUTHOR_ID")
+        or get_request_token_name()
+    )
     auth_type = author_type or os.environ.get("MNEMOSYNE_AUTHOR_TYPE")
     chan = channel_id or os.environ.get("MNEMOSYNE_CHANNEL_ID") or session_id or "default"
     sess = session_id or f"mcp_{bank}"

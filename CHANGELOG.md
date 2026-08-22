@@ -9,6 +9,8 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Added
 
+- **Multi-token SSE auth with per-agent identity (`MNEMOSYNE_MCP_TOKENS`, issue #761).** The SSE MCP server accepts a JSON object of named bearer tokens; each client authenticates with its own token, and the matched token's name becomes the author identity on memories that client creates (explicit `author_id` arguments and `MNEMOSYNE_AUTHOR_ID` still take precedence). Enables one instance to serve several agents with distinct audit attribution and per-agent token rotation/revocation. The session's identity is bound through the SSE transport's native session ownership: the matched token name is exposed as an authenticated principal, so a message for a session presented with a different valid token is rejected exactly as if the session did not exist, and the binding is dropped on disconnect. Empty mappings, duplicate names, and duplicate secrets are refused at startup. Single-token `MNEMOSYNE_MCP_TOKEN` is unchanged and fully backward compatible.
+
 - **Multimodal memory: images, video and audio can become recallable memories (RFCs 0002, 0003, 0004).** `BeamMemory.remember_media(ref)` takes a reference to a piece of media, registers it, describes it through a configured modality provider, and writes the description back as an ordinary memory that hybrid recall already understands. Nothing about text recall changes.
 
   The stack is additive throughout. Two sidecar tables, `media_assets` and `media_moments`, are created `IF NOT EXISTS` by their own store when a bank is opened, so existing databases acquire them with no migration step and no change to any existing table. No new package dependency is introduced.
