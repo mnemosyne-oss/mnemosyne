@@ -18,7 +18,7 @@ import logging
 import threading
 import tempfile
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Union
 from pathlib import Path
 
 import os
@@ -519,7 +519,8 @@ class Mnemosyne:
                vec_weight: float = None,
                fts_weight: float = None,
                importance_weight: float = None,
-               explain: bool = False) -> List[Dict]:
+               explain: bool = False,
+               metadata_keys: Optional[List[str]] = None) -> Union[List[Dict], Dict[str, Any]]:
         """
         Search memories with hybrid relevance scoring.
         Uses BEAM episodic + working memory retrieval (sqlite-vec + FTS5).
@@ -527,33 +528,50 @@ class Mnemosyne:
         Supports multi-agent identity filtering: author_id, author_type, channel_id.
         Supports temporal scoring: temporal_weight, query_time, temporal_halflife.
         Supports scoring weight overrides: vec_weight, fts_weight, importance_weight.
+        metadata_keys: Optional allowlist of stored top-level metadata keys to
+            project onto the results produced by this recall call.
         """
         import os as _os
+        payload: Any
         if _os.environ.get("MNEMOSYNE_ENHANCED_RECALL", "0") == "1":
-            return self.beam.recall_enhanced(query, top_k=top_k,
-                                             from_date=from_date, to_date=to_date,
-                                             source=source, topic=topic,
-                                             author_id=author_id, author_type=author_type,
-                                             channel_id=channel_id,
-                                             temporal_weight=temporal_weight,
-                                             query_time=query_time,
-                                             temporal_halflife=temporal_halflife,
-                                             vec_weight=vec_weight,
-                                             fts_weight=fts_weight,
-                                             importance_weight=importance_weight,
-                                             explain=explain)
-        return self.beam.recall(query, top_k=top_k,
-                                from_date=from_date, to_date=to_date,
-                                source=source, topic=topic,
-                                author_id=author_id, author_type=author_type,
-                                channel_id=channel_id,
-                                temporal_weight=temporal_weight,
-                                query_time=query_time,
-                                temporal_halflife=temporal_halflife,
-                                vec_weight=vec_weight,
-                                fts_weight=fts_weight,
-                                importance_weight=importance_weight,
-                                explain=explain)
+            payload = self.beam.recall_enhanced(
+                query, top_k=top_k,
+                from_date=from_date, to_date=to_date,
+                source=source, topic=topic,
+                author_id=author_id, author_type=author_type,
+                channel_id=channel_id,
+                temporal_weight=temporal_weight,
+                query_time=query_time,
+                temporal_halflife=temporal_halflife,
+                vec_weight=vec_weight,
+                fts_weight=fts_weight,
+                importance_weight=importance_weight,
+                explain=explain,
+            )
+        else:
+            payload = self.beam.recall(
+                query, top_k=top_k,
+                from_date=from_date, to_date=to_date,
+                source=source, topic=topic,
+                author_id=author_id, author_type=author_type,
+                channel_id=channel_id,
+                temporal_weight=temporal_weight,
+                query_time=query_time,
+                temporal_halflife=temporal_halflife,
+                vec_weight=vec_weight,
+                fts_weight=fts_weight,
+                importance_weight=importance_weight,
+                explain=explain,
+            )
+        if metadata_keys is None:
+            return payload
+        if explain:
+            projected = dict(payload)
+            projected["results"] = self.beam._hydrate_recall_metadata(
+                payload["results"], metadata_keys
+            )
+            return projected
+        return self.beam._hydrate_recall_metadata(payload, metadata_keys)
 
     def _emit_wrapper(self, event_type: str, memory_id: str, **kwargs) -> None:
         """Emit a streaming event through the Mnemosyne wrapper layer."""
@@ -1134,7 +1152,7 @@ _default_instance = None
 _default_bank = "default"
 
 
-def _get_default(bank: str = None):
+def _get_default(bank: Optional[str] = None):
     """Get or create the default Mnemosyne instance. Supports bank switching."""
     global _default_instance, _default_bank
     target_bank = bank or _default_bank or "default"
@@ -1185,7 +1203,8 @@ def recall(query: str, top_k: int = 5, *,
            fts_weight: float = None,
            importance_weight: float = None,
            explain: bool = False,
-           bank: str = None) -> List[Dict]:
+           metadata_keys: Optional[List[str]] = None,
+           bank: Optional[str] = None) -> Union[List[Dict], Dict[str, Any]]:
     """Search memories using the global instance with temporal filtering and scoring"""
     return _get_default(bank).recall(query, top_k,
                                      from_date=from_date, to_date=to_date,
@@ -1196,7 +1215,8 @@ def recall(query: str, top_k: int = 5, *,
                                      vec_weight=vec_weight,
                                      fts_weight=fts_weight,
                                      importance_weight=importance_weight,
-                                     explain=explain)
+                                     explain=explain,
+                                     metadata_keys=metadata_keys)
 
 
 def get_context(limit: int = 10, bank: str = None) -> List[Dict]:

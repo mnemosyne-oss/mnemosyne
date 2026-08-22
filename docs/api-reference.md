@@ -137,7 +137,19 @@ results = mem.recall(
 )
 ```
 
-Returns a list of dicts with keys: `id`, `content`, `score`, `source`, `timestamp`, `importance`, `scope`, `metadata`.
+Returns compact result dicts with ranking, source, lifecycle and scope fields. Stored `metadata_json` is not included by default.
+
+Pass `metadata_keys` when a policy-aware consumer needs selected top-level metadata keys:
+
+```python
+results = mem.recall(
+    "deployment policy",
+    top_k=10,
+    metadata_keys=["project_id", "policy_version"],
+)
+```
+
+Projection happens after ranking and scope filtering, never changes recall counters, skips synthetic rows, and issues at most one query per physical memory tier. It accepts at most 500 results and 32 keys, with a 16 KiB projected-metadata cap per result. Unrequested metadata is never returned, and enhanced-recall caches remain compact.
 
 **Examples:**
 
