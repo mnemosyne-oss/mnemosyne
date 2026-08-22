@@ -497,8 +497,10 @@ ENV_ONLY_DESCRIPTIONS = {
     "MNEMOSYNE_IMPORTED_WEIGHT": "Veracity multiplier for imported memories.",
     "MNEMOSYNE_INFERRED_WEIGHT": "Veracity multiplier for inferred memories.",
     "MNEMOSYNE_LEXICAL_GATE_MIN": "Override the lexical admission gate (float 0.0–1.0, clamped; non-finite/invalid values fall back to the historical query-length thresholds 0.15/0.5/0.3). `0.0` admits purely-vector candidates (recall-first, at a precision cost). Read on every recall call; retrieval stays local (sqlite-vec + JSON/NumPy embeddings, or lexical-only FTS5 when embeddings are unavailable).",
+    "MNEMOSYNE_MCP_ALLOWED_HOSTS": "Comma-separated Host header values allowed for a non-loopback MCP Streamable HTTP bind (exact names or `name:*` patterns covering any port). A non-loopback bind exposes the selected local SQLite-backed memory bank to network clients, so this variable and `MNEMOSYNE_MCP_TOKEN` together form the security boundary. Required to start a non-loopback server; requests presenting any other Host are rejected with HTTP 421.",
+    "MNEMOSYNE_MCP_ALLOWED_ORIGINS": "Optional comma-separated browser Origins allowed for a non-loopback MCP Streamable HTTP bind. Requests with no Origin header (CLI/SDK clients) always pass; any Origin not listed is rejected with HTTP 403. Origins only narrow the exposure boundary; the token and Host policy above are always required.",
     "MNEMOSYNE_MCP_BANK": "Memory bank used by the MCP server.",
-    "MNEMOSYNE_MCP_TOKEN": "Bearer token for MCP SSE auth. Required for any non-loopback bind.",
+    "MNEMOSYNE_MCP_TOKEN": "Bearer token for MCP HTTP (SSE and Streamable HTTP) auth. Required for any non-loopback bind, which exposes the selected local SQLite-backed memory bank to network clients.",
     "MNEMOSYNE_MODEL_CACHE_DIR": "Directory holding the local GGUF consolidation model. Unset or blank keeps `~/.hermes/mnemosyne/models`. Read at import; an explicitly set path is authoritative, so an unusable one fails rather than falling back to the default.",
     "MNEMOSYNE_PERSONA_FILE": "Path to an external persona facts file.",
     "MNEMOSYNE_PREFETCH_MODEL_SLOT_LIMIT": "Maximum canonical slots prefetched per turn.",
@@ -556,7 +558,7 @@ def _render_tool_schema(tools, version: str) -> str:
         "> Regenerate with `python3 scripts/generate-docs.py`.",
         "",
         f"Mnemosyne declares **{len(tools)} tools**. Of those, **{len(mcp)} are callable over MCP** "
-        f"(stdio and SSE), and **{len(plugin_only)} are implemented only in the Hermes provider** "
+        f"(stdio, SSE and Streamable HTTP), and **{len(plugin_only)} are implemented only in the Hermes provider** "
         "and are not reachable through the MCP server.",
         "",
         "The split is real and worth respecting: calling a plugin-only tool over MCP raises "

@@ -2,7 +2,7 @@
 title: "Configuration"
 version: 4.0.0b1
 config_key_count: 114
-env_only_count: 44
+env_only_count: 46
 generated_at: "auto"
 ---
 
@@ -24,7 +24,7 @@ Keys marked **restart** are read once at startup. Changing them at runtime warns
 and does not take effect until the process restarts.
 
 There are **114 configuration keys**. A further
-**44 environment variables** are read directly from the
+**46 environment variables** are read directly from the
 environment and are **not** settable in `config.yaml`; they are listed separately below.
 
 ---
@@ -176,7 +176,7 @@ This list is derived by scanning the package for `os.environ.get("MNEMOSYNE_..."
 
 ---
 
-## Environment-only variables (44)
+## Environment-only variables (46)
 
 These are read with `os.environ` at their point of use and bypass
 `MnemosyneConfig` entirely. They cannot be set in `config.yaml`.
@@ -205,8 +205,10 @@ These are read with `os.environ` at their point of use and bypass
 | `MNEMOSYNE_IMPORTED_WEIGHT` | Veracity multiplier for imported memories. |
 | `MNEMOSYNE_INFERRED_WEIGHT` | Veracity multiplier for inferred memories. |
 | `MNEMOSYNE_LEXICAL_GATE_MIN` | Override the lexical admission gate (float 0.0–1.0, clamped; non-finite/invalid values fall back to the historical query-length thresholds 0.15/0.5/0.3). `0.0` admits purely-vector candidates (recall-first, at a precision cost). Read on every recall call; retrieval stays local (sqlite-vec + JSON/NumPy embeddings, or lexical-only FTS5 when embeddings are unavailable). |
+| `MNEMOSYNE_MCP_ALLOWED_HOSTS` | Comma-separated Host header values allowed for a non-loopback MCP Streamable HTTP bind (exact names or `name:*` patterns covering any port). A non-loopback bind exposes the selected local SQLite-backed memory bank to network clients, so this variable and `MNEMOSYNE_MCP_TOKEN` together form the security boundary. Required to start a non-loopback server; requests presenting any other Host are rejected with HTTP 421. |
+| `MNEMOSYNE_MCP_ALLOWED_ORIGINS` | Optional comma-separated browser Origins allowed for a non-loopback MCP Streamable HTTP bind. Requests with no Origin header (CLI/SDK clients) always pass; any Origin not listed is rejected with HTTP 403. Origins only narrow the exposure boundary; the token and Host policy above are always required. |
 | `MNEMOSYNE_MCP_BANK` | Memory bank used by the MCP server. |
-| `MNEMOSYNE_MCP_TOKEN` | Bearer token for MCP SSE auth. Required for any non-loopback bind. |
+| `MNEMOSYNE_MCP_TOKEN` | Bearer token for MCP HTTP (SSE and Streamable HTTP) auth. Required for any non-loopback bind, which exposes the selected local SQLite-backed memory bank to network clients. |
 | `MNEMOSYNE_MODEL_CACHE_DIR` | Directory holding the local GGUF consolidation model. Unset or blank keeps `~/.hermes/mnemosyne/models`. Read at import; an explicitly set path is authoritative, so an unusable one fails rather than falling back to the default. |
 | `MNEMOSYNE_PERSONA_FILE` | Path to an external persona facts file. |
 | `MNEMOSYNE_PREFETCH_MODEL_SLOT_LIMIT` | Maximum canonical slots prefetched per turn. |

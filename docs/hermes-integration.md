@@ -457,7 +457,14 @@ For integration with MCP-compatible clients:
 ```bash
 mnemosyne mcp                          # stdio transport
 mnemosyne mcp --transport sse --port 8080  # SSE transport
+mnemosyne mcp --transport streamable-http --port 8080  # native MCP http transport
 ```
+
+The HTTP transports bind to loopback (`127.0.0.1`) by default and need no
+token there. A non-loopback bind exposes the selected local SQLite-backed
+memory bank to network clients, so it requires `MNEMOSYNE_MCP_TOKEN`; the
+`streamable-http` transport also requires `MNEMOSYNE_MCP_ALLOWED_HOSTS`, with
+`MNEMOSYNE_MCP_ALLOWED_ORIGINS` optionally restricting browser origins.
 
 Mnemosyne does not currently expose a standalone REST API server.
 

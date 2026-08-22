@@ -44,6 +44,11 @@ This release also changes Hermes wrapper install behavior. See
   media, describes it through a configured provider, and writes the description
   back as an ordinary memory that hybrid recall already understands. Text
   recall is unchanged.
+- **MCP Streamable HTTP transport.** `mnemosyne mcp` gains
+  `--transport streamable-http` (alias `http`). The MCP extras now require
+  `mcp>=2.0.0`; the lockfile previously resolved 1.28.1. If your environment
+  pins the MCP SDK transitively, relax a `mcp<2` constraint or move to 2.0.0
+  or newer before upgrading.
 - **Unknown embedding models now fail loud** instead of silently resolving to
   384 dimensions. This is the breaking change.
 
