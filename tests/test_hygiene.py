@@ -221,6 +221,16 @@ class TestScoreNoise:
         assert score >= 0.6
         assert "likely_dump" in reasons
 
+    @pytest.mark.parametrize("terminator", ["。", "！", "？", "."])
+    def test_multiline_sentences_are_not_flagged_as_dump(self, terminator):
+        content = "\n".join(
+            [f"This is a complete sentence with useful content{terminator}"] * 60
+        )
+
+        _score, reasons = _score_noise(content, 0.5, "")
+
+        assert "likely_dump" not in reasons
+
 
 # ---------------------------------------------------------------------------
 # _suggest_action

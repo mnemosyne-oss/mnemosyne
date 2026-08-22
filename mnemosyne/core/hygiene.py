@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from mnemosyne.core.filters import (
     DEFAULT_NOISE_PATTERNS,
+    _count_sentence_boundaries,
     detect_secrets,
     matches_patterns,
 )
@@ -234,7 +235,7 @@ def _score_noise(content: str, importance: float, source: str) -> Tuple[float, L
     # 6. High line count + low semantic structure (likely a dump)
     line_count = content.count("\n") + 1
     if line_count > 30 and len(content) > 1000:
-        sentences = content.count(". ")
+        sentences = _count_sentence_boundaries(content)
         if sentences < line_count * 0.1:
             score = max(score, 0.65)
             reasons.append("likely_dump")
