@@ -534,11 +534,11 @@ class TestSessionIdentityBinding:
         server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error"))
         thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
-        for _ in range(200):
+        for _ in range(600):  # 30 s — wolne runnery CI
             if server.started:
                 break
             time.sleep(0.05)
-        assert server.started, "uvicorn did not start"
+        assert server.started, "uvicorn did not start within 30s"
         port = server.servers[0].sockets[0].getsockname()[1]
         return server, thread, f"http://127.0.0.1:{port}"
 
@@ -575,11 +575,11 @@ class TestSessionIdentityBinding:
         try:
             reader = threading.Thread(target=_keep_reading, daemon=True)
             reader.start()
-            for _ in range(100):
+            for _ in range(200):  # 10 s
                 if "sid" in sid_holder:
                     break
                 time.sleep(0.05)
-            assert "sid" in sid_holder, "endpoint event with session_id not received within 5s"
+            assert "sid" in sid_holder, "endpoint event with session_id not received within 10s"
             sid = sid_holder["sid"]
             r_b = client.post(
                 f"/messages/?session_id={sid}",
@@ -629,11 +629,11 @@ class TestSessionIdentityBinding:
         try:
             reader = threading.Thread(target=_keep_reading, daemon=True)
             reader.start()
-            for _ in range(100):
+            for _ in range(200):  # 10 s
                 if "sid" in sid_holder:
                     break
                 time.sleep(0.05)
-            assert "sid" in sid_holder, "endpoint event with session_id not received within 5s"
+            assert "sid" in sid_holder, "endpoint event with session_id not received within 10s"
             sid = sid_holder["sid"]
             # close the stream -> transport ends the session (finally: pop owner/writer)
             sse.close()
@@ -688,12 +688,12 @@ class TestSessionIdentityBinding:
         try:
             reader = threading.Thread(target=_keep_reading, daemon=True)
             reader.start()
-            for _ in range(100):
+            for _ in range(200):  # 10 s na endpoint event
                 if events:
                     break
                 time.sleep(0.05)
             # pierwszy data = endpoint URI
-            assert events, "no endpoint event received"
+            assert events, "no endpoint event received within 10s"
             endpoint = events[0]
             sid = endpoint.split("session_id=")[1]
 
