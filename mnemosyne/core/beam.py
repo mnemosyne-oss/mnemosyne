@@ -3852,7 +3852,23 @@ class BeamMemory:
             if _embeddings.available():
                 try:
                     vec = _embeddings.embed([content])
-                    if vec is not None and len(vec) == 1:
+                    # Match remember_batch()'s two non-fatal failure modes:
+                    # None return and length mismatch. Pre-fix both were
+                    # silent no-ops here, so vector recall silently lost rows
+                    # while remember_batch() logged the same conditions.
+                    if vec is None:
+                        logger.warning(
+                            "remember: _embeddings.embed returned None -- "
+                            "no vector stored, vector voice will miss this row"
+                        )
+                    elif len(vec) != 1:
+                        logger.warning(
+                            "remember: embedding count mismatch (%d vectors "
+                            "for 1 input) -- skipping vector storage to avoid "
+                            "partial-alignment errors",
+                            len(vec),
+                        )
+                    else:
                         _store_working_embedding(self.conn, memory_id, vec[0])
                 except Exception as exc:
                     logger.warning(

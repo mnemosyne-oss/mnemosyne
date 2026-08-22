@@ -7,6 +7,7 @@ import tempfile
 import sqlite3
 import time
 import os
+import logging
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -215,6 +216,87 @@ def test_remember_update_and_forget_maintain_vec_working(temp_db, monkeypatch):
     assert beam.forget_working(memory_id) is True
     assert beam.conn.execute("SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?", (memory_id,)).fetchone()[0] == 0
     assert beam.conn.execute("SELECT COUNT(*) FROM vec_working WHERE rowid = ?", (rowid,)).fetchone()[0] == 0
+
+
+def test_remember_warns_when_embed_returns_none(temp_db, monkeypatch, caplog):
+    """Regression: remember() must warn when embeddings.available() is True
+    but embed([content]) returns None. Pre-fix this was a silent no-op: the
+    embedding was skipped with zero operator signal, mirroring the same bug
+    remember_batch() already logs (beam.py remember_batch None branch).
+    Content-free log: no memory id or content in the message."""
+    beam = BeamMemory(session_id="embed-none", db_path=temp_db)
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
+    monkeypatch.setattr(beam_module._embeddings, "embed", lambda contents: None)
+
+    with caplog.at_level(logging.WARNING, logger="mnemosyne.core.beam"):
+        memory_id = beam.remember("content that should be embedded", source="test")
+
+    # The memory itself must still land (embedding failure is non-fatal).
+    assert memory_id is not None
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?",
+        (memory_id,),
+    ).fetchone()[0] == 1
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, (
+        "remember() silently dropped embedding when embed() returned None -- "
+        "no WARNING logged (remember_batch already logs this; remember was missing it)"
+    )
+    assert "_embeddings.embed returned None" in warnings[0].getMessage()
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?",
+        (memory_id,),
+    ).fetchone()[0] == 0
+    # Content-free: message must not leak the memory id or the content.
+    msg = warnings[0].getMessage()
+    assert memory_id not in msg, (
+        f"WARNING log leaked memory id {memory_id!r}: {msg!r}"
+    )
+    assert "content that should be embedded" not in msg, (
+        f"WARNING log leaked memory content: {msg!r}"
+    )
+
+
+def test_remember_warns_when_embed_returns_wrong_count(temp_db, monkeypatch, caplog):
+    """Regression: remember() must warn when embed([content]) returns a list
+    whose length != 1 (the single input). Pre-fix this was a silent no-op
+    because the `len(vec) == 1` guard failed quietly. remember_batch() already
+    logs the analogous count-mismatch; remember() must match for consistency.
+    Content-free log: no memory id or content."""
+    beam = BeamMemory(session_id="embed-mismatch", db_path=temp_db)
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
+    # embed([one item]) returns two vectors -- a count mismatch.
+    monkeypatch.setattr(
+        beam_module._embeddings, "embed",
+        lambda contents: [[0.0] * beam_module.EMBEDDING_DIM,
+                          [0.0] * beam_module.EMBEDDING_DIM],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="mnemosyne.core.beam"):
+        memory_id = beam.remember("content for count mismatch check", source="test")
+
+    assert memory_id is not None
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?",
+        (memory_id,),
+    ).fetchone()[0] == 1
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings, (
+        "remember() silently dropped embedding on count mismatch -- "
+        "no WARNING logged (the len(vec)==1 guard failed quietly)"
+    )
+    assert "embedding count mismatch (2 vectors for 1 input)" in warnings[0].getMessage()
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id = ?",
+        (memory_id,),
+    ).fetchone()[0] == 0
+    msg = warnings[0].getMessage()
+    assert memory_id not in msg, (
+        f"WARNING log leaked memory id {memory_id!r}: {msg!r}"
+    )
+    assert "content for count mismatch check" not in msg, (
+        f"WARNING log leaked memory content: {msg!r}"
+    )
 
 
 def test_vec_working_backfill_from_memory_embeddings_is_idempotent(temp_db):
