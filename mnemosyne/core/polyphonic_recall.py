@@ -124,6 +124,16 @@ class PolyphonicRecallEngine:
         self.graph = EpisodicGraph(db_path=self.db_path, conn=conn)
         self.consolidator = VeracityConsolidator(db_path=self.db_path, conn=conn)
 
+        # [C4] Per-call degraded-path signal for recall diagnostics.
+        # The vector voice prefers the sqlite-vec `vec_episodes` fast
+        # path for the EM tier and falls back to a numpy full-scan
+        # over `memory_embeddings` when sqlite-vec is unavailable,
+        # errors, or its ANN hits all get filtered out. That is the
+        # polyphonic analogue of the linear path's em_fallback (the
+        # engine has no substring-scoring tier). reset per recall()
+        # call by the voice; beam.py reads it for record_fallback_used.
+        self.last_call_fallback = {"em": False, "wm": False}
+
         # Voice weights (deterministic, learned from validation)
         self.voice_weights = {
             "vector": 0.35,
@@ -228,6 +238,12 @@ class PolyphonicRecallEngine:
         ablation experiments. Returns empty so RRF fusion sees no
         vector contribution.
         """
+        # Reset per-call fallback state before any early-return path:
+        # a prior call may have recorded em=True; if this call exits
+        # early (voice disabled, missing/empty embedding, zero norm)
+        # the engine would otherwise inherit stale degraded state and
+        # beam.py would record a false fallback for this call.
+        self.last_call_fallback = {"em": False, "wm": False}
         if _env_disabled("MNEMOSYNE_VOICE_VECTOR"):
             return []
         if query_embedding is None or np is None:
@@ -543,6 +559,12 @@ class PolyphonicRecallEngine:
             results = sorted(
                 by_id.values(), key=lambda r: r.score, reverse=True
             )
+            # [C4] Surface whether the EM tier degraded to the numpy
+            # full-scan (sqlite-vec absent/failed, or its top-K ANN
+            # hits all dropped in the superseded/valid_until JOIN).
+            # WM tier always uses numpy cosine today (no sqlite-vec
+            # WM index exists), so WM is never a degraded path here.
+            self.last_call_fallback["em"] = not em_consumed_via_vec_episodes
             return results[:20]
         finally:
             if own_conn:

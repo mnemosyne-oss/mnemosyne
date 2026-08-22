@@ -6185,6 +6185,17 @@ class BeamMemory:
                         _tier_kept[_t] += 1
             for _t, _n in _tier_kept.items():
                 _recall_diag.record_tier_hits(_t, _n)
+            # [C4] Record degraded-path usage on the polyphonic path.
+            # The engine has no substring fallback tier (so wm stays
+            # False by design), but the vector voice degrades from the
+            # sqlite-vec fast path to a numpy full-scan when sqlite-vec
+            # is absent/fails or its top-K ANN hits all drop out. That
+            # is the polyphonic analogue of the linear path's EM
+            # fallback and alarms the same way: em_fallback_rate > 0
+            # means the vec index is not serving this recall.
+            _recall_diag.record_fallback_used(
+                em=bool(getattr(self, "_last_polyphonic_fallback", {}).get("em"))
+            )
             _recall_diag.record_call(truly_empty=(_kept == 0))
             if explain:
                 return {
@@ -8079,7 +8090,17 @@ class BeamMemory:
             )
         except Exception as exc:
             logger.exception("polyphonic recall engine failed: %s", exc)
+            # Degraded path signal stays default on engine failure so
+            # diagnostics don't attribute a broken call to fallback.
+            self._last_polyphonic_fallback = {"em": False, "wm": False}
             return []
+
+        # [C4] Surface the engine's per-call degraded-path signal so
+        # recall()'s diagnostics block can record em_fallback_used
+        # (the vector voice's sqlite-vec -> numpy full-scan fallback).
+        self._last_polyphonic_fallback = dict(
+            getattr(engine, "last_call_fallback", {"em": False, "wm": False})
+        )
 
         # Map → recall's dict shape with filters + multipliers applied.
         weight_map = {"stated": STATED_WEIGHT, "inferred": INFERRED_WEIGHT,
