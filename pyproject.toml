@@ -77,6 +77,9 @@ mnemosyne-auto-save = "mnemosyne.integrations.auto_save_openwebui:main"
 [tool.setuptools.packages.find]
 exclude = ["tests*", "benchmark*", "_benchmarks*", "scripts*", "docs*", "assets*", "integrations*"]
 
+[tool.setuptools.package-data]
+hermes_memory_provider = ["plugin.yaml"]
+
 [tool.setuptools.dynamic]
 version = {attr = "mnemosyne.__version__"}
 
