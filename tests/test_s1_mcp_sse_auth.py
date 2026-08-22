@@ -13,6 +13,7 @@ Run with: pytest tests/test_s1_mcp_sse_auth.py -v
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -503,84 +504,151 @@ class TestMultiTokenParserEdgeCases:
 
 
 class TestSessionIdentityBinding:
-    """Review #830: POST /messages/ cannot swap the session's agent identity.
+    """Maintainer review on #830: bind the token identity at the transport's
+    session-creation boundary, enforce it only for active sessions, drop it
+    when the session closes.
 
-    Transport-level contract via TestClient: establish a session identity on
-    GET /sse?session_id=... then POST /messages/?session_id=... with a
-    DIFFERENT valid token -- must be rejected 403 before reaching the
-    transport (which would 404 on the unknown writer anyway). The
-    instant-responding /whoami route proves the middleware logic itself.
+    Implementation: the middleware sets scope["user"] to an AuthenticatedUser
+    whose client_id is the token name; SseServerTransport's native
+    _session_owners registry then (a) binds the principal inside
+    connect_sse() — the GET /sse request that created the session,
+    (b) rejects POST /messages/ presented with a different credential
+    ("respond exactly as if the session did not exist" -> 404),
+    (c) pops the binding in connect_sse()'s finally block on close.
+
+    The regression below drives a REAL SSE session over uvicorn+httpx:
+    token A opens the stream (a background thread keeps it alive), the
+    emitted endpoint event yields the transport-generated session UUID,
+    then a real MCP message is POSTed with token B and later token A.
+
+    Note: the SSE stream must keep being read while POSTs are made —
+    aborting the line iterator closes the httpx response and tears the
+    session down (that is the close-path, exercised separately below).
     """
+
+    def _server(self, app):
+        import threading
+
+        import uvicorn
+
+        server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error"))
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        for _ in range(200):
+            if server.started:
+                break
+            time.sleep(0.05)
+        assert server.started, "uvicorn did not start"
+        port = server.servers[0].sockets[0].getsockname()[1]
+        return server, thread, f"http://127.0.0.1:{port}"
 
     def _build(self, monkeypatch, tokens):
         monkeypatch.setenv("MNEMOSYNE_MCP_TOKENS", _json.dumps(tokens))
         from mnemosyne.mcp_server import _build_sse_app
-        from mnemosyne.runtime_context import get_request_token_name
-        from starlette.responses import PlainTextResponse
-        from starlette.routing import Route
+        return _build_sse_app(host="0.0.0.0")
 
-        app = _build_sse_app(host="0.0.0.0")
+    def test_cross_token_message_rejected_at_transport_level(self, monkeypatch):
+        """SSE opened with A; MCP message with B rejected (404, as-if-missing);
+        the same message with A is accepted (202). No tool attribution can
+        occur for B because the transport never reaches the session writer."""
+        httpx = pytest.importorskip("httpx")
+        import threading
 
-        async def _whoami(request):
-            return PlainTextResponse(get_request_token_name() or "anon")
+        app = self._build(monkeypatch, {"hermes-family": "tokA", "ci": "tokB"})
+        server, thread, base = self._server(app)
+        client = httpx.Client(base_url=base, timeout=30)
+        sse = client.send(
+            client.build_request("GET", "/sse", headers={"Authorization": "Bearer tokA"}),
+            stream=True,
+        )
+        sid_holder = {}
 
-        app.router.routes.append(Route("/whoami", _whoami))
-        return app
+        def _keep_reading():
+            try:
+                for line in sse.iter_lines():
+                    if line.startswith("data:") and "session_id=" in line:
+                        sid_holder["sid"] = line.strip().split("session_id=")[1]
+            except Exception:
+                # strumień zamknięty przez test (close-path) — czytelnik ginie
+                pass
 
-    def test_post_with_same_token_ok(self, monkeypatch):
-        app = self._build(monkeypatch, {"hermes-family": "tok1", "hermes-admin": "tok2"})
-        from starlette.testclient import TestClient
+        try:
+            reader = threading.Thread(target=_keep_reading, daemon=True)
+            reader.start()
+            for _ in range(100):
+                if "sid" in sid_holder:
+                    break
+                time.sleep(0.05)
+            sid = sid_holder["sid"]
+            r_b = client.post(
+                f"/messages/?session_id={sid}",
+                headers={"Authorization": "Bearer tokB", "Content-Type": "application/json"},
+                content=_json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+            )
+            assert r_b.status_code == 404, (
+                "message with token B for a session created by token A must be "
+                f"rejected as if the session did not exist (got {r_b.status_code})"
+            )
+            r_a = client.post(
+                f"/messages/?session_id={sid}",
+                headers={"Authorization": "Bearer tokA", "Content-Type": "application/json"},
+                content=_json.dumps({"jsonrpc": "2.0", "id": 2, "method": "ping"}),
+            )
+            assert r_a.status_code == 202
+        finally:
+            sse.close()
+            client.close()
+            server.should_exit = True
+            thread.join(timeout=5)
 
-        with TestClient(app) as client:
-            # GET nawiązuje tożsamość sesji (session_id w query, jak w
-            # reconnect flow transportu)
-            r_get = client.get("/whoami?session_id=deadbeef", headers={"Authorization": "Bearer tok1"})
-            r_post = client.post("/messages/?session_id=deadbeef", headers={"Authorization": "Bearer tok1"})
-        assert r_get.text == "hermes-family"
-        # transport 404/202 na nieznanym writerze — ale NIE 403 (token zgodny)
-        assert r_post.status_code != 403
+    def test_session_owner_binding_cleared_on_close(self, monkeypatch):
+        """After the SSE stream closes, the transport drops the session:
+        POSTs with the ORIGINAL token are 404 too (no stale bindings)."""
+        httpx = pytest.importorskip("httpx")
+        import threading
 
-    def test_post_with_different_token_rejected_403(self, monkeypatch):
-        app = self._build(monkeypatch, {"hermes-family": "tok1", "hermes-admin": "tok2"})
-        from starlette.testclient import TestClient
+        app = self._build(monkeypatch, {"hermes-family": "tokA"})
+        server, thread, base = self._server(app)
+        client = httpx.Client(base_url=base, timeout=30)
+        sse = client.send(
+            client.build_request("GET", "/sse", headers={"Authorization": "Bearer tokA"}),
+            stream=True,
+        )
+        sid_holder = {}
 
-        with TestClient(app) as client:
-            client.get("/whoami?session_id=cafe1234", headers={"Authorization": "Bearer tok1"})
-            r = client.post("/messages/?session_id=cafe1234", headers={"Authorization": "Bearer tok2"})
-        assert r.status_code == 403
-        assert r.json() == {"error": "token does not match session identity"}
+        def _keep_reading():
+            try:
+                for line in sse.iter_lines():
+                    if line.startswith("data:") and "session_id=" in line:
+                        sid_holder["sid"] = line.strip().split("session_id=")[1]
+            except Exception:
+                # strumień zamknięty przez test (close-path) — czytelnik ginie
+                pass
 
-    def test_post_with_unknown_session_lets_transport_decide(self, monkeypatch):
-        """Brak zarejestrowanej sesji = brak wiązania; transport sam odmówi
-        (404 unknown writer). Middleware nie blokuje takich POSTów."""
-        app = self._build(monkeypatch, {"hermes-family": "tok1"})
-        from starlette.testclient import TestClient
-
-        with TestClient(app) as client:
-            r = client.post("/messages/?session_id=0000", headers={"Authorization": "Bearer tok1"})
-        assert r.status_code != 403
-
-    def test_session_identities_map_is_bounded(self, monkeypatch):
-        """Flooding unique session_ids cannot grow the map unboundedly
-        (FIFO eviction past the hard cap; review round 2 on #830)."""
-        monkeypatch.setenv("MNEMOSYNE_MCP_TOKENS", _json.dumps({"a": "t1", "b": "t2"}))
-        import mnemosyne.mcp_server as srv
-        # cap zyje w domknieciu _build_sse_app; sprawdzamy przez mape aplikacji
-        app = srv._build_sse_app(host="0.0.0.0")
-        from starlette.responses import PlainTextResponse
-        from starlette.routing import Route
-        from starlette.testclient import TestClient
-
-        async def _whoami(request):
-            return PlainTextResponse("ok")
-
-        app.router.routes.append(Route("/whoami", _whoami))
-        # mapa jest w domknieciu middleware; test pośredni: 2*N unikalnych
-        # sesji nie może zwiekszyc pamięci procesu ponad rozsądny limit —
-        # tu weryfikujemy funkcyjnie, że limit egzekwuje się bez błędów
-        with TestClient(app) as client:
-            for i in range(100):
-                client.get(f"/whoami?session_id=sess{i}", headers={"Authorization": "Bearer t1"})
-            # najstarsze wpisy wypadły; najnowsza sesja nadal działa
-            r = client.get("/whoami?session_id=sess99", headers={"Authorization": "Bearer t1"})
-        assert r.status_code == 200
+        try:
+            reader = threading.Thread(target=_keep_reading, daemon=True)
+            reader.start()
+            for _ in range(100):
+                if "sid" in sid_holder:
+                    break
+                time.sleep(0.05)
+            sid = sid_holder["sid"]
+            # zamknij strumień -> transport kończy sesję (finally: pop owner/writer)
+            sse.close()
+            deadline = time.time() + 5
+            cleared = False
+            while time.time() < deadline:
+                r = client.post(
+                    f"/messages/?session_id={sid}",
+                    headers={"Authorization": "Bearer tokA", "Content-Type": "application/json"},
+                    content=_json.dumps({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+                )
+                if r.status_code == 404:
+                    cleared = True
+                    break
+                time.sleep(0.2)
+            assert cleared, "session binding should be dropped after SSE close"
+        finally:
+            client.close()
+            server.should_exit = True
+            thread.join(timeout=5)

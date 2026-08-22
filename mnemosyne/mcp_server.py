@@ -261,23 +261,14 @@ def _build_sse_app(host: str = "127.0.0.1"):
     if require_auth:
         assert tokens is not None and len(tokens) > 0
 
-        # Session-identity binding (review feedback on #830): the SSE GET
-        # establishes the session's agent identity; subsequent POSTs to
-        # /messages/ must present the SAME token. A different valid token
-        # is rejected (403) so a tool call can never be attributed to an
-        # agent other than the one that opened the session.
-        # Bounded: identities are recorded only for sessions the transport
-        # later validates anyway, evicted FIFO past a hard cap so a client
-        # flooding unique session_ids cannot grow memory unboundedly.
-        session_identities: "dict[str, str]" = {}
-        _SESSION_IDENTITIES_MAX = 10_000
-
-        def _query_param(scope, key: str) -> "str | None":
-            qs = scope.get("query_string", b"").decode("latin-1")
-            for part in qs.split("&"):
-                if part.startswith(key + "="):
-                    return part[len(key) + 1:]
-            return None
+        # Session-identity binding (maintainer feedback on #830): instead of
+        # a parallel registry, the matched token name is exposed as
+        # scope["user"] (AuthenticatedUser with client_id = token name). The
+        # SSE transport natively binds that principal to the session inside
+        # connect_sse() (_session_owners), rejects POST /messages/ presented
+        # with a different credential ("respond exactly as if the session
+        # did not exist"), and drops the binding when the session closes —
+        # no state to bound or clean up here.
 
         class _BearerTokenMiddleware:
             """Pure-ASGI bearer auth middleware (single- or multi-token).
@@ -334,33 +325,27 @@ def _build_sse_app(host: str = "127.0.0.1"):
                     )
                     await resp(scope, receive, send)
                     return
-                # Session-identity binding: on any request carrying a
-                # session_id query param (in the transport's reconnect flow
-                # the SSE GET itself carries it; POSTs always do), the FIRST
-                # authenticated request for that session fixes its identity.
-                # Subsequent POSTs to /messages/ must present the SAME token
-                # (403 otherwise) so a tool call can never be attributed to
-                # an agent other than the one that opened the session.
-                path = scope.get("path", "")
-                session_id = _query_param(scope, "session_id")
-                if session_id:
-                    bound = session_identities.get(session_id)
-                    if bound is None:
-                        if len(session_identities) >= _SESSION_IDENTITIES_MAX:
-                            # FIFO eviction: drop the oldest recorded entry.
-                            session_identities.pop(next(iter(session_identities)))
-                        session_identities[session_id] = matched_name
-                    elif "/messages" in path and bound != matched_name:
-                        resp = JSONResponse(
-                            {"error": "token does not match session identity"},
-                            status_code=403,
-                        )
-                        await resp(scope, receive, send)
-                        return
-                # Per-agent identity: contextvar (consumed by mcp_tools'
-                # author resolution) + ASGI scope state for inspection.
+                # Per-agent identity, two consumers:
+                # 1. mcp_tools author resolution (contextvar);
+                # 2. the SSE transport's session-ownership check, which
+                #    compares principals between session creation
+                #    (GET /sse) and each POST /messages/ and cleans up
+                #    the binding when the session closes.
                 set_request_token_name(matched_name)
                 scope.setdefault("state", {})["mnemosyne_token_name"] = matched_name
+                try:
+                    from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+                    from mcp.server.auth.provider import AccessToken
+
+                    scope["user"] = AuthenticatedUser(
+                        AccessToken(
+                            token=presented.decode("latin-1", "replace"),
+                            client_id=matched_name,
+                            scopes=[],
+                        )
+                    )
+                except Exception:  # pragma: no cover — optional auth deps
+                    pass
                 await self.app(scope, receive, send)
 
         middleware.append(Middleware(_BearerTokenMiddleware))
