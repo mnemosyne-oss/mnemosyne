@@ -323,7 +323,7 @@ class TestClassifyMemoryWrite:
         assert decision.action == "reject"
         assert "dump" in decision.reason
 
-    @pytest.mark.parametrize("terminator", ["。", "！", "？", "."])
+    @pytest.mark.parametrize("terminator", ["。", "！", "？", ".", "!", "?"])
     def test_allows_multiline_sentences_with_cjk_or_line_end_punctuation(self, terminator):
         content = "\n".join(
             [f"This is a complete sentence with useful content{terminator}"] * 60
@@ -332,6 +332,19 @@ class TestClassifyMemoryWrite:
         decision = classify_memory_write(content)
 
         assert decision.action == "allow"
+
+    def test_rejects_dotted_low_structure_dump(self):
+        lines = [
+            "/var/lib/mnemosyne/cache-v3.2/item.bin",
+            "using worker id node-01.v2",
+            "reading package-4.1.0.tar.gz",
+        ]
+        content = "\n".join(lines * 25)
+
+        decision = classify_memory_write(content)
+
+        assert decision.action == "reject"
+        assert decision.reason == "likely_dump_high_linecount_low_structure"
 
     def test_value_keywords_reduce_score(self):
         content = "The user prefers using pytest for testing in this project. Always remember to run tests before committing."
