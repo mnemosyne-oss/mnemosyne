@@ -173,11 +173,15 @@ def key(v):
     stage = {None: 3, "a": 0, "b": 1, "rc": 2}[kind]
     return (int(major), int(minor), int(patch), stage, int(num or 0))
 
-sys.exit(0 if key(os.environ["TAG_VER"]) > key(os.environ["LATEST_VER"]) else 1)
+# `git tag --list` includes the tag being pushed, since it exists locally by
+# the time this hook runs, so LATEST_VER is frequently TAG_VER itself.
+# Equality must pass. Only a tag strictly behind the namespace is an error,
+# which is what the previous `sort -V` comparison allowed for.
+sys.exit(0 if key(os.environ["TAG_VER"]) >= key(os.environ["LATEST_VER"]) else 1)
 PEP440
         then
-            echo "ERROR: Tag '$tag_version' is not ahead of existing $tag_namespace tag '$latest_existing'"
-            echo "  New tag must be greater than the latest existing tag in that namespace."
+            echo "ERROR: Tag '$tag_version' is behind existing $tag_namespace tag '$latest_existing'"
+            echo "  New tag must not be older than the latest existing tag in that namespace."
             echo "  Pre-release order: 4.0.0a1 < 4.0.0b1 < 4.0.0rc1 < 4.0.0"
             exit 1
         fi
