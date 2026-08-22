@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """
-Comprehensive test suite for mnemosyne-stats.py
-Runs 30 iterations across edge cases, integration, and stress tests.
+Comprehensive pytest suite for scripts/mnemosyne-stats.py.
+
+All tests run against a hermetic pytest-owned database, home, and wiki (see
+the module-scoped `_hermetic_stats_env` fixture): the stats CLI subprocess is
+never allowed to touch the developer's real Mnemosyne data.
 """
 
 import subprocess
 import json
 import os
 import sys
-import shutil
-import tempfile
+import shlex
 import sqlite3
 from pathlib import Path
 from datetime import datetime
+
+import pytest
+
+from mnemosyne.core.beam import init_beam
+from mnemosyne.core.triples import init_triples
 
 
 def _safe_count(db, table):
@@ -36,31 +43,109 @@ DB_PATH = _expected_data_dir() / "mnemosyne.db"
 SNAP_DIR = Path.home() / ".hermes" / "mnemosyne" / "stats"
 WIKI_PATH = Path.home() / "wiki"
 
-passed = 0
-failed = 0
-errors = []
+# Populated by the module-scoped `_hermetic_stats_env` fixture below. Every
+# subprocess invocation of the stats CLI inherits this environment, so tests
+# never read or write the developer's real Mnemosyne database or home dirs.
+TEST_ENV = None
 
 def run(args="", check=True):
     """Run the script and return (exit_code, stdout, stderr)."""
-    cmd = f"cd {SCRIPT.parent} && python3 {SCRIPT} {args}"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+    if TEST_ENV is None:
+        raise RuntimeError(
+            "run() called without the hermetic environment; "
+            "_hermetic_stats_env must be active (issue #783)."
+        )
+    cmd = [sys.executable, str(SCRIPT), *shlex.split(args)]
+    result = subprocess.run(
+        cmd,
+        cwd=str(SCRIPT.parent),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=TEST_ENV,
+    )
     return result.returncode, result.stdout, result.stderr
 
-def _test(name, fn):
-    """Run a test function and track results."""
-    global passed, failed
-    try:
-        fn()
-        passed += 1
-        print(f"  ✓ {name}")
-    except AssertionError as e:
-        failed += 1
-        errors.append((name, str(e)))
-        print(f"  ✗ {name}: {e}")
-    except Exception as e:
-        failed += 1
-        errors.append((name, f"EXCEPTION: {e}"))
-        print(f"  ✗ {name}: EXCEPTION: {e}")
+def _seed_stats_db(db_path, wiki_path):
+    """Create a deterministic database and wiki for the stats CLI to read."""
+    # Use the production schema initializers so the fixture cannot drift from
+    # the shipped schema (columns such as consolidated_at, timestamp, scope,
+    # recall_count are added by migrations in init_beam; triples lives in its
+    # own store, initialized by init_triples).
+    init_beam(Path(db_path))
+    init_triples(Path(db_path))
+    older = datetime(2024, 1, 1).isoformat()
+    newer = datetime(2024, 1, 2).isoformat()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, veracity, recall_count, scope, consolidated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("wm-1", "global hermetic stats seed memory", "test", older, "default", 0.8, "tool", 3, "global", newer),
+    )
+    conn.execute(
+        "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, veracity, recall_count, scope) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("wm-2", "unrecalled session memory for the stats fixture", "user", newer, "default", 0.2, "stated", 0, "session"),
+    )
+    conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, importance) VALUES (?, ?, ?, ?, ?)",
+        ("em-1", "episodic summary of the hermetic stats run", "test", newer, 0.6),
+    )
+    conn.execute(
+        "INSERT INTO triples (subject, predicate, object, valid_from) VALUES (?, ?, ?, ?)",
+        ("stats-fixture", "prefers", "hermetic tests", "2024-01-01"),
+    )
+    conn.execute(
+        "INSERT INTO consolidation_log (session_id, items_consolidated, summary_preview) VALUES (?, ?, ?)",
+        ("sess-1", 2, "consolidated two fixture memories"),
+    )
+    conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        ("wm-1", "[0.1, 0.2, 0.3]", "test-model"),
+    )
+    (wiki_path / "memories" / "alpha.md").write_text("# Alpha\n")
+    (wiki_path / "concepts" / "beta.md").write_text("# Beta\n")
+    conn.commit()
+    conn.close()
+
+@pytest.fixture(scope="module", autouse=True)
+def _hermetic_stats_env(tmp_path_factory):
+    """Point the stats CLI at pytest-owned data, home, and wiki dirs (#783).
+
+    These tests shell out to scripts/mnemosyne-stats.py as a subprocess. Without
+    a hermetic environment that subprocess resolves the ambient MNEMOSYNE_DATA_DIR
+    / HERMES_HOME / HOME and reads the developer's real database, which makes
+    test_rapid_fire flaky under concurrent writers and leaks stored memories into
+    test output. This fixture replaces those env vars with tmp dirs, seeds a
+    small deterministic database, and re-points the module-level DB_PATH /
+    SNAP_DIR / WIKI_PATH that the assertion helpers read.
+    """
+    global DB_PATH, SNAP_DIR, WIKI_PATH, TEST_ENV
+    root = tmp_path_factory.mktemp("stats-env")
+    data_dir = root / "mnemosyne-data"
+    data_dir.mkdir()
+    home = root / "home"
+    home.mkdir()
+    wiki = home / "wiki"
+    (wiki / "memories").mkdir(parents=True)
+    (wiki / "concepts").mkdir()
+
+    db_path = data_dir / "mnemosyne.db"
+    _seed_stats_db(db_path, wiki)
+
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["HERMES_HOME"] = str(root / "hermes-home")
+    env["MNEMOSYNE_DATA_DIR"] = str(data_dir)
+    env["MNEMOSYNE_NO_EMBEDDINGS"] = "1"
+
+    DB_PATH = db_path
+    SNAP_DIR = home / ".hermes" / "mnemosyne" / "stats"
+    WIKI_PATH = wiki
+    TEST_ENV = env
+
+    yield env
+    TEST_ENV = None
 
 # ═══════════════════════════════════════════════════════════
 # GROUP 1: Normal Operation (10 tests)
@@ -233,36 +318,47 @@ def test_empty_db_path():
         DB_PATH.rename(tmp)
         try:
             code, out, err = run("--json")
-            # Should either error gracefully or return empty data
-            if code == 0:
-                data = json.loads(out)
-                # If it returns data, it should handle missing DB
+            assert code == 0, f"Exit code {code}: {err}"
+            payload = json.loads(out)
+            assert "error" in payload, "Missing DB should surface an error payload"
         finally:
             tmp.rename(DB_PATH)
 
 def test_corrupted_json_snapshot():
-    """Script should handle corrupted snapshot files."""
+    """Corrupted snapshot files are skipped without losing valid trends."""
+    SNAP_DIR.mkdir(parents=True, exist_ok=True)
+    for snap in SNAP_DIR.glob("snap_*.json"):
+        snap.unlink()
+    # Two valid snapshots so trends has data to report even after the
+    # corrupted file is skipped. The wm_total delta (1 -> 2) proves the
+    # valid snapshots were actually parsed.
+    good_a = SNAP_DIR / "snap_a.json"
+    good_b = SNAP_DIR / "snap_b.json"
+    good_a.write_text(json.dumps({"timestamp": "2024-01-01T00:00:00", "wm_total": 1}))
+    good_b.write_text(json.dumps({"timestamp": "2024-01-02T00:00:00", "wm_total": 2}))
     snap_file = SNAP_DIR / "snap_corrupted.json"
     snap_file.write_text("NOT VALID JSON{{{")
     try:
         code, out, err = run("--trends")
-        # Should handle gracefully, not crash
         assert code == 0, f"Crashed on corrupted snapshot: {err}"
+        assert "TRENDS" in out, "Valid snapshots must still produce trends: " + out
+        assert "No trend data yet" not in out, out
+        # +100.0% is the pct change derived from wm_total 1 -> 2, proving the
+        # two valid snapshots were parsed even though a corrupt file is present.
+        assert "+100.0%" in out, "Parsed wm_total trend missing: " + out
     finally:
         snap_file.unlink(missing_ok=True)
+        good_a.unlink(missing_ok=True)
+        good_b.unlink(missing_ok=True)
 
 def test_empty_snapshot_dir():
-    """Script should handle empty snapshot directory."""
-    tmp_dir = SNAP_DIR / "tmp_empty_test"
-    tmp_dir.mkdir(exist_ok=True)
-    try:
-        # The script uses SNAP_DIR, not a configurable path
-        # So we can't easily test this without mocking
-        # But we can verify the script doesn't crash with current state
-        code, out, err = run("--trends")
-        assert code == 0
-    finally:
-        tmp_dir.rmdir()
+    """Trends reports no data when the snapshot directory is empty."""
+    SNAP_DIR.mkdir(parents=True, exist_ok=True)
+    for snap in SNAP_DIR.glob("snap_*.json"):
+        snap.unlink()
+    code, out, err = run("--trends")
+    assert code == 0, f"Exit code {code}: {err}"
+    assert "No trend data yet" in out, out
 
 def test_special_characters_in_memory():
     """SQLite special characters should not crash output."""
@@ -461,75 +557,3 @@ def test_quality_score_bounds():
     data = json.loads(out)
     score = data["quality_score"]
     assert 0 <= score <= 7, f"Quality score out of bounds: {score}"
-
-# ═══════════════════════════════════════════════════════════
-# RUN ALL TESTS
-# ═══════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    print("=" * 60)
-    print("  MNEMOSYNE-STATS.PY TEST SUITE")
-    print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 60)
-
-    print("\n  GROUP 1: Normal Operation (10 tests)")
-    print("  " + "─" * 40)
-    _test("Full dashboard output", test_full_dashboard)
-    _test("Compact mode", test_compact_mode)
-    _test("JSON mode", test_json_mode)
-    _test("Save snapshot", test_save_snapshot)
-    _test("Trends display", test_trends)
-    _test("Auto-snapshot on full run", test_auto_snapshot)
-    _test("Health score format", test_health_score_in_output)
-    _test("DB size in output", test_db_size_in_output)
-    _test("Quality indicators section", test_quality_indicators_section)
-    _test("Recommendations section", test_recommendations_section)
-
-    print("\n  GROUP 2: Edge Cases (10 tests)")
-    print("  " + "─" * 40)
-    _test("Invalid flag handling", test_invalid_flag)
-    _test("Multiple flags", test_multiple_flags)
-    _test("Missing DB path", test_empty_db_path)
-    _test("Corrupted snapshot file", test_corrupted_json_snapshot)
-    _test("Empty snapshot dir", test_empty_snapshot_dir)
-    _test("Special characters in memories", test_special_characters_in_memory)
-    _test("Output size reasonable", test_large_output)
-    _test("JSON structure valid", test_json_valid_structure)
-    _test("Snapshot JSON valid", test_snapshot_json_valid)
-    _test("Concurrent access safety", test_concurrent_access)
-
-    print("\n  GROUP 3: Integration (5 tests)")
-    print("  " + "─" * 40)
-    _test("Wiki count matches files", test_wiki_count_matches)
-    _test("WM count matches DB", test_db_count_matches)
-    _test("Episodic count matches DB", test_episodic_count_matches)
-    _test("Triples count matches DB", test_triples_count_matches)
-    _test("Consolidation count matches DB", test_consolidation_count_matches)
-
-    print("\n  GROUP 4: Stress / Boundary (5 tests)")
-    print("  " + "─" * 40)
-    _test("Rapid fire (10 runs)", test_rapid_fire)
-    _test("JSON pipe to python", test_json_pipe_to_python)
-    _test("Output encoding (UTF-8)", test_output_encoding)
-    _test("Performance (<5s)", test_performance)
-    _test("Snapshot growth tracking", test_snapshot_growth)
-
-    print("\n  GROUP 5: Data Integrity (5 tests)")
-    print("  " + "─" * 40)
-    _test("Importance dist sums to total", test_importance_distribution_sums)
-    _test("Recall dist sums to total", test_recall_distribution_sums)
-    _test("Noise % calculation correct", test_noise_pct_calculation)
-    _test("Global count accuracy", test_global_count_accuracy)
-    _test("Quality score in bounds", test_quality_score_bounds)
-
-    # Summary
-    print(f"\n{'=' * 60}")
-    print(f"  RESULTS: {passed} passed, {failed} failed, {passed+failed} total")
-    print(f"{'=' * 60}")
-
-    if errors:
-        print("\n  FAILURES:")
-        for name, err in errors:
-            print(f"    ✗ {name}: {err}")
-
-    sys.exit(0 if failed == 0 else 1)
