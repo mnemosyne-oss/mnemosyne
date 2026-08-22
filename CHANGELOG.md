@@ -9,6 +9,8 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Added
 
+- **`recall_with_evidence_pack()` adds opt-in supplemental recall evidence (#545).** The API preserves the normal primary ranking and returns a bounded, provenance-preserving `evidence_pack` from eligible additional sessions. Candidate retrieval is telemetry-neutral, honors recall visibility and temporal filters, excludes consolidated and synthetic rows, and never exposes the raw candidate pool.
+
 - **Multimodal memory: images, video and audio can become recallable memories (RFCs 0002, 0003, 0004).** `BeamMemory.remember_media(ref)` takes a reference to a piece of media, registers it, describes it through a configured modality provider, and writes the description back as an ordinary memory that hybrid recall already understands. Nothing about text recall changes.
 
   The stack is additive throughout. Two sidecar tables, `media_assets` and `media_moments`, are created `IF NOT EXISTS` by their own store when a bank is opened, so existing databases acquire them with no migration step and no change to any existing table. No new package dependency is introduced.
