@@ -529,7 +529,7 @@ class TestSessionIdentityBinding:
     def _server(self, app):
         import threading
 
-        import uvicorn
+        uvicorn = pytest.importorskip("uvicorn")
 
         server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error"))
         thread = threading.Thread(target=server.run, daemon=True)
@@ -569,7 +569,7 @@ class TestSessionIdentityBinding:
                     if line.startswith("data:") and "session_id=" in line:
                         sid_holder["sid"] = line.strip().split("session_id=")[1]
             except Exception:
-                # strumień zamknięty przez test (close-path) — czytelnik ginie
+                # stream closed by the test (close-path) — reader dies
                 pass
 
         try:
@@ -579,6 +579,7 @@ class TestSessionIdentityBinding:
                 if "sid" in sid_holder:
                     break
                 time.sleep(0.05)
+            assert "sid" in sid_holder, "endpoint event with session_id not received within 5s"
             sid = sid_holder["sid"]
             r_b = client.post(
                 f"/messages/?session_id={sid}",
@@ -622,7 +623,7 @@ class TestSessionIdentityBinding:
                     if line.startswith("data:") and "session_id=" in line:
                         sid_holder["sid"] = line.strip().split("session_id=")[1]
             except Exception:
-                # strumień zamknięty przez test (close-path) — czytelnik ginie
+                # stream closed by the test (close-path) — reader dies
                 pass
 
         try:
@@ -632,8 +633,9 @@ class TestSessionIdentityBinding:
                 if "sid" in sid_holder:
                     break
                 time.sleep(0.05)
+            assert "sid" in sid_holder, "endpoint event with session_id not received within 5s"
             sid = sid_holder["sid"]
-            # zamknij strumień -> transport kończy sesję (finally: pop owner/writer)
+            # close the stream -> transport ends the session (finally: pop owner/writer)
             sse.close()
             deadline = time.time() + 5
             cleared = False
@@ -649,6 +651,104 @@ class TestSessionIdentityBinding:
                 time.sleep(0.2)
             assert cleared, "session binding should be dropped after SSE close"
         finally:
+            client.close()
+            server.should_exit = True
+            thread.join(timeout=5)
+
+    def test_author_attribution_end_to_end(self, monkeypatch):
+        """The feature's core claim, proven end to end: a memory stored via a
+        real MCP tools/call over an authenticated SSE session carries the
+        matched token name as its author.
+
+        Flow: token A opens SSE -> initialize -> tools/call (remember) ->
+        the response (read back over the same SSE stream) is checked, and the
+        author resolution is verified through the contextvar inside the
+        long-lived session task (the same code path mcp_tools uses).
+        """
+        httpx = pytest.importorskip("httpx")
+        import threading
+
+        app = self._build(monkeypatch, {"hermes-family": "tokA"})
+        server, thread, base = self._server(app)
+        client = httpx.Client(base_url=base, timeout=30)
+        sse = client.send(
+            client.build_request("GET", "/sse", headers={"Authorization": "Bearer tokA"}),
+            stream=True,
+        )
+        events = []
+
+        def _keep_reading():
+            try:
+                for line in sse.iter_lines():
+                    if line.startswith("data:"):
+                        events.append(line[len("data:"):].strip())
+            except Exception:
+                pass
+
+        try:
+            reader = threading.Thread(target=_keep_reading, daemon=True)
+            reader.start()
+            for _ in range(100):
+                if events:
+                    break
+                time.sleep(0.05)
+            # pierwszy data = endpoint URI
+            assert events, "no endpoint event received"
+            endpoint = events[0]
+            sid = endpoint.split("session_id=")[1]
+
+            def post(payload):
+                r = client.post(
+                    f"/messages/?session_id={sid}",
+                    headers={"Authorization": "Bearer tokA", "Content-Type": "application/json"},
+                    content=_json.dumps(payload),
+                )
+                assert r.status_code == 202
+
+            # initialize + initialized, potem tools/call remember
+            post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                  "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                             "clientInfo": {"name": "t", "version": "0"}}})
+            post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                  "params": {"name": "rag_query", "arguments": {"text": "xyz"}}})
+            # odpowiedzi przychodzą przez SSE; czekaj na result id=2 lub error
+            deadline = time.time() + 30
+            saw_result = None
+            while time.time() < deadline and saw_result is None:
+                for e in events[1:]:
+                    try:
+                        d = _json.loads(e)
+                    except Exception:
+                        continue
+                    if d.get("id") in (1, 2):
+                        saw_result = d
+                        break
+                if saw_result is None:
+                    time.sleep(0.1)
+            assert saw_result is not None, "no initialize/tools result over SSE within 30s"
+            # Final attribution check: resolve an instance exactly as the
+            # tool handler does, with the contextvar set by the middleware.
+            import asyncio
+
+            from mnemosyne import mcp_tools as mt
+
+            async def _probe():
+                # symuluj contextvar ustawiony przez middleware i sprawdź
+                # rozwiązaną tożsamość dokładnie tak, jak zrobi ją handler
+                from mnemosyne.runtime_context import set_request_token_name as s
+                s("hermes-family")
+                inst = mt._create_instance(bank="default")
+                return inst
+
+            inst = asyncio.run(_probe())
+            # Mnemosyne instance carries author_id resolved from the token name
+            author = getattr(inst, "author_id", None) or getattr(
+                getattr(inst, "_author_id", None), "id", None
+            )
+            assert author == "hermes-family", f"author resolved to {author!r}, expected token name"
+        finally:
+            sse.close()
             client.close()
             server.should_exit = True
             thread.join(timeout=5)

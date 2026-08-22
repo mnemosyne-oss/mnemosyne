@@ -261,14 +261,18 @@ def _build_sse_app(host: str = "127.0.0.1"):
     if require_auth:
         assert tokens is not None and len(tokens) > 0
 
-        # Session-identity binding (maintainer feedback on #830): instead of
-        # a parallel registry, the matched token name is exposed as
-        # scope["user"] (AuthenticatedUser with client_id = token name). The
-        # SSE transport natively binds that principal to the session inside
-        # connect_sse() (_session_owners), rejects POST /messages/ presented
-        # with a different credential ("respond exactly as if the session
-        # did not exist"), and drops the binding when the session closes —
-        # no state to bound or clean up here.
+        # Resolve the auth principal classes ONCE at app-build time. The
+        # session-ownership guarantee is only as good as this binding, so
+        # missing classes are a startup error, never a silent degradation
+        # (review round 4 on #830).
+        try:
+            from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+            from mcp.server.auth.provider import AccessToken
+        except ImportError as e:
+            raise RuntimeError(
+                "Multi-token SSE auth requires the mcp auth middleware "
+                "(AuthenticatedUser/AccessToken); install mnemosyne-memory[mcp]."
+            ) from e
 
         class _BearerTokenMiddleware:
             """Pure-ASGI bearer auth middleware (single- or multi-token).
@@ -333,19 +337,17 @@ def _build_sse_app(host: str = "127.0.0.1"):
                 #    the binding when the session closes.
                 set_request_token_name(matched_name)
                 scope.setdefault("state", {})["mnemosyne_token_name"] = matched_name
-                try:
-                    from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
-                    from mcp.server.auth.provider import AccessToken
-
-                    scope["user"] = AuthenticatedUser(
-                        AccessToken(
-                            token=presented.decode("latin-1", "replace"),
-                            client_id=matched_name,
-                            scopes=[],
-                        )
+                # Feed the SSE transport's native session-ownership check:
+                # the principal (client_id = token name) is bound to the
+                # session at connect_sse(), compared on every POST /messages/,
+                # and dropped when the session closes.
+                scope["user"] = AuthenticatedUser(
+                    AccessToken(
+                        token=presented.decode("latin-1", "replace"),
+                        client_id=matched_name,
+                        scopes=[],
                     )
-                except Exception:  # pragma: no cover — optional auth deps
-                    pass
+                )
                 await self.app(scope, receive, send)
 
         middleware.append(Middleware(_BearerTokenMiddleware))
