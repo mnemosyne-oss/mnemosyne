@@ -391,6 +391,8 @@ When used with Hermes Agent, Mnemosyne exposes provider tools for the memory lif
 
 **Hardware guidance:** Core alone runs on a Raspberry Pi 4 (4 GB) with ~300 MB free for LLM. `[embeddings]` needs at least 2 GB free RAM. `[all]` recommends 8 GB+.
 
+> **Privacy note on remote embedding endpoints.** `MNEMOSYNE_EMBEDDING_API_URL` sends the text of your memories and of your recall queries (working-memory content, summaries, annotations, and search queries) to that endpoint for vectorization. For privacy-sensitive or local-first deployments prefer a local-embedding profile (`[embeddings]` or `[all]`); use a remote endpoint only when you accept that the embedding provider sees your content.
+
 **Install (Hermes users):**
 ```bash
 source ~/.hermes/hermes-agent/venv/bin/activate

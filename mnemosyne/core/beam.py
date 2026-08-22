@@ -557,7 +557,10 @@ def _detect_vec_type(conn: sqlite3.Connection) -> str:
     return "float32"
 
 
-def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
+def _existing_vec_dim(
+    conn: sqlite3.Connection,
+    tables: Tuple[str, ...] = ("vec_episodes", "vec_working", "vec_facts"),
+) -> Optional[int]:
     """Return the embedding dimension already declared by a sqlite-vec table in
     this database, or ``None`` if no ``vec0`` table exists yet.
 
@@ -567,11 +570,17 @@ def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
     source of truth for what the stored data actually is. Reads only
     ``sqlite_master`` (no extension required) so it is safe to call before the
     sqlite-vec tables are (re)created.
+
+    ``tables`` narrows the lookup: mixed or partially migrated stores can carry
+    vec tables at different dimensions, and a caller reasoning about one
+    specific table (e.g. the episodic KNN about ``vec_episodes``) must not be
+    told some other table's dimension.
     """
     try:
         rows = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' "
-            "AND name IN ('vec_episodes', 'vec_working', 'vec_facts')"
+            f"SELECT sql FROM sqlite_master WHERE type = 'table' "
+            f"AND name IN ({','.join('?' * len(tables))})",
+            tables,
         ).fetchall()
     except sqlite3.Error:
         return None
@@ -2911,6 +2920,22 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     return plan
 
 
+def _is_query_dim_mismatch(exc: BaseException, query_dim: int, existing_dim: Optional[int]) -> bool:
+    """True only when sqlite-vec actually rejected the query vector for its
+    dimension.
+
+    An unrelated ``OperationalError`` (locked database, missing table) must not
+    be dressed up as a dimension mismatch with self-heal guidance, even when
+    the submitted and stored dimensions happen to disagree: classify on the
+    error's own signal, not on the dimension coincidence alone.
+    """
+    return (
+        existing_dim is not None
+        and query_dim != existing_dim
+        and "dimension mismatch" in str(exc).lower()
+    )
+
+
 def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -> List[Dict]:
     """Search sqlite-vec and return rowids with distances.
 
@@ -2932,21 +2957,77 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
     # can't resolve the parameter value. We inline k safely since it's
     # always an integer computed internally.
     k = int(k)
-    if vec_type == "bit":
-        rows = conn.execute(
-            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_binary(?) AND k={k} ORDER BY distance",
-            (emb_json,)
-        ).fetchall()
-    elif vec_type == "int8":
-        rows = conn.execute(
-            f'SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_int8(?, "unit") AND k={k} ORDER BY distance',
-            (emb_json,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH ? AND k={k} ORDER BY distance",
-            (emb_json,)
-        ).fetchall()
+    try:
+        if vec_type == "bit":
+            rows = conn.execute(
+                f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_binary(?) AND k={k} ORDER BY distance",
+                (emb_json,)
+            ).fetchall()
+        elif vec_type == "int8":
+            rows = conn.execute(
+                f'SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH vec_quantize_int8(?, "unit") AND k={k} ORDER BY distance',
+                (emb_json,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT rowid, distance FROM vec_episodes WHERE embedding MATCH ? AND k={k} ORDER BY distance",
+                (emb_json,)
+            ).fetchall()
+    except sqlite3.Error as exc:
+        # sqlite3.Error, not just OperationalError: recall() does not guard
+        # this call, so any sibling exception (DatabaseError,
+        # InternalError, ...) escaping here would take down the process the
+        # same way the dimension mismatch did. Degrade, don't crash: the
+        # write path already drops mismatched
+        # vectors with a warning and the working-memory KNN
+        # (_wm_vec_search_sqlite) returns [] on the same condition; this is
+        # the episodic voice's equivalent. Classify against the dimension of
+        # the query vector actually submitted, not the configured
+        # EMBEDDING_DIM: in the failure shape from the issue the table and the
+        # config agree (both 1024) while the endpoint serves a 384-dim query,
+        # and sqlite-vec rejects exactly that combination. Recall falls back
+        # to the non-vector voices for this call instead of taking down the
+        # agent process. _dim_mismatch_message() carries the self-heal
+        # guidance; keep this pointer short and point at it.
+        query_dim = len(embedding)
+        try:
+            # vec_episodes specifically: mixed or partially migrated stores
+            # can carry vec tables at different dimensions, and guidance
+            # about THIS table's KNN must be based on THIS table's DDL.
+            existing_dim = _existing_vec_dim(conn, tables=("vec_episodes",))
+        except Exception:
+            existing_dim = None
+        if _is_query_dim_mismatch(exc, query_dim, existing_dim):
+            # Keep stored/query/configured dimensions separate: the reindex
+            # guidance in _dim_mismatch_message is only correct when the
+            # CONFIGURED dimension disagrees with the store. When config and
+            # store agree, the embedding endpoint/model served a wrong-dim
+            # query vector and the store needs nothing -- pointing at a
+            # reindex there would be false and destructive advice.
+            if existing_dim != EMBEDDING_DIM:
+                guidance = _dim_mismatch_message(existing_dim, EMBEDDING_DIM)
+            else:
+                guidance = (
+                    f"The store and the process configuration agree at "
+                    f"{existing_dim}-dim; the embedding endpoint/model served "
+                    f"a {query_dim}-dim query vector. Point "
+                    f"MNEMOSYNE_EMBEDDING_API_URL / MNEMOSYNE_EMBEDDING_MODEL "
+                    f"at a {existing_dim}-dim model. The stored vectors are "
+                    f"fine; no reindex is needed."
+                )
+            logger.error(
+                "Dimension mismatch querying vec_episodes (query vector is "
+                "%s-dim, table is %s-dim, process configured %s-dim); vector "
+                "recall disabled for this call, falling back to other recall "
+                "voices. %s",
+                query_dim, existing_dim, EMBEDDING_DIM, guidance,
+            )
+        else:
+            logger.warning(
+                "vec_episodes query failed (%s): %s; vector recall disabled "
+                "for this call.", type(exc).__name__, exc,
+            )
+        return []
     return [{"rowid": r["rowid"], "distance": r["distance"]} for r in rows]
 
 
