@@ -9,6 +9,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Added
 
+- **Recall metadata can be projected explicitly without expanding default results.** `recall(..., metadata_keys=[...])` bulk-loads selected top-level metadata keys only for rows that passed that recall call's filters, with at most one query per physical memory tier. It is opt-in, skips synthetic rows, limits pages to 500 rows and projections to 32 keys / 16 KiB per result, and never exposes unrequested metadata.
 - **Multimodal memory: images, video and audio can become recallable memories (RFCs 0002, 0003, 0004).** `BeamMemory.remember_media(ref)` takes a reference to a piece of media, registers it, describes it through a configured modality provider, and writes the description back as an ordinary memory that hybrid recall already understands. Nothing about text recall changes.
 
   The stack is additive throughout. Two sidecar tables, `media_assets` and `media_moments`, are created `IF NOT EXISTS` by their own store when a bank is opened, so existing databases acquire them with no migration step and no change to any existing table. No new package dependency is introduced.

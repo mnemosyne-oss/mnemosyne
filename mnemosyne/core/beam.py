@@ -28,6 +28,7 @@ from mnemosyne.core._connection_gc import collect_connection_cycles
 from mnemosyne.core.config import resolve_beam_runtime
 
 logger = logging.getLogger(__name__)
+_RECALL_METADATA_MAX_BYTES = 16 * 1024
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Any, Set, Union, Tuple, Callable
 from pathlib import Path
@@ -7434,6 +7435,81 @@ class BeamMemory:
             }
 
         return final_results
+
+    def _hydrate_recall_metadata(
+        self,
+        results: List[Dict],
+        metadata_keys: Union[List[str], Tuple[str, ...]],
+    ) -> List[Dict]:
+        """Return an allowlisted projection for an authenticated recall page.
+
+        Public callers enter through ``Mnemosyne.recall(metadata_keys=...)`` so
+        arbitrary ids cannot bypass the filters that produced the page. This
+        helper hydrates with at most one query per physical tier; synthetic
+        rows are copied unchanged.
+        """
+        if not isinstance(results, list):
+            raise ValueError("results must be a list")
+        if isinstance(metadata_keys, (str, bytes)) or not isinstance(metadata_keys, (list, tuple)):
+            raise ValueError("metadata_keys must be a list or tuple of strings")
+        if len(results) > 500:
+            raise ValueError("at most 500 recall results can be hydrated at once")
+        if len(metadata_keys) > 32:
+            raise ValueError("at most 32 metadata keys can be requested")
+
+        keys: List[str] = []
+        seen_keys = set()
+        for key in metadata_keys:
+            if not isinstance(key, str) or not key or len(key) > 128:
+                raise ValueError("metadata keys must be non-empty strings up to 128 characters")
+            if key not in seen_keys:
+                seen_keys.add(key)
+                keys.append(key)
+
+        if not all(isinstance(result, dict) for result in results):
+            raise ValueError("each recall result must be a dictionary")
+        hydrated = [dict(result) for result in results]
+        if not keys or not hydrated:
+            return hydrated
+
+        ids_by_tier = {
+            "working": [result.get("id") for result in hydrated if result.get("tier") == "working"],
+            "episodic": [result.get("id") for result in hydrated if result.get("tier") == "episodic"],
+        }
+        metadata_by_result = {}
+        for tier, table in (("working", "working_memory"), ("episodic", "episodic_memory")):
+            ids = list(dict.fromkeys(memory_id for memory_id in ids_by_tier[tier] if isinstance(memory_id, str)))
+            if not ids:
+                continue
+            placeholders = ",".join("?" * len(ids))
+            rows = self.conn.execute(
+                f"SELECT id, metadata_json FROM {table} WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            for row in rows:
+                try:
+                    metadata = json.loads(row["metadata_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    metadata = {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                projected = {
+                    key: metadata[key] for key in keys if key in metadata
+                }
+                encoded = json.dumps(
+                    projected,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                if len(encoded) > _RECALL_METADATA_MAX_BYTES:
+                    raise ValueError("projected metadata exceeds 16384 bytes")
+                metadata_by_result[(tier, row["id"])] = projected
+
+        for result in hydrated:
+            result_key = (result.get("tier"), result.get("id"))
+            if result_key in metadata_by_result:
+                result["metadata"] = metadata_by_result[result_key]
+        return hydrated
 
     # Bump whenever the enhanced-recall ranking algorithm changes so entries
     # cached under an older digest are not reused. Part of the hashed payload;

@@ -133,11 +133,24 @@ results = mem.recall(
     temporal_halflife: float = None,      # Hours for decay (default: 168)
     vec_weight: float = None,             # Override vector scoring weight
     fts_weight: float = None,             # Override FTS scoring weight
-    importance_weight: float = None       # Override importance weight
+    importance_weight: float = None,      # Override importance weight
+    metadata_keys: list[str] = None       # Optional top-level metadata allowlist
 )
 ```
 
-Returns a list of dicts with keys: `id`, `content`, `score`, `source`, `timestamp`, `importance`, `scope`, `metadata`.
+Returns compact result dicts with ranking, source, lifecycle and scope fields. Stored `metadata_json` is not included by default.
+
+Pass `metadata_keys` when a policy-aware consumer needs selected top-level metadata keys:
+
+```python
+results = mem.recall(
+    "deployment policy",
+    top_k=10,
+    metadata_keys=["project_id", "policy_version"],
+)
+```
+
+Projection happens after ranking and scope filtering and reads only the local SQLite `working_memory` and `episodic_memory` tiers. It never changes recall counters, skips synthetic/external rows, and issues at most one query per physical tier. It accepts at most 500 results and 32 keys, with a 16 KiB projected-metadata cap per result. Unrequested metadata is never returned, and projected metadata is not stored in enhanced-recall cache payloads.
 
 **Examples:**
 
