@@ -181,6 +181,8 @@ ENV_VAR_MAP: Dict[str, str] = {
     "sleep_model_refresh_min_evidence": "MNEMOSYNE_SLEEP_MODEL_REFRESH_MIN_EVIDENCE",
     "sleep_model_refresh_conflict_min_confidence": "MNEMOSYNE_SLEEP_MODEL_REFRESH_CONFLICT_MIN_CONFIDENCE",
     "sleep_model_refresh_conflict_min_evidence": "MNEMOSYNE_SLEEP_MODEL_REFRESH_CONFLICT_MIN_EVIDENCE",
+    # Dream lifecycle (native; Wave 2 owns the module, this just reserves the seam)
+    "dream_active": "MNEMOSYNE_DREAM_ACTIVE",
     # SHMR
     "shmr_batch_size": "MNEMOSYNE_SHMR_BATCH_SIZE",
     "shmr_max_iterations": "MNEMOSYNE_SHMR_MAX_ITERATIONS",
@@ -323,6 +325,9 @@ DEFAULTS: Dict[str, Any] = {
     "sleep_model_refresh_min_evidence": 3,
     "sleep_model_refresh_conflict_min_confidence": 0.8,
     "sleep_model_refresh_conflict_min_evidence": 5,
+    # Dream lifecycle seam (Task 1 reserves it so model-refresh auto-apply
+    # can be gated off once Dream owns canonical mutations).
+    "dream_active": False,
     # SHMR
     "shmr_batch_size": 50,
     "shmr_max_iterations": 10,
