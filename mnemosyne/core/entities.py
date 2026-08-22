@@ -17,7 +17,7 @@ from typing import List, Set, Tuple
 # =============================================================================
 
 ENTITY_EXTRACTION_STOP_WORDS: Set[str] = {
-    # Standard stop words
+    # --- upstream standard stop words ---
     "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
     "of", "with", "by", "from", "as", "is", "was", "are", "were", "be",
     "been", "being", "have", "has", "had", "do", "does", "did", "will",
@@ -26,16 +26,100 @@ ENTITY_EXTRACTION_STOP_WORDS: Set[str] = {
     "us", "them", "my", "your", "his", "its", "our", "their",
     "this", "that", "these", "those", "here", "there", "where",
     "when", "what", "which", "who", "whom", "whose", "how", "why",
-    # Meta/system words that are NOT meaningful entities — extracted noise
-    # from LLM-generated summaries and extraction prompts
     "assistant", "user", "skill", "review", "target", "class",
     "level", "signals", "phase", "api", "pi", "summary", "added",
     "active", "be", "not", "whether", "all", "no", "replying",
     "ai", "memory", "conversation", "fact",
     "false", "true", "none", "null", "signal",
-    "hermes", "assistant", "agent", "model", "system", "memory",
+    "hermes", "agent", "model", "system",
     "note", "task", "project", "result", "output", "input", "data",
     "step", "process", "point", "way", "thing", "time", "work",
+    # --- expanded: capitalized English sentence-words (chat noise) ---
+    "after", "again", "also", "although", "always", "another", "any",
+    "anyone", "anything", "around", "away", "back", "because", "before",
+    "being", "better", "both", "but", "can", "cannot", "certain", "could",
+    "different", "does", "doing", "done", "down", "during", "each",
+    "either", "else", "enough", "every", "everyone", "everything",
+    "finally", "first", "following", "for", "from", "frustration",
+    "further", "getting", "going", "good", "great", "has", "have",
+    "having", "however", "if", "into", "just", "keep", "know", "last",
+    "like", "look", "looking", "made", "make", "makes", "many", "maybe",
+    "might", "more", "most", "much", "must", "need", "needs", "negative",
+    "never", "next", "nothing", "off", "once", "one", "only",
+    "onto", "other", "others", "otherwise", "out", "over", "part",
+    "please", "possible", "rather", "really", "right", "same", "say",
+    "see", "seen", "several", "should", "show", "shows", "since", "so",
+    "something", "sometimes", "soon", "still", "such", "sure", "take",
+    "than", "them", "then", "there", "these", "they", "thing", "things",
+    "this", "those", "through", "thus", "time", "times", "today",
+    "together", "too", "try", "under", "until", "updated", "upon",
+    "used", "using", "very", "want", "wants", "was", "way", "ways",
+    "well", "were", "what", "when", "where", "whether", "which",
+    "while", "whole", "will", "with", "within", "without", "would",
+    "yes", "yet", "you", "your",
+    # --- code/UI tokens observed in real extraction noise ---
+    "add", "app", "auth", "backup", "bank", "banks", "bootstrap", "bundled",
+    "capture", "capturing", "clean", "cleared", "click", "code", "command",
+    "commands", "confirmed", "convention", "create", "currently", "db",
+    "design", "docs", "encode", "environment", "existing", "file", "files",
+    "fixes", "full", "health", "hub", "ids", "image", "load", "loaded",
+    "memories", "mode", "net", "nightly", "non", "okay", "operator",
+    "option", "overlap", "patch", "pinned", "preference", "pr", "prompt",
+    "protected", "read", "rebuild", "redundant", "repo", "research",
+    "retire", "session", "shared", "skills", "support", "tonight",
+    "todo", "umbrella", "unresolved", "update", "verified", "write",
+    "writing",
+    # observed high-frequency single-cap words in dev-chat (2nd wave)
+    "action", "audit", "august", "check", "commit", "commits", "current",
+    "live", "ok", "per", "provider", "run", "status", "two", "verification",
+    "let", "acceptance", "account", "accounts", "act", "activities",
+    "activity", "additional", "administration", "alternative", "applications",
+    "applies", "approve", "archived", "assignment", "audience", "background",
+    "blocked", "branch", "bridge", "build", "built", "cancel", "candidate",
+    "canonical", "capability", "central", "chat", "cheap", "client",
+    "close", "complete", "completed", "config", "confirm", "connected",
+    "container", "contents", "convert", "core", "correct", "cost", "created",
+    "creating", "credential", "credentials", "cron", "dashboard", "decision",
+    "default", "deferred", "delete", "deletion", "deliver", "delivery",
+    "deploy", "deployment", "description", "developer", "distinguishing",
+    "documentation", "documented", "documenting", "domain", "draft", "drop",
+    "durable", "dynamic", "earlier", "encrypt", "endpoints", "english",
+    "europe", "even", "events", "evidence", "execute", "execution",
+    "explicit", "explicitly", "export", "extended", "facts", "failure",
+    "fetch", "filter", "final", "fine", "fix", "fixed", "focus", "follow",
+    "fork", "found", "functional", "gaps", "goal", "group", "hard",
+    "header", "history", "home", "hook", "housekeeping", "human", "humans",
+    "hybrid", "identity", "implemented", "independent", "initial", "install",
+    "installed", "instead", "interesting", "invalid", "inventory",
+    "investigation", "isolation", "item", "job", "keeping", "kept", "key",
+    "kind", "layer", "lifecycle", "likely", "limitation", "line", "list",
+    "local", "log", "lost", "main", "maintaining", "mandatory", "mapping",
+    "match", "meaning", "middle", "minor", "mixture", "monday", "mondays",
+    "mounts", "multiple", "name", "notable", "noted", "notes", "object",
+    "open", "operations", "optional", "options", "outcome", "parallel",
+    "password", "paste", "pending", "persist", "pin", "plan", "plugin",
+    "plus", "positioning", "post", "predicate", "prefer", "preserved",
+    "primary", "private", "problem", "procedure", "proceed", "proof",
+    "proposal", "proposed", "prose", "public", "pull", "purpose", "push",
+    "pushed", "qualify", "quota", "rate", "reading", "reads", "ready",
+    "real", "reasoning", "rebase", "receive", "recommended", "reconcile",
+    "record", "recorded", "reference", "references", "register", "related",
+    "relevant", "remaining", "remind", "remote", "remove", "renamed",
+    "renaming", "reorganize", "replaced", "repository", "required",
+    "requirement", "resume", "reviews", "revocation", "rewrite", "rewrote",
+    "risks", "root", "rotate", "rotation", "router", "routing", "row",
+    "runs", "runtime", "safety", "save", "saved", "saves", "schedule",
+    "scheduled", "scope", "scripts", "second", "secret", "section",
+    "security", "self", "separate", "separating", "server", "service",
+    "settings", "shell", "short", "signed", "smoke", "source", "sources",
+    "sovereignty", "split", "stable", "stale", "standing", "state",
+    "subject", "summarize", "switch", "syntax", "technically", "tell",
+    "temporary", "test", "text", "therefore", "tiny", "tomorrow", "tool",
+    "tools", "topic", "total", "transformation", "transient", "transversal",
+    "treat", "triggered", "trimmed", "triples", "unset", "unsigned",
+    "updating", "upstream", "valid", "validate", "validation", "value",
+    "verify", "vision", "wait", "watchdog", "websocket", "webhook",
+    "welcome", "whenever", "working", "works", "writes", "zero",
 }
 
 # Backward compatibility alias
@@ -155,13 +239,32 @@ def extract_entities_regex(text: str) -> List[str]:
             # Filter out stop words (single word only); case-insensitive
             words = entity.split()
             if len(words) == 1 and entity.lower() in _STOP_WORDS:
+                # @mentions / hashtags are explicit entity signals — bypass
+                # the stopword filter (mirrors the lowercase check below)
+                match_start = match.start(1)
+                prefix_char = text[match_start - 1] if match_start > 0 else ''
+                if prefix_char not in ('@', '#'):
+                    continue
+            # Multi-word entities: drop when ANY word is a stopword
+            # (upstream contract — "The Quick Brown Fox" drops on "the").
+            if len(words) > 1 and any(w.lower() in _STOP_WORDS for w in words):
                 continue
-            # Filter entities where ANY word is a stopword (e.g. "The USER",
-            # "Active Signal" -- the stopword contaminates the whole phrase)
-            if any(w.lower() in _STOP_WORDS for w in words):
+            # Multi-word entities must be proper-noun shaped: every word starts
+            # uppercase, is a digit, or is a stopword. Keeps "PMO City",
+            # rejects quoted sentence fragments ("reliable workflow").
+            if len(words) > 1 and not all(
+                w[0].isupper() or w[0].isdigit() or w.lower() in _STOP_WORDS
+                for w in words
+            ):
                 continue
             # Filter out pure numbers
             if entity.replace('.', '').replace(',', '').isdigit():
+                continue
+            # Template/code junk
+            if any(ch in entity for ch in ';/\\'):
+                continue
+            # Single-word ALL-CAPS tokens (emphasis/code, not names)
+            if len(words) == 1 and entity.isupper():
                 continue
             # Filter out standalone lowercase words (unless quoted/mentioned)
             # But allow @mentions and hashtags which are lowercase by nature

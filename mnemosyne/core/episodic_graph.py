@@ -42,12 +42,28 @@ _LOW_QUALITY_SUBJECT_LEADERS = frozenset({
 
 
 def _is_low_quality_subject(subject: str) -> bool:
-    """True if `subject` is a pronoun/demonstrative/possessive-led phrase that
-    should not become a fact triple. See _LOW_QUALITY_SUBJECT_LEADERS."""
+    """True if `subject` should not become a fact triple.
+
+    Rejects: pronoun/demonstrative/possessive-led phrases (see
+    _LOW_QUALITY_SUBJECT_LEADERS), sentence-word-led phrases ("If such a
+    skill", "The requested model"), and phrases that are not proper-noun
+    shaped ("reliable workflow", "stop doing X")."""
     if not subject:
         return True
     first = subject.strip().split(None, 1)[0].strip(".,!?;:'\"").lower()
-    return first in _LOW_QUALITY_SUBJECT_LEADERS
+    if first in _LOW_QUALITY_SUBJECT_LEADERS:
+        return True
+    try:
+        from mnemosyne.core.entities import ENTITY_EXTRACTION_STOP_WORDS as _STOP
+    except Exception:
+        _STOP = frozenset()
+    words = subject.split()
+    if first in _STOP:
+        return True
+    # proper-noun shape: every word starts uppercase / is a digit / is a stopword
+    return not all(
+        w[0].isupper() or w[0].isdigit() or w.lower() in _STOP for w in words
+    )
 
 
 @dataclass
