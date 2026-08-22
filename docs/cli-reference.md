@@ -112,8 +112,11 @@ Every client sends its own token as usual (`Authorization: Bearer tok1`). The
 *name* of the matched token is used as the author identity on memories that
 client creates (unless the tool call passes `author_id` explicitly, which still
 wins), giving per-agent audit attribution from a single instance. Malformed
-JSON, empty names/secrets, or duplicates refuse startup with an actionable
-error. Single-token deployments are unaffected.
+JSON, empty mappings, empty names/secrets, duplicate names, and duplicate
+secrets (two names sharing one token would make attribution ambiguous) all
+refuse startup with an actionable error. The identity is bound to the session
+at connect time: a later request for the same session presenting a different
+valid token is rejected. Single-token deployments are unaffected.
 
 ## Aliases
 

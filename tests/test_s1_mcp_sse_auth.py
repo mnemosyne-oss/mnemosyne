@@ -463,3 +463,96 @@ class TestMultiTokenMiddleware:
         with TestClient(app) as client:
             r = client.get("/probe", headers={"Authorization": "Bearer tok1"})
         assert r.text == "hermes-family"
+
+
+class TestMultiTokenParserEdgeCases:
+    """Review #830: parser must reject empty mappings and duplicate secrets."""
+
+    def test_empty_object_refused(self, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKENS", "{}")
+        from mnemosyne.mcp_server import _resolve_sse_auth
+        with pytest.raises(RuntimeError, match="empty"):
+            _resolve_sse_auth("0.0.0.0")
+
+    def test_duplicate_secret_refused(self, monkeypatch):
+        """Two names sharing one secret make attribution ambiguous."""
+        monkeypatch.setenv(
+            "MNEMOSYNE_MCP_TOKENS",
+            _json.dumps({"hermes-family": "same-secret", "ci": "same-secret"}),
+        )
+        from mnemosyne.mcp_server import _resolve_sse_auth
+        with pytest.raises(RuntimeError, match="unique secret"):
+            _resolve_sse_auth("0.0.0.0")
+
+    def test_error_names_both_aliases(self, monkeypatch):
+        """The duplicate-secret error names both offending entries."""
+        monkeypatch.setenv(
+            "MNEMOSYNE_MCP_TOKENS",
+            _json.dumps({"a": "s1", "b": "s1"}),
+        )
+        from mnemosyne.mcp_server import _resolve_sse_auth
+        with pytest.raises(RuntimeError) as e:
+            _resolve_sse_auth("0.0.0.0")
+        assert "'a'" in str(e.value) and "'b'" in str(e.value)
+
+
+class TestSessionIdentityBinding:
+    """Review #830: POST /messages/ cannot swap the session's agent identity.
+
+    Transport-level contract via TestClient: establish a session identity on
+    GET /sse?session_id=... then POST /messages/?session_id=... with a
+    DIFFERENT valid token -- must be rejected 403 before reaching the
+    transport (which would 404 on the unknown writer anyway). The
+    instant-responding /whoami route proves the middleware logic itself.
+    """
+
+    def _build(self, monkeypatch, tokens):
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKENS", _json.dumps(tokens))
+        from mnemosyne.mcp_server import _build_sse_app
+        from mnemosyne.runtime_context import get_request_token_name
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+
+        app = _build_sse_app(host="0.0.0.0")
+
+        async def _whoami(request):
+            return PlainTextResponse(get_request_token_name() or "anon")
+
+        app.router.routes.append(Route("/whoami", _whoami))
+        return app
+
+    @pytest.mark.asyncio
+    async def test_post_with_same_token_ok(self, monkeypatch):
+        app = self._build(monkeypatch, {"hermes-family": "tok1", "hermes-admin": "tok2"})
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            # GET nawiązuje tożsamość sesji (session_id w query, jak w
+            # reconnect flow transportu)
+            r_get = client.get("/whoami?session_id=deadbeef", headers={"Authorization": "Bearer tok1"})
+            r_post = client.post("/messages/?session_id=deadbeef", headers={"Authorization": "Bearer tok1"})
+        assert r_get.text == "hermes-family"
+        # transport 404/202 na nieznanym writerze — ale NIE 403 (token zgodny)
+        assert r_post.status_code != 403
+
+    @pytest.mark.asyncio
+    async def test_post_with_different_token_rejected_403(self, monkeypatch):
+        app = self._build(monkeypatch, {"hermes-family": "tok1", "hermes-admin": "tok2"})
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            client.get("/whoami?session_id=cafe1234", headers={"Authorization": "Bearer tok1"})
+            r = client.post("/messages/?session_id=cafe1234", headers={"Authorization": "Bearer tok2"})
+        assert r.status_code == 403
+        assert r.json() == {"error": "token does not match session identity"}
+
+    @pytest.mark.asyncio
+    async def test_post_with_unknown_session_lets_transport_decide(self, monkeypatch):
+        """Brak zarejestrowanej sesji = brak wiązania; transport sam odmówi
+        (404 unknown writer). Middleware nie blokuje takich POSTów."""
+        app = self._build(monkeypatch, {"hermes-family": "tok1"})
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            r = client.post("/messages/?session_id=0000", headers={"Authorization": "Bearer tok1"})
+        assert r.status_code != 403

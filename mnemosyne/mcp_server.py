@@ -72,8 +72,11 @@ def _parse_tokens_env(raw: str) -> "dict[str, str]":
 
     Accepts a JSON object of ``{"agent-name": "secret", ...}``. Raises
     RuntimeError with an actionable message on malformed JSON, empty
-    names/tokens, or duplicate names -- refusing to silently degrade to
-    fewer credentials than the operator configured.
+    mappings/names/tokens, duplicate names, or duplicate secrets --
+    refusing to silently degrade to fewer credentials than the operator
+    configured. Duplicate secrets are rejected because authentication
+    matches the FIRST name for a presented token, so aliases would make
+    attribution ambiguous.
     """
     import json as _json
 
@@ -90,7 +93,13 @@ def _parse_tokens_env(raw: str) -> "dict[str, str]":
             f"{_TOKENS_ENV} must be a JSON object mapping token names to "
             f"secrets; got {type(parsed).__name__}."
         )
+    if not parsed:
+        raise RuntimeError(
+            f"{_TOKENS_ENV} is empty; add at least one \"name\": \"secret\" "
+            f"entry (or unset it to fall back to {_TOKEN_ENV})."
+        )
     tokens: dict[str, str] = {}
+    seen_secrets: dict[str, str] = {}
     for name, token in parsed.items():
         name_s = str(name).strip()
         token_s = str(token).strip()
@@ -103,6 +112,13 @@ def _parse_tokens_env(raw: str) -> "dict[str, str]":
             raise RuntimeError(
                 f"{_TOKENS_ENV} contains duplicate name {name_s!r}."
             )
+        if token_s in seen_secrets:
+            raise RuntimeError(
+                f"{_TOKENS_ENV} maps names {seen_secrets[token_s]!r} and "
+                f"{name_s!r} to the same secret; each token needs a unique "
+                f"secret so the matched name is unambiguous."
+            )
+        seen_secrets[token_s] = name_s
         tokens[name_s] = token_s
     return tokens
 
@@ -245,6 +261,20 @@ def _build_sse_app(host: str = "127.0.0.1"):
     if require_auth:
         assert tokens is not None and len(tokens) > 0
 
+        # Session-identity binding (review feedback on #830): the SSE GET
+        # establishes the session's agent identity; subsequent POSTs to
+        # /messages/ must present the SAME token. A different valid token
+        # is rejected (403) so a tool call can never be attributed to an
+        # agent other than the one that opened the session.
+        session_identities: "dict[str, str]" = {}
+
+        def _query_param(scope, key: str) -> "str | None":
+            qs = scope.get("query_string", b"").decode("latin-1")
+            for part in qs.split("&"):
+                if part.startswith(key + "="):
+                    return part[len(key) + 1:]
+            return None
+
         class _BearerTokenMiddleware:
             """Pure-ASGI bearer auth middleware (single- or multi-token).
 
@@ -300,6 +330,26 @@ def _build_sse_app(host: str = "127.0.0.1"):
                     )
                     await resp(scope, receive, send)
                     return
+                # Session-identity binding: on any request carrying a
+                # session_id query param (in the transport's reconnect flow
+                # the SSE GET itself carries it; POSTs always do), the FIRST
+                # authenticated request for that session fixes its identity.
+                # Subsequent POSTs to /messages/ must present the SAME token
+                # (403 otherwise) so a tool call can never be attributed to
+                # an agent other than the one that opened the session.
+                path = scope.get("path", "")
+                session_id = _query_param(scope, "session_id")
+                if session_id:
+                    bound = session_identities.get(session_id)
+                    if bound is None:
+                        session_identities[session_id] = matched_name
+                    elif "/messages" in path and bound != matched_name:
+                        resp = JSONResponse(
+                            {"error": "token does not match session identity"},
+                            status_code=403,
+                        )
+                        await resp(scope, receive, send)
+                        return
                 # Per-agent identity: contextvar (consumed by mcp_tools'
                 # author resolution) + ASGI scope state for inspection.
                 set_request_token_name(matched_name)
