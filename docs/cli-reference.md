@@ -98,6 +98,23 @@ The built-in help lists only `hygiene audit|clean`; `status` and `restore` exist
 
 stdio is the default transport. A non-loopback SSE bind requires `MNEMOSYNE_MCP_TOKEN`.
 
+### Multi-agent tokens (per-agent identity)
+
+`MNEMOSYNE_MCP_TOKENS` accepts a JSON object of named bearer tokens and takes
+precedence over the single `MNEMOSYNE_MCP_TOKEN`:
+
+```bash
+MNEMOSYNE_MCP_TOKENS='{"hermes-family": "tok1", "hermes-admin": "tok2", "ci": "tok3"}' \
+  mnemosyne mcp --transport sse --host 0.0.0.0 --port 8080
+```
+
+Every client sends its own token as usual (`Authorization: Bearer tok1`). The
+*name* of the matched token is used as the author identity on memories that
+client creates (unless the tool call passes `author_id` explicitly, which still
+wins), giving per-agent audit attribution from a single instance. Malformed
+JSON, empty names/secrets, or duplicates refuse startup with an actionable
+error. Single-token deployments are unaffected.
+
 ## Aliases
 
 `remember`=`store`, `search`=`recall`, `edit`=`update`, `forget`=`delete`, `consolidate`=`sleep`, `sync-server`=`sync-serve`.

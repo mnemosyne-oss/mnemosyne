@@ -83,19 +83,19 @@ class TestResolveSseAuth:
             _resolve_sse_auth("0.0.0.0")
 
     def test_non_loopback_with_token_returns_pair(self, monkeypatch):
-        """Properly configured non-loopback returns (True, token)."""
+        """Properly configured non-loopback returns (True, tokens)."""
         monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "real-secret-123")
         from mnemosyne.mcp_server import _resolve_sse_auth
         require_auth, token = _resolve_sse_auth("0.0.0.0")
         assert require_auth is True
-        assert token == "real-secret-123"
+        assert token == {"default": "real-secret-123"}
 
     def test_token_is_stripped(self, monkeypatch):
         """Trailing whitespace in the env var doesn't break auth."""
         monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "  with-spaces  ")
         from mnemosyne.mcp_server import _resolve_sse_auth
-        require_auth, token = _resolve_sse_auth("0.0.0.0")
-        assert token == "with-spaces"
+        require_auth, tokens = _resolve_sse_auth("0.0.0.0")
+        assert tokens == {"default": "with-spaces"}
 
 
 # ---------------------------------------------------------------------------
@@ -320,3 +320,146 @@ class TestBuildSseApp:
         client = TestClient(app)
         resp = client.post("/messages", json={})
         assert resp.headers.get("www-authenticate") == "Bearer"
+
+
+# ---------------------------------------------------------------------------
+# Multi-token mode (issue #761): MNEMOSYNE_MCP_TOKENS
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+
+class TestMultiTokenResolve:
+    """`_resolve_sse_auth` with MNEMOSYNE_MCP_TOKENS (JSON object)."""
+
+    def test_multi_tokens_parse_and_win_over_single(self, monkeypatch):
+        """TOKENS takes precedence when both env vars are set."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKEN", "legacy-secret")
+        monkeypatch.setenv(
+            "MNEMOSYNE_MCP_TOKENS",
+            _json.dumps({"hermes-family": "tok1", "hermes-admin": "tok2"}),
+        )
+        from mnemosyne.mcp_server import _resolve_sse_auth
+        require_auth, tokens = _resolve_sse_auth("0.0.0.0")
+        assert require_auth is True
+        assert tokens == {"hermes-family": "tok1", "hermes-admin": "tok2"}
+
+    def test_loopback_still_skips_auth_with_multi(self, monkeypatch):
+        """Loopback bind ignores multi-token mode entirely."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKENS", '{"a": "t"}')
+        from mnemosyne.mcp_server import _resolve_sse_auth
+        require_auth, tokens = _resolve_sse_auth("127.0.0.1")
+        assert require_auth is False
+        assert tokens is None
+
+    def test_malformed_json_raises_with_env_name(self, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKENS", "not-json{")
+        from mnemosyne.mcp_server import _resolve_sse_auth
+        with pytest.raises(RuntimeError, match="MNEMOSYNE_MCP_TOKENS"):
+            _resolve_sse_auth("0.0.0.0")
+
+    def test_non_object_json_raises(self, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKENS", '["tok1", "tok2"]')
+        from mnemosyne.mcp_server import _resolve_sse_auth
+        with pytest.raises(RuntimeError, match="JSON object"):
+            _resolve_sse_auth("0.0.0.0")
+
+    def test_empty_name_or_token_raises(self, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKENS", '{"": "tok1"}')
+        from mnemosyne.mcp_server import _resolve_sse_auth
+        with pytest.raises(RuntimeError, match="empty name or token"):
+            _resolve_sse_auth("0.0.0.0")
+
+    def test_error_message_mentions_both_env_vars(self, monkeypatch):
+        """Non-loopback with neither var set names both options."""
+        monkeypatch.delenv("MNEMOSYNE_MCP_TOKEN", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_MCP_TOKENS", raising=False)
+        from mnemosyne.mcp_server import _resolve_sse_auth
+        with pytest.raises(RuntimeError) as e:
+            _resolve_sse_auth("0.0.0.0")
+        assert "MNEMOSYNE_MCP_TOKENS" in str(e.value)
+        assert "MNEMOSYNE_MCP_TOKEN" in str(e.value)
+
+
+class TestMultiTokenMiddleware:
+    """_BearerTokenMiddleware: per-name matching + identity propagation.
+
+    UWAGA: nie wolno wołać GET /sse z TestClient -- SSE streamuje w
+    nieskonczonosc i klient czeka na zamkniecie odpowiedzi (hang). Testy
+    uzywaja wlasnej trasy /whoami (przechodzi przez ten sam middleware,
+    ale odpowiada od razu).
+    """
+
+    def _build(self, monkeypatch, tokens):
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKENS", _json.dumps(tokens))
+        from mnemosyne.mcp_server import _build_sse_app
+        from mnemosyne.runtime_context import get_request_token_name
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+
+        app = _build_sse_app(host="0.0.0.0")
+
+        async def _whoami(request):
+            return PlainTextResponse(get_request_token_name() or "anon")
+
+        app.router.routes.append(Route("/whoami", _whoami))
+        return app
+
+    @pytest.mark.asyncio
+    async def test_each_named_token_accepted(self, monkeypatch):
+        app = self._build(monkeypatch, {"hermes-family": "tok1", "hermes-admin": "tok2"})
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            r1 = client.get("/whoami", headers={"Authorization": "Bearer tok1"})
+            r2 = client.get("/whoami", headers={"Authorization": "Bearer tok2"})
+        assert r1.status_code == 200 and r1.text == "hermes-family"
+        assert r2.status_code == 200 and r2.text == "hermes-admin"
+
+    @pytest.mark.asyncio
+    async def test_wrong_token_rejected_401(self, monkeypatch):
+        app = self._build(monkeypatch, {"hermes-family": "tok1"})
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            r = client.get("/whoami", headers={"Authorization": "Bearer nope"})
+            assert r.status_code == 401
+            assert r.json() == {"error": "invalid bearer token"}
+
+    @pytest.mark.asyncio
+    async def test_identity_propagates_via_contextvar(self, monkeypatch):
+        """Inside an authenticated request, get_request_token_name() returns
+        the matched token name (this is what tool handlers consume)."""
+        app = self._build(monkeypatch, {"hermes-family": "tok1", "hermes-admin": "tok2"})
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            r1 = client.get("/whoami", headers={"Authorization": "Bearer tok2"})
+            r2 = client.get("/whoami", headers={"Authorization": "Bearer tok1"})
+            r3 = client.get("/whoami")
+        assert r1.text == "hermes-admin"
+        assert r2.text == "hermes-family"
+        assert r3.status_code == 401  # brak tokenu odrzucony przed handlerem
+
+    @pytest.mark.asyncio
+    async def test_scope_state_carries_token_name(self, monkeypatch):
+        """ASGI scope carries mnemosyne_token_name for downstream handlers."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_TOKENS", _json.dumps({"hermes-family": "tok1"}))
+        from mnemosyne.mcp_server import _build_sse_app
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+        from starlette.testclient import TestClient
+
+        app = _build_sse_app(host="0.0.0.0")
+
+        async def _probe(request):
+            # request.scope["state"] jest wypelniane przez middleware auth
+            # (setdefault) PRZED wywolaniem handlera - odczyt tutaj jest
+            # po porzadku wykonywania.
+            name = request.scope.get("state", {}).get("mnemosyne_token_name")
+            return PlainTextResponse(name or "missing")
+
+        app.router.routes.append(Route("/probe", _probe))
+        with TestClient(app) as client:
+            r = client.get("/probe", headers={"Authorization": "Bearer tok1"})
+        assert r.text == "hermes-family"

@@ -49,6 +49,7 @@ except ImportError:
     CallToolResult = None
 
 from mnemosyne.mcp_tools import get_tool_definitions, handle_tool_call
+from mnemosyne.runtime_context import set_request_token_name  # noqa: F401 (re-export)
 
 # ---------------------------------------------------------------------------
 # Security helpers (S1)
@@ -58,6 +59,7 @@ from mnemosyne.mcp_tools import get_tool_definitions, handle_tool_call
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "ip6-localhost"})
 
 _TOKEN_ENV = "MNEMOSYNE_MCP_TOKEN"
+_TOKENS_ENV = "MNEMOSYNE_MCP_TOKENS"
 
 
 def _is_loopback(host: str) -> bool:
@@ -65,25 +67,77 @@ def _is_loopback(host: str) -> bool:
     return host.strip().lower() in _LOOPBACK_HOSTS
 
 
-def _resolve_sse_auth(host: str) -> Tuple[bool, Optional[str]]:
-    """Decide whether SSE needs bearer-token auth and what the token is.
+def _parse_tokens_env(raw: str) -> "dict[str, str]":
+    """Parse MNEMOSYNE_MCP_TOKENS into an ordered {name: token} mapping.
 
-    Returns (require_auth, token). Raises RuntimeError when host is
-    non-loopback and the MNEMOSYNE_MCP_TOKEN env var is unset/empty --
-    refusing to start an unauthenticated network-exposed MCP server.
+    Accepts a JSON object of ``{"agent-name": "secret", ...}``. Raises
+    RuntimeError with an actionable message on malformed JSON, empty
+    names/tokens, or duplicate names -- refusing to silently degrade to
+    fewer credentials than the operator configured.
+    """
+    import json as _json
+
+    try:
+        parsed = _json.loads(raw)
+    except _json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"{_TOKENS_ENV} is not valid JSON ({e}). Expected an object "
+            f'mapping token names to secrets, e.g. '
+            f"'{{\"hermes-family\": \"tok1\", \"hermes-admin\": \"tok2\"}}'."
+        ) from e
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"{_TOKENS_ENV} must be a JSON object mapping token names to "
+            f"secrets; got {type(parsed).__name__}."
+        )
+    tokens: dict[str, str] = {}
+    for name, token in parsed.items():
+        name_s = str(name).strip()
+        token_s = str(token).strip()
+        if not name_s or not token_s:
+            raise RuntimeError(
+                f"{_TOKENS_ENV} contains an empty name or token; every "
+                f"entry needs a non-empty name and secret."
+            )
+        if name_s in tokens:
+            raise RuntimeError(
+                f"{_TOKENS_ENV} contains duplicate name {name_s!r}."
+            )
+        tokens[name_s] = token_s
+    return tokens
+
+
+def _resolve_sse_auth(host: str) -> Tuple[bool, Optional[dict[str, str]]]:
+    """Decide whether SSE needs bearer-token auth and which tokens apply.
+
+    Returns (require_auth, tokens) where ``tokens`` maps token names to
+    secrets. When the multi-token env var ``MNEMOSYNE_MCP_TOKENS`` is set
+    (a JSON object), each named token is accepted and the *name* of the
+    presented token is recorded as the author identity for tool calls
+    (via ``MNEMOSYNE_AUTHOR_ID``-style resolution in mcp_tools), enabling
+    per-agent audit trails from a single instance. The legacy single-token
+    ``MNEMOSYNE_MCP_TOKEN`` remains fully supported.
+
+    Raises RuntimeError when host is non-loopback and neither env var is
+    set/parseable -- refusing to start an unauthenticated network-exposed
+    MCP server.
     """
     if _is_loopback(host):
         return (False, None)
+    multi_raw = (os.environ.get(_TOKENS_ENV) or "").strip()
+    if multi_raw:
+        return (True, _parse_tokens_env(multi_raw))
     token = (os.environ.get(_TOKEN_ENV) or "").strip()
     if not token:
         raise RuntimeError(
             f"Refusing to bind MCP SSE on non-loopback host {host!r} without "
-            f"authentication. Set the {_TOKEN_ENV} env var to a strong random "
-            f"secret and have clients send 'Authorization: Bearer <token>' on "
+            f"authentication. Set {_TOKENS_ENV} to a JSON object of named "
+            f"secrets (multiple agents) or {_TOKEN_ENV} to a single secret, "
+            f"and have clients send 'Authorization: Bearer <token>' on "
             f"each request. Or bind to 127.0.0.1 (the default) for local-only "
             f"use."
         )
-    return (True, token)
+    return (True, {"default": token})
 
 
 # ---------------------------------------------------------------------------
@@ -174,9 +228,9 @@ def _build_sse_app(host: str = "127.0.0.1"):
             "Run: pip install starlette uvicorn"
         )
 
-    require_auth, token = _resolve_sse_auth(host)
+    require_auth, tokens = _resolve_sse_auth(host)
 
-    # Trailing slash required: SseServerTransport emits POST URIs as
+    # Trailing slash required: SseServerTransport emits POST URUs as
     # /messages/ and Starlette Mount path-prefix matching needs it to
     # agree. Route("/messages") would 404 on every client POST.
     transport = SseServerTransport("/messages/")
@@ -189,11 +243,10 @@ def _build_sse_app(host: str = "127.0.0.1"):
 
     middleware = []
     if require_auth:
-        assert token is not None
-        expected = token.encode("utf-8")
+        assert tokens is not None and len(tokens) > 0
 
         class _BearerTokenMiddleware:
-            """Pure-ASGI bearer auth middleware.
+            """Pure-ASGI bearer auth middleware (single- or multi-token).
 
             BaseHTTPMiddleware buffers the full response body before
             forwarding it to the client. SseServerTransport writes
@@ -204,6 +257,13 @@ def _build_sse_app(host: str = "127.0.0.1"):
 
             This pure-ASGI implementation forwards scope/receive/send
             untouched after auth so SSE frames are never buffered.
+
+            Multi-token mode (MNEMOSYNE_MCP_TOKENS): the presented
+            bearer token is matched against every configured secret
+            (constant-time per candidate) and the *name* of the matched
+            entry is stored in ``scope["state"]`` plus a contextvar,
+            so tool handlers can attribute memories to the calling
+            agent without any client-side cooperation.
             """
 
             def __init__(self, app):
@@ -227,7 +287,12 @@ def _build_sse_app(host: str = "127.0.0.1"):
                     await resp(scope, receive, send)
                     return
                 presented = header[len(b"Bearer "):].strip()
-                if not hmac.compare_digest(presented, expected):
+                matched_name = None
+                for name, secret in tokens.items():
+                    if hmac.compare_digest(presented, secret.encode("utf-8")):
+                        matched_name = name
+                        break
+                if matched_name is None:
                     resp = JSONResponse(
                         {"error": "invalid bearer token"},
                         status_code=401,
@@ -235,13 +300,18 @@ def _build_sse_app(host: str = "127.0.0.1"):
                     )
                     await resp(scope, receive, send)
                     return
+                # Per-agent identity: contextvar (consumed by mcp_tools'
+                # author resolution) + ASGI scope state for inspection.
+                set_request_token_name(matched_name)
+                scope.setdefault("state", {})["mnemosyne_token_name"] = matched_name
                 await self.app(scope, receive, send)
 
         middleware.append(Middleware(_BearerTokenMiddleware))
         logger.info(
-            "MCP SSE bearer-token auth enabled (host=%s). Clients must send "
-            "'Authorization: Bearer <token>' on every request.",
+            "MCP SSE bearer-token auth enabled (host=%s, tokens=%d). Clients "
+            "must send 'Authorization: Bearer <token>' on every request.",
             host,
+            len(tokens),
         )
     else:
         logger.info(
