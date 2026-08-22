@@ -405,8 +405,7 @@ class TestMultiTokenMiddleware:
         app.router.routes.append(Route("/whoami", _whoami))
         return app
 
-    @pytest.mark.asyncio
-    async def test_each_named_token_accepted(self, monkeypatch):
+    def test_each_named_token_accepted(self, monkeypatch):
         app = self._build(monkeypatch, {"hermes-family": "tok1", "hermes-admin": "tok2"})
         from starlette.testclient import TestClient
 
@@ -416,8 +415,7 @@ class TestMultiTokenMiddleware:
         assert r1.status_code == 200 and r1.text == "hermes-family"
         assert r2.status_code == 200 and r2.text == "hermes-admin"
 
-    @pytest.mark.asyncio
-    async def test_wrong_token_rejected_401(self, monkeypatch):
+    def test_wrong_token_rejected_401(self, monkeypatch):
         app = self._build(monkeypatch, {"hermes-family": "tok1"})
         from starlette.testclient import TestClient
 
@@ -426,8 +424,7 @@ class TestMultiTokenMiddleware:
             assert r.status_code == 401
             assert r.json() == {"error": "invalid bearer token"}
 
-    @pytest.mark.asyncio
-    async def test_identity_propagates_via_contextvar(self, monkeypatch):
+    def test_identity_propagates_via_contextvar(self, monkeypatch):
         """Inside an authenticated request, get_request_token_name() returns
         the matched token name (this is what tool handlers consume)."""
         app = self._build(monkeypatch, {"hermes-family": "tok1", "hermes-admin": "tok2"})
@@ -441,8 +438,7 @@ class TestMultiTokenMiddleware:
         assert r2.text == "hermes-family"
         assert r3.status_code == 401  # brak tokenu odrzucony przed handlerem
 
-    @pytest.mark.asyncio
-    async def test_scope_state_carries_token_name(self, monkeypatch):
+    def test_scope_state_carries_token_name(self, monkeypatch):
         """ASGI scope carries mnemosyne_token_name for downstream handlers."""
         monkeypatch.setenv("MNEMOSYNE_MCP_TOKENS", _json.dumps({"hermes-family": "tok1"}))
         from mnemosyne.mcp_server import _build_sse_app
@@ -521,8 +517,7 @@ class TestSessionIdentityBinding:
         app.router.routes.append(Route("/whoami", _whoami))
         return app
 
-    @pytest.mark.asyncio
-    async def test_post_with_same_token_ok(self, monkeypatch):
+    def test_post_with_same_token_ok(self, monkeypatch):
         app = self._build(monkeypatch, {"hermes-family": "tok1", "hermes-admin": "tok2"})
         from starlette.testclient import TestClient
 
@@ -535,8 +530,7 @@ class TestSessionIdentityBinding:
         # transport 404/202 na nieznanym writerze — ale NIE 403 (token zgodny)
         assert r_post.status_code != 403
 
-    @pytest.mark.asyncio
-    async def test_post_with_different_token_rejected_403(self, monkeypatch):
+    def test_post_with_different_token_rejected_403(self, monkeypatch):
         app = self._build(monkeypatch, {"hermes-family": "tok1", "hermes-admin": "tok2"})
         from starlette.testclient import TestClient
 
@@ -546,8 +540,7 @@ class TestSessionIdentityBinding:
         assert r.status_code == 403
         assert r.json() == {"error": "token does not match session identity"}
 
-    @pytest.mark.asyncio
-    async def test_post_with_unknown_session_lets_transport_decide(self, monkeypatch):
+    def test_post_with_unknown_session_lets_transport_decide(self, monkeypatch):
         """Brak zarejestrowanej sesji = brak wiązania; transport sam odmówi
         (404 unknown writer). Middleware nie blokuje takich POSTów."""
         app = self._build(monkeypatch, {"hermes-family": "tok1"})
