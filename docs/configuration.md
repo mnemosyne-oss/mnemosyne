@@ -288,7 +288,7 @@ Use a remote model instead of the local MiniCPM5-1B GGUF:
 | `MNEMOSYNE_LLM_EXTRA_BODY` | *(none)* | JSON object merged last into every request body, for provider-specific keys the OpenAI shape has no name for (e.g. `{"thinking":{"type":"disabled"}}` to keep a thinking model from spending the whole `max_tokens` budget on reasoning). Ignored when unset, blank or not a JSON object; `messages`, `model` and `stream` are reserved and dropped from an otherwise valid object. Every rejected case is noted on stderr. Read at module import, so `mnemosyne config set` does not reach it and a change needs a restart. |
 | `MNEMOSYNE_LLM_FALLBACK_EXTRA_BODY` | *(none)* | Same, including the reserved keys and the import-time read, for requests to `MNEMOSYNE_LLM_FALLBACK_MODELS`. |
 
-With `MNEMOSYNE_LLM_ENABLED` enabled, Mnemosyne uses the remote endpoint when no host call was attempted, an explicit or provider-preset-resolved remote base URL is available, and `MNEMOSYNE_FORCE_LOCAL` is not enabled. On failure it falls back to the local GGUF backend, then AAAK encoding.
+With `MNEMOSYNE_LLM_ENABLED` enabled, Mnemosyne uses the remote endpoint when no host call was attempted, an explicit or provider-preset-resolved remote base URL is available, and `MNEMOSYNE_FORCE_LOCAL` is not enabled. A retryable failure from the primary model tries each model in `MNEMOSYNE_LLM_FALLBACK_MODELS` in order first; once every remote candidate has failed it falls back to the local GGUF backend, then AAAK encoding. An empty answer (a 2xx with no answer text) is not retried; it ends the remote stage and `last_llm_failure()` keeps the reason for the AAAK WARNING.
 
 Works with: llama.cpp server, vLLM, Ollama, LM Studio, or any OpenAI-compatible API.
 
@@ -340,7 +340,9 @@ With `MNEMOSYNE_LLM_ENABLED=true`:
 0. Host LLM adapter (if MNEMOSYNE_HOST_LLM_ENABLED=true AND a backend is registered)
    ↓ (on failure: skip remote, go to local)
 1. Remote LLM (if no host call was attempted, an explicit or provider-preset-resolved remote base URL is available, AND MNEMOSYNE_FORCE_LOCAL is not enabled)
-   ↓ (on failure)
+   ↓ (on a retryable failure; an empty answer is not retried)
+1b. Each model in MNEMOSYNE_LLM_FALLBACK_MODELS, in order
+   ↓ (on failure of every remote candidate)
 2. Local LLM (llama-cpp-python / ctransformers + MiniCPM5-1B GGUF)
    ↓ (on failure or not installed)
 3. AAAK encoding (keyword-based, no LLM required)
