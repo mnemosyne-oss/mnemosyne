@@ -208,6 +208,37 @@ class TestExtraBodyInRequest:
 # Empty answer
 # ---------------------------------------------------------------------------
 
+class TestDiagnosticText:
+    """The endpoint writes these fields, so the log line must survive them."""
+
+    def test_a_newline_cannot_forge_a_log_line(self):
+        exc = local_llm.EmptyAnswer(
+            finish_reason="length\nWARNING mnemosyne: all clear",
+            reasoning_tokens=7,
+        )
+        assert "\n" not in str(exc) and "\r" not in str(exc)
+        assert "\\n" in str(exc)
+        assert exc.finish_reason == "length\nWARNING mnemosyne: all clear"
+
+    def test_a_long_field_is_bounded(self):
+        exc = local_llm.EmptyAnswer(finish_reason="x" * 500)
+        assert len(str(exc)) < 200
+        assert str(exc).startswith("finish_reason=" + "x" * local_llm._DIAG_MAX_LEN + "...")
+
+    def test_other_control_characters_are_escaped(self):
+        exc = local_llm.EmptyAnswer(finish_reason="len\x1b[2Jgth", reasoning_tokens="4\r0")
+        assert "\x1b" not in str(exc)
+        assert "\\x1b" in str(exc)
+        assert "\\r" in str(exc)
+
+    def test_the_ordinary_case_reads_the_same(self):
+        exc = local_llm.EmptyAnswer(
+            finish_reason="length", reasoning_tokens=7, has_reasoning=True,
+        )
+        assert str(exc) == EMPTY_REASON
+        assert str(local_llm.EmptyAnswer()) == "finish_reason=n/a, content empty"
+
+
 class TestEmptyAnswer:
     def test_empty_answer_is_named(self, primary):
         text, status, exc = local_llm._call_remote_llm_with_model(
