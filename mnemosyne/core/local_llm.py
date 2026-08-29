@@ -626,21 +626,52 @@ def _is_retryable_status(status_code: int) -> bool:
     return False
 
 
+_DIAG_ESCAPES = {"\r": "\\r", "\n": "\\n", "\t": "\\t"}
+_DIAG_MAX_LEN = 60
+
+
+def _diag(value) -> str:
+    """Render one field from a remote body for a log line.
+
+    The value is whatever the endpoint sent, so it is neither trusted nor
+    bounded. Control characters are escaped, because this ends up in a
+    WARNING and a reply that could inject line breaks could forge log lines,
+    and the text is truncated, because a long field must not bury the rest
+    of the diagnostic.
+    """
+    out = []
+    for ch in str(value).replace("\\", "\\\\"):
+        if ch in _DIAG_ESCAPES:
+            out.append(_DIAG_ESCAPES[ch])
+        elif ch.isprintable():
+            out.append(ch)
+        else:
+            out.append(f"\\x{ord(ch):02x}")
+    text = "".join(out)
+    if len(text) > _DIAG_MAX_LEN:
+        text = text[:_DIAG_MAX_LEN] + "..."
+    return text
+
+
 class EmptyAnswer(Exception):
     """A 2xx reply whose answer text is empty.
 
     Carries what the body said about why. A thinking model that spends the
     whole ``max_tokens`` budget on reasoning comes back ``finish_reason=length``
     with ``reasoning_content`` set and ``content`` empty.
+
+    The attributes keep the raw values for callers; only the message text is
+    escaped and bounded, since that is what reaches a log line.
     """
 
     def __init__(self, finish_reason=None, reasoning_tokens=None, has_reasoning=False):
         self.finish_reason = finish_reason
         self.reasoning_tokens = reasoning_tokens
         self.has_reasoning = has_reasoning
-        parts = [f"finish_reason={finish_reason or 'n/a'}"]
+        shown = _diag(finish_reason) if finish_reason else "n/a"
+        parts = [f"finish_reason={shown}"]
         if reasoning_tokens is not None:
-            parts.append(f"reasoning_tokens={reasoning_tokens}")
+            parts.append(f"reasoning_tokens={_diag(reasoning_tokens)}")
         parts.append("reasoning_content present, content empty" if has_reasoning
                      else "content empty")
         super().__init__(", ".join(parts))
