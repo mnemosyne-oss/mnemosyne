@@ -81,13 +81,23 @@ LLM_FALLBACK_BASE_URL = os.environ.get("MNEMOSYNE_LLM_FALLBACK_BASE_URL", "").rs
 LLM_FALLBACK_API_KEY = os.environ.get("MNEMOSYNE_LLM_FALLBACK_API_KEY", "") or LLM_API_KEY
 
 
+# Payload keys the extra body may not set. The merge happens last, so without
+# this a typo'd key would silently send different messages or a different model
+# than every log line and config value says, and the bug report would be
+# unreadable. Provider-specific keys, which is what the escape hatch is for,
+# are unaffected.
+_EXTRA_BODY_RESERVED = ("messages", "model", "stream")
+
+
 def _parse_extra_body(var: str) -> dict:
     """Read a JSON object from ``var`` for merging into the request payload.
 
     Carries keys the OpenAI-compatible shape has no name for (a thinking-mode
     toggle, provider routing), one object per endpoint. Unset, blank, invalid
-    JSON or a non-object value all mean nothing is merged; the invalid cases
-    say so on stderr, since this runs at import before logging is configured.
+    JSON or a non-object value all mean nothing is merged; a reserved key
+    (``messages``, ``model``, ``stream``) is dropped and the rest of the object
+    is kept. The rejected cases say so on stderr, since this runs at import
+    before logging is configured.
     """
     raw = os.environ.get(var, "").strip()
     if not raw:
@@ -101,6 +111,14 @@ def _parse_extra_body(var: str) -> dict:
     if not isinstance(data, dict):
         print(f"[mnemosyne] {var} must be a JSON object, ignored", file=sys.stderr)
         return {}
+    reserved = [k for k in _EXTRA_BODY_RESERVED if k in data]
+    if reserved:
+        print(
+            f"[mnemosyne] {var} may not set {', '.join(reserved)}, "
+            "dropped from the request body",
+            file=sys.stderr,
+        )
+        data = {k: v for k, v in data.items() if k not in _EXTRA_BODY_RESERVED}
     return data
 
 

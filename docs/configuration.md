@@ -285,7 +285,7 @@ Use a remote model instead of the local MiniCPM5-1B GGUF:
 | `MNEMOSYNE_LLM_API_KEY` | *(none)* | API key for authenticated endpoints |
 | `MNEMOSYNE_LLM_MODEL` | *(none)* | Model identifier sent in requests |
 | `MNEMOSYNE_LLM_TIMEOUT` | `60` | HTTP timeout in seconds for remote LLM calls. Increase for slow proxies or models with long generation times (e.g. `300` for reasoning models routed through local proxies). |
-| `MNEMOSYNE_LLM_EXTRA_BODY` | *(none)* | JSON object merged last into every request body, for provider-specific keys the OpenAI shape has no name for (e.g. `{"thinking":{"type":"disabled"}}` to keep a thinking model from spending the whole `max_tokens` budget on reasoning). Ignored when unset or not a JSON object. |
+| `MNEMOSYNE_LLM_EXTRA_BODY` | *(none)* | JSON object merged last into every request body, for provider-specific keys the OpenAI shape has no name for (e.g. `{"thinking":{"type":"disabled"}}` to keep a thinking model from spending the whole `max_tokens` budget on reasoning). Ignored when unset or not a JSON object; `messages`, `model` and `stream` are reserved and dropped. |
 | `MNEMOSYNE_LLM_FALLBACK_EXTRA_BODY` | *(none)* | Same, for requests to `MNEMOSYNE_LLM_FALLBACK_MODELS`. |
 
 With `MNEMOSYNE_LLM_ENABLED` enabled, Mnemosyne uses the remote endpoint when no host call was attempted, an explicit or provider-preset-resolved remote base URL is available, and `MNEMOSYNE_FORCE_LOCAL` is not enabled. On failure it falls back to the local GGUF backend, then AAAK encoding.

@@ -159,6 +159,28 @@ class TestParseExtraBody:
         }
         assert capsys.readouterr().err == ""
 
+    @pytest.mark.parametrize("key", ["messages", "model", "stream"])
+    def test_a_reserved_key_is_dropped_and_noted(self, monkeypatch, capsys, key):
+        monkeypatch.setenv(
+            "MNEMOSYNE_LLM_EXTRA_BODY",
+            json.dumps({key: "hijacked", "thinking": {"type": "disabled"}}),
+        )
+        assert local_llm._parse_extra_body("MNEMOSYNE_LLM_EXTRA_BODY") == {
+            "thinking": {"type": "disabled"},
+        }
+        err = capsys.readouterr().err
+        assert "MNEMOSYNE_LLM_EXTRA_BODY" in err
+        assert key in err
+
+    def test_an_object_of_only_reserved_keys_is_empty(self, monkeypatch, capsys):
+        monkeypatch.setenv(
+            "MNEMOSYNE_LLM_FALLBACK_EXTRA_BODY",
+            '{"messages": "hijacked", "model": "evil"}',
+        )
+        assert local_llm._parse_extra_body("MNEMOSYNE_LLM_FALLBACK_EXTRA_BODY") == {}
+        err = capsys.readouterr().err
+        assert "messages, model" in err
+
 
 class TestExtraBodyInRequest:
     def test_extra_body_merges_last_and_keeps_the_rest(self, monkeypatch, fallback):
