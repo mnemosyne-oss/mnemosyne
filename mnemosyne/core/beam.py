@@ -2321,6 +2321,24 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
             if _is_meaningful_recall_token(part)
         )
     content_tokens = expanded_content_tokens
+    # `_recall_tokens()` reads its length floor off the surface form and then
+    # strips the particle that earned it: `AI가` clears the two-character
+    # Hangul floor and leaves `ai`, while a standalone `AI` in the content is
+    # measured against the three-character Latin floor and dropped. The two
+    # sides disagree about the same word. `_fts_query_terms()` emits `"ai"*`
+    # either way, so admission has to be able to credit a stem the query
+    # actually asked for -- otherwise `_fts_search()` returns the row as its
+    # top candidate and `recall()` scores it below the gate. Only stems the
+    # query names are admitted, so the global precision gates that share
+    # `_recall_tokens()` keep their current floor.
+    short_stems = {
+        token for token in query_tokens
+        if len(token) < 3 and not _has_hangul(token)
+    }
+    if short_stems:
+        content_tokens.update(
+            short_stems.intersection(_RECALL_TOKEN_RE.findall(content_lower))
+        )
     if not content_tokens and not query_cjk:
         return 0.0
 

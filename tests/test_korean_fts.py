@@ -464,6 +464,26 @@ def test_inflected_queries_survive_admission(episodic_memory, query, gold):
     assert got[:1] == [gold], f"{query!r} -> {got}"
 
 
+@pytest.mark.parametrize("query", ['AI가 정리된 폴더', 'AI 정리된 폴더'])
+def test_short_latin_stem_survives_josa_stripping(episodic_memory, query):
+    """A Latin stem must not change verdict depending on the particle glued to it.
+
+    ``_is_meaningful_recall_token`` reads its length floor off the surface form,
+    so ``AI가`` clears the two-character Hangul floor -- and then
+    ``_recall_tokens`` strips the very particle that earned the exemption,
+    leaving ``ai``. The same word standing alone in a document is measured
+    against the three-character Latin floor and dropped, so query and content
+    disagreed about ``AI``. ``_fts_query_terms`` emits ``"ai"*`` for both forms
+    and m27 is the top candidate either way; only admission diverged.
+
+    Both spellings are asserted together because the defect is the asymmetry,
+    not either form on its own -- pinning only the inflected one would pass
+    again if the exemption were removed instead of made consistent.
+    """
+    got = [row.get("id") for row in episodic_memory.recall(query, top_k=5)]
+    assert got[:1] == ['m27'], f"{query!r} -> {got}"
+
+
 def test_candidate_and_admission_agree_on_normalization(episodic_memory, corpus):
     """No query may be a top candidate and then be dropped by the gate.
 
