@@ -3106,7 +3106,11 @@ def _fts_query_terms(query: str) -> List[str]:
             if len(stem) >= 2:
                 if stem not in seen:
                     seen.add(stem)
-                    terms.append(f"{stem}*")
+                    # Quote before the wildcard. A bare `stem*` is parsed as
+                    # FTS5 syntax, so a stem carrying `/`, `:` or `-` raises
+                    # (`syntax error near "/"`, `no such column: ...`) and
+                    # kills the whole MATCH before any fallback can run.
+                    terms.append(f'"{stem}"*')
                 continue
         if term not in seen:
             seen.add(term)

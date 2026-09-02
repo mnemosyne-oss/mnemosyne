@@ -170,8 +170,8 @@ def _ranks(conn, rowid_of, k=5):
 
 
 def test_hangul_query_terms_use_stem_prefix():
-    """조사 is stripped and the stem becomes a prefix term, not a phrase."""
-    assert beam._fts_query_terms("여권은 언제 갱신하지") == ["여권*", "언제*", "갱신하지*"]
+    """조사 is stripped and the stem becomes a quoted prefix term."""
+    assert beam._fts_query_terms("여권은 언제 갱신하지") == ['"여권"*', '"언제"*', '"갱신하지"*']
 
 
 def test_single_syllable_particles_can_over_trim():
@@ -184,13 +184,36 @@ def test_single_syllable_particles_can_over_trim():
     a documented decision rather than an accident.
     """
     assert beam._strip_ko_josa("갱신하나") == "갱신하"
-    assert beam._fts_query_terms("여권은 언제 갱신하나") == ["여권*", "언제*", "갱신하*"]
+    assert beam._fts_query_terms("여권은 언제 갱신하나") == ['"여권"*', '"언제"*', '"갱신하"*']
 
 
 def test_two_syllable_hangul_tokens_survive():
     """Two-syllable Korean words are whole words and must not be filtered."""
     assert "캐시" in beam._ko_relaxed_recall_tokens("프롬프트 캐시 기본 크기")
-    assert beam._fts_query_terms("백업 주기") == ["백업*", "주기*"]
+    assert beam._fts_query_terms("백업 주기") == ['"백업"*', '"주기"*']
+
+
+def test_structured_hangul_tokens_are_quoted_before_wildcard(corpus):
+    """A bare ``stem*`` breaks FTS5 when the stem carries punctuation.
+
+    ``/`` raises ``syntax error near "/"``, while ``:`` and ``-`` are read as
+    column filters (``no such column: ...``). ``_fts_search`` has no exception
+    guard, so an unquoted prefix term aborts the entire search before the LIKE
+    fallback can run. Quoting turns all three into ordinary prefix terms.
+    """
+    conn, _ = corpus
+    cases = {
+        "한국어/영어 설정": ['"한국어/영어"*', '"설정"*'],
+        "캐시-크기 확인": ['"캐시-크기"*', '"확인"*'],
+        "8080:포트": ['"8080:포트"*'],
+    }
+    for query, expected in cases.items():
+        assert beam._fts_query_terms(query) == expected
+        conn.execute(
+            "SELECT rowid FROM fts_episodes WHERE fts_episodes MATCH ?",
+            (" OR ".join(expected),),
+        ).fetchall()
+        beam._fts_search(conn, query, k=5)
 
 
 def test_non_hangul_queries_are_unchanged():
