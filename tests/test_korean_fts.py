@@ -140,11 +140,18 @@ QUERIES = [
 ]
 
 
-# Function-scoped on purpose. conftest's autouse `_reset_thread_local_connections`
-# closes every cached connection around each test, so a module-scoped connection
-# would already be dead by the second test. 60 rows is cheap to rebuild.
 @pytest.fixture
 def corpus(tmp_path):
+    """A throwaway BEAM database holding the 60 benchmark memories.
+
+    Function-scoped on purpose: conftest's autouse
+    ``_reset_thread_local_connections`` closes every cached connection around
+    each test, so a module-scoped connection would already be dead by the
+    second test. 60 rows is cheap to rebuild.
+
+    Returns the open connection and a ``{memory id: rowid}`` map so tests can
+    check where a known document landed in the ranking.
+    """
     db = tmp_path / "ko.db"
     beam.init_beam(db)
     conn = beam._get_connection(db)
@@ -161,6 +168,12 @@ def corpus(tmp_path):
 
 
 def _ranks(conn, rowid_of, k=5):
+    """Run every benchmark query and report where its gold document landed.
+
+    Returns ``(kind, rank)`` per query, rank being 1-based within the top ``k``
+    and 0 when the gold document is absent. Calls ``_fts_search`` directly so a
+    lexical regression cannot be masked by the vector layer.
+    """
     out = []
     for query, gold, kind in QUERIES:
         got = [r["rowid"] for r in beam._fts_search(conn, query, k=k)]
@@ -224,6 +237,7 @@ def test_non_hangul_queries_are_unchanged():
 
 
 def test_strip_ko_josa_is_suffix_trimming_only():
+    """Particles come off the end; everything else is returned untouched."""
     assert beam._strip_ko_josa("갱신은") == "갱신"
     assert beam._strip_ko_josa("회사에서") == "회사"
     assert beam._strip_ko_josa("백업") == "백업"      # nothing to strip
@@ -231,17 +245,25 @@ def test_strip_ko_josa_is_suffix_trimming_only():
 
 
 def test_korean_recall_at_5(corpus):
+    """Frozen at the exact benchmark result, not a tolerance band.
+
+    48/49 is the number this PR claims. The one miss is a paraphrase with zero
+    lexical overlap with its target, which no lexical method can retrieve. A
+    band would let the claim rot silently, so any movement -- up or down -- is
+    meant to fail and be looked at.
+    """
     conn, rowid_of = corpus
     ranks = _ranks(conn, rowid_of)
     hit = sum(1 for _, r in ranks if r)
-    assert hit / len(ranks) >= 0.95, f"R@5 regressed to {hit}/{len(ranks)}"
+    assert hit == 48, f"R@5 moved to {hit}/{len(ranks)}, benchmark says 48/49"
 
 
 def test_korean_recall_at_1(corpus):
+    """Frozen at the exact benchmark result. See `test_korean_recall_at_5`."""
     conn, rowid_of = corpus
     ranks = _ranks(conn, rowid_of)
     top1 = sum(1 for _, r in ranks if r == 1)
-    assert top1 / len(ranks) >= 0.80, f"R@1 regressed to {top1}/{len(ranks)}"
+    assert top1 == 42, f"R@1 moved to {top1}/{len(ranks)}, benchmark says 42/49"
 
 
 def test_particle_inflected_queries_all_recall(corpus):
@@ -252,12 +274,18 @@ def test_particle_inflected_queries_all_recall(corpus):
 
 
 def test_like_fallback_is_rarely_needed(corpus):
-    """FTS should answer nearly everything; LIKE is a safety net, not a path."""
+    """FTS answers everything but one query; LIKE is a safety net, not a path.
+
+    Held at the benchmark's 1/49 rather than a looser cap. The fallback is the
+    path this PR routes around, so a second query falling into it means the
+    query layer regressed even if recall happens to hold.
+    """
     conn, rowid_of = corpus
     calls = {"n": 0}
     original = beam._cjk_like_search
 
     def counting(*args, **kwargs):
+        """Count each fallback entry, then delegate to the real search."""
         calls["n"] += 1
         return original(*args, **kwargs)
 
@@ -266,7 +294,7 @@ def test_like_fallback_is_rarely_needed(corpus):
         _ranks(conn, rowid_of)
     finally:
         beam._cjk_like_search = original
-    assert calls["n"] <= 3, f"LIKE fallback used {calls['n']}/{len(QUERIES)} times"
+    assert calls["n"] <= 1, f"LIKE fallback used {calls['n']}/{len(QUERIES)} times"
 
 
 def test_search_path_makes_no_network_calls(corpus, monkeypatch):
@@ -274,6 +302,7 @@ def test_search_path_makes_no_network_calls(corpus, monkeypatch):
     import socket
 
     def blocked(*args, **kwargs):
+        """Stand in for ``socket.socket`` and fail if anything opens one."""
         raise AssertionError("search path opened a socket")
 
     monkeypatch.setattr(socket, "socket", blocked)
