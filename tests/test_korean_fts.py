@@ -15,14 +15,21 @@ Baseline before the Korean query fix, for reference:
     unpatched                    63.3%   71.4%   0.667   12/19   23/49
     josa prefix only             63.3%   87.8%   0.740   17/19    9/49
     two-syllable relaxation only 65.3%   77.6%   0.708   14/19   12/49
-    both (this patch)            85.7%   98.0%   0.912   19/19    1/49
+    both (this patch)            87.8%  100.0%   0.933   19/19    0/49
 
 The two fixes are not additive -- either one alone leaves the other hole
 open, which is why they ship together.
+
+Every figure above is candidate generation. The public path is measured
+separately at the bottom of this file and lands lower (35/49 episodic,
+38/49 working), because ``BeamMemory.recall()`` applies a lexical
+admission gate on top. Quoting the candidate number as the recall number
+is the mistake this suite exists to prevent.
 """
 import pytest
 
 from mnemosyne.core import beam
+from mnemosyne.core.beam import BeamMemory
 
 MEMORIES = [
     ('m01', 'llama-server 8080 포트는 -c 131072 -np 1 설정으로 고정해서 서빙한다'),
@@ -202,7 +209,7 @@ def test_single_syllable_particles_can_over_trim():
 
 def test_two_syllable_hangul_tokens_survive():
     """Two-syllable Korean words are whole words and must not be filtered."""
-    assert "캐시" in beam._ko_relaxed_recall_tokens("프롬프트 캐시 기본 크기")
+    assert "캐시" in beam._recall_tokens("프롬프트 캐시 기본 크기")
     assert beam._fts_query_terms("백업 주기") == ['"백업"*', '"주기"*']
 
 
@@ -215,16 +222,21 @@ def test_structured_hangul_tokens_are_quoted_before_wildcard(corpus):
     fallback can run. Quoting turns all three into ordinary prefix terms.
     """
     conn, _ = corpus
+    # Only the structured token itself is asserted. Which *additional*
+    # components a query expands into is the hyphen-splitter's business and
+    # changes as the tokenizer evolves; pinning the whole list here would
+    # make this test fail for reasons unrelated to quoting.
     cases = {
-        "한국어/영어 설정": ['"한국어/영어"*', '"설정"*'],
-        "캐시-크기 확인": ['"캐시-크기"*', '"확인"*'],
-        "8080:포트": ['"8080:포트"*'],
+        "한국어/영어 설정": '"한국어/영어"*',
+        "캐시-크기 확인": '"캐시-크기"*',
+        "8080:포트": '"8080:포트"*',
     }
-    for query, expected in cases.items():
-        assert beam._fts_query_terms(query) == expected
+    for query, structured in cases.items():
+        terms = beam._fts_query_terms(query)
+        assert structured in terms
         conn.execute(
             "SELECT rowid FROM fts_episodes WHERE fts_episodes MATCH ?",
-            (" OR ".join(expected),),
+            (" OR ".join(terms),),
         ).fetchall()
         beam._fts_search(conn, query, k=5)
 
@@ -247,15 +259,14 @@ def test_strip_ko_josa_is_suffix_trimming_only():
 def test_korean_recall_at_5(corpus):
     """Frozen at the exact benchmark result, not a tolerance band.
 
-    48/49 is the number this PR claims. The one miss is a paraphrase with zero
-    lexical overlap with its target, which no lexical method can retrieve. A
-    band would let the claim rot silently, so any movement -- up or down -- is
-    meant to fail and be looked at.
+    49/49 is the number this PR claims. A band would let the claim rot
+    silently, so any movement -- up or down -- is meant to fail and be
+    looked at.
     """
     conn, rowid_of = corpus
     ranks = _ranks(conn, rowid_of)
     hit = sum(1 for _, r in ranks if r)
-    assert hit == 48, f"R@5 moved to {hit}/{len(ranks)}, benchmark says 48/49"
+    assert hit == 49, f"R@5 moved to {hit}/{len(ranks)}, benchmark says 49/49"
 
 
 def test_korean_recall_at_1(corpus):
@@ -263,7 +274,7 @@ def test_korean_recall_at_1(corpus):
     conn, rowid_of = corpus
     ranks = _ranks(conn, rowid_of)
     top1 = sum(1 for _, r in ranks if r == 1)
-    assert top1 == 42, f"R@1 moved to {top1}/{len(ranks)}, benchmark says 42/49"
+    assert top1 == 43, f"R@1 moved to {top1}/{len(ranks)}, benchmark says 43/49"
 
 
 def test_particle_inflected_queries_all_recall(corpus):
@@ -274,10 +285,10 @@ def test_particle_inflected_queries_all_recall(corpus):
 
 
 def test_like_fallback_is_rarely_needed(corpus):
-    """FTS answers everything but one query; LIKE is a safety net, not a path.
+    """FTS now answers every benchmark query; LIKE is a safety net, not a path.
 
-    Held at the benchmark's 1/49 rather than a looser cap. The fallback is the
-    path this PR routes around, so a second query falling into it means the
+    Held at the benchmark's 0/49 rather than a loose cap. The fallback is the
+    path this PR routes around, so a single query falling into it means the
     query layer regressed even if recall happens to hold.
     """
     conn, rowid_of = corpus
@@ -294,7 +305,7 @@ def test_like_fallback_is_rarely_needed(corpus):
         _ranks(conn, rowid_of)
     finally:
         beam._cjk_like_search = original
-    assert calls["n"] <= 1, f"LIKE fallback used {calls['n']}/{len(QUERIES)} times"
+    assert calls["n"] == 0, f"LIKE fallback used {calls['n']}/{len(QUERIES)} times"
 
 
 def test_search_path_makes_no_network_calls(corpus, monkeypatch):
@@ -309,3 +320,192 @@ def test_search_path_makes_no_network_calls(corpus, monkeypatch):
     conn, rowid_of = corpus
     ranks = _ranks(conn, rowid_of)
     assert sum(1 for _, r in ranks if r) > 0
+
+
+# ---------------------------------------------------------------------------
+# Public recall path
+#
+# Everything above measures `_fts_search()`, which is candidate generation
+# only. `BeamMemory.recall()` then applies a lexical admission gate, and a
+# candidate scoring below it is dropped even when it ranked first. The two
+# numbers are therefore different measurements, not the same one taken twice,
+# and the suite states both rather than letting the candidate figure stand in
+# for what a caller actually receives.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def episodic_memory(tmp_path):
+    """A ``BeamMemory`` whose episodic layer holds the 60 benchmark memories.
+
+    Rows are inserted directly, matching the ``corpus`` fixture, so the
+    documents are byte-identical across the candidate and public measurements
+    and any divergence is attributable to the admission gate alone.
+    """
+    db = tmp_path / "public.db"
+    memory = BeamMemory(session_id="default", db_path=db)
+    conn = beam._get_connection(db)
+    for mid, content in MEMORIES:
+        conn.execute(
+            "INSERT INTO episodic_memory"
+            " (id, content, source, session_id, importance)"
+            " VALUES (?, ?, 'test', 'default', 0.5)",
+            (mid, content),
+        )
+    conn.commit()
+    return memory
+
+
+@pytest.fixture
+def working_memory(tmp_path):
+    """A ``BeamMemory`` holding the same 60 memories in the working layer.
+
+    Written through the public ``remember()`` so the working-memory recall
+    branch is exercised end to end. Working rows carry generated ids, so
+    callers match on content.
+    """
+    memory = BeamMemory(session_id="default", db_path=tmp_path / "working.db")
+    for _, content in MEMORIES:
+        memory.remember(content, source="test")
+    return memory
+
+
+def _public_ranks(memory, key, k=5):
+    """Where each benchmark query's gold document lands in ``recall()``.
+
+    ``key`` maps a result row to the value compared against the gold id, which
+    differs by layer: episodic rows keep the benchmark id, working rows get a
+    generated one and are matched on content.
+    """
+    gold_content = dict(MEMORIES)
+    out = []
+    for query, gold, kind in QUERIES:
+        got = [key(row) for row in memory.recall(query, top_k=k)][:k]
+        want = gold if key is _row_id else gold_content[gold]
+        out.append((kind, got.index(want) + 1 if want in got else 0))
+    return out
+
+
+def _row_id(row):
+    """Identity key for episodic rows, which keep their benchmark id."""
+    return row.get("id")
+
+
+def _row_content(row):
+    """Identity key for working rows, whose ids are generated on write."""
+    return row.get("content", "")
+
+
+def test_public_episodic_recall_is_gated_below_candidate_recall(episodic_memory):
+    """Frozen at what a caller receives, which is not the candidate figure.
+
+    35/49 against 49/49 candidates. The 14-query gap is the lexical admission
+    gate, and it is not a normalization defect: in every dropped query only the
+    topic noun is shared, while the rest of the query is an interrogative
+    (누가, 뭐야) or a conjugated predicate whose document counterpart is a
+    synonym (수정할/고칠, 버렸더라/폐기했다). No suffix-trimming scheme
+    recovers those; closing the gap needs morphological analysis, which this
+    change deliberately does not introduce. The number is frozen so the next
+    attempt has a baseline instead of an impression.
+    """
+    ranks = _public_ranks(episodic_memory, _row_id)
+    hit = sum(1 for _, r in ranks if r)
+    assert hit == 35, f"public episodic R@5 moved to {hit}/{len(ranks)}, baseline 35/49"
+
+
+def test_public_episodic_recall_at_1(episodic_memory):
+    """Admitted rows are always rank 1 here, so R@1 tracks R@5 exactly.
+
+    That equality is the point: the gate does not demote, it excludes. A run
+    where R@1 falls below R@5 means something started ranking an admitted row
+    behind a distractor.
+    """
+    ranks = _public_ranks(episodic_memory, _row_id)
+    top1 = sum(1 for _, r in ranks if r == 1)
+    assert top1 == 35, f"public episodic R@1 moved to {top1}/{len(ranks)}, baseline 35/49"
+
+
+def test_public_working_recall(working_memory):
+    """The working layer is a separate recall branch and is measured separately.
+
+    R@5 is frozen exactly, because admission is a score threshold and does not
+    depend on write order. R@1 is a floor rather than an exact figure: the 60
+    rows are written in a burst, so whether two of them share a timestamp
+    varies per run, and the recency tiebreak then orders equally-scored rows
+    differently. Observed 36-37; pinning either value would make this test
+    flaky for a reason that has nothing to do with Korean.
+    """
+    ranks = _public_ranks(working_memory, _row_content)
+    hit = sum(1 for _, r in ranks if r)
+    top1 = sum(1 for _, r in ranks if r == 1)
+    assert hit == 38, f"public working R@5 moved to {hit}/{len(ranks)}, baseline 38/49"
+    assert top1 >= 36, f"public working R@1 fell to {top1}/{len(ranks)}, floor 36/49"
+
+
+@pytest.mark.parametrize(
+    "query, gold",
+    [
+        ('honcho가 한국어 검색을 못 하는 이유', 'm14'),
+        ('백업 보관 기간이 며칠이야', 'm40'),
+        ('임베딩 서버는 몇 번 포트야', 'm03'),
+        ('cram을 올린 뒤 축출이 어떻게 됐나', 'm05'),
+    ],
+)
+def test_inflected_queries_survive_admission(episodic_memory, query, gold):
+    """The reported defect: candidate generation succeeded, admission did not.
+
+    Each query inflects its target's key noun with a particle. Before the
+    normalization contract was unified, ``_fts_search()`` returned the target
+    as its top candidate and ``recall()`` then returned ``[]`` because the gate
+    scored the same row against unnormalized tokens. Asserting rank 1 rather
+    than mere presence keeps the distractors in play.
+    """
+    got = [row.get("id") for row in episodic_memory.recall(query, top_k=5)]
+    assert got[:1] == [gold], f"{query!r} -> {got}"
+
+
+def test_candidate_and_admission_agree_on_normalization(episodic_memory, corpus):
+    """No query may be a top candidate and then be dropped by the gate.
+
+    This is the invariant the two layers violated. It is asserted directly
+    rather than inferred from the aggregate counts, because a recall number can
+    hold while an individual row silently falls through.
+    """
+    conn, rowid_of = corpus
+    gold_content = dict(MEMORIES)
+    for query, gold, _kind in QUERIES:
+        top = beam._fts_search(conn, query, k=1)
+        if not top or top[0]["rowid"] != rowid_of[gold]:
+            continue
+        admitted = [row.get("id") for row in episodic_memory.recall(query, top_k=5)]
+        if gold in admitted:
+            continue
+        # A drop is permitted only when the query genuinely shares too little
+        # surface form with its target -- never because the two layers
+        # tokenized the same text differently.
+        query_tokens = beam._recall_tokens(query.lower())
+        relevance = beam._lexical_relevance(
+            query_tokens, gold_content[gold], query.lower()
+        )
+        assert relevance < beam._minimum_recall_relevance(query_tokens), (
+            f"{query!r} was the top candidate and scored {relevance:.3f} above "
+            f"the gate, yet recall() dropped it"
+        )
+
+
+def test_strip_ko_josa_is_idempotent():
+    """``f(stem) == f(stem + 조사)`` or the two sides can never meet.
+
+    A query token and the same word inflected inside a document are normalized
+    by separate calls, so a single pass is not enough: ``바나나`` trims to
+    ``바나`` because its final syllable is itself a particle, while ``바나나를``
+    trims only to ``바나나``. Trimming to a fixed point makes both converge.
+    """
+    for stem in ("바나나", "백업", "회사", "갱신", "포트", "캐시"):
+        assert beam._strip_ko_josa(stem) == beam._strip_ko_josa(
+            beam._strip_ko_josa(stem)
+        )
+        for josa in ("를", "은", "이", "에서", "으로", "까지"):
+            assert beam._strip_ko_josa(stem + josa) == beam._strip_ko_josa(stem), (
+                f"{stem}+{josa} normalizes differently from {stem}"
+            )
