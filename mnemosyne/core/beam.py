@@ -3099,6 +3099,12 @@ def _fts_query_terms(query: str) -> List[str]:
     terms: List[str] = []
     seen: Set[str] = set()
     symbolic = set(_symbolic_code_tokens(query))
+    # unicode61 glues a Korean particle onto whatever precedes it, including
+    # a Latin word: `ModelForge가` is one index token, and so is `honcho는`.
+    # An exact phrase term can never match either, so every term in a
+    # Hangul-bearing query must take the prefix form -- even the ones that
+    # `_recall_tokens()` has already stripped down to pure Latin.
+    query_has_hangul = _has_hangul(query)
     for term in _expanded_query_tokens(_recall_tokens(query)):
         if term.startswith("-"):
             # FTS5-only terms never reach MATCH verbatim. The fragment's
@@ -3111,7 +3117,7 @@ def _fts_query_terms(query: str) -> List[str]:
         term = term.replace('"', '""').strip()
         if not term:
             continue
-        if _has_hangul(term):
+        if _has_hangul(term) or query_has_hangul:
             stem = _strip_ko_josa(term)
             if len(stem) >= 2:
                 if stem not in seen:
