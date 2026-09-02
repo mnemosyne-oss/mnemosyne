@@ -20,7 +20,6 @@ Baseline before the Korean query fix, for reference:
 The two fixes are not additive -- either one alone leaves the other hole
 open, which is why they ship together.
 """
-import sqlite3
 import pytest
 
 from mnemosyne.core import beam
