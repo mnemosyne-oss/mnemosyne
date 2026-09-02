@@ -2320,6 +2320,18 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
         if token in content_tokens:
             exact += _component_unit_weight(components)
             continue
+        if _has_hangul(token) and any(
+            ctoken.startswith(token) for ctoken in content_tokens
+        ):
+            # Korean inflects by suffixing, and `_strip_ko_josa()` trims only
+            # particles -- verb and adjective endings stay attached, so a
+            # document says `보관한다` where the query says `보관`. FTS already
+            # matches those via the `"stem"*` prefix term; admission has to use
+            # the same rule, or `_fts_search()` returns the row as its top
+            # candidate and `recall()` then scores it below the gate.
+            exact += _component_unit_weight(components)
+            continue
+
         component_hits = sum(part in content_tokens for part in components)
         if len(components) >= 2 and component_hits >= 2:
             # A differently-hyphenated fact must share at least two meaningful
