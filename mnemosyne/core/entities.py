@@ -51,10 +51,11 @@ _ENTITY_PATTERNS = [
     re.compile(r'@(\w{2,30})'),
     # Hashtags: #topic
     re.compile(r'#(\w{2,30})'),
-    # Quoted phrases: "Hello World"
-    re.compile(r'"([^"]{2,50})"'),
-    # Single-quoted phrases: 'Hello World'
-    re.compile(r"'([^']{2,50})'"),
+    # There is deliberately no quoted-span pattern. A whole quoted span is
+    # usually dialogue rather than a name ('Okay,', 'Talia pauses.'), and its
+    # punctuation slips past the stop-word filter because 'okay,' != 'okay'.
+    # A real name inside quotes still extracts from the capitalized patterns
+    # below, which quotes do not block.
     # Capitalized word sequences (2-5 words): New York, Abdias J, San Francisco Bay Area
     re.compile(r'\b([A-Z][a-zA-Z]*(?:\s+[A-Z][a-zA-Z]*){1,4})\b'),
     # Single capitalized word (fallback): Abdias, Python, John
@@ -163,7 +164,7 @@ def extract_entities_regex(text: str) -> List[str]:
             # Filter out pure numbers
             if entity.replace('.', '').replace(',', '').isdigit():
                 continue
-            # Filter out standalone lowercase words (unless quoted/mentioned)
+            # Filter out standalone lowercase words (unless @-mentioned/#-tagged)
             # But allow @mentions and hashtags which are lowercase by nature
             if len(words) == 1 and entity[0].islower() and not entity.startswith('@') and not entity.startswith('#'):
                 # Check if this entity came from an @mention or #hashtag pattern

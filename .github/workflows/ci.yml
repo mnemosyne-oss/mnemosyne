@@ -206,10 +206,10 @@ jobs:
           "
 
       - name: Run core tests
-        run: pytest tests/ -v --tb=short
+        run: pytest tests/ -v --tb=short --timeout=900 --timeout-method=thread
 
       - name: Run Hermes integration tests
-        run: pytest integrations/hermes/tests/ -v --tb=short
+        run: pytest integrations/hermes/tests/ -v --tb=short --timeout=900 --timeout-method=thread
 
   build:
     runs-on: ubuntu-latest

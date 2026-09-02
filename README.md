@@ -346,6 +346,7 @@ When client-side encryption is enabled, the remote sync server sees **only metad
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MNEMOSYNE_DATA_DIR` | `~/.hermes/mnemosyne/data` | Database directory |
+| `MNEMOSYNE_JOURNAL_MODE` | `wal` | SQLite journal mode for store connections (memory, beam, query cache, veracity consolidator; the sync client rides the beam connection). Valid: `delete`, `truncate`, `persist`, `memory`, `wal`, `off`; the value is trimmed and lower-cased, unset or blank falls back to `wal`, and non-blank invalid values warn and fall back to `wal`. Set `delete` on filesystems where WAL corrupts reads (Linux containers on macOS virtiofs). Only `wal` persists in the database file; every other mode is per-connection and reverts to SQLite's default (`delete`) on reopen, so each connection re-applies the mode itself. `memory` and `off` remove disk-backed rollback protection and can corrupt the database after a crash. |
 | `MNEMOSYNE_VEC_TYPE` | `int8` | Vector compression: `float32`, `int8`, or `bit` |
 | `MNEMOSYNE_VEC_WEIGHT` | `0.5` | Vector similarity weight |
 | `MNEMOSYNE_FTS_WEIGHT` | `0.3` | FTS5 keyword weight |

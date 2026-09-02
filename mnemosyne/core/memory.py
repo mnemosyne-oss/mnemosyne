@@ -29,6 +29,7 @@ from mnemosyne.core import embeddings as _embeddings
 from mnemosyne.core import beam as beam_module
 from mnemosyne.core._connection_gc import collect_connection_cycles
 from mnemosyne.core.beam import BeamMemory, _BeamConnection, _deferred_commits, init_beam
+from mnemosyne.core.journal import journal_mode
 _thread_local = threading.local()
 
 # Default data directory
@@ -225,7 +226,7 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
             str(path), check_same_thread=False, factory=_BeamConnection
         )
         _thread_local.conn.row_factory = sqlite3.Row
-        _thread_local.conn.execute("PRAGMA journal_mode=WAL")
+        _thread_local.conn.execute(f"PRAGMA journal_mode={journal_mode()}")
         _thread_local.conn.execute("PRAGMA busy_timeout=5000")
         _thread_local.conn.execute("PRAGMA foreign_keys=ON")
         # Load sqlite-vec extension for vector search (matches beam._get_connection)

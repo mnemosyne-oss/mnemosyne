@@ -198,7 +198,7 @@ class TestWrapperExtractEntitiesParity:
         mem = Mnemosyne(session_id="c12a", db_path=db_path)
         # A content string that the regex extractor will pick entities from.
         # extract_entities_regex matches things like CapitalizedWords and
-        # quoted strings depending on the regex. Use a simple sentence with
+        # @mentions depending on the regex. Use a simple sentence with
         # capitalized proper nouns.
         mem.remember(
             "Alice met Bob in Paris last Tuesday.",
@@ -210,4 +210,28 @@ class TestWrapperExtractEntitiesParity:
         rows = ann_store.query_by_kind("mentions")
         assert len(rows) >= 1, (
             "extract_entities=True did not produce 'mentions' annotations"
+        )
+
+    def test_dialogue_does_not_write_quoted_fragments(self, tmp_path):
+        """Ingest-path regression: a quoted span never reaches the mentions
+        vocabulary, and the names in the same turn still do."""
+        from mnemosyne.core.annotations import AnnotationStore
+        db_path = tmp_path / "c12b.db"
+        mem = Mnemosyne(session_id="c12b", db_path=db_path)
+        mem.remember(
+            "'Okay,' Alice said. 'The room is quiet now.' Bob nodded.",
+            source="user",
+            extract_entities=True,
+        )
+        ann_store = AnnotationStore(db_path=db_path)
+        # filter_noise=False: assert the fragments were never written, not
+        # that a read-time filter hides them.
+        values = {
+            row["value"]
+            for row in ann_store.query_by_kind("mentions", filter_noise=False)
+        }
+        assert "Alice" in values
+        assert "Bob" in values
+        assert not [v for v in values if any(c in v for c in ",.'\"")], (
+            f"quoted dialogue reached the mentions vocabulary: {sorted(values)}"
         )

@@ -93,12 +93,28 @@ def dry_run_batch(normalized: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _safe_batch_context(index: Any, action: Any) -> tuple[int | None, str | None]:
+    safe_index = (
+        index
+        if type(index) is int and 0 <= index < _BATCH_MAX_OPS
+        else None
+    )
+    safe_action = (
+        action
+        if type(action) is str and action in _ALLOWED_BATCH_ACTIONS
+        else None
+    )
+    return safe_index, safe_action
+
+
 def batch_validation_error_payload(exc: BatchValidationError) -> dict[str, Any]:
-    payload: dict[str, Any] = {"status": "error", "error": str(exc)}
-    if exc.failed_index is not None:
-        payload["failed_index"] = exc.failed_index
-    if exc.action:
-        payload["action"] = exc.action
+    failed_index, action = _safe_batch_context(exc.failed_index, exc.action)
+    payload: dict[str, Any] = {
+        "status": "error",
+        "error": "batch_validation_failed",
+        "failed_index": failed_index,
+        "action": action,
+    }
     return payload
 
 
@@ -127,21 +143,30 @@ def apply_beam_batch(
                     audit_events=audit_events,
                     extract_defaults_global=extract_defaults_global,
                 ))
-    except Exception as exc:
-        logger.exception(
+    except Exception:
+        if isinstance(current, dict):
+            index = dict.get(current, "index")
+            current_action = dict.get(current, "action")
+        else:
+            index = current_action = None
+        failed_index, action = _safe_batch_context(index, current_action)
+        logger.error(
             "mnemosyne_batch failed at index=%s action=%s",
-            current.get("index"),
-            current.get("action"),
+            failed_index,
+            action,
         )
         return {
             "status": "error",
-            "failed_index": current.get("index"),
-            "action": current.get("action"),
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": "batch_failed",
+            "failed_index": failed_index,
+            "action": action,
         }
     if audit_event:
         for event_name, event_kwargs in audit_events:
-            audit_event(event_name, **event_kwargs)
+            try:
+                audit_event(event_name, **event_kwargs)
+            except Exception:
+                logger.error("mnemosyne_batch audit publication failed")
     return {"status": "ok", "operations_count": len(results), "results": results}
 
 

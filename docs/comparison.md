@@ -89,9 +89,9 @@ Additional: **TripleStore** — temporal knowledge graph with `valid_from`/`vali
 | Feature | Mnemosyne | Hindsight Self-Hosted |
 |---|---|---|
 | **Method** | Regex patterns + pure Python Levenshtein distance | spaCy NLP pipeline + LLM extraction |
-| **Patterns** | `@mentions`, `#hashtags`, `"quoted phrases"`, capitalized sequences (2–5 words) | Full NLP: named entities, noun phrases, coreference |
+| **Patterns** | `@mentions`, `#hashtags`, capitalized sequences (2–5 words), single capitalized words | Full NLP: named entities, noun phrases, coreference |
 | **Fuzzy matching** | Levenshtein distance with prefix/substring bonuses. `"Abdias"` ≈ `"Abdias J"` (similarity: 0.925) | Trigram/full resolution strategies. Entity co-occurrence tracking. |
-| **Storage** | TripleStore triples: `(memory_id, "mentions", "entity_name")` | Structured entity table with normalization |
+| **Storage** | AnnotationStore rows: `kind="mentions"`, one per entity per memory | Structured entity table with normalization |
 | **Speed** | ~0.01ms per extraction | Heavier (spaCy model loading + inference) |
 | **Accuracy** | Good for proper nouns, handles, hashtags. Misses pronouns, complex references. | Higher recall — resolves "she", "the project", complex entity mentions. |
 | **Opt-in?** | `extract_entities=True` on `remember()` | Always on |

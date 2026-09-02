@@ -13,6 +13,7 @@ All imports are guarded — this module loads safely even if mcp is not installe
 
 from typing import TYPE_CHECKING, Dict, Any, List, TypeAlias
 import json
+import logging
 import math  # noqa: F401
 import os
 import sqlite3
@@ -39,6 +40,8 @@ from mnemosyne.batch_tool import (
     dry_run_batch,
     validate_batch_operations,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from mnemosyne.core.memory import Mnemosyne
@@ -326,8 +329,11 @@ def _handle_batch(arguments: Dict[str, Any]) -> Dict[str, Any]:
         audit_event=lambda name, **kwargs: audit_events.append({"event": name, **kwargs}),
     )
     if result.get("status") == "ok":
-        adapter.replay_wrapper_events()
-    result["bank"] = bank
+        try:
+            adapter.replay_wrapper_events()
+        except Exception:
+            logger.error("mnemosyne_batch wrapper replay failed")
+        result["bank"] = bank
     if audit_events:
         result["audit_events"] = audit_events
     return result

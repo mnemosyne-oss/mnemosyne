@@ -124,6 +124,77 @@ def _provider_for_config(module, hermes_home: Path):
     return provider
 
 
+class _FailingBatchBeam:
+    conn = None
+
+    def remember(self, **_kwargs):
+        raise RuntimeError("/private/provider/path\ncanary")
+
+
+def test_batch_execution_failure_payload_matches_across_providers(provider_modules):
+    payloads = []
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        provider._beam = _FailingBatchBeam()
+        payloads.append(json.loads(provider._handle_batch({
+            "operations": [{"action": "remember", "content": "x"}],
+        })))
+
+    expected = {
+        "status": "error",
+        "error": "batch_failed",
+        "failed_index": 0,
+        "action": "remember",
+    }
+    assert payloads == [expected, expected]
+    assert "/private/provider/path" not in json.dumps(payloads)
+
+
+def test_batch_unknown_action_payload_matches_across_providers(
+    tmp_path, provider_modules
+):
+    canary = "<script>private-action</script>"
+    arguments = {
+        "operations": [
+            {"action": "remember", "content": "must not write"},
+            {
+                "action": canary,
+                "content": "complete unsupported operation",
+                "memory_id": "private-id",
+                "importance": 0.5,
+            },
+        ],
+    }
+    payloads = []
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            f"batch-unknown-{name}",
+            hermes_home=str(tmp_path / name),
+            profile_isolation=False,
+            agent_context="primary",
+        )
+        assert provider._beam is not None
+        payloads.append(json.loads(provider.handle_tool_call(
+            "mnemosyne_batch", arguments
+        )))
+        row_count = provider._beam.conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE content = ?",
+            ("must not write",),
+        ).fetchone()[0]
+        assert row_count == 0
+        provider._beam.conn.close()
+
+    expected = {
+        "status": "error",
+        "error": "batch_validation_failed",
+        "failed_index": 1,
+        "action": None,
+    }
+    assert payloads == [expected, expected]
+    assert canary not in json.dumps(payloads)
+
+
 def _json_stable(value):
     return json.loads(json.dumps(value, sort_keys=True))
 
@@ -402,14 +473,42 @@ def test_tool_whitelist_null_without_yaml_exposes_all_tools(
             _filtered_schemas(module, PROVIDER_TOOL_NAMES)
         )
         assert provider.has_tool("mnemosyne_remember") is True
-        assert json.loads(
-            provider.handle_tool_call("mnemosyne_remember", {"content": "x"})
-        ) == {
-            "status": "memory_unavailable",
-            "tool": "mnemosyne_remember",
-            "reason": "Mnemosyne not initialized",
-            "error": "Mnemosyne unavailable: Mnemosyne not initialized",
-        }
+
+
+def test_uninitialized_primary_tool_call_diverges_by_provider(
+    tmp_path, monkeypatch, provider_modules
+):
+    """Intentional divergence: only mnemosyne_hermes lazy-inits on first tool call.
+
+    The previous shared-loop assertion required memory_unavailable from both
+    providers. hermes_memory_provider still returns that uninitialized response.
+    mnemosyne_hermes lazy-initializes on a primary-context tool call when Hermes
+    never called initialize(), so it must not return memory_unavailable.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+
+    root = _provider_for_config(provider_modules["hermes_memory_provider"], tmp_path)
+    assert json.loads(
+        root.handle_tool_call("mnemosyne_remember", {"content": "x"})
+    ) == {
+        "status": "memory_unavailable",
+        "tool": "mnemosyne_remember",
+        "reason": "Mnemosyne not initialized",
+        "error": "Mnemosyne unavailable: Mnemosyne not initialized",
+    }
+
+    packaged = _provider_for_config(provider_modules["mnemosyne_hermes"], tmp_path)
+    try:
+        result = json.loads(
+            packaged.handle_tool_call("mnemosyne_remember", {"content": "x"})
+        )
+        assert result.get("status") != "memory_unavailable", result
+        assert "not initialized" not in str(result).lower()
+        assert result.get("status") == "stored"
+        assert result.get("memory_id")
+    finally:
+        packaged.shutdown()
 
 
 @pytest.mark.parametrize(

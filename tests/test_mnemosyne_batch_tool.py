@@ -183,6 +183,56 @@ def test_batch_audit_events_emit_only_after_successful_commit(tmp_path):
     assert [event[0] for event in events] == ["remember"]
 
 
+def test_batch_audit_failure_after_commit_preserves_success(tmp_path, caplog):
+    provider = _provider(tmp_path)
+    canary = "/private/audit/path\ncanary"
+
+    def fail_audit(action, **_kwargs):
+        raise RuntimeError(canary)
+
+    provider._audit_event = fail_audit
+    result = json.loads(provider.handle_tool_call("mnemosyne_batch", {
+        "operations": [
+            {"action": "remember", "content": "audit failure stays committed"},
+        ],
+    }))
+
+    assert result["status"] == "ok"
+    memory_id = result["results"][0]["memory_id"]
+    assert provider._beam is not None
+    assert provider._beam.get(memory_id)["content"] == "audit failure stays committed"
+    assert "mnemosyne_batch audit publication failed" in caplog.text
+    assert canary not in caplog.text
+
+
+def test_mcp_wrapper_replay_failure_after_commit_preserves_success(
+    tmp_path, monkeypatch, caplog
+):
+    from mnemosyne import mcp_tools
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    canary = "/private/replay/path\ncanary"
+
+    def fail_replay(self):
+        raise RuntimeError(canary)
+
+    monkeypatch.setattr(mcp_tools._WrapperBatchAdapter, "replay_wrapper_events", fail_replay)
+    result = mcp_tools.handle_tool_call("mnemosyne_batch", {
+        "operations": [
+            {"action": "remember", "content": "replay failure stays committed"},
+        ],
+    })
+
+    assert result is not None
+    assert result["status"] == "ok"
+    memory_id = result["results"][0]["memory_id"]
+    memory = mcp_tools._create_instance(bank="default")
+    assert memory.beam.get(memory_id)["content"] == "replay failure stays committed"
+    assert "mnemosyne_batch wrapper replay failed" in caplog.text
+    assert canary not in caplog.text
+
+
 def test_batch_dry_run_writes_nothing(tmp_path):
     provider = _provider(tmp_path)
     existing_id = provider._beam.remember("dry existing", importance=0.3)

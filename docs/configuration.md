@@ -8,6 +8,7 @@ Mnemosyne is designed to work with zero configuration. All settings have sensibl
 |---|---|---|
 | `MNEMOSYNE_EMBEDDING_API_URL` | `${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}` | Preferred name for custom embedding API endpoint. Falls back to `OPENROUTER_BASE_URL`. |
 | `MNEMOSYNE_EMBEDDING_API_KEY` | `${OPENROUTER_API_KEY:-${OPENAI_API_KEY:-}}` | Preferred name for embedding API key. Falls back to `OPENROUTER_API_KEY`, then `OPENAI_API_KEY`. |
+| `MNEMOSYNE_JOURNAL_MODE` | `wal` | SQLite journal mode for store connections (the sync client reuses the beam connection, so it inherits the mode too). Valid: `delete`, `truncate`, `persist`, `memory`, `wal`, `off`; the value is trimmed and lower-cased, unset or blank falls back to `wal`, and non-blank invalid values warn and fall back to `wal`. Only `wal` persists in the database file; other modes are per-connection and revert to SQLite's default (`delete`) on reopen, so each connection re-applies the mode. `memory` and `off` remove disk-backed rollback protection and can corrupt the database after a crash. See README for the virtiofs motivation. |
 
 ## Data Directory
 

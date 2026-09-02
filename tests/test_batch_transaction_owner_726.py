@@ -144,9 +144,13 @@ def test_forget_cascade_failure_after_guard_preserves_caller_transaction(
     )
 
     assert entered_guard == [True]  # Failure is downstream of forget_working's guard.
-    assert result["status"] == "error"
-    assert result["failed_index"] == 1
-    assert "forced cascade failure" in result["error"]
+    assert result == {
+        "status": "error",
+        "error": "batch_failed",
+        "failed_index": 1,
+        "action": "forget",
+    }
+    assert "forced cascade failure" not in str(result)
     assert events == []
     assert beam.conn.in_transaction is True
     assert beam.conn.execute("SELECT value FROM caller_marker").fetchone()[0] == (

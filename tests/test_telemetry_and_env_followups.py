@@ -20,12 +20,10 @@ Three small fidelity fixes surfaced by the /review army on PRs #89 and
 from __future__ import annotations
 
 import logging
-import os
 import sys
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import List
 from unittest.mock import MagicMock
 
 import pytest
@@ -133,20 +131,15 @@ class TestC30ExtendedToEntityFactPaths:
         from pathlib import Path
         import mnemosyne.core.beam as beam_module
         src = Path(beam_module.__file__).read_text()
-        # Count remaining wrong-pattern sites that target ep rows.
-        # The two valid `wm_vec_sims.get` lines (`tier: "working"` at
-        # ~2238 and ~2359) should remain; the two ep-tier sites we
-        # fixed should be gone.
+        # Count the remaining working fact-append use. The production diff
+        # removed the former entity-only append path, so there is no episodic
+        # occurrence to guard here.
         wrong_pattern_count = src.count(
             'dense_score": round(wm_vec_sims.get(row["id"], 0.0), 4)'
         )
-        # Only the two `tier: "working"` sites should match the old pattern.
-        # If a future change adds a new `tier: "episodic"` site with the
-        # wrong pattern, this count rises and the test fails.
-        assert wrong_pattern_count == 2, (
-            f"Expected exactly 2 `wm_vec_sims.get(row[id], 0.0)` sites "
-            f"(both `tier: working`); found {wrong_pattern_count}. A new "
-            f"episodic site may have reintroduced the C30 bug pattern."
+        assert wrong_pattern_count == 1, (
+            f"Expected exactly 1 `wm_vec_sims.get(row[id], 0.0)` site "
+            f"(the working fact-append path); found {wrong_pattern_count}."
         )
 
 

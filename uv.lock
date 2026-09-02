@@ -1106,8 +1106,8 @@ requires-dist = [
     { name = "pytest-timeout", marker = "extra == 'test'", specifier = ">=2.1" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.22" },
-    { name = "sqlite-vec", marker = "extra == 'all'", specifier = ">=0.1.0" },
-    { name = "sqlite-vec", marker = "extra == 'embeddings'", specifier = ">=0.1.0" },
+    { name = "sqlite-vec", marker = "extra == 'all'", specifier = ">=0.1.9,<0.1.10" },
+    { name = "sqlite-vec", marker = "extra == 'embeddings'", specifier = ">=0.1.9,<0.1.10" },
     { name = "twine", marker = "extra == 'dev'" },
 ]
 provides-extras = ["llm", "embeddings", "mcp", "openclaw", "sync", "test", "all", "dev"]
