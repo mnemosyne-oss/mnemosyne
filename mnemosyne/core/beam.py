@@ -1955,17 +1955,36 @@ _RECALL_SYNONYMS: Dict[str, tuple[str, ...]] = {
 
 
 def _is_meaningful_recall_token(token: str) -> bool:
-    """Return whether a token is eligible for lexical recall matching."""
-    return len(token) >= 3 and token not in _FACT_MATCH_STOPWORDS and not token.isdigit()
+    """Return whether a token is eligible for lexical recall matching.
+
+    Non-Hangul tokens need >= 3 characters: a shorter English token is almost
+    always a function word. Hangul is the opposite — a two-syllable 어절 is a
+    complete, high-information noun (백업, 캐시, 포트), so the English rule
+    discards exactly the terms a Korean user searches by.
+    """
+    minimum = 2 if _has_hangul(token) else 3
+    return (
+        len(token) >= minimum
+        and token not in _FACT_MATCH_STOPWORDS
+        and not token.isdigit()
+    )
 
 
 def _recall_tokens(text: str) -> List[str]:
-    """Meaningful lexical tokens for precision gates and fallback scoring."""
-    return [
-        token
-        for token in _RECALL_TOKEN_RE.findall(text.lower())
-        if _is_meaningful_recall_token(token)
-    ]
+    """Meaningful lexical tokens for precision gates and fallback scoring.
+
+    Hangul tokens are particle-stripped here, not at the call sites, so that
+    candidate generation and final admission share one normalization contract.
+    unicode61 indexes Hangul at whitespace granularity, so a particle stays
+    glued to its stem; normalizing only the query side lets ``_fts_search()``
+    return a row that ``recall()`` then scores at zero.
+    """
+    tokens: List[str] = []
+    for token in _RECALL_TOKEN_RE.findall(text.lower()):
+        if not _is_meaningful_recall_token(token):
+            continue
+        tokens.append(_strip_ko_josa(token) if _has_hangul(token) else token)
+    return tokens
 
 
 def _hyphen_components(token: str) -> List[str]:
@@ -2301,7 +2320,6 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
         if token in content_tokens:
             exact += _component_unit_weight(components)
             continue
-
         component_hits = sum(part in content_tokens for part in components)
         if len(components) >= 2 and component_hits >= 2:
             # A differently-hyphenated fact must share at least two meaningful
@@ -3029,42 +3047,34 @@ def _has_hangul(text: str) -> bool:
     return any("가" <= ch <= "힣" for ch in text)
 
 
+_KO_JOSA_LONGEST_FIRST = tuple(sorted(_KO_JOSA, key=len, reverse=True))
+
+
 def _strip_ko_josa(token: str) -> str:
-    """Strip a trailing Korean particle (조사) from a whitespace token.
+    """Strip trailing Korean particles (조사) from a whitespace token.
 
-    This is suffix trimming, not morphological analysis. It leaves at least
-    two syllables behind so that short words are never emptied out, and
-    returns the token unchanged when no particle is found.
+    Suffix trimming, not morphological analysis. Trimming repeats to a fixed
+    point so the function is idempotent, which the recall path requires: a
+    query token and the same word inflected inside a document must normalize
+    to the same string or they can never match. A single pass does not
+    guarantee that — ``바나나`` trims to ``바나`` because the final ``나`` is
+    itself a particle, while ``바나나를`` trims only to ``바나나``.
 
-        갱신은 -> 갱신      회사에서 -> 회사      백업 -> 백업
+    At least two syllables are always left behind, and a token carrying no
+    particle is returned unchanged.
 
-    Single-syllable particles are also verb endings, so "갱신하나" trims to
-    "갱신하". The result is used as a prefix term, so the over-trimmed stem
-    still matches the intended documents.
+        갱신은 -> 갱신    회사에서 -> 회사    바나나를 -> 바나    백업 -> 백업
+
+    Single-syllable particles are also verb endings, so ``갱신하나`` trims to
+    ``갱신하``.
     """
-    for josa in sorted(_KO_JOSA, key=len, reverse=True):
-        if len(token) > len(josa) + 1 and token.endswith(josa):
-            return token[: -len(josa)]
-    return token
-
-
-def _ko_relaxed_recall_tokens(text: str) -> List[str]:
-    """Like `_recall_tokens`, but admits two-syllable Hangul tokens.
-
-    Non-Hangul tokens keep the existing >= 3 character rule, so behaviour for
-    every other language is unchanged. Query-side only: the lexical
-    abstention gates still call `_recall_tokens`, so widening FTS candidate
-    generation here cannot lower precision elsewhere.
-    """
-    tokens: List[str] = []
-    for token in _RECALL_TOKEN_RE.findall(text.lower()):
-        if token in _FACT_MATCH_STOPWORDS or token.isdigit():
-            continue
-        minimum = 2 if _has_hangul(token) else 3
-        if len(token) < minimum:
-            continue
-        tokens.append(token)
-    return tokens
+    while True:
+        for josa in _KO_JOSA_LONGEST_FIRST:
+            if len(token) > len(josa) + 1 and token.endswith(josa):
+                token = token[: -len(josa)]
+                break
+        else:
+            return token
 
 
 def _fts_query_terms(query: str) -> List[str]:
@@ -3089,7 +3099,7 @@ def _fts_query_terms(query: str) -> List[str]:
     terms: List[str] = []
     seen: Set[str] = set()
     symbolic = set(_symbolic_code_tokens(query))
-    for term in _expanded_query_tokens(_ko_relaxed_recall_tokens(query)):
+    for term in _expanded_query_tokens(_recall_tokens(query)):
         if term.startswith("-"):
             # FTS5-only terms never reach MATCH verbatim. The fragment's
             # components are added below via _hyphen_fragment_tokens().
