@@ -2995,8 +2995,85 @@ def _vec_search(conn: sqlite3.Connection, embedding: List[float], k: int = 20) -
     return [{"rowid": r["rowid"], "distance": r["distance"]} for r in rows]
 
 
+# --- Korean (Hangul) query handling ----------------------------------------
+#
+# Two query-side filters independently drop Korean terms before they reach
+# FTS5, and fixing either one alone leaves the other hole open.
+#
+# 1. `_is_meaningful_recall_token` requires len(token) >= 3. A two-syllable
+#    Korean 어절 is a whole word -- "여권" (passport), "백업" (backup),
+#    "캐시" (cache), "포트" (port) -- so the most informative query terms are
+#    discarded before matching.
+#
+# 2. FTS5's unicode61 tokenizer indexes Hangul at whitespace-token
+#    granularity, not per syllable. Particles (조사) stay glued to the stem,
+#    so "여권은 언제 갱신하나" is indexed as "여권은" / "언제" / "갱신하나".
+#    Quoting a query term as an exact phrase can never match a
+#    differently-inflected stored form.
+#
+# Both fixes are query-side only. The stored index is untouched, so no
+# migration is required, and non-Hangul queries take a byte-identical path to
+# before. See tests/test_korean_fts.py for the ablation that motivates
+# shipping them together.
+
+_KO_JOSA = (
+    "으로부터", "에게서", "에서부터", "이라고", "라고", "에서", "에게", "한테",
+    "부터", "까지", "으로", "이나", "라도", "처럼", "보다", "마다", "조차",
+    "이란", "이든", "은", "는", "이", "가", "을", "를", "에", "의", "도",
+    "로", "만", "랑", "야", "여", "나", "와", "과",
+)
+
+
+def _has_hangul(text: str) -> bool:
+    """True if text contains at least one precomposed Hangul syllable."""
+    return any("가" <= ch <= "힣" for ch in text)
+
+
+def _strip_ko_josa(token: str) -> str:
+    """Strip a trailing Korean particle (조사) from a whitespace token.
+
+    This is suffix trimming, not morphological analysis. It leaves at least
+    two syllables behind so that short words are never emptied out, and
+    returns the token unchanged when no particle is found.
+
+        갱신은 -> 갱신      회사에서 -> 회사      백업 -> 백업
+
+    Single-syllable particles are also verb endings, so "갱신하나" trims to
+    "갱신하". The result is used as a prefix term, so the over-trimmed stem
+    still matches the intended documents.
+    """
+    for josa in sorted(_KO_JOSA, key=len, reverse=True):
+        if len(token) > len(josa) + 1 and token.endswith(josa):
+            return token[: -len(josa)]
+    return token
+
+
+def _ko_relaxed_recall_tokens(text: str) -> List[str]:
+    """Like `_recall_tokens`, but admits two-syllable Hangul tokens.
+
+    Non-Hangul tokens keep the existing >= 3 character rule, so behaviour for
+    every other language is unchanged. Query-side only: the lexical
+    abstention gates still call `_recall_tokens`, so widening FTS candidate
+    generation here cannot lower precision elsewhere.
+    """
+    tokens: List[str] = []
+    for token in _RECALL_TOKEN_RE.findall(text.lower()):
+        if token in _FACT_MATCH_STOPWORDS or token.isdigit():
+            continue
+        minimum = 2 if _has_hangul(token) else 3
+        if len(token) < minimum:
+            continue
+        tokens.append(token)
+    return tokens
+
+
 def _fts_query_terms(query: str) -> List[str]:
     """FTS-safe meaningful terms for natural-language recall queries.
+
+    Hangul terms are emitted as ``stem*`` prefix terms rather than quoted
+    phrases, because unicode61 keeps the particle glued to the stem and an
+    exact phrase can therefore never match a differently-inflected stored
+    form. Every other language keeps the quoted-phrase behaviour below.
 
     Terms are quoted so FTS5 treats them as literal phrases. A term must
     never start with ``-``: FTS5 parses a leading hyphen as the NOT /
@@ -3012,7 +3089,7 @@ def _fts_query_terms(query: str) -> List[str]:
     terms: List[str] = []
     seen: Set[str] = set()
     symbolic = set(_symbolic_code_tokens(query))
-    for term in _expanded_query_tokens(_recall_tokens(query)):
+    for term in _expanded_query_tokens(_ko_relaxed_recall_tokens(query)):
         if term.startswith("-"):
             # FTS5-only terms never reach MATCH verbatim. The fragment's
             # components are added below via _hyphen_fragment_tokens().
@@ -3022,7 +3099,16 @@ def _fts_query_terms(query: str) -> List[str]:
             # only; never emit an FTS5 term for them.
             continue
         term = term.replace('"', '""').strip()
-        if term and term not in seen:
+        if not term:
+            continue
+        if _has_hangul(term):
+            stem = _strip_ko_josa(term)
+            if len(stem) >= 2:
+                if stem not in seen:
+                    seen.add(stem)
+                    terms.append(f"{stem}*")
+                continue
+        if term not in seen:
             seen.add(term)
             terms.append(f'"{term}"')
     for component in _hyphen_fragment_tokens(query):
