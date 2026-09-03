@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import os
 import json
+import subprocess
+import sys
 import urllib.error
 
 import pytest
@@ -37,6 +39,31 @@ def _clean_embedding_env(monkeypatch):
 def test_is_disabled_default_false():
     """No env var set -> embeddings enabled."""
     assert embeddings._is_disabled() is False
+
+
+def test_fastembed_mean_pooling_warning_is_suppressed_for_multilingual_minilm():
+    """FastEmbed's expected pooling migration warning must not pollute startup."""
+    env = os.environ.copy()
+    env.pop("PYTHONWARNINGS", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import warnings\n"
+                "from mnemosyne.core import embeddings\n"
+                "warnings.warn("
+                "'The model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 "
+                "now uses mean pooling instead of CLS embedding.', UserWarning)"
+            ),
+        ],
+        capture_output=True,
+        check=True,
+        env=env,
+        text=True,
+    )
+
+    assert result.stderr == ""
 
 
 def test_is_disabled_no_embeddings_flag(monkeypatch):
