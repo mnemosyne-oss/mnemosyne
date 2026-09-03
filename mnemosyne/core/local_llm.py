@@ -80,6 +80,51 @@ LLM_FALLBACK_MODELS = [
 LLM_FALLBACK_BASE_URL = os.environ.get("MNEMOSYNE_LLM_FALLBACK_BASE_URL", "").rstrip("/") or LLM_BASE_URL
 LLM_FALLBACK_API_KEY = os.environ.get("MNEMOSYNE_LLM_FALLBACK_API_KEY", "") or LLM_API_KEY
 
+
+# Payload keys the extra body may not set. The merge happens last, so without
+# this a typo'd key would silently send different messages or a different model
+# than every log line and config value says, and the bug report would be
+# unreadable. Provider-specific keys, which is what the escape hatch is for,
+# are unaffected.
+_EXTRA_BODY_RESERVED = ("messages", "model", "stream")
+
+
+def _parse_extra_body(var: str) -> dict:
+    """Read a JSON object from ``var`` for merging into the request payload.
+
+    Carries keys the OpenAI-compatible shape has no name for (a thinking-mode
+    toggle, provider routing), one object per endpoint. Unset, blank, invalid
+    JSON or a non-object value all mean nothing is merged; a reserved key
+    (``messages``, ``model``, ``stream``) is dropped and the rest of the object
+    is kept. The rejected cases say so on stderr, since this runs at import
+    before logging is configured.
+    """
+    raw = os.environ.get(var, "").strip()
+    if not raw:
+        return {}
+    import json
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        print(f"[mnemosyne] {var} is not valid JSON, ignored: {exc}", file=sys.stderr)
+        return {}
+    if not isinstance(data, dict):
+        print(f"[mnemosyne] {var} must be a JSON object, ignored", file=sys.stderr)
+        return {}
+    reserved = [k for k in _EXTRA_BODY_RESERVED if k in data]
+    if reserved:
+        print(
+            f"[mnemosyne] {var} may not set {', '.join(reserved)}, "
+            "dropped from the request body",
+            file=sys.stderr,
+        )
+        data = {k: v for k, v in data.items() if k not in _EXTRA_BODY_RESERVED}
+    return data
+
+
+LLM_EXTRA_BODY = _parse_extra_body("MNEMOSYNE_LLM_EXTRA_BODY")
+LLM_FALLBACK_EXTRA_BODY = _parse_extra_body("MNEMOSYNE_LLM_FALLBACK_EXTRA_BODY")
+
 # Host LLM adapter (Hermes or another agent). Disabled by default to preserve
 # existing standalone behavior. When MNEMOSYNE_HOST_LLM_ENABLED=true and a
 # backend is registered via mnemosyne.core.llm_backends.set_host_llm_backend(),
@@ -581,6 +626,57 @@ def _is_retryable_status(status_code: int) -> bool:
     return False
 
 
+_DIAG_ESCAPES = {"\r": "\\r", "\n": "\\n", "\t": "\\t"}
+_DIAG_MAX_LEN = 60
+
+
+def _diag(value) -> str:
+    """Render one field from a remote body for a log line.
+
+    The value is whatever the endpoint sent, so it is neither trusted nor
+    bounded. Control characters are escaped, because this ends up in a
+    WARNING and a reply that could inject line breaks could forge log lines,
+    and the text is truncated, because a long field must not bury the rest
+    of the diagnostic.
+    """
+    out = []
+    for ch in str(value).replace("\\", "\\\\"):
+        if ch in _DIAG_ESCAPES:
+            out.append(_DIAG_ESCAPES[ch])
+        elif ch.isprintable():
+            out.append(ch)
+        else:
+            out.append(f"\\x{ord(ch):02x}")
+    text = "".join(out)
+    if len(text) > _DIAG_MAX_LEN:
+        text = text[:_DIAG_MAX_LEN] + "..."
+    return text
+
+
+class EmptyAnswer(Exception):
+    """A 2xx reply whose answer text is empty.
+
+    Carries what the body said about why. A thinking model that spends the
+    whole ``max_tokens`` budget on reasoning comes back ``finish_reason=length``
+    with ``reasoning_content`` set and ``content`` empty.
+
+    The attributes keep the raw values for callers; only the message text is
+    escaped and bounded, since that is what reaches a log line.
+    """
+
+    def __init__(self, finish_reason=None, reasoning_tokens=None, has_reasoning=False):
+        self.finish_reason = finish_reason
+        self.reasoning_tokens = reasoning_tokens
+        self.has_reasoning = has_reasoning
+        shown = _diag(finish_reason) if finish_reason else "n/a"
+        parts = [f"finish_reason={shown}"]
+        if reasoning_tokens is not None:
+            parts.append(f"reasoning_tokens={_diag(reasoning_tokens)}")
+        parts.append("reasoning_content present, content empty" if has_reasoning
+                     else "content empty")
+        super().__init__(", ".join(parts))
+
+
 def _call_remote_llm_with_model(
     prompt: str,
     model: str,
@@ -589,6 +685,7 @@ def _call_remote_llm_with_model(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     timeout: float = LLM_TIMEOUT,
+    extra_body: Optional[dict] = None,
 ) -> "tuple[Optional[str], Optional[int], Optional[Exception]]":
     """Call an OpenAI-compatible endpoint with a specific model name.
 
@@ -599,6 +696,10 @@ def _call_remote_llm_with_model(
       status code when available, else None. ``exc`` is the underlying exception
       (HTTPStatusError, ConnectError, TimeoutException, etc.) or None.
     - ``(None, None, exc)`` for non-HTTP failures (JSON decode, malformed body).
+    - ``(None, status, EmptyAnswer)`` for a 2xx whose answer text is empty.
+
+    ``extra_body`` is merged into the payload last, so a provider-specific
+    key such as a thinking toggle rides the same request.
 
     Callers (see ``_call_remote_llm``) use ``status`` to decide whether to
     retry against ``LLM_FALLBACK_MODELS``.
@@ -629,6 +730,8 @@ def _call_remote_llm_with_model(
         "stop": ["</s>", "<|user|>"],
         "stream": False
     }
+    if extra_body:
+        payload.update(extra_body)
 
     try:
         if has_httpx:
@@ -665,9 +768,29 @@ def _call_remote_llm_with_model(
         choices = data.get("choices", []) if isinstance(data, dict) else []
         if choices and choices[0].get("message", {}).get("content"):
             return (choices[0]["message"]["content"], status, None)
-        return (None, status, None)
+        first = choices[0] if choices and isinstance(choices[0], dict) else {}
+        message = first.get("message")
+        usage = data.get("usage") if isinstance(data, dict) else None
+        details = usage.get("completion_tokens_details") if isinstance(usage, dict) else None
+        return (None, status, EmptyAnswer(
+            finish_reason=first.get("finish_reason"),
+            reasoning_tokens=details.get("reasoning_tokens") if isinstance(details, dict) else None,
+            has_reasoning=bool(isinstance(message, dict) and message.get("reasoning_content")),
+        ))
     except Exception as exc:
         return (None, None, exc)
+
+
+# Most recent remote-call failure, for the caller's fallback WARNING.
+# _call_remote_llm_with_model returns the status and exception, but
+# _call_remote_llm returns only text or None, so without this the caller
+# could report that summarization failed, never why.
+_last_llm_failure: Optional[str] = None
+
+
+def last_llm_failure() -> Optional[str]:
+    """Return the most recent remote-call failure as "model: reason", or None."""
+    return _last_llm_failure
 
 
 def _call_remote_llm(prompt: str, temperature: float = 0.3) -> Optional[str]:
@@ -682,21 +805,35 @@ def _call_remote_llm(prompt: str, temperature: float = 0.3) -> Optional[str]:
     order. Returns the first successful response, or ``None`` if every
     model fails (caller falls through to local GGUF / None).
     """
+    global _last_llm_failure
     if not LLM_BASE_URL:
+        _last_llm_failure = "remote LLM not configured (MNEMOSYNE_LLM_BASE_URL unset)"
         return None
 
     primary = LLM_REMOTE_MODEL or "local"
-    candidates: List[tuple[str, str, str]] = [(primary, LLM_BASE_URL, LLM_API_KEY)]
+    candidates: List[tuple[str, str, str, dict]] = [
+        (primary, LLM_BASE_URL, LLM_API_KEY, LLM_EXTRA_BODY)]
     for fb in LLM_FALLBACK_MODELS:
         if fb and fb != primary:
-            candidates.append((fb, LLM_FALLBACK_BASE_URL or LLM_BASE_URL, LLM_FALLBACK_API_KEY or LLM_API_KEY))
+            candidates.append((fb, LLM_FALLBACK_BASE_URL or LLM_BASE_URL,
+                               LLM_FALLBACK_API_KEY or LLM_API_KEY, LLM_FALLBACK_EXTRA_BODY))
 
-    for model, base_url, api_key in candidates:
+    for model, base_url, api_key, extra_body in candidates:
         text, status, exc = _call_remote_llm_with_model(
-            prompt, model, temperature, base_url=base_url, api_key=api_key
+            prompt, model, temperature, base_url=base_url, api_key=api_key,
+            extra_body=extra_body,
         )
         if text:
             return text
+        if isinstance(exc, EmptyAnswer):
+            _last_llm_failure = f"{model}: HTTP {status} with no usable choices ({exc})"
+        elif exc is not None:
+            _last_llm_failure = (
+                f"{model}: {type(exc).__name__}: {str(exc) or repr(exc)} "
+                f"(timeout={LLM_TIMEOUT:g}s)"
+            )
+        else:
+            _last_llm_failure = f"{model}: HTTP {status} with no usable choices"
         if status is None:
             continue
         if not _is_retryable_status(status):
@@ -723,6 +860,9 @@ def _summarize_memories(
     3. ctransformers (x86_64 only, legacy).
     4. Return None → caller falls back to AAAK encoding.
     """
+    # A failure left by an earlier call must not be reported for this one.
+    global _last_llm_failure
+    _last_llm_failure = None
     if not memories:
         return None
 

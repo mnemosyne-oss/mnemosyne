@@ -9447,8 +9447,9 @@ class BeamMemory:
             if summary is None:
                 logger.warning(
                     "sleep: LLM summarization failed for source=%r (items=%d, "
-                    "llm_available=%s) — falling back to AAAK compression",
+                    "llm_available=%s, last_error=%s) — falling back to AAAK compression",
                     source, len(items), local_llm.llm_available(),
+                    local_llm.last_llm_failure(),
                 )
                 combined = " | ".join(lines)
                 compressed = aaak_encode(combined)
