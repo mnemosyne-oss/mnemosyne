@@ -7,7 +7,6 @@ update, forget, import, diagnose) plus the 7 already-existing tools.
 """
 
 import json
-import pytest
 from pathlib import Path
 
 from mnemosyne.core.beam import BeamMemory
@@ -176,6 +175,32 @@ class TestUpdate:
                                                   {"memory_id": mid,
                                                    "content": "new"}))
         assert r["status"] == "updated"
+
+    def test_dispatch_update_allows_global_memory_from_another_session(self, tmp_path):
+        db_path = Path(tmp_path) / "test.db"
+        writer = BeamMemory(session_id="session-a", db_path=db_path)
+        memory_id = writer.remember("global before", scope="global")
+        provider = _build_provider(BeamMemory(session_id="session-b", db_path=db_path))
+
+        response = json.loads(provider.handle_tool_call(
+            "mnemosyne_update", {"memory_id": memory_id, "content": "global after"}
+        ))
+
+        assert response["status"] == "updated"
+        assert writer.get(memory_id)["content"] == "global after"
+
+    def test_dispatch_update_rejects_private_memory_from_another_session(self, tmp_path):
+        db_path = Path(tmp_path) / "test.db"
+        writer = BeamMemory(session_id="session-a", db_path=db_path)
+        memory_id = writer.remember("private before", scope="session")
+        provider = _build_provider(BeamMemory(session_id="session-b", db_path=db_path))
+
+        response = json.loads(provider.handle_tool_call(
+            "mnemosyne_update", {"memory_id": memory_id, "content": "private after"}
+        ))
+
+        assert response["status"] == "not_found"
+        assert writer.get(memory_id)["content"] == "private before"
 
 
 # ---------------------------------------------------------------------------

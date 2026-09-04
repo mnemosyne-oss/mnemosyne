@@ -5035,9 +5035,13 @@ class BeamMemory:
             params.append(importance)
         if not updates:
             return False
+        # Match the visibility contract used by get(), forget_working(), and
+        # invalidate(): global memories are addressable across sessions, while
+        # session-scoped memories remain private to their creating session.
         params.extend([memory_id, self.session_id])
         cursor.execute(
-            f"UPDATE working_memory SET {', '.join(updates)} WHERE id = ? AND session_id = ?",
+            f"UPDATE working_memory SET {', '.join(updates)} "
+            "WHERE id = ? AND (session_id = ? OR scope = 'global')",
             params
         )
         affected = cursor.rowcount

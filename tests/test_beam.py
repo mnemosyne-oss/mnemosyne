@@ -38,6 +38,7 @@ def _same_utc_day_future(
         return None
     return candidate
 from mnemosyne.core.memory import Mnemosyne
+from mnemosyne.core.streaming import EventType
 
 
 @pytest.fixture
@@ -87,6 +88,150 @@ def test_get_working_memory_respects_global_cross_session_visibility(temp_db):
     assert cross_session_global["id"] == global_id
     assert cross_session_global["memory_store"] == "working"
     assert reader.get(private_id) is None
+
+
+def test_update_working_respects_global_cross_session_visibility(temp_db):
+    writer = BeamMemory(session_id="session-a", db_path=temp_db)
+    global_id = writer.remember("global before", source="test", scope="global")
+    private_id = writer.remember("private before", source="test", scope="session")
+
+    updater = BeamMemory(session_id="session-b", db_path=temp_db)
+    assert updater.update_working(global_id, content="global after") is True
+    assert updater.get(global_id)["content"] == "global after"
+
+    assert updater.update_working(private_id, content="private after") is False
+    assert writer.get(private_id)["content"] == "private before"
+
+
+def test_mnemosyne_update_reports_success_for_beam_only_global_memory(temp_db):
+    writer = BeamMemory(session_id="session-a", db_path=temp_db)
+    memory_id = writer.remember("beam only before", source="test", scope="global")
+
+    updater = Mnemosyne(session_id="session-b", db_path=temp_db)
+    assert updater.update(memory_id, content="beam only after") is True
+    assert updater.get(memory_id)["content"] == "beam only after"
+
+
+def test_mnemosyne_update_keeps_dual_written_global_memory_in_sync(temp_db):
+    writer = Mnemosyne(session_id="session-a", db_path=temp_db)
+    memory_id = writer.remember("dual before", source="test", scope="global")
+
+    updater = Mnemosyne(session_id="session-b", db_path=temp_db)
+    assert updater.update(memory_id, content="dual after", importance=0.9) is True
+    updated = updater.get(memory_id)
+    assert updated["content"] == "dual after"
+    assert updated["importance"] == 0.9
+    legacy_content, legacy_importance = updater.conn.execute(
+        "SELECT content, importance FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()
+    assert legacy_content == "dual after"
+    assert legacy_importance == 0.9
+
+
+def test_mnemosyne_update_rejects_dual_written_private_memory_cross_session(temp_db):
+    writer = Mnemosyne(session_id="session-a", db_path=temp_db)
+    memory_id = writer.remember("private before", source="test", scope="session")
+
+    updater = Mnemosyne(session_id="session-b", db_path=temp_db)
+    assert updater.update(memory_id, content="private after") is False
+    assert writer.get(memory_id)["content"] == "private before"
+    legacy_content = updater.conn.execute(
+        "SELECT content FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()[0]
+    assert legacy_content == "private before"
+
+
+def test_mnemosyne_update_unknown_memory_emits_no_event(temp_db):
+    memory = Mnemosyne(session_id="session-a", db_path=temp_db).enable_streaming()
+
+    assert memory.update("unknown-memory", content="after") is False
+    assert memory.stream.get_buffer(event_types=[EventType.MEMORY_UPDATED]) == []
+
+
+def test_mnemosyne_update_foreign_private_memory_emits_no_event(temp_db):
+    writer = Mnemosyne(session_id="session-a", db_path=temp_db)
+    memory_id = writer.remember("private before", source="test", scope="session")
+    updater = Mnemosyne(session_id="session-b", db_path=temp_db).enable_streaming()
+
+    assert updater.update(memory_id, content="private after") is False
+    assert writer.get(memory_id)["content"] == "private before"
+    assert updater.stream.get_buffer(event_types=[EventType.MEMORY_UPDATED]) == []
+
+
+def test_mnemosyne_update_rolls_back_and_emits_no_event_when_beam_write_fails(
+    temp_db, monkeypatch
+):
+    writer = Mnemosyne(session_id="session-a", db_path=temp_db)
+    memory_id = writer.remember("before", source="test", scope="global")
+    updater = Mnemosyne(session_id="session-b", db_path=temp_db).enable_streaming()
+
+    def fail_second_dual_write(*args, **kwargs):
+        raise RuntimeError("forced BEAM update failure")
+
+    monkeypatch.setattr(updater.beam, "update_working", fail_second_dual_write)
+
+    with pytest.raises(RuntimeError, match="forced BEAM update failure"):
+        updater.update(memory_id, content="after", importance=0.9)
+
+    legacy_content, legacy_importance = writer.conn.execute(
+        "SELECT content, importance FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()
+    assert (legacy_content, legacy_importance) == ("before", 0.5)
+    unchanged = writer.get(memory_id)
+    assert (unchanged["content"], unchanged["importance"]) == ("before", 0.5)
+    assert updater.stream.get_buffer(event_types=[EventType.MEMORY_UPDATED]) == []
+
+
+def test_mnemosyne_update_emits_once_after_dual_write_commit(temp_db):
+    writer = Mnemosyne(session_id="session-a", db_path=temp_db)
+    memory_id = writer.remember("before", source="test", scope="global")
+    updater = Mnemosyne(session_id="session-b", db_path=temp_db).enable_streaming()
+    observed = []
+
+    def observe(event):
+        legacy = updater.conn.execute(
+            "SELECT content, importance FROM memories WHERE id = ?", (memory_id,)
+        ).fetchone()
+        working = updater.conn.execute(
+            "SELECT content, importance FROM working_memory WHERE id = ?", (memory_id,)
+        ).fetchone()
+        observed.append((event, legacy, working, updater.conn.in_transaction))
+
+    updater.stream.on(EventType.MEMORY_UPDATED, observe)
+
+    assert updater.update(memory_id, content="after", importance=0.9) is True
+    events = updater.stream.get_buffer(event_types=[EventType.MEMORY_UPDATED])
+    assert len(events) == 1
+    assert events[0].memory_id == memory_id
+    assert len(observed) == 1
+    _, legacy, working, in_transaction = observed[0]
+    assert tuple(legacy) == ("after", 0.9)
+    assert tuple(working) == ("after", 0.9)
+    assert in_transaction is False
+
+
+def test_mnemosyne_update_preserves_legacy_only_session_compatibility(temp_db):
+    writer = Mnemosyne(session_id="session-a", db_path=temp_db)
+    memory_id = "legacy-only-memory"
+    writer.conn.execute(
+        """
+        INSERT INTO memories (id, content, source, timestamp, session_id, importance)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (memory_id, "legacy before", "test", "2026-01-01T00:00:00", "session-a", 0.5),
+    )
+    writer.conn.commit()
+
+    assert writer.update(memory_id, content="legacy after") is True
+    assert writer.conn.execute(
+        "SELECT content FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()[0] == "legacy after"
+
+    other_session = Mnemosyne(session_id="session-b", db_path=temp_db)
+    assert other_session.update(memory_id, content="should not update") is False
+    assert writer.conn.execute(
+        "SELECT content FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()[0] == "legacy after"
 
 
 class _FakeAnnotations:
