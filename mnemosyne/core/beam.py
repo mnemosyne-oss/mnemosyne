@@ -2342,7 +2342,7 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
     if not content_tokens and not query_cjk:
         return 0.0
 
-    exact = 0
+    exact = 0.0
     partial = 0.0
     for token, components in zip(query_tokens, component_groups, strict=True):
         if token in content_tokens:
@@ -2357,7 +2357,18 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
             # matches those via the `"stem"*` prefix term; admission has to use
             # the same rule, or `_fts_search()` returns the row as its top
             # candidate and `recall()` then scores it below the gate.
-            exact += _component_unit_weight(components)
+            #
+            # A prefix hit must NOT earn the same credit as a normalized exact
+            # hit. `_strip_ko_josa()` is fixed-point, so the uninflected query
+            # `바나나` normalizes to `바나`: the intended row (`바나나` ->
+            # `바나`) lands on the exact branch above, while `바나나우유` and
+            # `바나나맛` only prefix-match here. Paying both in full tied the
+            # distractors with the target at relevance 1.0 and ranked them
+            # ahead of it (upstream review of #896). Discounting this branch
+            # restores the ordering without dropping the row: the discounted
+            # score still clears every `_minimum_recall_relevance()` floor
+            # (0.15 / 0.3 / 0.5), so `보관` still admits `보관한다`.
+            exact += _component_unit_weight(components) * _HANGUL_PREFIX_MATCH_WEIGHT
             continue
 
         component_hits = sum(part in content_tokens for part in components)
@@ -2384,7 +2395,24 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
         ):
             partial += 0.4
 
-    full_match = 1.0 if query_lower and query_lower in content_lower else 0.0
+    if _has_hangul(query_lower):
+        # A raw substring test has no token boundary, so `바나나` "fully
+        # matches" `바나나우유` and the bonus alone saturates `score` at the
+        # 1.0 cap -- hiding the prefix discount above and tying the compound
+        # with the word the query named (upstream review of #896).
+        #
+        # For Hangul this term is either redundant or wrong. `_strip_ko_josa()`
+        # is fixed-point, so when the query string really does appear as a word
+        # the content token normalizes to the same stem, the exact branch
+        # already fires, and `exact / lexical_unit_count` is 1.0 on its own.
+        # The only case the substring test adds is a match landing mid-token.
+        # Requiring the normalized tokens instead keeps the bonus where it was
+        # earned and drops it where it was an artifact.
+        full_match = (
+            1.0 if query_tokens and set(query_tokens) <= content_tokens else 0.0
+        )
+    else:
+        full_match = 1.0 if query_lower and query_lower in content_lower else 0.0
     score = (exact + partial + full_match) / max(lexical_unit_count, 1)
 
     if score == 0.0:
@@ -3229,6 +3257,17 @@ def _has_hangul(text: str) -> bool:
 
 
 _KO_JOSA_LONGEST_FIRST = tuple(sorted(_KO_JOSA, key=len, reverse=True))
+
+# Credit for a Hangul prefix-only admission hit, relative to a normalized exact
+# hit. Ordering the two branches only needs a value below 1.0, so this is set
+# for headroom on both sides rather than at either limit: the worst case for
+# admission is a 3-token query whose tokens are all prefix-only, which scores
+# exactly this weight against a 0.5 gate (`_minimum_recall_relevance()`), and
+# the worst case for ranking is the 0.3 gap left to the exact branch. 0.5 sits
+# on the admission cliff -- it left two gold pairs in the 49-query Korean
+# benchmark at exactly 0.000 margin, and moving to 0.7 clears all of them
+# without changing which rows pass the gate (14/49 below it either way).
+_HANGUL_PREFIX_MATCH_WEIGHT = 0.7
 
 
 def _strip_ko_josa(token: str) -> str:

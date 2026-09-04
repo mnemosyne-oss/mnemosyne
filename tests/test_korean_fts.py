@@ -529,3 +529,117 @@ def test_strip_ko_josa_is_idempotent():
             assert beam._strip_ko_josa(stem + josa) == beam._strip_ko_josa(stem), (
                 f"{stem}+{josa} normalizes differently from {stem}"
             )
+
+
+# The stem `바나나` normalizes to `바나` because its final syllable is itself a
+# particle, so a longer compound that merely *starts* with `바나나` is reached
+# through the prefix branch of `_lexical_relevance` rather than the exact one.
+# The two branches used to pay the same weight, which tied the compounds with
+# the word the query actually named.
+#
+# The distractors are written *before* the target on purpose. Equal scores are
+# broken by the recency order the rows were inserted in, so a target written
+# last would come out on top even with the scoring defect present -- the
+# ablation would pass and the test would prove nothing.
+PREFIX_DISTRACTOR_MEMORIES = [
+    ('d01', '바나나우유는 편의점 냉장고에서 판다'),
+    ('d02', '바나나맛 사탕을 한 봉지 샀다'),
+    ('t01', '바나나는 노랗게 익으면 먹는 과일이다'),
+]
+
+
+@pytest.fixture
+def prefix_distractor_memory(tmp_path):
+    """A ``BeamMemory`` holding one target and two longer prefix distractors.
+
+    Kept separate from the 60-row benchmark on purpose: the frozen R@1/R@5
+    figures above are asserted exactly, and adding rows would move them for a
+    reason unrelated to what this test measures.
+    """
+    db = tmp_path / "prefix.db"
+    memory = BeamMemory(session_id="default", db_path=db)
+    conn = beam._get_connection(db)
+    for mid, content in PREFIX_DISTRACTOR_MEMORIES:
+        conn.execute(
+            "INSERT INTO episodic_memory"
+            " (id, content, source, session_id, importance)"
+            " VALUES (?, ?, 'test', 'default', 0.5)",
+            (mid, content),
+        )
+    conn.commit()
+    return memory
+
+
+def test_prefix_match_ranks_below_normalized_exact(prefix_distractor_memory):
+    """The upstream review defect: `바나나우유` outranked `바나나`.
+
+    All three rows clear candidate generation -- `_fts_query_terms` emits
+    ``"바나"*`` and the wildcard grows rightward through every compound, so
+    ranking is decided entirely by `_lexical_relevance`. Two independent terms
+    there paid the compounds as much as the target, and either one alone is
+    enough to reproduce the tie:
+
+    * the Hangul prefix branch credited `_component_unit_weight()` in full,
+      identically to the exact branch the target reaches; and
+    * `full_match` tested raw substring containment, and `바나나` is a
+      substring of `바나나우유` -- worth 1.0 on its own, which saturates the
+      final `min(score, 1.0)` cap and hides any discount applied above it.
+
+    With both scored at 1.0 the order fell to the recency tiebreak. Rank 1 is
+    asserted rather than mere presence, because presence held before the fix
+    too -- the defect was ordering.
+    """
+    got = [row.get("id") for row in prefix_distractor_memory.recall('바나나', top_k=3)]
+    assert got[:1] == ['t01'], f"'바나나' -> {got}"
+
+
+def test_inflected_prefix_query_ranks_below_normalized_exact(prefix_distractor_memory):
+    """Same ordering, with the `full_match` term out of the picture.
+
+    `바나나를` is not a substring of any row, so this query isolates the prefix
+    branch: it fails if the branch is restored to full weight even when the
+    `full_match` fix is left in place. The uninflected case above cannot make
+    that distinction, because either fix alone satisfies it.
+    """
+    got = [row.get("id") for row in prefix_distractor_memory.recall('바나나를', top_k=3)]
+    assert got[:1] == ['t01'], f"'바나나를' -> {got}"
+
+
+def test_prefix_match_still_clears_the_admission_gate(prefix_distractor_memory):
+    """Discounting the prefix branch must not evict the rows it admits.
+
+    The discount exists to break a tie, not to drop compounds: a query naming
+    only `바나나우유` still has to find d01. This is the guard against fixing
+    the ranking by raising the branch out of contention entirely, which would
+    also break `보관` -> `보관한다`, the case the prefix branch was added for.
+    """
+    got = [row.get("id") for row in prefix_distractor_memory.recall('바나나우유', top_k=3)]
+    assert got[:1] == ['d01'], f"'바나나우유' -> {got}"
+
+
+def test_prefix_and_exact_relevance_are_not_tied():
+    """Assert the scores directly, not just the order they produce.
+
+    Ranking tests can pass for the wrong reason -- equal scores fall through to
+    a tiebreak, and a tiebreak can land on the right row by luck. Comparing
+    `_lexical_relevance` output pins the actual contract: a compound that only
+    shares a prefix must score strictly below the word the query named, on both
+    the inflected and uninflected form of the query.
+    """
+    target = dict(PREFIX_DISTRACTOR_MEMORIES)['t01']
+    for query in ('바나나', '바나나를'):
+        query_tokens = beam._recall_tokens(query.lower())
+        gold = beam._lexical_relevance(query_tokens, target, query.lower())
+        floor = beam._minimum_recall_relevance(query_tokens)
+        for did in ('d01', 'd02'):
+            distractor = dict(PREFIX_DISTRACTOR_MEMORIES)[did]
+            score = beam._lexical_relevance(query_tokens, distractor, query.lower())
+            assert score < gold, (
+                f"{query!r}: {did} scored {score:.3f}, not below the target's "
+                f"{gold:.3f}"
+            )
+            # ...but still admitted. The discount breaks the tie; it must not
+            # push a legitimately prefix-matching row below the gate.
+            assert score >= floor, (
+                f"{query!r}: {did} scored {score:.3f}, under the gate {floor}"
+            )
