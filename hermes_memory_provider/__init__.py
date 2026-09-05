@@ -21,6 +21,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -304,6 +305,136 @@ def _strip_prefetch_prefix(content: str) -> str:
         if upper.startswith(prefix):
             return c[len(prefix):].strip()
     return c
+
+
+# Multi-user gateways (group chats, shared sessions) may stamp the speaker's
+# display name onto message content before it reaches the memory layer, e.g.
+# "[Alice] what time does the bakery open". The stamp is envelope
+# metadata, not a topical token: left in the recall query, it makes every
+# row mentioning the same speaker score as lexically relevant regardless of
+# subject. Strip leading stamps from the QUERY only -- captured rows and
+# consolidated summaries keep the stamped text so speaker attribution
+# survives distillation.
+#
+# The grammar is deliberately NAME-shaped, not bracket-shaped: gateways
+# stamp person names, so a stamp is a short human-name token (Unicode
+# letters, spaces, apostrophes, hyphens, periods; 1-4 words) followed by
+# whitespace or end-of-string. Bracketed tokens that carry topical meaning
+# -- song titles like [Untitled], tags like [TODO], timestamps like
+# [2026-05-14 12:00], markdown links like [API docs](http://x) -- contain
+# digits/underscores or are not name-shaped and are kept in the query.
+_PREFETCH_NAME_STAMP_RE = re.compile(
+    # No ^ anchor: _sanitize_prefetch_query matches at a moving offset
+    # (single-pass strip); pattern.match(pos) anchors implicitly.
+    r"(?:\[([^\W\d_](?:[^\W\d_]|[ .'\-]){0,47})\])(?:\s+|$)",
+    re.UNICODE,
+)
+
+# Bracketed tokens that look name-shaped but are common content tags, not
+# speakers. Matched case-insensitively against the stamp's inner text.
+_PREFETCH_NAME_STAMP_TAGS = frozenset({
+    "todo", "untitled", "note", "notes", "notice", "draft", "wip", "api",
+    "docs", "documentation", "link", "url", "tag", "important", "idea",
+    "question", "answer", "update", "edit", "screenshot", "image", "photo",
+    "video", "audio", "recording", "transcript", "log", "misc", "test",
+    "annotation", "announcement", "summary", "minutes", "changelog",
+    "release", "checklist", "reminder", "agenda", "minutes",
+})
+
+# Lowercase particles that occur inside real multi-word surnames
+# (Spanish/French/Dutch/Arabic transliteration conventions). Allowed only
+# BETWEEN capitalized words, never as the first or last word.
+_NAME_PARTICLES = frozenset({
+    "de", "del", "la", "las", "le", "les", "van", "von", "der", "den",
+    "di", "da", "dos", "das", "du", "bin", "ibn", "al", "el", "y", "e",
+})
+
+
+def _looks_capitalized(w: str) -> bool:
+    """Capitalized, or written in a script without letter case (CJK,
+    Arabic, Hebrew...): caseless scripts must not fail the gate."""
+    first = w[:1]
+    if not first:
+        return False
+    return first.isupper() or first.lower() == first.upper()
+
+
+def _blocklisted_word(w: str) -> bool:
+    """A word is blocklisted when it (or its simple singular/past-inflected
+    form) is a known content tag: kills [TODOs], [Noted], [API Docs]..."""
+    w = unicodedata.normalize("NFKC", w).lower().rstrip(".,")
+    if w in _PREFETCH_NAME_STAMP_TAGS:
+        return True
+    if w.endswith("s") and w[:-1] in _PREFETCH_NAME_STAMP_TAGS:
+        return True
+    if w.endswith("d") and w[:-1] in _PREFETCH_NAME_STAMP_TAGS:
+        return True
+    return False
+
+
+def _is_name_stamp(inner: str) -> bool:
+    """Whether a bracketed token's inner text plausibly names a speaker.
+
+    Inner text is NFKC-normalized first: fullwidth lookalikes ([ＴＯＤＯ]),
+    Turkish/combining variants, and other casefold-bypass forms must hit
+    the blocklist exactly like their ASCII spellings.
+
+    Note the accepted trade-off: a single lowercase Latin word passes the
+    capitalization gate, so real lowercase display names ([lauranne]) are
+    stripped AND lowercase topical tags ([recipe]) are stripped with them.
+    The gateway stamps speaker display names verbatim, which includes
+    lowercase names; grammar alone cannot separate the two without a
+    per-message speaker signal, which deployments do not pass here.
+    Multi-word stamps must look name-like; single words are accepted as
+    the lesser evil (missing a speaker stamp pollutes every recall)."""
+    inner = unicodedata.normalize("NFKC", inner)
+    words = inner.split()
+    if not (1 <= len(words) <= 4):
+        return False
+    if any(w.isdigit() or "_" in w for w in words):
+        return False
+    if any(_blocklisted_word(w) for w in words):
+        return False
+    if len(words) > 1:
+        for i, w in enumerate(words):
+            if w.lower() in _NAME_PARTICLES:
+                # particle: only between capitalized words
+                if i == 0 or i == len(words) - 1:
+                    return False
+                continue
+            if not _looks_capitalized(w):
+                return False
+    return True
+
+
+def _sanitize_prefetch_query(query: str) -> str:
+    q = (query or "").strip()
+    # NFKC so regex charset/blocklist see canonical forms; the returned
+    # remainder keeps this normalization (recall is case/width-insensitive
+    # downstream, so this is contract-safe).
+    q = unicodedata.normalize("NFKC", q)
+    orig = q
+    # Strip leading name-shaped stamps (one or more) in a single pass:
+    # match from a moving offset instead of re-slicing the remainder each
+    # iteration (the re-slice loop was O(n^2) — a 400KB all-stamp query
+    # cost ~11.6s on the per-turn prefetch path).
+    offset = 0
+    stripped_any = False
+    while True:
+        m = _PREFETCH_NAME_STAMP_RE.match(q, offset)
+        if not m or not _is_name_stamp(m.group(1)):
+            break
+        offset = m.end()
+        stripped_any = True
+    if stripped_any:
+        q = q[offset:].strip()
+        # Leading punctuation residue ([Alice] , ... / [Alice] ?) is not a
+        # query; lstrip it and treat a token-less remainder as no query.
+        q = q.lstrip(" \t,.:;!?…—-\u00a0").strip()
+        if not re.search(r"\w", q):
+            return ""
+        return q
+    return orig
 
 
 def _prefetch_tokens(content: str) -> Set[str]:
@@ -2059,6 +2190,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         ``general`` profile reproduces the prior single-source behavior exactly."""
         if not self._beam or self._agent_context in self._skip_contexts:
             return ""
+        query = _sanitize_prefetch_query(query)
         profile = _resolve_profile(self._prefetch_profile)
         blocks: List[str] = []
         for src in profile.sources:
@@ -2745,6 +2877,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _handle_recall(self, args: Dict[str, Any]) -> str:
         query = args.get("query", "")
+        # Tool queries carry the same gateway speaker stamps as prefetch
+        # (an agent forwarding a stamped message body); sanitize so
+        # recall does not score rows on speaker-name tokens.
+        query = _sanitize_prefetch_query(query)
         top_k = int(args.get("limit", 5))
         temporal_weight = float(args.get("temporal_weight", 0.0))
         query_time = args.get("query_time") or None

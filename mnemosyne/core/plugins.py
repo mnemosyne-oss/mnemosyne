@@ -584,14 +584,26 @@ class PluginManager:
             if file_path.name.startswith("_"):
                 continue
             try:
+                # Namespaced module key: a bare file stem here would
+                # replace any stdlib module of the same name in sys.modules
+                # (a plugin named logging.py/email.py/json.py would shadow
+                # the real one process-wide and break every later importer).
+                module_key = f"_mnemosyne_plugin_{file_path.stem}"
                 spec = importlib.util.spec_from_file_location(
-                    file_path.stem, str(file_path)
+                    module_key, str(file_path)
                 )
                 if spec is None or spec.loader is None:
                     continue
                 module = importlib.util.module_from_spec(spec)
-                sys.modules[file_path.stem] = module
-                spec.loader.exec_module(module)
+                module.__name__ = module_key
+                sys.modules[module_key] = module
+                try:
+                    spec.loader.exec_module(module)
+                except Exception:
+                    # Drop the half-initialized module: a failed exec must
+                    # not leave a resolvable broken entry in sys.modules.
+                    sys.modules.pop(module_key, None)
+                    raise
 
                 for attr_name in dir(module):
                     obj = getattr(module, attr_name)
