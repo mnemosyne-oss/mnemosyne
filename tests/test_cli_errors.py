@@ -133,7 +133,6 @@ def test_export_manifest_reports_omitted_and_partial_persisted_data(tmp_path):
     assert "facts (1)" in export_result.stdout
     assert "working_memory missing" in export_result.stdout
     assert "author_id (1)" in export_result.stdout
-    assert "pinned (1)" in export_result.stdout
 
     manifest = json.loads(export_path.read_text(encoding="utf-8"))["mnemosyne_export"]["completeness"]
     assert manifest["complete"] is False
@@ -141,7 +140,9 @@ def test_export_manifest_reports_omitted_and_partial_persisted_data(tmp_path):
     partial = {surface["section"]: surface for surface in manifest["partial_surfaces"]}
     fields = {field["field"]: field for field in partial["working_memory"]["omitted_fields"]}
     assert fields["author_id"]["affected_rows"] == 1
-    assert fields["pinned"]["affected_rows"] == 1
+    # pinned survives the portable round-trip since the event-date/pinned
+    # export fix; the manifest no longer reports it as omitted.
+    assert "pinned" not in fields
 
     import_result = run_cli(["import", str(export_path)], target_dir)
     assert import_result.returncode == 0, import_result.stderr
@@ -149,7 +150,9 @@ def test_export_manifest_reports_omitted_and_partial_persisted_data(tmp_path):
     target_db = target_dir / "mnemosyne-data" / "mnemosyne.db"
     with sqlite3.connect(target_db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
-        assert conn.execute("SELECT pinned, author_id FROM working_memory").fetchone() == (0, None)
+        # pinned=1 now survives the portable round-trip (event-date/pinned
+        # export fix); author_id stays omitted.
+        assert conn.execute("SELECT pinned, author_id FROM working_memory").fetchone() == (1, None)
 
 
 def test_export_warning_omits_invalid_partial_affected_row_counts(monkeypatch, capsys):
