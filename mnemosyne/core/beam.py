@@ -2397,9 +2397,14 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
             # recall tokenizer splits on the script boundary, so a document
             # saying `ModelForge가` already yields the token `modelforge` and
             # lands on the exact branch above. The only thing this substring
-            # test adds for a pure Latin stem is an unrelated longer word --
-            # `ModelForgeXYZ` scored 0.2 against the 0.15 floor and surfaced
-            # as a false hit for `ModelForge가` (upstream review of #896).
+            # test adds for a pure Latin stem is normally an unrelated
+            # longer word -- `ModelForgeXYZ` scored 0.2 against the 0.15
+            # floor and surfaced as a false hit for `ModelForge가`
+            # (upstream review of #896). Closing it is safe rather than
+            # free: `_RECALL_TOKEN_RE` joins on `[_.:/+-]`, so a stem like
+            # `lifecycle` reaches `lifecycle.log` only here. FTS5 does cut
+            # on those characters, so candidate generation still returns
+            # the row and its remaining tokens carry it over the gate.
             and not (_has_hangul(query_lower) and not _has_hangul(token))
             and any(
                 token in ctoken or ctoken in token
