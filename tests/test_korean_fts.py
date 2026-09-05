@@ -643,3 +643,90 @@ def test_prefix_and_exact_relevance_are_not_tied():
             assert score >= floor, (
                 f"{query!r}: {did} scored {score:.3f}, under the gate {floor}"
             )
+
+
+# `_fts_query_terms()` widens *every* term of a Hangul-bearing query to a
+# `"stem"*` prefix, including a pure Latin one, because unicode61 glues the
+# particle onto Latin too -- `ModelForge가` is a single index token that no
+# quoted phrase can reach. That widening is candidate generation only, and it
+# used to leak into the ranking: `ModelForgeXYZ` merely starts with the same
+# letters, and the substring branch of `_lexical_relevance` paid it 0.2 against
+# a 0.15 floor, so it surfaced as a public hit the exact-phrase behaviour had
+# never returned (upstream review of #896).
+#
+# The distractor is written first for the same reason as the Hangul fixture
+# above: a target inserted last wins the recency tiebreak on its own.
+LATIN_PREFIX_DISTRACTOR_MEMORIES = [
+    ('d01', 'ModelForgeXYZ 전용 문서는 아직 비어 있다'),
+    ('t01', 'ModelForge가 하는 일은 모델 양자화다'),
+]
+
+
+@pytest.fixture
+def latin_prefix_distractor_memory(tmp_path):
+    """A ``BeamMemory`` holding a mixed-script target and a longer Latin word.
+
+    Both rows start with the same eleven letters, so the widened prefix term
+    retrieves both. Only the ranking can tell them apart.
+    """
+    db = tmp_path / "latin_prefix.db"
+    memory = BeamMemory(session_id="default", db_path=db)
+    conn = beam._get_connection(db)
+    for mid, content in LATIN_PREFIX_DISTRACTOR_MEMORIES:
+        conn.execute(
+            "INSERT INTO episodic_memory"
+            " (id, content, source, session_id, importance)"
+            " VALUES (?, ?, 'test', 'default', 0.5)",
+            (mid, content),
+        )
+    conn.commit()
+    return memory
+
+
+def test_latin_prefix_distractor_is_not_publicly_recalled(
+    latin_prefix_distractor_memory,
+):
+    """A longer Latin word must not be admitted by a mixed-script query.
+
+    This is the public path, gate included -- the regression dplush reported
+    was a result the user could actually see, not a candidate-set artefact.
+    """
+    got = [
+        row.get("id")
+        for row in latin_prefix_distractor_memory.recall('ModelForge가 뭐야', top_k=5)
+    ]
+    assert got[:1] == ['t01'], f"'ModelForge가 뭐야' -> {got}"
+    assert 'd01' not in got, f"ModelForgeXYZ was publicly recalled: {got}"
+
+
+def test_latin_stem_keeps_exact_semantics_after_normalization():
+    """Score the two rows directly, so this cannot pass on a tiebreak.
+
+    `_RECALL_TOKEN_RE` splits on the script boundary, so the target's
+    `ModelForge가` already yields the token `modelforge` and is paid by the
+    exact branch. The distractor has only the substring branch to stand on,
+    and for a pure Latin stem inside a Hangul query that branch is now closed.
+    """
+    query = 'ModelForge가 뭐야'
+    query_tokens = beam._recall_tokens(query.lower())
+    floor = beam._minimum_recall_relevance(query_tokens)
+    rows = dict(LATIN_PREFIX_DISTRACTOR_MEMORIES)
+    gold = beam._lexical_relevance(query_tokens, rows['t01'], query.lower())
+    distractor = beam._lexical_relevance(query_tokens, rows['d01'], query.lower())
+    assert gold >= floor, f"target scored {gold:.3f}, under the gate {floor}"
+    assert distractor < floor, (
+        f"ModelForgeXYZ scored {distractor:.3f}, at or above the gate {floor}"
+    )
+
+
+def test_hangul_prefix_credit_is_unaffected_by_the_latin_guard():
+    """The guard must not disarm the Hangul prefix branch it sits next to.
+
+    `보관` -> `보관한다` is the inflection the branch exists for. The guard is
+    scoped to a Latin token inside a Hangul query, so this must still be paid.
+    """
+    query_tokens = beam._recall_tokens('보관')
+    score = beam._lexical_relevance(query_tokens, '영수증은 3년간 보관한다', '보관')
+    assert score >= beam._minimum_recall_relevance(query_tokens), (
+        f"'보관' -> '보관한다' scored {score:.3f} and would be gated out"
+    )

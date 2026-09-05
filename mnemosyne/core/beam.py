@@ -2388,10 +2388,24 @@ def _lexical_relevance(query_tokens: List[str], content: str, query_lower: str =
         if synonyms and any(syn in content_tokens for syn in synonyms):
             partial += 0.75
             continue
-        if len(token) >= 4 and any(
-            token in ctoken or ctoken in token
-            for ctoken in content_tokens
-            if len(ctoken) >= 4
+        if (
+            len(token) >= 4
+            # A Hangul-bearing query widens every term to a `"stem"*` prefix
+            # in `_fts_query_terms()`, because unicode61 glues the particle
+            # onto a Latin word too (`ModelForge가` is one index token). That
+            # is candidate generation only. Admission must not follow it: the
+            # recall tokenizer splits on the script boundary, so a document
+            # saying `ModelForge가` already yields the token `modelforge` and
+            # lands on the exact branch above. The only thing this substring
+            # test adds for a pure Latin stem is an unrelated longer word --
+            # `ModelForgeXYZ` scored 0.2 against the 0.15 floor and surfaced
+            # as a false hit for `ModelForge가` (upstream review of #896).
+            and not (_has_hangul(query_lower) and not _has_hangul(token))
+            and any(
+                token in ctoken or ctoken in token
+                for ctoken in content_tokens
+                if len(ctoken) >= 4
+            )
         ):
             partial += 0.4
 
