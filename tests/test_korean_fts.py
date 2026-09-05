@@ -26,6 +26,8 @@ separately at the bottom of this file and lands lower (35/49 episodic,
 admission gate on top. Quoting the candidate number as the recall number
 is the mistake this suite exists to prevent.
 """
+import sqlite3
+
 import pytest
 
 from mnemosyne.core import beam
@@ -221,24 +223,51 @@ def test_structured_hangul_tokens_are_quoted_before_wildcard(corpus):
     guard, so an unquoted prefix term aborts the entire search before the LIKE
     fallback can run. Quoting turns all three into ordinary prefix terms.
     """
-    conn, _ = corpus
+    conn, rowid_of = corpus
     # Only the structured token itself is asserted. Which *additional*
     # components a query expands into is the hyphen-splitter's business and
     # changes as the tokenizer evolves; pinning the whole list here would
     # make this test fail for reasons unrelated to quoting.
-    cases = {
-        "한국어/영어 설정": '"한국어/영어"*',
-        "캐시-크기 확인": '"캐시-크기"*',
-        "8080:포트": '"8080:포트"*',
-    }
-    for query, structured in cases.items():
+    #
+    # `bare` is what the term would look like without the quoting fix, and
+    # `gold` is the document the query is actually asking about. Asserting
+    # the term shape and MATCH parseability alone would still pass if the
+    # search returned nothing at all, so each case also has to show that the
+    # intended document comes back (upstream review of #896).
+    cases = [
+        ("한국어/영어 설정", '"한국어/영어"*', "한국어/영어*", "m14"),
+        ("캐시-크기 확인", '"캐시-크기"*', "캐시-크기*", "m04"),
+        ("8080:포트", '"8080:포트"*', "8080:포트*", "m01"),
+    ]
+    for query, structured, bare, gold in cases:
         terms = beam._fts_query_terms(query)
         assert structured in terms
+
+        # The failure being fixed. Without quotes FTS5 reads `/` as syntax and
+        # `-`/`:` as column filters, and the raise takes down the whole MATCH.
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute(
+                "SELECT rowid FROM fts_episodes WHERE fts_episodes MATCH ?",
+                (bare,),
+            ).fetchall()
+
         conn.execute(
             "SELECT rowid FROM fts_episodes WHERE fts_episodes MATCH ?",
             (" OR ".join(terms),),
         ).fetchall()
-        beam._fts_search(conn, query, k=5)
+
+        got = [row["rowid"] for row in beam._fts_search(conn, query, k=5)]
+        assert rowid_of[gold] in got, f"{query!r} lost {gold}: {got}"
+
+    # `8080:포트` expands to the structured token and nothing else, so its
+    # ranking is attributable to that one term rather than to the components
+    # a splitter happened to add. The other two cases only assert retrieval:
+    # their gold documents share a common word (`설정`, `캐시`) with unrelated
+    # rows, and pinning a rank here would freeze the scorer's tie handling
+    # instead of the quoting behaviour this test is about.
+    assert beam._fts_query_terms("8080:포트") == ['"8080:포트"*']
+    top = [row["rowid"] for row in beam._fts_search(conn, "8080:포트", k=5)]
+    assert top[:1] == [rowid_of["m01"]], f"'8080:포트' -> {top}"
 
 
 def test_non_hangul_queries_are_unchanged():
