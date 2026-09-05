@@ -1771,6 +1771,13 @@ COMMANDS = {
 
 def run_cli():
     """Main CLI entry point."""
+    # Force UTF-8 output: on Windows, stdout/stderr default to cp1252 when piped
+    # (e.g. by agent tooling spawning this CLI), and printing memory content that
+    # contains non-cp1252 characters (e.g. '\u20b1') raises UnicodeEncodeError and
+    # kills the command. See docs/integrations/pi.md tooling which pipes output.
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     if len(sys.argv) >= 2 and sys.argv[1] in ("--version", "version"):
         print(f"Mnemosyne {_distribution_version('mnemosyne-memory')}")
         return
