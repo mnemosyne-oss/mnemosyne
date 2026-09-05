@@ -2254,6 +2254,19 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # sessions) should never bypass session scoping.
             if author_id:
                 recall_kwargs["author_id"] = author_id
+            # Self-echo suppression: the live conversation's rows are
+            # already verbatim in the requester's context window. Exclude
+            # BOTH the raw gateway key (this call's session_id) and the
+            # prefixed beam session id (what remember() stamps); the
+            # engine also normalizes known prefixes so any variant of the
+            # same key matches.
+            if session_id:
+                recall_kwargs["exclude_session_id"] = session_id
+                prefixed = f"hermes_{session_id}"
+                if prefixed != self._beam.session_id:
+                    recall_kwargs["exclude_session_id_alt"] = prefixed
+                elif self._beam.session_id != session_id:
+                    recall_kwargs["exclude_session_id_alt"] = self._beam.session_id
             with self._ensure_beam_access_lock():
                 results = self._beam.recall(**recall_kwargs)
             if not results:

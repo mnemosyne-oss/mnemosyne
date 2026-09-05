@@ -1969,6 +1969,65 @@ def _is_meaningful_recall_token(token: str) -> bool:
     return len(token) >= 3 and token not in _FACT_MATCH_STOPWORDS and not token.isdigit()
 
 
+# Floor for the self-echo exclusion window (hours). Keeps a misconfigured
+# MNEMOSYNE_SELF_ECHO_HOURS=0/-1 from turning the echo clause into a blanket
+# history exclusion; 0.01h (~36s) still covers the fresh-capture use case.
+_SELF_ECHO_MIN_HOURS = 0.01
+
+
+def _self_echo_cutoff_iso() -> str:
+    """ISO cutoff for the self-echo exclusion window (recall exclude_session_id).
+
+    The cutoff must live on the SAME clock as the stored rows: production
+    write paths (remember()/remember_batch()/consolidation) stamp
+    datetime.now().isoformat() — naive host-local time — and the echo
+    predicate compares ISO strings lexicographically in SQL. Building the
+    cutoff from aware-UTC now() shifted the effective window by the host's
+    UTC offset (leak on TZ-behind-UTC hosts, over-exclusion ahead of UTC),
+    so this helper uses the same naive-local clock as the writers.
+
+    MNEMOSYNE_SELF_ECHO_HOURS is validated: non-numeric values fall back to
+    the 6h default with a warning, and the window is clamped to a small
+    positive floor so '0'/'-1' cannot silently exclude history of every age
+    (that would defeat the documented 'older rows stay recallable' contract).
+    """
+    hours = _self_echo_hours()
+    return (datetime.now() - timedelta(hours=hours)).isoformat()
+
+
+def _self_echo_hours() -> float:
+    """Validated MNEMOSYNE_SELF_ECHO_HOURS (finite, floored, warned)."""
+    raw = os.environ.get("MNEMOSYNE_SELF_ECHO_HOURS", "6")
+    try:
+        hours = float(raw or 6)
+    except (TypeError, ValueError):
+        logger.warning(
+            "invalid MNEMOSYNE_SELF_ECHO_HOURS=%r; falling back to 6", raw
+        )
+        hours = 6.0
+    if not math.isfinite(hours):
+        logger.warning(
+            "non-finite MNEMOSYNE_SELF_ECHO_HOURS=%r; falling back to 6", raw
+        )
+        hours = 6.0
+    _SELF_ECHO_MAX_HOURS = 24 * 365
+    if hours > _SELF_ECHO_MAX_HOURS:
+        logger.warning(
+            "MNEMOSYNE_SELF_ECHO_HOURS=%r exceeds one year; clamped to %s "
+            "(larger windows blanket-exclude all history under the key)",
+            raw, _SELF_ECHO_MAX_HOURS,
+        )
+        hours = float(_SELF_ECHO_MAX_HOURS)
+    if hours < _SELF_ECHO_MIN_HOURS:
+        if hours <= 0:
+            logger.warning(
+                "non-positive MNEMOSYNE_SELF_ECHO_HOURS=%r would exclude "
+                "history of every age; clamped to %s", raw, _SELF_ECHO_MIN_HOURS,
+            )
+        hours = _SELF_ECHO_MIN_HOURS
+    return hours
+
+
 def _recall_tokens(text: str) -> List[str]:
     """Meaningful lexical tokens for precision gates and fallback scoring."""
     return [
@@ -6281,7 +6340,9 @@ class BeamMemory:
                importance_weight: float = None,
                explain: bool = False,
                _cross_session: Optional[bool] = None,
-               _resolved_weights: Optional[_RecallWeightSnapshot] = None) -> List[Dict]:
+               _resolved_weights: Optional[_RecallWeightSnapshot] = None,
+               exclude_session_id: Optional[str] = None,
+               exclude_session_id_alt: Optional[str] = None) -> List[Dict]:
         """
         Hybrid recall across working_memory + episodic_memory.
         Uses sqlite-vec + FTS5 for episodic, FTS5 for working.
@@ -6350,6 +6411,8 @@ class BeamMemory:
                 channel_id=channel_id,
                 veracity=veracity, memory_type=memory_type,
                 cross_session=cross_session,
+                exclude_session_id=exclude_session_id,
+                exclude_session_id_alt=exclude_session_id_alt,
             )
             # [C4] Polyphonic path diagnostics. The linear-path recording
             # below (record_call / record_tier_hits at the end of recall())
@@ -6545,6 +6608,66 @@ class BeamMemory:
         else:
             wm_where_clauses.append(_session_scope_filter(cross_session=cross_session))
             wm_params.extend(_session_scope_params(self.session_id, cross_session=cross_session))
+
+        # Self-echo exclusion: rows captured in the calling conversation are
+        # already verbatim in the requester's context window, so recalling
+        # them back just wastes injection budget (and trains the model to
+        # parrot itself). Only RECENT rows are excluded -- older rows under
+        # the same session key are legitimate long-term history (e.g. after
+        # a session-key migration or a history replay the key persists but
+        # the content is no longer on screen). Callers may pass two key
+        # variants (deployments differ in how they derive the key).
+        # Scope note: the exclusion covers the WORKING-memory arm (both the
+        # polyphonic and linear engines' working-memory candidates). Rows
+        # already consolidated into episodic_memory under the same key stay
+        # recallable by design -- episodic rows are distilled summaries, not
+        # the verbatim capture, so they are not self-echo.
+        if exclude_session_id or exclude_session_id_alt:
+            _echo_cutoff = _self_echo_cutoff_iso()
+            _echo_variants = [
+                v for v in (exclude_session_id, exclude_session_id_alt) if v
+            ]
+            # Key normalization: writers stamp 'hermes_<gateway_key>' while
+            # callers may pass the raw key (or vice versa) — match both
+            # forms plus the stripped form.
+            _expanded = []
+            for _v in _echo_variants:
+                for _form in (_v, f"hermes_{_v}"):
+                    if _form not in _expanded:
+                        _expanded.append(_form)
+                if _v.startswith("hermes_") and _v[7:] not in _expanded:
+                    _expanded.append(_v[7:])
+            _echo_variants = _expanded
+            # Aware-stamped rows (imports/sync) must be judged on their UTC
+            # instant, not their wall string: add an arm that drops them
+            # when the UTC-instant cutoff says so. datetime() normalizes
+            # offsets to UTC; naive rows keep the naive-local comparison.
+            # GLOB detects offset-bearing stamps incl. negative offsets and
+            # the Z suffix (round-5 predicate, probe p5a).
+            _aware_cutoff_dt = datetime.now(timezone.utc) - timedelta(
+                hours=_self_echo_hours()
+            )
+            _echo_utc_cutoff = _aware_cutoff_dt.replace(
+                tzinfo=None
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            wm_where_clauses.append(
+                "(COALESCE(session_id, '') NOT IN (%s) OR timestamp <= ?"
+                " OR (session_id IN (%s) AND timestamp GLOB"
+                " '*[+-][0-9][0-9]:[0-9][0-9]*' AND"
+                " datetime(timestamp) <= ?) OR (session_id IN (%s) AND"
+                " timestamp LIKE '%%Z' AND datetime(timestamp) <= ?))"
+                % (
+                    ",".join("?" * len(_echo_variants)),
+                    ",".join("?" * len(_echo_variants)),
+                    ",".join("?" * len(_echo_variants)),
+                )
+            )
+            wm_params.extend(_echo_variants)
+            wm_params.append(_echo_cutoff)
+            wm_params.extend(_echo_variants)
+            wm_params.append(_echo_utc_cutoff)
+            wm_params.extend(_echo_variants)
+            wm_params.append(_echo_utc_cutoff)
         
         if from_date:
             wm_where_clauses.append("timestamp >= ?")
@@ -8165,7 +8288,9 @@ class BeamMemory:
                            channel_id: Optional[str] = None,
                            veracity: Optional[str] = None,
                            memory_type: Optional[str] = None,
-                           cross_session: Optional[bool] = None) -> List[Dict]:
+                           cross_session: Optional[bool] = None,
+                           exclude_session_id: Optional[str] = None,
+                           exclude_session_id_alt: Optional[str] = None) -> List[Dict]:
         """[E5] Polyphonic recall path.
 
         Delegates to PolyphonicRecallEngine when MNEMOSYNE_POLYPHONIC_RECALL=1.
@@ -8219,6 +8344,19 @@ class BeamMemory:
                 default_dense_source_filter=not (source or topic),
                 source=source,
                 topic=topic,
+                # Self-echo exclusion: applied post-voice on the combined
+                # candidate set (see engine._apply_self_echo_exclusion) so
+                # every working-memory-reading voice honors it. Kwargs are
+                # passed only when set — engines/tests that predate the
+                # feature implement recall() without them.
+                **(
+                    {
+                        "exclude_session_id": exclude_session_id,
+                        "exclude_session_id_alt": exclude_session_id_alt,
+                    }
+                    if (exclude_session_id or exclude_session_id_alt)
+                    else {}
+                ),
             )
         except Exception as exc:
             logger.exception("polyphonic recall engine failed: %s", exc)

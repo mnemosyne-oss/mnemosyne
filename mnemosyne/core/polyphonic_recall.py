@@ -146,7 +146,9 @@ class PolyphonicRecallEngine:
                top_k: int = 10, context_budget: int = 4000,
                *, default_dense_source_filter: bool = True,
                source: Optional[str] = None,
-               topic: Optional[str] = None) -> List[PolyphonicResult]:
+               topic: Optional[str] = None,
+               exclude_session_id: Optional[str] = None,
+               exclude_session_id_alt: Optional[str] = None) -> List[PolyphonicResult]:
         """
         Polyphonic recall: all 4 voices in parallel, then combine.
 
@@ -169,6 +171,14 @@ class PolyphonicRecallEngine:
             topic: Same as ``source`` -- topics are stored in the source
                 field for now (pending a dedicated topic column), exactly as
                 beam._wm_search does.
+            exclude_session_id: Self-echo exclusion -- working-memory rows
+                under this session key (or exclude_session_id_alt) that are
+                fresher than the self-echo window are dropped from every
+                voice's candidates, mirroring the linear path's
+                exclude_session_id contract. Applied post-voice on the
+                combined candidate set by memory_id -> session_id lookup.
+            exclude_session_id_alt: Second accepted session-key variant
+                (deployments derive the gateway session key differently).
 
         Returns:
             List of PolyphonicResult, sorted by combined score
@@ -183,11 +193,24 @@ class PolyphonicRecallEngine:
         graph_results = self._graph_voice(query)
         fact_results = self._fact_voice(query)
         temporal_results = self._temporal_voice(query)
-        
+
         # Combine results
         combined = self._combine_voices(
             vector_results, graph_results, fact_results, temporal_results
         )
+
+        # Self-echo exclusion: drop combined candidates whose memory_id maps
+        # to a working_memory row under the excluded session key AND inside
+        # the echo window. Applied BEFORE hydration/diversity so excluded
+        # rows never consume top_k or context budget. Post-voice (not
+        # per-voice WHERE) keeps the exclusion correct for every voice that
+        # reads working_memory, including ones added later.
+        echo_variants = [v for v in (exclude_session_id, exclude_session_id_alt) if v]
+        if echo_variants and combined:
+            combined = self._apply_self_echo_exclusion(
+                combined, echo_variants
+            )
+
         self._hydrate_result_content(combined)
 
         # Diversity re-rank
@@ -197,6 +220,103 @@ class PolyphonicRecallEngine:
         context = self._assemble_context(reranked, context_budget)
         
         return context
+
+    def _apply_self_echo_exclusion(
+        self,
+        combined: Dict[str, PolyphonicResult],
+        echo_variants: List[str],
+    ) -> Dict[str, PolyphonicResult]:
+        """Drop combined candidates under the excluded session keys.
+
+        The freshness window and its env knob live in beam
+        (MNEMOSYNE_SELF_ECHO_HOURS, naive-local clock matching the writers);
+        re-derive the cutoff here with the same semantics rather than
+        importing beam (import cycle). Rows whose timestamp parses as aware
+        are normalized onto the writers' local wall clock before the window
+        comparison; rows that fail to parse are kept (never exclude on
+        unparsable data). Only rows under the excluded keys are fetched and
+        tested; the linear recall path's episodic-tier scope note
+        (beam, recall exclusion) stays normative — episodic copies of a
+        dual-tier id are not dropped here.
+        """
+        from mnemosyne.core.beam import _self_echo_cutoff_iso
+
+        try:
+            cutoff = _self_echo_cutoff_iso()
+            cutoff_dt = datetime.fromisoformat(cutoff)
+        except Exception:
+            return combined
+
+        # Key normalization: writers may stamp session_id as
+        # 'hermes_<gateway_key>' while callers pass the raw key (or vice
+        # versa). Expand each variant to its prefixed/unprefixed forms so
+        # the exclusion matches regardless of which derivation was used.
+        expanded: List[str] = []
+        for v in echo_variants:
+            for form in (v, f"hermes_{v}"):
+                if form not in expanded:
+                    expanded.append(form)
+                if v.startswith("hermes_") and v[len("hermes_"):] not in expanded:
+                    expanded.append(v[len("hermes_"):])
+        echo_variants = expanded
+
+        if self.conn is not None:
+            conn = self.conn
+            own_conn = False
+        else:
+            conn = sqlite3.connect(str(self.db_path))
+            conn.row_factory = sqlite3.Row
+            own_conn = True
+        cursor = conn.cursor()
+        try:
+            placeholders = ",".join("?" * len(echo_variants))
+            try:
+                # Selective form: fetch only rows UNDER the excluded keys
+                # (bounded by that session's history, indexed), then apply
+                # the freshness window per row in Python — the window test
+                # normalizes aware stamps onto the writers' local clock,
+                # which raw SQL string comparison cannot express.
+                rows = cursor.execute(
+                    f"SELECT id, timestamp FROM working_memory "
+                    f"WHERE session_id IN ({placeholders}) OR session_id IS NULL",
+                    echo_variants,
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return combined
+            excluded_ids = {
+                row["id"]
+                for row in rows
+                if self._row_inside_echo_window(row["timestamp"], cutoff_dt)
+            }
+            for memory_id in list(combined):
+                if memory_id in excluded_ids:
+                    combined.pop(memory_id, None)
+            return combined
+        finally:
+            if own_conn:
+                conn.close()
+
+    @staticmethod
+    def _row_inside_echo_window(timestamp: str, cutoff_dt: datetime) -> bool:
+        """True when the row is FRESHER than the echo cutoff (i.e. excluded).
+
+        Mixed naive/aware ISO strings: compare as datetimes when both parse,
+        treating aware values on their UTC instant; unparsable values keep
+        the row (fail open)."""
+        try:
+            row_dt = datetime.fromisoformat(timestamp)
+        except (TypeError, ValueError):
+            return False
+        # Writers stamp naive host-local time and the cutoff is naive-local
+        # (see beam._self_echo_cutoff_iso); normalize aware rows onto that
+        # same local wall clock so mixed stamps compare on one calendar.
+        if row_dt.tzinfo is not None:
+            row_dt = row_dt.astimezone().replace(tzinfo=None)
+        cutoff_naive = (
+            cutoff_dt.astimezone().replace(tzinfo=None)
+            if cutoff_dt.tzinfo is not None else cutoff_dt
+        )
+        return row_dt > cutoff_naive
     
     def _vector_voice(self, query_embedding, default_dense_source_filter: bool = True,
                       source: Optional[str] = None,
@@ -745,8 +865,17 @@ class PolyphonicRecallEngine:
 
             results = []
             for row in cursor.fetchall():
-                # Calculate temporal score
-                age = datetime.now() - datetime.fromisoformat(row["timestamp"])
+                # Calculate temporal score. Timestamps may be naive-local
+                # (production writers) or aware-UTC (imports/migrations):
+                # normalize to naive before subtracting or fromisoformat
+                # raises 'can't subtract offset-naive and offset-aware'.
+                try:
+                    row_dt = datetime.fromisoformat(row["timestamp"])
+                except (TypeError, ValueError):
+                    continue
+                if row_dt.tzinfo is not None:
+                    row_dt = row_dt.astimezone().replace(tzinfo=None)
+                age = datetime.now() - row_dt
                 age_days = age.total_seconds() / 86400
                 temporal_score = np.exp(-age_days / 7)  # 7-day half-life
 
