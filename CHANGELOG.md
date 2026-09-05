@@ -29,6 +29,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Changed
 
+- **Removed the Hermes Tweet row from the README compatibility table.** The plugin has no Mnemosyne integration; its repository contains no reference to Mnemosyne or to any memory provider, so the July 3 listing was a drive-by placement. The matching 3.14.0 changelog line is removed as well.
 - **Entity extraction no longer stores whole quoted spans as entities (#891).** The `"..."` and `'...'` patterns in `_ENTITY_PATTERNS` captured any quoted span of 2-50 characters, so conversational and roleplay text wrote dialogue into the `mentions` vocabulary: `'Okay,'`, `'Talia pauses.'`, `'the light is fading.'`. Punctuation-bearing values also slip past the stop-word filter, which compares exact strings (`'okay,' != 'okay'`). Measured on one production store: 589 of 1,270 distinct `mentions` values (46%) carried punctuation or spaces, and of 9,831 `references` edges written by proactive linking, 127 connected pairs sharing such a fragment, 103 of them on nothing else, so junk vocabulary became graph topology that recall reads back. Both patterns are removed. A real name inside quotes is unaffected because quotes do not block `\b`, so it still extracts from the capitalized single-word and multi-word patterns; the values that disappear are exactly the spans no other pattern can produce, which are the lowercase and punctuation-bearing ones. A quoted lowercase single word was already dropped by the existing lowercase filter. Existing annotation rows are not cleaned retroactively.
 
 - **Unknown embedding models now fail loud at startup instead of silently assuming 384 dimensions (#518, #521).** `_get_embedding_dim` resolves an explicit `MNEMOSYNE_EMBEDDING_DIM` first (must be a positive integer), then the built-in model table, and raises `ValueError` for an unknown model with no explicit dimension rather than falling back to 384 (bge-small's dimension). A vec0 table is dimensioned at creation, so a silent 384 guess baked the wrong dimension into a fresh database and corrupted vector search for anyone using a model absent from the table (e.g. `mxbai-embed-large` via a custom endpoint). Dimension resolution is centralized in `embeddings._get_embedding_dim`; Beam delegates to it, removing a duplicate resolver that could drift. Embeddings-disabled invocations keep the 384 fallback (the dimension is unused there).
@@ -350,7 +351,6 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 - Installation steps revised for Hermes users (#414, @bruvv)
 - Pi agent integration docs added (#c0a7176)
-- Hermes Tweet compatibility table (#e032008, @Burak Bayır)
 - `.coderabbit.yaml` with grouped reviews and architectural rigor (#da4832a)
 
 ### Thanks

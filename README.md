@@ -77,7 +77,6 @@
 | **Pi** | Pi extension + skill | `pi install npm:@mnemosyne-oss/pi-mnemosyne` |
 | **OpenClaw** | Native provider | `pip install mnemosyne-memory[openclaw]` |
 | **Hermes Agent** | MCP + Plugin | Native -- ships enabled |
-| **Hermes Tweet** | Companion plugin | Add [Hermes Tweet](https://github.com/Xquik-dev/hermes-tweet) when remembered sessions need X/Twitter post, account, trend, or search context |
 | **Any MCP client** | MCP (stdio/SSE) | One config line |
 | **Any Python agent** | Direct SDK | `import mnemosyne` |
 
