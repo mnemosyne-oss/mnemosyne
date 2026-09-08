@@ -3,16 +3,25 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from hermes_memory_provider import MnemosyneMemoryProvider
+from mnemosyne_hermes import MnemosyneMemoryProvider as PackagedMemoryProvider
+
+# The provider is duplicated between hermes_memory_provider/ and
+# integrations/hermes/src/mnemosyne_hermes/ (docs/rfc/0003-media-moments.md).
+# Delete-cascade behaviour must stay identical in both copies.
+PROVIDER_CLASSES = [MnemosyneMemoryProvider, PackagedMemoryProvider]
 
 
-def _provider(tmp_path: Path, monkeypatch, agent_identity="Sisyphus"):
+def _provider(tmp_path: Path, monkeypatch, agent_identity="Sisyphus",
+              provider_cls=MnemosyneMemoryProvider):
     data_dir = tmp_path / "mnemosyne-data"
     hermes_home = tmp_path / "profiles" / agent_identity.lower()
     hermes_home.mkdir(parents=True)
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir / "private"))
     monkeypatch.setenv("MNEMOSYNE_HOST_LLM_ENABLED", "0")
-    provider = MnemosyneMemoryProvider()
+    provider = provider_cls()
     provider.initialize(
         session_id=f"{agent_identity.lower()}-session",
         hermes_home=str(hermes_home),
@@ -206,14 +215,16 @@ def test_validate_delete_removes_row(tmp_path, monkeypatch):
     assert _row(provider, mid) is None
 
 
-def test_validate_delete_cascades_support_rows(tmp_path, monkeypatch):
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES,
+                         ids=lambda c: c.__module__)
+def test_validate_delete_cascades_support_rows(tmp_path, monkeypatch, provider_cls):
     """Deleting through the provider must not leave the memory's children behind.
 
     The provider used to remove only the working_memory row, so every delete
     orphaned the memory's gist (and its annotations and fallback embedding)
     permanently -- see #904.
     """
-    provider = _provider(tmp_path, monkeypatch)
+    provider = _provider(tmp_path, monkeypatch, provider_cls=provider_cls)
     conn = provider._beam.conn
     delete_id = _seed_private(provider, "stale fact with children")
     keep_id = _seed_private(provider, "unrelated fact with children")
@@ -258,6 +269,83 @@ def test_validate_delete_cascades_support_rows(tmp_path, monkeypatch):
     for table in ("gists", "memory_embeddings", "annotations"):
         assert count(table, delete_id) == 0, f"{table} orphaned by delete"
         assert count(table, keep_id) == keep_counts[table]
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES,
+                         ids=lambda c: c.__module__)
+def test_validate_delete_rolls_back_when_validation_log_fails(tmp_path, monkeypatch,
+                                                              provider_cls):
+    """A failure after the cascade must not leave the deletes pending.
+
+    The handler returns validation_failed without rolling back, so the
+    support-row and parent-row deletes stayed in the connection's implicit
+    transaction and a later unrelated commit would make them permanent.
+    """
+    provider = _provider(tmp_path, monkeypatch, provider_cls=provider_cls)
+    conn = provider._beam.conn
+    mid = _seed_private(provider, "must survive a failed delete")
+    conn.execute(
+        "INSERT INTO gists (id, text, memory_id) VALUES (?, ?, ?)",
+        (f"gist-{mid}", "gist text", mid),
+    )
+    conn.execute(
+        "CREATE TRIGGER fail_validation_log "
+        "BEFORE INSERT ON memory_validations "
+        "BEGIN SELECT RAISE(ABORT, 'forced validation-log failure'); END"
+    )
+    conn.commit()
+    # remember() writes a gist of its own, so count rather than assume one.
+    gist_count = conn.execute(
+        "SELECT COUNT(*) FROM gists WHERE memory_id = ?", (mid,)
+    ).fetchone()[0]
+    assert gist_count > 0
+
+    res = _call(provider, "mnemosyne_validate", {
+        "memory_id": mid,
+        "action": "delete",
+        "validator": "Albedo",
+    })
+
+    assert res["error"] == "validation_failed"
+    assert "forced validation-log failure" in res["reason"]
+    assert not conn.in_transaction
+    assert _row(provider, mid) is not None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM gists WHERE memory_id = ?", (mid,)
+    ).fetchone()[0] == gist_count
+
+
+def test_validate_delete_removes_vec_working_row(tmp_path, monkeypatch):
+    """The provider delete removes the target's vector row when present."""
+    provider = _provider(tmp_path, monkeypatch)
+    conn = provider._beam.conn
+    delete_id = _seed_private(provider, "delete with vec")
+    keep_id = _seed_private(provider, "keep with vec")
+    rowids = {
+        mid: conn.execute(
+            "SELECT rowid FROM working_memory WHERE id = ?", (mid,)
+        ).fetchone()[0]
+        for mid in (delete_id, keep_id)
+    }
+    conn.execute("DROP TABLE IF EXISTS vec_working")
+    conn.execute("CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY)")
+    for rowid in rowids.values():
+        conn.execute("INSERT INTO vec_working (rowid) VALUES (?)", (rowid,))
+    conn.commit()
+
+    res = _call(provider, "mnemosyne_validate", {
+        "memory_id": delete_id,
+        "action": "delete",
+        "validator": "Albedo",
+    })
+
+    assert res["status"] == "validation_delete"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM vec_working WHERE rowid = ?", (rowids[delete_id],)
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM vec_working WHERE rowid = ?", (rowids[keep_id],)
+    ).fetchone()[0] == 1
 
 
 def test_validate_delete_handles_missing_gists_table(tmp_path, monkeypatch):
