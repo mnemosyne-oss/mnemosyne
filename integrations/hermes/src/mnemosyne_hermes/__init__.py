@@ -2633,7 +2633,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # validation-log insert below. Without the guard the deletes stayed
             # pending on this long-lived connection after a failed call, and a
             # later unrelated commit made them permanent (#904).
-            from mnemosyne.core.beam import _guarded_transaction
+            from mnemosyne.core.beam import _guarded_transaction, _wm_vec_available
             with _guarded_transaction(conn):
                 if action == "delete":
                     # Cascade the memory's support rows before the parent row, so a
@@ -2644,12 +2644,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     row = conn.execute(
                         "SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)
                     ).fetchone()
-                    if row is not None:
-                        try:
-                            conn.execute("DELETE FROM vec_working WHERE rowid = ?", (row[0],))
-                        except Exception as vec_err:
-                            if "no such table" not in str(vec_err).lower():
-                                raise
+                    if row is not None and _wm_vec_available(conn):
+                        conn.execute("DELETE FROM vec_working WHERE rowid = ?", (row[0],))
                     gists_table = conn.execute(
                         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
                     ).fetchone()

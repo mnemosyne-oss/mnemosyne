@@ -315,9 +315,11 @@ def test_validate_delete_rolls_back_when_validation_log_fails(tmp_path, monkeypa
     ).fetchone()[0] == gist_count
 
 
-def test_validate_delete_removes_vec_working_row(tmp_path, monkeypatch):
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES,
+                         ids=lambda c: c.__module__)
+def test_validate_delete_removes_vec_working_row(tmp_path, monkeypatch, provider_cls):
     """The provider delete removes the target's vector row when present."""
-    provider = _provider(tmp_path, monkeypatch)
+    provider = _provider(tmp_path, monkeypatch, provider_cls=provider_cls)
     conn = provider._beam.conn
     delete_id = _seed_private(provider, "delete with vec")
     keep_id = _seed_private(provider, "keep with vec")
@@ -348,9 +350,11 @@ def test_validate_delete_removes_vec_working_row(tmp_path, monkeypatch):
     ).fetchone()[0] == 1
 
 
-def test_validate_delete_handles_missing_gists_table(tmp_path, monkeypatch):
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES,
+                         ids=lambda c: c.__module__)
+def test_validate_delete_handles_missing_gists_table(tmp_path, monkeypatch, provider_cls):
     """The optional gists table may be absent on older databases."""
-    provider = _provider(tmp_path, monkeypatch)
+    provider = _provider(tmp_path, monkeypatch, provider_cls=provider_cls)
     mid = _seed_private(provider, "delete without gists")
     provider._beam.conn.execute("DROP TABLE gists")
     provider._beam.conn.commit()
