@@ -285,6 +285,13 @@ class SyncAdapter:
 
     # --- Push --------------------------------------------------------------
 
+    def _pull_cursor(self, remote: Optional[str] = None) -> str:
+        """Return the cursor persisted by SyncEngine for this pull remote."""
+        remote_url = (remote or self.remote).rstrip("/")
+        if not remote_url:
+            return ""
+        return str(self._engine._meta_get(f"last_pull_cursor_{remote_url}") or "")
+
     def _handle_push(self) -> str:
         if not self.remote:
             return json.dumps({
@@ -302,7 +309,7 @@ class SyncAdapter:
 
         push = result.get("push") or {}
         accepted = push.get("accepted", 0)
-        cursor = str(push.get("next_cursor") or "")
+        cursor = ""
         discovered = push.get("discovered") or {}
         if not accepted and not any(discovered.values()) and not push.get("batches"):
             return json.dumps({
@@ -337,7 +344,7 @@ class SyncAdapter:
             return json.dumps({"status": "error", "error": "; ".join(result["errors"])})
 
         pull = result.get("pull") or {}
-        cursor = str(pull.get("next_cursor") or "")
+        cursor = self._pull_cursor(result.get("remote"))
         if (
             not pull.get("accepted")
             and not pull.get("events_fetched")
@@ -364,7 +371,7 @@ class SyncAdapter:
         if not engine:
             return json.dumps({"status": "error", "error": "No engine"})
 
-        cursor = engine._meta_get("last_sync_cursor") or ""
+        cursor = self._pull_cursor()
         device_id = getattr(engine, "device_id", "unknown")
 
         # Count local events

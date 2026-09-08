@@ -890,21 +890,34 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             logger.debug("Audit log init skipped: %s", exc)
 
     def _clear_provider_adapters(self) -> None:
-        """Drop adapters that retain the Beam being replaced or closed."""
-        for attr_name in ("_provider_sync_adapter", "_provider_persona_adapter"):
-            adapter = getattr(self, attr_name, None)
-            if adapter is not None:
-                shutdown = getattr(adapter, "shutdown", None)
-                if callable(shutdown):
-                    try:
-                        shutdown()
-                    except Exception:
-                        logger.debug(
-                            "Mnemosyne: could not close provider adapter %s",
-                            attr_name,
-                            exc_info=True,
-                        )
-            setattr(self, attr_name, None)
+        """Drop adapters that retain a Beam being replaced or closed."""
+        global _sync_adapter
+
+        adapters = [
+            (attr_name, getattr(self, attr_name, None))
+            for attr_name in ("_provider_sync_adapter", "_provider_persona_adapter")
+        ]
+        self._provider_sync_adapter = None
+        self._provider_persona_adapter = None
+        if globals().get("_provider") is self:
+            adapters.append(("_sync_adapter", globals().get("_sync_adapter")))
+            _sync_adapter = None
+
+        seen: Set[int] = set()
+        for attr_name, adapter in adapters:
+            if adapter is None or id(adapter) in seen:
+                continue
+            seen.add(id(adapter))
+            shutdown = getattr(adapter, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception:
+                    logger.debug(
+                        "Mnemosyne: could not close provider adapter %s",
+                        attr_name,
+                        exc_info=True,
+                    )
 
     def _audit_event(self, action: str, **kwargs) -> None:
         """Record an audit event. Never raises, never blocks."""
@@ -3414,6 +3427,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 logger.debug("Mnemosyne: could not close audit log", exc_info=True)
         self._audit = None
         self._beam = None
+        self._surface_beam = None
 
         # C13: decrement this instance's contribution to the module-level
         # active-provider count. ``_provider_active`` stays True if other

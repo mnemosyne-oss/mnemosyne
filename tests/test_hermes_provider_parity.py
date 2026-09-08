@@ -1259,6 +1259,94 @@ def test_standalone_sync_handler_binds_provider_shared_surface(
     assert observed == [surface_beam]
 
 
+def test_reinitialize_rebinds_provider_sync_adapter_to_new_surface(
+    monkeypatch, provider_modules
+):
+    for name, module in provider_modules.items():
+        surface_a = object()
+        surface_b = object()
+        constructed = []
+        handled = []
+        shutdown = []
+
+        class _Adapter:
+            def __init__(self, beam, _config):
+                self.beam = beam
+                constructed.append(beam)
+
+            def handle_tool_call(self, _tool_name, _args):
+                handled.append(self.beam)
+                return "ok"
+
+            def shutdown(self):
+                shutdown.append(self.beam)
+
+        fake_sync_module = types.ModuleType(f"{name}.sync_adapter")
+        setattr(fake_sync_module, "SyncAdapter", _Adapter)
+        monkeypatch.setitem(sys.modules, f"{name}.sync_adapter", fake_sync_module)
+        provider = module.MnemosyneMemoryProvider()
+        provider._surface_beam = surface_a
+
+        assert provider._handle_sync_tool("mnemosyne_sync_status", {}) == "ok"
+        provider.initialize("replacement", agent_context="subagent")
+        provider._surface_beam = surface_b
+        assert provider._handle_sync_tool("mnemosyne_sync_status", {}) == "ok"
+
+        assert constructed == [surface_a, surface_b]
+        assert handled == [surface_a, surface_b]
+        assert shutdown == [surface_a]
+
+        provider.shutdown()
+        assert shutdown == [surface_a, surface_b]
+        assert provider._surface_beam is None
+
+
+def test_reinitialize_rebinds_standalone_sync_handler_to_new_surface(
+    monkeypatch, provider_modules
+):
+    module = provider_modules["mnemosyne_hermes"]
+    surface_a = object()
+    surface_b = object()
+    constructed = []
+    handled = []
+    shutdown = []
+
+    class _Adapter:
+        def __init__(self, beam):
+            self.beam = beam
+            constructed.append(beam)
+
+        def handle_tool_call(self, _tool_name, _args):
+            handled.append(self.beam)
+            return "ok"
+
+        def shutdown(self):
+            shutdown.append(self.beam)
+
+    fake_sync_module = types.ModuleType("mnemosyne_hermes.sync_adapter")
+    setattr(fake_sync_module, "SyncAdapter", _Adapter)
+    monkeypatch.setitem(sys.modules, "mnemosyne_hermes.sync_adapter", fake_sync_module)
+    provider = module.MnemosyneMemoryProvider()
+    monkeypatch.setattr(module, "_provider", provider)
+    monkeypatch.setattr(module, "_sync_adapter", None)
+    provider._surface_beam = surface_a
+    handler = module._get_sync_handler("mnemosyne_sync_status")
+
+    assert handler({}) == "ok"
+    provider.initialize("replacement", agent_context="subagent")
+    provider._surface_beam = surface_b
+    assert handler({}) == "ok"
+
+    assert constructed == [surface_a, surface_b]
+    assert handled == [surface_a, surface_b]
+    assert shutdown == [surface_a]
+
+    provider.shutdown()
+    assert shutdown == [surface_a, surface_b]
+    assert module._sync_adapter is None
+    assert provider._surface_beam is None
+
+
 def test_sync_adapter_config_resolution_matches(monkeypatch, sync_modules):
     _install_fake_sync_modules(monkeypatch)
     monkeypatch.delenv("MNEMOSYNE_SYNC_REMOTE", raising=False)
@@ -1299,10 +1387,10 @@ def test_sync_adapter_key_source_file_preserves_path_case(tmp_path, sync_modules
 class _ToolEngine:
     device_id = "device-1"
 
-    def __init__(self, *, local_next_cursor: str | None = "local-cursor"):
-        self.meta = {"last_sync_cursor": "cursor-previous"}
+    def __init__(self, *, pull_cursor: str | None = "local-cursor"):
+        self.meta = {}
         self.conn = self
-        self.local_next_cursor = local_next_cursor
+        self.pull_cursor = pull_cursor
 
     def _meta_get(self, key):
         return self.meta.get(key)
@@ -1310,21 +1398,20 @@ class _ToolEngine:
     def _meta_set(self, key, value):
         self.meta[key] = value
 
-    def pull_changes(self, since_cursor=None, limit=500):
-        return {"events": [{"id": "e1"}], "next_cursor": self.local_next_cursor}
-
-    def push_changes(self, events):
-        self.pushed_events = events
-        return {"accepted": 2, "duplicates": 1, "conflicts": 1}
-
-    def sync_with(self, _remote, mode="bidirectional", api_key=None):
+    def sync_with(self, remote, mode="bidirectional", api_key=None):
         phase = {
             "accepted": 2,
             "duplicates": 1,
             "conflicts": 1,
-            "next_cursor": self.local_next_cursor,
+            "events_fetched": 2,
+            "batches": 1,
         }
+        if mode == "pull" and self.pull_cursor is not None:
+            self._meta_set(
+                f"last_pull_cursor_{remote.rstrip('/')}", self.pull_cursor
+            )
         return {
+            "remote": remote.rstrip("/"),
             "push": phase if mode == "push" else None,
             "pull": phase if mode == "pull" else None,
             "errors": [],
@@ -1340,30 +1427,16 @@ class _ToolEngine:
 def _adapter_with_tool_engine(
     module,
     *,
-    next_cursor: str | None = "remote-cursor",
-    local_next_cursor: str | None = "local-cursor",
+    pull_cursor: str | None = "remote-cursor",
 ):
     adapter = module.SyncAdapter.__new__(module.SyncAdapter)
-    adapter._engine = _ToolEngine(local_next_cursor=local_next_cursor)
-    adapter._engine.local_next_cursor = next_cursor
+    adapter._engine = _ToolEngine(pull_cursor=pull_cursor)
     adapter._error = None
     adapter.remote = "https://sync.example"
     adapter.encrypt_enabled = False
     adapter.mode = "bidirectional"
     adapter.auth_token = ""
 
-    def fake_post(_path, _payload):
-        return {
-            "status": "ok",
-            "accepted": 2,
-            "duplicates": 1,
-            "conflicts": 1,
-            "events": [{"id": "remote-1"}, {"id": "remote-2"}],
-            "next_cursor": next_cursor,
-        }
-
-    adapter._http_post = fake_post
-    adapter._post = fake_post
     return adapter
 
 
@@ -1384,7 +1457,7 @@ def test_sync_adapter_tool_results_match(sync_modules):
         "pushed": 2,
         "duplicates": 1,
         "conflicts": 1,
-        "next_cursor": "remote-cursor",
+        "next_cursor": "",
     }
     assert observed["hermes_memory_provider"]["pull"] == {
         "status": "ok",
@@ -1398,7 +1471,7 @@ def test_sync_adapter_tool_results_match(sync_modules):
 def test_sync_adapter_push_tolerates_null_next_cursor(sync_modules):
     observed = {}
     for name, module in sync_modules.items():
-        adapter = _adapter_with_tool_engine(module, next_cursor=None, local_next_cursor=None)
+        adapter = _adapter_with_tool_engine(module, pull_cursor=None)
         observed[name] = json.loads(adapter.handle_tool_call("mnemosyne_sync_push", {}))
 
     assert observed["mnemosyne_hermes"] == observed["hermes_memory_provider"]
@@ -1415,7 +1488,7 @@ def test_sync_adapter_push_tolerates_null_next_cursor(sync_modules):
 def test_sync_adapter_pull_tolerates_null_next_cursor(sync_modules):
     observed = {}
     for name, module in sync_modules.items():
-        adapter = _adapter_with_tool_engine(module, next_cursor=None)
+        adapter = _adapter_with_tool_engine(module, pull_cursor=None)
         observed[name] = json.loads(adapter.handle_tool_call("mnemosyne_sync_pull", {}))
 
     assert observed["mnemosyne_hermes"] == observed["hermes_memory_provider"]

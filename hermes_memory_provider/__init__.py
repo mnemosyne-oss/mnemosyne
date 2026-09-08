@@ -1388,6 +1388,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._memory: Optional[Any] = None
         self._beam: Optional[Any] = None
         self._surface_beam: Optional[Any] = None
+        self._sync_adapter: Optional[Any] = None
         self._shared_surface_bank = "surface"
         self._shared_surface_path: Optional[Path] = None
         # When true, mnemosyne_recall merges shared-surface results into the
@@ -1516,6 +1517,17 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 logger.debug("Audit log initialized: %s", db_path)
         except Exception as exc:
             logger.debug("Audit log init skipped: %s", exc)
+
+    def _clear_sync_adapter(self) -> None:
+        """Drop the sync adapter that retains the surface Beam being replaced."""
+        adapter = getattr(self, "_sync_adapter", None)
+        self._sync_adapter = None
+        if adapter is None:
+            return
+        try:
+            adapter.shutdown()
+        except Exception:
+            logger.debug("Mnemosyne: could not close sync adapter", exc_info=True)
 
     def _audit_event(self, action: str, **kwargs) -> None:
         """Record an audit event. Never raises, never blocks."""
@@ -1908,6 +1920,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # _beam active, causing system_prompt_block() to report "Active"
         # and handle_tool_call() to silently write into the wrong session.
         # _init_error reset complements this for the failure-recovery case.
+        self._clear_sync_adapter()
         if self._memory is not None:
             try:
                 self._memory.close()
@@ -3868,6 +3881,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 unregister_hermes_host_llm()
             except Exception as exc:
                 logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
+        self._clear_sync_adapter()
         if self._memory is not None:
             try:
                 self._memory.close()
@@ -3875,6 +3889,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 logger.debug("Mnemosyne: could not close wrapper", exc_info=True)
         self._memory = None
         self._beam = None
+        self._surface_beam = None
 
         # C13: decrement this instance's contribution to the module-level
         # active-provider count. ``_provider_active`` stays True if other

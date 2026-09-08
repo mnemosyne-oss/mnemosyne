@@ -113,6 +113,65 @@ def test_push_tool_discovers_shared_global_memory_with_surface_id(
     assert json.loads(payload["metadata_json"]) == {"safe": "kept"}
 
 
+def test_pull_tool_and_status_report_real_persisted_remote_cursor(
+    tmp_path, monkeypatch, sync_module
+):
+    source_beam = BeamMemory(
+        session_id=SHARED_SESSION_ID,
+        db_path=tmp_path / "source.db",
+    )
+    source_adapter = sync_module.SyncAdapter(
+        source_beam,
+        {"remote": "https://source.example"},
+    )
+    source_adapter._engine.log_event(
+        "remote-memory",
+        "CREATE",
+        {
+            "content": "remote shared memory",
+            "source": "sync-test",
+            "scope": "global",
+            "session_id": SHARED_SESSION_ID,
+        },
+    )
+    [remote_event] = source_adapter._engine.pull_changes()["events"]
+    remote_cursor = "remote-cursor-after-page"
+
+    def fake_urlopen(_request, **_kwargs):
+        return _Response(
+            {
+                "events": [remote_event],
+                "next_cursor": remote_cursor,
+                "has_more": False,
+            }
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    receiver_beam = BeamMemory(
+        session_id=SHARED_SESSION_ID,
+        db_path=tmp_path / "receiver.db",
+    )
+    adapter = sync_module.SyncAdapter(
+        receiver_beam,
+        {"remote": "https://sync.example"},
+    )
+
+    pull_result = json.loads(adapter.handle_tool_call("mnemosyne_sync_pull", {}))
+    status_result = json.loads(adapter.handle_tool_call("mnemosyne_sync_status", {}))
+
+    assert pull_result == {
+        "status": "ok",
+        "pulled": 1,
+        "duplicates": 0,
+        "conflicts": 0,
+        "next_cursor": remote_cursor,
+    }
+    assert status_result["last_cursor"] == remote_cursor
+    assert adapter._engine._meta_get(
+        "last_pull_cursor_https://sync.example"
+    ) == remote_cursor
+
+
 @pytest.mark.parametrize(
     ("row_session", "scope"),
     (
