@@ -19,23 +19,6 @@
 
 </div>
 
-<div align="center">
-
-### Proudly sponsored by
-
-<a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=mnemosyne">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/partners/atlas-cloud-white.png">
-    <img src="assets/partners/atlas-cloud-black.png" alt="Atlas Cloud" width="240">
-  </picture>
-</a>
-
-**Compute Partner** &nbsp;·&nbsp; inference credits powering the nightly recall benchmarks, multi-model parity tests, and provider coverage in the Hermes plugin.
-
-[Partner with Mnemosyne](https://mnemosyne.site/partners)
-
-</div>
-
 ---
 
 **Mnemosyne** is a universal, Hermes-first memory layer that works with any agent framework (Claude Code, Cursor, Codex, OpenWebUI, OpenClaw, or your own custom agent). One `pip install`, one SQLite database. No external services required.
@@ -482,26 +465,13 @@ Full docs: [`docs/`](docs/README.md) . Changelog: [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Sponsors
 
-Mnemosyne development is supported by companies providing compute credits (LLM, embedding, GPU), hosting, and developer tooling. See the full list and sponsorship policy at **[mnemosyne.site/partners](https://mnemosyne.site/partners)**.
+Mnemosyne development is supported by companies providing compute credits (LLM, embedding, GPU), hosting, and developer tooling. See the full list and sponsorship policy at **[mnemosyne.site/partners](https://mnemosyne.site/en/partners)**.
 
 ### Compute Partners
 
-<div align="center">
+The Compute Partner position is currently open. It is held by one inference provider at a time, whose credits run the nightly recall benchmarks and multi-model parity tests, in exchange for the top placement in this README, the partners page and a dedicated documentation page.
 
-<a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=mnemosyne">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/partners/atlas-cloud-white.png">
-    <img src="assets/partners/atlas-cloud-black.png" alt="Atlas Cloud" width="280">
-  </picture>
-</a>
-
-</div>
-
-**[Atlas Cloud](https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=mnemosyne)** -- a full-modal AI inference platform: one API for 300+ curated LLM, image, and video models, so you connect once instead of maintaining a vendor integration per modality. Their OpenAI-compatible endpoint works with Mnemosyne and the Hermes plugin out of the box.
-
-Atlas Cloud provides inference credits used for nightly recall benchmarks, multi-model parity tests, and OpenAI-compatible provider coverage. Budget-friendly API access is available through their [coding plan](https://www.atlascloud.ai/console/coding-plan?utm_source=github&utm_medium=link&utm_campaign=mnemosyne).
-
-*Sponsored. Compute Partners are disclosed material connections under FTC Endorsement Guides (16 CFR Part 255). Sponsors have no editorial control over benchmark methodology or results.*
+*Compute Partners are disclosed material connections under FTC Endorsement Guides (16 CFR Part 255). Sponsors have no editorial control over benchmark methodology or results.*
 
 ### Partner with us
 

@@ -1,7 +1,7 @@
 # Atlas Cloud
 
-[Atlas Cloud](https://atlascloud.ai) is an OpenAI-compatible model aggregator
-and a Mnemosyne sponsor. This page is a **configuration recipe** — there is no
+[Atlas Cloud](https://atlascloud.ai) is an OpenAI-compatible model aggregator.
+This page is a **configuration recipe** — there is no
 Atlas-specific code in Mnemosyne, and there is not meant to be. Everything below
 is environment variables against interfaces Mnemosyne already speaks, which is
 why the same three blocks work against OpenRouter, vLLM, or a local server with
