@@ -1234,8 +1234,13 @@ def test_standalone_sync_handler_binds_provider_shared_surface(
 
     class _Provider:
         _surface_beam = surface_beam
+        _surface_generation = 0
+        _surface_adapter_lock = threading.RLock()
 
-        def _ensure_surface_beam(self):
+        def _ensure_surface_adapter_lock(self):
+            return self._surface_adapter_lock
+
+        def _ensure_surface_beam_locked(self):
             return None
 
     class _Adapter:
@@ -1345,6 +1350,129 @@ def test_reinitialize_rebinds_standalone_sync_handler_to_new_surface(
     assert shutdown == [surface_a, surface_b]
     assert module._sync_adapter is None
     assert provider._surface_beam is None
+
+
+def test_provider_sync_construction_race_retries_current_surface(
+    monkeypatch, provider_modules
+):
+    for name, module in provider_modules.items():
+        surface_a = object()
+        surface_b = object()
+        construction_started = threading.Event()
+        release_construction = threading.Event()
+        constructed = []
+        handled = []
+        shutdown = []
+        result = []
+
+        class _Adapter:
+            def __init__(self, beam, _config):
+                self.beam = beam
+                constructed.append(beam)
+                if beam is surface_a:
+                    construction_started.set()
+                    assert release_construction.wait(5)
+
+            def handle_tool_call(self, _tool_name, _args):
+                handled.append(self.beam)
+                return "ok"
+
+            def shutdown(self):
+                shutdown.append(self.beam)
+
+        fake_sync_module = types.ModuleType(f"{name}.sync_adapter")
+        setattr(fake_sync_module, "SyncAdapter", _Adapter)
+        monkeypatch.setitem(sys.modules, f"{name}.sync_adapter", fake_sync_module)
+        provider = module.MnemosyneMemoryProvider()
+        provider._surface_beam = surface_a
+
+        worker = threading.Thread(
+            target=lambda: result.append(
+                provider._handle_sync_tool("mnemosyne_sync_status", {})
+            )
+        )
+        worker.start()
+        assert construction_started.wait(5)
+
+        provider.initialize("replacement", agent_context="subagent")
+        with provider._ensure_surface_adapter_lock():
+            provider._surface_beam = surface_b
+        release_construction.set()
+        worker.join(5)
+
+        assert not worker.is_alive()
+        assert result == ["ok"]
+        assert constructed == [surface_a, surface_b]
+        assert handled == [surface_b]
+        assert shutdown == [surface_a]
+        cache_name = (
+            "_sync_adapter"
+            if name == "hermes_memory_provider"
+            else "_provider_sync_adapter"
+        )
+        assert getattr(provider, cache_name).beam is surface_b
+
+        provider.shutdown()
+        assert shutdown == [surface_a, surface_b]
+
+
+def test_standalone_sync_construction_race_retries_current_surface(
+    monkeypatch, provider_modules
+):
+    module = provider_modules["mnemosyne_hermes"]
+    surface_a = object()
+    surface_b = object()
+    construction_started = threading.Event()
+    release_construction = threading.Event()
+    constructed = []
+    handled = []
+    shutdown = []
+    result = []
+
+    class _Adapter:
+        def __init__(self, beam):
+            self.beam = beam
+            constructed.append(beam)
+            if beam is surface_a:
+                construction_started.set()
+                assert release_construction.wait(5)
+
+        def handle_tool_call(self, _tool_name, _args):
+            handled.append(self.beam)
+            return "ok"
+
+        def shutdown(self):
+            shutdown.append(self.beam)
+
+    fake_sync_module = types.ModuleType("mnemosyne_hermes.sync_adapter")
+    setattr(fake_sync_module, "SyncAdapter", _Adapter)
+    monkeypatch.setitem(sys.modules, "mnemosyne_hermes.sync_adapter", fake_sync_module)
+    provider = module.MnemosyneMemoryProvider()
+    monkeypatch.setattr(module, "_provider", provider)
+    monkeypatch.setattr(module, "_sync_adapter", None)
+    provider._surface_beam = surface_a
+    handler = module._get_sync_handler("mnemosyne_sync_status")
+
+    worker = threading.Thread(target=lambda: result.append(handler({})))
+    worker.start()
+    assert construction_started.wait(5)
+
+    provider.initialize("replacement", agent_context="subagent")
+    with provider._ensure_surface_adapter_lock():
+        provider._surface_beam = surface_b
+    release_construction.set()
+    worker.join(5)
+
+    assert not worker.is_alive()
+    assert result == ["ok"]
+    assert constructed == [surface_a, surface_b]
+    assert handled == [surface_b]
+    assert shutdown == [surface_a]
+    assert module._sync_adapter.beam is surface_b
+
+    provider.shutdown()
+    assert shutdown == [surface_a, surface_b]
+    assert module._sync_adapter is None
 
 
 def test_sync_adapter_config_resolution_matches(monkeypatch, sync_modules):

@@ -1389,6 +1389,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._beam: Optional[Any] = None
         self._surface_beam: Optional[Any] = None
         self._sync_adapter: Optional[Any] = None
+        # Coordinates only the shared-surface Beam and adapters that retain it.
+        # Adapter construction stays outside this lock; publication validates
+        # the generation so provider reinitialization can win without caching a
+        # stale adapter.
+        self._surface_adapter_lock = threading.RLock()
+        self._surface_generation = 0
         self._shared_surface_bank = "surface"
         self._shared_surface_path: Optional[Path] = None
         # When true, mnemosyne_recall merges shared-surface results into the
@@ -1528,6 +1534,21 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             adapter.shutdown()
         except Exception:
             logger.debug("Mnemosyne: could not close sync adapter", exc_info=True)
+
+    def _ensure_surface_adapter_lock(self):
+        """Return the surface lifecycle lock, including for __new__ tests."""
+        try:
+            return self._surface_adapter_lock
+        except AttributeError:
+            return self.__dict__.setdefault(
+                "_surface_adapter_lock", threading.RLock()
+            )
+
+    def _invalidate_surface_locked(self) -> None:
+        """Invalidate adapters and their Beam as one lifecycle transition."""
+        self._clear_sync_adapter()
+        self._surface_beam = None
+        self._surface_generation = getattr(self, "_surface_generation", 0) + 1
 
     def _audit_event(self, action: str, **kwargs) -> None:
         """Record an audit event. Never raises, never blocks."""
@@ -1912,6 +1933,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize Mnemosyne beam for this session."""
+        with self._ensure_surface_adapter_lock():
+            self._initialize_locked(session_id, **kwargs)
+
+    def _initialize_locked(self, session_id: str, **kwargs) -> None:
+        """Rebuild provider state while the surface lifecycle lock is held."""
         # C27: clear stale state from any prior init attempt so a re-init
         # returns the provider to a clean slate. _beam reset is critical
         # for the primary->skip-context re-init case (codex review finding
@@ -1920,7 +1946,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # _beam active, causing system_prompt_block() to report "Active"
         # and handle_tool_call() to silently write into the wrong session.
         # _init_error reset complements this for the failure-recovery case.
-        self._clear_sync_adapter()
+        self._invalidate_surface_locked()
         if self._memory is not None:
             try:
                 self._memory.close()
@@ -1928,7 +1954,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 logger.debug("Mnemosyne: could not close prior wrapper", exc_info=True)
         self._memory = None
         self._beam = None
-        self._surface_beam = None
         self._init_error = None
 
         self._agent_context = kwargs.get("agent_context", "primary")
@@ -2700,13 +2725,32 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _handle_sync_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
         try:
-            adapter = getattr(self, "_sync_adapter", None)
-            if adapter is None:
-                from hermes_memory_provider.sync_adapter import SyncAdapter
-                self._ensure_surface_beam()
-                adapter = SyncAdapter(self._surface_beam, {})
-                self._sync_adapter = adapter
-            return adapter.handle_tool_call(tool_name, args)
+            from hermes_memory_provider.sync_adapter import SyncAdapter
+
+            while True:
+                with self._ensure_surface_adapter_lock():
+                    adapter = getattr(self, "_sync_adapter", None)
+                    if adapter is not None:
+                        return adapter.handle_tool_call(tool_name, args)
+                    self._ensure_surface_beam_locked()
+                    surface_beam = self._surface_beam
+                    generation = getattr(self, "_surface_generation", 0)
+
+                candidate = SyncAdapter(surface_beam, {})
+                with self._ensure_surface_adapter_lock():
+                    if (
+                        generation != getattr(self, "_surface_generation", 0)
+                        or self._surface_beam is not surface_beam
+                    ):
+                        candidate.shutdown()
+                        continue
+                    adapter = getattr(self, "_sync_adapter", None)
+                    if adapter is None:
+                        adapter = candidate
+                        self._sync_adapter = adapter
+                    else:
+                        candidate.shutdown()
+                    return adapter.handle_tool_call(tool_name, args)
         except Exception as exc:
             return json.dumps({
                 "status": "error",
@@ -2928,6 +2972,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         return f"{label}: {content}"
 
     def _ensure_surface_beam(self) -> None:
+        with self._ensure_surface_adapter_lock():
+            self._ensure_surface_beam_locked()
+
+    def _ensure_surface_beam_locked(self) -> None:
         if self._surface_beam is not None:
             return
         BeamMemory = _get_beam_class()
@@ -3881,7 +3929,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 unregister_hermes_host_llm()
             except Exception as exc:
                 logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
-        self._clear_sync_adapter()
+        with self._ensure_surface_adapter_lock():
+            self._invalidate_surface_locked()
         if self._memory is not None:
             try:
                 self._memory.close()
@@ -3889,7 +3938,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 logger.debug("Mnemosyne: could not close wrapper", exc_info=True)
         self._memory = None
         self._beam = None
-        self._surface_beam = None
 
         # C13: decrement this instance's contribution to the module-level
         # active-provider count. ``_provider_active`` stays True if other
