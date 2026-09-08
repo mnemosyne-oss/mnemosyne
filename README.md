@@ -465,7 +465,7 @@ Full docs: [`docs/`](docs/README.md) . Changelog: [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Sponsors
 
-Mnemosyne development is supported by companies providing compute credits (LLM, embedding, GPU), hosting, and developer tooling. See the full list and sponsorship policy at **[mnemosyne.site/partners](https://mnemosyne.site/en/partners)**.
+Mnemosyne development is supported by paid sponsorships and by companies providing compute credits (LLM, embedding, GPU), hosting, and developer tooling. See the full list, tiers and sponsorship policy at **[mnemosyne.site/partners](https://mnemosyne.site/en/partners)**.
 
 ### Compute Partners
 
@@ -475,7 +475,7 @@ The Compute Partner position is currently open. It is held by one inference prov
 
 ### Partner with us
 
-If your company runs an OSS credits program and wants to partner, open an issue tagged `sponsorship` or email `sponsors@mnemosyne.site`.
+Sponsorship is paid, in cash or in credits, and every placement is disclosed. To ask about the Compute Partner position or a Sponsor slot, email `sponsors@mnemosyne.site` or open an issue tagged `sponsorship`.
 
 ---
 
