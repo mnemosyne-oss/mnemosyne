@@ -211,3 +211,29 @@ def test_surface_startup_rejects_non_shared_session_without_mutation(
     assert adapter.is_ready is False
     assert "expected session" in adapter._error
     assert _database_snapshot(beam.conn) == before
+
+
+@pytest.mark.parametrize(
+    "tool_name", ["mnemosyne_sync_push", "mnemosyne_sync_pull"]
+)
+def test_sync_tool_reports_joined_engine_errors(sync_module, tool_name):
+    class _ErrorEngine:
+        def sync_with(self, *_args, **_kwargs):
+            return {
+                "push": None,
+                "pull": None,
+                "errors": ["first sync failure", "second sync failure"],
+            }
+
+    adapter = sync_module.SyncAdapter.__new__(sync_module.SyncAdapter)
+    adapter._engine = _ErrorEngine()
+    adapter._error = None
+    adapter.remote = "https://sync.example"
+    adapter.auth_token = ""
+
+    result = json.loads(adapter.handle_tool_call(tool_name, {}))
+
+    assert result == {
+        "status": "error",
+        "error": "first sync failure; second sync failure",
+    }

@@ -1475,6 +1475,78 @@ def test_standalone_sync_construction_race_retries_current_surface(
     assert module._sync_adapter is None
 
 
+@pytest.mark.parametrize("invalidation", ["generation", "provider"])
+def test_standalone_sync_construction_retry_exhaustion_is_fail_soft(
+    monkeypatch, provider_modules, invalidation
+):
+    module = provider_modules["mnemosyne_hermes"]
+    max_attempts = module._SYNC_ADAPTER_MAX_ATTEMPTS
+    construction_started = [threading.Event() for _ in range(max_attempts)]
+    release_construction = [threading.Event() for _ in range(max_attempts)]
+    constructed = []
+    shutdown = []
+    result = []
+
+    class _Provider:
+        def __init__(self, surface):
+            self._surface_beam = surface
+            self._surface_generation = 0
+            self._surface_adapter_lock = threading.RLock()
+
+        def _ensure_surface_adapter_lock(self):
+            return self._surface_adapter_lock
+
+        def _ensure_surface_beam_locked(self):
+            return None
+
+    class _Adapter:
+        def __init__(self, beam):
+            self.beam = beam
+            attempt = len(constructed)
+            constructed.append(beam)
+            if attempt >= max_attempts:
+                raise AssertionError("retry limit was exceeded")
+            construction_started[attempt].set()
+            assert release_construction[attempt].wait(5)
+
+        def handle_tool_call(self, _tool_name, _args):
+            raise AssertionError("an invalidated adapter must not handle the call")
+
+        def shutdown(self):
+            shutdown.append(self.beam)
+
+    fake_sync_module = types.ModuleType("mnemosyne_hermes.sync_adapter")
+    setattr(fake_sync_module, "SyncAdapter", _Adapter)
+    monkeypatch.setitem(sys.modules, "mnemosyne_hermes.sync_adapter", fake_sync_module)
+    provider = _Provider(object())
+    monkeypatch.setattr(module, "_provider", provider)
+    monkeypatch.setattr(module, "_sync_adapter", None)
+    handler = module._get_sync_handler("mnemosyne_sync_status")
+
+    worker = threading.Thread(target=lambda: result.append(handler({})))
+    worker.start()
+    for attempt in range(max_attempts):
+        assert construction_started[attempt].wait(5)
+        current_provider = module._provider
+        with current_provider._ensure_surface_adapter_lock():
+            if invalidation == "generation":
+                current_provider._surface_generation += 1
+                current_provider._surface_beam = object()
+            else:
+                module._provider = _Provider(object())
+        release_construction[attempt].set()
+    worker.join(5)
+
+    assert not worker.is_alive()
+    assert json.loads(result[0]) == {
+        "status": "error",
+        "error": "Sync adapter unavailable. Install mnemosyne-memory[sync].",
+    }
+    assert len(constructed) == max_attempts
+    assert shutdown == constructed
+    assert module._sync_adapter is None
+
+
 def test_sync_adapter_config_resolution_matches(monkeypatch, sync_modules):
     _install_fake_sync_modules(monkeypatch)
     monkeypatch.delenv("MNEMOSYNE_SYNC_REMOTE", raising=False)

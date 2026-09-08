@@ -1370,6 +1370,7 @@ def test_auto_sleep_eligibility_and_snapshot_share_switch_lock(
 
 
 def test_reinitialize_rebuilds_beam_bound_tool_adapters(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mnemosyne_hermes import persona_adapter as persona_adapter_module
@@ -1419,6 +1420,7 @@ def test_reinitialize_rebuilds_beam_bound_tool_adapters(
     )
 
     provider, _ = _provider_with_recording_beam()
+    provider._shared_surface_path = tmp_path / "shared.db"
     provider.has_tool = lambda _name: True
     try:
         assert (

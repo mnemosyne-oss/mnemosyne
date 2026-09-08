@@ -194,6 +194,7 @@ class SyncAdapter:
                     "sync requires the dedicated global shared surface; "
                     f"expected session {_SURFACE_SESSION_ID!r}"
                 )
+            # SQLite IS NOT is null-safe, so NULL scope/session values are invalid.
             existing_rows, invalid_rows = beam.conn.execute(
                 """SELECT COUNT(*), COALESCE(SUM(
                        CASE WHEN scope IS NOT 'global' OR session_id IS NOT ? THEN 1 ELSE 0 END

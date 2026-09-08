@@ -3589,6 +3589,7 @@ def register(ctx):
 
 # Lazy-init sync adapter for standalone plugin (v0.2.0)
 _sync_adapter: Optional[Any] = None
+_SYNC_ADAPTER_MAX_ATTEMPTS = 3
 
 def _get_sync_handler(tool_name: str):
     """Return a handler fn that lazy-inits SyncAdapter on first use."""
@@ -3597,7 +3598,7 @@ def _get_sync_handler(tool_name: str):
         try:
             from mnemosyne_hermes.sync_adapter import SyncAdapter as SA
 
-            while True:
+            for _attempt in range(_SYNC_ADAPTER_MAX_ATTEMPTS):
                 provider = _provider
                 if provider is None:
                     raise RuntimeError("Mnemosyne provider is not initialized")
@@ -3624,6 +3625,7 @@ def _get_sync_handler(tool_name: str):
                     else:
                         candidate.shutdown()
                     return _sync_adapter.handle_tool_call(tool_name, args)
+            raise RuntimeError("Sync adapter surface changed during every construction attempt")
         except Exception:
             return json.dumps({
                 "status": "error",
