@@ -2139,7 +2139,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             adapter = getattr(self, "_provider_sync_adapter", None)
             if adapter is None:
                 from mnemosyne_hermes.sync_adapter import SyncAdapter
-                adapter = SyncAdapter(self._beam, {})
+                self._ensure_surface_beam()
+                adapter = SyncAdapter(self._surface_beam, {})
                 self._provider_sync_adapter = adapter
             return adapter.handle_tool_call(tool_name, args)
         except Exception as exc:
@@ -3540,7 +3541,10 @@ def _get_sync_handler(tool_name: str):
         if _sync_adapter is None:
             try:
                 from mnemosyne_hermes.sync_adapter import SyncAdapter as SA
-                _sync_adapter = SA(None)  # config resolved from env
+                if _provider is None:
+                    raise RuntimeError("Mnemosyne provider is not initialized")
+                _provider._ensure_surface_beam()
+                _sync_adapter = SA(_provider._surface_beam)
             except Exception:
                 return json.dumps({
                     "status": "error",

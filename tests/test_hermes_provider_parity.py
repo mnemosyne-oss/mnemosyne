@@ -1126,9 +1126,10 @@ def test_sync_adapter_schema_and_lifecycle_surface_match(sync_modules):
 
 
 class _FakeSyncEngine:
-    def __init__(self, beam_instance, encryption=None):
+    def __init__(self, beam_instance, encryption=None, **kwargs):
         self.beam_instance = beam_instance
         self.encryption = encryption
+        self.kwargs = kwargs
         self.device_id = "fake-device"
 
 
@@ -1147,6 +1148,19 @@ class _UnexpectedBeam:
         self.kwargs = kwargs
 
 
+class _FakeSurfaceConnection:
+    def execute(self, _sql, _params=()):
+        return self
+
+    def fetchone(self):
+        return (0, 0)
+
+
+class _FakeSurfaceBeam:
+    session_id = "hermes_shared_surface"
+    conn = _FakeSurfaceConnection()
+
+
 def _install_fake_sync_modules(monkeypatch):
     import types
 
@@ -1162,11 +1176,87 @@ def _install_fake_sync_modules(monkeypatch):
 def test_sync_adapter_uses_provider_beam_for_both_surfaces(monkeypatch, sync_modules):
     _install_fake_sync_modules(monkeypatch)
 
-    provider_beam = object()
+    provider_beam = _FakeSurfaceBeam()
     for module in sync_modules.values():
         adapter = module.SyncAdapter(provider_beam, {})
         assert adapter.is_ready is True
         assert adapter._engine.beam_instance is provider_beam
+        assert adapter._engine.kwargs == {
+            "surface_only": True,
+            "surface_id": "shared-surface-v1",
+            "initialize_surface": True,
+            "claim_existing_surface": False,
+        }
+
+
+def test_provider_sync_tools_bind_to_shared_surface(
+    monkeypatch, provider_modules
+):
+    for name, module in provider_modules.items():
+        private_beam = object()
+        surface_beam = object()
+        observed = []
+
+        class _Adapter:
+            def __init__(self, beam, _config):
+                observed.append(beam)
+
+            def handle_tool_call(self, tool_name, args):
+                return json.dumps({"tool": tool_name, "args": args})
+
+        fake_sync_module = types.ModuleType(f"{name}.sync_adapter")
+        setattr(fake_sync_module, "SyncAdapter", _Adapter)
+        monkeypatch.setitem(sys.modules, f"{name}.sync_adapter", fake_sync_module)
+        provider = module.MnemosyneMemoryProvider.__new__(
+            module.MnemosyneMemoryProvider
+        )
+        provider._beam = private_beam
+        provider._surface_beam = surface_beam
+        if name == "hermes_memory_provider":
+            provider._sync_adapter = None
+        else:
+            provider._provider_sync_adapter = None
+
+        result = json.loads(
+            provider._handle_sync_tool("mnemosyne_sync_status", {})
+        )
+
+        assert result["tool"] == "mnemosyne_sync_status"
+        assert observed == [surface_beam]
+
+
+def test_standalone_sync_handler_binds_provider_shared_surface(
+    monkeypatch, provider_modules
+):
+    module = provider_modules["mnemosyne_hermes"]
+    surface_beam = object()
+    observed = []
+
+    class _Provider:
+        _surface_beam = surface_beam
+
+        def _ensure_surface_beam(self):
+            return None
+
+    class _Adapter:
+        def __init__(self, beam):
+            observed.append(beam)
+
+        def handle_tool_call(self, tool_name, args):
+            return json.dumps({"tool": tool_name, "args": args})
+
+    fake_sync_module = types.ModuleType("mnemosyne_hermes.sync_adapter")
+    setattr(fake_sync_module, "SyncAdapter", _Adapter)
+    monkeypatch.setitem(
+        sys.modules, "mnemosyne_hermes.sync_adapter", fake_sync_module
+    )
+    monkeypatch.setattr(module, "_provider", _Provider())
+    monkeypatch.setattr(module, "_sync_adapter", None)
+
+    result = json.loads(module._get_sync_handler("mnemosyne_sync_status")({}))
+
+    assert result["tool"] == "mnemosyne_sync_status"
+    assert observed == [surface_beam]
 
 
 def test_sync_adapter_config_resolution_matches(monkeypatch, sync_modules):
@@ -1177,7 +1267,9 @@ def test_sync_adapter_config_resolution_matches(monkeypatch, sync_modules):
 
     observed = {}
     for name, module in sync_modules.items():
-        adapter = module.SyncAdapter(object(), {"encrypt": True, "key": "encoded-key"})
+        adapter = module.SyncAdapter(
+            _FakeSurfaceBeam(), {"encrypt": True, "key": "encoded-key"}
+        )
         observed[name] = {
             "remote": adapter.remote,
             "encryption_key_source": adapter._engine.encryption.key_source,
@@ -1225,6 +1317,19 @@ class _ToolEngine:
         self.pushed_events = events
         return {"accepted": 2, "duplicates": 1, "conflicts": 1}
 
+    def sync_with(self, _remote, mode="bidirectional", api_key=None):
+        phase = {
+            "accepted": 2,
+            "duplicates": 1,
+            "conflicts": 1,
+            "next_cursor": self.local_next_cursor,
+        }
+        return {
+            "push": phase if mode == "push" else None,
+            "pull": phase if mode == "pull" else None,
+            "errors": [],
+        }
+
     def execute(self, _sql):
         return self
 
@@ -1240,6 +1345,7 @@ def _adapter_with_tool_engine(
 ):
     adapter = module.SyncAdapter.__new__(module.SyncAdapter)
     adapter._engine = _ToolEngine(local_next_cursor=local_next_cursor)
+    adapter._engine.local_next_cursor = next_cursor
     adapter._error = None
     adapter.remote = "https://sync.example"
     adapter.encrypt_enabled = False

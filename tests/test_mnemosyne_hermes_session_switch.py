@@ -1423,7 +1423,7 @@ def test_reinitialize_rebuilds_beam_bound_tool_adapters(
     try:
         assert (
             provider.handle_tool_call("mnemosyne_sync_status", {})
-            == "hermes_SESS-A"
+            == "hermes_shared_surface"
         )
         assert (
             provider.handle_tool_call("mnemosyne_persona_list", {})
@@ -1434,21 +1434,21 @@ def test_reinitialize_rebuilds_beam_bound_tool_adapters(
 
         assert (
             provider.handle_tool_call("mnemosyne_sync_status", {})
-            == "hermes_SESS-B"
+            == "hermes_shared_surface"
         )
         assert (
             provider.handle_tool_call("mnemosyne_persona_list", {})
             == "hermes_SESS-B"
         )
-        assert sync_constructed == ["hermes_SESS-A", "hermes_SESS-B"]
+        assert sync_constructed == ["hermes_shared_surface", "hermes_shared_surface"]
         assert persona_constructed == ["hermes_SESS-A", "hermes_SESS-B"]
-        assert sync_handled == ["hermes_SESS-A", "hermes_SESS-B"]
+        assert sync_handled == ["hermes_shared_surface", "hermes_shared_surface"]
         assert persona_handled == ["hermes_SESS-A", "hermes_SESS-B"]
-        assert sync_shutdown == ["hermes_SESS-A"]
+        assert sync_shutdown == ["hermes_shared_surface"]
     finally:
         provider.shutdown()
 
-    assert sync_shutdown == ["hermes_SESS-A", "hermes_SESS-B"]
+    assert sync_shutdown == ["hermes_shared_surface", "hermes_shared_surface"]
     assert provider._provider_sync_adapter is None
     assert provider._provider_persona_adapter is None
 
