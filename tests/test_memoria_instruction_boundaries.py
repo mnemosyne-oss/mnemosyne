@@ -105,6 +105,83 @@ def test_extractor_end_to_end_still_stores_first_person_negation():
 
 
 @pytest.mark.parametrize(
+    "locale,embedded_token,first_person,expected_object",
+    [
+        (
+            "en",
+            "The API never returns the full payload for large queries",
+            "I never use the deprecated endpoint in production deployments.",
+            "use the deprecated endpoint in production deployments",
+        ),
+        (
+            "de",
+            "Der Teich nicht weiter für diese Anfrage verwendet wird",
+            "Ich nicht verwende den alten API-Endpunkt in der Produktion.",
+            "verwende den alten API-Endpunkt in der Produktion",
+        ),
+        (
+            "ru",
+            "Края никогда не используются в этом Produktionssystem",
+            "Я никогда не использую этот veralteten Endpunkt in Produktion",
+            "Я никогда не использую этот veralteten Endpunkt in Produktion",
+        ),
+        (
+            "it",
+            "Lo xenon ho mai usato per queste richieste lunghe",
+            "Non ho mai usato l'endpoint deprecato in produzione",
+            "Non ho mai usato l'endpoint deprecato in produzione",
+        ),
+        (
+            "es",
+            "Anunca todos los registros permanecen disponibles siempre",
+            "Nunca los registros permanecen disponibles en producción",
+            "Nunca",
+        ),
+    ],
+)
+def test_every_locale_negation_runtime_boundary_and_positive_control(
+    monkeypatch, locale, embedded_token, first_person, expected_object
+):
+    """Each locale rejects embedded tokens and keeps its real negation path.
+
+    The language detector is fixed only to isolate the locale pattern contract;
+    both inputs otherwise go through ``extract_and_store_facts`` and its real
+    knowledge-graph insertion path.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        mem = BeamMemory(session_id=f"test-559-{locale}", db_path=Path(tmp) / "memories.db")
+        monkeypatch.setattr(mem, "detect_language", lambda _content: locale)
+        try:
+            negative_counts = mem.extract_and_store_facts(
+                embedded_token,
+                source_memory_id="mem-559-negative",
+            )
+            negative_rows = mem.conn.execute(
+                "SELECT subject, predicate, object FROM memoria_kg "
+                "WHERE source_memory_id = ? AND predicate = 'negation'",
+                ("mem-559-negative",),
+            ).fetchall()
+            assert negative_counts["negation"] == 0
+            assert negative_rows == []
+
+            positive_counts = mem.extract_and_store_facts(
+                first_person,
+                source_memory_id="mem-559-positive",
+            )
+            positive_rows = mem.conn.execute(
+                "SELECT subject, predicate, object FROM memoria_kg "
+                "WHERE source_memory_id = ? AND predicate = 'negation'",
+                ("mem-559-positive",),
+            ).fetchall()
+            assert positive_counts["negation"] == 1
+            assert [tuple(row) for row in positive_rows] == [
+                ("user", "negation", expected_object)
+            ]
+        finally:
+            mem.conn.close()
+
+
+@pytest.mark.parametrize(
     "content",
     [
         "Good - whenever needed we can use it. I've disabled it.",
