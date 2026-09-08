@@ -42,6 +42,68 @@ def test_every_locale_instruction_pattern_is_boundary_anchored(locale):
     )
 
 
+@pytest.mark.parametrize("locale", LOCALES)
+def test_every_locale_negation_pattern_is_boundary_anchored(locale):
+    """Guard: no locale may reintroduce an unanchored negation pattern."""
+    pattern = BeamMemory.MULTILINGUAL_PATTERNS[locale]["negation"]
+    assert pattern.startswith(r"\b"), (
+        f"{locale} negation pattern is not word-boundary anchored; "
+        "third-person text may be stored as a first-person negation"
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "The API never returns the full payload for large queries",
+        "Hi never mind the config change we discussed",
+    ],
+)
+def test_extractor_end_to_end_does_not_store_third_person_negation(content):
+    """Third-person text must not reach the stored user-negation path (#559)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        mem = BeamMemory(session_id="test-559", db_path=Path(tmp) / "memories.db")
+        try:
+            counts = mem.extract_and_store_facts(
+                content,
+                source_memory_id="mem-559",
+            )
+            stored = mem.conn.execute(
+                "SELECT subject, predicate, object FROM memoria_kg "
+                "WHERE source_memory_id = ? AND predicate = 'negation'",
+                ("mem-559",),
+            ).fetchall()
+            assert counts["negation"] == 0
+            assert stored == []
+        finally:
+            mem.conn.close()
+
+
+def test_extractor_end_to_end_still_stores_first_person_negation():
+    """The boundary must preserve genuine first-person negation extraction."""
+    with tempfile.TemporaryDirectory() as tmp:
+        mem = BeamMemory(session_id="test-559-positive", db_path=Path(tmp) / "memories.db")
+        try:
+            counts = mem.extract_and_store_facts(
+                "I never return the full payload without validating it first",
+                source_memory_id="mem-559-positive",
+            )
+            stored = mem.conn.execute(
+                "SELECT subject, predicate, object FROM memoria_kg "
+                "WHERE source_memory_id = ? AND predicate = 'negation'",
+                ("mem-559-positive",),
+            ).fetchall()
+            assert counts["negation"] == 1
+            assert len(stored) == 1
+            assert tuple(stored[0]) == (
+                "user",
+                "negation",
+                "return the full payload without validating it first",
+            )
+        finally:
+            mem.conn.close()
+
+
 @pytest.mark.parametrize(
     "content",
     [
