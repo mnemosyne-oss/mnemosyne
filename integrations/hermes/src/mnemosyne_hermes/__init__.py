@@ -2687,6 +2687,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                      note or None),
                 )
         except Exception as exc:
+            # The guard above has already rolled the mutation back; log before
+            # failing soft so a schema or database fault in the cascade leaves a
+            # Hermes-side trace rather than only a JSON error string.
+            logger.exception("Mnemosyne: validate %s failed for %s", action, memory_id)
             return json.dumps({
                 "error": "validation_failed",
                 "reason": str(exc),

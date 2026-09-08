@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -313,6 +314,36 @@ def test_validate_delete_rolls_back_when_validation_log_fails(tmp_path, monkeypa
     assert conn.execute(
         "SELECT COUNT(*) FROM gists WHERE memory_id = ?", (mid,)
     ).fetchone()[0] == gist_count
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES,
+                         ids=lambda c: c.__module__)
+def test_validate_delete_logs_the_failure_it_swallows(tmp_path, monkeypatch, provider_cls,
+                                                      caplog):
+    """A failed cascade must leave a server-side trace, not just a JSON error."""
+    provider = _provider(tmp_path, monkeypatch, provider_cls=provider_cls)
+    conn = provider._beam.conn
+    mid = _seed_private(provider, "delete that fails")
+    conn.execute(
+        "CREATE TRIGGER fail_validation_log "
+        "BEFORE INSERT ON memory_validations "
+        "BEGIN SELECT RAISE(ABORT, 'forced validation-log failure'); END"
+    )
+    conn.commit()
+
+    with caplog.at_level(logging.ERROR, logger=provider_cls.__module__):
+        res = _call(provider, "mnemosyne_validate", {
+            "memory_id": mid,
+            "action": "delete",
+            "validator": "Albedo",
+        })
+
+    assert res["error"] == "validation_failed"
+    assert any(
+        "forced validation-log failure" in r.getMessage()
+        or (r.exc_info and "forced validation-log failure" in str(r.exc_info[1]))
+        for r in caplog.records
+    ), "cascade failure was swallowed without a log record"
 
 
 @pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES,
