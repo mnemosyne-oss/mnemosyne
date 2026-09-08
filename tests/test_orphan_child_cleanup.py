@@ -29,6 +29,10 @@ def _seed_children(beam: BeamMemory, memory_id: str) -> None:
         "VALUES (?, 'fact', 'test annotation', 'test', 1.0, CURRENT_TIMESTAMP)",
         (memory_id,),
     )
+    beam.conn.execute(
+        "INSERT INTO gists (id, text, memory_id) VALUES (?, ?, ?)",
+        (f"gist-{memory_id}", "test gist", memory_id),
+    )
     beam.conn.commit()
 
 
@@ -55,17 +59,20 @@ def test_mcp_validate_delete_cascades_only_target_children(beam: BeamMemory):
     _seed_children(beam, keep_id)
     _seed_children(beam, delete_id)
     keep_annotation_count = _count(beam, "annotations", keep_id)
+    keep_gist_count = _count(beam, "gists", keep_id)
 
     result = _validate_delete(beam, delete_id)
 
     assert result["status"] == "validation_delete"
     assert _count(beam, "memory_embeddings", delete_id) == 0
     assert _count(beam, "annotations", delete_id) == 0
+    assert _count(beam, "gists", delete_id) == 0
     assert beam.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE id = ?", (delete_id,)
     ).fetchone()[0] == 0
     assert _count(beam, "memory_embeddings", keep_id) == 1
     assert _count(beam, "annotations", keep_id) == keep_annotation_count
+    assert _count(beam, "gists", keep_id) == keep_gist_count
     assert beam.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE id = ?", (keep_id,)
     ).fetchone()[0] == 1
@@ -76,6 +83,7 @@ def test_mcp_validate_delete_rolls_back_on_child_failure(beam: BeamMemory):
     memory_id = beam.remember("must survive failed delete", source="test", importance=0.5)
     _seed_children(beam, memory_id)
     annotation_count = _count(beam, "annotations", memory_id)
+    gist_count = _count(beam, "gists", memory_id)
     beam.conn.execute(
         "CREATE TRIGGER fail_annotation_delete "
         "BEFORE DELETE ON annotations "
@@ -90,6 +98,7 @@ def test_mcp_validate_delete_rolls_back_on_child_failure(beam: BeamMemory):
     assert not beam.conn.in_transaction
     assert _count(beam, "memory_embeddings", memory_id) == 1
     assert _count(beam, "annotations", memory_id) == annotation_count
+    assert _count(beam, "gists", memory_id) == gist_count
     assert beam.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
     ).fetchone()[0] == 1
@@ -162,6 +171,21 @@ def test_mcp_validate_delete_handles_missing_vec_working(beam: BeamMemory):
     assert result["status"] == "validation_delete"
     assert _count(beam, "memory_embeddings", memory_id) == 0
     assert _count(beam, "annotations", memory_id) == 0
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
+    ).fetchone()[0] == 0
+
+
+def test_mcp_validate_delete_handles_missing_gists_table(beam: BeamMemory):
+    """The optional gists table may be absent on older databases."""
+    memory_id = beam.remember("delete without gists", source="test", importance=0.5)
+    _seed_children(beam, memory_id)
+    beam.conn.execute("DROP TABLE gists")
+    beam.conn.commit()
+
+    result = _validate_delete(beam, memory_id)
+
+    assert result["status"] == "validation_delete"
     assert beam.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
     ).fetchone()[0] == 0

@@ -206,6 +206,77 @@ def test_validate_delete_removes_row(tmp_path, monkeypatch):
     assert _row(provider, mid) is None
 
 
+def test_validate_delete_cascades_support_rows(tmp_path, monkeypatch):
+    """Deleting through the provider must not leave the memory's children behind.
+
+    The provider used to remove only the working_memory row, so every delete
+    orphaned the memory's gist (and its annotations and fallback embedding)
+    permanently -- see #904.
+    """
+    provider = _provider(tmp_path, monkeypatch)
+    conn = provider._beam.conn
+    delete_id = _seed_private(provider, "stale fact with children")
+    keep_id = _seed_private(provider, "unrelated fact with children")
+
+    def seed_children(memory_id):
+        conn.execute(
+            "INSERT INTO gists (id, text, memory_id) VALUES (?, ?, ?)",
+            (f"gist-{memory_id}", "gist text", memory_id),
+        )
+        conn.execute(
+            "INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)",
+            (memory_id, "[0.1, 0.2]"),
+        )
+        conn.execute(
+            "INSERT INTO annotations "
+            "(memory_id, kind, value, source, confidence, created_at) "
+            "VALUES (?, 'fact', 'note', 'test', 1.0, CURRENT_TIMESTAMP)",
+            (memory_id,),
+        )
+        conn.commit()
+
+    def count(table, memory_id):
+        return conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE memory_id = ?", (memory_id,)
+        ).fetchone()[0]
+
+    seed_children(delete_id)
+    seed_children(keep_id)
+    keep_counts = {
+        table: count(table, keep_id)
+        for table in ("gists", "memory_embeddings", "annotations")
+    }
+
+    res = _call(provider, "mnemosyne_validate", {
+        "memory_id": delete_id,
+        "action": "delete",
+        "validator": "Albedo",
+    })
+
+    assert res["status"] == "validation_delete"
+    assert _row(provider, delete_id) is None
+    for table in ("gists", "memory_embeddings", "annotations"):
+        assert count(table, delete_id) == 0, f"{table} orphaned by delete"
+        assert count(table, keep_id) == keep_counts[table]
+
+
+def test_validate_delete_handles_missing_gists_table(tmp_path, monkeypatch):
+    """The optional gists table may be absent on older databases."""
+    provider = _provider(tmp_path, monkeypatch)
+    mid = _seed_private(provider, "delete without gists")
+    provider._beam.conn.execute("DROP TABLE gists")
+    provider._beam.conn.commit()
+
+    res = _call(provider, "mnemosyne_validate", {
+        "memory_id": mid,
+        "action": "delete",
+        "validator": "Albedo",
+    })
+
+    assert res["status"] == "validation_delete"
+    assert _row(provider, mid) is None
+
+
 # --- Cross-bank: surface validation ---------------------------------------
 
 def test_validate_works_on_shared_surface(tmp_path, monkeypatch):

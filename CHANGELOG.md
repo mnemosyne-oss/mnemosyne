@@ -45,6 +45,8 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Deleting a memory no longer leaves its gist, annotations or fallback embedding orphaned (#904).** `BeamMemory.forget_working` has cascaded a memory's support rows since #782, but two other delete paths did not go through it. `mnemosyne_validate` with `action="delete"` removed the fallback embedding, the annotations and the vector row but not the gist, and the Hermes provider's own copy of that handler removed only the `working_memory` row, so every delete through the provider stranded all four. Because `remember()` writes a gist of its own, ordinary store/delete cycles accumulated one orphan per deleted memory indefinitely; the reporting database held 1,502 of them. Both handlers now perform the same cascade as `forget_working`, in the same transaction as the parent delete, and the gist step stays guarded on the table existing so databases predating the `gists` table are unaffected. Existing orphans are not cleaned up retroactively; `mnemosyne doctor --all` continues to report them.
+
 - **Event timestamps and working-memory retention now use chronological UTC instants.** Mixed-offset and whitespace-padded timestamps are compared consistently for TTL and keep-newest limits. Consolidation preserves separately validated event dates, safely degrades invalid stored metadata, and does not strand source claims. Empty embedding results no longer roll back episodic summaries, including the non-sqlite-vec fallback. Existing records are not rewritten.
 
 - Repeated discovery of a successfully loaded canonical plugin path reuses its module and classes across plugin managers. Discovery does not hot-reload changed plugin files.

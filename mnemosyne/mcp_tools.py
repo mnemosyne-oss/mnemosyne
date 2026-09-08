@@ -575,6 +575,11 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
                     except sqlite3.OperationalError as vec_err:
                         if "no such table" not in str(vec_err).lower():
                             raise
+                gists_table = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
+                ).fetchone()
+                if gists_table is not None:
+                    conn.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
                 conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
             elif action == "update":
                 conn.execute(

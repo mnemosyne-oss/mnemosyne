@@ -3172,6 +3172,25 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Apply the action atomically
         try:
             if action == "delete":
+                # Cascade the memory's support rows before the parent row, so a
+                # delete cannot leave orphaned annotations, embeddings, vector
+                # rows or gists behind (#904).
+                conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+                conn.execute("DELETE FROM annotations WHERE memory_id = ?", (memory_id,))
+                row = conn.execute(
+                    "SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)
+                ).fetchone()
+                if row is not None:
+                    try:
+                        conn.execute("DELETE FROM vec_working WHERE rowid = ?", (row[0],))
+                    except Exception as vec_err:
+                        if "no such table" not in str(vec_err).lower():
+                            raise
+                gists_table = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
+                ).fetchone()
+                if gists_table is not None:
+                    conn.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
                 conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
             elif action == "update":
                 conn.execute(
