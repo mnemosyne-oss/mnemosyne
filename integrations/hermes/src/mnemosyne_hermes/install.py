@@ -948,8 +948,14 @@ def _validate_explicit_python(explicit_python: str | Path | None) -> None:
         )
 
 
-def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[Path]:
-    """Try to find Hermes' python executable for dep validation.
+def _find_hermes_python(
+    explicit_python: str | Path | None = None,
+    hermes_home_path: str | Path | None = None,
+) -> Optional[Path]:
+    """Try to find Hermes' Python executable for dependency validation.
+
+    ``hermes_home_path`` scopes known-root discovery to an explicit CLI home;
+    otherwise the configured default Hermes home is used.
 
     Returns None when no *validated* Hermes runtime is found. A candidate is
     never returned on the strength of sitting next to the launcher alone: the
@@ -981,7 +987,11 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
         # or fail to find it at all.
         return Path(selected).expanduser()
 
-    hermes_home_path = hermes_home()
+    hermes_home_path = (
+        Path(hermes_home_path).expanduser()
+        if hermes_home_path is not None
+        else hermes_home()
+    )
 
     # 1. Resolve the `hermes` launcher on PATH back to its venv Python.
     #    A pip/pipx-installed Hermes puts its console script next to the
@@ -2101,10 +2111,16 @@ def _runtime_python_json_error(message: str) -> int:
     return 1
 
 
-def _runtime_python_json(explicit_python: str | Path | None = None) -> int:
+def _runtime_python_json(
+    explicit_python: str | Path | None = None,
+    hermes_home_path: str | Path | None = None,
+) -> int:
     """Print the selected Hermes interpreter and version as JSON."""
     try:
-        python = _find_hermes_python(explicit_python=explicit_python)
+        python = _find_hermes_python(
+            explicit_python=explicit_python,
+            hermes_home_path=hermes_home_path,
+        )
     except ValueError as exc:
         return _runtime_python_json_error(str(exc))
 
@@ -2124,8 +2140,13 @@ def _runtime_python_json(explicit_python: str | Path | None = None) -> int:
                 str(python),
                 "-I",
                 "-S",
+                "-B",
                 "-c",
-                "import platform; print(platform.python_version())",
+                (
+                    "import json, platform; "
+                    "print(json.dumps({'runtime': 'python', "
+                    "'version': platform.python_version()}))"
+                ),
             ],
             capture_output=True,
             text=True,
@@ -2135,9 +2156,21 @@ def _runtime_python_json(explicit_python: str | Path | None = None) -> int:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return _runtime_python_json_error(f"Could not run selected Python at {python}: {exc}")
 
-    version = result.stdout.strip()
-    if result.returncode != 0 or not version:
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        payload = None
+    version = payload.get("version") if isinstance(payload, dict) else None
+    if (
+        result.returncode != 0
+        or not isinstance(payload, dict)
+        or payload.get("runtime") != "python"
+        or not isinstance(version, str)
+        or not version
+    ):
         detail = result.stderr.strip() or f"exit status {result.returncode}"
+        if result.returncode == 0 and not result.stderr.strip():
+            detail = "unexpected runtime probe response"
         return _runtime_python_json_error(
             f"Could not read Python version from {python}: {detail}"
         )
@@ -2309,7 +2342,10 @@ def run_install(
     # Both install modes need a Hermes interpreter. Symlink installs bootstrap
     # it when needed; wrapper installs validate it and record its metadata. An
     # explicit --python remains authoritative through _find_hermes_python().
-    hermes_python = _find_hermes_python(explicit_python=python)
+    hermes_python = _find_hermes_python(
+        explicit_python=python,
+        hermes_home_path=hermes_home_path,
+    )
     if mode == "wrapper" and hermes_python is None:
         print(
             "\n  ⚠ Could not identify Hermes' Python for wrapper mode.\n"
@@ -2449,7 +2485,8 @@ def main(argv: list[str] | None = None) -> int:
 
             # Dry-run: just show what would happen
             hermes_python = _find_hermes_python(
-                explicit_python=getattr(args, "python", None)
+                explicit_python=getattr(args, "python", None),
+                hermes_home_path=args.hermes_home,
             )
             if args.mode == "wrapper" and hermes_python is None:
                 print(
@@ -2543,7 +2580,7 @@ def main(argv: list[str] | None = None) -> int:
             state = plugin_state(hermes_home_path=args.hermes_home)
             target = state.target
             installed = state.installed
-            hermes_python = _find_hermes_python()
+            hermes_python = _find_hermes_python(hermes_home_path=args.hermes_home)
             print("Status for mnemosyne-hermes plugin")
             print(f"  Plugin path: {target}")
             print(f"  State: {state.status}")
@@ -2599,7 +2636,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if installed else 1
 
         if command == "runtime-python":
-            return _runtime_python_json(explicit_python=args.python)
+            return _runtime_python_json(
+                explicit_python=args.python,
+                hermes_home_path=args.hermes_home,
+            )
 
         if command == "cleanup":
             dry_run = getattr(args, "dry_run", False)
