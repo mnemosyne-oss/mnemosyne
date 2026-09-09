@@ -19,8 +19,10 @@ def beam(tmp_path: Path) -> BeamMemory:
 
 def _seed_children(beam: BeamMemory, memory_id: str) -> None:
     """Add child records that the MCP delete handler must remove."""
+    # OR REPLACE so the fixture is idempotent: with embeddings enabled, remember()
+    # has already written this row, and memory_embeddings.memory_id is a PRIMARY KEY.
     beam.conn.execute(
-        "INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)",
+        "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)",
         (memory_id, "[0.1, 0.2]"),
     )
     beam.conn.execute(

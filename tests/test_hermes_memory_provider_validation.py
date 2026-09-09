@@ -235,8 +235,12 @@ def test_validate_delete_cascades_support_rows(tmp_path, monkeypatch, provider_c
             "INSERT INTO gists (id, text, memory_id) VALUES (?, ?, ?)",
             (f"gist-{memory_id}", "gist text", memory_id),
         )
+        # OR REPLACE so the fixture is idempotent: with embeddings enabled,
+        # remember() has already written this row, and memory_embeddings.memory_id
+        # is a PRIMARY KEY.
         conn.execute(
-            "INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json) "
+            "VALUES (?, ?)",
             (memory_id, "[0.1, 0.2]"),
         )
         conn.execute(
