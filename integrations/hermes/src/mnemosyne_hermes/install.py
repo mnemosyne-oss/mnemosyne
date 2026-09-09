@@ -2095,6 +2095,57 @@ def _distribution_version(distribution: str) -> str:
         return "unavailable"
 
 
+def _runtime_python_json_error(message: str) -> int:
+    """Print a runtime Python error using the command's JSON contract."""
+    print(json.dumps({"ok": False, "error": message}))
+    return 1
+
+
+def _runtime_python_json(explicit_python: str | Path | None = None) -> int:
+    """Print the selected Hermes interpreter and version as JSON."""
+    try:
+        python = _find_hermes_python(explicit_python=explicit_python)
+    except ValueError as exc:
+        return _runtime_python_json_error(str(exc))
+
+    if python is None:
+        return _runtime_python_json_error(
+            "Could not identify Hermes' Python. Pass --python "
+            "/path/to/hermes/venv/bin/python."
+        )
+    if not python.is_file() or not os.access(python, os.X_OK):
+        return _runtime_python_json_error(
+            f"Selected Python is not an executable file: {python}"
+        )
+
+    try:
+        result = subprocess.run(
+            [
+                str(python),
+                "-I",
+                "-S",
+                "-c",
+                "import platform; print(platform.python_version())",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _runtime_python_json_error(f"Could not run selected Python at {python}: {exc}")
+
+    version = result.stdout.strip()
+    if result.returncode != 0 or not version:
+        detail = result.stderr.strip() or f"exit status {result.returncode}"
+        return _runtime_python_json_error(
+            f"Could not read Python version from {python}: {detail}"
+        )
+
+    print(json.dumps({"ok": True, "python": str(python), "version": version}))
+    return 0
+
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -2184,6 +2235,20 @@ def _parser() -> argparse.ArgumentParser:
         help="Show whether Mnemosyne is installed for Hermes memory discovery.",
     )
     subparsers.add_parser("version", help="Show installed package versions.")
+    runtime_python = subparsers.add_parser(
+        "runtime-python",
+        help="Report the Python interpreter selected for Hermes.",
+    )
+    runtime_python.add_argument(
+        "--json",
+        action="store_true",
+        required=True,
+        help="Emit the selected interpreter and version as JSON.",
+    )
+    runtime_python.add_argument(
+        "--python",
+        help="Explicit Hermes Python interpreter; bypasses automatic discovery.",
+    )
     cleanup = subparsers.add_parser(
         "cleanup",
         help="Remove all traces of Mnemosyne from Hermes plugin directory (safe, never touches database).",
@@ -2532,6 +2597,9 @@ def main(argv: list[str] | None = None) -> int:
                 print("  → Hermes Python vs install Python mismatch means the symlink exists but Hermes")
                 print("     may not be able to import mnemosyne core. Run with --dry-run to diagnose.")
             return 0 if installed else 1
+
+        if command == "runtime-python":
+            return _runtime_python_json(explicit_python=args.python)
 
         if command == "cleanup":
             dry_run = getattr(args, "dry_run", False)
