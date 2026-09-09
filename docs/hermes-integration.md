@@ -77,38 +77,16 @@ pip install -e "integrations/hermes[dev]"
 >
 > **Docker.** Inside the official Hermes container, the mounted Hermes home is `/opt/data/`, not `~/.hermes/`. Keep the side venv on that mounted volume so both it and the wrapper survive image rebuilds. The side venv must use the same Python **major/minor** as the running Hermes gateway; do not create it with an unrelated `python3` from `PATH`.
 >
-> For a launcher-based Hermes installation, first derive its runtime interpreter from the resolved `hermes` launcher. This bounded launcher-sibling probe covers only that installation shape: it checks the launcher's sibling `python`, then `python3`. It is not a reproduction of the installer's broader internal discovery. If it cannot find a sibling, **stop** and determine the real gateway interpreter from the deployment; do not substitute the current-shell Python or guess another environment.
+> Before creating the venv, obtain the interpreter that starts the **actual running Hermes gateway** from the deployment configuration or container image. Do not infer it from a `hermes` launcher sibling: wrappers and shims can place an unrelated Python next to that command. Set `HERMES_PYTHON` only after verifying that ownership with the deployment operator or runtime configuration; if it cannot be determined, stop.
 >
 > ```bash
-> HERMES_BIN="$(command -v hermes)" || {
->   printf 'Could not find the Hermes launcher on PATH\n' >&2
->   exit 1
-> }
-> HERMES_BIN="$(readlink -f "$HERMES_BIN")" || {
->   printf 'Could not resolve the Hermes launcher\n' >&2
->   exit 1
-> }
-> if [ ! -f "$HERMES_BIN" ] || [ ! -x "$HERMES_BIN" ]; then
->   printf 'Resolved Hermes launcher is not a regular executable file: %s\n' "$HERMES_BIN" >&2
+> : "${HERMES_PYTHON:?Set this to the deployment-verified Python that starts the running Hermes gateway}"
+> if [ ! -f "$HERMES_PYTHON" ] || [ ! -x "$HERMES_PYTHON" ]; then
+>   printf 'Hermes Python is not an executable file: %s\n' "$HERMES_PYTHON" >&2
 >   exit 1
 > fi
-> HERMES_BIN_DIR="$(dirname "$HERMES_BIN")"
-> if [ -f "$HERMES_BIN_DIR/python" ]; then
->   HERMES_PYTHON="$HERMES_BIN_DIR/python"
-> elif [ -f "$HERMES_BIN_DIR/python3" ]; then
->   HERMES_PYTHON="$HERMES_BIN_DIR/python3"
-> else
->   printf 'Could not find Hermes Python beside %s\n' "$HERMES_BIN" >&2
->   exit 1
-> fi
-> if [ ! -x "$HERMES_PYTHON" ]; then
->   printf 'Hermes Python is not executable: %s\n' "$HERMES_PYTHON" >&2
->   exit 1
-> fi
-> # A sibling is trusted only when it activates a real virtual environment.
-> # Otherwise it may be a system/Homebrew Python beside a launcher shim.
 > "$HERMES_PYTHON" -c 'import sys; raise SystemExit(sys.prefix == sys.base_prefix)' || {
->   printf 'Resolved Python is not a virtual-environment runtime: %s\n' "$HERMES_PYTHON" >&2
+>   printf 'Hermes Python is not a virtual-environment runtime: %s\n' "$HERMES_PYTHON" >&2
 >   exit 1
 > }
 > "$HERMES_PYTHON" --version || {
