@@ -536,6 +536,8 @@ class Mnemosyne:
                  veracity: str = "unknown",
                  trust_tier: str = None,
                  memory_type: str = None,
+                 author_id: Optional[str] = None,
+                 author_type: Optional[str] = None,
                  dedupe: bool = True) -> str:
         """
         Store a memory directly to SQLite.
@@ -618,6 +620,8 @@ class Mnemosyne:
                 veracity=veracity,
                 trust_tier=trust_tier,
                 memory_type=memory_type,
+                author_id=author_id,
+                author_type=author_type,
                 dedupe=dedupe,
             )
             timestamp = datetime.now().isoformat()
