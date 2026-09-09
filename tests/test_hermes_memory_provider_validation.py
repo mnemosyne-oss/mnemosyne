@@ -16,15 +16,17 @@ PROVIDER_CLASSES = [MnemosyneMemoryProvider, PackagedMemoryProvider]
 
 
 def _provider(tmp_path: Path, monkeypatch, agent_identity="Sisyphus",
-              provider_cls=MnemosyneMemoryProvider):
+              provider_cls=MnemosyneMemoryProvider, session_id=None):
     data_dir = tmp_path / "mnemosyne-data"
     hermes_home = tmp_path / "profiles" / agent_identity.lower()
-    hermes_home.mkdir(parents=True)
+    # exist_ok so a second provider can share one identity (and therefore one
+    # database) while running under a different session.
+    hermes_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir / "private"))
     monkeypatch.setenv("MNEMOSYNE_HOST_LLM_ENABLED", "0")
     provider = provider_cls()
     provider.initialize(
-        session_id=f"{agent_identity.lower()}-session",
+        session_id=session_id or f"{agent_identity.lower()}-session",
         hermes_home=str(hermes_home),
         agent_identity=agent_identity,
         shared_surface_path=str(data_dir / "shared" / "mnemosyne.db"),
@@ -383,6 +385,61 @@ def test_validate_delete_removes_vec_working_row(tmp_path, monkeypatch, provider
     assert conn.execute(
         "SELECT COUNT(*) FROM vec_working WHERE rowid = ?", (rowids[keep_id],)
     ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES,
+                         ids=lambda c: c.__module__)
+def test_validate_delete_refuses_a_foreign_session_private_memory(tmp_path, monkeypatch,
+                                                                  provider_cls):
+    """A private memory owned by another session must be untouchable.
+
+    forget_working already refuses this. The provider's validate(delete) cascade
+    must decide the same way, and before it removes any support row.
+    """
+    owner = _provider(tmp_path, monkeypatch, provider_cls=provider_cls,
+                      session_id="owner-session")
+    conn = owner._beam.conn
+    mid = _seed_private(owner, "private to the owning session")
+    conn.execute(
+        "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json) "
+        "VALUES (?, ?)", (mid, "[0.1, 0.2]"))
+    conn.execute(
+        "INSERT INTO gists (id, text, memory_id) VALUES (?, ?, ?)",
+        (f"gist-{mid}", "gist text", mid))
+    conn.commit()
+    assert conn.execute(
+        "SELECT scope FROM working_memory WHERE id = ?", (mid,)
+    ).fetchone()[0] == "session"
+    conn_db_path = owner._beam.db_path
+    before = {
+        table: conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE memory_id = ?", (mid,)
+        ).fetchone()[0]
+        for table in ("memory_embeddings", "gists")
+    }
+
+    # Same agent identity, different session: mnemosyne_hermes derives its
+    # database from hermes_home (per identity), so varying the identity would
+    # put the two providers on separate databases and the test would pass for
+    # the wrong reason.
+    foreign = _provider(tmp_path, monkeypatch, provider_cls=provider_cls,
+                        session_id="foreign-session")
+    assert foreign._beam.db_path == conn_db_path
+    assert foreign._beam.session_id != owner._beam.session_id
+    res = _call(foreign, "mnemosyne_validate", {
+        "memory_id": mid,
+        "action": "delete",
+        "validator": "Foreign",
+    })
+
+    assert res["error"] == "memory_not_found"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid,)
+    ).fetchone()[0] == 1
+    for table, count in before.items():
+        assert conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE memory_id = ?", (mid,)
+        ).fetchone()[0] == count, f"{table} was touched"
 
 
 @pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES,

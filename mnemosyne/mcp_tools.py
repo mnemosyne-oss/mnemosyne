@@ -30,7 +30,13 @@ except ImportError:
     CallToolResult = None
     ErrorData = None
 
-from mnemosyne.core.beam import BeamMemory, _guarded_transaction
+from mnemosyne.core.beam import (
+    BeamMemory,
+    _cross_session_enabled,
+    _guarded_transaction,
+    _session_scope_filter,
+    _session_scope_params,
+)
 
 from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
 from mnemosyne.batch_tool import (
@@ -557,6 +563,23 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
     ).fetchone()
     if not existing:
         return {"error": "memory_not_found", "memory_id": memory_id, "bank": bank}
+
+    if action == "delete":
+        # Align the destructive path with BeamMemory.forget_working: a caller may
+        # only delete a memory its own session can see, honouring the configured
+        # cross-session setting. Resolved before the cascade so a foreign private
+        # id is memory_not_found rather than a partially applied delete (#930).
+        cross_session = _cross_session_enabled()
+        scope_sql = _session_scope_filter(cross_session=cross_session)
+        scope_params = _session_scope_params(
+            target_beam.session_id, cross_session=cross_session
+        )
+        visible = conn.execute(
+            f"SELECT 1 FROM working_memory WHERE id = ? AND {scope_sql}",
+            (memory_id, *scope_params),
+        ).fetchone()
+        if visible is None:
+            return {"error": "memory_not_found", "memory_id": memory_id, "bank": bank}
 
     author_id = existing[1]
     prev_content = existing[2]

@@ -191,3 +191,48 @@ def test_mcp_validate_delete_handles_missing_gists_table(beam: BeamMemory):
     assert beam.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
     ).fetchone()[0] == 0
+
+
+def test_mcp_validate_delete_refuses_a_foreign_session_private_memory(tmp_path: Path):
+    """A private memory from another session is invisible, so nothing is deleted.
+
+    forget_working already refuses this; the validate(delete) cascade must too,
+    and must decide before removing any support row.
+    """
+    owner = BeamMemory(session_id="owner", db_path=tmp_path / "foreign.db")
+    memory_id = owner.remember("private to owner", source="test", importance=0.5)
+    _seed_children(owner, memory_id)
+    assert owner.conn.execute(
+        "SELECT scope FROM working_memory WHERE id = ?", (memory_id,)
+    ).fetchone()[0] == "session"
+    before = {
+        table: _count(owner, table, memory_id)
+        for table in ("memory_embeddings", "annotations", "gists")
+    }
+
+    foreign = BeamMemory(session_id="foreign", db_path=tmp_path / "foreign.db")
+    result = _validate_delete(foreign, memory_id)
+
+    assert result["error"] == "memory_not_found"
+    assert owner.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
+    ).fetchone()[0] == 1
+    for table, count in before.items():
+        assert _count(owner, table, memory_id) == count, f"{table} was touched"
+
+
+def test_mcp_validate_delete_allows_a_global_memory_from_another_session(tmp_path: Path):
+    """Global scope stays deletable cross-session, as forget_working allows."""
+    owner = BeamMemory(session_id="owner", db_path=tmp_path / "global.db")
+    memory_id = owner.remember("global memory", source="test", importance=0.5)
+    owner.conn.execute(
+        "UPDATE working_memory SET scope = 'global' WHERE id = ?", (memory_id,)
+    )
+    owner.conn.commit()
+    _seed_children(owner, memory_id)
+
+    foreign = BeamMemory(session_id="foreign", db_path=tmp_path / "global.db")
+    result = _validate_delete(foreign, memory_id)
+
+    assert result["status"] == "validation_delete"
+    assert _count(owner, "gists", memory_id) == 0
