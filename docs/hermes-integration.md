@@ -105,6 +105,12 @@ pip install -e "integrations/hermes[dev]"
 >   printf 'Hermes Python is not executable: %s\n' "$HERMES_PYTHON" >&2
 >   exit 1
 > fi
+> # A sibling is trusted only when it activates a real virtual environment.
+> # Otherwise it may be a system/Homebrew Python beside a launcher shim.
+> "$HERMES_PYTHON" -c 'import sys; raise SystemExit(sys.prefix == sys.base_prefix)' || {
+>   printf 'Resolved Python is not a virtual-environment runtime: %s\n' "$HERMES_PYTHON" >&2
+>   exit 1
+> }
 > "$HERMES_PYTHON" --version || {
 >   printf 'Hermes Python failed its version probe: %s\n' "$HERMES_PYTHON" >&2
 >   exit 1
