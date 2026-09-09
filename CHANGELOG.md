@@ -9,6 +9,8 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Added
 
+- **Hermes runtime-Python discovery (#938).** `mnemosyne-hermes runtime-python --json` reports the validated Python interpreter selected for Hermes, or fails closed when it cannot identify one. `--hermes-home` scopes discovery to that deployment; `--python` explicitly selects an interpreter.
+
 - **BEAM initialization status is now available through the additive public Python `BeamInitResult`.** It reports the configured embedding dimension, any dimension mismatch, and immutable stored dimensions for each vector table.
 - **Multimodal memory: images, video and audio can become recallable memories (RFCs 0002, 0003, 0004).** `BeamMemory.remember_media(ref)` takes a reference to a piece of media, registers it, describes it through a configured modality provider, and writes the description back as an ordinary memory that hybrid recall already understands. Nothing about text recall changes.
 
