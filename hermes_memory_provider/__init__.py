@@ -61,7 +61,9 @@ def _stage_pending_write(payload: Dict[str, Any]) -> str:
         "provider": "mnemosyne",
         "tool": payload.get("tool", "mnemosyne_remember"),
         "payload": payload,
-        "summary": payload.get("content", "")[:200],
+        # Non-content actions (update/forget/invalidate) may stage
+        # content=None; keep the summary None-safe.
+        "summary": str(payload.get("content") or "")[:200],
         "created_at": time.time(),
     }
     (pending_dir / f"{pid}.json").write_text(json.dumps(record, indent=2))
@@ -2848,23 +2850,56 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps(dry_run_batch(normalized))
 
         # Write-approval gate: stage each operation individually.
+        # PR #926 finding 4: preserve the COMPLETE normalized payload so
+        # approval replay can dispatch by action. update needs memory_id,
+        # invalidate needs replacement_id; dropping them here would replay
+        # every op as a content-based remember at apply time.
         if _write_approval_enabled():
             staged = []
+            staged_actions = []
             for op in normalized:
+                payload = op["payload"]
+                # #926 finding 1: only content-based ops (remember)
+                # may fabricate default values at stage time. For update
+                # (and other non-remember actions) the staged payload must
+                # carry None for absent fields so replay forwards None to
+                # update_working, which mutates ONLY the supplied fields.
+                action = op.get("action", "")
+                if action == "remember":
+                    stage_content = payload.get("content", "")
+                    stage_importance = payload.get("importance", 0.5)
+                else:
+                    stage_content = payload.get("content")
+                    stage_importance = payload.get("importance")
                 pid = _stage_pending_write({
                     "tool": "mnemosyne_batch",
-                    "action": op.get("action", ""),
-                    "content": op.get("content", ""),
-                    "importance": op.get("importance", 0.5),
-                    "source": op.get("source", "user"),
-                    "scope": op.get("scope", self._default_scope),
-                    "metadata": op.get("metadata"),
-                    "veracity": op.get("veracity"),
+                    "action": action,
+                    "index": op.get("index"),
+                    "content": stage_content,
+                    "importance": stage_importance,
+                    "source": payload.get("source", "user"),
+                    "scope": payload.get("scope", self._default_scope),
+                    "valid_until": payload.get("valid_until"),
+                    "extract_entities": payload.get("extract_entities", False),
+                    "extract": payload.get("extract", False),
+                    "metadata": payload.get("metadata"),
+                    "veracity": payload.get("veracity"),
+                    "memory_id": payload.get("memory_id"),
+                    "replacement_id": payload.get("replacement_id"),
                 })
+                # PR #926 finding 7: 'staged' carries RAW pending IDs
+                # (strings) so a client can forward response['staged']
+                # verbatim to mnemosyne_apply_pending; action metadata
+                # lives in the additive 'staged_actions' field. The
+                # historical 'pending_ids' key stays as an alias.
                 staged.append(pid)
+                staged_actions.append({"action": action, "pending_id": pid})
             return json.dumps({
                 "status": "staged",
+                "staged": staged,
                 "pending_ids": staged,
+                "staged_actions": staged_actions,
+                "staged_count": len(staged),
                 "count": len(staged),
                 "message": f"{len(staged)} writes staged for approval. Use mnemosyne_apply_pending to commit.",
             })
@@ -3492,27 +3527,75 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     failed.append({"id": pid, "error": "id mismatch"})
                     continue
                 payload = record.get("payload", {})
-                content = payload.get("content", "")
-                if not content:
-                    failed.append({"id": pid, "error": "empty content"})
+                # PR #926 finding 4: dispatch each staged record by the
+                # action captured at stage time, mirroring apply_beam_batch/
+                # _apply_one. 'update' targets the existing memory (no new
+                # record), 'forget'/'invalidate' are content-less operations
+                # and must not fall into the remember path, and
+                # replacement_id chaining is preserved. The pending record
+                # is removed ONLY after a successful replay so no approved
+                # operation is silently lost on failure.
+                action = payload.get("action") or "remember"
+
+                if action == "remember":
+                    content = payload.get("content", "")
+                    if not content:
+                        failed.append({"id": pid, "error": "empty content"})
+                        continue
+                    memory_id = self._beam.remember(
+                        content=content,
+                        importance=float(payload.get("importance", 0.5)),
+                        source=payload.get("source", "user"),
+                        scope=payload.get("scope", self._default_scope),
+                        valid_until=payload.get("valid_until"),
+                        extract_entities=bool(payload.get("extract_entities", False)),
+                        extract=bool(payload.get("extract", False)),
+                        metadata=payload.get("metadata"),
+                        veracity=clamp_veracity(
+                            payload.get("veracity"), context="mnemosyne_apply_pending"
+                        ),
+                    )
                     record_path.unlink(missing_ok=True)
+                    applied.append({"id": pid, "action": action, "memory_id": memory_id})
                     continue
 
-                memory_id = self._beam.remember(
-                    content=content,
-                    importance=float(payload.get("importance", 0.5)),
-                    source=payload.get("source", "user"),
-                    scope=payload.get("scope", self._default_scope),
-                    valid_until=payload.get("valid_until"),
-                    extract_entities=bool(payload.get("extract_entities", False)),
-                    extract=bool(payload.get("extract", False)),
-                    metadata=payload.get("metadata"),
-                    veracity=clamp_veracity(
-                        payload.get("veracity"), context="mnemosyne_apply_pending"
-                    ),
-                )
+                memory_id = str(payload.get("memory_id") or "").strip()
+                if not memory_id:
+                    failed.append({
+                        "id": pid,
+                        "error": f"memory_id is required for action {action}",
+                    })
+                    continue
+
+                if action == "update":
+                    ok = self._beam.update_working(
+                        memory_id,
+                        content=payload.get("content"),
+                        importance=(
+                            float(payload["importance"])
+                            if payload.get("importance") is not None
+                            else None
+                        ),
+                    )
+                elif action == "forget":
+                    ok = self._beam.forget_working(memory_id)
+                elif action == "invalidate":
+                    ok = self._beam.invalidate(
+                        memory_id,
+                        replacement_id=payload.get("replacement_id") or None,
+                    )
+                else:
+                    failed.append({"id": pid, "error": f"unknown action: {action}"})
+                    continue
+
+                if not ok:
+                    failed.append({
+                        "id": pid, "action": action,
+                        "memory_id": memory_id, "error": "memory_not_found",
+                    })
+                    continue
                 record_path.unlink(missing_ok=True)
-                applied.append({"id": pid, "memory_id": memory_id})
+                applied.append({"id": pid, "action": action, "memory_id": memory_id})
             except Exception as exc:
                 failed.append({"id": pid, "error": str(exc)})
 

@@ -9,6 +9,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Added
 
+- **`mnemosyne_apply_pending` now replays approved writes by their staged action.** Pending batches stage the complete normalized operation (memory_id, replacement_id, and action-specific fields) and return raw pending IDs (`staged`, forwardable verbatim to `mnemosyne_apply_pending`); action metadata is exposed through the additive `staged_actions` field. On apply, `update` mutates only the supplied fields on the existing row, `forget` deletes, and `invalidate` preserves `replacement_id` chaining — instead of re-running every approved op as a content-based remember. A failed operation never deletes its pending record, so no approved write is silently lost. Both Hermes provider surfaces (`hermes_memory_provider` and `mnemosyne_hermes`).
 - **BEAM initialization status is now available through the additive public Python `BeamInitResult`.** It reports the configured embedding dimension, any dimension mismatch, and immutable stored dimensions for each vector table.
 - **Multimodal memory: images, video and audio can become recallable memories (RFCs 0002, 0003, 0004).** `BeamMemory.remember_media(ref)` takes a reference to a piece of media, registers it, describes it through a configured modality provider, and writes the description back as an ordinary memory that hybrid recall already understands. Nothing about text recall changes.
 
