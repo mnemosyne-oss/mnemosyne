@@ -112,20 +112,13 @@ results = recall("user preferences")
 
 ## Benchmarks
 
-Mnemosyne scores competitively on the two major memory benchmarks, **LongMemEval** (ICLR 2025) and **BEAM** (ICLR 2026), both in one SQLite file with no cloud dependency.
+Mnemosyne is measured on **BEAM** (ICLR 2026), in one SQLite file with no cloud dependency. A **LongMemEval** (ICLR 2025) run is pending.
 
 > **Read the version labels.** These are point-in-time results, not a claim about the current build. The BEAM numbers were measured on **v3.0.0 (May 2026)** and predate polyphonic recall, enhanced recall, SHMR, and the persona tier. They have not been re-run since. Re-running BEAM and LongMemEval on the current tree is tracked as an open task.
 
-### LongMemEval (retrieval), measured April 2026
+### LongMemEval
 
-| System | Score | Notes |
-|--------|-------|-------|
-| **Mnemosyne (dense)** | **98.9% Recall@All@5** | Apr 2026, bge-small-en-v1.5, 100 instances |
-| Mempalace | 96.6% Recall@5 | AAAK + Palace architecture |
-| Backboard | 93.4% | Independent assessment |
-| Hindsight | 91.4% | Vectorize.io |
-
-Note that Mnemosyne's row is Recall@All@5 while Mempalace's is Recall@5; the metrics are not identical and the ordering should not be read as a strict ranking.
+A 98.9% Recall@All@5 figure from an April 2026 run was listed here until September 2026. No methodology or run log for it exists in any of the project repositories, so it has been withdrawn until LongMemEval is re-run on the current tree with a published, reproducible setup (#584).
 
 ### BEAM (end-to-end QA), measured on v3.0.0
 
