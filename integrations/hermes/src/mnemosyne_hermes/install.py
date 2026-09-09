@@ -987,56 +987,48 @@ def _find_hermes_python(
         # or fail to find it at all.
         return Path(selected).expanduser()
 
+    scoped_home = hermes_home_path is not None
     hermes_home_path = (
         Path(hermes_home_path).expanduser()
-        if hermes_home_path is not None
+        if scoped_home
         else hermes_home()
     )
 
-    # 1. Resolve the `hermes` launcher on PATH back to its venv Python.
-    #    A pip/pipx-installed Hermes puts its console script next to the
-    #    interpreter that runs it, so the Python is a sibling of the resolved
-    #    binary. Covers the common /usr/local/lib/hermes-agent/venv layout that
-    #    the hardcoded roots below miss entirely (the silent-no-op that left
-    #    provider deps out of Hermes' actual venv and produced "loaded but no
-    #    provider instance found").
-    #
-    #    The sibling is only trusted when the directory it lives in is a real
-    #    venv. `_resolve_hermes_bin` follows symlinks and wrapper `exec` hops,
-    #    but a launcher that is neither -- a script that calls the real binary
-    #    as a subprocess, or a compiled shim with no `exec` line to read --
-    #    resolves to itself and leaves `bin_dir` as the shim directory. Without
-    #    this check `~/.local/bin/python` (commonly a Homebrew or system
-    #    symlink) gets `mnemosyne-hermes[all]` installed into it while the
-    #    installer reports success (#618). An unvalidated sibling is discarded
-    #    outright rather than kept as a fallback: the only layout it uniquely
-    #    covers is a non-venv system install, which is exactly where
-    #    bootstrapping does the most damage.
-    hermes_bin = shutil.which("hermes")
-    if hermes_bin:
-        resolved = _resolve_hermes_bin(hermes_bin)
-        if resolved:
-            for candidate in _venv_python_candidates(resolved.parent.parent):
-                if _is_validated_venv_python(candidate):
-                    return candidate
+    # An explicit --hermes-home is a discovery boundary. It must never bind the
+    # selected plugin home to a launcher, active venv, or global install that
+    # belongs to another Hermes deployment.
+    if not scoped_home:
+        # 1. Resolve the `hermes` launcher on PATH back to its venv Python.
+        # A pip/pipx-installed Hermes puts its console script next to the
+        # interpreter that runs it, so the Python is a sibling of the resolved
+        # binary. Covers the common /usr/local/lib/hermes-agent/venv layout that
+        # the hardcoded roots below miss entirely.
+        hermes_bin = shutil.which("hermes")
+        if hermes_bin:
+            resolved = _resolve_hermes_bin(hermes_bin)
+            if resolved:
+                for candidate in _venv_python_candidates(resolved.parent.parent):
+                    if _is_validated_venv_python(candidate):
+                        return candidate
 
-    # 2. Check known hermes-agent checkout / install roots with a venv.
-    #    Held to the same bar as the launcher sibling above: a directory named
-    #    `venv` is not evidence that it is one. A half-removed environment, or
-    #    one whose base interpreter is gone, leaves `bin/python` in place with
-    #    no pyvenv.cfg beside it, and bootstrapping into that is the failure
-    #    this function exists to prevent.
-    for root in [
-        hermes_home_path / "hermes-agent",
-        Path.home() / "hermes-agent",
-        Path("/opt/hermes/hermes-agent"),
-        Path("/usr/local/lib/hermes-agent"),
-        Path("/usr/lib/hermes-agent"),
-    ]:
+    # Check the selected Hermes home first. With an explicit home it is the
+    # only permitted root; otherwise retain the established global fallbacks.
+    roots = [hermes_home_path / "hermes-agent"]
+    if not scoped_home:
+        roots.extend([
+            Path.home() / "hermes-agent",
+            Path("/opt/hermes/hermes-agent"),
+            Path("/usr/local/lib/hermes-agent"),
+            Path("/usr/lib/hermes-agent"),
+        ])
+    for root in roots:
         for venv_name in ("venv", ".venv"):
             for candidate in _venv_python_candidates(root / venv_name):
                 if _is_validated_venv_python(candidate):
                     return candidate
+
+    if scoped_home:
+        return None
 
     # 3. Check if we're running inside Hermes' venv ourselves.
     #    `sys.prefix != sys.base_prefix` says the *running* interpreter is in a

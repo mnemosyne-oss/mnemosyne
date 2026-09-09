@@ -1123,6 +1123,34 @@ def test_default_symlink_retains_cli_core_preflight(tmp_path, monkeypatch, capsy
     assert "mnemosyne-memory NOT found in this Python" in capsys.readouterr().err
 
 
+def test_explicit_hermes_home_excludes_path_launcher(tmp_path, monkeypatch):
+    """A scoped home wins over a different valid Hermes launcher on PATH."""
+    selected_home = tmp_path / "selected-home"
+    selected_python = _make_venv(selected_home / "hermes-agent" / "venv")
+
+    other_venv = tmp_path / "other-hermes-venv"
+    _make_venv(other_venv)
+    _write_executable(other_venv / "bin" / "hermes", "#!/bin/sh\nexit 0\n")
+    monkeypatch.setenv("PATH", str(other_venv / "bin"))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+
+    assert install._find_hermes_python(hermes_home_path=selected_home) == selected_python
+
+
+def test_explicit_hermes_home_fails_closed_without_its_runtime(tmp_path, monkeypatch):
+    """A scoped home cannot fall back to an unrelated valid launcher on PATH."""
+    selected_home = tmp_path / "selected-home"
+    other_venv = tmp_path / "other-hermes-venv"
+    _make_venv(other_venv)
+    _write_executable(other_venv / "bin" / "hermes", "#!/bin/sh\nexit 0\n")
+    monkeypatch.setenv("PATH", str(other_venv / "bin"))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+
+    assert install._find_hermes_python(hermes_home_path=selected_home) is None
+
+
 def _make_windows_venv(root: Path) -> Path:
     """Create a native Windows venv layout without changing ``os.name``."""
     scripts = root / "Scripts"
