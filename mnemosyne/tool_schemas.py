@@ -870,3 +870,72 @@ ALL_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     PERSONA_PROMOTE_SCHEMA, PERSONA_DEMOTE_SCHEMA, PERSONA_LIST_SCHEMA, PERSONA_REINFORCE_SCHEMA,
     HYGIENE_AUDIT_SCHEMA, HYGIENE_CLEAN_SCHEMA,
 ]
+
+
+# ---------------------------------------------------------------------------
+# Tenant bank declaration
+# ---------------------------------------------------------------------------
+#
+# ``_resolve_bank()`` in ``mcp_tools`` has always read ``arguments["bank"]``
+# before falling back to ``MNEMOSYNE_MCP_BANK``, so nearly every tool already
+# honours a per-call bank at runtime. Almost none of them said so in their
+# schema, which left the capability undiscoverable: a conforming MCP client
+# has no way to learn about a parameter that is not declared, and a client
+# that validates arguments against the advertised schema may strip it.
+#
+# Declaring it here rather than editing each schema literal keeps the property
+# wording identical across tools and means a tool added later cannot silently
+# forget it. Membership is decided by an explicit exemption set, so adding a
+# tool that must not take a tenant bank is a deliberate edit rather than an
+# omission.
+
+BANK_PROPERTY: Dict[str, Any] = {
+    "type": "string",
+    "description": (
+        "Memory bank to operate on. Banks are separate stores: memories written "
+        "to one are not visible to another, which is how a single MCP server "
+        "serves more than one tenant. Defaults to the server's "
+        "MNEMOSYNE_MCP_BANK, or 'default'."
+    ),
+}
+
+# Tools that must not receive a tenant bank.
+#
+# ``mnemosyne_validate`` already has a ``bank`` parameter meaning something
+# else entirely: ``private`` or ``surface``, selecting which store holds the
+# memory. Overloading that name would be a breaking change to a shipped tool,
+# so it keeps its own declaration and is tracked separately.
+#
+# The ``mnemosyne_shared_*`` tools operate on the shared surface database,
+# which is a single global store by design. A tenant bank has no meaning
+# there, and accepting one would imply an isolation guarantee that does not
+# exist.
+BANK_EXEMPT_TOOLS: frozenset = frozenset({
+    "mnemosyne_validate",
+    "mnemosyne_shared_remember",
+    "mnemosyne_shared_recall",
+    "mnemosyne_shared_forget",
+    "mnemosyne_shared_stats",
+})
+
+
+def _declare_bank(schemas: List[Dict[str, Any]]) -> None:
+    """Add ``bank`` to every non-exempt schema that does not already declare it.
+
+    Mutates in place, at import, so ``ALL_TOOL_SCHEMAS`` and everything built
+    from it observe the same objects. Schemas that already spell out their own
+    ``bank`` are left untouched.
+    """
+    for schema in schemas:
+        if schema.get("name") in BANK_EXEMPT_TOOLS:
+            continue
+        container = schema.get("parameters") or schema.get("inputSchema")
+        if not isinstance(container, dict):
+            continue
+        properties = container.setdefault("properties", {})
+        if not isinstance(properties, dict) or "bank" in properties:
+            continue
+        properties["bank"] = dict(BANK_PROPERTY)
+
+
+_declare_bank(ALL_TOOL_SCHEMAS)

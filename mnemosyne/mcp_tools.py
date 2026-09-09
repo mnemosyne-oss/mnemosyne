@@ -988,19 +988,33 @@ def _handle_import(arguments: Dict[str, Any]) -> Dict[str, Any]:
 def _handle_diagnose(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_diagnose tool call."""
     from mnemosyne.diagnose import run_diagnostics
+
+    # ``run_diagnostics`` has always accepted a bank; this handler never passed
+    # one, so a caller diagnosing tenant_a was silently told about the default
+    # bank instead. Resolved without ``_resolve_bank`` on purpose: that helper
+    # collapses "unspecified" to the literal "default", while run_diagnostics
+    # distinguishes None (the profile-root DB) from a named bank. Passing
+    # "default" where None was meant would change which database an existing
+    # caller diagnoses, so unspecified stays None.
+    bank = arguments.get("bank") or os.environ.get("MNEMOSYNE_MCP_BANK") or None
+
     result = run_diagnostics(
         repair_vec_working=bool(arguments.get("repair_vec_working", False)),
         dry_run=bool(arguments.get("dry_run", False)),
+        bank=bank,
     )
     db_path = None
     try:
-        mem = _create_instance()
+        mem = _create_instance(bank=bank or "default")
         if hasattr(mem, "beam") and hasattr(mem.beam, "db_path"):
             db_path = str(mem.beam.db_path)
     except Exception:
         pass
     if db_path:
         result["active_provider_db_path"] = db_path
+    # Name the bank that was inspected so the report cannot be read as covering
+    # a bank the caller did not ask about.
+    result["bank"] = bank
     return _serialize(result)
 
 
