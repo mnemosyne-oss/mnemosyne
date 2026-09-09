@@ -18,18 +18,48 @@
 
 ## Path A: Hermes provider install
 
-For a persistent Docker/image install, use a persistent side venv and the wrapper installer. It keeps the plugin directory independent from a rebuildable Hermes venv. Set `HERMES_HOME` to the directory that contains the active Hermes `config.yaml`; `/opt/data` below is the Docker/image example and must be replaced for other deployments:
+For a persistent Docker/image install, use a persistent side venv and the wrapper installer. It keeps the plugin directory independent from a rebuildable Hermes venv. The side venv must use the same Python **major/minor** as the running Hermes gateway; do not substitute `python3` from `PATH` or run bare `uv venv`, which may select another interpreter.
+
+Set `HERMES_HOME` to the directory that contains the active Hermes `config.yaml`; `/opt/data` below is the Docker/image example and must be replaced for other deployments. First resolve and version-probe the Hermes runtime interpreter. This launcher-sibling probe applies only when the `hermes` launcher and its Python live together; if it cannot find that interpreter, stop and determine the actual gateway Python from the deployment rather than guessing.
 
 ```bash
+HERMES_BIN="$(command -v hermes)" || {
+  printf 'Could not find the Hermes launcher on PATH\n' >&2
+  exit 1
+}
+HERMES_BIN="$(readlink -f "$HERMES_BIN")" || {
+  printf 'Could not resolve the Hermes launcher\n' >&2
+  exit 1
+}
+HERMES_BIN_DIR="$(dirname "$HERMES_BIN")"
+if [ -x "$HERMES_BIN_DIR/python" ]; then
+  HERMES_PYTHON="$HERMES_BIN_DIR/python"
+elif [ -x "$HERMES_BIN_DIR/python3" ]; then
+  HERMES_PYTHON="$HERMES_BIN_DIR/python3"
+else
+  printf 'Could not find Hermes Python beside %s\n' "$HERMES_BIN" >&2
+  exit 1
+fi
+"$HERMES_PYTHON" --version || exit 1
+```
+
+Then create the side venv with that exact interpreter and install the wrapper. Stop on the first failure; do not register or restart a partially installed provider:
+
+```bash
+set -e
 export HERMES_HOME=/opt/data
 VENV="$HERMES_HOME/.mnemosyne/venv"
-python3 -m venv "$VENV"
+"$HERMES_PYTHON" -m venv "$VENV"
+"$VENV/bin/python" -m pip --version
 "$VENV/bin/python" -m pip install --upgrade pip
 "$VENV/bin/python" -m pip install 'mnemosyne-memory[embeddings]' mnemosyne-hermes
 "$VENV/bin/mnemosyne-hermes" install --mode wrapper --python "$VENV/bin/python"
 hermes config set memory.provider mnemosyne
-hermes gateway restart
 ```
+
+If the selected Hermes Python cannot create a usable venv with pip, stop. Do not substitute an arbitrary Python or continue with a partial target. After confirming that `$VENV` is safe to replace, `uv` can create a seeded venv from the same interpreter: `uv venv --clear --seed --python "$HERMES_PYTHON" "$VENV"`. Rerun the pip probe and remaining install commands above only after that command succeeds. For native Windows persistent-side-venv wrapper instructions, use [Native Windows local install and recovery](hermes-integration.md#native-windows-local-install-and-recovery).
+
+For Docker or Compose, restart the actual deployment service using its deployment tooling. Do not substitute `hermes gateway restart` inside the container.
 
 The wrapper installer registers the provider plugin in `$HERMES_HOME/plugins`. Verify the active profile rather than adding a separate `plugins.enabled` entry:
 
@@ -212,7 +242,7 @@ Both Path A's wrapper installer and Path B's `python -m mnemosyne.install` regis
 # Path A: persistent side venv + wrapper
 export HERMES_HOME=/opt/data  # Replace with the active Hermes home
 "$HERMES_HOME/.mnemosyne/venv/bin/python" -m pip install --upgrade 'mnemosyne-memory[embeddings]' mnemosyne-hermes
-hermes gateway restart
+# For Docker or Compose, restart the actual deployment service with its deployment tooling.
 
 # Path B: direct PyPI install
 pip install --upgrade mnemosyne-memory
@@ -235,10 +265,11 @@ Set `HERMES_HOME` to the active Hermes home before removing a Path A wrapper ins
 ```bash
 export HERMES_HOME=/opt/data  # Replace with the active Hermes home
 hermes memory off  # Disable the external provider; built-in memory remains active
-hermes gateway restart  # Run from a shell outside the gateway process
 "$HERMES_HOME/.mnemosyne/venv/bin/mnemosyne-hermes" uninstall
 rm -rf "$HERMES_HOME/.mnemosyne/venv"  # Only if this venv was created by Path A
 ```
+
+For Docker or Compose, restart the actual deployment service with its deployment tooling after the wrapper is removed.
 
 ### Path B or Path D: pip/source install
 

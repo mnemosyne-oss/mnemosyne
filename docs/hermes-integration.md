@@ -312,8 +312,42 @@ Use the same selected Hermes Python:
 mode is appropriate for a persistent side virtual environment in deployments
 where that side environment is retained across Hermes updates. It does **not**
 make a direct install into a Hermes-managed virtual environment survive a Hermes
-venv rebuild or replacement. After changing a wrapper, restart or refresh the
-actual local Hermes process before checking provider state.
+venv rebuild or replacement.
+
+#### Windows persistent side-venv wrapper
+
+For a wrapper that survives replacement of the Hermes-managed virtual
+environment, create a **new, empty** side venv with the same Hermes interpreter.
+Do not use bare `uv venv`: it can select a different Python major/minor. The
+commands below refuse to overwrite an existing side venv; choose a new path or
+explicitly retire the old one only after preserving a rollback copy.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$SideVenv = Join-Path $HermesHome '.mnemosyne\venv'
+if (Test-Path -LiteralPath $SideVenv) {
+    throw "Refusing to replace existing side venv: $SideVenv"
+}
+uv venv --seed --python $HermesPython $SideVenv
+if ($LASTEXITCODE -ne 0) {
+    throw "uv could not create the side venv: $SideVenv"
+}
+$SidePython = Join-Path $SideVenv 'Scripts\python.exe'
+$SideInstaller = Join-Path $SideVenv 'Scripts\mnemosyne-hermes.exe'
+& $SidePython -m pip install "mnemosyne-memory[embeddings]" mnemosyne-hermes
+if ($LASTEXITCODE -ne 0) {
+    throw 'Mnemosyne package installation failed in the side venv'
+}
+& $SideInstaller install --mode wrapper --python $SidePython --no-profile-links
+if ($LASTEXITCODE -ne 0) {
+    throw 'Mnemosyne wrapper installation failed'
+}
+```
+
+`--seed` makes `pip` available in the side venv. If `uv` is unavailable, install
+it or create a side venv by another method that explicitly uses `$HermesPython`;
+do not fall back to an unrelated `python` on `PATH`. After changing a wrapper,
+restart or refresh the actual local Hermes process before checking provider state.
 
 #### Enable and verify
 
@@ -522,12 +556,13 @@ Mnemosyne does not currently expose a standalone REST API server.
 export HERMES_HOME=/opt/data  # Replace with the non-default Hermes home used at install time
 VENV=/path/to/venv             # The same side venv passed to the wrapper install
 hermes memory off  # Disable the external provider; built-in memory remains active
-hermes gateway restart  # Run from a shell outside the gateway process
 "$VENV/bin/mnemosyne-hermes" uninstall
 # For every profile-local wrapper, repeat the uninstall first, with that profile's Hermes home.
 HERMES_HOME=/opt/data/profiles/work "$VENV/bin/mnemosyne-hermes" uninstall
 "$VENV/bin/python" -m pip uninstall mnemosyne-hermes
 ```
+
+For Docker or Compose, restart the actual deployment service with its deployment tooling after removing the wrapper. For a local installation, restart or refresh the actual local Hermes process.
 
 `mnemosyne-hermes uninstall` removes the plugin registration at `$HERMES_HOME/plugins/mnemosyne`. Remove every profile-local wrapper before uninstalling the side-venv package.
 
