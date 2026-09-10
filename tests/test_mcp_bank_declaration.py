@@ -161,3 +161,29 @@ class TestDiagnoseBank:
 
         result = handle_tool_call("mnemosyne_diagnose", {})
         assert result.get("bank") == "server_default"
+
+
+def test_every_declared_bank_is_read_by_the_mcp_dispatcher():
+    """A schema may only advertise ``bank`` if ``mcp_tools`` dispatches it.
+
+    The persona, sync and ``mnemosyne_triple_end`` schemas live in
+    ``tool_schemas`` for the Hermes provider and are not served over MCP, so
+    ``_resolve_bank()`` never runs for them. Advertising ``bank`` there would
+    promise routing that does not exist, and it also breaks the Hermes
+    provider parity test, which pins the provider's persona schemas to these.
+    """
+    from pathlib import Path
+
+    from mnemosyne import tool_schemas as ts
+
+    dispatcher = Path(ts.__file__).with_name("mcp_tools.py").read_text()
+    offenders = [
+        s["name"]
+        for s in ts.ALL_TOOL_SCHEMAS
+        if "bank" in _properties(s)
+        and s["name"] not in BANK_EXEMPT_TOOLS
+        and f'"{s["name"]}"' not in dispatcher
+        and f"'{s['name']}'" not in dispatcher
+    ]
+    assert offenders == [], offenders
+

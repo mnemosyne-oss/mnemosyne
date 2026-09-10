@@ -910,12 +910,26 @@ BANK_PROPERTY: Dict[str, Any] = {
 # which is a single global store by design. A tenant bank has no meaning
 # there, and accepting one would imply an isolation guarantee that does not
 # exist.
+#
+# The persona, sync and ``mnemosyne_triple_end`` schemas are defined here for
+# the Hermes provider, which pins its own copies to these definitions. The MCP
+# dispatcher in ``mcp_tools`` does not serve them, so no per-call bank is ever
+# read for them; the provider resolves its bank per Hermes profile instead.
+# Declaring ``bank`` on them would advertise a parameter nothing honours.
 BANK_EXEMPT_TOOLS: frozenset = frozenset({
     "mnemosyne_validate",
     "mnemosyne_shared_remember",
     "mnemosyne_shared_recall",
     "mnemosyne_shared_forget",
     "mnemosyne_shared_stats",
+    "mnemosyne_triple_end",
+    "mnemosyne_sync_push",
+    "mnemosyne_sync_pull",
+    "mnemosyne_sync_status",
+    "mnemosyne_persona_promote",
+    "mnemosyne_persona_demote",
+    "mnemosyne_persona_list",
+    "mnemosyne_persona_reinforce",
 })
 
 
