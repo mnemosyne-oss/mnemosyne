@@ -265,26 +265,38 @@ def _sync_init_subprocess(
     )
 
 
-def test_sync_init_confirmation_is_filesystem_read_only_in_fresh_process(tmp_path):
-    db_path = tmp_path / "existing-global.db"
+@pytest.mark.parametrize(
+    ("table", "schema", "row"),
+    [
+        (
+            "working_memory",
+            "scope TEXT, session_id TEXT",
+            ("global", "hermes_shared_surface"),
+        ),
+        (
+            "memories",
+            "id TEXT, session_id TEXT",
+            ("coincidental-id", "hermes_shared_surface"),
+        ),
+    ],
+    ids=["coincidental-working-memory", "coincidental-memories"],
+)
+def test_sync_init_rejects_coincidental_schema_read_only_in_fresh_process(
+    tmp_path, table, schema, row
+):
+    db_path = tmp_path / f"coincidental-{table}.db"
     with sqlite3.connect(db_path) as conn:
-        conn.execute("CREATE TABLE working_memory (scope TEXT, session_id TEXT)")
-        conn.execute(
-            "INSERT INTO working_memory VALUES ('global', 'hermes_shared_surface')"
-        )
+        conn.execute(f"CREATE TABLE {table} ({schema})")
+        placeholders = ", ".join("?" for _ in row)
+        conn.execute(f"INSERT INTO {table} VALUES ({placeholders})", row)
     before = _snapshot_tree(tmp_path)
 
-    confirmation = _sync_init_subprocess(tmp_path, db_path)
+    rejected = _sync_init_subprocess(
+        tmp_path, db_path, "--claim-existing", "--yes"
+    )
 
-    assert confirmation.returncode == 0, confirmation.stderr
-    assert json.loads(confirmation.stdout) == {
-        "db_path": str(db_path),
-        "existing_rows": 1,
-        "invalid_rows": 0,
-        "required_flags": ["--claim-existing", "--yes"],
-        "session_id": "hermes_shared_surface",
-        "status": "confirmation_required",
-    }
+    assert rejected.returncode != 0
+    assert "not a dedicated shared-surface database" in rejected.stderr
     assert _snapshot_tree(tmp_path) == before
     assert not Path(f"{db_path}-wal").exists()
     assert not Path(f"{db_path}-shm").exists()

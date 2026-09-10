@@ -735,6 +735,36 @@ _SYNC_DEDICATED_DB_RECOVERY = (
 )
 
 
+# A sync-init claim may construct Mnemosyne and run schema migrations, so an
+# existing file must first match the complete table/column identity produced by
+# the current initializer. Older or partial layouts remain fail-closed until a
+# read-only compatibility proof is added for that exact layout.
+_SYNC_SCHEMA_FINGERPRINT = {
+    "working_memory": frozenset({
+        "id", "content", "source", "timestamp", "session_id", "importance",
+        "metadata_json", "veracity", "created_at", "memory_type",
+        "consolidated_at", "consolidation_claimed_at", "recall_count",
+        "last_recalled", "pinned", "valid_until", "superseded_by", "scope",
+        "author_id", "author_type", "channel_id", "trust_tier", "validator",
+        "validated_at", "validation_count", "event_date",
+        "event_date_precision", "temporal_tags", "corrected_by",
+    }),
+    "episodic_memory": frozenset({
+        "rowid", "id", "content", "source", "timestamp", "session_id",
+        "importance", "metadata_json", "summary_of", "veracity", "created_at",
+        "tier", "degraded_at", "memory_type", "binary_vector", "recall_count",
+        "last_recalled", "valid_until", "superseded_by", "scope", "author_id",
+        "author_type", "channel_id", "trust_tier", "validator", "validated_at",
+        "validation_count", "event_date", "event_date_precision",
+        "temporal_tags", "corrected_by",
+    }),
+    "memories": frozenset({
+        "id", "content", "source", "timestamp", "session_id", "importance",
+        "metadata_json", "created_at",
+    }),
+}
+
+
 def _sync_init_readonly_preflight(
     db_path: str, session_id: str
 ) -> tuple[Path, int, int]:
@@ -796,21 +826,26 @@ def _sync_init_readonly_preflight(
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
+            columns_by_table = {
+                table: {
+                    row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+                }
+                for table in _SYNC_SCHEMA_FINGERPRINT
+                if table in tables
+            }
+            if any(
+                not required_columns.issubset(columns_by_table.get(table, set()))
+                for table, required_columns in _SYNC_SCHEMA_FINGERPRINT.items()
+            ):
+                raise SystemExit(
+                    f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                )
+
             existing_ids: set[object] = set()
             rows_without_ids = 0
             invalid_rows = 0
-            recognized_schema = False
             for table in ("working_memory", "episodic_memory"):
-                if table not in tables:
-                    continue
-                recognized_schema = True
-                columns = {
-                    row[1] for row in conn.execute(f"PRAGMA table_info({table})")
-                }
-                if not {"scope", "session_id"}.issubset(columns):
-                    raise SystemExit(
-                        f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
-                    )
+                columns = columns_by_table[table]
                 if "id" in columns:
                     existing_ids.update(
                         row[0] for row in conn.execute(f"SELECT id FROM {table}")
@@ -830,15 +865,8 @@ def _sync_init_readonly_preflight(
             # even after a row leaves working memory. Count IDs across all three
             # stores once so mirrors require confirmation without double-counting
             # one memory, and reject foreign or ambiguous sessions.
-            if "memories" in tables:
-                recognized_schema = True
-                columns = {
-                    row[1] for row in conn.execute("PRAGMA table_info(memories)")
-                }
-                if "session_id" not in columns:
-                    raise SystemExit(
-                        f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
-                    )
+            if "memories" in columns_by_table:
+                columns = columns_by_table["memories"]
                 if "id" in columns:
                     existing_ids.update(
                         row[0] for row in conn.execute("SELECT id FROM memories")
@@ -853,10 +881,6 @@ def _sync_init_readonly_preflight(
                     (session_id,),
                 ).fetchone()[0]
 
-            if not recognized_schema:
-                raise SystemExit(
-                    f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
-                )
             existing_rows = len(existing_ids) + rows_without_ids
             return path, existing_rows, invalid_rows
         finally:
