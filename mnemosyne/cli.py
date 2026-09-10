@@ -725,6 +725,7 @@ def _read_secret_file(path: str, label: str) -> str:
 
 
 _DEFAULT_SYNC_SESSION_ID = "hermes_shared_surface"
+_DEFAULT_SYNC_SURFACE_ID = "shared-surface-v1"
 
 _SYNC_DEDICATED_DB_RECOVERY = (
     "The supplied database is not a dedicated shared-surface database. "
@@ -763,6 +764,19 @@ _SYNC_SCHEMA_FINGERPRINT = {
         "metadata_json", "created_at",
     }),
 }
+
+_SYNC_EVENT_BASE_COLUMNS = frozenset({
+    "event_id", "memory_id", "operation", "timestamp", "device_id", "payload",
+    "parent_event_ids", "importance", "expiry", "event_hash", "synced_at",
+})
+_SYNC_EVENT_SURFACE_COLUMNS = frozenset({
+    "timestamp_epoch", "surface_id", "apply_state",
+})
+_SYNC_META_COLUMNS = frozenset({"key", "value"})
+_SYNC_META_KEYS = frozenset({
+    "surface_db_id", "device_id", "configured_push_remote",
+})
+_SYNC_META_KEY_PREFIXES = ("last_pull_cursor_", "last_sync_at_")
 
 
 def _sync_init_readonly_preflight(
@@ -841,6 +855,84 @@ def _sync_init_readonly_preflight(
                     f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
                 )
 
+            surface_marker = None
+            if "sync_meta" in tables:
+                meta_info = conn.execute("PRAGMA table_info(sync_meta)").fetchall()
+                meta_columns = {row[1] for row in meta_info}
+                key_info = next((row for row in meta_info if row[1] == "key"), None)
+                value_info = next((row for row in meta_info if row[1] == "value"), None)
+                if (
+                    meta_columns != _SYNC_META_COLUMNS
+                    or key_info is None
+                    or value_info is None
+                    or str(key_info[2]).upper() != "TEXT"
+                    or str(value_info[2]).upper() != "TEXT"
+                    or key_info[5] != 1
+                    or value_info[5] != 0
+                ):
+                    raise SystemExit(
+                        f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                    )
+                meta_rows = conn.execute("SELECT key, value FROM sync_meta").fetchall()
+                unknown_meta = [
+                    key for key, _value in meta_rows
+                    if not isinstance(key, str)
+                    or (
+                        key not in _SYNC_META_KEYS
+                        and not key.startswith(_SYNC_META_KEY_PREFIXES)
+                    )
+                ]
+                markers = [
+                    value for key, value in meta_rows if key == "surface_db_id"
+                ]
+                if unknown_meta or len(markers) > 1:
+                    raise SystemExit(
+                        f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                    )
+                surface_marker = markers[0] if markers else None
+                if surface_marker not in (None, _DEFAULT_SYNC_SURFACE_ID):
+                    raise SystemExit(
+                        f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                    )
+                # Metadata without a durable marker belongs to an unscoped
+                # sync engine and is ambiguous at the surface claim boundary.
+                if meta_rows and surface_marker is None:
+                    raise SystemExit(
+                        f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                    )
+
+            if "memory_events" in tables:
+                event_columns = {
+                    row[1] for row in conn.execute(
+                        "PRAGMA table_info(memory_events)"
+                    ).fetchall()
+                }
+                if not _SYNC_EVENT_BASE_COLUMNS.issubset(event_columns):
+                    raise SystemExit(
+                        f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                    )
+                event_count = conn.execute(
+                    "SELECT COUNT(*) FROM memory_events"
+                ).fetchone()[0]
+                if event_count:
+                    if (
+                        surface_marker != _DEFAULT_SYNC_SURFACE_ID
+                        or not _SYNC_EVENT_SURFACE_COLUMNS.issubset(event_columns)
+                    ):
+                        raise SystemExit(
+                            f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                        )
+                    invalid_events = conn.execute(
+                        """SELECT COUNT(*) FROM memory_events
+                           WHERE surface_id IS NULL OR surface_id != ?
+                              OR timestamp_epoch IS NULL""",
+                        (_DEFAULT_SYNC_SURFACE_ID,),
+                    ).fetchone()[0]
+                    if invalid_events:
+                        raise SystemExit(
+                            f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                        )
+
             existing_ids: set[object] = set()
             rows_without_ids = 0
             invalid_rows = 0
@@ -859,6 +951,14 @@ def _sync_init_readonly_preflight(
                         WHERE scope IS NULL OR scope != 'global'
                            OR session_id IS NULL OR session_id != ?""",
                     (session_id,),
+                ).fetchone()[0]
+
+            working_columns = columns_by_table["working_memory"]
+            if "sync_surface_id" in working_columns:
+                invalid_rows += conn.execute(
+                    """SELECT COUNT(*) FROM working_memory
+                       WHERE sync_surface_id IS NOT NULL AND sync_surface_id != ?""",
+                    (_DEFAULT_SYNC_SURFACE_ID,),
                 ).fetchone()[0]
 
             # The legacy mirror remains semantically readable and session-bound
@@ -950,6 +1050,7 @@ def cmd_sync_init(args):
     SyncEngine(
         mem,
         surface_only=True,
+        surface_id=_DEFAULT_SYNC_SURFACE_ID,
         initialize_surface=True,
         claim_existing_surface=bool(existing_rows),
     )
