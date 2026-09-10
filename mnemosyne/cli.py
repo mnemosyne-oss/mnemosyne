@@ -768,25 +768,50 @@ def _sync_init_readonly_preflight(db_path: str, session_id: str) -> tuple[int, i
         conn = sqlite3.connect(uri, uri=True)
         try:
             conn.execute("PRAGMA query_only=ON")
-            table_exists = conn.execute(
-                """SELECT 1 FROM sqlite_master
-                   WHERE type = 'table' AND name = 'working_memory'"""
-            ).fetchone()
-            if table_exists is None:
-                return 0, 0
-            columns = {
-                row[1] for row in conn.execute("PRAGMA table_info(working_memory)")
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
             }
-            if not {"scope", "session_id"}.issubset(columns):
-                raise SystemExit(f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}")
-            existing_rows = conn.execute(
-                "SELECT COUNT(*) FROM working_memory"
-            ).fetchone()[0]
-            invalid_rows = conn.execute(
-                """SELECT COUNT(*) FROM working_memory
-                   WHERE scope != 'global' OR session_id != ?""",
-                (session_id,),
-            ).fetchone()[0]
+            existing_rows = 0
+            invalid_rows = 0
+            for table in ("working_memory", "episodic_memory"):
+                if table not in tables:
+                    continue
+                columns = {
+                    row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+                }
+                if not {"scope", "session_id"}.issubset(columns):
+                    raise SystemExit(
+                        f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                    )
+                row_count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                if table == "working_memory":
+                    existing_rows = row_count
+                invalid_rows += conn.execute(
+                    f"""SELECT COUNT(*) FROM {table}
+                        WHERE scope IS NULL OR scope != 'global'
+                           OR session_id IS NULL OR session_id != ?""",
+                    (session_id,),
+                ).fetchone()[0]
+
+            # The legacy mirror remains semantically readable and session-bound
+            # even after a row leaves working memory, so it must not carry a
+            # foreign or ambiguous session into a dedicated surface either.
+            if "memories" in tables:
+                columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(memories)")
+                }
+                if "session_id" not in columns:
+                    raise SystemExit(
+                        f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                    )
+                invalid_rows += conn.execute(
+                    """SELECT COUNT(*) FROM memories
+                       WHERE session_id IS NULL OR session_id != ?""",
+                    (session_id,),
+                ).fetchone()[0]
             return existing_rows, invalid_rows
         finally:
             conn.close()
@@ -835,11 +860,6 @@ def cmd_sync_init(args):
     )
     if invalid_rows:
         raise SystemExit(f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}")
-
-    from mnemosyne.core.memory import Mnemosyne
-    from mnemosyne.core.sync import SyncEngine
-
-    mem = Mnemosyne(db_path=parsed.db_path, session_id=parsed.session_id)
     preview = {
         "db_path": str(parsed.db_path),
         "session_id": parsed.session_id,
@@ -851,6 +871,11 @@ def cmd_sync_init(args):
         preview["required_flags"] = ["--claim-existing", "--yes"]
         print(json.dumps(preview, sort_keys=True))
         return
+
+    from mnemosyne.core.memory import Mnemosyne
+    from mnemosyne.core.sync import SyncEngine
+
+    mem = Mnemosyne(db_path=parsed.db_path, session_id=parsed.session_id)
 
     SyncEngine(
         mem,

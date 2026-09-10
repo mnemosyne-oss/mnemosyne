@@ -443,8 +443,11 @@ mnemosyne sync-serve --db-path "$SURFACE" --port 8765 \
 mnemosyne sync --db-path "$SURFACE" --remote https://my-vps:8765
 
 # With client-side encryption
-export MNEMOSYNE_SYNC_KEY=$(mnemosyne sync-generate-key)
-mnemosyne sync --db-path "$SURFACE" --remote https://my-vps:8765 --encrypt
+SYNC_KEY_FILE="$HOME/.config/mnemosyne/sync-encryption.key"
+mkdir -p "$(dirname "$SYNC_KEY_FILE")"
+(umask 077 && mnemosyne sync-generate-key > "$SYNC_KEY_FILE")
+mnemosyne sync --db-path "$SURFACE" --remote https://my-vps:8765 \
+  --encrypt-key-file "$SYNC_KEY_FILE"
 
 # Check sync status
 mnemosyne sync-status --db-path "$SURFACE" --remote https://my-vps:8765
