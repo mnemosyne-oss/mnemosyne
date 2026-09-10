@@ -735,18 +735,40 @@ _SYNC_DEDICATED_DB_RECOVERY = (
 )
 
 
-def _sync_init_readonly_preflight(db_path: str, session_id: str) -> tuple[int, int]:
-    """Classify an existing sync-init target without changing SQLite state."""
+def _sync_init_readonly_preflight(
+    db_path: str, session_id: str
+) -> tuple[Path, int, int]:
+    """Classify a sync-init target and return the identity later opened."""
     import sqlite3
 
-    path = Path(db_path).expanduser()
-    if not path.exists():
-        return 0, 0
-    if not path.is_file():
-        raise SystemExit(f"Refusing initialization: {path} is not a database file")
+    supplied_path = Path(db_path).expanduser()
+    if supplied_path.is_symlink():
+        raise SystemExit(
+            "Refusing initialization: symbolic-link database targets are not allowed"
+        )
+    if not supplied_path.exists():
+        return supplied_path.resolve(), 0, 0
+    if not supplied_path.is_file():
+        raise SystemExit(
+            f"Refusing initialization: {supplied_path} is not a database file"
+        )
+
+    try:
+        path = supplied_path.resolve(strict=True)
+        if path.stat().st_nlink > 1:
+            raise SystemExit(
+                "Refusing initialization: multiply-linked database targets are not allowed"
+            )
+    except SystemExit:
+        raise
+    except OSError as error:
+        raise SystemExit(
+            f"Refusing initialization: cannot establish database identity: {error}"
+        ) from None
 
     # A hot WAL/journal cannot be inspected with immutable=1, while opening it
-    # normally may create or update sidecars. Fail closed instead.
+    # normally may create or update sidecars. Inspect the same canonical path
+    # that mutation will later open, and fail closed instead.
     for suffix in ("-wal", "-journal"):
         sidecar = Path(f"{path}{suffix}")
         try:
@@ -763,7 +785,7 @@ def _sync_init_readonly_preflight(db_path: str, session_id: str) -> tuple[int, i
 
     # immutable=1 prevents even a read-only SQLite connection from creating
     # WAL/SHM files while it inspects a quiescent existing target.
-    uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
+    uri = f"{path.as_uri()}?mode=ro&immutable=1"
     try:
         conn = sqlite3.connect(uri, uri=True)
         try:
@@ -774,11 +796,14 @@ def _sync_init_readonly_preflight(db_path: str, session_id: str) -> tuple[int, i
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-            existing_rows = 0
+            existing_ids: set[object] = set()
+            rows_without_ids = 0
             invalid_rows = 0
+            recognized_schema = False
             for table in ("working_memory", "episodic_memory"):
                 if table not in tables:
                     continue
+                recognized_schema = True
                 columns = {
                     row[1] for row in conn.execute(f"PRAGMA table_info({table})")
                 }
@@ -786,9 +811,14 @@ def _sync_init_readonly_preflight(db_path: str, session_id: str) -> tuple[int, i
                     raise SystemExit(
                         f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
                     )
-                row_count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                if table == "working_memory":
-                    existing_rows = row_count
+                if "id" in columns:
+                    existing_ids.update(
+                        row[0] for row in conn.execute(f"SELECT id FROM {table}")
+                    )
+                else:
+                    rows_without_ids += conn.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0]
                 invalid_rows += conn.execute(
                     f"""SELECT COUNT(*) FROM {table}
                         WHERE scope IS NULL OR scope != 'global'
@@ -797,9 +827,11 @@ def _sync_init_readonly_preflight(db_path: str, session_id: str) -> tuple[int, i
                 ).fetchone()[0]
 
             # The legacy mirror remains semantically readable and session-bound
-            # even after a row leaves working memory, so it must not carry a
-            # foreign or ambiguous session into a dedicated surface either.
+            # even after a row leaves working memory. Count IDs across all three
+            # stores once so mirrors require confirmation without double-counting
+            # one memory, and reject foreign or ambiguous sessions.
             if "memories" in tables:
+                recognized_schema = True
                 columns = {
                     row[1] for row in conn.execute("PRAGMA table_info(memories)")
                 }
@@ -807,12 +839,26 @@ def _sync_init_readonly_preflight(db_path: str, session_id: str) -> tuple[int, i
                     raise SystemExit(
                         f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
                     )
+                if "id" in columns:
+                    existing_ids.update(
+                        row[0] for row in conn.execute("SELECT id FROM memories")
+                    )
+                else:
+                    rows_without_ids += conn.execute(
+                        "SELECT COUNT(*) FROM memories"
+                    ).fetchone()[0]
                 invalid_rows += conn.execute(
                     """SELECT COUNT(*) FROM memories
                        WHERE session_id IS NULL OR session_id != ?""",
                     (session_id,),
                 ).fetchone()[0]
-            return existing_rows, invalid_rows
+
+            if not recognized_schema:
+                raise SystemExit(
+                    f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                )
+            existing_rows = len(existing_ids) + rows_without_ids
+            return path, existing_rows, invalid_rows
         finally:
             conn.close()
     except SystemExit:
@@ -855,13 +901,13 @@ def cmd_sync_init(args):
     )
     parsed = parser.parse_args(args)
 
-    existing_rows, invalid_rows = _sync_init_readonly_preflight(
+    target_path, existing_rows, invalid_rows = _sync_init_readonly_preflight(
         parsed.db_path, parsed.session_id
     )
     if invalid_rows:
         raise SystemExit(f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}")
     preview = {
-        "db_path": str(parsed.db_path),
+        "db_path": str(target_path),
         "session_id": parsed.session_id,
         "existing_rows": existing_rows,
         "invalid_rows": invalid_rows,
@@ -875,7 +921,7 @@ def cmd_sync_init(args):
     from mnemosyne.core.memory import Mnemosyne
     from mnemosyne.core.sync import SyncEngine
 
-    mem = Mnemosyne(db_path=parsed.db_path, session_id=parsed.session_id)
+    mem = Mnemosyne(db_path=target_path, session_id=parsed.session_id)
 
     SyncEngine(
         mem,

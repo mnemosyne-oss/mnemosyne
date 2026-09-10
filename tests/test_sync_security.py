@@ -232,14 +232,17 @@ def _snapshot_tree(root: Path) -> dict[str, tuple]:
 
 
 def _sync_init_subprocess(
-    tmp_path: Path, db_path: Path, *extra_args: str
+    tmp_path: Path,
+    db_path: Path,
+    *extra_args: str,
+    data_root: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.update(
         {
             "HOME": str(tmp_path / "home"),
             "HERMES_HOME": str(tmp_path / "hermes-home"),
-            "MNEMOSYNE_DATA_DIR": str(tmp_path / "data-root"),
+            "MNEMOSYNE_DATA_DIR": str(data_root or (tmp_path / "data-root")),
             "MNEMOSYNE_NO_EMBEDDINGS": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
         }
@@ -287,6 +290,113 @@ def test_sync_init_confirmation_is_filesystem_read_only_in_fresh_process(tmp_pat
     assert not Path(f"{db_path}-shm").exists()
     assert not (tmp_path / "data-root").exists()
     assert not (tmp_path / "hermes-home").exists()
+
+
+def test_sync_init_rejects_unrecognized_schema_read_only_in_fresh_process(tmp_path):
+    db_path = tmp_path / "unrelated.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE customer_records (id INTEGER PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO customer_records (value) VALUES ('must remain untouched')")
+    before = _snapshot_tree(tmp_path)
+
+    rejected = _sync_init_subprocess(
+        tmp_path, db_path, "--claim-existing", "--yes"
+    )
+
+    assert rejected.returncode != 0
+    assert "not a dedicated shared-surface database" in rejected.stderr
+    assert _snapshot_tree(tmp_path) == before
+    assert not Path(f"{db_path}-wal").exists()
+    assert not Path(f"{db_path}-shm").exists()
+    assert not (tmp_path / "data-root").exists()
+    assert not (tmp_path / "hermes-home").exists()
+
+
+def test_sync_init_global_episodic_rows_require_confirmation_in_fresh_process(tmp_path):
+    data_root = tmp_path / "data-root"
+    db_path = tmp_path / "episodic-only.db"
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(tmp_path / "home"),
+            "HERMES_HOME": str(tmp_path / "hermes-home"),
+            "MNEMOSYNE_DATA_DIR": str(data_root),
+            "MNEMOSYNE_NO_EMBEDDINGS": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    setup = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                import sys
+                from pathlib import Path
+                from mnemosyne.core.memory import Mnemosyne
+
+                memory = Mnemosyne(
+                    db_path=Path(sys.argv[1]),
+                    session_id="hermes_shared_surface",
+                )
+                memory.beam.conn.execute(
+                    "INSERT INTO episodic_memory "
+                    "(id, content, session_id, scope) VALUES (?, ?, ?, ?)",
+                    ("episode-1", "existing shared episode", "hermes_shared_surface", "global"),
+                )
+                memory.beam.conn.commit()
+                memory.beam.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                memory.beam.conn.close()
+                """
+            ),
+            str(db_path),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert setup.returncode == 0, setup.stderr
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0] == 1
+    before = _snapshot_tree(tmp_path)
+
+    confirmation = _sync_init_subprocess(tmp_path, db_path)
+
+    assert confirmation.returncode == 0, confirmation.stderr
+    assert json.loads(confirmation.stdout) == {
+        "db_path": str(db_path),
+        "existing_rows": 1,
+        "invalid_rows": 0,
+        "required_flags": ["--claim-existing", "--yes"],
+        "session_id": "hermes_shared_surface",
+        "status": "confirmation_required",
+    }
+    assert _snapshot_tree(tmp_path) == before
+
+    confirmed = _sync_init_subprocess(
+        tmp_path, db_path, "--claim-existing", "--yes"
+    )
+
+    assert confirmed.returncode == 0, confirmed.stderr
+    assert json.loads(confirmed.stdout)["claimed_rows"] == 1
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT id, content, scope, session_id FROM episodic_memory"
+        ).fetchall() == [
+            (
+                "episode-1",
+                "existing shared episode",
+                "global",
+                "hermes_shared_surface",
+            )
+        ]
+        assert conn.execute(
+            "SELECT value FROM sync_meta WHERE key = 'surface_db_id'"
+        ).fetchone() == ("shared-surface-v1",)
 
 
 @pytest.mark.parametrize(
@@ -460,6 +570,43 @@ def test_sync_init_does_not_touch_hot_wal_or_shm(tmp_path):
         assert "uncheckpointed SQLite state" in rejected.stderr
         assert "not a dedicated shared-surface database" in rejected.stderr
         assert _snapshot_tree(tmp_path) == before
+    finally:
+        conn.close()
+
+
+def test_sync_init_rejects_hot_wal_symlink_alias_read_only_in_fresh_process(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    db_path = data_root / "hot-shared.db"
+    alias = data_root / "shared-alias.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE working_memory (scope TEXT, session_id TEXT)")
+        conn.execute(
+            "INSERT INTO working_memory VALUES ('global', 'hermes_shared_surface')"
+        )
+        conn.commit()
+        alias.symlink_to(db_path)
+        assert Path(f"{db_path}-wal").stat().st_size > 0
+        assert Path(f"{db_path}-shm").exists()
+        before = _snapshot_tree(tmp_path)
+
+        rejected = _sync_init_subprocess(
+            tmp_path,
+            alias,
+            "--claim-existing",
+            "--yes",
+            data_root=data_root,
+        )
+
+        assert rejected.returncode != 0
+        assert "symbolic-link database targets are not allowed" in rejected.stderr
+        assert _snapshot_tree(tmp_path) == before
+        assert alias.is_symlink()
+        assert data_root.exists()
+        assert Path(f"{db_path}-wal").exists()
+        assert Path(f"{db_path}-shm").exists()
     finally:
         conn.close()
 
