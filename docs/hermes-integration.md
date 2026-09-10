@@ -77,34 +77,18 @@ pip install -e "integrations/hermes[dev]"
 >
 > **Docker.** Inside the official Hermes container, the mounted Hermes home is `/opt/data/`, not `~/.hermes/`. Keep the side venv on that mounted volume so both it and the wrapper survive image rebuilds. The side venv must use the same Python **major/minor** as the running Hermes gateway; do not create it with an unrelated `python3` from `PATH`.
 >
-> For a launcher-based Hermes installation, first derive its runtime interpreter from the resolved `hermes` launcher. This bounded launcher-sibling probe covers only that installation shape: it checks the launcher's sibling `python`, then `python3`. It is not a reproduction of the installer's broader internal discovery. If it cannot find a sibling, **stop** and determine the real gateway interpreter from the deployment; do not substitute the current-shell Python or guess another environment.
+> Before creating the venv, obtain the interpreter that starts the **actual running Hermes gateway** from the deployment configuration or container image. Do not infer it from a `hermes` launcher sibling: wrappers and shims can place an unrelated Python next to that command. Set `HERMES_PYTHON` only after verifying that ownership with the deployment operator or runtime configuration; if it cannot be determined, stop.
 >
 > ```bash
-> HERMES_BIN="$(command -v hermes)" || {
->   printf 'Could not find the Hermes launcher on PATH\n' >&2
+> : "${HERMES_PYTHON:?Set this to the deployment-verified Python that starts the running Hermes gateway}"
+> if [ ! -f "$HERMES_PYTHON" ] || [ ! -x "$HERMES_PYTHON" ]; then
+>   printf 'Hermes Python is not an executable file: %s\n' "$HERMES_PYTHON" >&2
+>   exit 1
+> fi
+> "$HERMES_PYTHON" -c 'import sys; raise SystemExit(sys.prefix == sys.base_prefix)' || {
+>   printf 'Hermes Python is not a virtual-environment runtime: %s\n' "$HERMES_PYTHON" >&2
 >   exit 1
 > }
-> HERMES_BIN="$(readlink -f "$HERMES_BIN")" || {
->   printf 'Could not resolve the Hermes launcher\n' >&2
->   exit 1
-> }
-> if [ ! -f "$HERMES_BIN" ] || [ ! -x "$HERMES_BIN" ]; then
->   printf 'Resolved Hermes launcher is not a regular executable file: %s\n' "$HERMES_BIN" >&2
->   exit 1
-> fi
-> HERMES_BIN_DIR="$(dirname "$HERMES_BIN")"
-> if [ -f "$HERMES_BIN_DIR/python" ]; then
->   HERMES_PYTHON="$HERMES_BIN_DIR/python"
-> elif [ -f "$HERMES_BIN_DIR/python3" ]; then
->   HERMES_PYTHON="$HERMES_BIN_DIR/python3"
-> else
->   printf 'Could not find Hermes Python beside %s\n' "$HERMES_BIN" >&2
->   exit 1
-> fi
-> if [ ! -x "$HERMES_PYTHON" ]; then
->   printf 'Hermes Python is not executable: %s\n' "$HERMES_PYTHON" >&2
->   exit 1
-> fi
 > "$HERMES_PYTHON" --version || {
 >   printf 'Hermes Python failed its version probe: %s\n' "$HERMES_PYTHON" >&2
 >   exit 1
@@ -312,8 +296,42 @@ Use the same selected Hermes Python:
 mode is appropriate for a persistent side virtual environment in deployments
 where that side environment is retained across Hermes updates. It does **not**
 make a direct install into a Hermes-managed virtual environment survive a Hermes
-venv rebuild or replacement. After changing a wrapper, restart or refresh the
-actual local Hermes process before checking provider state.
+venv rebuild or replacement.
+
+#### Windows persistent side-venv wrapper
+
+For a wrapper that survives replacement of the Hermes-managed virtual
+environment, create a **new, empty** side venv with the same Hermes interpreter.
+Do not use bare `uv venv`: it can select a different Python major/minor. The
+commands below refuse to overwrite an existing side venv; choose a new path or
+explicitly retire the old one only after preserving a rollback copy.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$SideVenv = Join-Path $HermesHome '.mnemosyne\venv'
+if (Test-Path -LiteralPath $SideVenv) {
+    throw "Refusing to replace existing side venv: $SideVenv"
+}
+uv venv --seed --python $HermesPython $SideVenv
+if ($LASTEXITCODE -ne 0) {
+    throw "uv could not create the side venv: $SideVenv"
+}
+$SidePython = Join-Path $SideVenv 'Scripts\python.exe'
+$SideInstaller = Join-Path $SideVenv 'Scripts\mnemosyne-hermes.exe'
+& $SidePython -m pip install "mnemosyne-memory[embeddings]" mnemosyne-hermes
+if ($LASTEXITCODE -ne 0) {
+    throw 'Mnemosyne package installation failed in the side venv'
+}
+& $SideInstaller install --mode wrapper --python $SidePython --no-profile-links
+if ($LASTEXITCODE -ne 0) {
+    throw 'Mnemosyne wrapper installation failed'
+}
+```
+
+`--seed` makes `pip` available in the side venv. If `uv` is unavailable, install
+it or create a side venv by another method that explicitly uses `$HermesPython`;
+do not fall back to an unrelated `python` on `PATH`. After changing a wrapper,
+restart or refresh the actual local Hermes process before checking provider state.
 
 #### Enable and verify
 
@@ -522,12 +540,13 @@ Mnemosyne does not currently expose a standalone REST API server.
 export HERMES_HOME=/opt/data  # Replace with the non-default Hermes home used at install time
 VENV=/path/to/venv             # The same side venv passed to the wrapper install
 hermes memory off  # Disable the external provider; built-in memory remains active
-hermes gateway restart  # Run from a shell outside the gateway process
 "$VENV/bin/mnemosyne-hermes" uninstall
 # For every profile-local wrapper, repeat the uninstall first, with that profile's Hermes home.
 HERMES_HOME=/opt/data/profiles/work "$VENV/bin/mnemosyne-hermes" uninstall
 "$VENV/bin/python" -m pip uninstall mnemosyne-hermes
 ```
+
+For Docker or Compose, restart the actual deployment service with its deployment tooling after removing the wrapper. For a local installation, restart or refresh the actual local Hermes process.
 
 `mnemosyne-hermes uninstall` removes the plugin registration at `$HERMES_HOME/plugins/mnemosyne`. Remove every profile-local wrapper before uninstalling the side-venv package.
 
