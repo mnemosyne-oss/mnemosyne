@@ -726,13 +726,93 @@ def _read_secret_file(path: str, label: str) -> str:
 
 _DEFAULT_SYNC_SESSION_ID = "hermes_shared_surface"
 
+_SYNC_DEDICATED_DB_RECOVERY = (
+    "The supplied database is not a dedicated shared-surface database. "
+    "Use a new path, for example: `mnemosyne sync-init --db-path "
+    '"$HOME/.hermes/mnemosyne/data/shared/mnemosyne.db"`. '
+    "Populate that database through `mnemosyne_shared_*`; private/session "
+    "history is not copied automatically."
+)
+
+
+def _sync_init_readonly_preflight(db_path: str, session_id: str) -> tuple[int, int]:
+    """Classify an existing sync-init target without changing SQLite state."""
+    import sqlite3
+
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return 0, 0
+    if not path.is_file():
+        raise SystemExit(f"Refusing initialization: {path} is not a database file")
+
+    # A hot WAL/journal cannot be inspected with immutable=1, while opening it
+    # normally may create or update sidecars. Fail closed instead.
+    for suffix in ("-wal", "-journal"):
+        sidecar = Path(f"{path}{suffix}")
+        try:
+            has_uncheckpointed_state = sidecar.exists() and sidecar.stat().st_size > 0
+        except OSError as error:
+            raise SystemExit(
+                f"Refusing initialization: cannot inspect SQLite sidecar read-only: {error}"
+            ) from None
+        if has_uncheckpointed_state:
+            raise SystemExit(
+                "Refusing initialization: the target has uncheckpointed SQLite "
+                f"state. Close/checkpoint it before retrying. {_SYNC_DEDICATED_DB_RECOVERY}"
+            )
+
+    # immutable=1 prevents even a read-only SQLite connection from creating
+    # WAL/SHM files while it inspects a quiescent existing target.
+    uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            table_exists = conn.execute(
+                """SELECT 1 FROM sqlite_master
+                   WHERE type = 'table' AND name = 'working_memory'"""
+            ).fetchone()
+            if table_exists is None:
+                return 0, 0
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(working_memory)")
+            }
+            if not {"scope", "session_id"}.issubset(columns):
+                raise SystemExit(f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}")
+            existing_rows = conn.execute(
+                "SELECT COUNT(*) FROM working_memory"
+            ).fetchone()[0]
+            invalid_rows = conn.execute(
+                """SELECT COUNT(*) FROM working_memory
+                   WHERE scope != 'global' OR session_id != ?""",
+                (session_id,),
+            ).fetchone()[0]
+            return existing_rows, invalid_rows
+        finally:
+            conn.close()
+    except SystemExit:
+        raise
+    except sqlite3.Error as error:
+        raise SystemExit(
+            f"Refusing initialization: cannot validate the target read-only: {error}"
+        ) from None
+
 
 def cmd_sync_init(args):
     """Explicitly initialize or migrate a dedicated shared-surface DB."""
     import argparse
 
-    parser = argparse.ArgumentParser(prog="mnemosyne sync-init")
-    parser.add_argument("--db-path", required=True, help="Dedicated shared-surface DB")
+    parser = argparse.ArgumentParser(
+        prog="mnemosyne sync-init",
+        description="Initialize a physically dedicated shared-surface database.",
+        epilog=(
+            "Do not use a private/session database. Populate the dedicated "
+            "surface through mnemosyne_shared_*; private history is not copied."
+        ),
+    )
+    parser.add_argument(
+        "--db-path", required=True, help="New or dedicated shared-surface DB"
+    )
     parser.add_argument(
         "--session-id",
         default=_DEFAULT_SYNC_SESSION_ID,
@@ -750,28 +830,22 @@ def cmd_sync_init(args):
     )
     parsed = parser.parse_args(args)
 
+    existing_rows, invalid_rows = _sync_init_readonly_preflight(
+        parsed.db_path, parsed.session_id
+    )
+    if invalid_rows:
+        raise SystemExit(f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}")
+
     from mnemosyne.core.memory import Mnemosyne
     from mnemosyne.core.sync import SyncEngine
 
     mem = Mnemosyne(db_path=parsed.db_path, session_id=parsed.session_id)
-    existing_rows = mem.beam.conn.execute(
-        "SELECT COUNT(*) FROM working_memory"
-    ).fetchone()[0]
-    invalid_rows = mem.beam.conn.execute(
-        """SELECT COUNT(*) FROM working_memory
-           WHERE scope != 'global' OR session_id != ?""",
-        (parsed.session_id,),
-    ).fetchone()[0]
     preview = {
         "db_path": str(parsed.db_path),
         "session_id": parsed.session_id,
         "existing_rows": existing_rows,
         "invalid_rows": invalid_rows,
     }
-    if invalid_rows:
-        raise SystemExit(
-            "Refusing migration: DB contains non-global or foreign-session rows"
-        )
     if existing_rows and not (parsed.claim_existing and parsed.yes):
         preview["status"] = "confirmation_required"
         preview["required_flags"] = ["--claim-existing", "--yes"]
@@ -1838,7 +1912,7 @@ def run_cli():
         # machine-readable code, never a traceback (which leaks absolute
         # paths and library internals into logs).
         try:
-            if command not in {"doctor", "repair"}:
+            if command not in {"doctor", "repair", "sync-init"}:
                 os.makedirs(DATA_DIR, exist_ok=True)
             handler(sys.argv[2:])
         except SystemExit:

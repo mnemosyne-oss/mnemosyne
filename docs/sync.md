@@ -115,11 +115,29 @@ Each exchange is idempotent &mdash; events carry unique `event_id`s and are dedu
 - Network connectivity between instances (or via SSH tunnel)
 - (Recommended) TLS certificate for the remote endpoint
 
+### Dedicated shared surface required
+
+Sync operates only on a physically dedicated shared-surface database. Never
+point `sync-init`, `sync`, or `sync-serve` at the regular Hermes memory DB. A
+safe initial path is:
+
+```bash
+SURFACE="$HOME/.hermes/mnemosyne/data/shared/mnemosyne.db"
+mkdir -p "$(dirname "$SURFACE")"
+mnemosyne sync-init --db-path "$SURFACE"
+```
+
+Hermes populates this surface through the explicit `mnemosyne_shared_*` tools.
+No command here automatically migrates, exports, or copies private/session
+history. In particular, `default_scope: global` only changes the default scope
+of new writes; it does not turn a regular Hermes DB into a shared surface.
+
 ### 1. Set Up the Remote Instance
 
 ```bash
 # On your VPS / remote machine
-mnemosyne sync-serve --port 8765 --api-key "your-secret-api-key"
+mnemosyne sync-serve --db-path "$SURFACE" --port 8765 \
+  --api-key "your-secret-api-key"
 ```
 
 This starts a sync server listening on port 8765.
@@ -133,20 +151,23 @@ This starts a sync server listening on port 8765.
 export MNEMOSYNE_SYNC_TOKEN="your-secret-api-key"
 
 # Test the connection
-mnemosyne sync-status --remote https://my-vps.example.com:8765
+mnemosyne sync-status --db-path "$SURFACE" \
+  --remote https://my-vps.example.com:8765
 ```
 
 ### 3. Run a Sync
 
 ```bash
 # Bidirectional sync (default)
-mnemosyne sync --remote https://my-vps.example.com:8765
+mnemosyne sync --db-path "$SURFACE" --remote https://my-vps.example.com:8765
 
 # Pull only (fetch remote changes without pushing local)
-mnemosyne sync --remote https://my-vps.example.com:8765 --mode pull
+mnemosyne sync --db-path "$SURFACE" \
+  --remote https://my-vps.example.com:8765 --mode pull
 
 # Push only (send local changes without fetching)
-mnemosyne sync --remote https://my-vps.example.com:8765 --mode push
+mnemosyne sync --db-path "$SURFACE" \
+  --remote https://my-vps.example.com:8765 --mode push
 ```
 
 ### 4. With Client-Side Encryption
