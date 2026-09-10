@@ -58,18 +58,21 @@ class TestBankDeclaration:
                 "there would be a false isolation guarantee"
             )
 
-    def test_validate_keeps_its_own_bank_meaning(self):
-        """``mnemosyne_validate`` uses ``bank`` for private vs surface.
+    def test_validate_declares_store_and_a_tenant_bank(self):
+        """``mnemosyne_validate`` selects private/surface via ``store``.
 
-        That is a different concept from a tenant partition and it shipped
-        first, so the injection must not overwrite it.
+        ``bank`` is the tenant bank, as on every other tool. The schema spells
+        it out itself so the description can also name the deprecated alias
+        (``bank='private'|'surface'``), which the injector must not overwrite.
         """
         schema = next(
             s for s in ALL_TOOL_SCHEMAS if s["name"] == "mnemosyne_validate"
         )
-        bank = _properties(schema)["bank"]
-        assert bank.get("enum") == ["private", "surface"]
-        assert bank["description"] != BANK_PROPERTY["description"]
+        props = _properties(schema)
+        assert props["store"]["enum"] == ["private", "surface"]
+        assert "enum" not in props["bank"]
+        assert "Deprecated" in props["bank"]["description"]
+        assert props["bank"]["description"] != BANK_PROPERTY["description"]
 
     def test_declaration_survives_the_mcp_tools_rebuild(self):
         """TOOLS is rebuilt from ALL_TOOL_SCHEMAS; the property must carry."""

@@ -233,11 +233,22 @@ VALIDATE_SCHEMA = {
                 "description": "Optional reason or evidence for this validation.",
                 "default": "",
             },
-            "bank": {
+            "store": {
                 "type": "string",
                 "enum": ["private", "surface"],
-                "description": "Which bank holds the memory. Default 'private'.",
+                "description": "Which store holds the memory: 'private' (the caller's own memory, tenant bank selectable via 'bank') or 'surface' (the shared cross-agent surface, one global store). Default 'private'.",
                 "default": "private",
+            },
+            "bank": {
+                "type": "string",
+                "description": (
+                    "Memory bank to operate on when store is 'private'. Banks are "
+                    "separate stores: memories written to one are not visible to "
+                    "another, which is how a single MCP server serves more than one "
+                    "tenant. Defaults to the server's MNEMOSYNE_MCP_BANK, or 'default'. "
+                    "Deprecated: the values 'private' and 'surface' are still accepted "
+                    "here as an alias for 'store' and will stop being accepted in 5.0."
+                ),
             },
         },
         "required": ["memory_id", "action"],
@@ -901,10 +912,10 @@ BANK_PROPERTY: Dict[str, Any] = {
 
 # Tools that must not receive a tenant bank.
 #
-# ``mnemosyne_validate`` already has a ``bank`` parameter meaning something
-# else entirely: ``private`` or ``surface``, selecting which store holds the
-# memory. Overloading that name would be a breaking change to a shipped tool,
-# so it keeps its own declaration and is tracked separately.
+# ``mnemosyne_validate`` declares its own ``bank``: it is the tenant bank, as
+# everywhere else, but its description also documents the deprecated alias
+# where ``bank`` carried ``private``/``surface`` (now ``store``). Because the
+# schema already spells ``bank`` out, ``_declare_bank`` leaves it alone.
 #
 # The ``mnemosyne_shared_*`` tools operate on the shared surface database,
 # which is a single global store by design. A tenant bank has no meaning
@@ -917,7 +928,6 @@ BANK_PROPERTY: Dict[str, Any] = {
 # read for them; the provider resolves its bank per Hermes profile instead.
 # Declaring ``bank`` on them would advertise a parameter nothing honours.
 BANK_EXEMPT_TOOLS: frozenset = frozenset({
-    "mnemosyne_validate",
     "mnemosyne_shared_remember",
     "mnemosyne_shared_recall",
     "mnemosyne_shared_forget",

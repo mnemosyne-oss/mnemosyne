@@ -532,11 +532,34 @@ def _handle_invalidate(arguments: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "invalidated", "memory_id": memory_id}
 
 
+def _resolve_validate_target(arguments: Dict[str, Any]):
+    """Resolve (store, bank, deprecated_alias) for ``mnemosyne_validate``.
+
+    ``store`` selects ``private`` (the caller's own memory) or ``surface`` (the
+    shared cross-agent surface). ``bank`` is the tenant bank and only applies
+    to the private store. Before 4.0 the tool carried the store selector in
+    ``bank``; those two literal values are still honoured there as an alias
+    when ``store`` is not given, so an existing caller keeps working, and the
+    response says so. Any other ``bank`` value is a tenant bank.
+    """
+    store = arguments.get("store")
+    raw_bank = arguments.get("bank")
+    deprecated = False
+    if store is None and raw_bank in ("private", "surface"):
+        store, raw_bank, deprecated = raw_bank, None, True
+    if store is None:
+        store = "private"
+    bank = raw_bank or os.environ.get("MNEMOSYNE_MCP_BANK") or "default"
+    if store == "surface":
+        bank = None
+    return store, bank, deprecated
+
+
 def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_validate tool call."""
     memory_id = arguments.get("memory_id", "")
     action = arguments.get("action", "")
-    bank = arguments.get("bank", "private")
+    store, bank, deprecated_alias = _resolve_validate_target(arguments)
     validator = arguments.get("validator") or os.environ.get("MNEMOSYNE_AUTHOR_ID") or "mcp"
     new_content = arguments.get("new_content", "")
     note = arguments.get("note", "")
@@ -545,15 +568,15 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "memory_id is required"}
     if action not in ("attest", "update", "invalidate", "delete"):
         return {"error": f"unknown action: {action}"}
-    if bank not in ("private", "surface"):
-        return {"error": f"unknown bank: {bank}"}
+    if store not in ("private", "surface"):
+        return {"error": f"unknown store: {store}"}
     if action == "update" and not new_content:
         return {"error": "new_content is required for action='update'"}
 
-    if bank == "surface":
+    if store == "surface":
         target_beam = _create_surface_instance()
     else:
-        mem = _create_instance()
+        mem = _create_instance(bank=bank)
         target_beam = mem.beam
 
     conn = target_beam.conn
@@ -562,7 +585,7 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
         (memory_id,),
     ).fetchone()
     if not existing:
-        return {"error": "memory_not_found", "memory_id": memory_id, "bank": bank}
+        return {"error": "memory_not_found", "memory_id": memory_id, "store": store, "bank": bank}
 
     if action == "delete":
         # Align the destructive path with BeamMemory.forget_working: a caller may
@@ -579,7 +602,7 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
             (memory_id, *scope_params),
         ).fetchone()
         if visible is None:
-            return {"error": "memory_not_found", "memory_id": memory_id, "bank": bank}
+            return {"error": "memory_not_found", "memory_id": memory_id, "store": store, "bank": bank}
 
     author_id = existing[1]
     prev_content = existing[2]
@@ -639,14 +662,21 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as exc:
         return {"error": "validation_failed", "reason": str(exc), "memory_id": memory_id}
 
-    return {
+    result = {
         "status": f"validation_{action}",
         "memory_id": memory_id,
+        "store": store,
         "bank": bank,
         "validator": validator,
         "author_id": author_id,
         "previous_content": prev_content[:200] if prev_content else None,
     }
+    if deprecated_alias:
+        result["deprecated"] = (
+            "bank='private'|'surface' is a deprecated alias for store; pass "
+            "store=... instead. The alias is removed in 5.0."
+        )
+    return result
 
 
 def _handle_get(arguments: Dict[str, Any]) -> Dict[str, Any]:

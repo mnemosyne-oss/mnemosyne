@@ -238,11 +238,16 @@ VALIDATE_SCHEMA = {
                 "description": "Optional reason or evidence for this validation.",
                 "default": "",
             },
+            "store": {
+                "type": "string",
+                "enum": ["private", "surface"],
+                "description": "Which store holds the memory: 'private' (this profile's own memory) or 'surface' (the shared cross-agent surface). Default 'private'.",
+                "default": "private",
+            },
             "bank": {
                 "type": "string",
                 "enum": ["private", "surface"],
-                "description": "Which bank holds the memory. Default 'private'.",
-                "default": "private",
+                "description": "Deprecated alias for 'store'. Accepted until 5.0; pass 'store' instead.",
             },
         },
         "required": ["memory_id", "action"],

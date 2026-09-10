@@ -2585,7 +2585,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         """
         memory_id = args.get("memory_id", "")
         action = args.get("action", "")
-        bank = args.get("bank", "private")
+        store = args.get("store")
+        deprecated_alias = False
+        if store is None:
+            # Pre-4.0 callers carried the selector in ``bank``. Honour it, say so.
+            store = args.get("bank", "private")
+            deprecated_alias = "bank" in args
+        bank = store
         validator = args.get("validator") or self._agent_identity or "unknown"
         new_content = args.get("new_content", "")
         note = args.get("note", "")
@@ -2594,13 +2600,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({"error": "memory_id is required"})
         if action not in ("attest", "update", "invalidate", "delete"):
             return json.dumps({"error": f"unknown action: {action}"})
-        if bank not in ("private", "surface"):
-            return json.dumps({"error": f"unknown bank: {bank}"})
+        if store not in ("private", "surface"):
+            return json.dumps({"error": f"unknown store: {store}"})
         if action == "update" and not new_content:
             return json.dumps({"error": "new_content is required for action='update'"})
 
         # Pick the right beam (private vs surface)
-        if bank == "surface":
+        if store == "surface":
             err = self._require_surface_beam()
             if err:
                 return json.dumps({"error": err})
@@ -2621,6 +2627,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({
                 "error": "memory_not_found",
                 "memory_id": memory_id,
+                "store": store,
                 "bank": bank,
             })
 
@@ -2648,7 +2655,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 return json.dumps({
                     "error": "memory_not_found",
                     "memory_id": memory_id,
-                    "bank": bank,
+                    "store": store,
+                "bank": bank,
                 })
 
         author_id = existing[1]
@@ -2736,14 +2744,21 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         except Exception:
             logger.debug("Mnemosyne audit event failed for validate", exc_info=True)
 
-        return json.dumps({
+        result = {
             "status": f"validation_{action}",
             "memory_id": memory_id,
-            "bank": bank,
+            "store": store,
+                "bank": bank,
             "validator": validator,
             "author_id": author_id,
             "previous_content": prev_content[:200] if prev_content else None,
-        })
+        }
+        if deprecated_alias:
+            result["deprecated"] = (
+                "bank='private'|'surface' is a deprecated alias for store; "
+                "pass store=... instead. The alias is removed in 5.0."
+            )
+        return json.dumps(result)
 
     def _handle_get(self, args: Dict[str, Any]) -> str:
         memory_id = args.get("memory_id", "")

@@ -471,11 +471,32 @@ def test_validate_works_on_shared_surface(tmp_path, monkeypatch):
         "memory_id": mid,
         "action": "attest",
         "validator": "Albedo",
+        "store": "surface",
+    })
+
+    assert res["status"] == "validation_attest"
+    assert res["store"] == "surface"
+    assert "deprecated" not in res
+    row = _row(provider, mid, bank="surface")
+    assert row[3] == "Albedo"
+
+
+def test_validate_bank_alias_still_routes_to_surface_and_says_so(tmp_path, monkeypatch):
+    """Pre-4.0 callers passed the store selector as ``bank``. Keep them working
+    through the deprecation window, and tell them in the response."""
+    provider = _provider(tmp_path, monkeypatch)
+    mid = _seed_surface(provider, "User prefers Tailscale over OpenVPN")
+
+    res = _call(provider, "mnemosyne_validate", {
+        "memory_id": mid,
+        "action": "attest",
+        "validator": "Albedo",
         "bank": "surface",
     })
 
     assert res["status"] == "validation_attest"
-    assert res["bank"] == "surface"
+    assert res["store"] == "surface"
+    assert "store" in res["deprecated"]
     row = _row(provider, mid, bank="surface")
     assert row[3] == "Albedo"
 
@@ -536,7 +557,20 @@ def test_validate_unknown_action_rejected(tmp_path, monkeypatch):
     assert "unknown action" in res["error"]
 
 
-def test_validate_unknown_bank_rejected(tmp_path, monkeypatch):
+def test_validate_unknown_store_rejected(tmp_path, monkeypatch):
+    provider = _provider(tmp_path, monkeypatch)
+    mid = _seed_private(provider, "fact")
+    res = _call(provider, "mnemosyne_validate", {
+        "memory_id": mid,
+        "action": "attest",
+        "store": "weird",
+    })
+    assert "unknown store" in res["error"]
+
+
+def test_validate_unknown_bank_alias_rejected(tmp_path, monkeypatch):
+    """A ``bank`` value outside the alias set is not a tenant bank on the
+    Hermes provider, whose bank is fixed per profile; reject it plainly."""
     provider = _provider(tmp_path, monkeypatch)
     mid = _seed_private(provider, "fact")
     res = _call(provider, "mnemosyne_validate", {
@@ -544,7 +578,7 @@ def test_validate_unknown_bank_rejected(tmp_path, monkeypatch):
         "action": "attest",
         "bank": "weird",
     })
-    assert "unknown bank" in res["error"]
+    assert "unknown store" in res["error"]
 
 
 def test_validate_missing_memory_id_rejected(tmp_path, monkeypatch):
