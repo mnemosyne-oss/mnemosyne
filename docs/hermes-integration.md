@@ -326,7 +326,7 @@ If Hermes reports the Mnemosyne plugin as disabled, enable it without requesting
 any built-in-tool override, then select it as the memory provider:
 
 ```powershell
-hermes plugins enable mnemosyne --no-allow-tool-override
+hermes plugins enable hermes-mnemosyne --no-allow-tool-override
 hermes config set memory.provider mnemosyne
 ```
 
