@@ -211,9 +211,15 @@ Both Path A's wrapper installer and Path B's `python -m mnemosyne.install` regis
 ```bash
 # Path A: persistent side venv + wrapper
 export HERMES_HOME=/opt/data  # Replace with the active Hermes home
-"$HERMES_HOME/.mnemosyne/venv/bin/python" -m pip install --upgrade 'mnemosyne-memory[embeddings]' mnemosyne-hermes
+VENV="$HERMES_HOME/.mnemosyne/venv"
+"$VENV/bin/python" -m pip install --upgrade 'mnemosyne-memory[embeddings]' mnemosyne-hermes
+"$VENV/bin/mnemosyne-hermes" install --mode wrapper --force --python "$VENV/bin/python"
 hermes gateway restart
+```
 
+The forced install regenerates the wrapper plugin files and does not modify the Mnemosyne database.
+
+```bash
 # Path B: direct PyPI install
 pip install --upgrade mnemosyne-memory
 hermes gateway restart

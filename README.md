@@ -409,9 +409,13 @@ Mnemosyne exposes memory, knowledge-graph, multi-agent-surface, working-note, an
 
 ```bash
 export HERMES_HOME=/opt/data  # Replace with the active Hermes home
-"$HERMES_HOME/.mnemosyne/venv/bin/python" -m pip install --upgrade 'mnemosyne-memory[embeddings]' mnemosyne-hermes
+VENV="$HERMES_HOME/.mnemosyne/venv"
+"$VENV/bin/python" -m pip install --upgrade 'mnemosyne-memory[embeddings]' mnemosyne-hermes
+"$VENV/bin/mnemosyne-hermes" install --mode wrapper --force --python "$VENV/bin/python"
 hermes gateway restart
 ```
+
+The forced install regenerates the wrapper plugin files and does not modify the Mnemosyne database.
 
 For a direct or source install, use `pip install --upgrade mnemosyne-hermes && hermes gateway restart` or `git pull && pip install --upgrade integrations/hermes && hermes gateway restart` (source).
 
