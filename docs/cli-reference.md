@@ -100,6 +100,51 @@ The built-in help lists only `hygiene audit|clean`; `status` and `restore` exist
 
 stdio is the default transport. `sse` and `streamable-http` are HTTP transports; a non-loopback bind requires `MNEMOSYNE_MCP_TOKEN`. `streamable-http` (alias `http`) is the native MCP Streamable HTTP transport: clients POST JSON-RPC straight to `--path` (default `/mcp`) with no separate `/messages` route to proxy. Add `--json-response` to force JSON-only responses instead of the default SSE-upgrade streaming. A non-loopback `streamable-http` bind also requires `MNEMOSYNE_MCP_ALLOWED_HOSTS` (see below); `sse` requires only the token.
 
+Bearer tokens travel as cleartext HTTP headers. On a non-loopback bind, terminate TLS in front of the server (reverse proxy or a secure tunnel) so the token never crosses the network in the clear.
+
+### Multi-agent tokens (per-agent identity)
+
+`MNEMOSYNE_MCP_TOKENS` accepts a JSON object of named bearer tokens and takes
+precedence over the single `MNEMOSYNE_MCP_TOKEN`:
+
+```bash
+MNEMOSYNE_MCP_TOKENS='{"hermes-family": "tok1", "hermes-admin": "tok2", "ci": "tok3"}' \
+  mnemosyne mcp --transport sse --host 0.0.0.0 --port 8080
+```
+
+Every client sends its own token on each request:
+
+```bash
+curl -H "Authorization: Bearer tok1" http://127.0.0.1:8080/sse
+```
+
+Setting `MNEMOSYNE_MCP_TOKENS` opts the server into multi-agent mode on
+**every** host, loopback included: bearer auth with per-agent identity is
+enforced even when bound to `127.0.0.1`, where the legacy single-token
+contract would run unauthenticated.
+
+In this opt-in multi-agent mode the *name* of the matched token is the
+**authoritative** author identity on memories that client creates: a
+conflicting client-supplied `author_id` is rejected before any write (an
+`author_id` matching the token name, or omitted, is fine), giving per-agent
+audit attribution from a single instance. Setting `MNEMOSYNE_MCP_TOKENS` to
+an empty or whitespace-only value refuses startup -- on every host,
+loopback included -- rather than silently falling back to the single token.
+Malformed JSON, non-string
+names/secrets (they are never coerced -- `1` or `null` fail instead of
+minting predictable credentials), empty mappings, empty names/secrets,
+duplicate names (exact JSON duplicates as well as distinct spellings that
+collide after surrounding whitespace is stripped, e.g. `agent` and
+`" agent "`), and duplicate secrets (two names sharing one token would
+make attribution ambiguous) all refuse startup with an actionable error. The
+identity is bound to the session at connect time: a later request for the
+same session presenting a different valid token is rejected.
+
+Single-token deployments (`MNEMOSYNE_MCP_TOKEN`) are unchanged: the token
+still authenticates and owns sessions, but introduces **no** author identity
+-- explicit `author_id` arguments and `MNEMOSYNE_AUTHOR_ID` keep their prior
+precedence, exactly as before multi-token support existed.
+
 ### Streamable HTTP Host/Origin policy
 
 The Streamable HTTP transport applies a Host/Origin policy on **non-loopback**

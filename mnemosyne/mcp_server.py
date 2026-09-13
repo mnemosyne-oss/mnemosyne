@@ -39,6 +39,14 @@ Security note (S1, 2026-05-12):
     reading/writing/deleting the user's memory via an unauthenticated
     MCP endpoint.
 
+    MNEMOSYNE_MCP_TOKENS (a JSON object of named secrets) is evaluated on
+    every host, loopback included: when set, it opts the server into
+    multi-agent mode -- bearer auth with per-agent identity is enforced
+    even on loopback, and a present-but-blank value refuses startup. See
+    docs/cli-reference.md ("Multi-agent tokens"). Bearer tokens are
+    cleartext headers: on a non-loopback bind, terminate TLS in front of
+    the server (reverse proxy or secure tunnel).
+
     The Streamable HTTP transport additionally applies a Host/Origin policy
     on non-loopback binds (fail-closed): MNEMOSYNE_MCP_ALLOWED_HOSTS is
     required (comma-separated exact names or ``name:*`` patterns), and
@@ -79,7 +87,20 @@ try:
 except ImportError:
     JSONResponse = None
 
+# Auth principal classes for the multi-token SSE session-ownership feed.
+# Resolved at import so a missing dependency fails at startup (the
+# identity-binding guarantee is only as good as this import; review
+# round 4 on #830). Absent only when the mcp extra is not installed,
+# in which case the app builders already refuse to start.
+try:
+    from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+    from mcp.server.auth.provider import AccessToken
+except ImportError:
+    AuthenticatedUser = None
+    AccessToken = None
+
 from mnemosyne.mcp_tools import get_tool_definitions, handle_tool_call
+from mnemosyne.runtime_context import set_request_token_name  # noqa: F401 (used in middleware)
 
 # ---------------------------------------------------------------------------
 # Security helpers (S1)
@@ -99,6 +120,7 @@ from mnemosyne.mcp_tools import get_tool_definitions, handle_tool_call
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 _TOKEN_ENV = "MNEMOSYNE_MCP_TOKEN"
+_TOKENS_ENV = "MNEMOSYNE_MCP_TOKENS"
 _ALLOWED_HOSTS_ENV = "MNEMOSYNE_MCP_ALLOWED_HOSTS"
 _ALLOWED_ORIGINS_ENV = "MNEMOSYNE_MCP_ALLOWED_ORIGINS"
 
@@ -161,25 +183,139 @@ def _resolve_transport_security(host: str):
     )
 
 
+def _parse_tokens_env(raw: str) -> "dict[str, str]":
+    """Parse MNEMOSYNE_MCP_TOKENS into an ordered {name: secret} mapping.
+
+    Accepts a JSON object of ``{"agent-name": "secret", ...}``. Names and
+    secrets MUST be JSON strings: non-string values are never coerced --
+    ``str(1)`` or ``str(None)`` would mint predictable credentials ("1",
+    "None", "True") instead of surfacing the operator's mistake at startup.
+
+    Raises RuntimeError with an actionable message on malformed JSON,
+    non-object payloads, empty mappings, empty names/secrets, duplicate
+    names (exact JSON duplicates -- ``json.loads`` would silently keep
+    only the last member -- and post-strip collisions like ``"agent"``
+    vs ``" agent "``, either of which could rotate which credential owns
+    an agent identity without an error), and duplicate secrets (two
+    names sharing one secret would make per-agent attribution
+    ambiguous, since authentication matches the first name for a
+    presented token).
+    """
+    import json as _json
+
+    # json.loads collapses exact duplicate members to the last value;
+    # catch them at parse time (any object in the payload) via the
+    # pairs hook, then fail closed after the decode.
+    duplicate_names: list = []
+
+    def _flag_duplicate_names(pairs):
+        seen = set()
+        for key, _ in pairs:
+            if key in seen:
+                duplicate_names.append(key)
+            seen.add(key)
+        return dict(pairs)
+
+    try:
+        parsed = _json.loads(raw, object_pairs_hook=_flag_duplicate_names)
+    except _json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"{_TOKENS_ENV} is not valid JSON ({e}). Expected an object "
+            f"mapping token names to secrets, e.g. "
+            f"'{{\"hermes-family\": \"tok1\", \"hermes-admin\": \"tok2\"}}'."
+        ) from e
+    if duplicate_names:
+        raise RuntimeError(
+            f"{_TOKENS_ENV} contains duplicate token name(s) "
+            f"{', '.join(repr(n) for n in duplicate_names)}; JSON would "
+            f"silently keep only the last entry for a duplicated name, "
+            f"rotating which secret owns that agent. Use unique names."
+        )
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"{_TOKENS_ENV} must be a JSON object mapping token names to "
+            f"secrets; got {type(parsed).__name__}."
+        )
+    if not parsed:
+        raise RuntimeError(
+            f"{_TOKENS_ENV} is empty; add at least one \"name\": \"secret\" "
+            f"entry (or unset it to fall back to {_TOKEN_ENV})."
+        )
+    tokens: dict[str, str] = {}
+    seen_names: dict[str, str] = {}
+    seen_secrets: dict[str, str] = {}
+    for name, secret in parsed.items():
+        if not isinstance(name, str) or not isinstance(secret, str):
+            bad = name if not isinstance(name, str) else secret
+            raise RuntimeError(
+                f"{_TOKENS_ENV} entries must be JSON strings; got "
+                f"{type(bad).__name__} for {name!r}. Quote both the name "
+                f'and the secret, e.g. {{"agent-name": "secret"}}.'
+            )
+        name_s = name.strip()
+        secret_s = secret.strip()
+        if not name_s or not secret_s:
+            raise RuntimeError(
+                f"{_TOKENS_ENV} contains an empty name or secret; every "
+                f"entry needs a non-empty name and secret."
+            )
+        if name_s in seen_names:
+            raise RuntimeError(
+                f"{_TOKENS_ENV} entries {seen_names[name_s]!r} and "
+                f"{name!r} normalize to the same token name {name_s!r}; "
+                f"use unique names so per-agent attribution stays "
+                f"unambiguous."
+            )
+        seen_names[name_s] = name
+        if secret_s in seen_secrets:
+            raise RuntimeError(
+                f"{_TOKENS_ENV} entries {seen_secrets[secret_s]!r} and "
+                f"{name_s!r} share one secret; each token needs a unique "
+                f"secret so per-agent attribution stays unambiguous."
+            )
+        seen_secrets[secret_s] = name_s
+        tokens[name_s] = secret_s
+    return tokens
+
+
 def _resolve_http_auth(host: str) -> Tuple[bool, Optional[str]]:
     """Decide whether an HTTP transport needs bearer-token auth and the token.
 
     Applies to both the SSE and Streamable HTTP transports.
 
-    Returns (require_auth, token). Raises RuntimeError when host is
-    non-loopback and the MNEMOSYNE_MCP_TOKEN env var is unset/empty --
-    refusing to start an unauthenticated network-exposed MCP server.
+    MNEMOSYNE_MCP_TOKENS is evaluated FIRST, on every host: setting it
+    opts the operator into multi-agent mode, so a valid mapping enables
+    bearer auth (with per-agent identity) even on loopback, and a
+    present-but-blank value is a startup error even on loopback -- the
+    variable never silently disappears behind the loopback bypass.
+
+    Returns (require_auth, token). With MNEMOSYNE_MCP_TOKENS unset the
+    legacy contract applies: loopback needs no auth; a non-loopback bind
+    requires MNEMOSYNE_MCP_TOKEN -- refusing to start an
+    unauthenticated network-exposed MCP server. Bearer tokens are
+    cleartext headers: on non-loopback binds, terminate TLS in front of
+    the server (reverse proxy or secure tunnel).
     """
+    if _resolve_multi_tokens() is not None:
+        # Opt-in multi-agent mode: named tokens satisfy the auth
+        # requirement on their own (they take precedence over the single
+        # MNEMOSYNE_MCP_TOKEN) and enable per-agent identity on every
+        # host. The builders install the multi-token middleware when the
+        # resolved token is None.
+        return (True, None)
     if _is_loopback(host):
         return (False, None)
     token = (os.environ.get(_TOKEN_ENV) or "").strip()
     if not token:
         raise RuntimeError(
             f"Refusing to bind MCP over HTTP on non-loopback host {host!r} without "
-            f"authentication. Set the {_TOKEN_ENV} env var to a strong random "
-            f"secret and have clients send 'Authorization: Bearer <token>' on "
-            f"each request. Or bind to 127.0.0.1 (the default) for local-only "
-            f"use."
+            f"authentication. Set the {_TOKENS_ENV} env var to a JSON object of "
+            f"named secrets (multiple agents) or {_TOKEN_ENV} to a strong random "
+            f"secret, and have clients send 'Authorization: Bearer <token>' on "
+            f"each request. Bearer tokens are cleartext headers: on a "
+            f"non-loopback bind terminate TLS with a reverse proxy or a "
+            f"secure tunnel. Or bind to 127.0.0.1 (the default) for "
+            f"local-only use."
         )
     return (True, token)
 
@@ -188,8 +324,35 @@ def _resolve_http_auth(host: str) -> Tuple[bool, Optional[str]]:
 _resolve_sse_auth = _resolve_http_auth
 
 
+def _resolve_multi_tokens() -> Optional["dict[str, str]"]:
+    """Return the MNEMOSYNE_MCP_TOKENS mapping, or None when unset.
+
+    This is the opt-in multi-agent mode selector: a valid JSON object of
+    named secrets enables per-agent identity; unset falls back to the
+    legacy single MNEMOSYNE_MCP_TOKEN contract. Parse errors raise here
+    (fail closed at startup).
+
+    Present-but-blank (empty or whitespace-only) also raises rather than
+    falling back: an operator who sets the variable has opted into
+    multi-agent mode, and a stray ``MNEMOSYNE_MCP_TOKENS=""`` silently
+    selecting the legacy single-token contract would hide that mistake
+    behind an auth mode nobody intended.
+    """
+    raw = os.environ.get(_TOKENS_ENV)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        raise RuntimeError(
+            f"{_TOKENS_ENV} is set but empty; provide a JSON object of "
+            f'"name": "secret" entries, or unset it to use '
+            f"{_TOKEN_ENV}."
+        )
+    return _parse_tokens_env(raw)
+
+
 class _BearerTokenMiddleware:
-    """Pure-ASGI bearer auth middleware.
+    """Pure-ASGI bearer auth middleware (single- or multi-token).
 
     BaseHTTPMiddleware buffers the full response body before forwarding it
     to the client. SseServerTransport and the streamable-HTTP transport
@@ -200,17 +363,44 @@ class _BearerTokenMiddleware:
 
     This pure-ASGI implementation forwards scope/receive/send untouched
     after auth so SSE/streamable frames are never buffered.
+
+    Single-token mode (``token=``): the legacy contract -- authenticate and
+    forward, no author-identity binding (explicit ``author_id`` /
+    ``MNEMOSYNE_AUTHOR_ID`` keep their prior precedence in mcp_tools).
+
+    Multi-token mode (``tokens=``): the presented bearer token is matched
+    against every configured secret (constant-time per candidate) and the
+    *name* of the matched entry is stored in ``scope["state"]`` plus a
+    contextvar, so tool handlers attribute memories to the calling agent
+    without any client-side cooperation; the name is also exposed as an
+    authenticated principal feeding the SSE transport's native
+    session-ownership check. A conflicting client-supplied ``author_id``
+    is rejected in mcp_tools in this mode.
     """
 
-    def __init__(self, app, token: str):
-        """Wrap ``app`` and require ``token`` as the bearer credential.
+    def __init__(self, app, token: Optional[str] = None,
+                 tokens: Optional["dict[str, str]"] = None):
+        """Wrap ``app`` and require the bearer credential.
 
-        The token is stored as bytes so presented credentials can be
-        compared safely with ``hmac.compare_digest`` (which raises on
-        non-ASCII str, turning a bad request into a 500).
+        Exactly one of ``token`` (legacy single secret) or ``tokens``
+        (multi-agent {name: secret} mapping) must be given. Secrets are
+        stored as bytes so presented credentials can be compared safely
+        with ``hmac.compare_digest`` (which raises on non-ASCII str,
+        turning a bad request into a 500).
         """
+        if (token is None) == (tokens is None):
+            raise ValueError("pass exactly one of token= or tokens=")
         self.app = app
-        self.expected = token.encode("utf-8")
+        if token is not None:
+            self.tokens: "dict[str, str]" = {"default": token}
+            self.bind_identity = False
+        else:
+            self.tokens = tokens
+            self.bind_identity = True
+            # Pre-encode for constant-time comparison per candidate.
+        self._encoded = [
+            (name, secret.encode("utf-8")) for name, secret in self.tokens.items()
+        ]
 
     async def __call__(self, scope, receive, send):
         """Enforce bearer auth on HTTP requests, passing non-HTTP scope through.
@@ -249,7 +439,12 @@ class _BearerTokenMiddleware:
             await resp(scope, receive, send)
             return
         presented = presented.strip()
-        if not presented or not hmac.compare_digest(presented, self.expected):
+        matched_name = None
+        for name, encoded in self._encoded:
+            if hmac.compare_digest(presented, encoded):
+                matched_name = name
+                break
+        if matched_name is None:
             resp = JSONResponse(
                 {"error": "invalid bearer token"},
                 status_code=401,
@@ -257,6 +452,20 @@ class _BearerTokenMiddleware:
             )
             await resp(scope, receive, send)
             return
+        if self.bind_identity:
+            # Multi-token mode only: record the per-agent identity for
+            # mcp_tools author resolution (contextvar + ASGI state). The
+            # legacy single-token mode deliberately does NOT bind an
+            # author identity -- prior contract preserved.
+            set_request_token_name(matched_name)
+            scope.setdefault("state", {})["mnemosyne_token_name"] = matched_name
+            scope["user"] = AuthenticatedUser(
+                AccessToken(
+                    token=presented.decode("latin-1", "replace"),
+                    client_id=matched_name,
+                    scopes=[],
+                )
+            )
         await self.app(scope, receive, send)
 
 
@@ -366,6 +575,7 @@ def _build_sse_app(host: str = "127.0.0.1"):
         )
 
     require_auth, token = _resolve_http_auth(host)
+    multi_tokens = _resolve_multi_tokens() if require_auth else None
 
     # Trailing slash required: SseServerTransport emits POST URIs as
     # /messages/ and Starlette Mount path-prefix matching needs it to
@@ -380,12 +590,33 @@ def _build_sse_app(host: str = "127.0.0.1"):
 
     middleware = []
     if require_auth:
-        middleware.append(Middleware(_BearerTokenMiddleware, token=token))
-        logger.info(
-            "MCP SSE bearer-token auth enabled (host=%s). Clients must send "
-            "'Authorization: Bearer <token>' on every request.",
-            host,
-        )
+        if multi_tokens is not None:
+            # Opt-in multi-agent mode: matched token name is the
+            # authoritative author identity (session ownership included).
+            if AuthenticatedUser is None or AccessToken is None:
+                raise RuntimeError(
+                    "Multi-token SSE auth requires the mcp auth middleware "
+                    "(AuthenticatedUser/AccessToken); install mnemosyne-memory[mcp]."
+                )
+            middleware.append(Middleware(_BearerTokenMiddleware, tokens=multi_tokens))
+            logger.info(
+                "MCP SSE multi-token auth enabled (host=%s, agents=%d). Each "
+                "client sends its own 'Authorization: Bearer <token>'; the "
+                "matched token name is the authoritative author identity. "
+                "Bearer tokens are cleartext headers: on a non-loopback "
+                "bind terminate TLS with a reverse proxy or a secure tunnel.",
+                host,
+                len(multi_tokens),
+            )
+        else:
+            middleware.append(Middleware(_BearerTokenMiddleware, token=token))
+            logger.info(
+                "MCP SSE bearer-token auth enabled (host=%s). Clients must send "
+                "'Authorization: Bearer <token>' on every request. Bearer "
+                "tokens are cleartext headers: on a non-loopback bind "
+                "terminate TLS with a reverse proxy or a secure tunnel.",
+                host,
+            )
     else:
         logger.info(
             "MCP SSE running loopback-only (host=%s); no auth required.",
@@ -409,8 +640,9 @@ def _build_sse_app(host: str = "127.0.0.1"):
 async def _run_sse(port: int = 8080, host: str = "127.0.0.1") -> None:
     """Run MCP server over SSE transport.
 
-    Default host is 127.0.0.1 (loopback only). Binding non-loopback
-    requires MNEMOSYNE_MCP_TOKEN -- see _resolve_sse_auth.
+    Default host is 127.0.0.1 (loopback only). Auth policy per host:
+    see _resolve_sse_auth (MNEMOSYNE_MCP_TOKENS is honored on every
+    host; a non-loopback bind without it requires MNEMOSYNE_MCP_TOKEN).
     """
     try:
         import uvicorn
@@ -450,6 +682,7 @@ def _build_streamable_http_app(
         raise RuntimeError("MCP not installed. Run: pip install mnemosyne-memory[mcp]")
 
     require_auth, token = _resolve_http_auth(host)
+    multi_tokens = _resolve_multi_tokens() if require_auth else None
     transport_security = _resolve_transport_security(host)
 
     server = _build_mcp_server()
@@ -464,13 +697,34 @@ def _build_streamable_http_app(
         # add_middleware inserts outermost and is the supported Starlette
         # API (mutating user_middleware directly would miss the lazy-built
         # middleware stack).
-        app.add_middleware(_BearerTokenMiddleware, token=token)
-        logger.info(
-            "MCP Streamable HTTP bearer-token auth enabled (host=%s, path=%s). "
-            "Clients must send 'Authorization: Bearer <token>' on every request.",
-            host,
-            path,
-        )
+        if multi_tokens is not None:
+            if AuthenticatedUser is None or AccessToken is None:
+                raise RuntimeError(
+                    "Multi-token HTTP auth requires the mcp auth middleware "
+                    "(AuthenticatedUser/AccessToken); install mnemosyne-memory[mcp]."
+                )
+            app.add_middleware(_BearerTokenMiddleware, tokens=multi_tokens)
+            logger.info(
+                "MCP Streamable HTTP multi-token auth enabled (host=%s, path=%s, "
+                "agents=%d). The matched token name is the authoritative "
+                "author identity. Bearer tokens are cleartext headers: on a "
+                "non-loopback bind terminate TLS with a reverse proxy or a "
+                "secure tunnel.",
+                host,
+                path,
+                len(multi_tokens),
+            )
+        else:
+            app.add_middleware(_BearerTokenMiddleware, token=token)
+            logger.info(
+                "MCP Streamable HTTP bearer-token auth enabled (host=%s, path=%s). "
+                "Clients must send 'Authorization: Bearer <token>' on every "
+                "request. Bearer tokens are cleartext headers: on a "
+                "non-loopback bind terminate TLS with a reverse proxy or a "
+                "secure tunnel.",
+                host,
+                path,
+            )
     else:
         logger.info(
             "MCP Streamable HTTP running loopback-only (host=%s, path=%s); "
