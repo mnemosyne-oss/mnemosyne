@@ -5141,7 +5141,9 @@ class BeamMemory:
                  veracity: str = "unknown",
                  trust_tier: str = None,
                  memory_type: str = None,
-                 dedupe: bool = True) -> str:
+                 dedupe: bool = True,
+                 author_id: str = None,
+                 author_type: str = None) -> str:
         """Store into working_memory. Deduplicates exact content matches.
 
         When called from the legacy-compatible Mnemosyne.remember() path,
@@ -5162,6 +5164,11 @@ class BeamMemory:
                 and store as triples. Default False.
             veracity: Confidence level -- 'stated', 'inferred', 'tool', 'imported', 'unknown'.
                 Non-canonical labels are clamped to 'unknown' with a WARNING
+            author_id: Per-write author identity. When provided, overrides
+                self.author_id for THIS write only (issue #914). The instance
+                read identity (self.author_id, used by recall author-scoping)
+                is never mutated. None falls back to self.author_id.
+            author_type: Per-write author type, same override semantics.
                 (mirrors the C12.b clamp at the hermes_memory_provider boundary).
             memory_type: Optional explicit MemoryType value (e.g. 'artifact').
                 Overrides the content classifier entirely -- the classifier is
@@ -5217,6 +5224,12 @@ class BeamMemory:
         # content does not say. An unrecognized label degrades to
         # classification rather than to NULL.
         memory_type = _clamp_memory_type(memory_type)
+        # --- Per-write author identity (issue #914) ---
+        # Resolve once: per-write args override the instance identity for
+        # THIS write only. self.author_id (read identity, consulted by
+        # recall author-scoping) is never mutated.
+        _write_author_id = author_id if author_id is not None else self.author_id
+        _write_author_type = author_type if author_type is not None else self.author_type
         if memory_type is None and classify_memory is not None:
             try:
                 result = classify_memory(content)
@@ -5259,7 +5272,7 @@ class BeamMemory:
                 WHERE id = ? AND session_id = ?
             """, (importance, datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), source,
                   valid_until, scope,
-                  self.author_id, self.author_type, self.channel_id,
+                  _write_author_id, _write_author_type, self.channel_id,
                   memory_type,
                   veracity, veracity,
                   trust_tier,
@@ -5306,7 +5319,7 @@ class BeamMemory:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (memory_id, content, source, timestamp, self.session_id, importance,
               json.dumps(metadata or {}), valid_until, scope,
-              self.author_id, self.author_type, self.channel_id, veracity, memory_type, trust_tier))
+              _write_author_id, _write_author_type, self.channel_id, veracity, memory_type, trust_tier))
         self.conn.commit()
         try:
             self._trim_working_memory()

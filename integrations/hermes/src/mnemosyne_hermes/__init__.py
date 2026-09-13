@@ -1369,6 +1369,48 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
         return "default"
 
+    def _resolve_author_identity(self) -> dict:
+        """Resolve author identity for memory writes (issue #914).
+
+        Precedence (matches the MCP path in mnemosyne.mcp_tools._create_instance):
+        1. agent_identity kwarg (explicit, from Hermes)
+        2. MNEMOSYNE_AUTHOR_ID / MNEMOSYNE_AUTHOR_TYPE env vars
+        3. No identity -> empty dict (constructors called without author
+           kwargs, preserving the legacy NULL-author behavior exactly).
+
+        'primary' is a generic identity, not a specific author, and is
+        excluded the same way _resolve_profile_bank treats it. Kept in strict
+        parity with hermes_memory_provider.MnemosyneMemoryProvider.
+        """
+        identity = getattr(self, "_agent_identity", None) or ""
+        if identity and identity.lower() not in ("primary", "default", "none", ""):
+            result = {"author_id": identity}
+            author_type = os.environ.get("MNEMOSYNE_AUTHOR_TYPE")
+            if author_type:
+                result["author_type"] = author_type
+            return result
+
+        env_author = os.environ.get("MNEMOSYNE_AUTHOR_ID")
+        if env_author:
+            result = {"author_id": env_author}
+            author_type = os.environ.get("MNEMOSYNE_AUTHOR_TYPE")
+            if author_type:
+                result["author_type"] = author_type
+            return result
+
+        return {}
+
+    def _write_identity_kwargs(self) -> dict:
+        """Per-write author identity kwargs for remember() calls (issue #914).
+
+        Narrow per-write identity path per the #914 design note: identity is
+        attached at the WRITE, never by mutating the Beam's read identity
+        (self.author_id), because recall author-scoping keys off that field
+        and setting it would bypass session/channel scoping in prefetch.
+        Kept in strict parity with hermes_memory_provider.
+        """
+        return self._resolve_author_identity()
+
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize Mnemosyne beam for this session."""
         with self._ensure_beam_access_lock():
@@ -1955,6 +1997,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     importance=0.85,
                     scope="global",
                     veracity="stated",
+                    **self._write_identity_kwargs(),
                 )
                 break  # One identity memory per turn
 
@@ -2261,6 +2304,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             extract=extract,
             metadata=metadata,
             veracity=veracity,
+            **self._write_identity_kwargs(),
         )
         self._audit_event(
             "remember", memory_id=memory_id, bank="private",
@@ -2960,6 +3004,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     extract=bool(p.get("extract", False)),
                     metadata=p.get("metadata"),
                     veracity=clamp_veracity(p.get("veracity"), context="apply_pending"),
+                    **self._write_identity_kwargs(),
                 )
                 rp.unlink(missing_ok=True)
                 applied.append({"id": pid, "memory_id": mid})
