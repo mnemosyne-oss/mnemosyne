@@ -380,6 +380,58 @@ WM_PINNED_IDS = set(
     if pid.strip()
 )
 EPISODIC_RECALL_LIMIT = int(os.environ.get("MNEMOSYNE_EP_LIMIT", "50000"))
+
+def _env_int(name: str, default: int) -> int:
+    """Parse a positive integer knob, falling back on empty/invalid values."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    logger.warning("%s is not a positive integer; using default %s", name, default)
+    return default
+
+
+# Recall content cap: bounded by default at 500 chars per result to keep
+# the public recall contract stable (see #685). MNEMOSYNE_RECALL_CONTENT_CAP
+# opts into a higher limit; resolved once at IMPORT time (restart to
+# change). Empty/unset falls back silently, invalid or non-positive
+# values warn and fall back to 500. The cap is enforced at the shared
+# public-result boundary of recall() (see _cap_recall_results), covering
+# the linear producers, the polyphonic engine path, the MEMORIA
+# supplements and the fact-voice merge alike.
+RECALL_CONTENT_CAP = _env_int("MNEMOSYNE_RECALL_CONTENT_CAP", 500)
+
+
+def _cap_recall_content(content: Any) -> Any:
+    """Apply the public recall content cap to one result's content field."""
+    if isinstance(content, str) and len(content) > RECALL_CONTENT_CAP:
+        return content[:RECALL_CONTENT_CAP]
+    return content
+
+
+def _cap_recall_results(results: Any) -> Any:
+    """Shared public-result boundary for the recall content cap.
+
+    Enforces RECALL_CONTENT_CAP on every result leaving recall() or
+    recall_enhanced(), including associative additions and cache hits, whatever
+    producer built it: the six linear slices, the polyphonic engine mapper,
+    the MEMORIA structured-fact supplements (linear + polyphonic) and the
+    fact-voice merge. Feature-gated paths are exactly the ones that tend to
+    re-grow raw-content leaks, so capping at the boundary (not per producer)
+    keeps the #685 bounded-payload contract true by construction.
+    """
+    if not isinstance(results, list):
+        return results
+    for r in results:
+        if isinstance(r, dict) and "content" in r:
+            r["content"] = _cap_recall_content(r["content"])
+    return results
+
 SLEEP_BATCH_SIZE = int(os.environ.get("MNEMOSYNE_SLEEP_BATCH", "5000"))
 SCRATCHPAD_MAX_ITEMS = int(os.environ.get("MNEMOSYNE_SP_MAX", "1000"))
 RECENCY_HALFLIFE_HOURS = float(os.environ.get("MNEMOSYNE_RECENCY_HALFLIFE", "168"))  # 1 week default
@@ -445,21 +497,6 @@ def _env_float(name: str, default: float) -> float:
             name, raw[:80], default,
         )
         return default
-
-
-def _env_int(name: str, default: int) -> int:
-    """Parse a positive integer knob, falling back on empty/invalid values."""
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-        if value > 0:
-            return value
-    except ValueError:
-        pass
-    logger.warning("%s is not a positive integer; using default %s", name, default)
-    return default
 
 
 # Conflict validation limits apply to one complete sleep(), not each source.
@@ -7984,13 +8021,13 @@ class BeamMemory:
                     "query": query,
                     "top_k": top_k,
                     "engine": "polyphonic",
-                    "results": poly_results,
+                    "results": _cap_recall_results(poly_results),
                     "explain": {
                         "unsupported": True,
                         "reason": "polyphonic recall explain is not implemented in v1; inspect per-result voice_scores instead.",
                     },
                 }
-            return poly_results
+            return _cap_recall_results(poly_results)
 
         results = []
         query_lower = query.lower()
@@ -8321,7 +8358,7 @@ class BeamMemory:
                 _track_literal_content("working", row["id"], row["content"])
                 results.append({
                     "id": row["id"],
-                    "content": row["content"][:500],
+                    "content": row["content"][:RECALL_CONTENT_CAP],
                     "source": row["source"],
                     "timestamp": row["timestamp"],
                     "tier": "working",
@@ -8439,7 +8476,7 @@ class BeamMemory:
                     _track_literal_content("working", row["id"], row["content"])
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": row["content"][:RECALL_CONTENT_CAP],
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "working",
@@ -8501,7 +8538,7 @@ class BeamMemory:
                     _track_literal_content("episodic", row["id"], row["content"])
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": row["content"][:RECALL_CONTENT_CAP],
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "episodic",
@@ -8839,7 +8876,7 @@ class BeamMemory:
             _track_literal_content("episodic", row["id"], row["content"])
             results.append({
                 "id": row["id"],
-                "content": row["content"][:500],
+                "content": row["content"][:RECALL_CONTENT_CAP],
                 "source": row["source"],
                 "timestamp": row["timestamp"],
                 "tier": "episodic",
@@ -8947,7 +8984,7 @@ class BeamMemory:
                     _track_literal_content("episodic", row["id"], row["content"])
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": row["content"][:RECALL_CONTENT_CAP],
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "episodic",
@@ -9117,7 +9154,7 @@ class BeamMemory:
                             )
                             results.append({
                                 "id": memoria_source_id,
-                                "content": _row["content"][:500],
+                                "content": _row["content"][:RECALL_CONTENT_CAP],
                                 "source": _row["source"],
                                 "timestamp": _row["timestamp"],
                                 "tier": "memoria_source",
@@ -9279,17 +9316,17 @@ class BeamMemory:
                 "query": query,
                 "top_k": top_k,
                 "engine": "linear",
-                "results": final_results,
+                "results": _cap_recall_results(final_results),
                 "explain": _explain_trace.to_dict(),
             }
 
-        return final_results
+        return _cap_recall_results(final_results)
 
     # Bump whenever the enhanced-recall candidate or ranking algorithm changes
     # so entries cached under an older digest are not reused. Part of the
     # hashed payload; the opaque key keeps the "v2:" prefix because QueryCache's
     # opaque-path recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 8
+    _ENHANCED_RECALL_CACHE_VERSION = 9
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.
@@ -9429,6 +9466,7 @@ class BeamMemory:
                 "associative_graph": self.episodic_graph is not None,
                 "embeddings_available": _embeddings.available(),
                 "em_vec_admit": EM_VEC_ADMIT,
+                "recall_content_cap": RECALL_CONTENT_CAP,
                 "embedding_model": getattr(_embeddings, "_DEFAULT_MODEL", None),
                 "embedding_dimension": getattr(_embeddings, "EMBEDDING_DIM", None),
                 "embedding_query_prefix": os.environ.get("MNEMOSYNE_EMBEDDING_QUERY_PREFIX", ""),
@@ -9574,7 +9612,7 @@ class BeamMemory:
             # ``top_k`` is part of the v2 digest, so truncating here would
             # make a hit differ from the cached pipeline result (notably when
             # associative retrieval appends related memories after top-k).
-            return cached
+            return _cap_recall_results(cached)
 
         # 4. Run base recall with expanded query
         results = self.recall(
@@ -9669,7 +9707,10 @@ class BeamMemory:
             except Exception:
                 logger.info("Regex extraction failed, skipping", exc_info=True)
 
-        # 9. Cache results (skip entirely when the key could not be built)
+        # 9. Cap after all augmentation, before persistence and public return.
+        results = _cap_recall_results(results)
+
+        # 10. Cache results (skip entirely when the key could not be built)
         if (cache_key is not None and use_cache and not explain
                 and hasattr(self, '_query_cache') and self._query_cache is not None):
             self._query_cache.put_opaque(cache_key, results)
@@ -10241,10 +10282,12 @@ class BeamMemory:
     def _polyphonic_row_to_dict(self, row, *, tier_label: str) -> Dict:
         """Shared row → recall-dict mapper. /review caught the
         near-duplicate column mapping across episodic/working
-        branches -- single helper now."""
+        branches -- single helper now. Content is capped through
+        _cap_recall_content so the polyphonic result shape obeys the
+        same public recall content bound as the linear producers."""
         d = {
             "id": row["id"],
-            "content": row["content"],
+            "content": _cap_recall_content(row["content"]),
             "source": row["source"],
             "timestamp": row["timestamp"],
             "session_id": row["session_id"] if "session_id" in row.keys() else None,
@@ -10379,9 +10422,10 @@ class BeamMemory:
         except Exception:
             pass  # consolidated_facts search is best-effort
 
-        # Sort by score descending and respect top_k
+        # Sort by score descending, respect top_k, and apply the same public
+        # content boundary as recall() / recall_enhanced().
         results.sort(key=lambda x: x["score"], reverse=True)
-        return results[:top_k]
+        return _cap_recall_results(results[:top_k])
 
     def get_episodic_stats(self, author_id: str = None, author_type: str = None,
                            channel_id: str = None) -> Dict:
