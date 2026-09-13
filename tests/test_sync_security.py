@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -62,6 +68,108 @@ def test_deployment_readme_initializes_client_surface_before_sync():
     assert client_section.index(init_command) < client_section.index(sync_command)
 
 
+def test_documented_encrypted_sync_form_matches_and_executes_current_cli(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    sync_doc = (root / "docs" / "sync.md").read_text(encoding="utf-8")
+    cli_reference = (root / "docs" / "cli-reference.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "--encrypt-key-file \"$SYNC_KEY_FILE\"" in readme
+    documented_command = (
+        'mnemosyne sync --db-path "$SURFACE" \\\n'
+        "  --remote https://my-vps.example.com:8765 \\\n"
+        "  --encrypt-key-file mnemosyne-sync.key"
+    )
+    assert documented_command in sync_doc
+    assert "--encrypt <key>\\|--encrypt-key-file <path>" in cli_reference
+    assert "--prompt-key" not in sync_doc
+    assert "MNEMOSYNE_SYNC_KEY=" not in readme
+    assert "MNEMOSYNE_SYNC_KEY=" not in sync_doc
+    documented_sync_commands = [
+        line.strip()
+        for line in sync_doc.splitlines()
+        if line.strip().startswith("mnemosyne sync --")
+    ]
+    assert documented_sync_commands
+    assert all("--db-path" in command for command in documented_sync_commands)
+
+    cli_help = subprocess.run(
+        [sys.executable, "-m", "mnemosyne.cli", "sync", "--help"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert cli_help.returncode == 0, cli_help.stderr
+    assert "--encrypt ENCRYPT" in cli_help.stdout
+    assert "--encrypt-key-file ENCRYPT_KEY_FILE" in cli_help.stdout
+    assert "--prompt-key" not in cli_help.stdout
+
+    key_file = tmp_path / "sync-encryption.key"
+    key_file.write_text("documented-test-key\n", encoding="utf-8")
+    if os.name != "nt":
+        key_file.chmod(0o600)
+    command_args = [
+        "--db-path",
+        str(tmp_path / "surface.db"),
+        "--remote",
+        "https://relay.example",
+        "--encrypt-key-file",
+        str(key_file),
+    ]
+    probe = textwrap.dedent(
+        """
+        import json
+        import sys
+        import types
+
+        memory_module = types.ModuleType("mnemosyne.core.memory")
+        memory_module.Mnemosyne = type("Mnemosyne", (), {"__init__": lambda self, **kwargs: None})
+        sync_module = types.ModuleType("mnemosyne.core.sync")
+
+        class SyncEncryption:
+            @classmethod
+            def from_config(cls, value):
+                assert value == "documented-test-key"
+                return value
+
+        class SyncEngine:
+            def __init__(self, memory, **kwargs):
+                assert kwargs["encryption"] == "documented-test-key"
+                assert kwargs["require_encryption"] is True
+
+            def sync_with(self, remote_url, mode, api_key):
+                return {
+                    "remote": remote_url,
+                    "mode": mode,
+                    "push": None,
+                    "pull": None,
+                    "errors": [],
+                }
+
+        sync_module.SyncEncryption = SyncEncryption
+        sync_module.SyncEngine = SyncEngine
+        sys.modules["mnemosyne.core.memory"] = memory_module
+        sys.modules["mnemosyne.core.sync"] = sync_module
+
+        from mnemosyne.cli import cmd_sync
+        cmd_sync(json.loads(sys.argv[1]))
+        """
+    )
+    executed = subprocess.run(
+        [sys.executable, "-c", probe, json.dumps(command_args)],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert executed.returncode == 0, executed.stderr
+    assert "Sync to https://relay.example" in executed.stdout
+
+
 def test_surface_mode_refuses_unmarked_db_without_claiming_rows(tmp_path):
     from mnemosyne.core.sync import SyncEngine
 
@@ -105,12 +213,540 @@ def test_non_loopback_plain_http_sync_is_rejected(tmp_path):
         engine.get_status(remote_url="http://relay.example", api_key="secret")
 
 
+def _snapshot_tree(root: Path) -> dict[str, tuple]:
+    """Capture names, metadata, and file bytes for mutation comparisons."""
+    if not root.exists():
+        return {}
+    snapshot = {}
+    for path in sorted(root.rglob("*")):
+        stat_result = path.lstat()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+        snapshot[str(path.relative_to(root))] = (
+            "file" if path.is_file() else "directory",
+            stat_result.st_mode,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            digest,
+        )
+    return snapshot
+
+
+def _sync_init_subprocess(
+    tmp_path: Path,
+    db_path: Path,
+    *extra_args: str,
+    data_root: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(tmp_path / "home"),
+            "HERMES_HOME": str(tmp_path / "hermes-home"),
+            "MNEMOSYNE_DATA_DIR": str(data_root or (tmp_path / "data-root")),
+            "MNEMOSYNE_NO_EMBEDDINGS": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mnemosyne.cli",
+            "sync-init",
+            "--db-path",
+            str(db_path),
+            *extra_args,
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("table", "schema", "row"),
+    [
+        (
+            "working_memory",
+            "scope TEXT, session_id TEXT",
+            ("global", "hermes_shared_surface"),
+        ),
+        (
+            "memories",
+            "id TEXT, session_id TEXT",
+            ("coincidental-id", "hermes_shared_surface"),
+        ),
+    ],
+    ids=["coincidental-working-memory", "coincidental-memories"],
+)
+def test_sync_init_rejects_coincidental_schema_read_only_in_fresh_process(
+    tmp_path, table, schema, row
+):
+    db_path = tmp_path / f"coincidental-{table}.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(f"CREATE TABLE {table} ({schema})")
+        placeholders = ", ".join("?" for _ in row)
+        conn.execute(f"INSERT INTO {table} VALUES ({placeholders})", row)
+    before = _snapshot_tree(tmp_path)
+
+    rejected = _sync_init_subprocess(
+        tmp_path, db_path, "--claim-existing", "--yes"
+    )
+
+    assert rejected.returncode != 0
+    assert "not a dedicated shared-surface database" in rejected.stderr
+    assert _snapshot_tree(tmp_path) == before
+    assert not Path(f"{db_path}-wal").exists()
+    assert not Path(f"{db_path}-shm").exists()
+    assert not (tmp_path / "data-root").exists()
+    assert not (tmp_path / "hermes-home").exists()
+
+
+def test_sync_init_rejects_unrecognized_schema_read_only_in_fresh_process(tmp_path):
+    db_path = tmp_path / "unrelated.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE customer_records (id INTEGER PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO customer_records (value) VALUES ('must remain untouched')")
+    before = _snapshot_tree(tmp_path)
+
+    rejected = _sync_init_subprocess(
+        tmp_path, db_path, "--claim-existing", "--yes"
+    )
+
+    assert rejected.returncode != 0
+    assert "not a dedicated shared-surface database" in rejected.stderr
+    assert _snapshot_tree(tmp_path) == before
+    assert not Path(f"{db_path}-wal").exists()
+    assert not Path(f"{db_path}-shm").exists()
+    assert not (tmp_path / "data-root").exists()
+    assert not (tmp_path / "hermes-home").exists()
+
+
+@pytest.mark.parametrize(
+    ("setup", "db_name"),
+    [
+        (
+            """
+            from mnemosyne.core.sync import SyncEngine
+
+            engine = SyncEngine(memory, device_id="legacy-device", allow_unscoped_sync=True)
+            engine.log_event("legacy-memory", "CREATE", {"content": "legacy event"})
+            """,
+            "legacy-events.db",
+        ),
+        (
+            """
+            from mnemosyne.core.sync import SyncEngine
+
+            engine = SyncEngine(memory, device_id="foreign-device", allow_unscoped_sync=True)
+            engine.conn.execute(
+                "INSERT INTO sync_meta (key, value) VALUES (?, ?)",
+                ("surface_db_id", "foreign-surface"),
+            )
+            engine.conn.commit()
+            """,
+            "foreign-surface-meta.db",
+        ),
+    ],
+    ids=["legacy-unscoped-memory-event", "conflicting-surface-marker"],
+)
+def test_sync_init_rejects_existing_sync_state_read_only_in_fresh_process(
+    tmp_path, setup, db_name
+):
+    data_root = tmp_path / "data-root"
+    db_path = tmp_path / db_name
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(tmp_path / "home"),
+            "HERMES_HOME": str(tmp_path / "hermes-home"),
+            "MNEMOSYNE_DATA_DIR": str(data_root),
+            "MNEMOSYNE_NO_EMBEDDINGS": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    created = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                from pathlib import Path
+                import sys
+                from mnemosyne.core.memory import Mnemosyne
+
+                memory = Mnemosyne(
+                    db_path=Path(sys.argv[1]),
+                    session_id="hermes_shared_surface",
+                )
+                """
+            )
+            + textwrap.dedent(setup)
+            + textwrap.dedent(
+                """
+                memory.beam.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                memory.beam.conn.close()
+                """
+            ),
+            str(db_path),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert created.returncode == 0, created.stderr
+    with sqlite3.connect(
+        f"{db_path.as_uri()}?mode=ro&immutable=1", uri=True
+    ) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+    before = _snapshot_tree(tmp_path)
+
+    rejected = _sync_init_subprocess(
+        tmp_path,
+        db_path,
+        "--claim-existing",
+        "--yes",
+        data_root=data_root,
+    )
+
+    assert rejected.returncode != 0
+    assert "not a dedicated shared-surface database" in rejected.stderr
+    assert _snapshot_tree(tmp_path) == before
+    assert not Path(f"{db_path}-wal").exists()
+    assert not Path(f"{db_path}-shm").exists()
+
+
+def test_sync_init_global_episodic_rows_require_confirmation_in_fresh_process(tmp_path):
+    data_root = tmp_path / "data-root"
+    db_path = tmp_path / "episodic-only.db"
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(tmp_path / "home"),
+            "HERMES_HOME": str(tmp_path / "hermes-home"),
+            "MNEMOSYNE_DATA_DIR": str(data_root),
+            "MNEMOSYNE_NO_EMBEDDINGS": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    setup = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                import sys
+                from pathlib import Path
+                from mnemosyne.core.memory import Mnemosyne
+
+                memory = Mnemosyne(
+                    db_path=Path(sys.argv[1]),
+                    session_id="hermes_shared_surface",
+                )
+                memory.beam.conn.execute(
+                    "INSERT INTO episodic_memory "
+                    "(id, content, session_id, scope) VALUES (?, ?, ?, ?)",
+                    ("episode-1", "existing shared episode", "hermes_shared_surface", "global"),
+                )
+                memory.beam.conn.commit()
+                memory.beam.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                memory.beam.conn.close()
+                """
+            ),
+            str(db_path),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert setup.returncode == 0, setup.stderr
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0] == 1
+    before = _snapshot_tree(tmp_path)
+
+    confirmation = _sync_init_subprocess(tmp_path, db_path)
+
+    assert confirmation.returncode == 0, confirmation.stderr
+    assert json.loads(confirmation.stdout) == {
+        "db_path": str(db_path),
+        "existing_rows": 1,
+        "invalid_rows": 0,
+        "required_flags": ["--claim-existing", "--yes"],
+        "session_id": "hermes_shared_surface",
+        "status": "confirmation_required",
+    }
+    assert _snapshot_tree(tmp_path) == before
+
+    confirmed = _sync_init_subprocess(
+        tmp_path, db_path, "--claim-existing", "--yes"
+    )
+
+    assert confirmed.returncode == 0, confirmed.stderr
+    assert json.loads(confirmed.stdout)["claimed_rows"] == 1
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT id, content, scope, session_id FROM episodic_memory"
+        ).fetchall() == [
+            (
+                "episode-1",
+                "existing shared episode",
+                "global",
+                "hermes_shared_surface",
+            )
+        ]
+        assert conn.execute(
+            "SELECT value FROM sync_meta WHERE key = 'surface_db_id'"
+        ).fetchone() == ("shared-surface-v1",)
+
+
+@pytest.mark.parametrize(
+    ("scope", "session_id"),
+    [
+        (None, "hermes_shared_surface"),
+        ("global", None),
+    ],
+    ids=["null-scope", "null-session-id"],
+)
+def test_sync_init_null_ownership_is_read_only_in_fresh_process(
+    tmp_path, scope, session_id
+):
+    db_path = tmp_path / "ambiguous.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE working_memory (scope TEXT, session_id TEXT)")
+        conn.execute("INSERT INTO working_memory VALUES (?, ?)", (scope, session_id))
+    before = _snapshot_tree(tmp_path)
+
+    rejected = _sync_init_subprocess(
+        tmp_path, db_path, "--claim-existing", "--yes"
+    )
+
+    assert rejected.returncode != 0
+    assert "not a dedicated shared-surface database" in rejected.stderr
+    assert _snapshot_tree(tmp_path) == before
+    assert not Path(f"{db_path}-wal").exists()
+    assert not Path(f"{db_path}-shm").exists()
+
+
+def test_sync_init_private_episodic_history_is_read_only_in_fresh_process(tmp_path):
+    db_path = tmp_path / "private-episodic.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE working_memory (scope TEXT, session_id TEXT)")
+        conn.execute("CREATE TABLE episodic_memory (scope TEXT, session_id TEXT)")
+        conn.execute("INSERT INTO episodic_memory VALUES ('session', 'private-session')")
+    before = _snapshot_tree(tmp_path)
+
+    rejected = _sync_init_subprocess(
+        tmp_path, db_path, "--claim-existing", "--yes"
+    )
+
+    assert rejected.returncode != 0
+    assert "not a dedicated shared-surface database" in rejected.stderr
+    assert _snapshot_tree(tmp_path) == before
+    assert not Path(f"{db_path}-wal").exists()
+    assert not Path(f"{db_path}-shm").exists()
+
+
+def test_rejected_sync_init_is_filesystem_read_only_in_fresh_process(tmp_path):
+    data_root = tmp_path / "data"
+    db_path = data_root / "private.db"
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(tmp_path / "home"),
+            "HERMES_HOME": str(tmp_path / "hermes-home"),
+            "MNEMOSYNE_DATA_DIR": str(data_root),
+            "MNEMOSYNE_NO_EMBEDDINGS": "1",
+        }
+    )
+    setup = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from mnemosyne.core.memory import Mnemosyne; "
+                f"m = Mnemosyne(db_path={str(db_path)!r}, "
+                "session_id='hermes_shared_surface'); "
+                "m.remember('shared row', scope='global', source='test'); "
+                "m.remember('private row', scope='session', source='test')"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert setup.returncode == 0, setup.stderr
+    before = _snapshot_tree(tmp_path)
+
+    rejected = subprocess.run(
+        [sys.executable, "-m", "mnemosyne.cli", "sync-init", "--db-path", str(db_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert rejected.returncode != 0
+    assert "not a dedicated shared-surface database" in rejected.stderr
+    assert "mnemosyne sync-init --db-path" in rejected.stderr
+    assert "mnemosyne_shared_*" in rejected.stderr
+    assert _snapshot_tree(tmp_path) == before
+    assert not Path(f"{db_path}-wal").exists()
+    assert not Path(f"{db_path}-shm").exists()
+
+
+def test_sync_init_missing_target_does_not_create_data_root(tmp_path):
+    data_root = tmp_path / "absent-data"
+    hermes_home = tmp_path / "absent-hermes-home"
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(tmp_path / "home"),
+            "HERMES_HOME": str(hermes_home),
+            "MNEMOSYNE_DATA_DIR": str(data_root),
+        }
+    )
+
+    rejected = subprocess.run(
+        [sys.executable, "-m", "mnemosyne.cli", "sync-init"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert rejected.returncode == 2
+    assert "--db-path" in rejected.stderr
+    assert not data_root.exists()
+    assert not hermes_home.exists()
+
+
+def test_sync_init_does_not_touch_hot_wal_or_shm(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    db_path = data_root / "hot-private.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE working_memory (scope TEXT, session_id TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO working_memory VALUES ('session', 'private-session')"
+        )
+        conn.commit()
+        assert Path(f"{db_path}-wal").stat().st_size > 0
+        assert Path(f"{db_path}-shm").exists()
+        before = _snapshot_tree(tmp_path)
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(tmp_path / "home"),
+                "HERMES_HOME": str(tmp_path / "hermes-home"),
+                "MNEMOSYNE_DATA_DIR": str(data_root),
+            }
+        )
+
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "mnemosyne.cli",
+                "sync-init",
+                "--db-path",
+                str(db_path),
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert rejected.returncode != 0
+        assert "uncheckpointed SQLite state" in rejected.stderr
+        assert "not a dedicated shared-surface database" in rejected.stderr
+        assert _snapshot_tree(tmp_path) == before
+    finally:
+        conn.close()
+
+
+def test_sync_init_rejects_hot_wal_symlink_alias_read_only_in_fresh_process(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    db_path = data_root / "hot-shared.db"
+    alias = data_root / "shared-alias.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE working_memory (scope TEXT, session_id TEXT)")
+        conn.execute(
+            "INSERT INTO working_memory VALUES ('global', 'hermes_shared_surface')"
+        )
+        conn.commit()
+        alias.symlink_to(db_path)
+        assert Path(f"{db_path}-wal").stat().st_size > 0
+        assert Path(f"{db_path}-shm").exists()
+        before = _snapshot_tree(tmp_path)
+
+        rejected = _sync_init_subprocess(
+            tmp_path,
+            alias,
+            "--claim-existing",
+            "--yes",
+            data_root=data_root,
+        )
+
+        assert rejected.returncode != 0
+        assert "symbolic-link database targets are not allowed" in rejected.stderr
+        assert _snapshot_tree(tmp_path) == before
+        assert alias.is_symlink()
+        assert data_root.exists()
+        assert Path(f"{db_path}-wal").exists()
+        assert Path(f"{db_path}-shm").exists()
+    finally:
+        conn.close()
+
+
+def test_sync_init_accepts_empty_existing_sync_tables(tmp_path, capsys):
+    from mnemosyne.cli import cmd_sync_init
+    from mnemosyne.core.sync import SyncEngine
+
+    db_path = tmp_path / "empty-sync-state.db"
+    memory = Mnemosyne(db_path=db_path, session_id="hermes_shared_surface")
+    engine = SyncEngine(memory, device_id="legacy-device", allow_unscoped_sync=True)
+    assert engine.conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0] == 0
+    assert engine.conn.execute("SELECT COUNT(*) FROM sync_meta").fetchone()[0] == 0
+    engine.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    cmd_sync_init(["--db-path", str(db_path)])
+
+    assert json.loads(capsys.readouterr().out)["status"] == "initialized"
+    assert engine.conn.execute(
+        "SELECT value FROM sync_meta WHERE key = 'surface_db_id'"
+    ).fetchone()[0] == "shared-surface-v1"
+
+
 def test_sync_init_requires_explicit_confirmation_for_existing_rows(tmp_path, capsys):
     from mnemosyne.cli import cmd_sync_init
 
     db_path = tmp_path / "legacy-shared.db"
     memory = Mnemosyne(db_path=db_path, session_id="hermes_shared_surface")
     memory.remember("existing shared", source="test", scope="global")
+    memory.beam.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     cmd_sync_init(["--db-path", str(db_path)])
     preview = json.loads(capsys.readouterr().out)
@@ -120,6 +756,7 @@ def test_sync_init_requires_explicit_confirmation_for_existing_rows(tmp_path, ca
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_meta'"
     ).fetchone()
     assert sync_meta_exists is None
+    memory.beam.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     cmd_sync_init(
         ["--db-path", str(db_path), "--claim-existing", "--yes"]
