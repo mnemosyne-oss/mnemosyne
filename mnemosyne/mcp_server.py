@@ -358,7 +358,7 @@ def _build_sse_app(host: str = "127.0.0.1"):
         from starlette.applications import Starlette
         from starlette.routing import Mount, Route
         from starlette.middleware import Middleware
-        from starlette.responses import JSONResponse
+        from starlette.responses import Response
     except ImportError:
         raise RuntimeError(
             "SSE transport requires starlette and uvicorn. "
@@ -373,10 +373,29 @@ def _build_sse_app(host: str = "127.0.0.1"):
     transport = SseServerTransport("/messages/")
     server = _build_mcp_server()
 
+    class _SseStreamDoneResponse(Response):
+        """No-op response returned after the SSE stream has ended.
+
+        SseServerTransport.connect_sse() owns the ASGI response: it sends
+        ``http.response.start`` itself and streams until disconnect.
+        Returning a normal response after it (previously ``JSONResponse({})``)
+        emits a *second* ``http.response.start``, which starlette/uvicorn
+        reject with ``RuntimeError: Expected ASGI message
+        'http.response.body', but got 'http.response.start'`` on every
+        disconnect or server shutdown with open sessions (issue #910).
+        This response intentionally sends nothing.
+        """
+
+        def __init__(self) -> None:
+            super().__init__(status_code=200)
+
+        async def __call__(self, scope, receive, send):  # noqa: ARG002
+            return None
+
     async def handle_sse(request):
         async with transport.connect_sse(request.scope, request.receive, request._send) as streams:
             await server.run(streams[0], streams[1], server.create_initialization_options())
-        return JSONResponse({})
+        return _SseStreamDoneResponse()
 
     middleware = []
     if require_auth:
