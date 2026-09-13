@@ -850,19 +850,42 @@ class Mnemosyne:
         if not updates:
             return False
 
-        params.extend([memory_id, self.session_id])
         with _deferred_commits(self.conn):
+            # Authorize from the authoritative BEAM working row. Global rows
+            # may be updated cross-session; session-scoped rows remain private.
+            owner = cursor.execute(
+                """
+                SELECT session_id FROM working_memory
+                WHERE id = ? AND (session_id = ? OR scope = 'global')
+                """,
+                (memory_id, self.session_id),
+            ).fetchone()
+            if owner is None:
+                # Preserve owner-only updates for old legacy-only rows without
+                # letting their fallback authorize a foreign working-memory row.
+                params.extend([memory_id, self.session_id])
+                legacy_where = "id = ? AND session_id = ?"
+            else:
+                # The legacy mirror has no scope; update it by the BEAM row's
+                # owning session after BEAM has authorized the operation.
+                params.extend([memory_id, owner["session_id"]])
+                legacy_where = "id = ? AND session_id = ?"
+
             cursor.execute(
-                f"UPDATE memories SET {', '.join(updates)} WHERE id = ? AND session_id = ?",
-                params
+                f"UPDATE memories SET {', '.join(updates)} WHERE {legacy_where}",
+                params,
             )
+            legacy_updated = cursor.rowcount > 0
             self.conn.commit()
+            beam_updated = self.beam.update_working(
+                memory_id, content=content, importance=importance
+            )
+            updated = legacy_updated or beam_updated
 
-            # Sync BEAM working_memory
-            self.beam.update_working(memory_id, content=content, importance=importance)
-
+        if not updated:
+            return False
         self._emit_wrapper("MEMORY_UPDATED", memory_id, content=content, importance=importance)
-        return cursor.rowcount > 0
+        return True
 
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """Mark a memory as expired or superseded. Delegates to BEAM."""
