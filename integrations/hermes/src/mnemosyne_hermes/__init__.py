@@ -1463,13 +1463,27 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
         try:
             if self._profile_isolation_enabled:
-                # Route through Mnemosyne(bank=...) so BankManager handles
-                # directory creation, canonical path resolution, and isolates
-                # memories per Hermes profile.
+                # A supplied Hermes home is the authoritative profile binding.
+                # Pass the concrete database path so BankManager cannot resolve
+                # the private store from process-global HERMES_HOME or
+                # MNEMOSYNE_DATA_DIR in a multiplexed Gateway process.
                 bank_name = self._resolve_profile_bank()
+                private_db_path = None
+                if self._hermes_home:
+                    private_data_dir = (
+                        Path(self._hermes_home).expanduser().resolve()
+                        / "mnemosyne"
+                        / "data"
+                    )
+                    private_db_path = (
+                        private_data_dir / "mnemosyne.db"
+                        if bank_name == "default"
+                        else private_data_dir / "banks" / bank_name / "mnemosyne.db"
+                    )
                 from mnemosyne.core.memory import Mnemosyne
                 mem = Mnemosyne(
                     session_id=self._session_id,
+                    db_path=private_db_path,
                     bank=bank_name,
                     channel_id=kwargs.get("channel_id", ""),
                 )

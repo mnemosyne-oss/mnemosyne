@@ -435,6 +435,49 @@ def test_profile_isolation_switch_preserves_bank_db_and_explicit_channel(
         _shutdown_and_close(provider)
 
 
+@pytest.mark.parametrize(
+    ("active_home_name", "agent_identity", "expected_relative_path"),
+    [
+        (
+            "profile-b",
+            "profile-b",
+            Path("mnemosyne/data/banks/profile-b/mnemosyne.db"),
+        ),
+        (".hermes", "default", Path("mnemosyne/data/mnemosyne.db")),
+    ],
+)
+def test_profile_isolation_uses_active_hermes_home_not_ambient_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    active_home_name: str,
+    agent_identity: str,
+    expected_relative_path: Path,
+) -> None:
+    """The active profile home wins over ambient process-level storage roots."""
+    ambient_home = tmp_path / "profiles" / "ambient-a"
+    active_home = tmp_path / "profiles" / active_home_name
+    monkeypatch.setenv("HERMES_HOME", str(ambient_home))
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(ambient_home / "override"))
+    monkeypatch.setattr(MnemosyneConfig, "_instance", None)
+
+    provider = MnemosyneMemoryProvider()
+    provider.initialize(
+        "SESS-A",
+        hermes_home=str(active_home),
+        agent_identity=agent_identity,
+        profile_isolation=True,
+        auto_sleep=False,
+    )
+    try:
+        assert provider._beam is not None
+        assert provider._beam.db_path == (active_home / expected_relative_path).resolve()
+        assert not (ambient_home / "mnemosyne" / "data").exists()
+        assert not (ambient_home / "override" / "mnemosyne.db").exists()
+    finally:
+        _shutdown_and_close(provider)
+        MnemosyneConfig._instance = None
+
+
 def test_switch_waits_for_inflight_turn_without_mixing_sessions() -> None:
     turn_started = threading.Event()
     release_turn = threading.Event()
