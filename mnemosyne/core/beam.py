@@ -35,9 +35,7 @@ from pathlib import Path
 
 
 class MemoryTransactionStateError(RuntimeError):
-    """consolidate_to_episodic() was asked to emit MEMORY_CONSOLIDATED while
-    a caller-owned transaction is open: the event cannot be ordered after
-    the outer commit, so the call is rejected before any write."""
+    """An event-emitting write cannot be ordered after its caller's commit."""
 
 
 def _event_date_valid(value: str) -> bool:
@@ -6383,9 +6381,26 @@ class BeamMemory:
             )
         if not updates:
             return False
+        # Match consolidate_to_episodic(): an active emitter cannot publish a
+        # durable update before a caller-owned transaction eventually commits.
+        # An active _deferred_commits scope is method-owned (including batch and
+        # wrapper coordination), so it retains the existing commit path.
+        if (
+            self.conn.in_transaction
+            and not getattr(self.conn, "_defer_commit", False)
+            and self._event_emitter is not None
+        ):
+            raise MemoryTransactionStateError(
+                "update_working(): an event emitter is active while a"
+                " caller-owned transaction is open; commit before updating."
+            )
+        # Match the visibility contract used by get(), forget_working(), and
+        # invalidate(): global memories are addressable across sessions, while
+        # session-scoped memories remain private to their creating session.
         params.extend([memory_id, self.session_id])
         cursor.execute(
-            f"UPDATE working_memory SET {', '.join(updates)} WHERE id = ? AND session_id = ?",
+            f"UPDATE working_memory SET {', '.join(updates)} "
+            "WHERE id = ? AND (session_id = ? OR scope = 'global')",
             params
         )
         affected = cursor.rowcount

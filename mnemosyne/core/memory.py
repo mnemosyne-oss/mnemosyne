@@ -28,7 +28,13 @@ logger = logging.getLogger(__name__)
 from mnemosyne.core import embeddings as _embeddings
 from mnemosyne.core import beam as beam_module
 from mnemosyne.core._connection_gc import collect_connection_cycles
-from mnemosyne.core.beam import BeamMemory, _BeamConnection, _deferred_commits, init_beam
+from mnemosyne.core.beam import (
+    BeamMemory,
+    MemoryTransactionStateError,
+    _BeamConnection,
+    _deferred_commits,
+    init_beam,
+)
 from mnemosyne.core.journal import journal_mode
 _thread_local = threading.local()
 
@@ -850,19 +856,53 @@ class Mnemosyne:
         if not updates:
             return False
 
-        params.extend([memory_id, self.session_id])
-        with _deferred_commits(self.conn):
-            cursor.execute(
-                f"UPDATE memories SET {', '.join(updates)} WHERE id = ? AND session_id = ?",
-                params
+        # A caller-owned transaction can roll back after this method returns,
+        # but the wrapper cannot defer MEMORY_UPDATED until that outer commit.
+        # Fail before either mirror is touched when streaming makes the update
+        # observable. Without streaming, the existing savepoint path remains
+        # available to callers and batch adapters.
+        if self._stream is not None and self.conn.in_transaction:
+            raise MemoryTransactionStateError(
+                "Mnemosyne.update(): streaming is active while a caller-owned"
+                " transaction is open; commit before updating."
             )
+
+        with _deferred_commits(self.conn):
+            # Authorize from the authoritative BEAM working row. Global rows
+            # may be updated cross-session; session-scoped rows remain private.
+            owner = cursor.execute(
+                """
+                SELECT session_id FROM working_memory
+                WHERE id = ? AND (session_id = ? OR scope = 'global')
+                """,
+                (memory_id, self.session_id),
+            ).fetchone()
+            if owner is None:
+                # Preserve owner-only updates for old legacy-only rows without
+                # letting their fallback authorize a foreign working-memory row.
+                params.extend([memory_id, self.session_id])
+                legacy_where = "id = ? AND session_id = ?"
+            else:
+                # The legacy mirror has no scope; update it by the BEAM row's
+                # owning session after BEAM has authorized the operation.
+                params.extend([memory_id, owner["session_id"]])
+                legacy_where = "id = ? AND session_id = ?"
+
+            cursor.execute(
+                f"UPDATE memories SET {', '.join(updates)} WHERE {legacy_where}",
+                params,
+            )
+            legacy_updated = cursor.rowcount > 0
             self.conn.commit()
+            beam_updated = self.beam.update_working(
+                memory_id, content=content, importance=importance
+            )
+            updated = legacy_updated or beam_updated
 
-            # Sync BEAM working_memory
-            self.beam.update_working(memory_id, content=content, importance=importance)
-
+        if not updated:
+            return False
         self._emit_wrapper("MEMORY_UPDATED", memory_id, content=content, importance=importance)
-        return cursor.rowcount > 0
+        return True
 
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """Mark a memory as expired or superseded. Delegates to BEAM."""
