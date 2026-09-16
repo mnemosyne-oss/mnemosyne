@@ -16,6 +16,8 @@ import re
 from pathlib import Path
 from typing import List, Optional
 
+from mnemosyne.core.user_agent import application_user_agent
+
 # --- Config ------------------------------------------------------------------
 DEFAULT_MODEL_REPO = "openbmb/MiniCPM5-1B-GGUF"
 DEFAULT_MODEL_FILE = "MiniCPM5-1B-Q4_K_M.gguf"
@@ -617,7 +619,10 @@ def _call_remote_llm_with_model(
         has_httpx = False
 
     url = f"{base_url}/chat/completions"
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": application_user_agent(),
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 

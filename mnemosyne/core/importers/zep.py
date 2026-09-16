@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import List, Dict
 
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
+from mnemosyne.core.user_agent import application_user_agent
 
 
 class ZepImporter(BaseImporter):
@@ -116,7 +117,10 @@ class ZepImporter(BaseImporter):
         import urllib.request
 
         base = self.base_url or "https://api.getzep.com"
-        headers = {"Authorization": f"Bearer {self.api_key}"}
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "User-Agent": application_user_agent(),
+        }
 
         all_memories = []
 

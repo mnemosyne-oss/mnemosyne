@@ -24,6 +24,7 @@ from datetime import datetime
 from typing import List, Dict
 
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
+from mnemosyne.core.user_agent import application_user_agent
 
 
 class Mem0Importer(BaseImporter):
@@ -136,7 +137,9 @@ class Mem0Importer(BaseImporter):
         if params:
             url += "?" + urllib.parse.urlencode(params)
 
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(
+            url, headers={"User-Agent": application_user_agent()}
+        )
         if self.api_key:
             req.add_header("Authorization", f"Bearer {self.api_key}")
 
