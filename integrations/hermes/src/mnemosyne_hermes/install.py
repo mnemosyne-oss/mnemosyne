@@ -28,6 +28,7 @@ SKILL_NAME = "mnemosyne-memory-override"
 SKILL_CATEGORY = "memory"
 BUNDLED_SKILL_RESOURCE = ("skills", SKILL_NAME, "SKILL.md")
 WRAPPER_MANIFEST_NAME = "mnemosyne-wrapper.json"
+PROFILE_LINKS_PREFERENCE_NAME = ".mnemosyne-profile-links.json"
 
 _MAX_HERMES_BIN_DEPTH = 10
 LOGGER = logging.getLogger(__name__)
@@ -90,11 +91,13 @@ class SkillInstallResult:
 
 @dataclass(frozen=True)
 class HermesPathContract:
-    """Stable wrapper/skill paths on which Mnemosyne depends in one Hermes home."""
+    """Installer-owned plugin, profile-link, and skill paths in one Hermes home."""
 
     hermes_home: Path
     plugin_target: Path
     wrapper_manifest: Path
+    profile_links_preference: Path
+    profile_plugin_targets: tuple[Path, ...]
     skill_target: Path
 
 
@@ -169,6 +172,11 @@ def hermes_path_contract(
         hermes_home=base,
         plugin_target=plugin_target,
         wrapper_manifest=_wrapper_manifest_file(plugin_target),
+        profile_links_preference=_profile_links_preference_path(base),
+        profile_plugin_targets=tuple(
+            profile / "plugins" / PLUGIN_NAME
+            for profile in _iter_mnemosyne_profiles(base)
+        ),
         skill_target=skill_target_file(base),
     )
 
@@ -1276,7 +1284,7 @@ def _link_all_profiles(
 def _profile_links_preference_path(hermes_home_path: str | Path | None = None) -> Path:
     """Return the installer-managed profile-link preference for a Hermes home."""
     base = Path(hermes_home_path).expanduser() if hermes_home_path else hermes_home()
-    return base / "plugins" / ".mnemosyne-profile-links.json"
+    return base / "plugins" / PROFILE_LINKS_PREFERENCE_NAME
 
 
 def _atomic_write_profile_links_preference(path: Path, payload: bytes) -> None:
@@ -1734,7 +1742,7 @@ def _guard_selected_site_packages_python_compatibility(selected_site_packages: P
 
 def activate() -> dict[str, object]:
     \"\"\"Validate the wrapper and import its selected package identity.\"\"\"
-    manifest_path = Path(__file__).with_name("mnemosyne-wrapper.json")
+    manifest_path = Path(__file__).with_name(__MNEMOSYNE_WRAPPER_MANIFEST_NAME__)
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -1802,7 +1810,7 @@ def activate() -> dict[str, object]:
     if expected_root is not None and not from_selected_package(selected_package):
         raise RuntimeError("Mnemosyne wrapper imported package from an unexpected origin")
     return manifest
-"""
+""".replace("__MNEMOSYNE_WRAPPER_MANIFEST_NAME__", repr(WRAPPER_MANIFEST_NAME))
     init_source = """\"\"\"Persistent Mnemosyne Hermes plugin wrapper.\"\"\"
 from ._mnemosyne_bootstrap import activate as _activate
 

@@ -21,6 +21,10 @@ def test_hermes_path_contract_resolves_from_the_existing_install_helpers(
     assert contract.hermes_home == home
     assert contract.plugin_target == home / "plugins" / "mnemosyne"
     assert contract.wrapper_manifest == contract.plugin_target / "mnemosyne-wrapper.json"
+    assert contract.profile_links_preference == (
+        home / "plugins" / ".mnemosyne-profile-links.json"
+    )
+    assert contract.profile_plugin_targets == ()
     assert contract.skill_target == (
         home / "skills" / "memory" / "mnemosyne-memory-override" / "SKILL.md"
     )
@@ -29,34 +33,60 @@ def test_hermes_path_contract_resolves_from_the_existing_install_helpers(
 
 
 def test_wrapper_and_skill_artifacts_follow_the_declared_path_and_manifest_boundary(
-    tmp_path,
+    tmp_path, monkeypatch
 ):
     home = tmp_path / "hermes-home"
     side_venv = tmp_path / "mnemosyne-side-venv"
     side_python = Path(sys.executable).absolute()
     side_site_packages = side_venv / "site-packages"
     side_site_packages.mkdir(parents=True)
+    profile = home / "profiles" / "selected"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        "memory:\n  provider: mnemosyne\n", encoding="utf-8"
+    )
     contract = install.hermes_path_contract(home)
+    artifacts_before_install = {
+        path.relative_to(home).as_posix() for path in home.rglob("*")
+    }
 
-    install._write_wrapper_plugin(
-        contract.plugin_target,
+    monkeypatch.setattr(
+        install,
+        "_validated_wrapper_environment",
+        lambda *_args, **_kwargs: (side_python, side_site_packages),
+    )
+    install.install_plugin(
+        hermes_home_path=home,
+        mode="wrapper",
         python=side_python,
-        site_packages=side_site_packages,
     )
     install.install_bundled_skill(hermes_home_path=home)
 
-    files_under_home = {
-        path.relative_to(home).as_posix() for path in home.rglob("*") if path.is_file()
+    installer_artifacts = {
+        path.relative_to(home).as_posix()
+        for path in home.rglob("*")
+        if (path.is_file() or path.is_symlink())
+        and path.relative_to(home).as_posix() not in artifacts_before_install
     }
-    assert files_under_home == {
+    assert installer_artifacts == {
+        "plugins/.mnemosyne-profile-links.json",
         "plugins/mnemosyne/__init__.py",
         "plugins/mnemosyne/_mnemosyne_bootstrap.py",
         "plugins/mnemosyne/cli.py",
         "plugins/mnemosyne/mnemosyne-wrapper.json",
         "plugins/mnemosyne/plugin.yaml",
+        "profiles/selected/plugins/mnemosyne",
         "skills/memory/mnemosyne-memory-override/SKILL.md",
         "skills/memory/mnemosyne-memory-override/SKILL.md.sha256",
     }
+    assert contract.profile_links_preference.read_text(encoding="utf-8") == (
+        '{"link_profiles": true}\n'
+    )
+    assert contract.profile_plugin_targets == (
+        profile / "plugins" / "mnemosyne",
+    )
+    assert contract.profile_plugin_targets[0].is_symlink()
+    assert contract.profile_plugin_targets[0].resolve() == contract.plugin_target
 
     manifest = json.loads(contract.wrapper_manifest.read_text(encoding="utf-8"))
     assert manifest == {
@@ -65,6 +95,10 @@ def test_wrapper_and_skill_artifacts_follow_the_declared_path_and_manifest_bound
         "site_packages": str(side_site_packages.resolve()),
         "package": "mnemosyne_hermes",
     }
+    bootstrap_source = (contract.plugin_target / "_mnemosyne_bootstrap.py").read_text(
+        encoding="utf-8"
+    )
+    assert f"with_name({install.WRAPPER_MANIFEST_NAME!r})" in bootstrap_source
     assert not side_site_packages.is_relative_to(home)
 
     shutil.rmtree(side_venv)
