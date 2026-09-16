@@ -55,22 +55,23 @@ validation in the corresponding Hermes distribution and release.
 ### Step 1: Install
 
 **Choose an install mode first.** The default writes a symbolic link into the
-Hermes home and expects that link to survive. Persistent wrapper mode instead
-keeps Mnemosyne's Python dependencies in a side venv outside the Hermes runtime
-and installs a real plugin directory. Pick wrapper mode whenever Hermes rebuilds
-its own Python environment, or where symbolic links are privileged operations:
+Hermes home and relies on that link remaining available. Persistent wrapper mode
+instead keeps Mnemosyne's Python dependencies in a side venv outside the Hermes
+runtime and installs a real plugin directory. Pick wrapper mode when you need
+independence from replacement of Hermes' own Python environment, or where
+symbolic links are privileged operations:
 
 | Your Hermes | Mode | Why |
 |---|---|---|
 | Linux or macOS, pip or source install | default (symlink) | The Hermes venv is yours and persists. |
-| Docker image | **wrapper** | The venv is rebuilt on every image update. |
-| Desktop binary installer | **wrapper** | The bundled Python environment is wiped and rebuilt on update. |
+| Docker image | **wrapper** | An image update may replace the venv. |
+| Desktop binary installer | **wrapper** | An update may replace the bundled Python environment. |
 | Native Windows | **wrapper** | The native default is the persistent wrapper install; a symbolic link needs Developer Mode or an elevated shell, so `WinError 1314` appears only when explicitly requesting `--mode symlink`. |
 | WSL | default (symlink) | Behaves like Linux. |
 
-The three wrapper rows are the same mechanism for the same underlying reason:
-something outside your control replaces or restricts the Hermes runtime, and
-Mnemosyne has to survive it. Only the paths differ. See
+The three wrapper rows use the same mechanism to keep Mnemosyne independent
+when something outside your control replaces or restricts the Hermes runtime.
+Only the paths differ. See
 [Persistent side-venv wrapper mode](#persistent-side-venv-wrapper-mode) below.
 
 **pip (recommended):**
