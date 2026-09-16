@@ -4,6 +4,37 @@ Mnemosyne is designed as a native memory backend for the [Hermes Agent Framework
 
 > **This is the canonical Hermes setup guide.** The README links here for full instructions.
 
+## Mnemosyne-owned Hermes home contract
+
+For installer and status operations, Mnemosyne uses an explicitly supplied
+`--hermes-home` (or API path) when present; otherwise it uses a non-empty
+`HERMES_HOME`, falling back to the expanded `~/.hermes`. The resulting active
+Hermes home is the base for these Mnemosyne-owned paths:
+
+- `$HERMES_HOME/plugins/mnemosyne/` is the base plugin or wrapper directory. In
+  wrapper mode it contains `mnemosyne-wrapper.json`, whose `python` and
+  `site_packages` fields record the selected Python executable and
+  site-packages directory.
+- Where the installer manages profile-link preference, it stores that choice in
+  `$HERMES_HOME/plugins/.mnemosyne-profile-links.json`.
+- The bundled skill is installed at
+  `$HERMES_HOME/skills/memory/mnemosyne-memory-override/SKILL.md`; its
+  installer-managed SHA-256 checksum is stored beside it as `SKILL.md.sha256`.
+
+A wrapper's selected side environment is intended to live outside the
+replaceable Hermes runtime. This is a Mnemosyne deployment layout, not a claim
+that Hermes itself enforces or preserves the side environment, plugin
+directory, manifest, preference file, or skill. See
+[Persistent side-venv wrapper mode](#persistent-side-venv-wrapper-mode) for
+setup and recovery instructions.
+
+Mnemosyne CI can verify its own path construction, manifest contents, plugin
+discovery, selected-home propagation, and simulated managed-venv replacement
+using temporary fixtures. It cannot verify Hermes Desktop updates, update
+behavior in tagged Hermes releases, uninstall or provider-removal behavior,
+profile deletion, or experimental package-manager semantics; those require
+validation in the corresponding Hermes distribution and release.
+
 ## Install Profile Comparison
 
 | Profile | When to use | RAM | Key tradeoff |
