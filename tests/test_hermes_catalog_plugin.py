@@ -11,7 +11,6 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 import pytest
@@ -39,8 +38,16 @@ def test_manifest_is_an_exclusive_memory_provider_named_like_the_wrapper():
     assert m["provides_hooks"] == [] and m["provides_middleware"] == [] and m["requires_env"] == []
 
 
+def _toml_loads(text: str) -> dict:
+    try:
+        import tomllib
+    except ImportError:  # Python 3.10
+        tomllib = pytest.importorskip("tomli")
+    return tomllib.loads(text)
+
+
 def test_wrapper_pyproject_declares_the_package_and_is_not_a_distribution():
-    data = tomllib.loads((CATALOG / "pyproject.toml").read_text())
+    data = _toml_loads((CATALOG / "pyproject.toml").read_text())
     deps = data["project"]["dependencies"]
     assert any(d.startswith("mnemosyne-hermes>=0.7.0") for d in deps), deps
     assert any(d.startswith("mnemosyne-memory[embeddings]") for d in deps), deps
