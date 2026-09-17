@@ -250,6 +250,13 @@ def test_wrapper_install_accepts_an_11_second_import_with_60_second_timeout(tmp_
 
 
 def test_install_plugin_wrapper_creates_persistent_shim(tmp_path):
+    packaged_plugin_path = install._resolve_package_dir() / "plugin.yaml"
+    packaged_plugin_before = packaged_plugin_path.read_bytes()
+    source_plugin_path = Path(__file__).parents[1] / "plugin.yaml"
+    source_plugin_before = source_plugin_path.read_bytes()
+    catalog_plugin_path = Path(__file__).parents[2] / "hermes-catalog" / "plugin.yaml"
+    catalog_plugin_before = catalog_plugin_path.read_bytes()
+
     target = install.install_plugin(
         hermes_home_path=tmp_path,
         force=False,
@@ -276,6 +283,13 @@ def test_install_plugin_wrapper_creates_persistent_shim(tmp_path):
     assert (target / "plugin.yaml").is_file()
     installed_plugin = yaml.safe_load((target / "plugin.yaml").read_text(encoding="utf-8"))
     assert installed_plugin["version"] == mnemosyne_hermes.__version__
+    assert installed_plugin["python_runtime"] == "external"
+    assert "python_runtime" not in yaml.safe_load(packaged_plugin_before)
+    assert "python_runtime" not in yaml.safe_load(source_plugin_before)
+    assert "python_runtime" not in yaml.safe_load(catalog_plugin_before)
+    assert packaged_plugin_path.read_bytes() == packaged_plugin_before
+    assert source_plugin_path.read_bytes() == source_plugin_before
+    assert catalog_plugin_path.read_bytes() == catalog_plugin_before
 
     state = install.plugin_state(hermes_home_path=tmp_path)
     assert state.status == "installed"
@@ -284,6 +298,8 @@ def test_install_plugin_wrapper_creates_persistent_shim(tmp_path):
     assert state.wrapper_python == Path(sys.executable).absolute()
     assert state.wrapper_site_packages is not None
     assert state.wrapper_import_ok is True
+    assert install._is_wrapper_plugin_target(target) is True
+    assert install._provider_init_is_mnemosyne(target / "__init__.py") is True
 
 
 def test_plugin_state_uses_legacy_wrapper_metadata_without_manifest(tmp_path):

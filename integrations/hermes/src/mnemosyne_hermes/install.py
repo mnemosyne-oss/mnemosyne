@@ -550,10 +550,13 @@ def _check_wrapper_import(
     return False, (result.stderr.strip() or result.stdout.strip() or "import failed")[:500], False
 
 
-def _copy_plugin_yaml(target: Path) -> None:
+def _write_wrapper_plugin_yaml(target: Path) -> None:
+    """Write wrapper-only Hermes metadata without changing the package manifest."""
     source_yaml = _resolve_package_dir() / "plugin.yaml"
     if source_yaml.is_file():
-        shutil.copy2(source_yaml, target / "plugin.yaml")
+        manifest = source_yaml.read_text(encoding="utf-8")
+        manifest = manifest.rstrip("\n") + "\npython_runtime: external\n"
+        (target / "plugin.yaml").write_text(manifest, encoding="utf-8")
 
 
 def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
@@ -1844,7 +1847,7 @@ from mnemosyne_hermes.cli import *  # noqa: F401,F403,E402
     (target / "_mnemosyne_bootstrap.py").write_text(bootstrap_source, encoding="utf-8")
     (target / "__init__.py").write_text(init_source, encoding="utf-8")
     (target / "cli.py").write_text(cli_source, encoding="utf-8")
-    _copy_plugin_yaml(target)
+    _write_wrapper_plugin_yaml(target)
 
 
 def install_plugin(
