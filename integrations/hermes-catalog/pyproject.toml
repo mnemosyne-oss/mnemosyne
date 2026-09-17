@@ -1,0 +1,12 @@
+# Hermes catalog wrapper. Not a buildable distribution: the package that
+# ships on PyPI is integrations/hermes (mnemosyne-hermes). Hermes reads
+# [project].dependencies from this file and installs them into its venv.
+[project]
+name = "mnemosyne-plugin"
+version = "0.7.0"
+description = "Mnemosyne memory provider for Hermes Agent, catalog wrapper"
+requires-python = ">=3.11"
+dependencies = [
+    "mnemosyne-hermes>=0.7.0,<0.8",
+    "mnemosyne-memory[embeddings]>=3.11.1",
+]
