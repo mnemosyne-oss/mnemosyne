@@ -37,6 +37,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
+from mnemosyne.core.user_agent import application_user_agent
+
 from mnemosyne.core.modality_backends import (
     DescribedMoment,
     DescribeRequest,
@@ -381,7 +383,9 @@ def probe_model_modalities(base_url: str, api_key: str, timeout: float = 10.0) -
     except ImportError:
         return {}
     try:
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        headers = {"User-Agent": application_user_agent()}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         with httpx.Client(timeout=timeout) as client:
             response = client.get(f"{base_url.rstrip('/')}/models", headers=headers)
             if response.status_code >= 400:
@@ -470,6 +474,7 @@ class OpenAICompatModalityBackend:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
+            "User-Agent": application_user_agent(),
         }
         url = f"{base_url}/chat/completions"
 

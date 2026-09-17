@@ -17,6 +17,8 @@ import urllib.request
 from typing import List, Optional
 from functools import lru_cache
 
+from mnemosyne.core.user_agent import application_user_agent
+
 
 logger = logging.getLogger(__name__)
 
@@ -380,6 +382,7 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
         "Content-Type": "application/json",
         "HTTP-Referer": "https://mnemosyne.site",
         "X-Title": "Mnemosyne Embedding",
+        "User-Agent": application_user_agent(),
     }
     if _OPENAI_API_KEY:
         headers["Authorization"] = f"Bearer {_OPENAI_API_KEY}"
