@@ -181,6 +181,17 @@ SECRET_LABELED_PATTERNS: List[tuple] = [
     ("env_secret_assignment", r"(?i)^\s*(?:DB_PASS|SECRET_KEY|AUTH_TOKEN|API_SECRET)\s*="),
 ]
 
+# A sentence boundary is either a CJK terminator or an ASCII terminator at
+# whitespace/end-of-content. The latter avoids treating dots in paths,
+# versions, or identifiers as sentence boundaries while still recognizing
+# both ``. `` and line-ending ``.``.
+_SENTENCE_BOUNDARY_RE = re.compile(r"[。！？]|[.!?](?=\s|\Z)")
+
+
+def _count_sentence_boundaries(content: str) -> int:
+    """Count sentence-ending punctuation without treating arbitrary dots as prose."""
+    return len(_SENTENCE_BOUNDARY_RE.findall(content))
+
 # Compiled pattern cache
 _compiled_noise: Optional[List[re.Pattern]] = None
 _compiled_secrets: Optional[List[tuple]] = None  # list of (label, compiled_regex)
@@ -373,7 +384,7 @@ def classify_memory_write(
     line_count = content.count("\n") + 1
     if line_count > 50 and len(content) > 1000:
         # Check if it looks like structured text (has sentences)
-        sentences = content.count(". ")
+        sentences = _count_sentence_boundaries(content)
         if sentences < line_count * 0.1:
             return WriteDecision(
                 action="reject", target="none",
