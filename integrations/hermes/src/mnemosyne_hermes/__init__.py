@@ -146,7 +146,7 @@ except Exception as _persona_import_exc:  # pragma: no cover - graceful import f
         def _with_persona_block(self, base: str) -> str:
             return base
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 logger = logging.getLogger(__name__)
 
@@ -1303,6 +1303,137 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 yaml.safe_dump(config, f, default_flow_style=False, allow_unicode=True)
         except Exception:
             logger.debug("Mnemosyne: could not persist config values", exc_info=True)
+
+    def get_status_config(self, provider_config: Any) -> Dict[str, Any]:
+        """Return a bounded, secret-free view of configured provider options.
+
+        Hermes calls this from ``hermes memory status`` before the provider is
+        initialized.  Keep it strictly read-only: do not open the database or
+        config file, and tolerate malformed user-owned YAML without raising.
+        Unknown keys are intentionally omitted so future credentials cannot be
+        echoed merely because they live under ``memory.mnemosyne``.
+        """
+        try:
+            if not isinstance(provider_config, dict):
+                return {}
+
+            status: Dict[str, Any] = {}
+            for key in ("auto_sleep", "profile_isolation", "shared_surface_read"):
+                value = provider_config.get(key)
+                if isinstance(value, bool):
+                    status[key] = value
+
+            threshold = provider_config.get("sleep_threshold")
+            if (
+                isinstance(threshold, int)
+                and not isinstance(threshold, bool)
+                and -1_000_000 <= threshold <= 1_000_000
+            ):
+                status["sleep_threshold"] = threshold
+
+            vector_type = provider_config.get("vector_type")
+            if vector_type in {"float32", "int8", "bit"}:
+                status["vector_type"] = vector_type
+
+            default_scope = provider_config.get("default_scope")
+            if default_scope in {"session", "global"}:
+                status["default_scope"] = default_scope
+
+            reflect = provider_config.get("reflect")
+            if isinstance(reflect, dict):
+                safe_reflect: Dict[str, Any] = {}
+                disabled_for_cron = reflect.get("disabled_for_cron")
+                if isinstance(disabled_for_cron, bool):
+                    safe_reflect["disabled_for_cron"] = disabled_for_cron
+                max_calls = reflect.get("max_calls_per_session")
+                if (
+                    isinstance(max_calls, int)
+                    and not isinstance(max_calls, bool)
+                    and -1_000_000 <= max_calls <= 1_000_000
+                ):
+                    safe_reflect["max_calls_per_session"] = max_calls
+                if safe_reflect:
+                    status["reflect"] = safe_reflect
+
+            patterns = provider_config.get("ignore_patterns")
+            if isinstance(patterns, (str, list, tuple, set)):
+                raw_patterns = (
+                    patterns.replace(",", "\n").splitlines()
+                    if isinstance(patterns, str)
+                    else patterns
+                )
+                parsed_patterns = {
+                    str(value).strip()
+                    for value in raw_patterns
+                    if str(value).strip()
+                }
+                status["ignore_patterns"] = f"{len(parsed_patterns)} configured"
+
+            skip_contexts = provider_config.get("skip_contexts")
+            if isinstance(skip_contexts, (str, list, tuple, set)):
+                allowed_contexts = {
+                    "background", "cron", "flush", "primary", "skill_loop", "subagent"
+                }
+                raw_contexts = (
+                    skip_contexts.split(",")
+                    if isinstance(skip_contexts, str)
+                    else skip_contexts
+                )
+                contexts = []
+                for value in raw_contexts:
+                    normalized = str(value).strip()
+                    if normalized in allowed_contexts and normalized not in contexts:
+                        contexts.append(normalized)
+                    if len(contexts) >= 32:
+                        break
+                status["skip_contexts"] = ",".join(contexts)
+
+            sync_roles = provider_config.get("sync_roles")
+            if isinstance(sync_roles, (str, list, tuple, set)):
+                raw_roles = (
+                    sync_roles.split(",")
+                    if isinstance(sync_roles, str)
+                    else sync_roles
+                )
+                roles = []
+                for value in raw_roles:
+                    normalized = str(value).strip().lower()
+                    if normalized in {"assistant", "user"} and normalized not in roles:
+                        roles.append(normalized)
+                    if len(roles) >= 2:
+                        break
+                status["sync_roles"] = roles
+
+            if "tools" in provider_config:
+                tools = provider_config.get("tools")
+                if tools is None:
+                    status["tools"] = "all"
+                elif isinstance(tools, list):
+                    canonical_names = {
+                        schema.get("name")
+                        for schema in ALL_TOOL_SCHEMAS
+                        if isinstance(schema, dict) and isinstance(schema.get("name"), str)
+                    }
+                    safe_tools = []
+                    seen_tools = set()
+                    for value in tools[:256]:
+                        if value in canonical_names and value not in seen_tools:
+                            safe_tools.append(value)
+                            seen_tools.add(value)
+                    status["tools"] = safe_tools
+
+            shared_surface_path = provider_config.get("shared_surface_path")
+            if (
+                isinstance(shared_surface_path, str)
+                and len(shared_surface_path) <= 512
+                and all(char.isprintable() for char in shared_surface_path)
+            ):
+                status["shared_surface_path"] = shared_surface_path
+
+            return status
+        except Exception:
+            logger.debug("Mnemosyne: could not format status config", exc_info=True)
+            return {}
 
     import re
     _BANK_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")

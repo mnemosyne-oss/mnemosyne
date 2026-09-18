@@ -4,6 +4,15 @@ Mnemosyne is designed as a native memory backend for the [Hermes Agent Framework
 
 > **This is the canonical Hermes setup guide.** The README links here for full instructions.
 
+> **Desktop configuration compatibility:** current Hermes declared provider
+> schemas persist non-secret fields to provider-specific JSON (or Honcho's host
+> store); they cannot target `memory.mnemosyne` in `config.yaml`. Mnemosyne does
+> not declare that desktop surface because doing so would create a second,
+> ignored config store. Use `hermes memory setup` or `hermes config set
+> memory.mnemosyne.<key> <value>` until Hermes ships a config-backed provider
+> schema storage contract. This is an upstream release gate, not a Mnemosyne
+> runtime limitation.
+
 ## Mnemosyne-owned Hermes home contract
 
 For installer and status operations, Mnemosyne uses an explicitly supplied
