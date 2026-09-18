@@ -207,10 +207,10 @@ remember("Met with Abdias about the v2 release",
 remember("User said they prefer Python for backend work",
          extract=True)
 
-# Temporal triples (knowledge graph). Standalone store, its own triples.db;
-# use TripleStore.for_bank(bank) instead to match a bank's MCP tools.
+# Temporal triples (knowledge graph), scoped to a bank so it shares the
+# bank's MCP tools instead of writing a standalone triples.db.
 from mnemosyne.core.triples import TripleStore
-kg = TripleStore()
+kg = TripleStore.for_bank("default")
 kg.add("Maya", "assigned_to", "auth-migration",
        valid_from="2026-01-15")
 kg.query("Maya", as_of="2026-02-01")
