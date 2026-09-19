@@ -2256,6 +2256,79 @@ def test_scoped_replay_serializes_background_beam_snapshots(
         }
 
 
+def test_scoped_replay_serializes_complete_root_prefetch(
+    provider_modules, monkeypatch
+):
+    """All root prefetch sources read the active scope after replay restores it."""
+    module = provider_modules["hermes_memory_provider"]
+    provider, beam = _replay_lock_provider(module)
+    beam_lock = _ObservedRLock()
+    provider._beam_access_lock = beam_lock
+    provider._skip_contexts = set()
+    provider._prefetch_profile = "test"
+    provider._prefetch_sources = {}
+    observed = []
+    replay_entered = threading.Event()
+    release_replay = threading.Event()
+    prefetch_started = threading.Event()
+    failures = []
+
+    profile = types.SimpleNamespace(sources=["bank"], dedup=False)
+    monkeypatch.setattr(module, "_resolve_profile", lambda _name: profile)
+    provider._prefetch_bank = lambda *_args: observed.append(
+        ("bank", beam.session_id, beam.channel_id)
+    ) or ""
+    provider._prefetch_model_slots = lambda *_args: observed.append(
+        ("model", beam.session_id, beam.channel_id)
+    ) or ""
+    provider._prefetch_identity = lambda *_args: observed.append(
+        ("identity", beam.session_id, beam.channel_id)
+    ) or ""
+
+    def replay():
+        try:
+            with provider._replay_scope_locked(
+                "staged-session", "staged-channel"
+            ):
+                replay_entered.set()
+                assert release_replay.wait(timeout=5)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    def prefetch():
+        try:
+            prefetch_started.set()
+            provider.prefetch("query")
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    replay_thread = threading.Thread(target=replay)
+    prefetch_thread = threading.Thread(target=prefetch)
+    replay_thread.start()
+    assert replay_entered.wait(timeout=1)
+    beam_lock.waiting.clear()
+    prefetch_thread.start()
+    assert prefetch_started.wait(timeout=1)
+    assert beam_lock.waiting.wait(timeout=1)
+
+    try:
+        assert prefetch_thread.is_alive()
+        assert observed == []
+    finally:
+        release_replay.set()
+        replay_thread.join(timeout=2)
+        prefetch_thread.join(timeout=2)
+
+    assert not replay_thread.is_alive()
+    assert not prefetch_thread.is_alive()
+    assert failures == []
+    assert observed == [
+        ("bank", "active-session", "active-channel"),
+        ("model", "active-session", "active-channel"),
+        ("identity", "active-session", "active-channel"),
+    ]
+
+
 def test_scoped_replay_restores_beam_and_memory_on_success_and_failure(
     provider_modules
 ):

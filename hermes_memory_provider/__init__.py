@@ -2184,6 +2184,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             self._prefetch_sources[name] = fn
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        # Keep every Beam-backed source on the durable provider scope. Some
+        # sources run after _prefetch_bank(), so locking only that helper would
+        # let scoped replay leak its temporary session into prompt context.
+        with self._ensure_beam_access_lock():
+            return self._prefetch_locked(query, session_id=session_id)
+
+    def _prefetch_locked(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context for injection, driven by the active profile.
 
         The profile selects which sources to merge (default: just the memory
