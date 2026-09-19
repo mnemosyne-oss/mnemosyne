@@ -1935,21 +1935,92 @@ class _BeamConnection(sqlite3.Connection):
         self._defer_commit = False
         self._savepoint_counter = 0
         self._vec_working_count_cache: Optional[Tuple[int, int, int]] = None
+        # Callables to run once after the *next* real commit. They are drained
+        # by ``_drain_after_commit_hooks`` from ``commit()`` and
+        # ``_real_commit()``; a ``rollback()`` discards them so a later
+        # successful commit does not replay work whose rows never persisted.
+        # Failures are logged and isolated so a hook can never break the
+        # commit path. Hooks registered from inside another hook defer to the
+        # next commit instead of recursing on the same drain.
+        self._after_commit_hooks: List[Callable[[], None]] = []
+        self._draining_after_commit_hooks: bool = False
 
     def _next_savepoint_name(self, purpose: str) -> str:
         """Return a connection-local, SQLite-safe savepoint identifier."""
         self._savepoint_counter += 1
         return f"mnemosyne_{purpose}_{self._savepoint_counter}"
 
+    def register_after_commit_hook(self, hook: Callable[[], None]) -> None:
+        """Queue ``hook`` to run once after the next real commit.
+
+        The hook is discarded if a rollback fires before commit. A hook that
+        raises is logged and skipped; it never propagates into the commit
+        path. Registering from inside a hook is deferred to the *following*
+        commit so we never recurse on the same drain cycle.
+        """
+        if self._draining_after_commit_hooks:
+            # Defer to next drain; do not mutate the list we are iterating.
+            # Stash on the connection itself so the next commit picks it up.
+            pending = getattr(self, "_pending_after_commit_hooks", None)
+            if pending is None:
+                pending = []
+                self._pending_after_commit_hooks = pending
+            pending.append(hook)
+            return
+        self._after_commit_hooks.append(hook)
+
+    def _drain_after_commit_hooks(self) -> None:
+        """Run queued hooks in FIFO order. Errors are logged, never raised.
+
+        Hooks may register further hooks; those are stashed on
+        ``_pending_after_commit_hooks`` and merged into the live list AFTER
+        the current drain, so the same commit never re-enters a hook that
+        just registered.
+        """
+        if not self._after_commit_hooks:
+            return
+        self._draining_after_commit_hooks = True
+        try:
+            while self._after_commit_hooks:
+                hook = self._after_commit_hooks.pop(0)
+                try:
+                    hook()
+                except Exception as exc:
+                    logger.warning(
+                        "after_commit_hook %s failed: %s: %s",
+                        getattr(hook, "__qualname__", repr(hook)),
+                        type(exc).__name__, exc,
+                    )
+        finally:
+            pending = getattr(self, "_pending_after_commit_hooks", None)
+            if pending:
+                # Move deferred hooks to the front of the live list so they
+                # fire on the next commit in registration order.
+                self._after_commit_hooks = list(pending) + self._after_commit_hooks
+                self._pending_after_commit_hooks = []
+            self._draining_after_commit_hooks = False
+
     def commit(self) -> None:
         if self._defer_commit:
             return
         super().commit()
+        self._drain_after_commit_hooks()
+
+    def rollback(self) -> None:
+        # A rollback invalidates any queued hooks: their backing rows did not
+        # persist, so replaying them would fire stale side effects (cache
+        # invalidation, events) for data that is still in the database.
+        super().rollback()
+        self._after_commit_hooks = []
+        # Drop any deferred registrations too -- they belong to a transaction
+        # that no longer exists.
+        self._pending_after_commit_hooks = []
 
     def _real_commit(self) -> None:
         """Force a real commit regardless of the defer flag.
         Used by `_deferred_commits` on successful exit."""
         super().commit()
+        self._drain_after_commit_hooks()
 
 
 @contextlib.contextmanager
@@ -6637,6 +6708,125 @@ class BeamMemory:
                 self._invalidate_query_cache_after_commit("forget_working")
             else:
                 self._invalidate_query_cache()
+        return forgotten
+
+    def forget_episodic(self, memory_id: str) -> bool:
+        """Delete a session-authorized episodic memory row and its cascade
+        (vector, annotations, embeddings, gists) atomically.
+
+        Same trust boundary as forget_working (see E6.a there): the
+        session-scoped episodic_memory DELETE
+        (``session_id = ? OR scope = 'global'``) authorizes the cascade.
+        A foreign session's private row matches zero rows and is left
+        untouched; a global row may be removed cross-session.
+
+        Cascade scope: the child tables (annotations, memory_embeddings,
+        gists) hold rows for working, legacy, and episodic tiers and carry
+        no tier column, so a same-ID collision in another tier could share
+        those rows. The cascade is therefore scoped to child rows whose
+        parent still exists in episodic_memory with the same ``id`` --
+        after the ``DELETE FROM episodic_memory WHERE id = ? AND ...``
+        line this is empty for the targeted row, so we re-check the
+        surviving parent before deleting each child table. A child row
+        whose parent lives in another tier is left alone. The vec_working
+        cascade in ``forget_working`` uses ``rowid`` from the
+        session-scoped SELECT, which is tier-local, so it does not need
+        the same re-check.
+
+        FTS needs no handling: the em_ad trigger maintains fts_episodes
+        on base-table DELETE.
+
+        Wrapped in _guarded_transaction like forget_working so a
+        mid-cascade failure rolls everything back instead of leaving a
+        half-deleted row.
+
+        Cache invalidation contract: when this method owns its own
+        transaction, the query cache is invalidated immediately after
+        commit. When the caller already owns the transaction
+        (``conn.in_transaction`` is true on entry), invalidation is
+        deferred to the next real commit on the connection via
+        ``register_after_commit_hook`` -- clearing now would let a
+        concurrent enhanced recall refill the cache from the pre-commit
+        episodic row before the caller commits (and would fire on a
+        caller rollback that left the row in place). This is the same
+        after-commit hook used by ``_emit_after_commit``-style flows
+        and ships with the deferred-invalidation plumbing added for
+        cross-path consistency.
+        """
+        cursor = self.conn.cursor()
+        owns_transaction = not self.conn.in_transaction
+        with _guarded_transaction(self.conn):
+            authorized_row = cursor.execute(
+                "SELECT rowid FROM episodic_memory WHERE id = ? AND (session_id = ? OR scope = 'global')",
+                (memory_id, self.session_id),
+            ).fetchone()
+            ep_rows = 0
+            if authorized_row is not None:
+                if _vec_table_available(self.conn, "vec_episodes"):
+                    cursor.execute(
+                        "DELETE FROM vec_episodes WHERE rowid = ?",
+                        (int(authorized_row["rowid"]),),
+                    )
+                # Cross-tier-scoped cascade: only delete child rows whose
+                # parent currently lives in episodic_memory with this id.
+                # The IN-subquery is evaluated against the live
+                # episodic_memory, so child rows whose real parent lives
+                # in another tier (working_memory / memories) are skipped
+                # -- they cannot match any episodic parent and therefore
+                # never appear in the IN list. We delete the children
+                # BEFORE the parent so the EXISTS-style scoping uses a
+                # parent that still exists at evaluation time.
+                cursor.execute(
+                    """
+                    DELETE FROM annotations
+                    WHERE memory_id IN (
+                      SELECT id FROM episodic_memory
+                      WHERE id = ?
+                    )
+                    """,
+                    (memory_id,),
+                )
+                cursor.execute(
+                    """
+                    DELETE FROM memory_embeddings
+                    WHERE memory_id IN (
+                      SELECT id FROM episodic_memory
+                      WHERE id = ?
+                    )
+                    """,
+                    (memory_id,),
+                )
+                gists_table = cursor.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
+                ).fetchone()
+                if gists_table is not None:
+                    cursor.execute(
+                        """
+                        DELETE FROM gists
+                        WHERE memory_id IN (
+                          SELECT id FROM episodic_memory
+                          WHERE id = ?
+                        )
+                        """,
+                        (memory_id,),
+                    )
+                cursor.execute(
+                    "DELETE FROM episodic_memory WHERE id = ? AND (session_id = ? OR scope = 'global')",
+                    (memory_id, self.session_id),
+                )
+                ep_rows = cursor.rowcount
+        forgotten = ep_rows > 0
+        if forgotten:
+            if owns_transaction:
+                self._invalidate_query_cache_after_commit("forget_episodic")
+            else:
+                # Caller-owned transaction: defer cache invalidation to the
+                # real outer commit so a concurrent recall cannot repopulate
+                # the cache from pre-commit state, and so a caller rollback
+                # does not invalidate cache entries for rows that remain.
+                self.conn.register_after_commit_hook(
+                    lambda: self._invalidate_query_cache()
+                )
         return forgotten
 
     # ------------------------------------------------------------------

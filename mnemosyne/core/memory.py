@@ -797,7 +797,7 @@ class Mnemosyne:
         return self.beam.get(memory_id)
 
     def forget(self, memory_id: str) -> bool:
-        """Delete a memory by ID from legacy table and working_memory."""
+        """Delete a memory by ID from legacy table, working_memory, or episodic_memory."""
         with _deferred_commits(self.conn):
             cursor = self.conn.cursor()
             # Authorize from the authoritative BEAM row before deleting either
@@ -819,13 +819,22 @@ class Mnemosyne:
                     (memory_id, self.session_id),
                 ).fetchone()
                 if legacy_owner is None:
-                    return False
-                cursor.execute(
-                    "DELETE FROM memories WHERE id = ? AND session_id = ?",
-                    (memory_id, self.session_id),
-                )
-                self.conn.commit()
-                result = False
+                    # Neither working_memory nor the legacy mirror claim this
+                    # ID in our session scope. Fall back to episodic_memory
+                    # (session-or-global authorized inside forget_episodic,
+                    # same trust boundary as forget_working) before giving
+                    # up — otherwise episodic rows are unmanageable by ID
+                    # (see #959).
+                    result = self.beam.forget_episodic(memory_id)
+                    emit_invalidated = result
+                else:
+                    cursor.execute(
+                        "DELETE FROM memories WHERE id = ? AND session_id = ?",
+                        (memory_id, self.session_id),
+                    )
+                    self.conn.commit()
+                    result = False
+                    emit_invalidated = True
             else:
                 cursor.execute(
                     "DELETE FROM memories WHERE id = ? AND session_id = ?",
@@ -833,7 +842,12 @@ class Mnemosyne:
                 )
                 self.conn.commit()
                 result = self.beam.forget_working(memory_id)
-        self._emit_wrapper("MEMORY_INVALIDATED", memory_id)
+                emit_invalidated = True
+        # Emit only after _deferred_commits finalizes: emitting inside the
+        # block would fire MEMORY_INVALIDATED before _real_commit(), a
+        # phantom event if finalization raises and rolls back.
+        if emit_invalidated:
+            self._emit_wrapper("MEMORY_INVALIDATED", memory_id)
         return result
 
     def update(self, memory_id: str, content: str = None,
