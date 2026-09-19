@@ -940,6 +940,12 @@ class _ObservedLock:
         self.release()
 
 
+class _ObservedRLock(_ObservedLock):
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.waiting = threading.Event()
+
+
 def test_provider_lazy_beam_lock_initialization_is_thread_safe(monkeypatch, provider_modules):
     """Concurrent __new__ callers publish and receive one lock in both providers."""
     real_lock = threading.Lock
@@ -970,7 +976,11 @@ def test_provider_lazy_beam_lock_initialization_is_thread_safe(monkeypatch, prov
         workers = [threading.Thread(target=get_lock) for _ in range(2)]
         # `threading` is a shared stdlib module, so replace only this provider
         # module's binding rather than patching threading.Lock process-wide.
-        monkeypatch.setattr(module, "threading", types.SimpleNamespace(Lock=racing_lock))
+        monkeypatch.setattr(
+            module,
+            "threading",
+            types.SimpleNamespace(RLock=racing_lock),
+        )
         try:
             for worker in workers:
                 worker.start()
@@ -2056,3 +2066,265 @@ def test_provider_batch_dispatch_matches(tmp_path, provider_modules):
         "operations_count": 1,
         "result_statuses": ["stored"],
     }
+
+
+class _ScopeRecordingBeam:
+    def __init__(self):
+        self.session_id = "active-session"
+        self.channel_id = "active-channel"
+        self.db_path = "active.db"
+        self.author_id = "active-author"
+        self.author_type = "human"
+        self.calls = []
+
+    def get_working_stats(self):
+        return {"total": 1}
+
+    def _count_unconsolidated_before(self, _cutoff):
+        return 1
+
+    def remember(self, **kwargs):
+        self.calls.append(
+            (kwargs.get("content"), self.session_id, self.channel_id)
+        )
+        return "memory-id"
+
+
+def _replay_lock_provider(module):
+    provider = module.MnemosyneMemoryProvider()
+    beam = _ScopeRecordingBeam()
+    provider._beam = beam
+    provider._memory = None
+    provider._session_id = beam.session_id
+    provider._agent_context = ""
+    provider._reflect_disabled_for_cron = False
+    provider.has_tool = lambda _name: True
+    provider._maybe_retry_init = lambda: None
+    provider._ensure_initialized_for_tools = lambda: None
+    provider._audit_event = lambda *args, **kwargs: None
+    provider._handle_remember = lambda args: json.dumps({
+        "memory_id": beam.remember(content=args["content"]),
+    })
+    return provider, beam
+
+
+@pytest.mark.parametrize("callback", ["on_memory_write", "handle_tool_call"])
+def test_scoped_replay_serializes_root_beam_callbacks(
+    provider_modules, callback
+):
+    """Concurrent callbacks cannot write under the temporary replay scope."""
+    for module in provider_modules.values():
+        provider, beam = _replay_lock_provider(module)
+        beam_lock = _ObservedRLock()
+        provider._beam_access_lock = beam_lock
+        replay_entered = threading.Event()
+        release_replay = threading.Event()
+        callback_started = threading.Event()
+        failures = []
+
+        def replay():
+            try:
+                with provider._replay_scope_locked(
+                    "staged-session", "staged-channel"
+                ):
+                    replay_entered.set()
+                    assert release_replay.wait(timeout=5)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        def invoke_callback():
+            try:
+                callback_started.set()
+                if callback == "on_memory_write":
+                    provider.on_memory_write("add", "session", "concurrent")
+                else:
+                    provider.handle_tool_call(
+                        "mnemosyne_remember", {"content": "concurrent"}
+                    )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        replay_thread = threading.Thread(target=replay)
+        callback_thread = threading.Thread(target=invoke_callback)
+        replay_thread.start()
+        assert replay_entered.wait(timeout=1)
+        beam_lock.waiting.clear()
+        callback_thread.start()
+        assert callback_started.wait(timeout=1)
+        assert beam_lock.waiting.wait(timeout=1), (
+            f"{callback} did not attempt the Beam lock"
+        )
+
+        try:
+            assert callback_thread.is_alive(), (
+                f"{callback} reached the Beam during scoped replay"
+            )
+            assert beam.calls == []
+        finally:
+            release_replay.set()
+            replay_thread.join(timeout=2)
+            callback_thread.join(timeout=2)
+
+        assert not replay_thread.is_alive()
+        assert not callback_thread.is_alive()
+        assert failures == []
+        assert beam.calls == [
+            ("concurrent", "active-session", "active-channel")
+        ]
+
+
+@pytest.mark.parametrize("callback", ["auto_sleep", "session_end"])
+def test_scoped_replay_serializes_background_beam_snapshots(
+    provider_modules, monkeypatch, callback
+):
+    """Background workers snapshot the active scope, never the replay scope."""
+    for module in provider_modules.values():
+        provider, _beam = _replay_lock_provider(module)
+        beam_lock = _ObservedRLock()
+        provider._beam_access_lock = beam_lock
+        provider._auto_sleep_threshold = 0
+        provider._AUTO_SLEEP_TIMEOUT_SECONDS = 2
+        provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 2
+        provider._reserve_reflection_budget = lambda _reason: None
+        provider._reserve_reflection_budget_locked = lambda _reason: None
+        worker_args = []
+        replay_entered = threading.Event()
+        release_replay = threading.Event()
+        callback_started = threading.Event()
+        failures = []
+
+        class _WorkerBeam:
+            def __init__(self, **kwargs):
+                worker_args.append(kwargs)
+
+            def sleep(self):
+                return None
+
+        monkeypatch.setattr(module, "_get_beam_class", lambda: _WorkerBeam)
+
+        def replay():
+            try:
+                with provider._replay_scope_locked(
+                    "staged-session", "staged-channel"
+                ):
+                    replay_entered.set()
+                    assert release_replay.wait(timeout=5)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        def invoke_callback():
+            try:
+                callback_started.set()
+                if callback == "auto_sleep":
+                    provider._maybe_auto_sleep()
+                else:
+                    provider.on_session_end([])
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        replay_thread = threading.Thread(target=replay)
+        callback_thread = threading.Thread(target=invoke_callback)
+        replay_thread.start()
+        assert replay_entered.wait(timeout=1)
+        beam_lock.waiting.clear()
+        callback_thread.start()
+        assert callback_started.wait(timeout=1)
+        assert beam_lock.waiting.wait(timeout=1), (
+            f"{callback} did not attempt the Beam lock"
+        )
+
+        try:
+            assert callback_thread.is_alive(), (
+                f"{callback} captured the Beam during scoped replay"
+            )
+            assert worker_args == []
+        finally:
+            release_replay.set()
+            replay_thread.join(timeout=2)
+            callback_thread.join(timeout=2)
+
+        assert not replay_thread.is_alive()
+        assert not callback_thread.is_alive()
+        assert failures == []
+        assert len(worker_args) == 1
+        assert worker_args[0]["session_id"] == "active-session"
+        assert worker_args[0]["channel_id"] == "active-channel"
+
+
+def test_scoped_replay_restores_beam_and_memory_on_success_and_failure(
+    provider_modules
+):
+    for module in provider_modules.values():
+        provider, beam = _replay_lock_provider(module)
+        memory = types.SimpleNamespace(
+            session_id="active-session", channel_id="active-channel"
+        )
+        provider._memory = memory
+
+        with provider._replay_scope_locked("staged-session", "staged-channel"):
+            assert (beam.session_id, beam.channel_id) == (
+                "staged-session", "staged-channel"
+            )
+            assert (memory.session_id, memory.channel_id) == (
+                "staged-session", "staged-channel"
+            )
+        assert (beam.session_id, beam.channel_id) == (
+            "active-session", "active-channel"
+        )
+        assert (memory.session_id, memory.channel_id) == (
+            "active-session", "active-channel"
+        )
+
+        with pytest.raises(RuntimeError, match="replay failed"):
+            with provider._replay_scope_locked(
+                "failed-session", "failed-channel"
+            ):
+                raise RuntimeError("replay failed")
+        assert (beam.session_id, beam.channel_id) == (
+            "active-session", "active-channel"
+        )
+        assert (memory.session_id, memory.channel_id) == (
+            "active-session", "active-channel"
+        )
+
+
+def test_apply_pending_dispatch_can_reenter_replay_lock(provider_modules):
+    """handle_tool_call -> apply_pending -> replay must not deadlock."""
+    for module in provider_modules.values():
+        provider, beam = _replay_lock_provider(module)
+        del provider._beam_access_lock
+        failures = []
+        results = []
+
+        def apply_pending(_args):
+            with provider._replay_scope_locked(
+                "staged-session", "staged-channel"
+            ):
+                return json.dumps({
+                    "session_id": beam.session_id,
+                    "channel_id": beam.channel_id,
+                })
+
+        provider._handle_apply_pending = apply_pending
+
+        def dispatch():
+            try:
+                results.append(provider.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": ["pending-id"]}
+                ))
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        worker = threading.Thread(target=dispatch)
+        worker.start()
+        worker.join(timeout=1)
+
+        assert not worker.is_alive(), "nested pending replay deadlocked"
+        assert failures == []
+        assert json.loads(results[0]) == {
+            "session_id": "staged-session",
+            "channel_id": "staged-channel",
+        }
+        assert (beam.session_id, beam.channel_id) == (
+            "active-session", "active-channel"
+        )
