@@ -2737,23 +2737,43 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 )
                 break  # One identity memory per turn
 
+    def _auto_sleep_snapshot_locked(self):
+        """Return one immutable auto-sleep snapshot while Beam is locked."""
+        beam = self._beam
+        if beam is None:
+            return None
+        stats = beam.get_working_stats()
+        working = stats.get("total", 0)
+        if working <= self._auto_sleep_threshold:
+            return None
+
+        cutoff = (
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        eligible = beam._count_unconsolidated_before(cutoff)
+        if eligible == 0:
+            return None
+
+        skip = self._reserve_reflection_budget("auto_sleep")
+        if skip is not None:
+            logger.info("Mnemosyne auto-sleep skipped: %s", json.dumps(skip))
+            return None
+        sleep_args = {
+            "session_id": beam.session_id,
+            "db_path": beam.db_path,
+            "author_id": beam.author_id,
+            "author_type": beam.author_type,
+            "channel_id": beam.channel_id,
+        }
+        return working, eligible, sleep_args
+
     def _maybe_auto_sleep(self) -> None:
         try:
-            stats = self._beam.get_working_stats()
-            working = stats.get("total", 0)
-            if working > self._auto_sleep_threshold:
-                # Cheap eligibility check: are there any unconsolidated
-                # working memories old enough to consolidate?
-                cutoff = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).strftime("%Y-%m-%d %H:%M:%S")
-                eligible = self._beam._count_unconsolidated_before(cutoff)
-                if eligible == 0:
-                    return
-
-                skip = self._reserve_reflection_budget("auto_sleep")
-                if skip is not None:
-                    logger.info("Mnemosyne auto-sleep skipped: %s", json.dumps(skip))
-                    return
-
+            with self._ensure_beam_access_lock():
+                snapshot = self._auto_sleep_snapshot_locked()
+            if snapshot is not None:
+                working, eligible, sleep_args = snapshot
                 logger.info("Mnemosyne auto-sleep: working=%d, eligible=%d > threshold=%d", working, eligible, self._auto_sleep_threshold)
                 # Use session-scoped sleep to avoid timeout on large databases.
                 # Create a SEPARATE BeamMemory instance for the daemon thread
@@ -2761,19 +2781,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 # Reusing self._beam.conn from a daemon thread races with the
                 # main thread's sync_turn() writes, causing episodic INSERT
                 # failures (commit rolled back by concurrent main-thread writes).
-                beam_ref = self._beam
                 beam_lock = self._ensure_beam_access_lock()
                 def _sleep_isolated():
                     try:
                         BeamClass = _get_beam_class()
-                        sleep_beam = BeamClass(
-                            session_id=beam_ref.session_id,
-                            db_path=beam_ref.db_path,
-                            author_id=beam_ref.author_id,
-                            author_type=beam_ref.author_type,
-                            channel_id=beam_ref.channel_id,
-                        )
                         with beam_lock:
+                            sleep_beam = BeamClass(**sleep_args)
                             sleep_beam.sleep()
                     except Exception as inner:
                         logger.debug("Mnemosyne auto-sleep worker failed: %s", inner)
@@ -4297,16 +4310,25 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # the daemon-thread pattern already used by _maybe_auto_sleep above:
         # the thread keeps running in the background if it overruns, but the
         # main shutdown path is freed after the join timeout.
-        if not self._beam:
-            return
         try:
-            skip = self._reserve_reflection_budget("session_end")
-            if skip is not None:
-                logger.info("Mnemosyne session-end sleep skipped: %s", json.dumps(skip))
-                return
             logger.info("Mnemosyne session end — running consolidation")
             timeout = self.SESSION_END_SLEEP_TIMEOUT_SECONDS
-            beam_ref = self._beam
+            with self._ensure_beam_access_lock():
+                skip = self._reserve_reflection_budget("session_end")
+                if skip is not None:
+                    logger.info("Mnemosyne session-end sleep skipped: %s", json.dumps(skip))
+                    return
+                beam = self._beam
+                if beam is None:
+                    return
+                sleep_args = {
+                    "session_id": beam.session_id,
+                    "db_path": beam.db_path,
+                    "author_id": beam.author_id,
+                    "author_type": beam.author_type,
+                    "channel_id": beam.channel_id,
+                }
+                beam_lock = self._ensure_beam_access_lock()
 
             def _sleep_with_logging():
                 # Wrap the target so exceptions get logged at the same
@@ -4316,15 +4338,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 # SQLite connection via _thread_local, avoiding races with
                 # the main thread's writes.
                 try:
-                    BeamClass = _get_beam_class()
-                    sleep_beam = BeamClass(
-                        session_id=beam_ref.session_id,
-                        db_path=beam_ref.db_path,
-                        author_id=beam_ref.author_id,
-                        author_type=beam_ref.author_type,
-                        channel_id=beam_ref.channel_id,
-                    )
-                    sleep_beam.sleep()
+                    with beam_lock:
+                        BeamClass = _get_beam_class()
+                        sleep_beam = BeamClass(**sleep_args)
+                        sleep_beam.sleep()
                 except Exception as inner:
                     logger.debug("Mnemosyne session-end sleep failed: %s", inner)
 
