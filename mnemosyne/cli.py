@@ -1694,10 +1694,12 @@ def cmd_migrate(args):
     """Add the 3.11.1 schema tables to an existing bank.
 
     Bank selection: ``--bank <name>`` flag, else ``$MNEMOSYNE_BANK``,
-    else the default bank.
+    else the default bank. ``--dry-run`` reports pending DDL without
+    writing.
     """
-    usage = "Usage: mnemosyne migrate [--bank <name>]"
+    usage = "Usage: mnemosyne migrate [--bank <name>] [--dry-run]"
     bank_override = None
+    dry_run = False
     i = 0
     while i < len(args):
         arg = args[i]
@@ -1706,6 +1708,9 @@ def cmd_migrate(args):
                 _usage(usage)
             bank_override = args[i + 1]
             i += 2
+        elif arg == "--dry-run":
+            dry_run = True
+            i += 1
         else:
             _usage(usage)
 
@@ -1724,17 +1729,24 @@ def cmd_migrate(args):
         _fail(f"Bank '{bank}' does not exist (no db at {db_path})", exit_code=1)
 
     try:
-        report = migrate_311_tables(db_path)
+        report = migrate_311_tables(db_path, dry_run=dry_run)
     except Exception:
         _fail("migrate_failed", exit_code=1)
 
-    print(f"migrate 311: bank={bank} db={db_path}")
-    print(f"  tables added: {', '.join(report['tables_added']) or '(none)'}")
-    print(
-        "  tables already present: "
-        f"{', '.join(report['tables_already_present']) or '(none)'}"
-    )
-    print(f"  indices added: {report['indices_added']}")
+    mode = "DRY RUN" if dry_run else "APPLIED"
+    print(f"migrate 311 [{mode}]: bank={bank} db={db_path}")
+    if "tables_would_add" in report:
+        print(
+            f"  would add tables: {', '.join(report['tables_would_add']) or '(none)'}"
+        )
+        print(f"  would add indices: {report['indices_would_add']}")
+    else:
+        print(f"  tables added: {', '.join(report['tables_added']) or '(none)'}")
+        print(
+            "  tables already present: "
+            f"{', '.join(report['tables_already_present']) or '(none)'}"
+        )
+        print(f"  indices added: {report['indices_added']}")
 
 
 COMMANDS = {

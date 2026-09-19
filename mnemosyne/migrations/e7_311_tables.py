@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import TypedDict
+from typing import Literal, TypedDict, Union, overload
 
 
 # Canonical DDL from mnemosyne/core/sync.py:641-665
@@ -59,24 +59,25 @@ CREATE TABLE IF NOT EXISTS sync_meta (
 _MEMORY_EVENTS_INDICES = [
     (
         "idx_me_timestamp",
-        "CREATE INDEX IF NOT EXISTS idx_me_timestamp "
-        "ON memory_events(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_me_timestamp ON memory_events(timestamp)",
     ),
     (
         "idx_me_memory_id",
-        "CREATE INDEX IF NOT EXISTS idx_me_memory_id "
-        "ON memory_events(memory_id)",
+        "CREATE INDEX IF NOT EXISTS idx_me_memory_id ON memory_events(memory_id)",
     ),
     (
         "idx_me_device_id",
-        "CREATE INDEX IF NOT EXISTS idx_me_device_id "
-        "ON memory_events(device_id)",
+        "CREATE INDEX IF NOT EXISTS idx_me_device_id ON memory_events(device_id)",
     ),
 ]
 
 
 # The new tables this migration adds (in 3.11.1).
 NEW_TABLES = ("memory_events", "sync_meta")
+_TABLES = (
+    ("memory_events", _MEMORY_EVENTS_DDL),
+    ("sync_meta", _SYNC_META_DDL),
+)
 
 
 class MigrationReport(TypedDict):
@@ -84,6 +85,13 @@ class MigrationReport(TypedDict):
     tables_added: list[str]
     tables_already_present: list[str]
     indices_added: int
+
+
+class MigrationDryRunReport(MigrationReport):
+    # Report-only (dry-run) fields; present in every dry-run report.
+    would_add: int
+    tables_would_add: list[str]
+    indices_would_add: int
 
 
 def _has_table(conn: sqlite3.Connection, name: str) -> bool:
@@ -102,39 +110,93 @@ def _has_index(conn: sqlite3.Connection, name: str) -> bool:
     return cursor.fetchone() is not None
 
 
-def migrate_311_tables(db_path: Path) -> MigrationReport:
+@overload
+def migrate_311_tables(db_path: Path, dry_run: Literal[True]) -> MigrationDryRunReport:
+    ...
+
+
+@overload
+def migrate_311_tables(db_path: Path, dry_run: Literal[False] = False) -> MigrationReport:
+    ...
+
+
+@overload
+def migrate_311_tables(
+    db_path: Path, dry_run: bool = False
+) -> Union[MigrationReport, MigrationDryRunReport]:
+    ...
+
+
+def migrate_311_tables(
+    db_path: Path, dry_run: bool = False
+) -> Union[MigrationReport, MigrationDryRunReport]:
     """Add the 3.11.1 schema tables to an existing bank at the older
     54-table schema. Idempotent.
+
+    With ``dry_run=True`` the database is opened read-only
+    (``mode=ro`` + ``PRAGMA query_only=ON``), no DDL is executed and no
+    commit happens. The report keeps ``added`` / ``tables_added`` /
+    ``indices_added`` at zero and instead exposes ``would_add`` /
+    ``tables_would_add`` / ``indices_would_add`` for the pending DDL
+    (all zero/empty when the bank does not exist yet).
 
     Returns a report dict with:
       - added: int (number of tables added in this call)
       - tables_added: List[str] (names of tables added in this call)
       - tables_already_present: List[str] (names already in the schema)
       - indices_added: int (number of indices added in this call)
+      - dry-run reports additionally carry would_add /
+        tables_would_add / indices_would_add describing the DDL a real
+        run would execute.
     """
     db_path = Path(db_path)
-    report: MigrationReport = {
+    if dry_run:
+        dry_report: MigrationDryRunReport = {
+            "added": 0,
+            "tables_added": [],
+            "tables_already_present": [],
+            "indices_added": 0,
+            "would_add": 0,
+            "tables_would_add": [],
+            "indices_would_add": 0,
+        }
+        if not db_path.exists():
+            return dry_report
+
+        conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            for name, _ddl in _TABLES:
+                if _has_table(conn, name):
+                    dry_report["tables_already_present"].append(name)
+                else:
+                    dry_report["tables_would_add"].append(name)
+                    dry_report["would_add"] += 1
+            for index_name, _index_ddl in _MEMORY_EVENTS_INDICES:
+                if not _has_index(conn, index_name):
+                    dry_report["indices_would_add"] += 1
+        finally:
+            conn.close()
+        return dry_report
+
+    applied_report: MigrationReport = {
         "added": 0,
         "tables_added": [],
         "tables_already_present": [],
         "indices_added": 0,
     }
     if not db_path.exists():
-        # Nothing to migrate (the bank doesn't exist yet).
-        return report
+        return applied_report
 
     conn = sqlite3.connect(str(db_path))
     try:
-        for name, ddl in (
-            ("memory_events", _MEMORY_EVENTS_DDL),
-            ("sync_meta", _SYNC_META_DDL),
-        ):
+        for name, ddl in _TABLES:
             if _has_table(conn, name):
-                report["tables_already_present"].append(name)
+                applied_report["tables_already_present"].append(name)
                 continue
             conn.execute(ddl)
-            report["tables_added"].append(name)
-            report["added"] += 1
+            applied_report["tables_added"].append(name)
+            applied_report["added"] += 1
 
         # Indices (best-effort; IF NOT EXISTS may not be supported
         # in all SQLite versions, matching the upstream behavior).
@@ -143,7 +205,7 @@ def migrate_311_tables(db_path: Path) -> MigrationReport:
                 continue
             try:
                 conn.execute(index_ddl)
-                report["indices_added"] += 1
+                applied_report["indices_added"] += 1
             except sqlite3.OperationalError:
                 # IF NOT EXISTS not supported in this SQLite version.
                 # Indices are best-effort; not fatal.
@@ -151,4 +213,4 @@ def migrate_311_tables(db_path: Path) -> MigrationReport:
         conn.commit()
     finally:
         conn.close()
-    return report
+    return applied_report
