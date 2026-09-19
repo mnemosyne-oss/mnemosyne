@@ -1749,36 +1749,33 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context via Mnemosyne hybrid search with temporal weighting.
-        
+
         Only includes memories above a relevance threshold to prevent context pollution
-        from low-quality matches. Scoped to the user's author_id when available."""
+        from low-quality matches. Strictly session-scoped: author identity is never
+        injected into this recall path (see CWE-200 note below)."""
         self._maybe_retry_init()
         if not self._beam or self._agent_context in self._skip_contexts:
             return ""
         try:
-            import os
             with self._beam_session_scope(session_id) as beam:
                 if beam is None:
                     return ""
-                author_id = beam.author_id or os.environ.get("MNEMOSYNE_AUTHOR_ID")
                 recall_kwargs: Dict[str, Any] = dict(
                     query=query,
                     top_k=max(_PREFETCH_TOP_K * 2, 16),
                     temporal_weight=0.2,
                     temporal_halflife=48,
                 )
-                # Only pass author_id when explicitly non-empty.  Passing an empty
-                # falsy author_id is harmless (no (1=1) bypass), but passing a real
-                # non-empty one triggers the (1=1) clause in beam.recall() that
-                # SKIPS session/channel filtering entirely -- which would defeat
-                # the gateway_session_key thread isolation above.  Multi-agent
-                # deployments that NEED author_id filtering can set it and accept
-                # the wider scope; the common case (single-user, per-thread
-                # sessions) should never bypass session scoping.
-                if author_id:
-                    recall_kwargs["author_id"] = author_id
-                # Revocable provider-owned capture proofs; explicit tools do not
-                # pass this optimization to recall.
+                # CWE-200 (#914 follow-up): author identity is NEVER injected
+                # into the automatic prefetch recall path. A non-empty
+                # author_id makes beam.recall() replace session/channel
+                # filtering with (1=1), silently widening prefetch scope
+                # across gateway threads and leaking memories across
+                # sessions. Author identity is applied exclusively as a
+                # per-write stamp at the store site; the beam read
+                # identity stays unset so recall keeps session scoping.
+                # Revocable provider-owned capture proofs; explicit tools do
+                # not pass this optimization to recall.
                 _ledger_key = str(session_id or "").strip() or getattr(
                     self, "_active_session_id", ""
                 ) or ""
