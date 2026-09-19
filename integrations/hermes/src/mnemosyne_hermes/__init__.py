@@ -1963,8 +1963,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         except AttributeError:
             # setdefault atomically publishes one per-instance lock when
             # concurrent __new__ callers both need lazy initialization.
-            lock_factory = getattr(threading, "RLock", threading.Lock)
-            return self.__dict__.setdefault("_beam_access_lock", lock_factory())
+            return self.__dict__.setdefault("_beam_access_lock", threading.RLock())
 
     @contextmanager
     def _replay_scope_locked(self, session_scope: str, channel_scope: str = ""):

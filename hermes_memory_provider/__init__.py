@@ -1505,7 +1505,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # the same WAL database can trigger a NULL-pointer SEGV in
         # sqlite3_clear_bindings when a checkpoint invalidates an active
         # statement on the other connection (#498).
-        self._beam_access_lock = threading.Lock()
+        # Tool dispatch may enter _replay_scope_locked() while already holding
+        # the provider-wide Beam lock, so this must remain re-entrant.
+        self._beam_access_lock = threading.RLock()
         self._sync_turn_telemetry: Dict[str, Any] = {
             "pending_queue_length": 0,
             "max_queue_length": 0,
@@ -2480,7 +2482,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         except AttributeError:
             # setdefault atomically publishes one per-instance lock when
             # concurrent __new__ callers both need lazy initialization.
-            return self.__dict__.setdefault("_beam_access_lock", threading.Lock())
+            return self.__dict__.setdefault("_beam_access_lock", threading.RLock())
 
     @contextmanager
     def _replay_scope_locked(self, session_scope: str, channel_scope: str = ""):
@@ -2788,6 +2790,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         return self._configured_tool_schemas()
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        # Keep the live Beam stable for the entire operation. In particular,
+        # callbacks must not observe the temporary scope used by pending replay.
+        with self._ensure_beam_access_lock():
+            return self._handle_tool_call_locked(tool_name, args, **kwargs)
+
+    def _handle_tool_call_locked(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        """Dispatch one tool while the provider-wide Beam lock is held."""
         try:
             if not self.has_tool(tool_name):
                 return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
@@ -4332,16 +4341,20 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             logger.debug("Mnemosyne session-end sleep failed: %s", e)
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
-        if not self._beam or action not in ("add", "replace"):
+        if action not in ("add", "replace"):
             return
         try:
-            scope = "global" if target == "user" else "session"
-            self._beam.remember(
-                content=content,
-                source=f"builtin_memory_{target}",
-                importance=0.7 if target == "user" else 0.5,
-                scope=scope,
-            )
+            with self._ensure_beam_access_lock():
+                beam = self._beam
+                if beam is None:
+                    return
+                scope = "global" if target == "user" else "session"
+                beam.remember(
+                    content=content,
+                    source=f"builtin_memory_{target}",
+                    importance=0.7 if target == "user" else 0.5,
+                    scope=scope,
+                )
         except Exception as e:
             logger.debug("Mnemosyne mirror write failed: %s", e)
 
