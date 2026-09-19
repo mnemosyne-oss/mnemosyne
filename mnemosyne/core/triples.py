@@ -116,6 +116,19 @@ def init_triples(db_path: Path = None):
             pass
 
 
+def _admit_triple_fields(
+    subject: str, predicate: str, object: str, *, policy=None
+) -> bool:
+    """Apply one write-policy snapshot to every persisted triple text field."""
+    from mnemosyne.core.filters import admit_memory_write, current_write_policy
+
+    policy = policy or current_write_policy()
+    return all(
+        admit_memory_write(value, policy=policy)[0]
+        for value in (subject, predicate, object)
+    )
+
+
 class TripleStore:
     """
     Temporal knowledge graph for Mnemosyne — single-current-truth semantics.
@@ -148,7 +161,7 @@ class TripleStore:
     def add(self, subject: str, predicate: str, object: str,
             valid_from: str = None, source: str = "inferred",
             confidence: float = 1.0, valid_until: str = None,
-            supersede: bool = True) -> int:
+            supersede: bool = True, *, _write_policy=None) -> int | None:
         """
         Add a temporal triple.
 
@@ -159,7 +172,15 @@ class TripleStore:
         multiple simultaneous values for one predicate (multi-valued facts,
         e.g. ('user','speaks','English') + ('user','speaks','Spanish')).
         valid_until: optional explicit expiry date (ISO YYYY-MM-DD) for the row.
+
+        Returns the inserted row id, or ``None`` when write policy rejects a
+        persisted text field.
         """
+        if not _admit_triple_fields(
+            subject, predicate, object, policy=_write_policy
+        ):
+            return None
+
         valid_from = valid_from or datetime.now().isoformat()[:10]
 
         cursor = self.conn.cursor()
@@ -319,13 +340,24 @@ class TripleStore:
             DeprecationWarning,
             stacklevel=2,
         )
-        from mnemosyne.core.annotations import AnnotationStore, filter_facts
+        from mnemosyne.core.annotations import (
+            AnnotationStore,
+            _admit_annotation_values,
+            filter_facts,
+        )
+        from mnemosyne.core.filters import write_policy_operation
+
         kept = filter_facts(facts)
         if not kept:
             return 0
-        store = AnnotationStore(db_path=self.db_path)
-        store.add_many(memory_id, "fact", kept, source=source, confidence=confidence)
-        return len(kept)
+        with write_policy_operation():
+            admitted = _admit_annotation_values(kept)
+            if not admitted:
+                return 0
+            store = AnnotationStore(db_path=self.db_path)
+            return store.add_many(
+                memory_id, "fact", admitted, source=source, confidence=confidence
+            )
 
     def export_all(self) -> List[Dict]:
         """Export all triples to a list of dictionaries."""
@@ -514,16 +546,26 @@ class TripleStore:
 def add_triple(subject: str, predicate: str, object: str,
                valid_from: str = None, source: str = "inferred",
                confidence: float = 1.0, db_path: Path = None,
-               valid_until: str = None, supersede: bool = True) -> int:
+               valid_until: str = None, supersede: bool = True) -> int | None:
     """
     Add a temporal triple without instantiating TripleStore manually.
     Optional db_path aligns with BEAM memory database when used from Hermes.
     valid_until/supersede passthrough (see TripleStore.add).
     """
-    store = TripleStore(db_path=db_path)
-    return store.add(subject, predicate, object,
-                     valid_from=valid_from, source=source, confidence=confidence,
-                     valid_until=valid_until, supersede=supersede)
+    from mnemosyne.core.filters import current_write_policy, write_policy_operation
+
+    with write_policy_operation():
+        policy = current_write_policy()
+        if not _admit_triple_fields(subject, predicate, object, policy=policy):
+            return None
+
+        store = TripleStore(db_path=db_path)
+        return store.add(
+            subject, predicate, object,
+            valid_from=valid_from, source=source, confidence=confidence,
+            valid_until=valid_until, supersede=supersede,
+            _write_policy=policy,
+        )
 
 
 def end_triple(subject: str, predicate: str, object: str = None,

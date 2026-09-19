@@ -246,8 +246,8 @@ class _WrapperBatchAdapter:
 
     def update_working(self, memory_id: str, *, content=None, importance=None):
         wrapper_ok = self._call_wrapper("update", memory_id, content=content, importance=importance)
-        if wrapper_ok:
-            return True
+        if wrapper_ok is not False:
+            return wrapper_ok
         return self._mem.beam.update_working(memory_id, content=content, importance=importance)
 
     def forget_working(self, memory_id: str):
@@ -299,6 +299,9 @@ def _handle_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
         valid_until=valid_until,
         veracity=veracity,
     )
+
+    if memory_id is None:
+        return {"status": "filtered", "bank": bank}
 
     return {
         "status": "stored",
@@ -439,7 +442,11 @@ def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
         metadata=meta,
         scope="global",
         memory_id=stable_id,
+        _write_policy_content=content,
     )
+
+    if memory_id is None:
+        return {"status": "filtered_shared", "kind": kind}
 
     return {
         "status": "stored_shared",
@@ -572,6 +579,22 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": f"unknown store: {store}"}
     if action == "update" and not new_content:
         return {"error": "new_content is required for action='update'"}
+    from mnemosyne.core.filters import admit_memory_write, current_write_policy
+
+    policy = current_write_policy()
+    persisted_inputs = (
+        arguments.get("validator"),
+        new_content if action == "update" else None,
+        note,
+    )
+    if any(value and not admit_memory_write(value, policy=policy)[0]
+           for value in persisted_inputs):
+        return {
+            "status": "filtered",
+            "memory_id": memory_id,
+            "store": store,
+            "bank": bank,
+        }
 
     if store == "surface":
         target_beam = _create_surface_instance()
@@ -703,56 +726,72 @@ def _handle_triple_add(arguments: Dict[str, Any]) -> Dict[str, Any]:
     _log = logging.getLogger("mnemosyne.mcp.triple_add")
 
     from mnemosyne.core.annotations import ANNOTATION_KINDS, AnnotationStore
+    from mnemosyne.core.filters import (
+        admit_memory_write,
+        current_write_policy,
+        write_policy_operation,
+    )
     from mnemosyne.core.triples import TripleStore
 
-    predicate = arguments["predicate"]
+    policy = current_write_policy()
+    with write_policy_operation(policy):
+        predicate = arguments["predicate"]
+        annotation_path = isinstance(predicate, str) and predicate in ANNOTATION_KINDS
+        if any(
+            not admit_memory_write(arguments[field], policy=policy)[0]
+            for field in ("subject", "predicate", "object")
+        ):
+            return {
+                "status": "filtered",
+                "store": "annotations" if annotation_path else "triples",
+            }
 
-    if isinstance(predicate, str) and predicate in ANNOTATION_KINDS:
+        if annotation_path:
+            bank = _resolve_bank(arguments)
+            mem = _create_instance(bank=bank)
+            db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+            store = getattr(mem.beam, "annotations", None)
+            if store is None:
+                store = AnnotationStore(db_path=db_path, conn=mem.beam.conn)
+            valid_from = arguments.get("valid_from")
+            if predicate == "occurred_on" and valid_from:
+                row_id = store.add(
+                    memory_id=arguments["subject"],
+                    kind=predicate,
+                    value=arguments["object"],
+                    source=arguments.get("source", "conversation"),
+                    confidence=arguments.get("confidence", 1.0),
+                    valid_from=valid_from,
+                )
+            else:
+                if valid_from:
+                    _log.warning(
+                        "mnemosyne_triple_add: valid_from=%r provided with "
+                        "predicate=%r (not occurred_on); valid_from discarded.",
+                        valid_from, predicate,
+                    )
+                row_id = store.add(
+                    memory_id=arguments["subject"],
+                    kind=predicate,
+                    value=arguments["object"],
+                    source=arguments.get("source", "conversation"),
+                    confidence=arguments.get("confidence", 1.0),
+                )
+            return {"status": "added", "annotation_id": row_id, "store": "annotations"}
+
         bank = _resolve_bank(arguments)
         mem = _create_instance(bank=bank)
         db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
-        store = getattr(mem.beam, "annotations", None)
-        if store is None:
-            store = AnnotationStore(db_path=db_path, conn=mem.beam.conn)
-        valid_from = arguments.get("valid_from")
-        if predicate == "occurred_on" and valid_from:
-            row_id = store.add(
-                memory_id=arguments["subject"],
-                kind=predicate,
-                value=arguments["object"],
-                source=arguments.get("source", "conversation"),
-                confidence=arguments.get("confidence", 1.0),
-                valid_from=valid_from,
-            )
-        else:
-            if valid_from:
-                _log.warning(
-                    "mnemosyne_triple_add: valid_from=%r provided with "
-                    "predicate=%r (not occurred_on); valid_from discarded.",
-                    valid_from, predicate,
-                )
-            row_id = store.add(
-                memory_id=arguments["subject"],
-                kind=predicate,
-                value=arguments["object"],
-                source=arguments.get("source", "conversation"),
-                confidence=arguments.get("confidence", 1.0),
-            )
-        return {"status": "added", "annotation_id": row_id, "store": "annotations"}
-
-    bank = _resolve_bank(arguments)
-    mem = _create_instance(bank=bank)
-    db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
-    kg = TripleStore(db_path=db_path)
-    triple_id = kg.add(
-        subject=arguments["subject"],
-        predicate=predicate,
-        object=arguments["object"],
-        valid_from=arguments.get("valid_from"),
-        source=arguments.get("source", "conversation"),
-        confidence=arguments.get("confidence", 1.0),
-    )
-    return {"status": "added", "triple_id": triple_id, "store": "triples"}
+        kg = TripleStore(db_path=db_path)
+        triple_id = kg.add(
+            subject=arguments["subject"],
+            predicate=predicate,
+            object=arguments["object"],
+            valid_from=arguments.get("valid_from"),
+            source=arguments.get("source", "conversation"),
+            confidence=arguments.get("confidence", 1.0),
+        )
+        return {"status": "added", "triple_id": triple_id, "store": "triples"}
 
 
 def _handle_triple_query(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -824,6 +863,8 @@ def _handle_remember_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
         source=arguments.get("source", "canonical_tool"),
         confidence=arguments.get("confidence", 1.0),
     )
+    if row is None:
+        return {"status": "filtered", "store": "canonical"}
     status = row.pop("status", "stored")
     return {"status": status, "owner_id": owner_id, "category": category,
             "name": name, "version": row.get("version"), "store": "canonical"}
@@ -923,6 +964,8 @@ def _handle_scratchpad_write(arguments: Dict[str, Any]) -> Dict[str, Any]:
     bank = _resolve_bank(arguments)
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     entry_id = mem.scratchpad_write(content)
+    if entry_id is None:
+        return {"status": "filtered", "store": "scratchpad"}
     return {"status": "written", "id": entry_id}
 
 
@@ -963,6 +1006,8 @@ def _handle_update(arguments: Dict[str, Any]) -> Dict[str, Any]:
     bank = _resolve_bank(arguments)
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     ok = mem.update(memory_id, content=content, importance=importance)
+    if ok is None:
+        return {"status": "filtered", "memory_id": memory_id}
     return {"status": "updated" if ok else "not_found", "memory_id": memory_id}
 
 

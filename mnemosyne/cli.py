@@ -226,7 +226,9 @@ def cmd_update(args):
 
     mem = _get_memory()
     success = mem.update(memory_id, content=content, importance=importance)
-    if success:
+    if success is None:
+        _fail(f"Update filtered by write policy: {memory_id}", exit_code=1)
+    elif success:
         print(f"Updated: {memory_id}")
     else:
         _fail(f"Memory not found: {memory_id}", exit_code=1)

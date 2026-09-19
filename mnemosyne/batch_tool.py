@@ -127,12 +127,14 @@ def apply_beam_batch(
     remember_source_tool: str = "mnemosyne_batch",
     audit_event: Callable[..., Any] | None = None,
     extract_defaults_global: bool = False,
+    write_policy: Any = None,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     audit_events: list[tuple[str, dict[str, Any]]] = []
     current = {"index": None, "action": None}
     try:
-        with _deferred_commits(beam.conn):
+        from mnemosyne.core.filters import write_policy_operation
+        with write_policy_operation(write_policy), _deferred_commits(beam.conn):
             for current in normalized:
                 results.append(_apply_one(
                     beam,
@@ -201,6 +203,8 @@ def _apply_one(
             metadata=metadata,
             veracity=veracity,
         )
+        if memory_id is None:
+            return {"index": index, "action": action, "status": "filtered"}
         audit_events.append((
             "remember",
             {"memory_id": memory_id, "bank": "private", "scope": scope, "source_tool": remember_source_tool},
@@ -215,6 +219,8 @@ def _apply_one(
             content=payload.get("content"),
             importance=float(importance) if importance is not None else None,
         )
+        if ok is None:
+            return {"index": index, "action": action, "status": "filtered"}
         if not ok:
             raise BatchOperationError("memory_not_found")
         audit_events.append(("update", {"memory_id": memory_id, "bank": "private", "source_tool": remember_source_tool}))

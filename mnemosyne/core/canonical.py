@@ -201,7 +201,8 @@ class CanonicalStore:
         body: str,
         source: str = "",
         confidence: float = 1.0,
-    ) -> Dict:
+        _write_kind: object = "public",
+    ) -> Optional[Dict]:
         """Upsert the canonical value for ``(owner_id, category, name)``.
 
         - If the slot is empty, insert version 1.
@@ -212,6 +213,8 @@ class CanonicalStore:
 
         Returns the resulting current row as a dict, with an added
         ``status`` key: ``"created"``, ``"unchanged"``, or ``"updated"``.
+        Returns ``None`` when the current write policy rejects ``body``;
+        policy rejection does not modify the canonical slot or its history.
 
         Raises ``ValueError`` if owner_id / category / name / body is empty —
         the slot key and value must all be non-blank for the uniqueness
@@ -221,6 +224,11 @@ class CanonicalStore:
             raise ValueError("owner_id, category, and name are required")
         if not body or not body.strip():
             raise ValueError("body is required and cannot be blank")
+
+        from mnemosyne.core.filters import admit_memory_write
+
+        if not admit_memory_write(body, write_kind=_write_kind)[0]:
+            return None
 
         cursor = self.conn.cursor()
         # BEGIN IMMEDIATE so the read-current + supersede + insert sequence is
@@ -581,11 +589,19 @@ def remember_canonical(
     source: str = "",
     confidence: float = 1.0,
     db_path: Optional[Path] = None,
-) -> Dict:
+) -> Optional[Dict]:
     """Upsert a canonical fact without instantiating CanonicalStore manually."""
-    store = CanonicalStore(db_path=db_path)
-    return store.remember(owner_id, category, name, body,
-                          source=source, confidence=confidence)
+    from mnemosyne.core.filters import admit_memory_write, write_policy_operation
+
+    # Admission must precede CanonicalStore construction: initializing a store
+    # creates the parent directory, database file, and schema. Keep that same
+    # immutable snapshot active for the store's defensive admission check.
+    with write_policy_operation() as policy:
+        if not admit_memory_write(body, policy=policy)[0]:
+            return None
+        store = CanonicalStore(db_path=db_path)
+        return store.remember(owner_id, category, name, body,
+                              source=source, confidence=confidence)
 
 
 def recall_canonical(

@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Dict
 
+from mnemosyne.core.filters import _RESTORE_WRITE_CAPABILITY
+
 
 @dataclass
 class ImporterResult:
@@ -118,7 +120,11 @@ class BaseImporter(ABC):
                         metadata=mem_dict.get("metadata", {}),
                         valid_until=mem_dict.get("valid_until"),
                         scope=mem_dict.get("scope", "session"),
+                        _write_kind=_RESTORE_WRITE_CAPABILITY,
                     )
+                    if mid is None:
+                        result.skipped += 1
+                        continue
                     result.memory_ids.append(mid)
                     result.imported += 1
                 except Exception as e:
@@ -126,9 +132,6 @@ class BaseImporter(ABC):
                     result.errors.append(
                         f"Failed to import '{mem_dict.get('content', '')[:80]}': {e}"
                     )
-
-            if result.skipped:
-                result.skipped = result.total - result.imported - result.failed
 
         except Exception as e:
             result.errors.append(f"Import failed: {e}")

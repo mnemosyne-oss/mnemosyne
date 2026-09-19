@@ -97,6 +97,30 @@ def filter_facts(facts: List[str]) -> List[str]:
     return [f for f in facts if f and len(f) > MIN_FACT_LENGTH]
 
 
+def _admit_annotation_values(
+    values: List[str], *, write_kind: object = "public", write_policy=None
+) -> List[str]:
+    """Return values admitted by one immutable write-policy snapshot."""
+    from mnemosyne.core.filters import (
+        admit_memory_write,
+        current_write_policy,
+        is_write_policy_exempt,
+    )
+
+    # Trusted derived writes have already crossed the raw-memory admission
+    # boundary. Avoid resolving a second snapshot for their extracted values.
+    policy = (
+        None
+        if is_write_policy_exempt(write_kind)
+        else write_policy if write_policy is not None else current_write_policy()
+    )
+    return [
+        value
+        for value in values
+        if admit_memory_write(value, write_kind=write_kind, policy=policy)[0]
+    ]
+
+
 def _get_conn(db_path: Optional[Path] = None) -> sqlite3.Connection:
     path = Path(db_path) if db_path else DEFAULT_DB
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -212,12 +236,20 @@ class AnnotationStore:
         value: str,
         source: str = "",
         confidence: float = 1.0,
-    ) -> int:
-        """Append an annotation row. Returns the new row id.
+        *,
+        _write_kind: object = "public",
+        _write_policy=None,
+    ) -> int | None:
+        """Append an annotation row. Returns the new row id when admitted.
 
         No invalidation of prior rows — multiple values for the same
         (memory_id, kind) coexist and are all returned by query methods.
         """
+        if not _admit_annotation_values(
+            [value], write_kind=_write_kind, write_policy=_write_policy
+        ):
+            return None
+
         cursor = self.conn.cursor()
         cursor.execute(
             """
@@ -236,18 +268,47 @@ class AnnotationStore:
         values: List[str],
         source: str = "",
         confidence: float = 1.0,
+        *,
+        _write_policy=None,
     ) -> int:
         """Batch-insert helper for multiple values under one (memory_id, kind).
 
         Returns the count of rows inserted. Skips empty / blank values silently.
         """
+        return self._add_many(
+            memory_id,
+            kind,
+            values,
+            source,
+            confidence,
+            _write_kind="public",
+            _write_policy=_write_policy,
+        )
+
+    def _add_many(
+        self,
+        memory_id: str,
+        kind: str,
+        values: List[str],
+        source: str = "",
+        confidence: float = 1.0,
+        *,
+        _write_kind: object,
+        _write_policy=None,
+    ) -> int:
+        """Internal batch insert accepting an opaque write capability."""
         if not values:
             return 0
 
+        candidates = [v for v in values if v and v.strip()]
+        admitted = _admit_annotation_values(
+            candidates,
+            write_kind=_write_kind,
+            write_policy=_write_policy,
+        )
         rows = [
             (memory_id, kind, v, source, confidence)
-            for v in values
-            if v and v.strip()
+            for v in admitted
         ]
         if not rows:
             return 0
@@ -261,7 +322,7 @@ class AnnotationStore:
             rows,
         )
         self.conn.commit()
-        return len(rows)
+        return cursor.rowcount
 
     # ------------------------------------------------------------------
     # Reads
@@ -538,10 +599,15 @@ def add_annotation(
     source: str = "",
     confidence: float = 1.0,
     db_path: Optional[Path] = None,
-) -> int:
+) -> int | None:
     """Add a single annotation without instantiating AnnotationStore manually."""
-    store = AnnotationStore(db_path=db_path)
-    return store.add(memory_id, kind, value, source=source, confidence=confidence)
+    from mnemosyne.core.filters import write_policy_operation
+
+    with write_policy_operation():
+        if not _admit_annotation_values([value]):
+            return None
+        store = AnnotationStore(db_path=db_path)
+        return store.add(memory_id, kind, value, source=source, confidence=confidence)
 
 
 def query_annotations(

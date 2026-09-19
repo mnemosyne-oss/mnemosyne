@@ -239,6 +239,8 @@ No required config. Everything defaults to `~/.mnemosyne/`. Optional overrides:
 | `MNEMOSYNE_SYNC_TURN_USER_LIMIT` | `500` | User content truncation in `sync_turn()` (`0` = no limit) |
 | `MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT` | `800` | Assistant content truncation in `sync_turn()` (`0` = no limit) |
 | `MNEMOSYNE_FACT_RECALL_ENABLED` | `false` | Merge LLM-extracted facts into standard recall |
+| `MNEMOSYNE_IGNORE_PATTERNS` | _(empty)_ | Newline-separated regular expressions; matching writes are rejected before persistence |
+| `MNEMOSYNE_WRITE_CLASSIFIER` | `off` | Write admission classifier: `off`, `warn`, or `strict` |
 | `MNEMOSYNE_PREFETCH_CONTENT_CHARS` | `0` | Per-memory prefetch content cap (`0` = full content) |
 | `MNEMOSYNE_PREFETCH_MIN_DISTINCTIVE_TOKENS` | `2` | Shared non-generic terms required for automatic prefetch injection |
 | `MNEMOSYNE_PREFETCH_MIN_QUERY_COVERAGE` | `0.30` | Minimum fraction of non-generic query terms covered by a prefetched memory |
@@ -255,7 +257,20 @@ memory:
   mnemosyne:
     auto_sleep: true
     sleep_threshold: 30
+    ignore_patterns:
+      - "^\\s*\\$\\s*pip\\s"
+    write_classifier: "off"  # off | warn | strict
 ```
+
+For `ignore_patterns` and `write_classifier`, an explicit `initialize(...)`
+keyword argument takes precedence. Without that override, resolution is
+`memory.mnemosyne` in `config.yaml` > environment variable > default.
+`MNEMOSYNE_IGNORE_PATTERNS` is newline-separated and defaults to empty (no
+patterns). `MNEMOSYNE_WRITE_CLASSIFIER` controls admission for explicit writes
+and autosaved turns: `off` still applies `ignore_patterns`; `warn` runs the
+noise/secret classifier but stores classified content with warnings; and
+`strict` rejects content classified as noise or secret-like. Unset, blank, or
+invalid classifier values fall back to `off` (invalid values also log a warning).
 
 ## Tools
 
