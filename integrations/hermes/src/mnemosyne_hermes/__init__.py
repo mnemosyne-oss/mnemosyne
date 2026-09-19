@@ -290,12 +290,13 @@ def _prefetch_canonical_rare_token_max_frequency() -> int:
     return _parse_bounded_int_env("MNEMOSYNE_PREFETCH_CANONICAL_RARE_TOKEN_MAX_FREQUENCY", 1, 0)
 
 
-def _parse_token_set_env(key: str, default: Set[str]) -> Set[str]:
+def _parse_token_set_env(key: str, default: Set[str], *, min_chars: int = 3) -> Set[str]:
     """Read a comma/space-separated token set from env.
 
     Empty/unset means use ``default``. This keeps relevance tuning generic for
     upstream users while allowing deployments to mark local owner/assistant
-    names as non-topical via configuration.
+    names as non-topical via configuration. ``min_chars`` is 3 for word tokens
+    and 2 for CJK 2-gram units, which are exactly two characters long.
     """
     raw = os.environ.get(key, "").strip()
     if not raw:
@@ -303,7 +304,7 @@ def _parse_token_set_env(key: str, default: Set[str]) -> Set[str]:
     tokens: Set[str] = set()
     for token in re.split(r"[,\s]+", raw.lower()):
         token = token.strip(".,;!?()[]{}\"'“”’‘")
-        if len(token) > 2:
+        if len(token) >= min_chars:
             tokens.add(token)
     return tokens or set(default)
 
@@ -381,12 +382,14 @@ def _is_prefetch_cjk_char(char: str) -> bool:
     )
 
 
-def _prefetch_tokens(content: str) -> Set[str]:
-    c = _strip_prefetch_prefix(content).lower()
-    # Core recall scores spaceless CJK text by character overlap. Preserve that
-    # evidence in the stricter automatic-prefetch gate instead of discarding an
-    # already-relevant result merely because the adapter's word regex is ASCII.
-    tokens: Set[str] = {char for char in c if _is_prefetch_cjk_char(char)}
+def _prefetch_word_tokens(c: str) -> Set[str]:
+    """Return the adapter's word tokens for already-normalized text.
+
+    Shared by the CJK-character tokenizer that backs core lexical evidence
+    and the 2-gram units used for canonical slot matching, so the word half
+    of both tokenizers cannot drift apart.
+    """
+    tokens: Set[str] = set()
     for token in _PREFETCH_TOKEN_RE.findall(c):
         # Keep internal URL/path separators, but trim sentence punctuation so
         # canonical facts ending in "branding." still match query token
@@ -398,9 +401,125 @@ def _prefetch_tokens(content: str) -> Set[str]:
     return tokens
 
 
+def _prefetch_tokens(content: str) -> Set[str]:
+    c = _strip_prefetch_prefix(content).lower()
+    # Core recall scores spaceless CJK text by character overlap. Preserve
+    # that evidence instead of discarding an already-relevant result merely
+    # because the adapter's word regex is ASCII. Canonical slot matching
+    # uses _prefetch_lexical_units() instead: there, per-character tokens
+    # are too coarse to be distinctive (#971).
+    tokens: Set[str] = {char for char in c if _is_prefetch_cjk_char(char)}
+    tokens |= _prefetch_word_tokens(c)
+    return tokens
+
+
+# U+3005 (々, ideographic iteration mark) sits inside the run so a name such as
+# 佐々木 is never split into single-character units, while U+30FB (・, katakana
+# middle dot) deliberately stays outside it because it separates entries: 猫・犬
+# must yield the same units as 猫、犬 (review: dplush on #975).
+_PREFETCH_CJK_UNIT_RE = re.compile(r"[\u3005\u3040-\u30fa\u30fc-\u30ff\u4e00-\u9fff\uac00-\ud7af]+")
+_PREFETCH_CJK_ITERATION_MARK = "\u3005"
+
+
+# Function-word CJK 2-grams carry no topical evidence. Without this filter a
+# short Chinese query such as "什么时候部署？" shares exactly one useful unit
+# ("部署") out of five, so query coverage stayed under the 0.30 threshold and a
+# real match was dropped (test_canonical_cjk_gating).
+_PREFETCH_CJK_STOP_UNIT_DEFAULTS = frozenset({
+    # Japanese
+    "する", "して", "した", "しな", "しれ", "です", "ます", "ませ", "って", "やる", "こと", "ため",
+    "よう", "これ", "それ", "あれ", "どこ", "いつ", "なに", "なん", "どの", "より", "まで", "から",
+    "でも", "には", "とは", "ので", "のに", "もの", "ばあ", "ほう", "たり", "だり", "なく", "ない",
+    "ある", "いる", "なる", "てる",
+    # Chinese
+    "什么", "么时", "时候", "怎么", "怎样", "哪里", "哪儿", "哪些", "哪个", "是否", "多久", "多少",
+    "为什", "在哪", "一下", "这个", "那个", "这些", "那些", "可以", "需要", "我们", "你们",
+    # Korean
+    "무엇", "어디", "언제", "얼마", "하나", "있나", "인가", "습니", "니다", "하다", "하는", "한가",
+    "있습", "없습", "그것", "저것", "이것", "우리", "저희",
+})
+
+
+def _prefetch_cjk_stop_units() -> Set[str]:
+    """Units that carry no topical evidence in canonical slot matching.
+
+    Mirrors _prefetch_canonical_generic_tokens(): the plain env key replaces the
+    defaults and the extra key adds to them, so a deployment can tune the list
+    without a code change.
+    """
+    configured = _parse_token_set_env(
+        "MNEMOSYNE_PREFETCH_CJK_STOP_UNITS",
+        _PREFETCH_CJK_STOP_UNIT_DEFAULTS,
+        min_chars=2,
+    )
+    extras = _parse_token_set_env(
+        "MNEMOSYNE_PREFETCH_CJK_EXTRA_STOP_UNITS",
+        set(),
+        min_chars=2,
+    )
+    return configured | extras
+
+
+def _prefetch_cjk_run_units(run: str, stop_units: Set[str]) -> Set[str]:
+    """Reduce one CJK run to the lexical units used for slot matching.
+
+    A run longer than one character becomes overlapping 2-grams; that is what
+    keeps unrelated single-source-of-truth slots out of the context (#971). Two
+    further rules come from review on #975:
+
+    * the ideographic iteration mark is folded away, so 佐々木 compares as 佐木
+      and 佐々野 as 佐野 -- different names no longer share a prefix unit;
+    * a 2-gram that lies *entirely inside* configured function-word spans is
+      dropped even when it is not listed itself. Filtering only the listed units
+      left bridge evidence such as るこ from すること, which satisfied the
+      single-token exception and injected unrelated facts.
+    """
+    run = run.replace(_PREFETCH_CJK_ITERATION_MARK, "")
+    if not run:
+        return set()
+    if len(run) == 1:
+        return {run}
+    covered: Set[int] = set()
+    for index in range(len(run) - 1):
+        if run[index:index + 2] in stop_units:
+            covered.update((index, index + 1))
+    units: Set[str] = set()
+    for index in range(len(run) - 1):
+        unit = run[index:index + 2]
+        if unit in stop_units or (index in covered and index + 1 in covered):
+            continue
+        units.add(unit)
+    return units
+
+
+def _prefetch_lexical_units(content: str) -> Set[str]:
+    """Return lexical evidence units used for canonical slot matching.
+
+    Latin words behave exactly as before. Spaceless CJK runs (kana, Han,
+    Hangul) are reduced to overlapping 2-gram units instead of one token per
+    character: with per-character tokens any two characters shared with a slot
+    satisfied the "two distinctive tokens" gate, so unrelated
+    single-source-of-truth facts reached 0.94-0.98 and were injected into the
+    context of every turn. A one-character run keeps its character, so
+    comma-separated short entries still match. Function-word units are filtered
+    so they cannot dilute query coverage.
+    """
+    c = _strip_prefetch_prefix(content).lower()
+    stop_units = _prefetch_cjk_stop_units()
+    units: Set[str] = set()
+    for match in _PREFETCH_CJK_UNIT_RE.finditer(c):
+        units.update(_prefetch_cjk_run_units(match.group(0), stop_units))
+    # Word tokens come from the non-CJK remainder only. _PREFETCH_TOKEN_RE uses
+    # Unicode \\w, so an unread run would also arrive as one whole-run token that
+    # bypasses the stop-unit filter whenever a query and a row share an
+    # identical span (review: coderabbitai on #975).
+    units |= _prefetch_word_tokens(_PREFETCH_CJK_UNIT_RE.sub(" ", c))
+    return units
+
+
 def _canonical_recall_rows(store: Any, owner_id: str, query: str, *, limit: int = 3) -> List[Dict[str, Any]]:
     """Return canonical facts using the established explicit-recall contract."""
-    query_tokens = _prefetch_tokens(query)
+    query_tokens = _prefetch_lexical_units(query)
     if not query_tokens:
         return []
     try:
@@ -413,7 +532,7 @@ def _canonical_recall_rows(store: Any, owner_id: str, query: str, *, limit: int 
         body = str(row.get("body") or "").strip()
         if not body:
             continue
-        row_tokens = _prefetch_tokens(body)
+        row_tokens = _prefetch_lexical_units(body)
         overlap = query_tokens & row_tokens
         distinctive_overlap = overlap - generic_tokens
         if not distinctive_overlap:
@@ -450,7 +569,7 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
     lightweight lexical pass over current slots is enough and avoids LLM/reranker
     cost. Importance cannot rescue a row here; it must share query terms.
     """
-    query_tokens = _prefetch_tokens(query)
+    query_tokens = _prefetch_lexical_units(query)
     if not query_tokens:
         return []
     try:
@@ -468,7 +587,7 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
         # labels such as "identity" or "profile" are schema metadata; counting
         # them as topical evidence made generic identity slots inject into
         # unrelated professional-identity questions.
-        row_tokens = _prefetch_tokens(body)
+        row_tokens = _prefetch_lexical_units(body)
         tokenized_rows.append((row, body, row_tokens))
         for token in row_tokens - generic_tokens:
             token_document_frequency[token] = token_document_frequency.get(token, 0) + 1
@@ -584,11 +703,44 @@ def _prefetch_has_distinctive_lexical_evidence(query: str, content: str) -> bool
     )
 
 
+def _prefetch_dedup_signature(content: str) -> Set[str]:
+    """Lexical signature used to collapse duplicate prefetch rows.
+
+    Deduplication is ordinary-result behaviour, so it must not follow the
+    canonical CJK stop-unit settings: those knobs are operator controls for slot
+    matching, and letting them reshape ordinary signatures made the same recall
+    pair collapse differently after configuration (review: coderabbitai on
+    #975). CJK runs are still reduced to 2-grams, which is what stops a
+    canonical row ("部署安排") and a spaced ordinary result ("部 署 安 排") from
+    being collapsed merely because they share characters.
+    """
+    c = _strip_prefetch_prefix(content).lower()
+    units: Set[str] = set()
+    for match in _PREFETCH_CJK_UNIT_RE.finditer(c):
+        run = match.group(0).replace(_PREFETCH_CJK_ITERATION_MARK, "")
+        if not run:
+            continue
+        if len(run) == 1:
+            units.add(run)
+            continue
+        units.update(run[index:index + 2] for index in range(len(run) - 1))
+    units |= _prefetch_word_tokens(_PREFETCH_CJK_UNIT_RE.sub(" ", c))
+    return units
+
+
 def _semantic_dedup_prefetch(rows: List[Dict[str, Any]], threshold: float = 0.72) -> List[Dict[str, Any]]:
     kept: List[Dict[str, Any]] = []
     kept_tokens: List[Set[str]] = []
     for row in rows:
-        tokens = _prefetch_tokens(row.get("content", ""))
+        # Compare lexical units, never the per-character token set: a canonical
+        # row ("部署安排" -> 部署/署安/安排) and a spaced result ("部 署 安 排" ->
+        # 部/署/安/排) share every character while carrying different evidence,
+        # so a character-set comparison silently dropped one of the two rows
+        # (review: coderabbitai on #975). The signature deliberately ignores the
+        # canonical stop-unit configuration, so tuning slot matching cannot
+        # change how ordinary rows deduplicate; rows with no signature at all
+        # keep the previous character/word signature instead of being dropped.
+        tokens = _prefetch_dedup_signature(row.get("content", "")) or _prefetch_tokens(row.get("content", ""))
         if not tokens:
             continue
         duplicate = False

@@ -245,6 +245,8 @@ No required config. Everything defaults to `~/.mnemosyne/`. Optional overrides:
 | `MNEMOSYNE_PREFETCH_CANONICAL_RARE_TOKEN_MAX_FREQUENCY` | `1` | Maximum canonical document frequency that permits a one-token match (`0` disables the exception) |
 | `MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS` | path-specific built-in canonical set | Complete replacement for the canonical generic-token set used by automatic and explicit canonical lookup; does not affect working/episodic prefetch |
 | `MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS` | _(empty)_ | Extra owner/deployment terms added to automatic canonical prefetch only |
+| `MNEMOSYNE_PREFETCH_CJK_STOP_UNITS` | built-in CJK function-word units | Complete replacement for the CJK units ignored when canonical slots are matched, on both canonical paths; does not affect working/episodic prefetch and does not change how duplicate recall results are collapsed |
+| `MNEMOSYNE_PREFETCH_CJK_EXTRA_STOP_UNITS` | _(empty)_ | Extra CJK units ignored when canonical slots are matched, added to the configured or built-in set |
 | `MNEMOSYNE_DEFAULT_SCOPE` | `session` | Default scope for remember (`global` enables cross-session immediate recall) |
 
 Or in `~/.hermes/config.yaml`:
