@@ -2247,8 +2247,13 @@ def test_scoped_replay_serializes_background_beam_snapshots(
         assert not callback_thread.is_alive()
         assert failures == []
         assert len(worker_args) == 1
-        assert worker_args[0]["session_id"] == "active-session"
-        assert worker_args[0]["channel_id"] == "active-channel"
+        assert worker_args[0] == {
+            "session_id": "active-session",
+            "channel_id": "active-channel",
+            "db_path": "active.db",
+            "author_id": "active-author",
+            "author_type": "human",
+        }
 
 
 def test_scoped_replay_restores_beam_and_memory_on_success_and_failure(
