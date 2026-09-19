@@ -434,19 +434,33 @@ Bidirectional, delta-based memory sync between Mnemosyne instances. Designed for
 - Append-only event log for auditability
 
 ```bash
-# Start a sync server on your VPS
-mnemosyne sync-serve --port 8765 --api-key "your-secret-key"
+# Create a physically dedicated shared-surface DB (never your private Hermes DB)
+SURFACE="$HOME/.hermes/mnemosyne/data/shared/mnemosyne.db"
+mkdir -p "$(dirname "$SURFACE")"
+mnemosyne sync-init --db-path "$SURFACE"
+
+# Start a sync server on that dedicated surface
+mnemosyne sync-serve --db-path "$SURFACE" --port 8765 \
+  --api-key "your-secret-key"
 
 # On your local machine, sync bidirectionally
-mnemosyne sync --remote https://my-vps:8765
+mnemosyne sync --db-path "$SURFACE" --remote https://my-vps:8765
 
 # With client-side encryption
-export MNEMOSYNE_SYNC_KEY=$(mnemosyne sync-generate-key)
-mnemosyne sync --remote https://my-vps:8765 --encrypt
+SYNC_KEY_FILE="$HOME/.config/mnemosyne/sync-encryption.key"
+mkdir -p "$(dirname "$SYNC_KEY_FILE")"
+(umask 077 && mnemosyne sync-generate-key > "$SYNC_KEY_FILE")
+mnemosyne sync --db-path "$SURFACE" --remote https://my-vps:8765 \
+  --encrypt-key-file "$SYNC_KEY_FILE"
 
 # Check sync status
-mnemosyne sync-status --remote https://my-vps:8765
+mnemosyne sync-status --db-path "$SURFACE" --remote https://my-vps:8765
 ```
+
+The shared surface is populated only through the explicit `mnemosyne_shared_*`
+Hermes tools. Setting `default_scope: global` changes the default scope for new
+private-database writes; it does not convert existing private/session history,
+copy it into the surface, or make a regular Hermes database safe to sync.
 
 **When encryption is enabled**, the remote server sees only metadata (event IDs, timestamps, operation types). Memory content is encrypted before leaving your machine and can only be decrypted with your key.
 

@@ -115,11 +115,29 @@ Each exchange is idempotent &mdash; events carry unique `event_id`s and are dedu
 - Network connectivity between instances (or via SSH tunnel)
 - (Recommended) TLS certificate for the remote endpoint
 
+### Dedicated shared surface required
+
+Sync operates only on a physically dedicated shared-surface database. Never
+point `sync-init`, `sync`, or `sync-serve` at the regular Hermes memory DB. A
+safe initial path is:
+
+```bash
+SURFACE="$HOME/.hermes/mnemosyne/data/shared/mnemosyne.db"
+mkdir -p "$(dirname "$SURFACE")"
+mnemosyne sync-init --db-path "$SURFACE"
+```
+
+Hermes populates this surface through the explicit `mnemosyne_shared_*` tools.
+No command here automatically migrates, exports, or copies private/session
+history. In particular, `default_scope: global` only changes the default scope
+of new writes; it does not turn a regular Hermes DB into a shared surface.
+
 ### 1. Set Up the Remote Instance
 
 ```bash
 # On your VPS / remote machine
-mnemosyne sync-serve --port 8765 --api-key "your-secret-api-key"
+mnemosyne sync-serve --db-path "$SURFACE" --port 8765 \
+  --api-key "your-secret-api-key"
 ```
 
 This starts a sync server listening on port 8765.
@@ -133,31 +151,35 @@ This starts a sync server listening on port 8765.
 export MNEMOSYNE_SYNC_TOKEN="your-secret-api-key"
 
 # Test the connection
-mnemosyne sync-status --remote https://my-vps.example.com:8765
+mnemosyne sync-status --db-path "$SURFACE" \
+  --remote https://my-vps.example.com:8765
 ```
 
 ### 3. Run a Sync
 
 ```bash
 # Bidirectional sync (default)
-mnemosyne sync --remote https://my-vps.example.com:8765
+mnemosyne sync --db-path "$SURFACE" --remote https://my-vps.example.com:8765
 
 # Pull only (fetch remote changes without pushing local)
-mnemosyne sync --remote https://my-vps.example.com:8765 --mode pull
+mnemosyne sync --db-path "$SURFACE" \
+  --remote https://my-vps.example.com:8765 --mode pull
 
 # Push only (send local changes without fetching)
-mnemosyne sync --remote https://my-vps.example.com:8765 --mode push
+mnemosyne sync --db-path "$SURFACE" \
+  --remote https://my-vps.example.com:8765 --mode push
 ```
 
 ### 4. With Client-Side Encryption
 
 ```bash
-# Generate an encryption key
-mnemosyne sync-generate-key > mnemosyne-sync.key
+# Generate a private encryption-key file
+(umask 077 && mnemosyne sync-generate-key > mnemosyne-sync.key)
 
 # Sync with encryption
-MNEMOSYNE_SYNC_KEY=$(cat mnemosyne-sync.key) \
-  mnemosyne sync --remote https://my-vps.example.com:8765 --encrypt
+mnemosyne sync --db-path "$SURFACE" \
+  --remote https://my-vps.example.com:8765 \
+  --encrypt-key-file mnemosyne-sync.key
 ```
 
 ---
@@ -172,13 +194,17 @@ Usage: mnemosyne sync [OPTIONS]
 Synchronize memories with a remote Mnemosyne instance.
 
 Options:
-  --remote TEXT          Remote URL (e.g., https://my-vps:8765)  [required]
-  --mode TEXT            Sync mode: bidirectional, pull, push  [default: bidirectional]
-  --encrypt              Enable client-side payload encryption
-  --prompt-key           Prompt for encryption key interactively
-  --api-key TEXT         API key for remote authentication
-  --interval SECONDS     Continuous sync interval (0 = one-shot)  [default: 0]
-  --help                 Show this message and exit
+  --remote REMOTE                       Remote sync server URL  [required]
+  --db-path DB_PATH                     Dedicated shared-surface DB  [required]
+  --session-id SESSION_ID               Stable shared-surface session ID
+  --mode {push,pull,bidirectional}       Sync direction
+  --encrypt ENCRYPT                     Encryption key (visible in process arguments)
+  --encrypt-key-file ENCRYPT_KEY_FILE   Private file containing the encryption key
+  --api-key API_KEY                     API key (visible in process arguments)
+  --api-key-file API_KEY_FILE           Private file containing the API key
+  --interval INTERVAL                   Repeat interval in seconds
+  --initialize-surface                  Explicitly initialize a new dedicated surface
+  -h, --help                            Show this message and exit
 
 Security Notice:
   ╔════════════════════════════════════════════════════════╗
@@ -204,13 +230,19 @@ Usage: mnemosyne sync-serve [OPTIONS]
 Start a sync server for remote Mnemosyne instances.
 
 Options:
-  --port INTEGER          Port to listen on  [default: 8765]
-  --host TEXT             Host to bind to  [default: 127.0.0.1]
-  --api-key TEXT          API key for authentication  [default: none]
-  --jwt-secret TEXT       JWT secret for authentication  [default: none]
-  --tls-cert TEXT         Path to TLS certificate file
-  --tls-key TEXT          Path to TLS key file
-  --help                  Show this message and exit
+  --port PORT                         Server port
+  --host HOST                         Bind address
+  --db-path DB_PATH                   Relay SQLite DB  [required]
+  --initialize-surface                Initialize a new dedicated relay DB
+  --behind-tls-proxy                  Allow cleartext behind a trusted TLS proxy
+  --api-key API_KEY                   Bearer-token API key
+  --api-key-file API_KEY_FILE         Private file containing the API key
+  --jwt-secret JWT_SECRET             JWT secret
+  --jwt-secret-file JWT_SECRET_FILE   Private file containing the JWT secret
+  --tls-cert TLS_CERT                 TLS certificate file
+  --tls-key TLS_KEY                   TLS key file
+  --device-id DEVICE_ID               Custom device identifier
+  -h, --help                          Show this message and exit
 ```
 
 ### `mnemosyne sync-status`
@@ -221,10 +253,12 @@ Usage: mnemosyne sync-status [OPTIONS]
 Show sync status with a remote instance.
 
 Options:
-  --remote TEXT    Remote URL  [required]
-  --api-key TEXT   API key for authentication
-  --json           Output as JSON
-  --help           Show this message and exit
+  --db-path DB_PATH               Shared-surface SQLite DB  [required]
+  --remote REMOTE                 Remote URL to check
+  --api-key API_KEY               API key
+  --api-key-file API_KEY_FILE     Private file containing the API key
+  --json                          Output as JSON
+  -h, --help                      Show this message and exit
 
 Example output:
   Sync Status
@@ -248,10 +282,11 @@ Usage: mnemosyne sync-generate-key
 
 Generate a random 32-byte key for client-side encryption.
 
-Outputs a base64-encoded key suitable for MNEMOSYNE_SYNC_KEY.
+Outputs a base64-encoded key suitable for `--encrypt` or a private
+`--encrypt-key-file`.
 
 Example:
-  export MNEMOSYNE_SYNC_KEY=$(mnemosyne sync-generate-key)
+  (umask 077 && mnemosyne sync-generate-key > mnemosyne-sync.key)
 ```
 
 ---
@@ -353,11 +388,12 @@ The simplest authentication method. Passed as `Authorization: Bearer <key>` head
 
 ```bash
 # Server side
-mnemosyne sync-serve --api-key "sk-mnemo-abc123"
+mnemosyne sync-serve --db-path "$SURFACE" --api-key "sk-mnemo-abc123"
 
 # Client side
 export MNEMOSYNE_SYNC_TOKEN="sk-mnemo-abc123"
-mnemosyne sync --remote https://my-vps:8765
+mnemosyne sync --db-path "$SURFACE" --remote https://my-vps:8765 \
+  --api-key "$MNEMOSYNE_SYNC_TOKEN"
 ```
 
 ### JWT
@@ -366,10 +402,11 @@ For multi-user setups or integration with existing auth systems.
 
 ```bash
 # Server side
-mnemosyne sync-serve --jwt-secret "your-jwt-secret"
+mnemosyne sync-serve --db-path "$SURFACE" --jwt-secret "your-jwt-secret"
 
 # Client side
-MNEMOSYNE_SYNC_JWT="<token>" mnemosyne sync --remote https://my-vps:8765
+mnemosyne sync --db-path "$SURFACE" --remote https://my-vps:8765 \
+  --api-key "<JWT token>"
 ```
 
 ---
@@ -381,16 +418,12 @@ See [docs/security.md](security.md#encryption-in-mnemosyne-sync) for the full en
 ### Quick Reference
 
 ```bash
-# Generate a key
-mnemosyne sync-generate-key
+# Generate a private key file
+(umask 077 && mnemosyne sync-generate-key > mnemosyne-sync.key)
 
 # Sync with encryption
-export MNEMOSYNE_SYNC_KEY="<base64-key>"
-mnemosyne sync --remote https://my-vps:8765 --encrypt
-
-# Or use a passphrase (key derived automatically)
-export MNEMOSYNE_SYNC_PASSPHRASE="your strong passphrase"
-mnemosyne sync --remote https://my-vps:8765 --encrypt
+mnemosyne sync --db-path "$SURFACE" --remote https://my-vps:8765 \
+  --encrypt-key-file mnemosyne-sync.key
 ```
 
 ### Dependencies
@@ -429,7 +462,8 @@ services:
       - MNEMOSYNE_SYNC_KEY_FILE=/run/secrets/sync.key
     command: >
       sh -c "pip install -q mnemosyne-memory[sync] &&
-             mnemosyne sync-serve --port 8765 --api-key $(cat /run/secrets/sync.key)"
+             mnemosyne sync-serve --db-path /data/relay.db --initialize-surface
+             --port 8765 --api-key $(cat /run/secrets/sync.key)"
 
 volumes:
   mnemosyne-data:
@@ -503,10 +537,11 @@ If you don't want to expose the sync port publicly:
 ssh -L 8765:localhost:8765 user@your-vps
 
 # On your VPS
-mnemosyne sync-serve --port 8765 --host 127.0.0.1 --api-key "..."
+mnemosyne sync-serve --db-path "$SURFACE" --port 8765 \
+  --host 127.0.0.1 --api-key "..."
 
 # On your local machine (tunnel active)
-mnemosyne sync --remote http://localhost:8765
+mnemosyne sync --db-path "$SURFACE" --remote http://localhost:8765
 ```
 
 ### Ready-to-Use Configs

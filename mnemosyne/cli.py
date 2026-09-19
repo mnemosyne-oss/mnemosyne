@@ -725,14 +725,289 @@ def _read_secret_file(path: str, label: str) -> str:
 
 
 _DEFAULT_SYNC_SESSION_ID = "hermes_shared_surface"
+_DEFAULT_SYNC_SURFACE_ID = "shared-surface-v1"
+
+_SYNC_DEDICATED_DB_RECOVERY = (
+    "The supplied database is not a dedicated shared-surface database. "
+    "Use a new path, for example: `mnemosyne sync-init --db-path "
+    '"$HOME/.hermes/mnemosyne/data/shared/mnemosyne.db"`. '
+    "Populate that database through `mnemosyne_shared_*`; private/session "
+    "history is not copied automatically."
+)
+
+
+# A sync-init claim may construct Mnemosyne and run schema migrations, so an
+# existing file must first match the complete table/column identity produced by
+# the current initializer. Older or partial layouts remain fail-closed until a
+# read-only compatibility proof is added for that exact layout.
+_SYNC_SCHEMA_FINGERPRINT = {
+    "working_memory": frozenset({
+        "id", "content", "source", "timestamp", "session_id", "importance",
+        "metadata_json", "veracity", "created_at", "memory_type",
+        "consolidated_at", "consolidation_claimed_at", "recall_count",
+        "last_recalled", "pinned", "valid_until", "superseded_by", "scope",
+        "author_id", "author_type", "channel_id", "trust_tier", "validator",
+        "validated_at", "validation_count", "event_date",
+        "event_date_precision", "temporal_tags", "corrected_by",
+    }),
+    "episodic_memory": frozenset({
+        "rowid", "id", "content", "source", "timestamp", "session_id",
+        "importance", "metadata_json", "summary_of", "veracity", "created_at",
+        "tier", "degraded_at", "memory_type", "binary_vector", "recall_count",
+        "last_recalled", "valid_until", "superseded_by", "scope", "author_id",
+        "author_type", "channel_id", "trust_tier", "validator", "validated_at",
+        "validation_count", "event_date", "event_date_precision",
+        "temporal_tags", "corrected_by",
+    }),
+    "memories": frozenset({
+        "id", "content", "source", "timestamp", "session_id", "importance",
+        "metadata_json", "created_at",
+    }),
+}
+
+_SYNC_EVENT_BASE_COLUMNS = frozenset({
+    "event_id", "memory_id", "operation", "timestamp", "device_id", "payload",
+    "parent_event_ids", "importance", "expiry", "event_hash", "synced_at",
+})
+_SYNC_EVENT_SURFACE_COLUMNS = frozenset({
+    "timestamp_epoch", "surface_id", "apply_state",
+})
+_SYNC_META_COLUMNS = frozenset({"key", "value"})
+_SYNC_META_KEYS = frozenset({
+    "surface_db_id", "device_id", "configured_push_remote",
+})
+_SYNC_META_KEY_PREFIXES = ("last_pull_cursor_", "last_sync_at_")
+
+
+def _sync_init_readonly_preflight(
+    db_path: str, session_id: str
+) -> tuple[Path, int, int]:
+    """Classify a sync-init target and return the identity later opened."""
+    import sqlite3
+
+    supplied_path = Path(db_path).expanduser()
+    if supplied_path.is_symlink():
+        raise SystemExit(
+            "Refusing initialization: symbolic-link database targets are not allowed"
+        )
+    if not supplied_path.exists():
+        return supplied_path.resolve(), 0, 0
+    if not supplied_path.is_file():
+        raise SystemExit(
+            f"Refusing initialization: {supplied_path} is not a database file"
+        )
+
+    try:
+        path = supplied_path.resolve(strict=True)
+        if path.stat().st_nlink > 1:
+            raise SystemExit(
+                "Refusing initialization: multiply-linked database targets are not allowed"
+            )
+    except SystemExit:
+        raise
+    except OSError as error:
+        raise SystemExit(
+            f"Refusing initialization: cannot establish database identity: {error}"
+        ) from None
+
+    # A hot WAL/journal cannot be inspected with immutable=1, while opening it
+    # normally may create or update sidecars. Inspect the same canonical path
+    # that mutation will later open, and fail closed instead.
+    for suffix in ("-wal", "-journal"):
+        sidecar = Path(f"{path}{suffix}")
+        try:
+            has_uncheckpointed_state = sidecar.exists() and sidecar.stat().st_size > 0
+        except OSError as error:
+            raise SystemExit(
+                f"Refusing initialization: cannot inspect SQLite sidecar read-only: {error}"
+            ) from None
+        if has_uncheckpointed_state:
+            raise SystemExit(
+                "Refusing initialization: the target has uncheckpointed SQLite "
+                f"state. Close/checkpoint it before retrying. {_SYNC_DEDICATED_DB_RECOVERY}"
+            )
+
+    # immutable=1 prevents even a read-only SQLite connection from creating
+    # WAL/SHM files while it inspects a quiescent existing target.
+    uri = f"{path.as_uri()}?mode=ro&immutable=1"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            columns_by_table = {
+                table: {
+                    row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+                }
+                for table in _SYNC_SCHEMA_FINGERPRINT
+                if table in tables
+            }
+            if any(
+                not required_columns.issubset(columns_by_table.get(table, set()))
+                for table, required_columns in _SYNC_SCHEMA_FINGERPRINT.items()
+            ):
+                raise SystemExit(
+                    f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                )
+
+            surface_marker = None
+            if "sync_meta" in tables:
+                meta_info = conn.execute("PRAGMA table_info(sync_meta)").fetchall()
+                meta_columns = {row[1] for row in meta_info}
+                key_info = next((row for row in meta_info if row[1] == "key"), None)
+                value_info = next((row for row in meta_info if row[1] == "value"), None)
+                if (
+                    meta_columns != _SYNC_META_COLUMNS
+                    or key_info is None
+                    or value_info is None
+                    or str(key_info[2]).upper() != "TEXT"
+                    or str(value_info[2]).upper() != "TEXT"
+                    or key_info[5] != 1
+                    or value_info[5] != 0
+                ):
+                    raise SystemExit(
+                        f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                    )
+                meta_rows = conn.execute("SELECT key, value FROM sync_meta").fetchall()
+                unknown_meta = [
+                    key for key, _value in meta_rows
+                    if not isinstance(key, str)
+                    or (
+                        key not in _SYNC_META_KEYS
+                        and not key.startswith(_SYNC_META_KEY_PREFIXES)
+                    )
+                ]
+                markers = [
+                    value for key, value in meta_rows if key == "surface_db_id"
+                ]
+                if unknown_meta or len(markers) > 1:
+                    raise SystemExit(
+                        f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                    )
+                surface_marker = markers[0] if markers else None
+                if surface_marker not in (None, _DEFAULT_SYNC_SURFACE_ID):
+                    raise SystemExit(
+                        f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                    )
+                # Metadata without a durable marker belongs to an unscoped
+                # sync engine and is ambiguous at the surface claim boundary.
+                if meta_rows and surface_marker is None:
+                    raise SystemExit(
+                        f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                    )
+
+            if "memory_events" in tables:
+                event_columns = {
+                    row[1] for row in conn.execute(
+                        "PRAGMA table_info(memory_events)"
+                    ).fetchall()
+                }
+                if not _SYNC_EVENT_BASE_COLUMNS.issubset(event_columns):
+                    raise SystemExit(
+                        f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                    )
+                event_count = conn.execute(
+                    "SELECT COUNT(*) FROM memory_events"
+                ).fetchone()[0]
+                if event_count:
+                    if (
+                        surface_marker != _DEFAULT_SYNC_SURFACE_ID
+                        or not _SYNC_EVENT_SURFACE_COLUMNS.issubset(event_columns)
+                    ):
+                        raise SystemExit(
+                            f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                        )
+                    invalid_events = conn.execute(
+                        """SELECT COUNT(*) FROM memory_events
+                           WHERE surface_id IS NULL OR surface_id != ?
+                              OR timestamp_epoch IS NULL""",
+                        (_DEFAULT_SYNC_SURFACE_ID,),
+                    ).fetchone()[0]
+                    if invalid_events:
+                        raise SystemExit(
+                            f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}"
+                        )
+
+            existing_ids: set[object] = set()
+            rows_without_ids = 0
+            invalid_rows = 0
+            for table in ("working_memory", "episodic_memory"):
+                columns = columns_by_table[table]
+                if "id" in columns:
+                    existing_ids.update(
+                        row[0] for row in conn.execute(f"SELECT id FROM {table}")
+                    )
+                else:
+                    rows_without_ids += conn.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0]
+                invalid_rows += conn.execute(
+                    f"""SELECT COUNT(*) FROM {table}
+                        WHERE scope IS NULL OR scope != 'global'
+                           OR session_id IS NULL OR session_id != ?""",
+                    (session_id,),
+                ).fetchone()[0]
+
+            working_columns = columns_by_table["working_memory"]
+            if "sync_surface_id" in working_columns:
+                invalid_rows += conn.execute(
+                    """SELECT COUNT(*) FROM working_memory
+                       WHERE sync_surface_id IS NOT NULL AND sync_surface_id != ?""",
+                    (_DEFAULT_SYNC_SURFACE_ID,),
+                ).fetchone()[0]
+
+            # The legacy mirror remains semantically readable and session-bound
+            # even after a row leaves working memory. Count IDs across all three
+            # stores once so mirrors require confirmation without double-counting
+            # one memory, and reject foreign or ambiguous sessions.
+            if "memories" in columns_by_table:
+                columns = columns_by_table["memories"]
+                if "id" in columns:
+                    existing_ids.update(
+                        row[0] for row in conn.execute("SELECT id FROM memories")
+                    )
+                else:
+                    rows_without_ids += conn.execute(
+                        "SELECT COUNT(*) FROM memories"
+                    ).fetchone()[0]
+                invalid_rows += conn.execute(
+                    """SELECT COUNT(*) FROM memories
+                       WHERE session_id IS NULL OR session_id != ?""",
+                    (session_id,),
+                ).fetchone()[0]
+
+            existing_rows = len(existing_ids) + rows_without_ids
+            return path, existing_rows, invalid_rows
+        finally:
+            conn.close()
+    except SystemExit:
+        raise
+    except sqlite3.Error as error:
+        raise SystemExit(
+            f"Refusing initialization: cannot validate the target read-only: {error}"
+        ) from None
 
 
 def cmd_sync_init(args):
     """Explicitly initialize or migrate a dedicated shared-surface DB."""
     import argparse
 
-    parser = argparse.ArgumentParser(prog="mnemosyne sync-init")
-    parser.add_argument("--db-path", required=True, help="Dedicated shared-surface DB")
+    parser = argparse.ArgumentParser(
+        prog="mnemosyne sync-init",
+        description="Initialize a physically dedicated shared-surface database.",
+        epilog=(
+            "Do not use a private/session database. Populate the dedicated "
+            "surface through mnemosyne_shared_*; private history is not copied."
+        ),
+    )
+    parser.add_argument(
+        "--db-path", required=True, help="New or dedicated shared-surface DB"
+    )
     parser.add_argument(
         "--session-id",
         default=_DEFAULT_SYNC_SESSION_ID,
@@ -750,37 +1025,32 @@ def cmd_sync_init(args):
     )
     parsed = parser.parse_args(args)
 
-    from mnemosyne.core.memory import Mnemosyne
-    from mnemosyne.core.sync import SyncEngine
-
-    mem = Mnemosyne(db_path=parsed.db_path, session_id=parsed.session_id)
-    existing_rows = mem.beam.conn.execute(
-        "SELECT COUNT(*) FROM working_memory"
-    ).fetchone()[0]
-    invalid_rows = mem.beam.conn.execute(
-        """SELECT COUNT(*) FROM working_memory
-           WHERE scope != 'global' OR session_id != ?""",
-        (parsed.session_id,),
-    ).fetchone()[0]
+    target_path, existing_rows, invalid_rows = _sync_init_readonly_preflight(
+        parsed.db_path, parsed.session_id
+    )
+    if invalid_rows:
+        raise SystemExit(f"Refusing initialization: {_SYNC_DEDICATED_DB_RECOVERY}")
     preview = {
-        "db_path": str(parsed.db_path),
+        "db_path": str(target_path),
         "session_id": parsed.session_id,
         "existing_rows": existing_rows,
         "invalid_rows": invalid_rows,
     }
-    if invalid_rows:
-        raise SystemExit(
-            "Refusing migration: DB contains non-global or foreign-session rows"
-        )
     if existing_rows and not (parsed.claim_existing and parsed.yes):
         preview["status"] = "confirmation_required"
         preview["required_flags"] = ["--claim-existing", "--yes"]
         print(json.dumps(preview, sort_keys=True))
         return
 
+    from mnemosyne.core.memory import Mnemosyne
+    from mnemosyne.core.sync import SyncEngine
+
+    mem = Mnemosyne(db_path=target_path, session_id=parsed.session_id)
+
     SyncEngine(
         mem,
         surface_only=True,
+        surface_id=_DEFAULT_SYNC_SURFACE_ID,
         initialize_surface=True,
         claim_existing_surface=bool(existing_rows),
     )
@@ -1838,7 +2108,7 @@ def run_cli():
         # machine-readable code, never a traceback (which leaks absolute
         # paths and library internals into logs).
         try:
-            if command not in {"doctor", "repair"}:
+            if command not in {"doctor", "repair", "sync-init"}:
                 os.makedirs(DATA_DIR, exist_ok=True)
             handler(sys.argv[2:])
         except SystemExit:
