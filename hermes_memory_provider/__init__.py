@@ -306,6 +306,13 @@ def _strip_prefetch_prefix(content: str) -> str:
     return c
 
 
+def _sanitize_prefetch_query(query: str) -> str:
+    """Use core's shared sanitizer lazily to preserve diagnostic CLI imports."""
+    from mnemosyne.core.query_sanitize import sanitize_prefetch_query
+
+    return sanitize_prefetch_query(query)
+
+
 def _prefetch_tokens(content: str) -> Set[str]:
     c = _strip_prefetch_prefix(content).lower()
     tokens: Set[str] = set()
@@ -2114,9 +2121,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         ``general`` profile reproduces the prior single-source behavior exactly."""
         if not self._beam or self._agent_context in self._skip_contexts:
             return ""
+        query = _sanitize_prefetch_query(query)
         profile = _resolve_profile(self._prefetch_profile)
         blocks: List[str] = []
-        for src in profile.sources:
+        # All profile sources are query-driven; identity below is not.
+        for src in profile.sources if query.strip() else ():
             try:
                 if src == "bank":
                     block = self._prefetch_bank(query, session_id, profile)
@@ -2139,7 +2148,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # it is talking to. Inject them deterministically at the FRONT, scoped
         # strictly to the active session_id, deduplicated against whatever
         # recall already surfaced. No identity rows == no-op (legacy behavior).
-        model_block = self._prefetch_model_slots(query, profile)
+        model_block = self._prefetch_model_slots(query, profile) if query.strip() else ""
         if model_block:
             blocks.insert(0, model_block)
         identity_block = self._prefetch_identity(blocks, profile)
@@ -2886,12 +2895,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _handle_recall(self, args: Dict[str, Any]) -> str:
         query = args.get("query", "")
+        # Tool queries carry the same gateway speaker stamps as prefetch
+        # (an agent forwarding a stamped message body); sanitize so
+        # recall does not score rows on speaker-name tokens.
+        query = _sanitize_prefetch_query(query)
         top_k = int(args.get("limit", 5))
         temporal_weight = float(args.get("temporal_weight", 0.0))
         query_time = args.get("query_time") or None
         temporal_halflife_hours = float(args.get("temporal_halflife", 24))
         explain = bool(args.get("explain", False))
-        if not query:
+        if not query.strip():
             return json.dumps({"error": "query is required"})
 
         # Forward configurable scoring weights ONLY when the caller actually
