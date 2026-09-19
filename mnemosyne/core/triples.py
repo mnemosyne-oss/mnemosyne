@@ -138,13 +138,36 @@ class TripleStore:
         >>> ann = AnnotationStore()
         >>> ann.add("mem-1", "mentions", "Alice")
         >>> ann.add("mem-1", "mentions", "Bob")  # both preserved
+
+    Bare ``TripleStore()`` is a standalone store: it always resolves to its
+    own ``triples.db`` (see module docstring), never to a bank's
+    ``mnemosyne.db``. The MCP ``mnemosyne_triple_add``/``mnemosyne_triple_query``
+    tools read and write a *different* file, the calling bank's own
+    ``mnemosyne.db``, so triples written through the bare constructor are
+    invisible to them and vice versa (#548). Use `TripleStore.for_bank()` to
+    get the store instance that matches what a given bank's MCP tools see.
     """
-    
+
     def __init__(self, db_path: Path = None):
         self.db_path = Path(db_path) if db_path else _resolve_default_db()
         init_triples(self.db_path)
         self.conn = _get_conn(self.db_path)
-    
+
+    @classmethod
+    def for_bank(cls, bank: str = "default") -> "TripleStore":
+        """Return a TripleStore backed by the given bank's own mnemosyne.db.
+
+        Mirrors the resolution `Mnemosyne(bank=...)` and the MCP
+        `triple_add`/`triple_query` handlers already use
+        (`BankManager().get_bank_db_path(bank)`), so triples added here are
+        the same ones those tools read and write. This does not change the
+        bare `TripleStore()` default, and it does not move, merge, or migrate
+        any existing `triples.db` file.
+        """
+        from mnemosyne.core.banks import BankManager
+
+        return cls(db_path=BankManager().get_bank_db_path(bank))
+
     def add(self, subject: str, predicate: str, object: str,
             valid_from: str = None, source: str = "inferred",
             confidence: float = 1.0, valid_until: str = None,
