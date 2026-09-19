@@ -506,6 +506,7 @@ ENV_ONLY_DESCRIPTIONS = {
     "MNEMOSYNE_PREFETCH_MODEL_SLOT_LIMIT": "Maximum canonical slots prefetched per turn.",
     "MNEMOSYNE_PREFETCH_MODEL_SLOT_MIN_OVERLAP": "Minimum token overlap for a canonical slot to count as relevant.",
     "MNEMOSYNE_PREFETCH_PROFILE": "Prefetch profile name, for example `general` or `coding`.",
+    "MNEMOSYNE_RECALL_PROVENANCE": "Set to `1` to make linear `recall()` append one JSONL audit line per call to `<db>.recall_provenance.jsonl` (plaintext: up to 200 chars of raw query text, plus the first 20 results with id/tier/score/importance/timestamp). Default OFF, read per call. The file is created `0600`, rotates at 1 MB (the current file plus one `.1` are retained), and reads are bounded to a 256 KB tail of the current generation. `explain=True` calls are intentionally excluded: their trace object is the audit surface for that call. `recall_enhanced()` and polyphonic paths are never logged. Fail-open: a provenance failure never breaks recall. When enabled, each call pays one small locked append (no fsync); local filesystems only.",
     "MNEMOSYNE_SESSION_END_TIMEOUT": "Seconds allowed for end-of-session memory writes.",
     "MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT": "Seconds allowed to drain pending writes on shutdown.",
     "MNEMOSYNE_STATED_WEIGHT": "Veracity multiplier for directly stated memories.",

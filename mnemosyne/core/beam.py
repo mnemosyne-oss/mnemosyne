@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from mnemosyne.core._connection_gc import collect_connection_cycles
 from mnemosyne.core.config import resolve_beam_runtime
 from mnemosyne.core.journal import journal_mode
+from mnemosyne.core.recall_provenance import append_recall_provenance
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta, timezone
@@ -7934,6 +7935,7 @@ class BeamMemory:
                importance_weight: float = None,
                explain: bool = False,
                _cross_session: Optional[bool] = None,
+               _skip_provenance: bool = False,
                _resolved_weights: Optional[_RecallWeightSnapshot] = None,
                exclude_captures: Optional[ExclusionSnapshot] = None) -> List[Dict]:
         """
@@ -9358,6 +9360,21 @@ class BeamMemory:
                 "explain": _explain_trace.to_dict(),
             }
 
+        # [Recall provenance] Persistent query->result-ids audit line
+        # (JSONL at <db>.recall_provenance.jsonl, one file per db).
+        # Opt-in via env flag, read per call (same pattern as the
+        # polyphonic flag above) so operators can toggle without
+        # rebuilding BeamMemory. append_recall_provenance never raises;
+        # the default is OFF so no surprise disk writes. explain=True
+        # intentionally excluded: its trace object above is already
+        # the audit surface for that call. Linear path only:
+        # enhanced/polyphonic return before this point.
+        # Internal delegation (recall_enhanced) passes _skip_provenance=True
+        # so its expanded query + doubled top_k are not mislogged.
+        if (not _skip_provenance
+                and os.environ.get("MNEMOSYNE_RECALL_PROVENANCE", "0") == "1"):
+            append_recall_provenance(str(self.db_path), query, final_results, top_k)
+
         return final_results
 
     # Bump whenever the enhanced-recall candidate or ranking algorithm changes
@@ -9657,6 +9674,7 @@ class BeamMemory:
             top_k=top_k * 2,
             _cross_session=runtime.cross_session,
             _resolved_weights=weight_snapshot,
+            _skip_provenance=True,
             **kwargs,
         )
         if explain:
