@@ -358,6 +358,7 @@ CONFIG_DESCRIPTIONS = {
     "sleep_model_refresh_min_evidence": "Minimum supporting memories before proposing a change.",
     "sleep_model_refresh_conflict_min_confidence": "Minimum confidence to auto-apply a proposal that contradicts a current fact.",
     "sleep_model_refresh_conflict_min_evidence": "Minimum supporting memories for a contradicting change.",
+    "dream_active": "Whether Dream mode is active, disabling automated model-refresh mutations.",
 
     # SHMR
     "shmr_batch_size": "Memories per SHMR harmonization batch.",
