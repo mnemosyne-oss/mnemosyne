@@ -51,9 +51,12 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
   **Breaking:** pointing `MNEMOSYNE_EMBEDDING_API_URL` at a custom endpoint with a model not in the built-in table now requires `MNEMOSYNE_EMBEDDING_DIM=<N>`, otherwise direct core/MCP-provider startup exits at import with an actionable error (the `mnemosyne-hermes` wrapper catches this and reports the provider unavailable instead of exiting). Blank/empty `MNEMOSYNE_EMBEDDING_DIM` and `MNEMOSYNE_EMBEDDING_MODEL` (common in Docker Compose and `.env` files) are normalized to unset/default rather than treated as explicit invalid values.
 
-  **Upgrade note for stores created under the old silent-384 fallback:** setting the model's true dimension can trigger the existing dimension-mismatch guard. Use the documented reindex/recovery path rather than treating the override as a one-step fix. See [docs/migration-4.0.md](docs/migration-4.0.md).
+  **Upgrade note for stores created under the old silent-384 fallback:** setting the model's true dimension can trigger the existing dimension-mismatch guard. Use the documented reindex/recovery path rather than treating the override as a one-step fix.
 
 ### Fixed
+- **SHMR local LLM dispatch (#716).** The harmonization path no longer passes
+  unsupported keyword arguments to the prompt-only local LLM helper, so local
+  inference is reachable and failures remain diagnostically visible.
 
 - **Standalone Hermes setup and status now survive every discovery path (#983).** The `mnemosyne-hermes` package, catalog directory wrapper, and generated persistent wrapper expose the provider CLI contract without declaring a desktop config schema that would write a second config store. `hermes memory status` uses a bounded, terminal-safe, read-only, fail-soft, secret-free view of `memory.mnemosyne`; setup keeps the provider name, existing config keys, data paths, tools, and CLI unchanged.
 - **The standalone `mnemosyne-hermes` package builds again.** A direct push on 2026-09-17 replaced `integrations/hermes/pyproject.toml` with a Hermes catalog wrapper named `mnemosyne-plugin`, so `python -m build` produced a wheel under the wrong name and CI's editable install failed. Reverted; the catalog plugin gets its own directory instead of reusing the PyPI project root.
