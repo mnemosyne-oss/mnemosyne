@@ -579,13 +579,27 @@ mnemosyne mcp --transport streamable-http --port 8080  # native MCP http transpo
 The HTTP transports bind to loopback (`127.0.0.1`) by default and need no
 token there unless `MNEMOSYNE_MCP_TOKENS` is set. `MNEMOSYNE_MCP_TOKENS`
 takes precedence; either it or `MNEMOSYNE_MCP_TOKEN` supplies HTTP
-authentication. A non-loopback bind exposes the selected local SQLite-backed
-memory bank to network clients, so it requires authentication; the
-`streamable-http` transport additionally requires
-`MNEMOSYNE_MCP_ALLOWED_HOSTS`, with `MNEMOSYNE_MCP_ALLOWED_ORIGINS` optionally
-restricting browser origins.
-Bearer tokens on a non-loopback HTTP bind require TLS termination in front of
-the server, using a reverse proxy or secure tunnel.
+authentication. For multi-agent deployments, set a JSON name-to-secret mapping
+(placeholders shown):
+
+```bash
+export MNEMOSYNE_MCP_TOKENS='{"agent-a":"replace-with-agent-a-secret","agent-b":"replace-with-agent-b-secret"}'
+```
+
+The matched token name becomes the authoritative memory author identity;
+conflicting client-supplied `author_id` values are rejected. Startup is rejected
+when the value is blank or whitespace, malformed JSON, a non-object or empty
+object, or contains non-string or blank names/secrets, duplicate names (including
+names equal after trimming), or duplicate secrets. See the
+[CLI reference](cli-reference.md#multi-agent-tokens-per-agent-identity) and
+[configuration reference](api/configuration.mdx) for the canonical contract.
+
+A non-loopback bind exposes the selected local SQLite-backed memory bank to
+network clients, so it requires authentication; the `streamable-http` transport
+additionally requires `MNEMOSYNE_MCP_ALLOWED_HOSTS`, with
+`MNEMOSYNE_MCP_ALLOWED_ORIGINS` optionally restricting browser origins. Bearer
+tokens on a non-loopback HTTP bind require TLS termination in front of the
+server, using a reverse proxy or secure tunnel.
 
 Mnemosyne does not currently expose a standalone REST API server.
 
