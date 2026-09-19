@@ -5200,7 +5200,9 @@ class BeamMemory:
                  veracity: str = "unknown",
                  trust_tier: str = None,
                  memory_type: str = None,
-                 dedupe: bool = True) -> str:
+                 dedupe: bool = True,
+                 author_id: str = None,
+                 author_type: str = None) -> str:
         """Store into working_memory. Deduplicates exact content matches.
 
         When called from the legacy-compatible Mnemosyne.remember() path,
@@ -5221,6 +5223,11 @@ class BeamMemory:
                 and store as triples. Default False.
             veracity: Confidence level -- 'stated', 'inferred', 'tool', 'imported', 'unknown'.
                 Non-canonical labels are clamped to 'unknown' with a WARNING
+            author_id: Per-write author identity. When provided, overrides
+                self.author_id for THIS write only (issue #914). The instance
+                read identity (self.author_id, used by recall author-scoping)
+                is never mutated. None falls back to self.author_id.
+            author_type: Per-write author type, same override semantics.
                 (mirrors the C12.b clamp at the hermes_memory_provider boundary).
             memory_type: Optional explicit MemoryType value (e.g. 'artifact').
                 Overrides the content classifier entirely -- the classifier is
@@ -5276,6 +5283,12 @@ class BeamMemory:
         # content does not say. An unrecognized label degrades to
         # classification rather than to NULL.
         memory_type = _clamp_memory_type(memory_type)
+        # --- Per-write author identity (issue #914) ---
+        # Resolve once: per-write args override the instance identity for
+        # THIS write only. self.author_id (read identity, consulted by
+        # recall author-scoping) is never mutated.
+        _write_author_id = author_id if author_id is not None else self.author_id
+        _write_author_type = author_type if author_type is not None else self.author_type
         if memory_type is None and classify_memory is not None:
             try:
                 result = classify_memory(content)
@@ -5318,7 +5331,7 @@ class BeamMemory:
                 WHERE id = ? AND session_id = ?
             """, (importance, datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), source,
                   valid_until, scope,
-                  self.author_id, self.author_type, self.channel_id,
+                  _write_author_id, _write_author_type, self.channel_id,
                   memory_type,
                   veracity, veracity,
                   trust_tier,
@@ -5365,7 +5378,7 @@ class BeamMemory:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (memory_id, content, source, timestamp, self.session_id, importance,
               json.dumps(metadata or {}), valid_until, scope,
-              self.author_id, self.author_type, self.channel_id, veracity, memory_type, trust_tier))
+              _write_author_id, _write_author_type, self.channel_id, veracity, memory_type, trust_tier))
         self.conn.commit()
         try:
             self._trim_working_memory()
@@ -6595,7 +6608,9 @@ class BeamMemory:
                                 event_timestamp: 'Optional[str]' = None,
                                 event_date: 'Optional[str]' = None,
                                 event_date_precision: 'Optional[str]' = None,
-                                emit_event: bool = True) -> str:
+                                emit_event: bool = True,
+                                author_id: Optional[str] = None,
+                                author_type: Optional[str] = None) -> str:
         """
         Store a consolidated summary into episodic_memory with optional embedding.
 
@@ -6609,6 +6624,10 @@ class BeamMemory:
             event_timestamp — ingest time and event time are distinct
             contracts (see sleep()'s aggregation rule).
 
+        `author_id` / `author_type` are appended AFTER `emit_event` to keep the
+        positional slots of the pre-existing `event_*` / `emit_event` params
+        stable; every caller in-tree passes them by keyword.
+
         E4.a.1: `veracity` kwarg threads the aggregated source-row veracity
         into the episodic INSERT. Pre-fix the INSERT didn't include the
         veracity column at all, so post-sleep rows took the schema default
@@ -6617,6 +6636,14 @@ class BeamMemory:
         aggregate via `aggregate_veracity()` over the source rows' veracity
         values and pass it here. `None` falls back to 'unknown' (matches
         legacy behavior + schema default).
+
+        #914 author preservation: `author_id` / `author_type` kwargs thread
+        the aggregated source-row authorship into the episodic INSERT.
+        Pre-fix the INSERT copied `self.author_id` (the beam-level identity),
+        dropping write-side stamps at consolidation. Callers (typically
+        `sleep()`) should pass the unanimous source-row author when every
+        source row agrees; `None` falls back to the beam identity (previous
+        behavior).
         """
         # Caller-owned transaction gate (round-4): the MEMORY_CONSOLIDATED
         # event must never precede the commit that persists the row. Under
@@ -6701,6 +6728,10 @@ class BeamMemory:
             row_veracity = clamp_veracity(
                 veracity, context="consolidate_to_episodic.veracity"
             )
+        # Per-write author override: explicit kwargs win, beam identity is the
+        # fallback (pre-#914 the INSERT unconditionally copied self.author_id).
+        ep_author_id = author_id if author_id is not None else self.author_id
+        ep_author_type = author_type if author_type is not None else self.author_type
 
         # Compute the embedding BEFORE the INSERT opens the write transaction.
         # embed() can be a network call (API embeddings, 30s timeout) or a
@@ -6741,7 +6772,7 @@ class BeamMemory:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (memory_id, _sanitize_utf8(summary), source, timestamp, self.session_id, importance,
                   json.dumps(metadata or {}), ",".join(source_wm_ids), valid_until, scope,
-                  self.author_id, self.author_type, self.channel_id, ep_type, row_veracity))
+                  ep_author_id, ep_author_type, self.channel_id, ep_type, row_veracity))
             rowid = cursor.lastrowid
 
             # Apply post-insert field overrides inside the same transaction.
@@ -11134,7 +11165,8 @@ class BeamMemory:
         # earliest, the same degradation contract as the Python side in
         # _row_sort_key.
         cursor.execute(f"""
-            SELECT id, content, source, timestamp, importance, metadata_json, scope, valid_until, veracity, event_date, event_date_precision, superseded_by
+            SELECT id, content, source, timestamp, importance, metadata_json, scope, valid_until, veracity, event_date, event_date_precision, superseded_by,
+                   author_id, author_type
             FROM working_memory
             WHERE COALESCE(session_id, 'default') = ?
               AND {_SQL_CHRONO_TS} < ?
@@ -11304,6 +11336,44 @@ class BeamMemory:
             aggregated_veracity = aggregate_veracity(
                 [item.get("veracity") for item in items]
             )
+
+            # #914: aggregate per-row authorship into the summary. When
+            # EVERY source row carries the same author_id/author_type the
+            # stamp is restored on the episodic row; mixed or absent
+            # authorship falls back to the beam identity (self.author_id),
+            # matching the pre-fix behavior. Rows may carry non-text author
+            # values (legacy/foreign writes), so degrade those to absent.
+            def _wm_author_text(item, key):
+                v = item.get(key)
+                if v is None:
+                    return ""
+                if not isinstance(v, str):
+                    logger.warning(
+                        "sleep: group row %r has non-text %s %r; treated as absent",
+                        item.get("id"), key, v,
+                    )
+                    return ""
+                return v.strip()
+
+            _author_values = [
+                _wm_author_text(item, "author_id") for item in items
+            ]
+            _authors = {v for v in _author_values if v}
+            # Unanimous only when EVERY row carries the same non-empty
+            # author; a sibling row with an absent author must not be
+            # attributed to the present rows' author (falls back below).
+            if len(_authors) == 1 and all(_author_values):
+                aggregated_author_id = _authors.pop() or None
+            else:
+                aggregated_author_id = None
+            _author_type_values = [
+                _wm_author_text(item, "author_type") for item in items
+            ]
+            _author_types = {v for v in _author_type_values if v}
+            if len(_author_types) == 1 and all(_author_type_values):
+                aggregated_author_type = _author_types.pop() or None
+            else:
+                aggregated_author_type = None
 
             # --- Phase 1: heuristic conflict detection (no LLM) ---
             if len(items) >= 2:
@@ -11591,6 +11661,8 @@ class BeamMemory:
                     scope=aggregated_scope,
                     valid_until=aggregated_valid_until,
                     veracity=aggregated_veracity,
+                    author_id=aggregated_author_id,
+                    author_type=aggregated_author_type,
                     metadata={
                         "original_count": len(items),
                         "source": source,
@@ -11946,7 +12018,8 @@ class BeamMemory:
                    metadata_json, valid_until, superseded_by, scope,
                    recall_count, last_recalled, created_at, veracity,
                    consolidated_at, consolidation_claimed_at,
-                   event_date, event_date_precision, pinned
+                   event_date, event_date_precision, pinned,
+                   author_id, author_type
             FROM working_memory
             ORDER BY session_id, timestamp
         """)
@@ -11957,7 +12030,8 @@ class BeamMemory:
             SELECT rowid, id, content, source, timestamp, session_id, importance,
                    metadata_json, summary_of, valid_until, superseded_by, scope,
                    recall_count, last_recalled, created_at,
-                   event_date, event_date_precision
+                   event_date, event_date_precision,
+                   author_id, author_type
             FROM episodic_memory
             ORDER BY session_id, timestamp
         """)
@@ -12088,8 +12162,9 @@ class BeamMemory:
                 (id, content, source, timestamp, session_id, importance, metadata_json,
                  valid_until, superseded_by, scope, recall_count, last_recalled, created_at,
                  veracity, consolidated_at, consolidation_claimed_at,
-                 event_date, event_date_precision, pinned)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 event_date, event_date_precision, pinned,
+                 author_id, author_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 mid, item.get("content"), item.get("source"), _ts_for_insert,
                 item.get("session_id", "default"), item.get("importance", 0.5),
@@ -12107,6 +12182,10 @@ class BeamMemory:
                 # pinned rows keep their consolidation/trim exemption.
                 *_sanitize_import_event_date(item.get("event_date"), item.get("event_date_precision")),
                 _pin_for_insert,
+                # author stamps survive backup/restore (per-write authorship
+                # is row data, not derived state); pre-PR exports carry no
+                # key and restore as NULL, matching the column default.
+                item.get("author_id"), item.get("author_type"),
             ))
         self.conn.commit()
         try:
@@ -12198,8 +12277,9 @@ class BeamMemory:
                 INSERT INTO episodic_memory
                 (id, content, source, timestamp, session_id, importance, metadata_json,
                  summary_of, valid_until, superseded_by, scope, recall_count, last_recalled, created_at,
-                 event_date, event_date_precision)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 event_date, event_date_precision,
+                 author_id, author_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 mid, item.get("content"), item.get("source"), _ts_for_insert,
                 item.get("session_id", "default"), item.get("importance", 0.5),
@@ -12208,6 +12288,9 @@ class BeamMemory:
                 item.get("scope", "session"), item.get("recall_count", 0),
                 item.get("last_recalled"), item.get("created_at"),
                 *_sanitize_import_event_date(item.get("event_date"), item.get("event_date_precision")),
+                # author stamps survive backup/restore; absent keys (pre-PR
+                # exports) restore as NULL.
+                item.get("author_id"), item.get("author_type"),
             ))
             new_rowid = cursor.lastrowid
             old_to_new_rowid[item.get("rowid")] = new_rowid

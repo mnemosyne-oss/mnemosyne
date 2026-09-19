@@ -51,13 +51,13 @@ _EXPORTED_SURFACES = {
         "metadata_json", "valid_until", "superseded_by", "scope", "recall_count",
         "last_recalled", "created_at", "veracity", "consolidated_at",
         "consolidation_claimed_at", "event_date", "event_date_precision",
-        "pinned",
+        "pinned", "author_id", "author_type",
     }),
     "episodic_memory": ("episodic_memory", {
         "rowid", "id", "content", "source", "timestamp", "session_id",
         "importance", "metadata_json", "summary_of", "valid_until",
         "superseded_by", "scope", "recall_count", "last_recalled", "created_at",
-        "event_date", "event_date_precision",
+        "event_date", "event_date_precision", "author_id", "author_type",
     }),
     "scratchpad": ("scratchpad", {"id", "content", "session_id", "created_at", "updated_at"}),
     "consolidation_log": ("consolidation_log", {"id", "session_id", "items_consolidated", "summary_preview", "created_at"}),
@@ -541,7 +541,9 @@ class Mnemosyne:
                  veracity: str = "unknown",
                  trust_tier: str = None,
                  memory_type: str = None,
-                 dedupe: bool = True) -> str:
+                 dedupe: bool = True,
+                 author_id: Optional[str] = None,
+                 author_type: Optional[str] = None) -> str:
         """
         Store a memory directly to SQLite.
         Writes to both BEAM working_memory and legacy memories table.
@@ -623,6 +625,8 @@ class Mnemosyne:
                 veracity=veracity,
                 trust_tier=trust_tier,
                 memory_type=memory_type,
+                author_id=author_id,
+                author_type=author_type,
                 dedupe=dedupe,
             )
             timestamp = datetime.now().isoformat()

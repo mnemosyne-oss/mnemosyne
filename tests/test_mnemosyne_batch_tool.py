@@ -264,6 +264,57 @@ def test_batch_unknown_action_rejected_before_mutation(tmp_path):
     assert _count_matching(provider._beam, "should not write") == 0
 
 
+def test_batch_explicit_null_op_author_falls_back_to_default(tmp_path, monkeypatch):
+    """#926 (CodeRabbit F3): explicit null op authors must NOT defeat the
+    batch default.
+
+    ``validate_batch_operations`` copies the whole op into ``payload``, so a
+    payload carrying ``author_id: None`` used to hit
+    ``payload.get("author_id", default)`` -> None (key present, value null)
+    and clobber the resolved batch/env default. The lookup must use
+    ``payload.get("author_id") or default`` (same for author_type).
+    """
+    provider = _provider(tmp_path)
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_ID", "batch-default-author")
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_TYPE", "profile")
+    result = json.loads(provider.handle_tool_call("mnemosyne_batch", {
+        "operations": [
+            {"action": "remember", "content": "explicit null op author",
+             "author_id": None, "author_type": None},
+        ],
+    }))
+
+    assert result["status"] == "ok"
+    memory_id = result["results"][0]["memory_id"]
+    row = provider._beam.conn.execute(
+        "SELECT author_id, author_type FROM working_memory WHERE id = ?",
+        (memory_id,),
+    ).fetchone()
+    assert tuple(row) == ("batch-default-author", "profile"), tuple(row)
+
+
+def test_batch_null_op_author_type_falls_back_to_default(tmp_path, monkeypatch):
+    """#926 (F3 sibling case): a per-op author_id with an explicit null
+    author_type must keep the op author and take only the type default."""
+    provider = _provider(tmp_path)
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_ID", "batch-default-author")
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_TYPE", "profile")
+    result = json.loads(provider.handle_tool_call("mnemosyne_batch", {
+        "operations": [
+            {"action": "remember", "content": "op author, null type",
+             "author_id": "op-author", "author_type": None},
+        ],
+    }))
+
+    assert result["status"] == "ok"
+    memory_id = result["results"][0]["memory_id"]
+    row = provider._beam.conn.execute(
+        "SELECT author_id, author_type FROM working_memory WHERE id = ?",
+        (memory_id,),
+    ).fetchone()
+    assert tuple(row) == ("op-author", "profile"), tuple(row)
+
+
 def test_batch_requires_exact_ids_for_destructive_ops(tmp_path):
     provider = _provider(tmp_path)
     for action in ("update", "forget", "invalidate"):

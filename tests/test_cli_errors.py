@@ -132,15 +132,16 @@ def test_export_manifest_reports_omitted_and_partial_persisted_data(tmp_path):
     assert export_result.returncode == 0, export_result.stderr
     assert "WARNING: portable export is partial" in export_result.stdout
     assert "facts (1)" in export_result.stdout
-    assert "working_memory missing" in export_result.stdout
-    assert "author_id (1)" in export_result.stdout
 
     manifest = json.loads(export_path.read_text(encoding="utf-8"))["mnemosyne_export"]["completeness"]
     assert manifest["complete"] is False
     assert {surface["table"] for surface in manifest["omitted_surfaces"]} >= {"facts"}
     partial = {surface["section"]: surface for surface in manifest["partial_surfaces"]}
-    fields = {field["field"]: field for field in partial["working_memory"]["omitted_fields"]}
-    assert fields["author_id"]["affected_rows"] == 1
+    fields = {field["field"]: field for field in partial.get("working_memory", {}).get("omitted_fields", [])}
+    # author_id/author_type survive the portable round-trip since the
+    # author-stamp export fix; the manifest no longer reports them as omitted.
+    assert "author_id" not in fields
+    assert "author_type" not in fields
     # pinned survives the portable round-trip since the event-date/pinned
     # export fix; the manifest no longer reports it as omitted.
     assert "pinned" not in fields
@@ -151,11 +152,11 @@ def test_export_manifest_reports_omitted_and_partial_persisted_data(tmp_path):
     target_db = target_dir / "mnemosyne-data" / "mnemosyne.db"
     with sqlite3.connect(target_db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
-        # pinned=1 + event_date survive the portable round-trip
-        # (event-date/pinned export fix); author_id stays omitted.
+        # pinned=1 + event_date + author_id survive the portable round-trip
+        # (event-date/pinned and author-stamp export fixes).
         assert conn.execute(
             "SELECT pinned, author_id, event_date, event_date_precision FROM working_memory"
-        ).fetchone() == (1, None, "2026-04-01", "day")
+        ).fetchone() == (1, "export-owner", "2026-04-01", "day")
 
 
 def test_export_warning_omits_invalid_partial_affected_row_counts(monkeypatch, capsys):
