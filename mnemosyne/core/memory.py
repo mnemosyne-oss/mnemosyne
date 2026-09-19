@@ -639,7 +639,14 @@ class Mnemosyne:
 
             # Legacy embedding store
             if _embeddings.available():
-                vec = _embeddings.embed([_content])
+                try:
+                    vec = _embeddings.embed([_content])
+                except Exception as exc:
+                    logger.warning(
+                        "legacy embedding storage failed for %s (%s): %s",
+                        memory_id, type(exc).__name__, exc,
+                    )
+                    vec = None
                 if vec is not None:
                     cursor.execute("""
                         INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)

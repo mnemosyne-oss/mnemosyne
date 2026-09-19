@@ -3476,6 +3476,20 @@ def _wm_vec_delete(conn: sqlite3.Connection, memory_id: str) -> None:
     conn.execute("DELETE FROM vec_working WHERE rowid = ?", (rowid,))
 
 
+def _invalidate_working_embedding(conn: sqlite3.Connection, memory_id: str) -> None:
+    """Best-effort delete of a working row's derived vectors from both stores.
+
+    Used when the content changed but no fresh vector could be produced
+    (embedding provider unavailable, returned no vectors, or raised). The
+    stored embedding describes the OLD content, so leaving it in place lets
+    dense recall score the new content with a stale derived vector. Removing
+    it degrades the row to keyword-only retrieval instead of returning wrong
+    dense results.
+    """
+    conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+    _wm_vec_delete(conn, memory_id)
+
+
 def _store_working_embedding(conn: sqlite3.Connection, memory_id: str, embedding: List[float], *,
                              commit_vec: bool = True, strict_vec: bool = False) -> None:
     """Store working-memory embedding in fallback and sqlite-vec stores.
@@ -6452,17 +6466,26 @@ class BeamMemory:
         # Refresh derived state when content changed.
         # FTS5 is handled by the wm_au trigger (AFTER UPDATE OF content),
         # but memory_embeddings must be recomputed explicitly.
-        if content_changed and affected > 0 and _embeddings.available():
-            try:
-                vec = _embeddings.embed([content])
-                if vec is not None and len(vec) > 0:
-                    _store_working_embedding(self.conn, memory_id, vec[0])
-            except Exception as exc:
-                logger.warning(
-                    "update_working: embedding refresh failed for %s"
-                    " (%s): %s",
-                    memory_id, type(exc).__name__, exc,
-                )
+        if content_changed and affected > 0:
+            refreshed = False
+            if _embeddings.available():
+                try:
+                    vec = _embeddings.embed([content])
+                    if vec is not None and len(vec) > 0:
+                        _store_working_embedding(self.conn, memory_id, vec[0])
+                        refreshed = True
+                except Exception as exc:
+                    logger.warning(
+                        "update_working: embedding refresh failed for %s"
+                        " (%s): %s",
+                        memory_id, type(exc).__name__, exc,
+                    )
+            if not refreshed:
+                # The content changed but no fresh derived vector was produced
+                # (provider unavailable, no vectors returned, or embed raised):
+                # drop the old vector so dense recall never pairs the new
+                # content with the embedding of its previous content.
+                _invalidate_working_embedding(self.conn, memory_id)
 
         self.conn.commit()
         if affected > 0:

@@ -95,7 +95,14 @@ def _init_schema(conn):
 def _embed(text: str) -> np.ndarray:
     """Embed text using Mnemosyne's embedding pipeline (BAAI/bge-small)."""
     np = _require_numpy()
-    emb = _embeddings.embed([text])
+    try:
+        emb = _embeddings.embed([text])
+    except Exception as exc:
+        logger.warning(
+            "SHMR embedding failed, using zero vector (%s): %s",
+            type(exc).__name__, exc,
+        )
+        return np.zeros(EMBEDDING_DIM, dtype=np.float32)
     if emb is None or len(emb) == 0:
         return np.zeros(EMBEDDING_DIM, dtype=np.float32)
     emb = emb[0]
