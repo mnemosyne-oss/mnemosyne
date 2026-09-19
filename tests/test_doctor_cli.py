@@ -490,6 +490,8 @@ def test_doctor_cli_single_output_failure_preserves_target_and_cleans_temps(
         cli.cmd_doctor(["--db", str(db_path), "--format", output_format, output_flag, str(target)])
 
     assert raised.value.code == 1
-    assert capsys.readouterr().err == "Error: doctor_report_failed\n"
+    err = capsys.readouterr().err
+    assert err == "Error: doctor_report_failed\n"
+    assert "simulated CLI single-target" not in err
     assert target.read_text() == previous
     assert not list(tmp_path.glob(".doctor-*"))

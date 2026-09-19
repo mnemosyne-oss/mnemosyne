@@ -880,14 +880,14 @@ class TestAuditNoise:
         assert capsys.readouterr().err == ""
 
     @pytest.mark.parametrize(
-        ("command_args", "function_name"),
+        ("command_args", "function_name", "expected_code"),
         [
-            (["audit"], "audit_noise"),
-            (["status"], "hygiene_status"),
+            (["audit"], "audit_noise", "hygiene_audit_failed"),
+            (["status"], "hygiene_status", "hygiene_status_failed"),
         ],
     )
     def test_cmd_hygiene_read_commands_close_connection_after_hygiene_error(
-        self, monkeypatch, tmp_path, capsys, command_args, function_name
+        self, monkeypatch, tmp_path, capsys, command_args, function_name, expected_code
     ):
         db_path = tmp_path / "mnemosyne.db"
         sqlite3.connect(db_path).close()
@@ -918,11 +918,19 @@ class TestAuditNoise:
             if function_name == "audit_noise"
             else "hygiene_status_failed"
         )
-        assert capsys.readouterr().err == f"Error: {expected_code}\n"
+        err = capsys.readouterr().err
+        assert err == f"Error: {expected_code}\n"
+        assert "hygiene read failed" not in err
 
-    @pytest.mark.parametrize("command_args", [["audit"], ["status"]])
+    @pytest.mark.parametrize(
+        ("command_args", "expected_code"),
+        [
+            (["audit"], "hygiene_audit_failed"),
+            (["status"], "hygiene_status_failed"),
+        ],
+    )
     def test_cmd_hygiene_read_commands_report_readonly_open_errors(
-        self, monkeypatch, tmp_path, capsys, command_args
+        self, monkeypatch, tmp_path, capsys, command_args, expected_code
     ):
         db_path = tmp_path / "mnemosyne.db"
         sqlite3.connect(db_path).close()
@@ -936,7 +944,9 @@ class TestAuditNoise:
         with pytest.raises(SystemExit):
             cmd_hygiene(command_args)
 
-        assert capsys.readouterr().err == f"Error: hygiene_{command_args[0]}_failed\n"
+        err = capsys.readouterr().err
+        assert err == f"Error: {expected_code}\n"
+        assert "readonly connection failed" not in err
 
     def test_noise_summary_is_pii_safe(self, temp_db):
         db_path, beam = temp_db
@@ -1196,6 +1206,34 @@ class TestRestoreArchived:
         assert meta.get("original") == "data"
         conn.close()
 
+    def test_repeated_archive_restore_cycles_preserve_importance(self, temp_db):
+        db_path, beam = temp_db
+        _insert_row(beam, "working_memory", "cycle1", "cycling content", importance=0.85,
+                    metadata={"key": "val"})
+        candidate = NoiseCandidate(
+            memory_id="cycle1", table_name="working_memory",
+            content_preview="cycling content", noise_score=0.6,
+            noise_reasons=["trivial"], suggested_action="archive",
+        )
+
+        # Cycle 1: archive then restore
+        clean_noise(db_path, [candidate], action="archive", confirm=True, dry_run=False)
+        assert restore_archived(db_path) == 1
+
+        # Cycle 2: archive then restore again (audit log now has multiple entries)
+        clean_noise(db_path, [candidate], action="archive", confirm=True, dry_run=False)
+        assert restore_archived(db_path) == 1
+
+        conn = sqlite3.connect(str(db_path))
+        imp, meta_str = conn.execute(
+            "SELECT importance, metadata_json FROM working_memory WHERE id = 'cycle1'"
+        ).fetchone()
+        conn.close()
+        assert imp == 0.85
+        meta = json.loads(meta_str)
+        assert "_archived" not in meta
+        assert meta.get("key") == "val"
+
 
 def test_hygiene_suite_does_not_leak_config_into_subagent_provider(tmp_path, monkeypatch):
     """A provider after hygiene must use its own safe temporary config.
@@ -1228,3 +1266,448 @@ def test_hygiene_suite_does_not_leak_config_into_subagent_provider(tmp_path, mon
     provider.initialize("hygiene-followup", agent_context="subagent")
 
     assert provider._beam is None
+
+
+# ---------------------------------------------------------------------------
+# Task 1 / Wave 1 P0: per-candidate savepoint isolation + idempotent restore
+# ---------------------------------------------------------------------------
+
+
+class TestHygieneSavepointIsolation:
+    """Hygiene mutation, auxiliary cleanup, and audit writes must be isolated
+    by a per-candidate savepoint so one bad candidate does not partially
+    mutate another."""
+
+    def test_bad_candidate_partial_mutation_rolled_back_good_candidate_preserved(self, temp_db):
+        db_path, beam = temp_db
+        _insert_row(beam, "working_memory", "good", "good content", importance=0.7)
+        _insert_row(beam, "working_memory", "bad", "bad content", importance=0.7)
+        # A non-JSON-serializable noise_reason makes json.dumps raise during
+        # bad's audit-log INSERT, AFTER bad's DELETE has staged.
+        candidates = [
+            NoiseCandidate(
+                memory_id="good", table_name="working_memory",
+                content_preview="", noise_score=0.8,
+                noise_reasons=["x"], suggested_action="delete",
+            ),
+            NoiseCandidate(
+                memory_id="bad", table_name="working_memory",
+                content_preview="", noise_score=0.8,
+                noise_reasons=[object()],  # not JSON-serializable
+                suggested_action="delete",
+            ),
+        ]
+        result = clean_noise(db_path, candidates, action="delete", confirm=True, dry_run=False)
+
+        conn = sqlite3.connect(str(db_path))
+        good = conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE id = 'good'"
+        ).fetchone()[0]
+        bad = conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE id = 'bad'"
+        ).fetchone()[0]
+        good_log = conn.execute(
+            "SELECT COUNT(*) FROM hygiene_audit_log WHERE memory_id = 'good'"
+        ).fetchone()[0]
+        bad_log = conn.execute(
+            "SELECT COUNT(*) FROM hygiene_audit_log WHERE memory_id = 'bad'"
+        ).fetchone()[0]
+        conn.close()
+
+        assert good == 0, "good candidate should be deleted"
+        assert bad == 1, (
+            "bad candidate must survive — its partial DELETE should have been "
+            "rolled back by the per-candidate savepoint"
+        )
+        assert good_log == 1, "good candidate audit entry committed"
+        assert bad_log == 0, "bad candidate audit entry must not have committed"
+        assert any(
+            e == "hygiene_candidate_failed: working_memory:bad" for e in result.errors
+        ), f"structured per-candidate error missing: {result.errors}"
+        assert result.deleted == 1
+        assert result.log_entries == 1
+
+    def test_missing_candidate_between_valid_candidates_preserves_both(self, temp_db):
+        db_path, beam = temp_db
+        _insert_row(beam, "working_memory", "first", "first content", importance=0.7)
+        _insert_row(beam, "working_memory", "third", "third content", importance=0.7)
+
+        candidates = [
+            NoiseCandidate(
+                memory_id="first", table_name="working_memory",
+                content_preview="", noise_score=0.8,
+                noise_reasons=["x"], suggested_action="delete",
+            ),
+            NoiseCandidate(
+                memory_id="missing", table_name="working_memory",
+                content_preview="", noise_score=0.8,
+                noise_reasons=["x"], suggested_action="delete",
+            ),
+            NoiseCandidate(
+                memory_id="third", table_name="working_memory",
+                content_preview="", noise_score=0.8,
+                noise_reasons=["x"], suggested_action="delete",
+            ),
+        ]
+        result = clean_noise(db_path, candidates, action="delete", confirm=True, dry_run=False)
+
+        assert result.deleted == 2
+        assert result.log_entries == 2
+        assert any("Row not found: working_memory:missing" in e for e in result.errors)
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute("SELECT id FROM working_memory").fetchall()
+        logs = conn.execute("SELECT memory_id FROM hygiene_audit_log ORDER BY memory_id").fetchall()
+        conn.close()
+        assert len(rows) == 0
+        assert [r[0] for r in logs] == ["first", "third"]
+
+    def test_invalid_table_candidate_rejected_early(self, temp_db):
+        db_path, beam = temp_db
+        _insert_row(beam, "working_memory", "valid", "valid content", importance=0.7)
+
+        candidates = [
+            NoiseCandidate(
+                memory_id="evil", table_name="sqlite_master",
+                content_preview="", noise_score=0.8,
+                noise_reasons=["x"], suggested_action="delete",
+            ),
+            NoiseCandidate(
+                memory_id="valid", table_name="working_memory",
+                content_preview="", noise_score=0.8,
+                noise_reasons=["x"], suggested_action="delete",
+            ),
+        ]
+        result = clean_noise(db_path, candidates, action="delete", confirm=True, dry_run=False)
+
+        assert result.deleted == 1
+        assert any("Invalid table name: sqlite_master:evil" in e for e in result.errors)
+
+    def test_savepoint_rollback_failure_aborts_transaction(self, temp_db, monkeypatch):
+        db_path, beam = temp_db
+        _insert_row(beam, "working_memory", "first", "first content", importance=0.7)
+        _insert_row(beam, "working_memory", "second", "second content", importance=0.7)
+
+        candidates = [
+            NoiseCandidate(
+                memory_id="first", table_name="working_memory",
+                content_preview="", noise_score=0.8,
+                noise_reasons=["x"], suggested_action="delete",
+            ),
+            NoiseCandidate(
+                memory_id="second", table_name="working_memory",
+                content_preview="", noise_score=0.8,
+                noise_reasons=[object()],  # forces exception in candidate loop
+                suggested_action="delete",
+            ),
+        ]
+
+        original_connect = sqlite3.connect
+
+        class _BrokenRollbackCursor:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *args, **kwargs):
+                if isinstance(sql, str) and "ROLLBACK TO hygiene_candidate" in sql:
+                    raise sqlite3.OperationalError("simulated rollback failure")
+                return self._real.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        class _WrappedConnection:
+            def __init__(self, real):
+                self._real = real
+
+            def cursor(self, *args, **kwargs):
+                return _BrokenRollbackCursor(self._real.cursor(*args, **kwargs))
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        def connect_wrapped(*a, **kw):
+            return _WrappedConnection(original_connect(*a, **kw))
+
+        monkeypatch.setattr(hygiene_module.sqlite3, "connect", connect_wrapped)
+
+        result = clean_noise(db_path, candidates, action="delete", confirm=True, dry_run=False)
+
+        assert any("hygiene_savepoint_rollback_failed" in e for e in result.errors)
+        assert result.deleted == 0
+        assert result.log_entries == 0
+
+        # Entire transaction rolled back, first row survives!
+        conn = sqlite3.connect(str(db_path))
+        count = conn.execute("SELECT COUNT(*) FROM working_memory WHERE id = 'first'").fetchone()[0]
+        conn.close()
+        assert count == 1
+
+
+class TestHygieneRestoreIdempotent:
+    """restore_archived() must be idempotent — calling it twice must not
+    corrupt the restored importance value."""
+
+    def test_restore_twice_does_not_corrupt_importance(self, temp_db):
+        db_path, beam = temp_db
+        _insert_row(beam, "working_memory", "n1", "heartbeat", importance=0.8,
+                    metadata={"original": "data"})
+        candidates = [NoiseCandidate(
+            memory_id="n1", table_name="working_memory",
+            content_preview="heartbeat", noise_score=0.6,
+            noise_reasons=["trivial"], suggested_action="archive",
+        )]
+        clean_noise(db_path, candidates, action="archive", confirm=True, dry_run=False)
+
+        first = restore_archived(db_path)
+        restore_archived(db_path)  # idempotent: must not raise or duplicate
+
+        assert first >= 1, "first restore should recover the archived row"
+        conn = sqlite3.connect(str(db_path))
+        importance, metadata_json = conn.execute(
+            "SELECT importance, metadata_json FROM working_memory WHERE id = 'n1'"
+        ).fetchone()
+        conn.close()
+        assert importance == 0.8, (
+            "second restore overwrote the restored importance — restore is not "
+            "idempotent"
+        )
+        meta = json.loads(metadata_json)
+        assert "_archived" not in meta
+        assert "_original_importance" not in meta
+        assert meta.get("original") == "data"
+
+
+# ---------------------------------------------------------------------------
+# Task 1 fix round 1: transactional hygiene counters
+# ---------------------------------------------------------------------------
+
+
+class TestHygieneTransactionalCounters:
+    """result.deleted/archived/flagged must reflect committed savepoint state,
+    not pre-rollback optimism."""
+
+    def test_failed_audit_rollback_keeps_counters_truthful(self, tmp_path):
+        db_path = tmp_path / "txcount.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE working_memory ("
+            "id TEXT PRIMARY KEY, content TEXT, source TEXT, timestamp TEXT, "
+            "session_id TEXT, importance REAL, metadata_json TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE hygiene_audit_log ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, memory_id TEXT, table_name TEXT, "
+            "action TEXT, reason TEXT, noise_score REAL, secret_flags TEXT, "
+            "original_content_preview TEXT, original_metadata TEXT, "
+            "timestamp TEXT, session_id TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO working_memory VALUES ('good','g','s','t','s',0.7,'{}')"
+        )
+        conn.execute(
+            "INSERT INTO working_memory VALUES ('bad','b','s','t','s',0.7,'{}')"
+        )
+        conn.commit()
+        conn.close()
+
+        candidates = [
+            NoiseCandidate(
+                memory_id="good", table_name="working_memory",
+                content_preview="", noise_score=0.8,
+                noise_reasons=["x"], suggested_action="delete",
+            ),
+            NoiseCandidate(
+                memory_id="bad", table_name="working_memory",
+                content_preview="", noise_score=0.8,
+                # object() is not JSON-serializable: the audit INSERT for this
+                # candidate fails after its DELETE has staged.
+                noise_reasons=[object()],
+                suggested_action="delete",
+            ),
+        ]
+        result = clean_noise(db_path, candidates, action="delete", confirm=True, dry_run=False)
+
+        conn = sqlite3.connect(str(db_path))
+        good = conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE id = 'good'"
+        ).fetchone()[0]
+        bad = conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE id = 'bad'"
+        ).fetchone()[0]
+        conn.close()
+
+        assert good == 0, "good candidate should be deleted"
+        assert bad == 1, "bad candidate must survive (savepoint rollback)"
+        assert result.deleted == 1, (
+            f"deleted count {result.deleted} does not match committed state (1)"
+        )
+        assert any(
+            e == "hygiene_candidate_failed: working_memory:bad" for e in result.errors
+        ), f"structured per-candidate error missing: {result.errors}"
+        assert result.log_entries == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 29: per-candidate error path must not leak raw exception/traceback
+# ---------------------------------------------------------------------------
+
+
+class TestHygieneCleanNoLeak:
+    """The clean_noise() per-candidate failure path must produce structural,
+    content-free errors — no raw exception text, no traceback, no content-derived
+    identifier that is not essential to the cleanup status contract."""
+
+    @staticmethod
+    def _failing_candidate():
+        """A candidate whose audit-log write raises with a unique marker.
+
+        ``noise_reasons`` holds a non-JSON-serializable instance of a uniquely
+        named class; ``json.dumps`` during the audit-log INSERT raises a
+        ``TypeError`` whose ``str()`` contains the marker class name.
+        """
+
+        class MarkerHygieneLeakProbeXyz9:  # unique marker baked into the type name
+            pass
+
+        return NoiseCandidate(
+            memory_id="leaky",
+            table_name="working_memory",
+            content_preview="",
+            noise_score=0.8,
+            noise_reasons=[MarkerHygieneLeakProbeXyz9()],
+            suggested_action="delete",
+        )
+
+    def test_per_candidate_error_excludes_marker_traceback_and_remains_an_error(
+        self, tmp_path, caplog
+    ):
+        db_path = tmp_path / "leak.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE working_memory ("
+            "id TEXT PRIMARY KEY, content TEXT, source TEXT, timestamp TEXT, "
+            "session_id TEXT, importance REAL, metadata_json TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO working_memory VALUES ('leaky','c','s','t','s',0.7,'{}')"
+        )
+        conn.commit()
+        conn.close()
+
+        candidate = self._failing_candidate()
+        marker = type(candidate.noise_reasons[0]).__name__
+
+        with caplog.at_level("WARNING", logger="mnemosyne.core.hygiene"):
+            result = clean_noise(
+                db_path, [candidate], action="delete", confirm=True, dry_run=False
+            )
+
+        # The result must still be an error (not silently successful).
+        assert result.errors, "failed candidate must still surface an error"
+
+        # A static, structural error code must be visible to the CLI surface.
+        assert any(
+            "hygiene_candidate_failed" in err or "candidate_failed" in err
+            for err in result.errors
+        ), f"static error code missing from result.errors: {result.errors}"
+
+        # The unique marker (raw exception text) must not reach result.errors.
+        assert not any(marker in err for err in result.errors), (
+            f"raw exception marker leaked into result.errors: {result.errors}"
+        )
+
+        # No traceback must reach the captured log output.
+        log_text = caplog.text
+        assert "Traceback" not in log_text, (
+            f"traceback leaked into log output:\n{log_text}"
+        )
+        assert marker not in log_text, (
+            f"raw exception marker leaked into log output:\n{log_text}"
+        )
+
+        # Good-candidate behavior remains intact: the row survives because the
+        # per-candidate savepoint rolled back the partial DELETE.
+        verify = sqlite3.connect(str(db_path))
+        try:
+            surviving = verify.execute(
+                "SELECT COUNT(*) FROM working_memory WHERE id = 'leaky'"
+            ).fetchone()[0]
+        finally:
+            verify.close()
+        assert surviving == 1, "failed candidate row must survive savepoint rollback"
+
+    def test_transaction_failure_excludes_raw_exception_text(
+        self, tmp_path, monkeypatch
+    ):
+        """The outer transaction-failure path must also be content-free."""
+        db_path = tmp_path / "txleak.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE working_memory ("
+            "id TEXT PRIMARY KEY, content TEXT, source TEXT, timestamp TEXT, "
+            "session_id TEXT, importance REAL, metadata_json TEXT)"
+        )
+        conn.execute("INSERT INTO working_memory VALUES ('k','c','s','t','s',0.7,'{}')")
+        conn.commit()
+        conn.close()
+
+        marker = "MarkerTxnLeakProbeZzz1"
+        candidate = NoiseCandidate(
+            memory_id="k",
+            table_name="working_memory",
+            content_preview="",
+            noise_score=0.8,
+            noise_reasons=["x"],
+            suggested_action="delete",
+        )
+
+        # Wrap sqlite3.connect so the connection's commit() raises with a
+        # marker-bearing message, forcing the outer transaction-failure path.
+        original_connect = sqlite3.connect
+
+        class _FailingCommitConnection:
+            def __init__(self, real):
+                self._real = real
+                self._commits = 0
+
+            def commit(self):
+                # The first commit belongs to _ensure_hygiene_log_table. Fail
+                # the final commit so the candidate loop runs first.
+                self._commits += 1
+                if self._commits == 1:
+                    return self._real.commit()
+                raise sqlite3.OperationalError(marker + ": synthetic commit failure")
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        def connect_failing_commit(*a, **kw):
+            return _FailingCommitConnection(original_connect(*a, **kw))
+
+        monkeypatch.setattr(hygiene_module.sqlite3, "connect", connect_failing_commit)
+
+        result = clean_noise(
+            db_path, [candidate], action="delete", confirm=True, dry_run=False
+        )
+
+        assert result.errors, "transaction failure must surface an error"
+        assert any(
+            "hygiene_transaction_failed" in err or "transaction_failed" in err
+            for err in result.errors
+        ), f"static error code missing: {result.errors}"
+        assert not any(marker in err for err in result.errors), (
+            f"raw exception marker leaked into transaction error: {result.errors}"
+        )
+        # Nothing was committed, so no mutation may be reported as applied.
+        assert (result.deleted, result.archived, result.flagged, result.kept) == (0, 0, 0, 0), (
+            f"counters report uncommitted mutations: {result.to_dict()}"
+        )
+        assert result.log_entries == 0
+        verify = sqlite3.connect(str(db_path))
+        try:
+            assert verify.execute(
+                "SELECT COUNT(*) FROM working_memory WHERE id = 'k'"
+            ).fetchone()[0] == 1
+        finally:
+            verify.close()
