@@ -1551,14 +1551,124 @@ class VectorCoverageAdapter:
         catalog = _catalog(self.conn)
         if catalog.error_class:
             unknown = {"status": STATUS_UNKNOWN, "error_class": catalog.error_class}
-            return AdapterResult(metrics={name: dict(unknown) for name in ("working", "episodic", "legacy", "canonical", "triples")})
-        return AdapterResult(metrics={
-            "working": self._working(catalog),
-            "episodic": self._episodic(catalog),
-            "legacy": {"status": "compatibility_store" if "memories" in catalog.tables else "not_configured"},
-            "canonical": {"status": "not_applicable" if "canonical_facts" in catalog.tables else "not_configured"},
-            "triples": {"status": "not_applicable" if "triples" in catalog.tables else "not_configured"},
-        })
+            metrics = {name: dict(unknown) for name in ("working", "episodic", "legacy", "canonical", "triples")}
+            metrics["vec_store_format"] = dict(unknown)
+            return AdapterResult(metrics=metrics)
+        working = self._working(catalog)
+        episodic = self._episodic(catalog)
+        store_format, findings, repair_candidates = self._vec_store_format(catalog, working, episodic)
+        return AdapterResult(
+            metrics={
+                "working": working,
+                "episodic": episodic,
+                "legacy": {"status": "compatibility_store" if "memories" in catalog.tables else "not_configured"},
+                "canonical": {"status": "not_applicable" if "canonical_facts" in catalog.tables else "not_configured"},
+                "triples": {"status": "not_applicable" if "triples" in catalog.tables else "not_configured"},
+                "vec_store_format": store_format,
+            },
+            findings=findings,
+            repair_candidates=repair_candidates,
+        )
+
+    def _vec_store_format(
+        self,
+        catalog: _CatalogResult,
+        working: dict[str, Any],
+        episodic: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[Finding], list[RepairCandidate]]:
+        """Report whether the stored vec blobs use the normalized write format.
+
+        Counting rows cannot see this defect.  Blobs quantized without
+        normalization are present, well-formed, correctly sized and fully
+        counted, so ``vec_working`` and ``vec_episodes`` can both read
+        ``complete`` while every blob's norm is wrong.  A wrong norm inflates
+        raw-L2 distance regardless of direction and clamps stored-blob cosine
+        toward zero, so dense episodic recall returns nothing useful while
+        every coverage metric says the store is healthy.
+
+        The format boundary is the normalized-format marker on the database's
+        ``user_version`` (``beam._VEC_NORM_BIT``), not a sample of the data: it
+        is set when the current code creates a vec table and after every
+        successful ``reindex_vectors()``.  An unmarked store routes through the
+        conservative exact-cosine scan, so recall stays correct and this is a
+        warning rather than an error -- but the dense scores stay unusable
+        until the rows are re-embedded, which only ``mnemosyne reindex`` does.
+
+        ``beam`` is imported lazily inside this method: it is the owner of the
+        marker and of the routing decision, doctor must stay importable and
+        cheap when it cannot be imported, and a failure here degrades to
+        ``unknown`` rather than to a verdict doctor cannot support.
+
+        Only ``vec_working`` and ``vec_episodes`` are gated on having rows
+        because only they have writers; ``vec_facts`` is recreated empty by a
+        reindex and has no writer yet, so an unmarked store whose two real
+        vec stores are empty has no blob that could have been mis-encoded.
+        """
+
+        vec_tables = sorted(
+            name
+            for name, ddl in catalog.tables.items()
+            if ddl and _VEC0_VIRTUAL_TABLE.search(ddl)
+        )
+        if not vec_tables:
+            return {"status": "not_configured", "vec_tables": []}, [], []
+        populated = self._metric_count(working, "vec_working_rows") or self._metric_count(
+            episodic, "vec_episode_rows"
+        )
+        if not populated:
+            # Nothing to judge either because the store is genuinely empty or
+            # because the counts could not be read.  An unreadable vec0 table
+            # leaves no count behind, so separate the two rather than asserting
+            # an emptiness doctor has not established.
+            if any(
+                metric.get("status") in (STATUS_UNKNOWN, "unavailable")
+                for metric in (working, episodic)
+            ):
+                return {"status": STATUS_UNKNOWN, "vec_tables": vec_tables}, [], []
+            return {"status": "no_vectors", "vec_tables": vec_tables}, [], []
+        try:
+            from mnemosyne.core.beam import _classify_vec_store_regime
+        except Exception:
+            return {"status": STATUS_UNKNOWN, "vec_tables": vec_tables}, [], []
+        regime = _classify_vec_store_regime(self.conn)
+        if regime == "pure":
+            return {"status": "normalized", "vec_tables": vec_tables}, [], []
+        if regime != "legacy":
+            return {"status": STATUS_UNKNOWN, "vec_tables": vec_tables}, [], []
+        return (
+            {"status": "legacy_unnormalized", "vec_tables": vec_tables},
+            [
+                Finding(
+                    code="vectors.legacy_unnormalized_blobs",
+                    status=STATUS_WARNING,
+                    severity=SEVERITY_WARNING,
+                    message=(
+                        "The vector store predates the normalized-format marker, so its "
+                        "stored blobs may have been quantized without normalization and "
+                        "dense recall can score them near zero. Run `mnemosyne reindex` "
+                        "to re-embed them and mark the store."
+                    ),
+                )
+            ],
+            [
+                RepairCandidate(
+                    id="reindex-vector-store",
+                    description=(
+                        "Re-embed every stored vector with the active embedding model so "
+                        "the blobs are normalized and the store carries the "
+                        "normalized-format marker."
+                    ),
+                    finding_codes=["vectors.legacy_unnormalized_blobs"],
+                )
+            ],
+        )
+
+    @staticmethod
+    def _metric_count(metric: dict[str, Any], name: str) -> int:
+        """Read a bounded row count, treating an absent count as zero."""
+
+        value = metric.get(name)
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
     def _working(self, catalog: _CatalogResult) -> dict[str, Any]:
         empty = {"status": "no_vectors", "active_source_rows": 0, "fallback_embedding_rows": 0, "vec_working_rows": 0, "missing_vec_working_rows": 0, "orphan_vec_working_rows": 0}

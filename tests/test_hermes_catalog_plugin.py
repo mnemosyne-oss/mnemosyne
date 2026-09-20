@@ -44,6 +44,49 @@ def test_manifest_is_an_exclusive_memory_provider_named_like_the_wrapper():
     assert m["provides_hooks"] == [] and m["provides_middleware"] == [] and m["requires_env"] == []
 
 
+# The floor is a contract with an external system, not a tunable threshold: 0.21.4 is the first
+# Hermes release that carries declared-Python-dependency install (hermes-agent#113851) and
+# automatic catalog install of memory providers that leave core (hermes-agent#114569). Neither
+# is in 0.21.3, so a 0.21.3 install would load the plugin without the install path it needs.
+MIN_HERMES_RELEASE = ">=0.21.4"
+
+
+def test_manifest_gates_loading_on_a_lower_bound_hermes_release():
+    """`requires_hermes` must name 0.21.4, the first release that carries the whole catalog path.
+
+    Hermes' `plugins_manifest.requires_hermes_error()` blocks the plugin and reports the reason
+    when the running version fails this specifier, so an exact pin (`==0.21.4`) would uninstall
+    the plugin's future rather than describe it -- the next Hermes release would load-block a
+    plugin that works. That is the part this test can decide on its own: the specifier must be a
+    plain floor.
+
+    The floor is 0.21.4 and not 0.21.3 because both halves of the catalog path reached Hermes
+    `main` after the 0.21.3 release (tag v2026.9.14, 2026-09-14): declared Python dependencies
+    installed and re-applied after `hermes update` (hermes-agent#113851, commit `96e8a23222`) and
+    automatic catalog install of memory providers that leave core (hermes-agent#114569, commit
+    `d177b119`). `hermes_cli/plugin_python_deps.py` does not exist at the v2026.9.14 tag, so a
+    0.21.3 install would load this plugin without the install path it needs. dplush asked for
+    exactly this floor while reviewing the catalog entry on hermes-agent#113581.
+
+    A release that is not out yet is the point rather than a defect: below 0.21.4 the gate fails
+    closed, which is safer than loading a plugin whose declared dependencies never get installed.
+    This repository cannot enumerate Hermes' published releases, so raising the floor stays a
+    review-time obligation against hermes-agent, and this constant is what a future bump must
+    edit on purpose.
+    """
+    spec = _manifest()["requires_hermes"]
+    assert re.fullmatch(r">=\s*\d+(\.\d+){1,2}", spec), (
+        f"requires_hermes must be a '>=X.Y' or '>=X.Y.Z' lower bound, got {spec!r}: an exact "
+        "pin would load-block the plugin on the very next Hermes release, and a specifier that "
+        "is not a plain floor is harder to keep honest as Hermes moves."
+    )
+    assert spec == MIN_HERMES_RELEASE, (
+        f"requires_hermes must be {MIN_HERMES_RELEASE}, the first Hermes release that carries "
+        f"hermes-agent#113851 and #114569; got {spec!r}. Lowering it re-ships eb9ffde, which let "
+        "the plugin load on 0.21.3 where its declared dependencies are never installed."
+    )
+
+
 def _toml_loads(text: str) -> dict:
     try:
         import tomllib

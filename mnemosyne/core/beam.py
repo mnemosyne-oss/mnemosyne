@@ -740,6 +740,31 @@ def _vec_distance_sim(distance: float, vec_type: "Optional[str]" = None,
     return 0.0
 
 
+def _wm_vec_row_sim(distance: float, vec_type: "Optional[str]",
+                    query_blob: "Optional[bytes]" = None,
+                    row_blob: "Optional[bytes]" = None) -> "Optional[float]":
+    """Similarity for a single working-memory vector candidate.
+
+    int8 candidates are scored from their stored bytes with the exact blob
+    cosine (``_vec_int8_blob_cosine``), the contract the episodic paths adopted
+    in #911. ``None`` means "not scorable": an int8 distance alone cannot yield
+    an absolute cosine (see ``_vec_distance_sim``), so this arm abstains rather
+    than falling back to the ``1 - distance / (2 * EMBEDDING_DIM)`` guess, which
+    compressed every candidate into a 0.92-0.95 band and left the
+    working-memory dense blend with ordering but no amplitude. The caller then
+    routes the candidate set through the exact compatibility scan.
+
+    Every other arm keeps its existing mapping.
+    """
+    if vec_type == "int8":
+        if query_blob and row_blob and len(bytes(query_blob)) == len(bytes(row_blob)):
+            # Exact: a genuine 0.0 cosine is a valid answer, so this never
+            # falls back to the distance mapping.
+            return _vec_int8_blob_cosine(bytes(query_blob), bytes(row_blob))
+        return None
+    return max(0.0, min(1.0, 1.0 - (max(float(distance), 0.0) / (2.0 * EMBEDDING_DIM))))
+
+
 def _classify_vec_store_regime(conn, table: str = "vec_episodes") -> str:
     """Route the episodic vec table by FORMAT BOUNDARY, not sampling.
 
@@ -834,13 +859,13 @@ def _warn_vec_store_unknown_once() -> None:
 
 def _env_vec_admit() -> float:
     """Resolve MNEMOSYNE_EM_VEC_ADMIT once at import: finite and within
-    (0, 1]; NaN, Inf or out-of-range values fall back to 0.80 with a warning.
+    (0, 1]; NaN, Inf or out-of-range values fall back to 0.62 with a warning.
     NaN would otherwise make `sim < threshold` always False and admit every
     vector candidate."""
-    v = _env_float("MNEMOSYNE_EM_VEC_ADMIT", 0.80)
+    v = _env_float("MNEMOSYNE_EM_VEC_ADMIT", 0.62)
     if not math.isfinite(v) or not (0.0 < v <= 1.0):
-        logger.warning("MNEMOSYNE_EM_VEC_ADMIT=%r out of range; using 0.80", v)
-        return 0.80
+        logger.warning("MNEMOSYNE_EM_VEC_ADMIT=%r out of range; using 0.62", v)
+        return 0.62
     return v
 
 
@@ -856,9 +881,16 @@ def _env_vec_admit() -> float:
 # never decided by this threshold alone.
 # Resolved once at import: changing MNEMOSYNE_EM_VEC_ADMIT in a deployment
 # env (.env / gateway config) requires restarting the gateway process to
-# take effect. Calibration note: 0.80 is the default on the absolute-cosine
-# scale. Deployments on e5-style stores that need the full 0.74-0.80
-# paraphrase band can lower the threshold via the env var.
+# take effect. Calibration note: the default follows the shipped embedding
+# model, BAAI/bge-small-en-v1.5 (384d), measured on real memory text --
+# genuine matches land at 0.62-0.71 (best observed 0.7090) while unrelated
+# queries top out at 0.5960, so the two bands separate. The previous 0.80
+# default sat above the entire genuine band, which made vector-only
+# episodic admission unreachable on the default model: session-scope dense
+# recall returned nothing at all. 0.62 admits that band and still excluded
+# every unrelated row measured (0 of 390 candidates). Deployments on
+# e5-style stores, whose paraphrase band sits at 0.74-0.80, can raise the
+# threshold via the env var.
 EM_VEC_ADMIT = _env_vec_admit()
 
 
@@ -4871,11 +4903,27 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
         "bit": "vec_quantize_binary(?)",
         "int8": "vec_quantize_int8(?, 'unit')",
     }.get(vec_type, "?")
+    # int8 rows are scored from their stored bytes (exact cosine), so the query
+    # blob and the vector column are fetched up front. Without them there is no
+    # cosine to report: abstain and let the caller's exact compatibility scan
+    # score the candidate set instead of guessing from the distance.
+    query_blob: "Optional[bytes]" = None
+    use_blobs = vec_type == "int8"
+    if use_blobs:
+        try:
+            query_blob = bytes(conn.execute(
+                "SELECT vec_quantize_int8(?, 'unit')", (emb_json,)
+            ).fetchone()[0])
+        except Exception:
+            query_blob = None
+        if not query_blob:
+            return []
+    blob_col = ", vw.embedding" if use_blobs else ""
     rows = []
     while True:
         try:
             rows = conn.execute(f"""
-                SELECT wm.id, vw.distance
+                SELECT wm.id, vw.distance{blob_col}
                 FROM vec_working vw
                 JOIN working_memory wm ON wm.rowid = vw.rowid
                 WHERE vw.embedding MATCH {match_expr}
@@ -4884,19 +4932,26 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
                 ORDER BY vw.distance
             """, (emb_json, scan_k, *where_params)).fetchall()
         except Exception:
+            # An unusable vec table (or a store that cannot return the vector
+            # column) has no blob to score: abstain rather than guess.
             return []
         if len(rows) >= k or scan_k >= total_vectors:
             break
         scan_k = min(total_vectors, scan_k * 2)
     results = []
+    keys = rows[0].keys() if rows else []
     for row in rows:
         distance = float(row["distance"])
         # Keep the existing caller contract: larger sim is better and roughly
-        # cosine-like. sqlite-vec reports a distance whose raw scale differs
-        # by backend/vector type; divide by dimensionality before bounding so
-        # the vector voice remains comparable to the memory_embeddings cosine
-        # fallback instead of collapsing to ~0 on high-dimensional vectors.
-        sim = max(0.0, min(1.0, 1.0 - (max(distance, 0.0) / (2.0 * EMBEDDING_DIM))))
+        # cosine-like. int8 candidates come from their stored bytes; the other
+        # arms keep their mapping, which stays comparable to the
+        # memory_embeddings cosine fallback instead of collapsing to ~0 on high
+        # dimensions.
+        row_blob = row["embedding"] if "embedding" in keys else None
+        sim = _wm_vec_row_sim(distance, vec_type, query_blob, row_blob)
+        if sim is None:
+            # int8 candidate without a usable blob (see _wm_vec_row_sim).
+            return []
         results.append({"id": row["id"], "sim": sim})
     return results[:k]
 
