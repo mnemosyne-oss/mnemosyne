@@ -167,9 +167,13 @@ def _create_instance(session_id: str = None, author_id: str = None,
     """Create a fresh Mnemosyne instance for each MCP connection.
 
     Identity is resolved from:
-    1. Explicit args (from tool call or constructor)
-    2. Environment variables (MNEMOSYNE_AUTHOR_ID, etc.)
-    3. None (backward compatible, no identity tracking)
+    1. Authenticated multi-token SSE: the transport-bound token name
+       (authoritative -- issue #761); a conflicting client-supplied
+       author_id is rejected, not silently overridden
+    2. Explicit args (from tool call or constructor) -- only on
+       unauthenticated paths (stdio/local), for backward compatibility
+    3. Environment variables (MNEMOSYNE_AUTHOR_ID, etc.)
+    4. None (backward compatible, no identity tracking)
 
     ``MnemosyneInstance`` resolves to ``Any`` at runtime so type-hint
     resolution remains side-effect-free, while static checkers use the
@@ -178,8 +182,29 @@ def _create_instance(session_id: str = None, author_id: str = None,
     # Importing core.memory initializes the legacy default database, so keep it
     # on this mutation-capable construction path rather than at MCP import time.
     from mnemosyne.core.memory import Mnemosyne
+    from mnemosyne.runtime_context import get_request_token_name
 
-    auth = author_id or os.environ.get("MNEMOSYNE_AUTHOR_ID")
+    # Authenticated multi-token SSE (MNEMOSYNE_MCP_TOKENS): the matched
+    # token name is the authoritative author identity -- the client
+    # authenticates as that principal and cannot attribute writes to
+    # anyone else. A client-supplied author_id is accepted only when it
+    # agrees with the token name; any mismatch is a spoofing attempt and
+    # is rejected. Explicit author_id (and the env fallback) remain
+    # authoritative only on unauthenticated paths (stdio/local).
+    token_name = get_request_token_name()
+    if token_name:
+        if author_id and author_id != token_name:
+            raise ValueError(
+                f"author_id {author_id!r} conflicts with the authenticated "
+                f"identity {token_name!r}; omit author_id or match the "
+                "authenticated token name"
+            )
+        auth = token_name
+    else:
+        auth = (
+            author_id
+            or os.environ.get("MNEMOSYNE_AUTHOR_ID")
+        )
     auth_type = author_type or os.environ.get("MNEMOSYNE_AUTHOR_TYPE")
     chan = channel_id or os.environ.get("MNEMOSYNE_CHANNEL_ID") or session_id or "default"
     sess = session_id or f"mcp_{bank}"

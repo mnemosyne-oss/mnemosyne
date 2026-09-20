@@ -77,7 +77,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "mnemosyne-install=mnemosyne.install:install",
+            "mnemosyne-install=mnemosyne.install:main",
             "mnemosyne-uninstall=mnemosyne.install:uninstall",
             "mnemosyne=mnemosyne.cli:run_cli",
             "mnemosyne-browser=mnemosyne.integrations.memory_browser:main",

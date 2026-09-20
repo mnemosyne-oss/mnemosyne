@@ -2,19 +2,90 @@
 Mnemosyne Hermes Installer
 ==========================
 
-One-command setup for Mnemosyne as a Hermes MemoryProvider.
+Installs Mnemosyne as a Hermes MemoryProvider through the standalone
+``mnemosyne-hermes`` provider package — the supported route.
+
+This module is the compatibility entry point behind the ``mnemosyne-install``
+and ``mnemosyne-uninstall`` console scripts. It used to create the legacy
+source-checkout symlink (``~/.hermes/plugins/mnemosyne`` pointing at
+``hermes_memory_provider/``). That route is obsolete (#651): the standalone
+``mnemosyne-hermes`` package owns the plugin directory, the bundled skill, the
+per-profile links and the wrapper mode, and its ``mnemosyne-hermes install``
+command is the supported installer.
+
+What this entry point does instead:
+
+* delegates install, uninstall and status to the standalone provider;
+* detects a legacy ``hermes_memory_provider`` plugin link, warns about it, and
+  removes it during install (``--migrate`` does only that);
+* fails clearly, naming the install command, when the standalone provider is
+  not available.
+
+The legacy module ``hermes_memory_provider/`` is still shipped for the
+providers that import it; only the installer stops wiring it into Hermes.
 
 Usage:
-    python -m mnemosyne.install
-    # or after pip install:
-    mnemosyne-install
+    mnemosyne-install                 # delegate an install to mnemosyne-hermes
+    mnemosyne-install --status        # verify the standalone provider
+    mnemosyne-install --migrate       # remove legacy links only
+    mnemosyne-uninstall               # delegate an uninstall
+    python -m mnemosyne.install --status
 """
 
 from __future__ import annotations
 
+import argparse
+import importlib
+import importlib.util
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
+
+PLUGIN_DIRNAME = "mnemosyne"
+LEGACY_PROVIDER_DIRNAME = "hermes_memory_provider"
+LEGACY_PLUGIN_DIRNAME = "hermes-mnemosyne"
+STANDALONE_MODULE = "mnemosyne_hermes.install"
+STANDALONE_DISTRIBUTION = "mnemosyne-hermes"
+STANDALONE_CONSOLE_SCRIPT = "mnemosyne-hermes"
+STANDALONE_INSTALL_HINT = (
+    "pipx install mnemosyne-hermes",
+    "or, into Hermes' own venv:",
+    'uv pip install --python <hermes-python> -U "mnemosyne-hermes[all]"',
+)
+
+
+def _print_install_hint(stream=sys.stderr) -> None:
+    """Print the standalone-provider install commands, one per line."""
+    for line in STANDALONE_INSTALL_HINT:
+        print(f"     {line}", file=stream)
+
+_PATH_SCRUB = (
+    "import os, sys\n"
+    "try:\n"
+    "    _cwd = os.getcwd()\n"
+    "except OSError:\n"
+    "    _cwd = None\n"
+    "sys.path[:] = [p for p in sys.path if p not in ('', '.', _cwd)]\n"
+)
+"""Drop the implicit cwd entry before importing anything.
+
+``python -c`` puts the working directory at ``sys.path[0]``. A directory that
+happens to contain a ``mnemosyne`` or ``mnemosyne_hermes`` entry — a source
+checkout, or a workspace umbrella holding one — then shadows the installed
+packages and makes a delegated probe or status report a false negative.
+"""
+
+_PROVIDER_PROBE = _PATH_SCRUB + (
+    "import importlib.util as u\n"
+    "sys.exit(0 if u.find_spec('mnemosyne_hermes') else 1)\n"
+)
+
+_DELEGATE_TO_STANDALONE = _PATH_SCRUB + (
+    "from mnemosyne_hermes.install import main\n"
+    "sys.exit(main())\n"
+)
 
 
 def _get_mnemosyne_root() -> Path:
@@ -23,7 +94,7 @@ def _get_mnemosyne_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def _get_hermes_home() -> Path:
+def _get_hermes_home() -> Path | None:
     """Return the Hermes home directory, or None if not found."""
     # Check env var first
     env = os.environ.get("HERMES_HOME")
@@ -34,6 +105,13 @@ def _get_hermes_home() -> Path:
     if default.exists():
         return default
     return None
+
+
+def _resolve_hermes_home(hermes_home_path: str | Path | None = None) -> Path | None:
+    """Return the explicit Hermes home, else the discovered default."""
+    if hermes_home_path is not None:
+        return Path(hermes_home_path).expanduser()
+    return _get_hermes_home()
 
 
 def _get_hermes_agent_path() -> Path | None:
@@ -60,7 +138,6 @@ def _remove_link(link_path: Path) -> None:
         # Windows: junctions aren't detected by is_symlink(), and rmdir /
         # shutil.rmtree may follow the reparse point. Use rmdir which
         # removes the junction itself on Windows (like a directory symlink).
-        import subprocess
         try:
             subprocess.run(
                 ["cmd", "/c", "rmdir", str(link_path)],
@@ -74,85 +151,95 @@ def _remove_link(link_path: Path) -> None:
     if link_path.is_symlink():
         link_path.unlink()
     elif link_path.exists():
-        import shutil
         shutil.rmtree(link_path)
 
 
-def _make_link(target: Path, source: Path) -> tuple[bool, str]:
-    """Create a symlink (POSIX) or junction (Windows) from target to source.
+# ---------------------------------------------------------------------------
+# Legacy install detection and migration (#651)
+# ---------------------------------------------------------------------------
 
-    Returns (ok, message). The caller must remove any existing path at
-    ``target`` first.
+
+def _legacy_provider_dir() -> Path:
+    """Return the obsolete source-checkout provider directory.
+
+    The pre-#651 installer linked ``~/.hermes/plugins/mnemosyne`` at this
+    directory, whether it came from a source checkout or from the copy shipped
+    inside the installed ``mnemosyne-memory`` distribution.
     """
-    if _is_windows():
-        import subprocess
-        result = subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(target), str(source)],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            return False, f"Failed to create junction: {result.stderr.strip()}"
-        return True, f"Junction: {target} -> {source}"
+    return _get_mnemosyne_root() / LEGACY_PROVIDER_DIRNAME
+
+
+def is_legacy_plugin_path(path: Path) -> bool:
+    """Return whether ``path`` is a legacy ``hermes_memory_provider`` link.
+
+    Detection is by the resolved target's directory name, so a link into a
+    source checkout, a link into an installed distribution's copy, and a broken
+    legacy link are all recognized. A link into the standalone
+    ``mnemosyne_hermes`` package is deliberately **not** legacy: that target is
+    the supported route, even when a user linked it by hand.
+    """
+    if not (path.is_symlink() or path.exists()):
+        return False
     try:
-        target.symlink_to(source, target_is_directory=True)
-    except OSError as e:
-        return False, f"Failed to create symlink: {e}"
-    return True, f"Symlinked: {target} -> {source}"
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return resolved.name == LEGACY_PROVIDER_DIRNAME
 
 
-def _ensure_link() -> bool:
-    """Create the plugin link from ~/.hermes/plugins/mnemosyne -> hermes_memory_provider.
+def _plugin_paths(hermes_home: Path | None) -> list[Path]:
+    """Return the plugin link paths the installer is responsible for."""
+    if hermes_home is None:
+        return []
+    paths = [hermes_home / "plugins" / PLUGIN_DIRNAME]
+    paths.extend(
+        profile / "plugins" / PLUGIN_DIRNAME
+        for profile in _iter_mnemosyne_profiles(hermes_home)
+    )
+    return paths
 
-    Uses symlinks on POSIX, directory junctions on Windows (no admin required).
-    Automatically migrates from old plugin directory name (hermes-mnemosyne).
+
+def detect_legacy_installs(hermes_home_path: str | Path | None = None) -> list[Path]:
+    """Return every legacy install path present in this Hermes home.
+
+    Covers the default home and the opted-in profiles, plus the pre-rename
+    ``hermes-mnemosyne`` plugin directory in the default home.
     """
-    hermes_home = _get_hermes_home()
-    if not hermes_home:
-        print("❌ Hermes not found. Is Hermes installed?")
-        print("   Expected: ~/.hermes/ or $HERMES_HOME set")
-        return False
+    hermes_home = _resolve_hermes_home(hermes_home_path)
+    found = [path for path in _plugin_paths(hermes_home) if is_legacy_plugin_path(path)]
+    if hermes_home is not None:
+        renamed = hermes_home / "plugins" / LEGACY_PLUGIN_DIRNAME
+        if renamed.is_symlink() or renamed.exists():
+            found.append(renamed)
+    return found
 
-    plugins_dir = hermes_home / "plugins"
-    plugins_dir.mkdir(parents=True, exist_ok=True)
 
-    target = plugins_dir / "mnemosyne"
-    source = _get_mnemosyne_root() / "hermes_memory_provider"
+def migrate_legacy_install(
+    *,
+    dry_run: bool = False,
+    hermes_home_path: str | Path | None = None,
+) -> list[Path]:
+    """Remove legacy plugin links, returning the paths removed (or planned).
 
-    if not source.exists():
-        print(f"❌ Mnemosyne MemoryProvider not found at {source}")
-        return False
+    Only the links the installer itself created are touched: a real directory
+    is reported and left alone, so user data is never deleted silently.
+    """
+    planned = detect_legacy_installs(hermes_home_path)
+    removed: list[Path] = []
+    for path in planned:
+        if not path.is_symlink() and path.exists():
+            # Never report a path as removable when the real run would keep it.
+            print(f"⏭️  Kept {path} (not a link) — remove it manually if it is obsolete")
+            continue
+        if not dry_run:
+            _remove_link(path)
+        removed.append(path)
+    return removed
 
-    # Migrate from old plugin directory name (hermes-mnemosyne -> mnemosyne)
-    old_target = plugins_dir / "hermes-mnemosyne"
-    if old_target.is_symlink() or old_target.exists():
-        _remove_link(old_target)
-        print(f"🔄 Removed old plugin directory: {old_target}")
 
-    # Migrate config from old provider name
-    config_path = hermes_home / "config.yaml"
-    if config_path.is_file():
-        try:
-            config_text = config_path.read_text(encoding="utf-8")
-            if "provider: hermes-mnemosyne" in config_text:
-                new_text = config_text.replace(
-                    "provider: hermes-mnemosyne", "provider: mnemosyne"
-                )
-                config_path.write_text(new_text, encoding="utf-8")
-                print("🔄 Updated config: memory.provider hermes-mnemosyne -> mnemosyne")
-        except Exception:
-            pass
-
-    # Remove existing link or directory
-    if target.is_symlink() or target.exists():
-        _remove_link(target)
-        print(f"🔄 Removed existing {target}")
-
-    ok, msg = _make_link(target, source)
-    if not ok:
-        print(f"❌ {msg}")
-        return False
-    print(f"✅ {msg}")
-    return True
+# ---------------------------------------------------------------------------
+# Configuration (kept: the one-command setup writes provider selection)
+# ---------------------------------------------------------------------------
 
 
 def _config_selects_mnemosyne(text: str) -> bool:
@@ -182,7 +269,7 @@ def _config_selects_mnemosyne(text: str) -> bool:
     return False
 
 
-def _iter_mnemosyne_profiles() -> list[Path]:
+def _iter_mnemosyne_profiles(hermes_home_path: str | Path | None = None) -> list[Path]:
     """Return profile dirs under <hermes_home>/profiles/* that opt into Mnemosyne.
 
     A profile opts in when its ``config.yaml`` parses to
@@ -192,7 +279,7 @@ def _iter_mnemosyne_profiles() -> list[Path]:
     ``config.yaml`` are skipped. Returns an empty list when no ``profiles/``
     directory exists (the default, no-profile install).
     """
-    hermes_home = _get_hermes_home()
+    hermes_home = _resolve_hermes_home(hermes_home_path)
     if not hermes_home:
         return []
     profiles_dir = hermes_home / "profiles"
@@ -216,118 +303,9 @@ def _iter_mnemosyne_profiles() -> list[Path]:
     return selected
 
 
-def _link_profile(profile_home: Path, source: Path, *, force: bool = False) -> bool:
-    """Link ``profile_home/plugins/mnemosyne`` to source. Idempotent.
-
-    A link already pointing at ``source`` is left untouched. A stale or broken
-    symlink is replaced. A real (non-symlink) path is left in place and reported
-    unless ``force`` is set — the installer never silently deletes user data.
-    Returns True on success.
-    """
-    plugins_dir = profile_home / "plugins"
-    plugins_dir.mkdir(parents=True, exist_ok=True)
-    target = plugins_dir / "mnemosyne"
-
-    if target.is_symlink():
-        try:
-            if target.resolve() == source.resolve():
-                print(f"✅ Profile {profile_home.name}: already linked")
-                return True
-        except OSError:
-            pass
-        _remove_link(target)  # stale/broken symlink — safe to replace
-    elif target.exists():
-        if not force:
-            print(f"⏭️  Profile {profile_home.name}: {target} exists (not a link), skipped")
-            return False
-        _remove_link(target)
-
-    ok, msg = _make_link(target, source)
-    print(f"{'✅' if ok else '❌'} Profile {profile_home.name}: {msg}")
-    return ok
-
-
-def _link_all_profiles() -> None:
-    """Link Mnemosyne into every opted-in profile. No-op without profiles.
-
-    A failure on one profile is reported and does not abort the remaining
-    profiles.
-    """
-    profiles = _iter_mnemosyne_profiles()
-    if not profiles:
-        return
-    source = _get_mnemosyne_root() / "hermes_memory_provider"
-    print()
-    print(f"🔗 Linking {len(profiles)} profile(s)...")
-    for profile_home in profiles:
-        try:
-            _link_profile(profile_home, source)
-        except OSError as e:
-            print(f"❌ Profile {profile_home.name}: {e}")
-
-
-def _unlink_all_profiles() -> None:
-    """Remove the per-profile plugin links created by ``_link_all_profiles``.
-
-    Scans every profile directory by *link*, not by config opt-in: a profile's
-    ``plugins/mnemosyne`` is removed when it is a symlink resolving to the
-    provider source, regardless of what (or whether) the profile's
-    ``config.yaml`` currently selects. This still never touches a real directory
-    or a link pointing elsewhere. Symlinked profile entries are skipped.
-    """
-    hermes_home = _get_hermes_home()
-    if not hermes_home:
-        return
-    profiles_dir = hermes_home / "profiles"
-    if not profiles_dir.is_dir():
-        return
-    source = _get_mnemosyne_root() / "hermes_memory_provider"
-    for child in sorted(profiles_dir.iterdir()):
-        if child.is_symlink():
-            continue
-        target = child / "plugins" / "mnemosyne"
-        if not target.is_symlink():
-            continue
-        try:
-            if target.resolve() == source.resolve():
-                _remove_link(target)
-                print(f"Removed profile link: {target}")
-        except OSError:
-            continue
-
-
-def _verify_links() -> bool:
-    """Print PASS/FAIL for each home that should have a resolvable plugin link.
-
-    Checks the default home plus every opted-in profile. Returns True only
-    when every checked link resolves to the provider source.
-    """
-    source = _get_mnemosyne_root() / "hermes_memory_provider"
-    hermes_home = _get_hermes_home()
-    homes: list[Path] = []
-    if hermes_home:
-        homes.append(hermes_home)
-    homes.extend(_iter_mnemosyne_profiles())
-
-    all_ok = True
-    print()
-    print("🔍 Verifying plugin links...")
-    for home in homes:
-        target = home / "plugins" / "mnemosyne"
-        ok = target.is_symlink() or target.exists()
-        if ok:
-            try:
-                ok = target.resolve() == source.resolve()
-            except OSError:
-                ok = False
-        all_ok = all_ok and ok
-        print(f"  {'PASS' if ok else 'FAIL'}  {home.name or home}: {target}")
-    return all_ok
-
-
-def _configure_hermes() -> bool:
+def _configure_hermes(hermes_home_path: str | Path | None = None) -> bool:
     """Set memory.provider = mnemosyne in Hermes config."""
-    hermes_home = _get_hermes_home()
+    hermes_home = _resolve_hermes_home(hermes_home_path)
     if not hermes_home:
         return False
 
@@ -339,7 +317,7 @@ def _configure_hermes() -> bool:
         config_text = config_path.read_text(encoding="utf-8")
 
     # Check if already configured
-    if "provider: mnemosyne" in config_text:
+    if _config_selects_mnemosyne(config_text):
         print("✅ Hermes config already has memory.provider = mnemosyne")
         return True
 
@@ -370,107 +348,330 @@ def _configure_hermes() -> bool:
     return True
 
 
-def _verify() -> bool:
-    """Try to import and verify the provider works."""
-    hermes_home = _get_hermes_home()
-    if not hermes_home:
-        return False
+# ---------------------------------------------------------------------------
+# Standalone provider delegation
+# ---------------------------------------------------------------------------
 
-    # Add Hermes to path for verification
-    agent_path = _get_hermes_agent_path()
-    if agent_path and str(agent_path) not in sys.path:
-        sys.path.insert(0, str(agent_path))
 
+def _load_standalone_installer():
+    """Return the standalone provider's install module, or None when absent.
+
+    ``find_spec`` on the distribution name is a cheap presence check that does
+    not execute the package. The module import is deferred until the provider is
+    actually needed, so ``--status`` stays useful when the provider is missing.
+    """
     try:
-        from plugins.memory import load_memory_provider
-        provider = load_memory_provider("mnemosyne")
-        if provider and provider.is_available():
-            print(f"✅ Provider verified: {provider.name} is_available=True")
-            return True
-        else:
-            print("⚠️  Provider loaded but not available (Mnemosyne core not importable)")
-            return False
-    except Exception as e:
-        print(f"⚠️  Verification skipped: {e}")
+        if importlib.util.find_spec("mnemosyne_hermes") is None:
+            return None
+    except (ImportError, ValueError):
+        return None
+    try:
+        return importlib.import_module(STANDALONE_MODULE)
+    except Exception:
+        return None
+
+
+def _hermes_venv_python(hermes_home: Path | None) -> Path | None:
+    """Return a Hermes venv Python, or None when it cannot be located.
+
+    An explicit HERMES_HOME scopes discovery to that deployment; only when no
+    home is known does this fall back to the common install locations.
+    """
+    candidates: list[Path] = []
+    if hermes_home is not None:
+        candidates.append(hermes_home / "hermes-agent" / "venv" / "bin" / "python")
+    else:
+        agent_path = _get_hermes_agent_path()
+        if agent_path is not None:
+            candidates.append(agent_path / "venv" / "bin" / "python")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _python_has_standalone(python: Path) -> bool:
+    """Return whether ``python`` can import the standalone provider."""
+    try:
+        result = subprocess.run(
+            [str(python), "-c", _PROVIDER_PROBE],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
         return False
+    return result.returncode == 0
 
 
-def install():
-    """Run the full Mnemosyne Hermes installation."""
+def _standalone_runner(hermes_home: Path | None):
+    """Return a callable running standalone-installer argv, or None.
+
+    The provider is looked for, in order: in this Python, as the published
+    ``mnemosyne-hermes`` console script, and finally in Hermes' own venv, which
+    is where a Hermes-managed install lands.
+    """
+    module = _load_standalone_installer()
+    if module is not None:
+        return lambda argv: int(module.main(list(argv)))
+
+    console_script = shutil.which(STANDALONE_CONSOLE_SCRIPT)
+    if console_script:
+        return lambda argv: subprocess.call([console_script, *argv])
+
+    hermes_python = _hermes_venv_python(hermes_home)
+    if hermes_python is not None and _python_has_standalone(hermes_python):
+        command = [str(hermes_python), "-c", _DELEGATE_TO_STANDALONE]
+        return lambda argv: subprocess.call([*command, *argv])
+
+    return None
+
+
+def _print_standalone_missing(legacy_paths: list[Path]) -> None:
+    """Explain what is missing and how to fix it."""
+    sys.stdout.flush()  # keep the banner above this stderr block in a terminal
+    print("❌ The standalone Mnemosyne provider is not available.", file=sys.stderr)
+    print(file=sys.stderr)
+    if legacy_paths:
+        print("   A legacy hermes_memory_provider install was found:", file=sys.stderr)
+        for path in legacy_paths:
+            print(f"     {path}", file=sys.stderr)
+        print(
+            "   That route is obsolete and is no longer created or repaired (#651).",
+            file=sys.stderr,
+        )
+    print(f"   Install the supported provider ({STANDALONE_DISTRIBUTION}):", file=sys.stderr)
+    _print_install_hint()
+    print(file=sys.stderr)
+    print("   Then re-run: mnemosyne-install", file=sys.stderr)
+    print("   Verify with: mnemosyne-install --status", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Status / install / uninstall
+# ---------------------------------------------------------------------------
+
+
+def status(hermes_home_path: str | Path | None = None) -> bool:
+    """Report whether the standalone provider is installed and active.
+
+    Returns True only when no legacy link remains, the standalone provider is
+    available, its plugin directory is discoverable by Hermes, and the Hermes
+    config selects ``memory.provider: mnemosyne``.
+    """
+    hermes_home = _resolve_hermes_home(hermes_home_path)
+    ok = True
+
+    print("🔍 Mnemosyne Hermes provider status")
+    print()
+
+    legacy = detect_legacy_installs(hermes_home_path)
+    if legacy:
+        ok = False
+        print("❌ Legacy hermes_memory_provider install detected (obsolete, #651):")
+        for path in legacy:
+            print(f"     {path}")
+        print("   Fix: mnemosyne-install --migrate")
+    else:
+        print("✅ No legacy hermes_memory_provider plugin link")
+
+    module = _load_standalone_installer()
+    if module is not None:
+        try:
+            state = module.plugin_state(hermes_home_path=hermes_home)
+        except Exception as exc:  # provider API drift must not crash the check
+            ok = False
+            print(f"❌ Could not read plugin state: {exc}")
+        else:
+            if state.installed:
+                print(f"✅ Provider installed ({state.mode}): {state.target}")
+                if state.link_target is not None:
+                    print(f"     -> {state.link_target}")
+            else:
+                ok = False
+                print(f"❌ Provider not installed ({state.status}): {state.message}")
+    else:
+        # The provider lives in another interpreter (typically Hermes' own venv),
+        # so its own status command is the authority on plugin state.
+        runner = _standalone_runner(hermes_home)
+        if runner is None:
+            ok = False
+            print(f"❌ Standalone provider ({STANDALONE_DISTRIBUTION}) is not available here")
+            _print_install_hint(sys.stdout)
+        else:
+            argv = ["status"]
+            if hermes_home_path is not None:
+                argv += ["--hermes-home", str(hermes_home_path)]
+            print("ℹ️  Provider found outside this Python; delegating the plugin check")
+            sys.stdout.flush()  # the delegated status writes to the same terminal
+            if runner(argv) == 0:
+                print("✅ Standalone provider reports the plugin installed and discoverable")
+            else:
+                ok = False
+                print("❌ Standalone provider reports the plugin NOT installed")
+
+    if hermes_home is None:
+        ok = False
+        print("❌ Hermes home not found (set HERMES_HOME or pass --hermes-home)")
+    else:
+        config_path = hermes_home / "config.yaml"
+        if not config_path.is_file():
+            ok = False
+            print(f"❌ No Hermes config at {config_path}")
+        else:
+            try:
+                text = config_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                ok = False
+                print(f"❌ Could not read {config_path}: {exc}")
+            else:
+                if _config_selects_mnemosyne(text):
+                    print(f"✅ {config_path} selects memory.provider: mnemosyne")
+                else:
+                    ok = False
+                    print(f"❌ {config_path} does not select memory.provider: mnemosyne")
+
+    print()
+    print("✅ Standalone provider is installed and active"
+          if ok else "❌ Standalone provider is NOT fully installed")
+    return ok
+
+
+def install(
+    *,
+    force: bool = False,
+    dry_run: bool = False,
+    migrate_only: bool = False,
+    hermes_home_path: str | Path | None = None,
+) -> None:
+    """Delegate an install to the standalone provider, migrating legacy links."""
+    hermes_home = _resolve_hermes_home(hermes_home_path)
+
     print("🌀 Mnemosyne Hermes Installer")
     print("=" * 40)
     print()
 
-    # Step 1: Link default home (symlink on POSIX, junction on Windows)
-    if not _ensure_link():
+    legacy = detect_legacy_installs(hermes_home_path)
+
+    if migrate_only:
+        if not legacy:
+            print("✅ No legacy hermes_memory_provider install to migrate")
+            return
+        print(f"🔄 Migrating {len(legacy)} legacy path(s)...")
+        for path in migrate_legacy_install(dry_run=dry_run, hermes_home_path=hermes_home_path):
+            print(f"{'Would remove' if dry_run else 'Removed'}: {path}")
         print()
-        print("❌ Install failed at symlink step.")
-        sys.exit(1)
-
-    # Step 1b: Link any named profiles that opt into Mnemosyne
-    _link_all_profiles()
-
-    # Step 2: Configure (default home only — profile configs stay the user's)
-    _configure_hermes()
-
-    # Step 3: Verify
-    print()
-    print("🔍 Verifying...")
-    _verify()
-    _verify_links()
-
-    print()
-    print("✅ Mnemosyne is ready!")
-    print()
-    print("Next steps:")
-    print("  • Restart Hermes (if running)")
-    print("  • Run: hermes memory status")
-    print("  • Run: hermes mnemosyne stats")
-    print()
-
-
-def uninstall():
-    """Remove Mnemosyne from Hermes."""
-    hermes_home = _get_hermes_home()
-    if not hermes_home:
-        print("❌ Hermes not found.")
+        print("✅ Legacy migration complete. Re-run mnemosyne-install to install the "
+              "standalone provider.")
         return
 
-    target = hermes_home / "plugins" / "mnemosyne"
-    old_target = hermes_home / "plugins" / "hermes-mnemosyne"
+    runner = _standalone_runner(hermes_home)
+    if runner is None:
+        _print_standalone_missing(legacy)
+        sys.exit(1)
 
-    found = False
-    for t in [target, old_target]:
-        if t.is_symlink() or t.exists():
-            _remove_link(t)
-            found = True
-    if found:
-        print(f"Removed {target}")
+    if legacy:
+        print("⚠️  Legacy hermes_memory_provider install detected (obsolete, #651):")
+        for path in legacy:
+            print(f"     {path}")
+        print("   The supported route is the standalone "
+              f"{STANDALONE_DISTRIBUTION} provider; migrating.")
+        print()
+        for path in migrate_legacy_install(dry_run=dry_run, hermes_home_path=hermes_home):
+            print(f"{'Would remove' if dry_run else '🔄 Removed'}: {path}")
+        print()
+
+    argv = ["install"]
+    if force:
+        argv.append("--force")
+    if dry_run:
+        argv.append("--dry-run")
+    if hermes_home_path is not None:
+        argv += ["--hermes-home", str(hermes_home_path)]
+
+    sys.stdout.flush()  # the delegated installer writes to the same terminal
+    returncode = runner(argv)
+    if returncode != 0:
+        print()
+        print("❌ Standalone provider install failed.", file=sys.stderr)
+        print("   Run it directly for the full report: "
+              f"{STANDALONE_CONSOLE_SCRIPT} install", file=sys.stderr)
+        sys.exit(returncode)
+
+    if dry_run:
+        return
+
+    _configure_hermes(hermes_home_path)
+
+    print()
+    if not status(hermes_home_path):
+        sys.exit(1)
+
+
+def uninstall(hermes_home_path: str | Path | None = None) -> None:
+    """Delegate an uninstall, and remove any legacy links this route left."""
+    hermes_home = _resolve_hermes_home(hermes_home_path)
+
+    runner = _standalone_runner(hermes_home)
+    if runner is None:
+        print("⚠️  The standalone Mnemosyne provider is not available here; "
+              "removing legacy links only.", file=sys.stderr)
     else:
-        print("ℹ️  Mnemosyne plugin not found in Hermes.")
+        argv = ["uninstall"]
+        if hermes_home_path is not None:
+            argv += ["--hermes-home", str(hermes_home_path)]
+        runner(argv)
 
-    # Remove any per-profile links created at install time
-    _unlink_all_profiles()
+    for path in migrate_legacy_install(hermes_home_path=hermes_home_path):
+        print(f"Removed legacy link: {path}")
 
-    # Reset config
-    config_path = hermes_home / "config.yaml"
-    if config_path.exists():
-        text = config_path.read_text(encoding="utf-8")
-        if "provider: mnemosyne" in text:
-            new_text = text.replace("provider: mnemosyne", "provider: null")
-            config_path.write_text(new_text, encoding="utf-8")
-            print("✅ Reset memory.provider to null")
+    if hermes_home is not None:
+        config_path = hermes_home / "config.yaml"
+        if config_path.exists():
+            text = config_path.read_text(encoding="utf-8")
+            if _config_selects_mnemosyne(text):
+                new_text = text.replace("provider: mnemosyne", "provider: null")
+                config_path.write_text(new_text, encoding="utf-8")
+                print("✅ Reset memory.provider to null")
 
     print("\n✅ Mnemosyne uninstalled. Hermes will use built-in memory.")
 
 
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Mnemosyne Hermes Installer")
-    parser.add_argument("--uninstall", action="store_true", help="Remove Mnemosyne from Hermes")
-    args = parser.parse_args()
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mnemosyne-install",
+        description=(
+            "Install the Mnemosyne Hermes memory provider. Delegates to the "
+            "standalone mnemosyne-hermes provider, migrating any legacy "
+            "hermes_memory_provider install."
+        ),
+    )
+    parser.add_argument("--hermes-home", help="Hermes home. Defaults to HERMES_HOME or ~/.hermes.")
+    parser.add_argument("--status", action="store_true",
+                        help="Verify the standalone provider and exit.")
+    parser.add_argument("--migrate", action="store_true",
+                        help="Remove legacy hermes_memory_provider links and exit.")
+    parser.add_argument("--force", action="store_true",
+                        help="Replace an existing provider plugin directory.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would be done without making changes.")
+    parser.add_argument("--uninstall", action="store_true", help="Remove Mnemosyne from Hermes.")
+    return parser
 
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    if args.status:
+        return 0 if status(args.hermes_home) else 1
     if args.uninstall:
-        uninstall()
-    else:
-        install()
+        uninstall(args.hermes_home)
+        return 0
+    install(
+        force=args.force,
+        dry_run=args.dry_run,
+        migrate_only=args.migrate,
+        hermes_home_path=args.hermes_home,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

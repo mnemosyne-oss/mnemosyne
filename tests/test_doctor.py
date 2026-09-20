@@ -25,6 +25,7 @@ from mnemosyne.doctor import (
     STATUS_OK,
     STATUS_PRESENT_BUT_UNLOADABLE,
     STATUS_UNKNOWN,
+    STATUS_WARNING,
     SchemaFingerprint,
     TableFingerprint,
     build_doctor_report,
@@ -1468,3 +1469,186 @@ def test_vector_coverage_treats_unloadable_vec0_as_degraded_not_corrupt(tmp_path
     assert coverage["working"]["vec0_status"] == STATUS_PRESENT_BUT_UNLOADABLE
     assert coverage["working"]["error_class"] == "operational_error"
     assert set(coverage["working"]) == {"status", "vec0_status", "error_class"}
+
+
+@pytest.mark.parametrize(
+    ("user_version", "expected_status", "warns"),
+    [
+        (0, "legacy_unnormalized", True),
+        (0x10000000, "legacy_unnormalized", True),
+        (0x20000000, "normalized", False),
+    ],
+)
+def test_vector_coverage_reports_the_vec_store_format_marker(
+    tmp_path, user_version, expected_status, warns
+):
+    """The dense=0 defect is invisible to every row count.
+
+    ``vec_working`` reports ``complete`` with a row present either way, because
+    blobs quantized without normalization are still well-formed, correctly sized
+    and fully counted.  Only the normalized-format marker separates them from
+    blobs written by the current code, and an unmarked store is routed
+    conservatively, so its dense scores stay unusable until a reindex.
+    """
+
+    conn = _queryable_vec0_fixture(
+        tmp_path,
+        f"""
+        CREATE TABLE working_memory (id TEXT PRIMARY KEY, valid_until TEXT, superseded_by TEXT);
+        CREATE TABLE memory_embeddings (memory_id TEXT PRIMARY KEY, embedding_json TEXT);
+        CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY);
+        INSERT INTO working_memory VALUES ('working-live', NULL, NULL);
+        INSERT INTO memory_embeddings VALUES ('working-live', '[0]');
+        INSERT INTO vec_working VALUES (1);
+        PRAGMA user_version = {user_version};
+        """,
+    )
+    try:
+        result = VectorCoverageAdapter(conn).inspect()
+    finally:
+        conn.close()
+
+    assert result.metrics["working"]["status"] == "complete"
+    assert result.metrics["vec_store_format"] == {
+        "status": expected_status,
+        "vec_tables": ["vec_working"],
+    }
+    if not warns:
+        assert result.findings == []
+        assert result.repair_candidates == []
+        return
+    assert [finding.code for finding in result.findings] == ["vectors.legacy_unnormalized_blobs"]
+    finding = result.findings[0]
+    assert finding.status == STATUS_WARNING
+    assert finding.severity == SEVERITY_WARNING
+    assert "mnemosyne reindex" in finding.message
+    assert [candidate.id for candidate in result.repair_candidates] == ["reindex-vector-store"]
+    candidate = result.repair_candidates[0]
+    assert candidate.finding_codes == ["vectors.legacy_unnormalized_blobs"]
+    assert candidate.requires_explicit_confirmation is True
+
+
+def test_vector_coverage_does_not_warn_about_an_unmarked_but_empty_vec_store(tmp_path):
+    """An unmarked store with no blobs has nothing that could be mis-encoded.
+
+    The marker is absent, which is the signal for "may hold pre-format rows",
+    but with no rows there is no dense score to lose, so the format is reported
+    without proposing a reindex.  A 3.x bank that only ever used JSON fallback
+    embeddings migrates to exactly this shape.
+    """
+
+    conn = _queryable_vec0_fixture(
+        tmp_path,
+        """
+        CREATE TABLE working_memory (id TEXT PRIMARY KEY, valid_until TEXT, superseded_by TEXT);
+        CREATE TABLE memory_embeddings (memory_id TEXT PRIMARY KEY, embedding_json TEXT);
+        CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY);
+        INSERT INTO working_memory VALUES ('working-live', NULL, NULL);
+        """,
+    )
+    try:
+        result = VectorCoverageAdapter(conn).inspect()
+    finally:
+        conn.close()
+
+    assert result.metrics["working"]["vec_working_rows"] == 0
+    assert result.metrics["vec_store_format"] == {
+        "status": "no_vectors",
+        "vec_tables": ["vec_working"],
+    }
+    assert result.findings == []
+    assert result.repair_candidates == []
+
+
+def test_vector_coverage_reports_no_vec_store_format_without_a_vec0_table(tmp_path):
+    """A plain table named ``vec_working`` is not a vector store to judge."""
+
+    conn = _readonly_fixture(
+        tmp_path,
+        """
+        CREATE TABLE working_memory (id TEXT PRIMARY KEY);
+        CREATE TABLE memory_embeddings (memory_id TEXT PRIMARY KEY, embedding_json TEXT);
+        CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY);
+        INSERT INTO working_memory VALUES ('working-live');
+        INSERT INTO memory_embeddings VALUES ('working-live', '[0]');
+        INSERT INTO vec_working VALUES (1);
+        """,
+    )
+    try:
+        result = VectorCoverageAdapter(conn).inspect()
+    finally:
+        conn.close()
+
+    assert result.metrics["vec_store_format"] == {"status": "not_configured", "vec_tables": []}
+    assert result.findings == []
+    assert result.repair_candidates == []
+
+
+def test_vector_coverage_reports_the_vec_store_format_when_the_catalog_is_unreadable(tmp_path, monkeypatch):
+    """The format key survives the catalog-error path like every other key."""
+
+    conn = _queryable_vec0_fixture(
+        tmp_path,
+        """
+        CREATE TABLE working_memory (id TEXT PRIMARY KEY, valid_until TEXT, superseded_by TEXT);
+        CREATE TABLE memory_embeddings (memory_id TEXT PRIMARY KEY, embedding_json TEXT);
+        CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY);
+        """,
+    )
+
+    def _broken_catalog(_conn, _scan_limit=doctor.DEFAULT_SCAN_LIMIT):
+        return doctor._CatalogResult(error_class="sqlite_error")
+
+    monkeypatch.setattr(doctor, "_catalog", _broken_catalog)
+    try:
+        result = VectorCoverageAdapter(conn).inspect()
+    finally:
+        conn.close()
+
+    assert result.metrics["vec_store_format"] == {
+        "status": STATUS_UNKNOWN,
+        "error_class": "sqlite_error",
+    }
+    assert result.findings == []
+
+
+def test_vector_coverage_does_not_assert_an_empty_format_when_vec0_is_unreadable(tmp_path):
+    """An unreadable vec0 table leaves no row count, so the format abstains.
+
+    Reporting ``no_vectors`` here would claim the store is empty when doctor
+    could not read it at all.  The coverage entry already reports the table as
+    unavailable, and this key must not contradict it.
+    """
+
+    db_path = tmp_path / "vec-format-unreadable.db"
+    writable = sqlite3.connect(db_path)
+    writable.executescript(
+        """
+        CREATE TABLE working_memory (id TEXT PRIMARY KEY);
+        CREATE TABLE memory_embeddings (memory_id TEXT PRIMARY KEY, embedding_json TEXT);
+        CREATE TABLE vec_working (id INTEGER PRIMARY KEY);
+        INSERT INTO working_memory VALUES ('working-live');
+        INSERT INTO memory_embeddings VALUES ('working-live', '[0]');
+        PRAGMA writable_schema = ON;
+        UPDATE sqlite_master SET sql =
+          'CREATE VIRTUAL TABLE vec_working USING vec0(embedding float[3])'
+          WHERE name = 'vec_working';
+        PRAGMA writable_schema = OFF;
+        """
+    )
+    writable.commit()
+    writable.close()
+
+    readonly = open_readonly_doctor_db(db_path)
+    try:
+        result = VectorCoverageAdapter(readonly).inspect()
+    finally:
+        readonly.close()
+
+    assert result.metrics["working"]["status"] == "unavailable"
+    assert result.metrics["vec_store_format"] == {
+        "status": STATUS_UNKNOWN,
+        "vec_tables": ["vec_working"],
+    }
+    assert result.findings == []
+    assert result.repair_candidates == []
