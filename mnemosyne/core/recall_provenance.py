@@ -26,12 +26,16 @@ records intact across processes on local Linux filesystems
 NFS and other network filesystems are not supported.
 
 Coverage note: the hook lives at the single final return of the
-LINEAR recall path in beam.py. The `recall_enhanced()` and
-polyphonic (MNEMOSYNE_POLYPHONIC_RECALL=1) delegation paths return
-before reaching it and are NOT logged. Calls with `explain=True` are
-ALSO not logged, and that is intentional: an explain call returns its
-own trace object, which is the audit surface for that call, so a
-provenance line would duplicate semantics rather than add them.
+LINEAR recall path in beam.py. Provenance is suppressed only when
+`recall_enhanced()` takes its ENHANCED branch (MNEMOSYNE_ENHANCED_RECALL=1,
+which calls recall() with _skip_provenance=True) and on the polyphonic
+(MNEMOSYNE_POLYPHONIC_RECALL=1) path, which returns before the hook.
+When MNEMOSYNE_ENHANCED_RECALL is not 1, `recall_enhanced()` is a plain
+passthrough into `recall()` WITHOUT _skip_provenance, and those calls
+ARE logged. Calls with `explain=True` are ALSO not logged, and that is
+intentional: an explain call returns its own trace object, which is the
+audit surface for that call, so a provenance line would duplicate
+semantics rather than add them.
 
 Lifecycle: the audit file can outlive its database. Call
 `cleanup_orphaned_provenance()` at BeamMemory init/upgrade time to
