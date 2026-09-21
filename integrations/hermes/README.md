@@ -91,6 +91,15 @@ individual operation; empty values preserve the active session. A configured
 session changes, so a branch or compression switch does not adopt the child
 session ID.
 
+A configured skip context (`subagent`, `cron`, `flush`, `background`, or
+`skill_loop` by default) intentionally receives no private Beam. If an existing
+primary provider instance is re-initialized under one of those contexts, it must
+clear the live Beam to prevent writes into the wrong session. That transition
+emits a warning, returns `reason_code="reset_by_reinit"` from memory tools, and
+shows an `UNAVAILABLE` prompt notice. Re-initialize the provider in a primary
+context to recover. A provider that starts directly in a skip context remains
+silent and returns `reason_code="skipped_context"`.
+
 Provider lifecycle hooks are fail-soft. Database or disk failures during
 prefetch, turn sync, session-end or automatic consolidation, and wrapper or
 audit cleanup are logged and suppressed so Hermes can continue without a
@@ -239,6 +248,8 @@ No required config. Everything defaults to `~/.mnemosyne/`. Optional overrides:
 | `MNEMOSYNE_SYNC_TURN_USER_LIMIT` | `500` | User content truncation in `sync_turn()` (`0` = no limit) |
 | `MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT` | `800` | Assistant content truncation in `sync_turn()` (`0` = no limit) |
 | `MNEMOSYNE_FACT_RECALL_ENABLED` | `false` | Merge LLM-extracted facts into standard recall |
+| `MNEMOSYNE_IGNORE_PATTERNS` | _(empty)_ | Newline-separated regular expressions; matching writes are rejected before persistence |
+| `MNEMOSYNE_WRITE_CLASSIFIER` | `off` | Write admission classifier: `off`, `warn`, or `strict` |
 | `MNEMOSYNE_PREFETCH_CONTENT_CHARS` | `0` | Per-memory prefetch content cap (`0` = full content) |
 | `MNEMOSYNE_PREFETCH_MIN_DISTINCTIVE_TOKENS` | `2` | Shared non-generic terms required for automatic prefetch injection |
 | `MNEMOSYNE_PREFETCH_MIN_QUERY_COVERAGE` | `0.30` | Minimum fraction of non-generic query terms covered by a prefetched memory |
@@ -255,7 +266,21 @@ memory:
   mnemosyne:
     auto_sleep: true
     sleep_threshold: 30
+    ignore_patterns:
+      - "^\\s*\\$\\s*pip\\s"
+    write_classifier: "off"  # off | warn | strict
 ```
+
+For `ignore_patterns` and `write_classifier`, an explicit `initialize(...)`
+keyword argument takes precedence. Without that override, resolution is
+Hermes `config.yaml` `memory.mnemosyne.*` > core `config.yaml` > environment
+variable > default.
+`MNEMOSYNE_IGNORE_PATTERNS` is newline-separated and defaults to empty (no
+patterns). `MNEMOSYNE_WRITE_CLASSIFIER` controls admission for explicit writes
+and autosaved turns: `off` still applies `ignore_patterns`; `warn` runs the
+noise/secret classifier but stores classified content with warnings; and
+`strict` rejects content classified as noise or secret-like. Unset, blank, or
+invalid classifier values fall back to `off` (invalid values also log a warning).
 
 ## Tools
 

@@ -57,9 +57,9 @@ embeddings = ["fastembed>=0.3.0", "onnxruntime>=1.21.0,<1.29", "sqlite-vec>=0.1.
 mcp = ["mcp>=2.0.0,!=2.1.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'"]
 openclaw = ["openclaw>=0.1.0; python_version >= '3.10'"]
 sync = ["cryptography>=41.0"]
-test = ["pytest>=7.0", "pytest-timeout>=2.1", "build"]
+test = ["pytest>=7.0", "pytest-timeout>=2.1", "build", "httpx>=0.27", "tomli>=2.0; python_version < '3.11'"]
 all = ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20", "fastembed>=0.3.0", "onnxruntime>=1.21.0,<1.29", "sqlite-vec>=0.1.9,<0.1.10", "mcp>=2.0.0,!=2.1.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'", "cryptography>=41.0"]
-dev = ["pytest>=7.0", "pytest-timeout>=2.1", "build", "twine", "ruff==0.15.22"]
+dev = ["pytest>=7.0", "pytest-timeout>=2.1", "build", "httpx>=0.27", "twine", "ruff==0.15.22"]
 
 [project.urls]
 Homepage = "https://github.com/mnemosyne-oss/mnemosyne"
@@ -68,7 +68,7 @@ Issues = "https://github.com/mnemosyne-oss/mnemosyne/issues"
 Documentation = "https://github.com/mnemosyne-oss/mnemosyne/blob/main/docs/README.md"
 
 [project.scripts]
-mnemosyne-install = "mnemosyne.install:install"
+mnemosyne-install = "mnemosyne.install:main"
 mnemosyne-uninstall = "mnemosyne.install:uninstall"
 mnemosyne = "mnemosyne.cli:run_cli"
 mnemosyne-browser = "mnemosyne.integrations.memory_browser:main"

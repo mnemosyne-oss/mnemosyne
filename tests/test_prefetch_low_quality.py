@@ -29,9 +29,11 @@ def test_real_phrases_are_kept(real):
 
 class FakeBeam:
     """Returns a fixed mix of junk fragments and real phrases regardless of query."""
+    # Simulates a beam with author identity set; prefetch must IGNORE it
+    # (CWE-200: a non-empty author_id would widen recall to (1=1)).
     author_id = "test-author"
 
-    def recall(self, query, top_k, temporal_weight, temporal_halflife, author_id):
+    def recall(self, query, top_k, temporal_weight, temporal_halflife):
         return [
             # bare fragments scoring high on keyword match — must be filtered out
             {"content": "what", "timestamp": "2026-05-14T12:00:00Z",

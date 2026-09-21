@@ -276,6 +276,8 @@ TRIPLE_ADD_SCHEMA = {
     "description": (
         "Add a temporal fact triple (subject, predicate, object) to the knowledge graph. "
         "Example: ('user', 'prefers', 'neovim'). Use for structured relationships. "
+        "For predicate='occurred_on', when valid_from is provided, valid_from is stored "
+        "as the annotation value and the supplied object is intentionally discarded. "
         "By default a new triple supersedes any prior fact with the same subject+predicate; "
         "set supersede=false for multi-valued facts that should coexist "
         "(e.g. ('user','speaks','English') and ('user','speaks','Spanish'))."

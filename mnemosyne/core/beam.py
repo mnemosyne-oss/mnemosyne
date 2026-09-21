@@ -26,6 +26,7 @@ from dataclasses import dataclass
 
 from mnemosyne.core._connection_gc import collect_connection_cycles
 from mnemosyne.core.config import resolve_beam_runtime
+from mnemosyne.core.filters import _SYSTEM_DERIVED_WRITE_CAPABILITY
 from mnemosyne.core.journal import journal_mode
 from mnemosyne.core.recall_provenance import append_recall_provenance
 
@@ -741,6 +742,31 @@ def _vec_distance_sim(distance: float, vec_type: "Optional[str]" = None,
     return 0.0
 
 
+def _wm_vec_row_sim(distance: float, vec_type: "Optional[str]",
+                    query_blob: "Optional[bytes]" = None,
+                    row_blob: "Optional[bytes]" = None) -> "Optional[float]":
+    """Similarity for a single working-memory vector candidate.
+
+    int8 candidates are scored from their stored bytes with the exact blob
+    cosine (``_vec_int8_blob_cosine``), the contract the episodic paths adopted
+    in #911. ``None`` means "not scorable": an int8 distance alone cannot yield
+    an absolute cosine (see ``_vec_distance_sim``), so this arm abstains rather
+    than falling back to the ``1 - distance / (2 * EMBEDDING_DIM)`` guess, which
+    compressed every candidate into a 0.92-0.95 band and left the
+    working-memory dense blend with ordering but no amplitude. The caller then
+    routes the candidate set through the exact compatibility scan.
+
+    Every other arm keeps its existing mapping.
+    """
+    if vec_type == "int8":
+        if query_blob and row_blob and len(bytes(query_blob)) == len(bytes(row_blob)):
+            # Exact: a genuine 0.0 cosine is a valid answer, so this never
+            # falls back to the distance mapping.
+            return _vec_int8_blob_cosine(bytes(query_blob), bytes(row_blob))
+        return None
+    return max(0.0, min(1.0, 1.0 - (max(float(distance), 0.0) / (2.0 * EMBEDDING_DIM))))
+
+
 def _classify_vec_store_regime(conn, table: str = "vec_episodes") -> str:
     """Route the episodic vec table by FORMAT BOUNDARY, not sampling.
 
@@ -835,13 +861,13 @@ def _warn_vec_store_unknown_once() -> None:
 
 def _env_vec_admit() -> float:
     """Resolve MNEMOSYNE_EM_VEC_ADMIT once at import: finite and within
-    (0, 1]; NaN, Inf or out-of-range values fall back to 0.80 with a warning.
+    (0, 1]; NaN, Inf or out-of-range values fall back to 0.62 with a warning.
     NaN would otherwise make `sim < threshold` always False and admit every
     vector candidate."""
-    v = _env_float("MNEMOSYNE_EM_VEC_ADMIT", 0.80)
+    v = _env_float("MNEMOSYNE_EM_VEC_ADMIT", 0.62)
     if not math.isfinite(v) or not (0.0 < v <= 1.0):
-        logger.warning("MNEMOSYNE_EM_VEC_ADMIT=%r out of range; using 0.80", v)
-        return 0.80
+        logger.warning("MNEMOSYNE_EM_VEC_ADMIT=%r out of range; using 0.62", v)
+        return 0.62
     return v
 
 
@@ -857,9 +883,16 @@ def _env_vec_admit() -> float:
 # never decided by this threshold alone.
 # Resolved once at import: changing MNEMOSYNE_EM_VEC_ADMIT in a deployment
 # env (.env / gateway config) requires restarting the gateway process to
-# take effect. Calibration note: 0.80 is the default on the absolute-cosine
-# scale. Deployments on e5-style stores that need the full 0.74-0.80
-# paraphrase band can lower the threshold via the env var.
+# take effect. Calibration note: the default follows the shipped embedding
+# model, BAAI/bge-small-en-v1.5 (384d), measured on real memory text --
+# genuine matches land at 0.62-0.71 (best observed 0.7090) while unrelated
+# queries top out at 0.5960, so the two bands separate. The previous 0.80
+# default sat above the entire genuine band, which made vector-only
+# episodic admission unreachable on the default model: session-scope dense
+# recall returned nothing at all. 0.62 admits that band and still excluded
+# every unrelated row measured (0 of 390 candidates). Deployments on
+# e5-style stores, whose paraphrase band sits at 0.74-0.80, can raise the
+# threshold via the env var.
 EM_VEC_ADMIT = _env_vec_admit()
 
 
@@ -2523,19 +2556,23 @@ def _extract_and_store_entities(beam: "BeamMemory", memory_id: str, content: str
         # instance, shares the thread-local connection). UNIQUE constraint
         # on (memory_id, kind, value) plus INSERT OR IGNORE makes this
         # idempotent -- re-extraction on duplicate-content writes is a no-op.
-        beam.annotations.add_many(
+        beam.annotations._add_many(
             memory_id=memory_id,
             kind="mentions",
             values=entities,
             source="regex",
             confidence=0.8,
+            _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
         )
     except Exception:
         # Entity extraction is best-effort; never fail remember() because of it
         pass
 
 
-def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, source: str = ""):
+def _extract_and_store_facts(
+    beam: "BeamMemory", memory_id: str, content: str, source: str = "",
+    write_policy=None,
+):
     """
     Extract structured facts from content using LLM and store as annotations
     + facts table. Called internally by remember() when extract=True.
@@ -2550,9 +2587,12 @@ def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, s
     coexist.
     """
     try:
-        from mnemosyne.core.extraction import extract_facts_safe
         from mnemosyne.core.annotations import filter_facts
+        from mnemosyne.core.extraction import extract_facts_safe
+        from mnemosyne.core.filters import current_write_policy
 
+        if write_policy is None:
+            write_policy = current_write_policy()
         facts = extract_facts_safe(content)
         if not facts:
             return
@@ -2566,11 +2606,14 @@ def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, s
                 values=kept,
                 source=source,
                 confidence=0.7,
+                _write_policy=write_policy,
             )
 
-        # ALSO store in facts table (new cloud extraction path) -- uses the
-        # full facts list (matching pre-E6 behavior).
-        _store_facts_in_table(beam, memory_id, content, source, facts)
+        # ALSO store every policy-admitted fact in the facts table (new cloud
+        # extraction path), preserving the pre-E6 two-store behavior.
+        _store_facts_in_table(
+            beam, memory_id, content, source, facts, write_policy=write_policy
+        )
 
     except Exception:
         # Fact extraction is best-effort; never fail remember() because of it
@@ -2578,13 +2621,18 @@ def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, s
 
 
 def _store_facts_in_table(beam: "BeamMemory", memory_id: str,
-                          content: str, source: str, facts: list):
+                          content: str, source: str, facts: list,
+                          write_policy=None):
     """Store extracted free-text facts as simple SPO entries in the facts table."""
     import hashlib
     cursor = beam.conn.cursor()
     timestamp = __import__('datetime').datetime.now().isoformat()
     
+    from mnemosyne.core.filters import admit_memory_write
+
     for i, fact_text in enumerate(facts):
+        if not admit_memory_write(fact_text, policy=write_policy)[0]:
+            continue
         # Derive subject from source, predicate = "stated", object = fact text
         subject = source or "user"
         fact_id = hashlib.sha256(
@@ -4872,11 +4920,27 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
         "bit": "vec_quantize_binary(?)",
         "int8": "vec_quantize_int8(?, 'unit')",
     }.get(vec_type, "?")
+    # int8 rows are scored from their stored bytes (exact cosine), so the query
+    # blob and the vector column are fetched up front. Without them there is no
+    # cosine to report: abstain and let the caller's exact compatibility scan
+    # score the candidate set instead of guessing from the distance.
+    query_blob: "Optional[bytes]" = None
+    use_blobs = vec_type == "int8"
+    if use_blobs:
+        try:
+            query_blob = bytes(conn.execute(
+                "SELECT vec_quantize_int8(?, 'unit')", (emb_json,)
+            ).fetchone()[0])
+        except Exception:
+            query_blob = None
+        if not query_blob:
+            return []
+    blob_col = ", vw.embedding" if use_blobs else ""
     rows = []
     while True:
         try:
             rows = conn.execute(f"""
-                SELECT wm.id, vw.distance
+                SELECT wm.id, vw.distance{blob_col}
                 FROM vec_working vw
                 JOIN working_memory wm ON wm.rowid = vw.rowid
                 WHERE vw.embedding MATCH {match_expr}
@@ -4885,19 +4949,26 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
                 ORDER BY vw.distance
             """, (emb_json, scan_k, *where_params)).fetchall()
         except Exception:
+            # An unusable vec table (or a store that cannot return the vector
+            # column) has no blob to score: abstain rather than guess.
             return []
         if len(rows) >= k or scan_k >= total_vectors:
             break
         scan_k = min(total_vectors, scan_k * 2)
     results = []
+    keys = rows[0].keys() if rows else []
     for row in rows:
         distance = float(row["distance"])
         # Keep the existing caller contract: larger sim is better and roughly
-        # cosine-like. sqlite-vec reports a distance whose raw scale differs
-        # by backend/vector type; divide by dimensionality before bounding so
-        # the vector voice remains comparable to the memory_embeddings cosine
-        # fallback instead of collapsing to ~0 on high-dimensional vectors.
-        sim = max(0.0, min(1.0, 1.0 - (max(distance, 0.0) / (2.0 * EMBEDDING_DIM))))
+        # cosine-like. int8 candidates come from their stored bytes; the other
+        # arms keep their mapping, which stays comparable to the
+        # memory_embeddings cosine fallback instead of collapsing to ~0 on high
+        # dimensions.
+        row_blob = row["embedding"] if "embedding" in keys else None
+        sim = _wm_vec_row_sim(distance, vec_type, query_blob, row_blob)
+        if sim is None:
+            # int8 candidate without a usable blob (see _wm_vec_row_sim).
+            return []
         results.append({"id": row["id"], "sim": sim})
     return results[:k]
 
@@ -5201,7 +5272,10 @@ class BeamMemory:
                  veracity: str = "unknown",
                  trust_tier: str = None,
                  memory_type: str = None,
-                 dedupe: bool = True) -> str:
+                 dedupe: bool = True,
+                 _write_kind: object = "public",
+                 _write_policy=None,
+                 _write_policy_content: Optional[str] = None) -> Optional[str]:
         """Store into working_memory. Deduplicates exact content matches.
 
         When called from the legacy-compatible Mnemosyne.remember() path,
@@ -5247,6 +5321,27 @@ class BeamMemory:
                 dedup-update path applies memory_type via COALESCE, so an
                 explicit type on a colliding write retypes the existing row.
         """
+        # This is the common policy boundary for every public content gateway.
+        # It runs before sanitization, deduplication, blob writes, or SQL.
+        from mnemosyne.core.filters import (
+            admit_memory_write,
+            current_write_policy,
+            is_write_policy_exempt,
+        )
+
+        write_policy = (
+            _write_policy
+            if _write_policy is not None or is_write_policy_exempt(_write_kind)
+            else current_write_policy()
+        )
+        should_write, _decision = admit_memory_write(
+            content if _write_policy_content is None else _write_policy_content,
+            write_kind=_write_kind,
+            policy=write_policy,
+        )
+        if not should_write:
+            return None
+
         # Clamp veracity at the BeamMemory.remember entry too -- the
         # method is the lowest-level public ingest path under BeamMemory,
         # so consistency with remember_batch and the provider
@@ -5337,7 +5432,9 @@ class BeamMemory:
                 if extract_entities:
                     _extract_and_store_entities(self, existing_id, content)
                 if extract:
-                    _extract_and_store_facts(self, existing_id, content, source)
+                    _extract_and_store_facts(
+                        self, existing_id, content, source, write_policy
+                    )
                 # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
                 # Populates memoria_facts, memoria_timelines, memoria_kg for the
                 # structured retrieval router. Runs silently on every remember()
@@ -5409,7 +5506,10 @@ class BeamMemory:
                     )
 
             # Auto-generate temporal triple
-            self._add_temporal_triple(memory_id, timestamp, source, content)
+            self._add_temporal_triple(
+                memory_id, timestamp, source, content,
+                _write_kind=_write_kind, _write_policy=write_policy,
+            )
 
             # --- Temporal extraction ---
             if extract_temporal is not None:
@@ -5434,7 +5534,9 @@ class BeamMemory:
 
             # --- Structured fact extraction ---
             if extract:
-                _extract_and_store_facts(self, memory_id, content, source)
+                _extract_and_store_facts(
+                    self, memory_id, content, source, write_policy
+                )
 
             # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
             # Populates memoria_facts, memoria_timelines, memoria_kg for the
@@ -5476,7 +5578,7 @@ class BeamMemory:
                        force_veracity: bool = False,
                        trust_tier: str = "IMPORTED",
                        extract_entities: bool = False,
-                       extract: bool = False) -> List[str]:
+                       extract: bool = False) -> List[Optional[str]]:
         """
         Batch insert into working_memory for high-throughput ingestion.
         Each item dict should have keys: content, source, importance,
@@ -5553,6 +5655,22 @@ class BeamMemory:
         BEAM benchmark's 250k-message ingest, ~minutes. Documented in
         CHANGELOG.
         """
+        from mnemosyne.core.filters import admit_memory_write, current_write_policy
+        policy = current_write_policy()
+        result_ids: List[Optional[str]] = [None] * len(items)
+        admitted_items = []
+        admitted_positions = []
+        for position, item in enumerate(items):
+            should_write, _decision = admit_memory_write(
+                item["content"], policy=policy
+            )
+            if should_write:
+                admitted_items.append(item)
+                admitted_positions.append(position)
+        items = admitted_items
+        if not items:
+            return result_ids
+
         cursor = self.conn.cursor()
         ids = []
         # Carry per-row source + veracity through to enrichment so we
@@ -5580,6 +5698,7 @@ class BeamMemory:
 
             memory_id = _generate_id(item["content"])
             ids.append(memory_id)
+            result_ids[admitted_positions[len(ids) - 1]] = memory_id
             # Typed memory classification
             # Per-item explicit type wins and short-circuits the classifier,
             # matching remember(). There is no method-level default: a batch
@@ -5702,7 +5821,8 @@ class BeamMemory:
                 row_content = row["content"] if hasattr(row, "keys") else row[0]
                 row_timestamp = row["timestamp"] if hasattr(row, "keys") else row[1]
                 self._add_temporal_triple(
-                    memory_id, row_timestamp, item_source, row_content
+                    memory_id, row_timestamp, item_source, row_content,
+                    _write_policy=policy,
                 )
                 self._ingest_graph_and_veracity(
                     memory_id, row_content, item_source, item_veracity
@@ -5710,7 +5830,10 @@ class BeamMemory:
                 if extract_entities:
                     _extract_and_store_entities(self, memory_id, row_content)
                 if extract:
-                    _extract_and_store_facts(self, memory_id, row_content, item_source)
+                    _extract_and_store_facts(
+                        self, memory_id, row_content, item_source,
+                        write_policy=policy,
+                    )
                 # Phase 2: MEMORIA regex-based extraction for every batch row.
                 try:
                     self.extract_and_store_facts(row_content, message_idx=0, source_memory_id=memory_id)
@@ -5735,7 +5858,7 @@ class BeamMemory:
                 )
 
         self._trim_working_memory()
-        return ids
+        return result_ids
 
     def _ingest_graph_and_veracity(self, memory_id: str, content: str,
                                     source: str, veracity: str = "unknown"):
@@ -5897,7 +6020,10 @@ class BeamMemory:
             logger.debug("Proactive linking outer wrapper failed for %s", memory_id, exc_info=True)
             # Non-blocking — never surface to caller
 
-    def _add_temporal_triple(self, memory_id: str, timestamp: str, source: str, content: str):
+    def _add_temporal_triple(
+        self, memory_id: str, timestamp: str, source: str, content: str, *,
+        _write_kind: object = "public", _write_policy=None,
+    ):
         """Auto-generate temporal annotations for a memory.
 
         Post-E6: writes occurred_on / has_source as annotations rather
@@ -5913,6 +6039,8 @@ class BeamMemory:
                 memory_id=memory_id,
                 kind="occurred_on",
                 value=date_str,
+                _write_kind=_write_kind,
+                _write_policy=_write_policy,
             )
             # Also tag source type
             if source and source not in ("conversation", "user", "assistant"):
@@ -5920,6 +6048,8 @@ class BeamMemory:
                     memory_id=memory_id,
                     kind="has_source",
                     value=source,
+                    _write_kind=_write_kind,
+                    _write_policy=_write_policy,
                 )
         except Exception:
             # Annotation writes are optional; don't fail memory write if they fail
@@ -6403,7 +6533,7 @@ class BeamMemory:
 
     def update_working(self, memory_id: str, content: str = None,
                        importance: float = None, pinned: int = None,
-                       timestamp: str = None) -> bool:
+                       timestamp: str = None, _write_policy=None) -> Optional[bool]:
         """Update a working_memory entry.
 
         After updating content, reindexes FTS5 (via wm_au trigger) and
@@ -6415,6 +6545,15 @@ class BeamMemory:
         pinned=1; the operator re-dates or unpins them explicitly
         through this API — no raw SQL required.
         """
+        if content is not None:
+            from mnemosyne.core.filters import admit_memory_write
+
+            should_write, _decision = admit_memory_write(
+                content, policy=_write_policy
+            )
+            if not should_write:
+                return None
+
         cursor = self.conn.cursor()
         updates = []
         params = []
@@ -6596,7 +6735,9 @@ class BeamMemory:
                                 event_timestamp: 'Optional[str]' = None,
                                 event_date: 'Optional[str]' = None,
                                 event_date_precision: 'Optional[str]' = None,
-                                emit_event: bool = True) -> str:
+                                emit_event: bool = True,
+                                _write_kind: object = "public",
+                                _write_policy=None) -> Optional[str]:
         """
         Store a consolidated summary into episodic_memory with optional embedding.
 
@@ -6619,6 +6760,17 @@ class BeamMemory:
         values and pass it here. `None` falls back to 'unknown' (matches
         legacy behavior + schema default).
         """
+        # Public raw-content admission must precede classification, embedding,
+        # event emission, and every SQL/vector mutation. Only the sleep pipeline
+        # marks its generated summary as system-derived; direct callers remain
+        # public even when they choose source="sleep_consolidation".
+        from mnemosyne.core.filters import admit_memory_write
+        should_write, _decision = admit_memory_write(
+            summary, write_kind=_write_kind, policy=_write_policy
+        )
+        if not should_write:
+            return None
+
         # Caller-owned transaction gate (round-4): the MEMORY_CONSOLIDATED
         # event must never precede the commit that persists the row. Under
         # a caller-owned transaction this method cannot observe the outer
@@ -10569,7 +10721,11 @@ class BeamMemory:
     # ------------------------------------------------------------------
     # Scratchpad
     # ------------------------------------------------------------------
-    def scratchpad_write(self, content: str) -> str:
+    def scratchpad_write(self, content: str) -> Optional[str]:
+        from mnemosyne.core.filters import admit_memory_write
+
+        if not admit_memory_write(content)[0]:
+            return None
         pad_id = _generate_id(content)
         ts = datetime.now().isoformat()
         self.conn.execute("""
@@ -11119,7 +11275,9 @@ class BeamMemory:
         """
         from mnemosyne.core.aaak import encode as aaak_encode
         from mnemosyne.core import local_llm
+        from mnemosyne.core.filters import current_write_policy
 
+        sleep_write_policy = None
         cursor = self.conn.cursor()
         _cutoff_raw = (
             datetime.now(timezone.utc)
@@ -11598,6 +11756,8 @@ class BeamMemory:
                         _agg_event_date_precision = "unknown"
                 if _agg_event_date_precision not in _EVENT_DATE_PRECISIONS:
                     _agg_event_date_precision = "unknown"
+                if sleep_write_policy is None:
+                    sleep_write_policy = current_write_policy()
                 self.consolidate_to_episodic(
                     summary=summary,
                     source_wm_ids=ids,
@@ -11609,6 +11769,8 @@ class BeamMemory:
                     scope=aggregated_scope,
                     valid_until=aggregated_valid_until,
                     veracity=aggregated_veracity,
+                    _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
+                    _write_policy=sleep_write_policy,
                     metadata={
                         "original_count": len(items),
                         "source": source,
@@ -11636,6 +11798,7 @@ class BeamMemory:
                             scope="session",
                             veracity="inferred",
                             trust_tier="DERIVED",
+                            _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
                         )
                         # Proposal rows are review artifacts from this sleep pass,
                         # not fresh raw memories that should recursively trigger

@@ -162,8 +162,12 @@ def test_empty_gateway_session_key_falls_back(tmp_path, monkeypatch):
 
 def test_prefetch_scopes_to_thread(tmp_path, monkeypatch):
     """prefetch() should only return memories from the current thread's session,
-    plus scope='global' memories."""
-    monkeypatch.setenv("MNEMOSYNE_AUTHOR_ID", "")  # default in user's env
+    plus scope='global' memories.
+
+    MNEMOSYNE_AUTHOR_ID is set to a NON-EMPTY value: the env-based author
+    fallback must never widen prefetch recall to (1=1) (CWE-200), so thread
+    isolation must hold even when an author identity is configured."""
+    monkeypatch.setenv("MNEMOSYNE_AUTHOR_ID", "thread-test-author")
 
     prov_a = _make_provider(
         tmp_path, monkeypatch,

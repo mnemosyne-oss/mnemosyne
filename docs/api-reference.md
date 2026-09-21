@@ -30,11 +30,11 @@ These functions create a default `Mnemosyne` instance and delegate to it. The op
 
 | Function | Signature | Description |
 |---|---|---|
-| `remember()` | `(content, source="conversation", importance=0.5, **kwargs) -> str` | Store a memory, returns memory ID |
+| `remember()` | `(content, source="conversation", importance=0.5, **kwargs) -> Optional[str]` | Store a memory; returns its ID, or `None` when write policy rejects it |
 | `recall()` | `(query, top_k=5, **kwargs) -> list` | Search memories |
 | `get_stats()` | `() -> dict` | Memory statistics |
 | `forget()` | `(memory_id) -> bool` | Delete a memory |
-| `update()` | `(memory_id, **kwargs) -> bool` | Update a memory |
+| `update()` | `(memory_id, **kwargs) -> Optional[bool]` | Update a memory; returns `None` when write policy rejects it |
 | `get_context()` | `(limit=10, bank=None) -> list[dict]` | Get recent working-memory context |
 
 ---
@@ -555,7 +555,8 @@ from mnemosyne.core.canonical import CanonicalStore
 
 store = CanonicalStore(db_path)
 
-# Upsert the canonical value for a slot (returns the current row + status).
+# Upsert the canonical value for a slot (returns the current row + status,
+# or None without mutation when write policy rejects the body).
 store.remember("jessi", "identity", "name", "My name is Jessi.")   # status="created"
 store.remember("jessi", "identity", "name", "My name is Jessi.")   # status="unchanged" (no-op)
 store.remember("jessi", "identity", "name", "I go by Jess now.")    # status="updated"

@@ -261,23 +261,34 @@ class TestDetectionFailureAbstains:
 class TestEnvValidation:
     def test_invalid_env_falls_back(self, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_EM_VEC_ADMIT", "garbage")
-        assert beam_module._env_vec_admit() == pytest.approx(0.80)
+        assert beam_module._env_vec_admit() == pytest.approx(0.62)
 
     def test_nan_env_falls_back(self, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_EM_VEC_ADMIT", "nan")
-        assert beam_module._env_vec_admit() == pytest.approx(0.80)
+        assert beam_module._env_vec_admit() == pytest.approx(0.62)
 
     def test_inf_env_falls_back(self, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_EM_VEC_ADMIT", "inf")
-        assert beam_module._env_vec_admit() == pytest.approx(0.80)
+        assert beam_module._env_vec_admit() == pytest.approx(0.62)
 
     def test_out_of_range_env_falls_back(self, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_EM_VEC_ADMIT", "2")
-        assert beam_module._env_vec_admit() == pytest.approx(0.80)
+        assert beam_module._env_vec_admit() == pytest.approx(0.62)
 
     def test_valid_env_is_honored(self, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_EM_VEC_ADMIT", "0.70")
         assert beam_module._env_vec_admit() == pytest.approx(0.70)
+
+    def test_default_stays_on_the_default_models_genuine_band(self, monkeypatch):
+        """The shipped default must sit inside the genuine-match band of the
+        default embedding model, BAAI/bge-small-en-v1.5 (384d), whose real
+        matches measure 0.62-0.71 while unrelated queries top out at 0.5960.
+        A default above the band is not a stricter filter, it is an
+        unreachable one: every vector-only episodic candidate is rejected
+        and session-scope dense recall returns nothing. It was 0.80, which
+        is above the band's best observed 0.7090."""
+        monkeypatch.delenv("MNEMOSYNE_EM_VEC_ADMIT", raising=False)
+        assert beam_module._env_vec_admit() == pytest.approx(0.62)
 
 
 class TestInt8BlobCosine:
@@ -286,7 +297,7 @@ class TestInt8BlobCosine:
     @requires_vec
     def test_recovers_true_cosine_above_gate(self):
         """The maintainer's case: true cosine 0.82 at 1024d must score
-        >= 0.80 (the constant model scored 0.7915 and rejected it)."""
+        >= EM_VEC_ADMIT (the constant model scored 0.7915 and rejected it)."""
         rng = np.random.default_rng(42)
         dim = 1024
         a, b = exact_cos_pair(rng, dim, 0.82)

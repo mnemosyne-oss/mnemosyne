@@ -1,8 +1,17 @@
 name: mnemosyne
 kind: exclusive
-version: 0.7.0
+version: 0.7.2
 description: "Native local memory for Hermes - SQLite with vector search, FTS5 hybrid ranking, episodic consolidation, and temporal triples. Zero cloud. Installed from the Hermes plugin catalog; the implementation is the mnemosyne-hermes package declared in pyproject.toml."
 author: Abdias J
+# A floor, not a pin: Hermes refuses to load this plugin when the running version fails this
+# specifier, so the value names the first Hermes release that carries both halves of the catalog
+# path this wrapper depends on: declared Python dependencies installed and re-applied after
+# `hermes update` (hermes-agent#113851, commit 96e8a23222) and automatic catalog install of
+# memory providers that leave core (#114569, commit d177b119). Both landed on Hermes `main`
+# after the 0.21.3 release (tag v2026.9.14, 2026-09-14), and `hermes_cli/plugin_python_deps.py`
+# does not exist at that tag, so 0.21.3 loads this plugin without the install path it needs.
+# Load-blocking below 0.21.4 is the intended fail-closed behaviour, not a defect: do not lower
+# this to a release that predates hermes-agent#113851. Raised at hermes-agent#113581.
 requires_hermes: ">=0.21.4"
 provides_tools:
   - mnemosyne_apply_pending
