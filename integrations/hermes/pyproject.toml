@@ -12,7 +12,7 @@ authors = [{name = "Abdias J", email = "abdi.moya@gmail.com"}]
 requires-python = ">=3.10"
 keywords = ["hermes-agent", "memory", "mnemosyne", "ai-agents", "local-first", "long-term-memory"]
 dependencies = [
-    "mnemosyne-memory[embeddings]>=4.0.0b3",
+    "mnemosyne-memory[embeddings]>=4.0.0b4",
     "PyYAML>=6.0",
 ]
 classifiers = [
@@ -27,11 +27,11 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-llm = ["mnemosyne-memory[llm]>=4.0.0b3"]
-mcp = ["mnemosyne-memory[mcp]>=4.0.0b3"]
+llm = ["mnemosyne-memory[llm]>=4.0.0b4"]
+mcp = ["mnemosyne-memory[mcp]>=4.0.0b4"]
 test = ["pytest>=7.0"]
 dev = ["mnemosyne-hermes[test]", "build", "twine"]
-all = ["mnemosyne-memory[all]>=4.0.0b3"]
+all = ["mnemosyne-memory[all]>=4.0.0b4"]
 
 [project.entry-points."hermes_agent.plugins"]
 hermes-mnemosyne = "mnemosyne_hermes:register"

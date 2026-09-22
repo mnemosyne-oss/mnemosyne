@@ -8,5 +8,5 @@ description = "Mnemosyne memory provider for Hermes Agent, catalog wrapper"
 requires-python = ">=3.11"
 dependencies = [
     "mnemosyne-hermes>=0.7.4,<0.8",
-    "mnemosyne-memory[embeddings]>=4.0.0b3",
+    "mnemosyne-memory[embeddings]>=4.0.0b4",
 ]
