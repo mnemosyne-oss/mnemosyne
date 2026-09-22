@@ -3191,3 +3191,32 @@ def test_remember_warns_when_embed_returns_wrong_count(temp_db, monkeypatch, cap
     assert "content for count mismatch check" not in msg, (
         f"WARNING log leaked memory content: {msg!r}"
     )
+
+
+def test_recall_scopes_working_fts_before_bounded_candidate_pool(temp_db):
+    source = BeamMemory(session_id="source-session", db_path=temp_db)
+    target = BeamMemory(session_id="target-session", db_path=temp_db)
+    source_ids = []
+    try:
+        for index in range(60):
+            source_ids.append(source.remember(
+                f"needle shared needle shared out-of-scope filler {index}",
+                source="test",
+                scope="session",
+            ))
+        target_id = target.remember(
+            "needle shared in-scope target",
+            source="test",
+            scope="session",
+        )
+
+        isolated = target.recall("needle shared", top_k=5)
+        assert any(row["id"] == target_id and row["fts_score"] > 0 for row in isolated)
+        assert not any(row["id"] in source_ids for row in isolated)
+
+        cross_session = target.recall("needle shared", top_k=100, _cross_session=True)
+        assert any(row["id"] == target_id and row["fts_score"] > 0 for row in cross_session)
+        assert any(row["id"] in source_ids for row in cross_session)
+    finally:
+        source.conn.close()
+        target.conn.close()

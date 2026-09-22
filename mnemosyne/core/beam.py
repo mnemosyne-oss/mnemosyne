@@ -4444,7 +4444,8 @@ def _has_cjk(text: str) -> bool:
     )
 
 
-def _cjk_like_search(conn: sqlite3.Connection, query: str, k: int = 20, working: bool = False) -> List[Dict]:
+def _cjk_like_search(conn: sqlite3.Connection, query: str, k: int = 20, working: bool = False, *,
+                     where_sql: str = "", where_params: Tuple[Any, ...] = ()) -> List[Dict]:
     """Fallback LIKE search for CJK text.
 
     The default unicode61 FTS5 tokenizer does not index CJK characters
@@ -4468,9 +4469,13 @@ def _cjk_like_search(conn: sqlite3.Connection, query: str, k: int = 20, working:
     if working:
         table = "working_memory"
         id_col = "id"
+        join_sql = ""
+        visibility = f" AND ({where_sql})" if where_sql else ""
     else:
         table = "episodic_memory"
         id_col = "rowid"
+        join_sql = ""
+        visibility = ""
 
     # Build parameterized LIKE clauses for each CJK character
     conditions = " OR ".join("content LIKE ? ESCAPE '\\'" for _ in cjk_chars)
@@ -4478,8 +4483,8 @@ def _cjk_like_search(conn: sqlite3.Connection, query: str, k: int = 20, working:
     # Also search for mixed CJK+ASCII: any of the CJK chars must be present
     try:
         all_rows = conn.execute(
-            f"SELECT {id_col}, content FROM {table} WHERE {conditions} LIMIT ?",
-            params + [k * 5]
+            f"SELECT {id_col}, content FROM {table}{join_sql} WHERE {conditions}{visibility} LIMIT ?",
+            params + list(where_params) + [k * 5]
         ).fetchall()
     except Exception:
         return []
@@ -4595,7 +4600,8 @@ def _cyrillic_score(query: str, content: str, n: int = 3) -> float:
 
 
 def _cyrillic_like_search(
-    conn: sqlite3.Connection, query: str, k: int = 20, working: bool = False,
+    conn: sqlite3.Connection, query: str, k: int = 20, working: bool = False, *,
+    where_sql: str = "", where_params: Tuple[Any, ...] = (),
 ) -> List[Dict]:
     """LIKE-based FTS5 fallback for Russian/Cyrillic text.
 
@@ -4613,8 +4619,10 @@ def _cyrillic_like_search(
         return []
     if working:
         table, id_col = "working_memory", "id"
+        visibility = f" AND ({where_sql})" if where_sql else ""
     else:
         table, id_col = "episodic_memory", "rowid"
+        visibility = ""
 
     # SQLite's default LOWER() and LIKE are ASCII-only, so they cannot
     # case-fold Cyrillic letters (Т ≠ т, Ё ≠ ё). Register a Python
@@ -4640,8 +4648,8 @@ def _cyrillic_like_search(
     params = [f"%{w[:4].lower()}%" for w in q_words]
     try:
         all_rows = conn.execute(
-            f"SELECT {id_col}, content FROM {table} WHERE {conditions} LIMIT ?",
-            params + [k * 5],
+            f"SELECT {id_col}, content FROM {table} WHERE {conditions}{visibility} LIMIT ?",
+            params + list(where_params) + [k * 5],
         ).fetchall()
     except Exception:
         return []
@@ -4669,6 +4677,10 @@ def _fts_staged_rows(
     query: str,
     k: int,
     expansion_terms: List[str],
+    *,
+    join_sql: str = "",
+    where_sql: str = "",
+    where_params: Tuple[Any, ...] = (),
 ) -> List[Dict]:
     """Fill the bounded candidate budget with exact hits before expansions.
 
@@ -4709,13 +4721,16 @@ def _fts_staged_rows(
     literal hits without enlarging the pool. Thirds and halves need no
     per-corpus constant.
     """
+    qualified_id = f"{table}.{id_col}" if join_sql else id_col
     match_sql = (
+        f"SELECT {qualified_id}, rank FROM {table}{join_sql} WHERE {table} MATCH ?"
+        f" AND ({where_sql})" if where_sql else
         f"SELECT {id_col}, rank FROM {table} WHERE {table} MATCH ?"
-        f" ORDER BY rank, {id_col} LIMIT ?"
     )
+    match_sql += f" ORDER BY {qualified_id} LIMIT ?"
     precise_terms = _fts_precise_terms(query)
     if not precise_terms or precise_terms == expansion_terms:
-        rows = conn.execute(match_sql, (" OR ".join(expansion_terms), k)).fetchall()
+        rows = conn.execute(match_sql, (" OR ".join(expansion_terms), *where_params, k)).fetchall()
         return [{id_col: r[id_col], "rank": r["rank"]} for r in rows]
     exact_terms = _fts_precise_terms(query, widen=False)
 
@@ -4728,7 +4743,7 @@ def _fts_staged_rows(
     ):
         if len(ordered_ids) >= budget:
             continue
-        for r in conn.execute(match_sql, (" OR ".join(terms), budget)).fetchall():
+        for r in conn.execute(match_sql, (" OR ".join(terms), *where_params, budget)).fetchall():
             rid = r[id_col]
             if rid in seen_ids:
                 continue
@@ -4741,9 +4756,10 @@ def _fts_staged_rows(
 
     placeholders = ",".join("?" * len(ordered_ids))
     rank_rows = conn.execute(
-        f"SELECT {id_col}, rank FROM {table}"
-        f" WHERE {table} MATCH ? AND {id_col} IN ({placeholders})",
-        (" OR ".join(expansion_terms), *ordered_ids),
+        f"SELECT {qualified_id}, rank FROM {table}{join_sql}"
+        f" WHERE {table} MATCH ? AND {qualified_id} IN ({placeholders})"
+        + (f" AND ({where_sql})" if where_sql else ""),
+        (" OR ".join(expansion_terms), *ordered_ids, *where_params),
     ).fetchall()
     ranks = {r[id_col]: r["rank"] for r in rank_rows}
     # An exact hit the expansion terms cannot reach keeps the pool slot but
@@ -4783,20 +4799,24 @@ def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]
     return rows
 
 
-def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]:
-    """Search FTS5 working memory and return ids with ranks."""
+def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20, *,
+                        where_sql: str = "",
+                        where_params: Tuple[Any, ...] = ()) -> List[Dict]:
+    """Search working FTS, optionally scoped to visible working-memory rows."""
     terms = _fts_query_terms(query)
     if not terms:
         if _has_cjk(query):
-            return _cjk_like_search(conn, query, k=k, working=True)
+            return _cjk_like_search(conn, query, k=k, working=True, where_sql=where_sql, where_params=where_params)
         if _has_cyrillic(query):
-            return _cyrillic_like_search(conn, query, k=k, working=True)
+            return _cyrillic_like_search(conn, query, k=k, working=True, where_sql=where_sql, where_params=where_params)
         return []
-    rows = _fts_staged_rows(conn, "fts_working", "id", query, k, terms)
+    rows = _fts_staged_rows(conn, "fts_working", "id", query, k, terms,
+                            join_sql=" JOIN working_memory wm ON wm.id = fts_working.id" if where_sql else "",
+                            where_sql=where_sql, where_params=where_params)
     if not rows and _has_cjk(query):
-        return _cjk_like_search(conn, query, k=k, working=True)
+        return _cjk_like_search(conn, query, k=k, working=True, where_sql=where_sql, where_params=where_params)
     if not rows and _has_cyrillic(query):
-        return _cyrillic_like_search(conn, query, k=k, working=True)
+        return _cyrillic_like_search(conn, query, k=k, working=True, where_sql=where_sql, where_params=where_params)
     return rows
 
 
@@ -8182,17 +8202,11 @@ class BeamMemory:
         # row. Overfetch by excluded ROWS bounds all possible FTS dropouts.
         _excluded_wm_ids = resolve_exclusions(self.conn, exclude_captures)
         _echo_overfetch = len(_excluded_wm_ids)
-        try:
-            wm_fts = _fts_search_working(
-                self.conn, query, k=max(top_k * 3, 50) + _echo_overfetch
-            )
-        except Exception:
-            wm_fts = []
-        _wm_fts_raw_count = len(wm_fts)
+        # FTS is populated after wm_where is built below so its bounded pool
+        # cannot be consumed by rows that the final SELECT will reject.
+        wm_fts = []
 
         wm_ids = {r["id"] for r in wm_fts}
-        wm_ranks = {r["id"]: r["rank"] for r in wm_fts}
-
         # Build temporal/filter clause for working memory before vector search
         # so _wm_vec_search can push the same recall filters into SQL instead
         # of scanning broad memory_embeddings rows and filtering later.
@@ -8247,6 +8261,17 @@ class BeamMemory:
             wm_params.append(channel_id)
         
         wm_where = " AND ".join(wm_where_clauses)
+
+        try:
+            wm_fts = _fts_search_working(
+                self.conn, query, k=max(top_k * 3, 50) + _echo_overfetch,
+                where_sql=wm_where, where_params=tuple(wm_params),
+            )
+        except Exception:
+            wm_fts = []
+        _wm_fts_raw_count = len(wm_fts)
+        wm_ids = {r["id"] for r in wm_fts}
+        wm_ranks = {r["id"]: r["rank"] for r in wm_fts}
 
         # Vector pool isolation (#696): raw dialog capture (source='conversation',
         # source='honcho_message') stays fully FTS-reachable but is excluded from
