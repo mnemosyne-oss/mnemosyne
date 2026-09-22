@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mnemosyne-hermes"
-version = "0.7.3"
+version = "0.7.4"
 description = "Mnemosyne memory provider for Hermes Agent — local-first, zero-cloud memory"
 readme = "README.md"
 license = "MIT"
@@ -34,10 +34,10 @@ dev = ["mnemosyne-hermes[test]", "build", "twine"]
 all = ["mnemosyne-memory[all]>=4.0.0b3"]
 
 [project.entry-points."hermes_agent.plugins"]
-mnemosyne = "mnemosyne_hermes:register"
+hermes-mnemosyne = "mnemosyne_hermes:register"
 
 [project.entry-points."hermes_agent.memory_providers"]
-mnemosyne = "mnemosyne_hermes"
+hermes-mnemosyne = "mnemosyne_hermes"
 
 [project.scripts]
 mnemosyne-hermes = "mnemosyne_hermes.install:main"

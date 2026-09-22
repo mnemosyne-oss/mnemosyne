@@ -7,6 +7,10 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Hermes wrapper entry-points renamed to `hermes-mnemosyne`.** `integrations/hermes/pyproject.toml` still registered the bare `mnemosyne` key after the plugin was renamed in the #972 revert, so Hermes discovery missed the provider. Both entry-point groups now use the hyphenated name matching `plugin.yaml`, with a contract test pinning the names and a PATCH bump of the wrapper to 0.7.4 across all version surfaces (pyproject, both `plugin.yaml` copies, `__version__`, catalog wrapper and its dependency floor).
+
 ### Added
 
 - **`disable_local_llm` config flag (`MNEMOSYNE_DISABLE_LOCAL_LLM`).** Local GGUF model loading can now be switched off from `config.yaml` (registered in `ENV_VAR_MAP`/`DEFAULTS`/`TEMPLATE_KEYS`, default `false`) instead of relying on a monkey-patch module. `local_llm._load_llm()` consults the flag on every call with the central `config.yaml > env > default` precedence, so `mnemosyne config set disable_local_llm true` takes effect without a restart and the sleep/consolidation path degrades to remote LLM or AAAK encoding.
