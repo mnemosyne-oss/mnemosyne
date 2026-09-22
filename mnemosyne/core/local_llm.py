@@ -233,9 +233,25 @@ def _load_llm_ctransformers(model_path: Path):
         return None
 
 
+def _local_llm_disabled() -> bool:
+    """True when local GGUF loading is disabled via config or env.
+
+    Precedence mirrors the central config: config.yaml > env > default
+    (False). Read per call so ``mnemosyne config set disable_local_llm``
+    applies without a process restart.
+    """
+    try:
+        from mnemosyne.core.config import get_config
+        return get_config().get_bool("disable_local_llm", False)
+    except Exception:
+        return os.environ.get(
+            "MNEMOSYNE_DISABLE_LOCAL_LLM", "").strip().lower() in (
+                "1", "true", "yes", "on")
+
+
 def _load_llm():
     """Lazy-load the best available local LLM backend.
-    
+
     Priority: llama-cpp-python > ctransformers (x86_64 fallback).
     Returns the loaded model/LLM instance, or None if no backend works.
     """
@@ -245,6 +261,10 @@ def _load_llm():
         return _llm_instance
 
     if not LLM_ENABLED:
+        _llm_available = False
+        return None
+
+    if _local_llm_disabled():
         _llm_available = False
         return None
 
