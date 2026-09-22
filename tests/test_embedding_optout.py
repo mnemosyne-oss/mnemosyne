@@ -17,15 +17,56 @@ import urllib.error
 import pytest
 
 from mnemosyne.core import embeddings
+from mnemosyne.core.config import MnemosyneConfig
+
+
+def _isolate_config(monkeypatch, tmp_path):
+    """Point the config singleton at an empty temp config.
+
+    Resolution precedence is config.yaml > env, so an ambient
+    ~/.hermes/mnemosyne/config.yaml would otherwise shadow the env vars
+    under test. An empty file disables seeding and leaves every key unset.
+    The import-time snapshots are re-resolved after the reset so
+    snapshot consumers (``_get_model`` via ``_DEFAULT_MODEL``) see the
+    isolated state instead of the ambient config active at import.
+    """
+    cfg_dir = tmp_path / "mnemosyne-data"
+    cfg_dir.mkdir(exist_ok=True)
+    (cfg_dir / "config.yaml").write_text("")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(cfg_dir))
+    MnemosyneConfig.reset_instance()
+    monkeypatch.setattr(
+        embeddings, "_DEFAULT_MODEL", embeddings._resolve_default_model()
+    )
+    monkeypatch.setattr(
+        embeddings, "_OPENAI_API_KEY", embeddings._resolve_api_key()
+    )
+    monkeypatch.setattr(
+        embeddings, "_OPENAI_BASE_URL", embeddings._resolve_api_base_url()
+    )
+
+
+class _UrlopenOpener:
+    """Test-only opener routing ``.open()`` through ``urlopen``.
+
+    ``_embed_api`` sends credentialed requests via
+    ``build_opener(...).open()``, not ``urlopen``, so tests that set an API
+    key and mock ``urlopen`` would otherwise attempt real network egress.
+    Delegating keeps a single mock seam; the redirect-refusal policy keeps
+    dedicated tests (``test_embedding_dim_fresh_process.py``).
+    """
+
+    def open(self, req, timeout=None):
+        return embeddings.urllib.request.urlopen(req, timeout=timeout)
 
 
 @pytest.fixture(autouse=True)
-def _clean_embedding_env(monkeypatch):
+def _clean_embedding_env(monkeypatch, tmp_path):
     """Make sure no embedding-related env var leaks between tests. The module
-    global is blanked too: _embed_api reads _OPENAI_API_KEY (captured at
-    import), so a shell-exported key would otherwise flip tests onto the
-    credentialed transport, bypass their urlopen patches, and attempt real
-    credentialed network egress."""
+    globals are re-resolved too: resolution is lazy (config.yaml > env), so
+    blanking ``_OPENAI_API_KEY`` alone no longer controls the transport --
+    a test-set env key would flip tests onto the credentialed transport,
+    bypass their urlopen patches, and attempt real credentialed egress."""
     for key in (
         "MNEMOSYNE_NO_EMBEDDINGS",
         "MNEMOSYNE_SKIP_EMBEDDINGS",
@@ -34,7 +75,11 @@ def _clean_embedding_env(monkeypatch):
         "MNEMOSYNE_EMBEDDING_API_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
-    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "")
+    _isolate_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        embeddings.urllib.request, "build_opener",
+        lambda *handlers: _UrlopenOpener(),
+    )
     yield
 
 

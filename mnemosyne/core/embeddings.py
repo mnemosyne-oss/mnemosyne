@@ -65,11 +65,98 @@ _FASTEMBED_CACHE_DIR = os.environ.get(
     ),
 )
 
+# --- helpers: config.yaml-aware resolution ---
+# embeddings.py originally read env vars only, ignoring ~/.hermes/mnemosyne/config.yaml.
+# That caused hermes serve (which is launched without MNEMOSYNE_* env, but with
+# a correct config.yaml containing embedding_dim:1024) to fall back to 384 and
+# trigger "Embedding dimension mismatch" on every recall, silently disabling
+# vector search. Central config precedence is config.yaml > env > defaults
+# (see mnemosyne/core/config.py). These helpers mirror it without a hard
+# import cycle: they try get_config() lazily and fall back to env.
+
+def _cfg_get(key: str):
+    try:
+        from mnemosyne.core.config import (  # local import avoids cycle at top-level
+            _default_config_path,
+            get_config,
+        )
+
+        if not _default_config_path().exists():
+            # No config file: do not seed one as a mere import side
+            # effect. Read-only callers (doctor, fresh data dirs) must
+            # not create config.yaml; env fallback is handled below.
+            return None
+        cfg = get_config()
+        val = cfg.get(key)
+        # cfg.get may return None when unset; env fallback handled below.
+        # Empty string from YAML should be treated as unset (like blank env).
+        if val is not None and str(val).strip() != "":
+            return val
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_default_model() -> str:
+    v = _cfg_get("embedding_model")
+    if v is not None:
+        s = str(v).strip()
+        if s:
+            return s
+    return (os.environ.get("MNEMOSYNE_EMBEDDING_MODEL") or "").strip() or "BAAI/bge-small-en-v1.5"
+
+
+def _resolve_api_key() -> str:
+    v = _cfg_get("embedding_api_key")
+    if v is not None:
+        s = str(v).strip()
+        if s:
+            return s
+    env_key = os.environ.get("MNEMOSYNE_EMBEDDING_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+    if env_key.strip():
+        return env_key
+    # Fall back to the import-time snapshot so tests (and callers) that
+    # monkeypatch embeddings._OPENAI_API_KEY keep controlling the transport.
+    return str(globals().get("_OPENAI_API_KEY", "") or "")
+
+
+def _resolve_api_base_url() -> str:
+    v = _cfg_get("embedding_api_url")
+    if v is not None:
+        s = str(v).strip()
+        if s:
+            return s
+    env_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
+    if env_url.strip():
+        return env_url
+    return str(globals().get("_OPENAI_BASE_URL", "") or "") or "https://openrouter.ai/api/v1"
+
+
+def _resolve_embeddings_via_api_raw() -> str:
+    v = _cfg_get("embeddings_via_api")
+    if v is not None:
+        return str(v)
+    return os.environ.get("MNEMOSYNE_EMBEDDINGS_VIA_API", "")
+
+
+def _api_base_url() -> str:
+    """Normalized BASE url for the embeddings endpoint.
+
+    The request builder appends ``/embeddings`` itself, but some writers store
+    the full endpoint (``.../v1/embeddings``) in config.yaml. Strip that suffix
+    so both conventions resolve to the same URL instead of doubling it.
+    """
+    base = _resolve_api_base_url().strip().rstrip("/")
+    if base.endswith("/embeddings"):
+        base = base[: -len("/embeddings")]
+    return base or "https://openrouter.ai/api/v1"
+
+
 # --- OpenAI-compatible API ---
 # Mnemosyne embedding config is independent of general OpenRouter/OpenAI settings.
 # Embedding models may use local llama.cpp, OpenAI, Anthropic, or any other provider.
-_OPENAI_API_KEY = os.environ.get("MNEMOSYNE_EMBEDDING_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
-_OPENAI_BASE_URL = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
+_OPENAI_API_KEY = _resolve_api_key()
+_OPENAI_BASE_URL = _resolve_api_base_url()
 
 # --- Model selection ---
 # Normalize a blank (empty or whitespace-only) env var to the default. Such
@@ -78,7 +165,7 @@ _OPENAI_BASE_URL = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openro
 # empty-string, which is unknown and would raise at import under the fail-loud
 # rule even though the user set nothing meaningful. Uses .strip() to mirror the
 # blank handling for MNEMOSYNE_EMBEDDING_DIM in _get_embedding_dim.
-_DEFAULT_MODEL = (os.environ.get("MNEMOSYNE_EMBEDDING_MODEL") or "").strip() or "BAAI/bge-small-en-v1.5"
+_DEFAULT_MODEL = _resolve_default_model()
 _embedding_model = None
 _API_CALL_COUNT = 0
 
@@ -127,7 +214,8 @@ def _is_api_model(model_name: str) -> bool:
         return True
     # Custom endpoint: if MNEMOSYNE_EMBEDDING_API_URL is set to a non-OpenRouter URL,
     # assume the user has their own API server and any model name should route there.
-    base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
+    _api_url_for_check = _cfg_get("embedding_api_url")
+    base_url = str(_api_url_for_check).strip() if _api_url_for_check is not None else os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
     if base_url and "openrouter.ai" not in base_url:
         return True
     # Explicit opt-in for non-OpenAI embedding models hosted on OpenRouter
@@ -138,7 +226,7 @@ def _is_api_model(model_name: str) -> bool:
     # users that also have OPENROUTER_API_KEY set for chat. Requiring an explicit
     # env flag keeps local-first behavior the default while giving a clean opt-in
     # for OpenRouter-hosted embedding models.
-    if os.environ.get("MNEMOSYNE_EMBEDDINGS_VIA_API", "").strip().lower() in ("1", "true", "yes", "on"):
+    if str(_resolve_embeddings_via_api_raw()).strip().lower() in ("1", "true", "yes", "on"):
         return True
     return False
 
@@ -196,6 +284,23 @@ def _get_embedding_dim(model_name: str) -> int:
     # error -- raise rather than silently fall through to a guess. A set-but-
     # empty value (routine in Docker Compose / .env / CI matrices) is normalized
     # to unset so it does not raise for a known model or with embeddings off.
+    # Check config.yaml first (yaml > env precedence), then env.
+    cfg_dim = _cfg_get("embedding_dim")
+    if cfg_dim is not None and str(cfg_dim).strip():
+        cfg_dim_str = str(cfg_dim).strip()
+        try:
+            value = int(cfg_dim_str)
+        except ValueError:
+            raise ValueError(
+                f"MNEMOSYNE_EMBEDDING_DIM={cfg_dim_str!r} is not a valid integer; "
+                f"set it to the embedding model's output dimension."
+            ) from None
+        if value <= 0:
+            raise ValueError(
+                f"MNEMOSYNE_EMBEDDING_DIM={value} must be a positive integer; "
+                f"vector dimensions are >= 1."
+            )
+        return value
     env_dim = os.environ.get("MNEMOSYNE_EMBEDDING_DIM")
     if env_dim is not None and env_dim.strip():
         try:
@@ -355,11 +460,13 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint)."""
     global _API_CALL_COUNT
     # Require API key for OpenRouter; custom endpoints may not need one.
-    base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
+    base_url = _api_base_url()
     is_custom = "openrouter.ai" not in base_url
-    if not is_custom and not _OPENAI_API_KEY:
+    # Re-resolve API key lazily so config.yaml changes without restart can be picked up
+    _api_key = _resolve_api_key()
+    if not is_custom and not _api_key:
         return None
-    if _OPENAI_API_KEY and not base_url.startswith("https://"):
+    if _api_key and not base_url.startswith("https://"):
         # Fail loud before any request: sending Authorization (and the text
         # being embedded) over cleartext http:// leaks both on the wire.
         raise _EmbeddingPolicyError(
@@ -381,8 +488,8 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
         "HTTP-Referer": "https://mnemosyne.site",
         "X-Title": "Mnemosyne Embedding",
     }
-    if _OPENAI_API_KEY:
-        headers["Authorization"] = f"Bearer {_OPENAI_API_KEY}"
+    if _api_key:
+        headers["Authorization"] = f"Bearer {_api_key}"
 
     def retry_delay(attempt: int) -> float:
         return 0.5 * (2 ** attempt) + random.uniform(0, 0.5)
@@ -396,7 +503,7 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
             cert_file = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
             if cert_file:
                 ctx.load_verify_locations(cert_file)
-            if _OPENAI_API_KEY:
+            if _api_key:
                 # Credentialed: refuse redirects (Authorization would be
                 # forwarded to the target); uncredentialed requests keep
                 # the default redirect behavior.
@@ -467,16 +574,17 @@ def available() -> bool:
         return False
     if _is_api_model(_DEFAULT_MODEL):
         # Custom endpoints (non-OpenRouter) may not require an API key
-        base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
+        _cfg_url2 = _cfg_get("embedding_api_url")
+        base_url = str(_cfg_url2).strip() if _cfg_url2 is not None else os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
         if base_url and "openrouter.ai" not in base_url:
             return True
-        return bool(_OPENAI_API_KEY)
+        return bool(_resolve_api_key())
     return _FASTEMBED_AVAILABLE
 
 
 def available_api() -> bool:
     """Check if API-based embeddings are available."""
-    return bool(_OPENAI_API_KEY)
+    return bool(_resolve_api_key())
 
 
 # (2) embed_query: apply query prefix verbatim, then delegate to a cached inner

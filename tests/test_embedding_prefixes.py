@@ -27,7 +27,7 @@ class StubHandler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
 @pytest.fixture
-def embeddings_mod(monkeypatch):
+def embeddings_mod(monkeypatch, tmp_path):
     server = HTTPServer(("127.0.0.1", 0), StubHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_port}/v1"
@@ -41,6 +41,15 @@ def embeddings_mod(monkeypatch):
     # credentialed non-HTTPS endpoints).
     monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    # Isolate the config: resolution precedence is config.yaml > env, so an
+    # ambient config would shadow the stub URL/model above. Reset the
+    # singleton BEFORE the reload so import-time resolution sees tmp state.
+    from mnemosyne.core.config import MnemosyneConfig
+    cfg_dir = tmp_path / "mnemosyne-data"
+    cfg_dir.mkdir(exist_ok=True)
+    (cfg_dir / "config.yaml").write_text("")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(cfg_dir))
+    MnemosyneConfig.reset_instance()
     # The reload below re-reads _DEFAULT_MODEL from the patched env (model
     # "embeddinggemma-300m-q4"); restore the original afterward so later
     # tests in the same session see the true default instead of this
@@ -52,6 +61,7 @@ def embeddings_mod(monkeypatch):
     # needed for prefix changes (see test_unset_prefixes_unchanged).
     _orig_default_model = embeddings._DEFAULT_MODEL
     _orig_api_key = embeddings._OPENAI_API_KEY
+    _orig_base_url = embeddings._OPENAI_BASE_URL
     importlib.reload(embeddings)
     yield embeddings
     # The reload re-reads both module globals from the (patched, key-stripped)
@@ -59,6 +69,7 @@ def embeddings_mod(monkeypatch):
     # default model and the real credential state, not this fixture's.
     embeddings._DEFAULT_MODEL = _orig_default_model
     embeddings._OPENAI_API_KEY = _orig_api_key
+    embeddings._OPENAI_BASE_URL = _orig_base_url
     server.shutdown()
 
 def test_query_prefix_byte_exact(embeddings_mod):
@@ -85,16 +96,25 @@ def test_unset_prefixes_unchanged(embeddings_mod, monkeypatch):
     assert embeddings_mod.embed_query("plain") is not None
     assert RECORDED[-1]["input"] == ["plain"]
 
-def test_fastembed_path_applies_prefixes(monkeypatch):
+def test_fastembed_path_applies_prefixes(monkeypatch, tmp_path):
     # The fastembed (local ONNX) branch must apply the same prefixes: only the
     # model object is doubled; the branch selection logic runs for real.
     import numpy as np
     from mnemosyne.core import embeddings as emb
+    from mnemosyne.core.config import MnemosyneConfig
     class FakeFastembedModel:
         def __init__(self): self.received = []
         def embed(self, texts):
             self.received.append(list(texts))
             return [np.ones(768, dtype=np.float32) for _ in texts]
+    # Isolate the config: _is_api_model consults config.yaml first, so an
+    # ambient api_url would force the API path despite the deleted env var.
+    cfg_dir = tmp_path / "mnemosyne-data"
+    cfg_dir.mkdir(exist_ok=True)
+    (cfg_dir / "config.yaml").write_text("")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(cfg_dir))
+    MnemosyneConfig.reset_instance()
+    monkeypatch.setattr(emb, "_DEFAULT_MODEL", emb._resolve_default_model())
     monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_URL", raising=False)   # force non-API path
     monkeypatch.delenv("MNEMOSYNE_EMBEDDINGS_VIA_API", raising=False)
     # CI globally disables local model loading to avoid downloads. This test

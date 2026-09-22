@@ -345,13 +345,48 @@ DEFAULTS: Dict[str, Any] = {
 
 
 def _default_config_path() -> Path:
-    """Resolve the config.yaml path."""
+    """Resolve the config.yaml path.
+
+    Durable fallback: when HERMES_HOME points to a per-profile directory
+    (kanban workers, etc.) but that profile has never seeded Mnemosyne,
+    fall back to the shared HOME config instead of creating a fresh
+    384-dim default that would mismatch the existing 1024-dim DB.
+    """
     data_dir = os.environ.get("MNEMOSYNE_DATA_DIR")
     if data_dir:
         return Path(data_dir) / "config.yaml"
     hermes_home = os.environ.get("HERMES_HOME")
     if hermes_home:
-        return Path(hermes_home) / "mnemosyne" / "config.yaml"
+        candidate = Path(hermes_home) / "mnemosyne" / "config.yaml"
+        # If the profile-specific file exists and contains an explicit
+        # embedding_dim, use it. Otherwise fall back to the shared HOME
+        # config so every hermes-spawned process resolves the same
+        # 1024-dim configuration regardless of HERMES_HOME fragmentation.
+        if candidate.exists():
+            try:
+                import yaml as _yaml
+                with open(candidate) as _f:
+                    _d = _yaml.safe_load(_f) or {}
+                if isinstance(_d, dict) and "embedding_dim" in _d:
+                    return candidate
+                # Missing embedding_dim -> incomplete/minimal file; fall back
+                # to HOME if that one is complete.
+                _home_candidate = Path.home() / ".hermes" / "mnemosyne" / "config.yaml"
+                if _home_candidate.exists():
+                    with open(_home_candidate) as _hf:
+                        _hd = _yaml.safe_load(_hf) or {}
+                    if isinstance(_hd, dict) and "embedding_dim" in _hd:
+                        return _home_candidate
+            except Exception:
+                pass
+            return candidate
+        # No profile file -> use shared HOME config if it exists, otherwise
+        # return the candidate path so _seed() creates it (it will copy
+        # from shared HOME when possible; see _seed()).
+        shared = Path.home() / ".hermes" / "mnemosyne" / "config.yaml"
+        if shared.exists():
+            return shared
+        return candidate
     return Path.home() / ".hermes" / "mnemosyne" / "config.yaml"
 
 
@@ -398,11 +433,17 @@ class MnemosyneConfig:
 
         When the file doesn't exist, creates it with every known key.
         For each key: if the corresponding env var is set, that value is used.
-        Otherwise the hardcoded default is used.
+        Otherwise the hardcoded default is used — EXCEPT for embedding_dim,
+        where an existing DB's vec dimension takes precedence over the 384
+        default, so a fresh hermes-spawned process never bakes in the wrong
+        dimension and triggers "dimension mismatch". When no env var, no
+        shared-HOME value and no existing DB can vouch for the dimension,
+        the key is left unset so an unknown model still fails loud (#521)
+        instead of inheriting a seeded 384 that looks explicit.
 
-        This ensures that users with existing env var configurations don't
-        get silently overridden by the auto-seeded defaults. The resulting
-        config.yaml reflects exactly what's already running.
+        Also, when seeding a per-profile config and a shared HOME config
+        already exists, copy its embedding_* / vec_type values so the
+        profile inherits the 1024-dim shared reality instead of diverging.
 
         Does NOT overwrite an existing file.
         Returns without error if the file already exists.
@@ -412,10 +453,84 @@ class MnemosyneConfig:
 
         import yaml
         try:
-            # Build the seed data: env var value if set, otherwise default
+            # 1) Inherit embedding config from shared HOME when seeding a
+            # profile-specific path. Prevents HERMES_HOME fragmentation
+            # from creating a second 384-dim config alongside the shared
+            # 1024-dim one.
+            _inherited: Dict[str, Any] = {}
+            try:
+                _shared = Path.home() / ".hermes" / "mnemosyne" / "config.yaml"
+                if _shared.exists() and _shared != self._config_path:
+                    with open(_shared) as _sf:
+                        _sd = yaml.safe_load(_sf) or {}
+                    if isinstance(_sd, dict):
+                        for _k in ("embedding_model", "embedding_dim",
+                                   "embedding_api_url", "embedding_api_key",
+                                   "embeddings_via_api", "vec_type", "vec_weight"):
+                            if _k in _sd:
+                                _inherited[_k] = _sd[_k]
+            except Exception:
+                pass
+
+            # 2) If no env and no inherited value, sniff the existing DB's
+            # vec dimension (1024) so we don't seed 384 on top of a 1024 DB.
+            _db_dim: Optional[int] = None
+            try:
+                # Reuse the DB path that Beam would use (respects HERMES_HOME)
+                # but also check the shared HOME DB as fallback.
+                from pathlib import Path as _P
+                import sqlite3 as _sq3
+                _candidates = []
+                _dd = os.environ.get("MNEMOSYNE_DATA_DIR")
+                if _dd:
+                    _candidates.append(_P(_dd) / "mnemosyne.db")
+                _hh = os.environ.get("HERMES_HOME")
+                if _hh:
+                    _candidates.append(_P(_hh) / "mnemosyne" / "data" / "mnemosyne.db")
+                _candidates.append(_P.home() / ".hermes" / "mnemosyne" / "data" / "mnemosyne.db")
+                for _dbp in _candidates:
+                    if _dbp.exists():
+                        _con = None
+                        try:
+                            _con = _sq3.connect(f"file:{_dbp}?mode=ro", uri=True)
+                            _cur = _con.cursor()
+                            _cur.execute("SELECT sql FROM sqlite_master WHERE name='vec_working'")
+                            _row = _cur.fetchone()
+                            if _row and _row[0]:
+                                import re as _re
+                                _m = _re.search(r"\[(\d+)\]", _row[0])
+                                if _m:
+                                    _db_dim = int(_m.group(1))
+                                    break
+                        except Exception:
+                            continue
+                        finally:
+                            try:
+                                if _con is not None:
+                                    _con.close()
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+            # Build the seed data: env var value if set, otherwise inherited,
+            # otherwise DB-sniffed dim, otherwise hardcoded default.
             seed_data: Dict[str, Any] = {}
             for key, default_val in DEFAULTS.items():
+                if key in _inherited:
+                    # Inherited from shared HOME config wins over DB/default
+                    # (but env still wins over inherited; handled below).
+                    _use_inherited = True
+                else:
+                    _use_inherited = False
                 env_var = ENV_VAR_MAP.get(key)
+                if (key == "embedding_dim" and not _use_inherited
+                        and _db_dim is None
+                        and not (env_var and env_var in os.environ)):
+                    # No trustworthy source for the dimension: leave the key
+                    # unset so an unknown model still fails loud (#521)
+                    # instead of inheriting a seeded 384 that looks explicit.
+                    continue
                 if env_var and env_var in os.environ:
                     env_val = os.environ[env_var]
                     # Type-coerce env vars to match the default type
@@ -433,6 +548,10 @@ class MnemosyneConfig:
                             seed_data[key] = default_val
                     else:
                         seed_data[key] = env_val
+                elif _use_inherited:
+                    seed_data[key] = _inherited[key]
+                elif key == "embedding_dim" and _db_dim is not None:
+                    seed_data[key] = _db_dim
                 else:
                     seed_data[key] = default_val
 

@@ -21,6 +21,34 @@ from mnemosyne.doctor import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_embedding_config(monkeypatch, tmp_path):
+    """Isolate live embedding resolution from the ambient config.
+
+    ``doctor._embedding_runtime_status`` reads the model/endpoint live
+    (config.yaml > env), so an ambient ~/.hermes config would otherwise
+    shadow the test doubles. An empty temp config disables seeding and
+    leaves every key unset.
+    """
+    from mnemosyne.core.config import MnemosyneConfig
+
+    for key in (
+        "MNEMOSYNE_EMBEDDING_API_URL",
+        "MNEMOSYNE_EMBEDDING_API_KEY",
+        "MNEMOSYNE_EMBEDDING_MODEL",
+        "MNEMOSYNE_EMBEDDING_DIM",
+        "MNEMOSYNE_EMBEDDINGS_VIA_API",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    cfg_dir = tmp_path / "iso-config"
+    cfg_dir.mkdir(exist_ok=True)
+    (cfg_dir / "config.yaml").write_text("")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(cfg_dir))
+    MnemosyneConfig.reset_instance()
+    yield
+    MnemosyneConfig.reset_instance()
+
+
 def _runtime(**overrides):
     values = {
         "disabled": False,

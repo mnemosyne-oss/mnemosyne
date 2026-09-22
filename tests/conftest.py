@@ -10,6 +10,9 @@ make real CPU inference calls when a model is available on disk.
 import pytest
 
 
+_CLEAN_ROOM_DEFAULTS = {}
+
+
 def _close_cached_connections():
     """Close and reset thread-local SQLite connection caches in both modules."""
     for mod_path in (
@@ -109,6 +112,99 @@ def _reset_thread_local_connections(_before_connection_reset):
     _close_cached_connections()
     yield
     _close_cached_connections()
+
+
+# ---------------------------------------------------------------------------
+# Clean-room embedding/vec snapshots (ambient-config hermeticity)
+# ---------------------------------------------------------------------------
+#
+# Background: embeddings and beam resolve model/dimension/endpoint through
+# the central config (config.yaml > env > default) and snapshot several
+# values at import (embeddings._DEFAULT_MODEL / EMBEDDING_DIM,
+# beam.EMBEDDING_DIM / VEC_TYPE). On a developer machine whose ambient
+# ~/.hermes/mnemosyne/config.yaml names a non-default model, every test
+# that assumes the default model (384-dim tables, local fastembed path)
+# breaks -- not because the code is wrong, but because the import-time
+# snapshot baked the ambient state.
+#
+# These fixtures pin those snapshots to the values a clean machine (empty
+# HOME, no MNEMOSYNE_* env) would resolve, for every test. Tests that need
+# their own values keep overriding via monkeypatch (applied after autouse
+# fixtures, so theirs still win) or via fresh subprocesses.
+
+@pytest.fixture(scope="session", autouse=True)
+def _clean_room_embedding_defaults(tmp_path_factory):
+    """Resolve embedding/vec defaults once in a sanitized environment."""
+    import os
+
+    saved = dict(os.environ)
+    home = tmp_path_factory.mktemp("clean-home")
+    try:
+        for key in list(os.environ):
+            if key.startswith("MNEMOSYNE_"):
+                del os.environ[key]
+        os.environ.pop("HERMES_HOME", None)
+        os.environ["HOME"] = str(home)
+        from mnemosyne.core.config import MnemosyneConfig
+        MnemosyneConfig.reset_instance()
+        from mnemosyne.core import beam as _beam_mod
+        from mnemosyne.core import embeddings as _emb_mod
+        model = _emb_mod._resolve_default_model()
+        _CLEAN_ROOM_DEFAULTS.update(
+            default_model=model,
+            api_key=_emb_mod._resolve_api_key(),
+            base_url=_emb_mod._resolve_api_base_url(),
+            embedding_dim=_emb_mod._get_embedding_dim(model),
+            vec_type=_beam_mod._resolve_vec_type(),
+        )
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        try:
+            from mnemosyne.core.config import MnemosyneConfig
+            MnemosyneConfig.reset_instance()
+        except Exception:
+            pass
+    yield _CLEAN_ROOM_DEFAULTS
+
+
+@pytest.fixture(autouse=True)
+def _pin_clean_embedding_snapshots(monkeypatch, _clean_room_embedding_defaults):
+    """Pin import-time embedding/vec snapshots to clean-room defaults.
+
+    Covers embeddings._DEFAULT_MODEL / _OPENAI_API_KEY / _OPENAI_BASE_URL /
+    EMBEDDING_DIM and beam.EMBEDDING_DIM / VEC_TYPE. The config singleton is
+    already reset per test by _reset_thread_local_connections; live
+    (per-call) resolution still sees the ambient config, so tests that
+    assert live resolution keep their own config isolation.
+    """
+    if not _clean_room_embedding_defaults:
+        yield
+        return
+    try:
+        from mnemosyne.core import beam as _beam_mod
+        from mnemosyne.core import embeddings as _emb_mod
+    except Exception:
+        yield
+        return
+    defaults = _clean_room_embedding_defaults
+    monkeypatch.setattr(
+        _emb_mod, "_DEFAULT_MODEL", defaults["default_model"], raising=False
+    )
+    monkeypatch.setattr(
+        _emb_mod, "_OPENAI_API_KEY", defaults["api_key"], raising=False
+    )
+    monkeypatch.setattr(
+        _emb_mod, "_OPENAI_BASE_URL", defaults["base_url"], raising=False
+    )
+    monkeypatch.setattr(
+        _emb_mod, "EMBEDDING_DIM", defaults["embedding_dim"], raising=False
+    )
+    monkeypatch.setattr(
+        _beam_mod, "EMBEDDING_DIM", defaults["embedding_dim"], raising=False
+    )
+    monkeypatch.setattr(_beam_mod, "VEC_TYPE", defaults["vec_type"], raising=False)
+    yield
 
 
 # ---------------------------------------------------------------------------

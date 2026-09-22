@@ -72,6 +72,11 @@ def test_cross_session_hermes_provider_honors_yaml_over_env(tmp_path: Path, yaml
     config_dir = hermes_home / "mnemosyne"
     config_dir.mkdir(parents=True)
     (config_dir / "config.yaml").write_text(f"cross_session: {yaml_value}\n")
+    # Sandbox HOME: a per-profile HERMES_HOME without embedding_dim falls
+    # back to the shared HOME config, so the real ~/.hermes config would
+    # otherwise shadow this test's model/endpoint resolution.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir(exist_ok=True)
     result = _run(
         """
 import os
@@ -89,7 +94,7 @@ print(any("provider sentinel" in row.get("content", "") for row in results))
 writer._beam.conn.close()
 reader._beam.conn.close()
 """,
-        env={"HERMES_HOME": str(hermes_home), "MNEMOSYNE_CROSS_SESSION": env_value, "MNEMOSYNE_DATA_DIR": ""},
+        env={"HERMES_HOME": str(hermes_home), "MNEMOSYNE_CROSS_SESSION": env_value, "MNEMOSYNE_DATA_DIR": "", "HOME": str(fake_home)},
     )
     assert result.stdout.strip() == expected
 

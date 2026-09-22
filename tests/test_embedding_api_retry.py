@@ -9,17 +9,45 @@ from unittest.mock import patch
 import pytest
 
 from mnemosyne.core import embeddings
+from mnemosyne.core.config import MnemosyneConfig
 
 
 @pytest.fixture(autouse=True)
-def _uncredentialed_embedding_client(monkeypatch):
+def _uncredentialed_embedding_client(monkeypatch, tmp_path):
     """These tests drive `_embed_api` against plain-http endpoints; the client
     refuses credentialed non-HTTPS URLs, so blank the key regardless of the
     developer shell. Tests that need a key set it themselves AFTER this (on an
-    https:// URL)."""
+    https:// URL). The config is isolated too: resolution precedence is
+    config.yaml > env, so an ambient config would shadow the URLs under test.
+    The import-time snapshots are re-resolved after the reset, and the
+    credentialed opener is routed through `urlopen`, so tests mock a single
+    transport seam (redirect refusal keeps dedicated tests elsewhere).
+    """
     monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "")
+    cfg_dir = tmp_path / "mnemosyne-data"
+    cfg_dir.mkdir(exist_ok=True)
+    (cfg_dir / "config.yaml").write_text("")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(cfg_dir))
+    MnemosyneConfig.reset_instance()
+    monkeypatch.setattr(
+        embeddings, "_DEFAULT_MODEL", embeddings._resolve_default_model()
+    )
+    monkeypatch.setattr(
+        embeddings, "_OPENAI_API_KEY", embeddings._resolve_api_key()
+    )
+    monkeypatch.setattr(
+        embeddings, "_OPENAI_BASE_URL", embeddings._resolve_api_base_url()
+    )
+
+    class _UrlopenOpener:
+        def open(self, req, timeout=None):
+            return embeddings.urllib.request.urlopen(req, timeout=timeout)
+
+    monkeypatch.setattr(
+        embeddings.urllib.request, "build_opener",
+        lambda *handlers: _UrlopenOpener(),
+    )
 
 
 class Response:
