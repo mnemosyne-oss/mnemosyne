@@ -267,11 +267,24 @@ def _autoregister_configured_backends() -> None:
             set_modality_backend(LocalDocumentBackend(), frozenset({"document"}))
         except Exception:
             logger.info("modality: local document backend unavailable", exc_info=True)
-    if _default is not None:
-        return
     try:
-        from mnemosyne.core.modality_openai_compat import register_if_configured
-        register_if_configured()
+        from mnemosyne.core.modality_openai_compat import is_configured, register_if_configured
     except Exception:
-        logger.info("modality: built-in adapter registration failed", exc_info=True)
+        logger.info("modality: built-in adapter unavailable", exc_info=True)
+        return
+    if not is_configured():
+        return
+    if get_modality_backend("video") is None:
+        # Frames to the vision model and the soundtrack to transcription, via
+        # the same endpoint; needs ffmpeg, and says so when it is missing.
+        try:
+            from mnemosyne.core.modality_video import VideoFrameBackend
+            set_modality_backend(VideoFrameBackend(), frozenset({"video"}))
+        except Exception:
+            logger.info("modality: video backend unavailable", exc_info=True)
+    if _default is None:
+        try:
+            register_if_configured()
+        except Exception:
+            logger.info("modality: built-in adapter registration failed", exc_info=True)
 
