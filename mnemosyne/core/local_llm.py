@@ -262,6 +262,10 @@ def _load_llm():
         return None
 
     if _llm_instance is not None:
+        # Reusing a model loaded before a disable/re-enable cycle must
+        # restore availability: _load_llm() set _llm_available=False while
+        # the flag was on, so refresh it here when the flag is off again.
+        _llm_available = True
         return _llm_instance
 
     if not LLM_ENABLED:

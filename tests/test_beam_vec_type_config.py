@@ -131,6 +131,43 @@ class TestHotReload:
         assert beam._detect_vec_type(sqlite3.connect(":memory:")) == "float32"
         assert calls["n"] >= 1
 
+    def test_detect_vec_type_probes_live_bit_config(
+        self, isolated_config, monkeypatch
+    ):
+        """Live ``bit`` must exercise the probe, not return early.
+
+        The ``float32`` case above short-circuits before probing, so a
+        regression that probes the import-time snapshot instead of the
+        live config would still pass. This case keeps the snapshot at
+        ``int8`` while the live config is ``bit`` and asserts the probe
+        sees ``bit`` via a recording fake connection.
+        """
+        _write_config(isolated_config, {"vec_type": "bit"})
+        monkeypatch.setattr(beam, "VEC_TYPE", "int8")
+        monkeypatch.setattr(beam, "_SQLITE_VEC_AVAILABLE", True)
+        assert beam._resolve_vec_type() == "bit"
+
+        probed: list[str] = []
+
+        class _FakeCursor:
+            def execute(self, sql, *args, **kwargs):
+                if "vec0(embedding" in sql:
+                    # e.g. CREATE VIRTUAL TABLE _vec_test USING
+                    # vec0(embedding bit[384])
+                    try:
+                        inner = sql.split("vec0(embedding", 1)[1]
+                        probed.append(inner.strip().split("[")[0].strip())
+                    except Exception:
+                        probed.append(sql)
+                return self
+
+        class _FakeConn:
+            def cursor(self):
+                return _FakeCursor()
+
+        assert beam._detect_vec_type(_FakeConn()) == "bit"
+        assert probed and probed[0] == "bit"
+
 
 def _run_fresh(code: str, tmp_path: Path, **env_overrides: str):
     """Run code in a fresh interpreter with an isolated data dir and HOME."""

@@ -366,3 +366,197 @@ class TestFreshProcessYamlDim:
             assert cfg.get("embedding_dim") == 1024
         finally:
             MnemosyneConfig.reset_instance()
+
+
+class TestSharedInheritanceRegressions:
+    """Regression coverage for the shared-HOME inheritance paths."""
+
+    def _clean_env(self, monkeypatch):
+        for key in list(os.environ):
+            if key.startswith("MNEMOSYNE_"):
+                monkeypatch.delenv(key, raising=False)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_DATA_DIR", raising=False)
+
+    def test_data_dir_isolation_ignores_shared_home(
+        self, tmp_path, monkeypatch
+    ):
+        """An isolated store with an (empty) config.yaml never inherits."""
+        from mnemosyne.core.config import _default_config_path
+
+        home = tmp_path / "home"
+        shared_dir = home / ".hermes" / "mnemosyne"
+        shared_dir.mkdir(parents=True)
+        (shared_dir / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "embedding_dim": 1024,
+                    "embedding_api_url": "https://shared.test/v1",
+                }
+            )
+        )
+        store = tmp_path / "store"
+        store.mkdir()
+        (store / "config.yaml").write_text("")
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(store))
+        MnemosyneConfig.reset_instance()
+        try:
+            cfg = MnemosyneConfig()
+            assert cfg.config_path == _default_config_path()
+            assert cfg.get("embedding_dim") is None
+            assert (
+                embeddings._is_api_model("BAAI/bge-small-en-v1.5") is False
+            )
+        finally:
+            MnemosyneConfig.reset_instance()
+
+    def test_profile_write_target_stays_profile_specific(
+        self, tmp_path, monkeypatch
+    ):
+        """set() on a missing profile must not mutate the shared file."""
+        home = tmp_path / "home"
+        shared_dir = home / ".hermes" / "mnemosyne"
+        shared_dir.mkdir(parents=True)
+        shared_file = shared_dir / "config.yaml"
+        shared_file.write_text(yaml.safe_dump({"embedding_dim": 1024}))
+        profile_home = tmp_path / "profile-home"
+        (profile_home / "mnemosyne").mkdir(parents=True)
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        MnemosyneConfig.reset_instance()
+        try:
+            cfg = MnemosyneConfig()
+            cfg.set("llm_model", "x")
+            profile_file = profile_home / "mnemosyne" / "config.yaml"
+            assert profile_file.exists()
+            assert yaml.safe_load(profile_file.read_text()).get("llm_model") == "x"
+            assert "llm_model" not in (yaml.safe_load(shared_file.read_text()) or {})
+        finally:
+            MnemosyneConfig.reset_instance()
+
+    def test_credential_pairing_blocks_shared_key_on_profile_url(
+        self, tmp_path, monkeypatch
+    ):
+        """A profile-specific URL must not inherit the shared API key."""
+        home = tmp_path / "home"
+        shared_dir = home / ".hermes" / "mnemosyne"
+        shared_dir.mkdir(parents=True)
+        (shared_dir / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "embedding_api_url": "https://shared.test/v1",
+                    "embedding_api_key": "shared-secret",
+                }
+            )
+        )
+        profile_home = tmp_path / "profile-home"
+        profile_cfg_dir = profile_home / "mnemosyne"
+        profile_cfg_dir.mkdir(parents=True)
+        (profile_cfg_dir / "config.yaml").write_text(
+            yaml.safe_dump({"embedding_api_url": "https://profile.test/v1"})
+        )
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        MnemosyneConfig.reset_instance()
+        try:
+            assert embeddings._resolve_api_key() == ""
+        finally:
+            MnemosyneConfig.reset_instance()
+
+    def test_env_beats_shared(self, tmp_path, monkeypatch):
+        """Explicit env wins over the shared file for a missing profile key."""
+        home = tmp_path / "home"
+        shared_dir = home / ".hermes" / "mnemosyne"
+        shared_dir.mkdir(parents=True)
+        (shared_dir / "config.yaml").write_text(
+            yaml.safe_dump({"embedding_dim": 1024})
+        )
+        profile_home = tmp_path / "profile-home"
+        profile_cfg_dir = profile_home / "mnemosyne"
+        profile_cfg_dir.mkdir(parents=True)
+        (profile_cfg_dir / "config.yaml").write_text(yaml.safe_dump({}))
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("MNEMOSYNE_EMBEDDING_DIM", "768")
+        MnemosyneConfig.reset_instance()
+        try:
+            cfg = MnemosyneConfig()
+            assert cfg.get("embedding_dim") == "768"
+        finally:
+            MnemosyneConfig.reset_instance()
+
+    def test_get_many_parity(self, tmp_path, monkeypatch):
+        """get_many() resolves the same model/URL/dim as get()."""
+        home = tmp_path / "home"
+        shared_dir = home / ".hermes" / "mnemosyne"
+        shared_dir.mkdir(parents=True)
+        (shared_dir / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "embedding_model": "shared-model",
+                    "embedding_dim": 1024,
+                    "embedding_api_url": "https://shared.test/v1",
+                }
+            )
+        )
+        profile_home = tmp_path / "profile-home"
+        profile_cfg_dir = profile_home / "mnemosyne"
+        profile_cfg_dir.mkdir(parents=True)
+        (profile_cfg_dir / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "embedding_model": "profile-model",
+                    "embedding_api_url": "https://profile.test/v1",
+                }
+            )
+        )
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        MnemosyneConfig.reset_instance()
+        try:
+            cfg = MnemosyneConfig()
+            many = cfg.get_many(
+                {
+                    "embedding_model": None,
+                    "embedding_api_url": None,
+                    "embedding_dim": None,
+                }
+            )
+            assert many["embedding_model"] == "profile-model"
+            assert many["embedding_api_url"] == "https://profile.test/v1"
+            assert many["embedding_dim"] == 1024
+            assert many["embedding_model"] == cfg.get("embedding_model")
+            assert many["embedding_api_url"] == cfg.get("embedding_api_url")
+            assert many["embedding_dim"] == cfg.get("embedding_dim")
+        finally:
+            MnemosyneConfig.reset_instance()
+
+    def test_blank_profile_dim_inherits_shared(self, tmp_path, monkeypatch):
+        """A blank profile dimension counts as unset and inherits shared."""
+        home = tmp_path / "home"
+        shared_dir = home / ".hermes" / "mnemosyne"
+        shared_dir.mkdir(parents=True)
+        (shared_dir / "config.yaml").write_text(
+            yaml.safe_dump({"embedding_dim": 1024})
+        )
+        profile_home = tmp_path / "profile-home"
+        profile_cfg_dir = profile_home / "mnemosyne"
+        profile_cfg_dir.mkdir(parents=True)
+        (profile_cfg_dir / "config.yaml").write_text(
+            yaml.safe_dump({"embedding_dim": ""})
+        )
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        MnemosyneConfig.reset_instance()
+        try:
+            cfg = MnemosyneConfig()
+            assert cfg.get("embedding_dim") == 1024
+        finally:
+            MnemosyneConfig.reset_instance()

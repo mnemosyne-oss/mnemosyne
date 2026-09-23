@@ -139,6 +139,10 @@ class TestLoadGuard:
         isolated_config.set("disable_local_llm", True)
         assert local_llm._load_llm() is None
         assert local_llm._llm_available is False
+        # Re-enabling restores the cached model as available.
+        isolated_config.set("disable_local_llm", False)
+        assert local_llm._load_llm() is sentinel
+        assert local_llm._llm_available is True
 
     def test_fresh_process_env_disables_load(self, tmp_path):
         """Fresh interpreter: env flag alone blocks the loader."""

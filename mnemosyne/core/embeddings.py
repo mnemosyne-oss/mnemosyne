@@ -78,6 +78,7 @@ def _cfg_get(key: str):
     try:
         from mnemosyne.core.config import (  # local import avoids cycle at top-level
             _default_config_path,
+            _shared_key_allowed,
             get_config,
             get_shared_value,
         )
@@ -104,6 +105,20 @@ def _cfg_get(key: str):
                     if not _env_set:
                         _sv = get_shared_value(key)
                         if _sv is not None and str(_sv).strip() != "":
+                            # Bind the shared key to the shared endpoint:
+                            # an env-level URL that differs from the shared
+                            # URL must not receive the ambient shared key.
+                            if key == "embedding_api_key":
+                                _env_url = os.environ.get(
+                                    _EVM.get("embedding_api_url", ""), ""
+                                )
+                                _shared_url = get_shared_value(
+                                    "embedding_api_url"
+                                )
+                                if not _shared_key_allowed(
+                                    None, _env_url, _shared_url
+                                ):
+                                    return None
                             return _sv
                 except Exception:
                     pass
