@@ -17,17 +17,13 @@ import pytest
 
 from mnemosyne.core.config import (
     ENV_VAR_MAP,
-    REQUIRES_RESTART,
     MnemosyneConfig,
-    get_config,
 )
 from mnemosyne.core.profiles import (
     PROFILES,
     TEMPLATE_KEYS,
     validate_profile,
     validate_all_profiles,
-    list_profiles,
-    get_profile,
     apply_profile,
     create_profile,
 )
@@ -46,6 +42,11 @@ def temp_config(monkeypatch):
             monkeypatch.delenv(key, raising=False)
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        # Isolate the shared-HOME fallback (profile YAML > env > shared
+        # YAML) so an ambient ~/.hermes config cannot shadow assertions
+        # about an empty/local config.
+        monkeypatch.setenv("HOME", tmpdir)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
         config_path = Path(tmpdir) / "config.yaml"
         # Create an empty config.yaml so auto-seed doesn't fire.
         # The auto-seed writes defaults which would override test env vars
@@ -100,9 +101,10 @@ class TestTemplateCoverage:
             )
 
     def test_template_keys_count(self):
-        """TEMPLATE_KEYS must have exactly 68 entries (74 was initial estimate,
-        actual after excluding deployment/secret/infra/internal keys = 68)."""
-        assert len(TEMPLATE_KEYS) == 68, f"Expected 68, got {len(TEMPLATE_KEYS)}"
+        """TEMPLATE_KEYS must have exactly 69 entries (74 was initial estimate,
+        actual after excluding deployment/secret/infra/internal keys = 68,
+        plus disable_local_llm)."""
+        assert len(TEMPLATE_KEYS) == 69, f"Expected 69, got {len(TEMPLATE_KEYS)}"
 
     def test_template_keys_in_env_var_map(self):
         """Every TEMPLATE_KEY must be in ENV_VAR_MAP."""

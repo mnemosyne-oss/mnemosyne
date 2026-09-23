@@ -130,6 +130,7 @@ ENV_VAR_MAP: Dict[str, str] = {
     "llm_fallback_base_url": "MNEMOSYNE_LLM_FALLBACK_BASE_URL",
     "llm_fallback_api_key": "MNEMOSYNE_LLM_FALLBACK_API_KEY",
     "force_local": "MNEMOSYNE_FORCE_LOCAL",
+    "disable_local_llm": "MNEMOSYNE_DISABLE_LOCAL_LLM",
     "sleep_prompt": "MNEMOSYNE_SLEEP_PROMPT",
     "host_llm_enabled": "MNEMOSYNE_HOST_LLM_ENABLED",
     "host_llm_provider": "MNEMOSYNE_HOST_LLM_PROVIDER",
@@ -271,6 +272,7 @@ DEFAULTS: Dict[str, Any] = {
     "llm_fallback_base_url": "",
     "llm_fallback_api_key": "",
     "force_local": False,
+    "disable_local_llm": False,
     "sleep_prompt": "",
     "host_llm_enabled": False,
     "host_llm_provider": "",
@@ -343,7 +345,66 @@ DEFAULTS: Dict[str, Any] = {
 
 
 def _default_config_path() -> Path:
-    """Resolve the config.yaml path."""
+    """Resolve the config.yaml path.
+
+    Pure path resolution with cheap existence checks and no YAML parsing:
+    the profile path stays active whenever its file exists (even when
+    minimal). Missing embedding/vector keys are inherited from the shared
+    HOME config inside :meth:`MnemosyneConfig.get` (see
+    ``_SHARED_INHERIT_KEYS``), so profile-specific values such as
+    ``embedding_model``/``embedding_api_url`` are never ignored. When no
+    profile file exists, the existing shared HOME config is used directly
+    so read-only callers never seed a per-profile file as a side effect;
+    otherwise the profile candidate is returned and :meth:`_seed` copies
+    shared values into it on creation.
+    """
+    data_dir = os.environ.get("MNEMOSYNE_DATA_DIR")
+    if data_dir:
+        return Path(data_dir) / "config.yaml"
+    hermes_home = os.environ.get("HERMES_HOME")
+    if hermes_home:
+        candidate = Path(hermes_home) / "mnemosyne" / "config.yaml"
+        if candidate.exists():
+            return candidate
+        shared = Path.home() / ".hermes" / "mnemosyne" / "config.yaml"
+        try:
+            if shared.exists():
+                return shared
+        except OSError:
+            pass
+        return candidate
+    return Path.home() / ".hermes" / "mnemosyne" / "config.yaml"
+
+
+# Keys for which a per-profile config inherits missing values from the
+# shared HOME config instead of diverging (embedding dimension, endpoint,
+# vector compression). Precedence: profile YAML (non-blank) > env >
+# shared YAML > default.
+_SHARED_INHERIT_KEYS = (
+    "embedding_model",
+    "embedding_dim",
+    "embedding_api_url",
+    "embedding_api_key",
+    "embeddings_via_api",
+    "vec_type",
+    "vec_weight",
+)
+
+_SHARED_YAML_CACHE: Dict[str, Any] = {}
+_SHARED_YAML_MTIME: float = 0.0
+_SHARED_YAML_PATH: Optional[str] = None
+_shared_yaml_lock = threading.Lock()
+
+
+def _default_write_path() -> Path:
+    """Write target for mutations (profile candidate, never shared fallback).
+
+    Reads may fall back to the shared HOME config when the profile file is
+    missing (see :func:`_default_config_path`), but ``set()``/``set_many()``/
+    ``migrate_from_env()`` must never mutate the shared file: a
+    ``mnemosyne config set`` run in one profile would otherwise apply to
+    every profile.
+    """
     data_dir = os.environ.get("MNEMOSYNE_DATA_DIR")
     if data_dir:
         return Path(data_dir) / "config.yaml"
@@ -351,6 +412,95 @@ def _default_config_path() -> Path:
     if hermes_home:
         return Path(hermes_home) / "mnemosyne" / "config.yaml"
     return Path.home() / ".hermes" / "mnemosyne" / "config.yaml"
+
+
+def _shared_config_path() -> Path:
+    """Path of the shared HOME config used as inheritance source."""
+    return Path.home() / ".hermes" / "mnemosyne" / "config.yaml"
+
+
+def _normalize_endpoint(url: Any) -> str:
+    """Normalize an embedding endpoint for credential-pairing comparison."""
+    try:
+        return str(url or "").strip().rstrip("/")
+    except Exception:
+        return ""
+
+
+def _shared_key_allowed(yaml_url: Any, env_url: Any, shared_url: Any) -> bool:
+    """True when the shared API key may be inherited for the effective URL.
+
+    The shared key is bound to the shared endpoint: when the profile
+    defines its own URL (via YAML or env) that differs from the shared
+    URL, inheriting the shared key would send ambient credentials to a
+    profile-specific endpoint (CWE-201). Only allow inheritance when the
+    effective URL matches the shared URL (both normalized; empty means
+    the default endpoint).
+    """
+    shared_norm = _normalize_endpoint(shared_url)
+    # Effective URL: profile YAML wins when non-blank, then env, then shared.
+    eff = ""
+    try:
+        if yaml_url is not None and str(yaml_url).strip() != "":
+            eff = str(yaml_url).strip()
+        elif env_url is not None and str(env_url).strip() != "":
+            eff = str(env_url).strip()
+        else:
+            eff = str(shared_url or "")
+    except Exception:
+        eff = str(shared_url or "")
+    return _normalize_endpoint(eff) == shared_norm
+
+
+def get_shared_value(key: str) -> Optional[Any]:
+    """Read one inherit-key from the shared HOME config without seeding.
+
+    Returns the non-blank value or None. Never creates files, never raises.
+    Cached by file mtime so per-call resolution stays cheap.
+
+    An explicitly isolated store (``MNEMOSYNE_DATA_DIR``) never inherits
+    the ambient shared HOME config, so ``get()``/``get_many()``/
+    ``embeddings._cfg_get`` and Beam's ``vec_type`` lookup all stay
+    hermetic for isolated stores whether or not a ``config.yaml`` exists.
+    """
+    if key not in _SHARED_INHERIT_KEYS:
+        return None
+    # An explicitly isolated store never inherits ambient shared config.
+    if os.environ.get("MNEMOSYNE_DATA_DIR"):
+        return None
+    try:
+        shared = _shared_config_path()
+        try:
+            if not shared.exists():
+                return None
+            mtime = shared.stat().st_mtime
+        except OSError:
+            return None
+        global _SHARED_YAML_CACHE, _SHARED_YAML_MTIME, _SHARED_YAML_PATH
+        with _shared_yaml_lock:
+            if (
+                _SHARED_YAML_PATH != str(shared)
+                or mtime != _SHARED_YAML_MTIME
+                or not _SHARED_YAML_CACHE
+            ):
+                try:
+                    import yaml as _yaml
+
+                    with open(shared) as _sf:
+                        _sd = _yaml.safe_load(_sf) or {}
+                    if not isinstance(_sd, dict):
+                        _sd = {}
+                except Exception:
+                    _sd = {}
+                _SHARED_YAML_CACHE = dict(_sd)
+                _SHARED_YAML_MTIME = mtime
+                _SHARED_YAML_PATH = str(shared)
+            val = _SHARED_YAML_CACHE.get(key)
+        if val is None or (isinstance(val, str) and not val.strip()):
+            return None
+        return val
+    except Exception:
+        return None
 
 
 @dataclass(frozen=True)
@@ -370,7 +520,20 @@ class MnemosyneConfig:
     _lock = threading.Lock()
 
     def __init__(self, config_path: Optional[Path] = None):
+        self._explicit_path = config_path is not None
         self._config_path = config_path or _default_config_path()
+        # Write target stays profile-specific even when reads fall back to
+        # the shared HOME file (missing profile + existing shared). Without
+        # this, set()/set_many()/migrate_from_env() would mutate the shared
+        # file and leak one profile's change into every profile.
+        try:
+            self._write_path = (
+                Path(config_path)
+                if config_path is not None
+                else _default_write_path()
+            )
+        except Exception:
+            self._write_path = self._config_path
         self._yaml_cache: Dict[str, Any] = {}
         self._yaml_mtime: float = 0.0
         self._yaml_lock = threading.Lock()
@@ -382,6 +545,37 @@ class MnemosyneConfig:
             self._warn_legacy_provider_defaults()
 
         self._load_yaml()
+
+    def _write_target(self) -> Path:
+        """Resolve the mutation target, switching reads to it on first write.
+
+        When the instance was constructed with an explicit path the target
+        is that path. Otherwise it is the current profile candidate, so a
+        process that started on the shared fallback (missing profile file)
+        migrates to its own profile file instead of editing the shared one.
+        """
+        if getattr(self, "_explicit_path", False):
+            return self._config_path
+        try:
+            target = _default_write_path()
+        except Exception:
+            target = self._config_path
+        if str(target) != str(self._config_path):
+            # First profile write: adopt the profile candidate for reads so
+            # the new key is visible via get()/get_many() while shared
+            # fallback still covers the remaining missing keys.
+            self._config_path = target
+            try:
+                self._write_path = target
+            except Exception:
+                pass
+            self._yaml_cache = {}
+            self._yaml_mtime = 0.0
+            try:
+                self._load_yaml()
+            except Exception:
+                pass
+        return target
 
     @classmethod
     def get_instance(cls) -> "MnemosyneConfig":
@@ -396,11 +590,17 @@ class MnemosyneConfig:
 
         When the file doesn't exist, creates it with every known key.
         For each key: if the corresponding env var is set, that value is used.
-        Otherwise the hardcoded default is used.
+        Otherwise the hardcoded default is used — EXCEPT for embedding_dim,
+        where an existing DB's vec dimension takes precedence over the 384
+        default, so a fresh hermes-spawned process never bakes in the wrong
+        dimension and triggers "dimension mismatch". When no env var, no
+        shared-HOME value and no existing DB can vouch for the dimension,
+        the key is left unset so an unknown model still fails loud (#521)
+        instead of inheriting a seeded 384 that looks explicit.
 
-        This ensures that users with existing env var configurations don't
-        get silently overridden by the auto-seeded defaults. The resulting
-        config.yaml reflects exactly what's already running.
+        Also, when seeding a per-profile config and a shared HOME config
+        already exists, copy its embedding_* / vec_type values so the
+        profile inherits the 1024-dim shared reality instead of diverging.
 
         Does NOT overwrite an existing file.
         Returns without error if the file already exists.
@@ -410,10 +610,84 @@ class MnemosyneConfig:
 
         import yaml
         try:
-            # Build the seed data: env var value if set, otherwise default
+            # 1) Inherit embedding config from shared HOME when seeding a
+            # profile-specific path. Prevents HERMES_HOME fragmentation
+            # from creating a second 384-dim config alongside the shared
+            # 1024-dim one.
+            _inherited: Dict[str, Any] = {}
+            try:
+                _shared = Path.home() / ".hermes" / "mnemosyne" / "config.yaml"
+                if _shared.exists() and _shared != self._config_path:
+                    with open(_shared) as _sf:
+                        _sd = yaml.safe_load(_sf) or {}
+                    if isinstance(_sd, dict):
+                        for _k in ("embedding_model", "embedding_dim",
+                                   "embedding_api_url", "embedding_api_key",
+                                   "embeddings_via_api", "vec_type", "vec_weight"):
+                            if _k in _sd:
+                                _inherited[_k] = _sd[_k]
+            except Exception:
+                pass
+
+            # 2) If no env and no inherited value, sniff the existing DB's
+            # vec dimension (1024) so we don't seed 384 on top of a 1024 DB.
+            _db_dim: Optional[int] = None
+            try:
+                # Reuse the DB path that Beam would use (respects HERMES_HOME)
+                # but also check the shared HOME DB as fallback.
+                from pathlib import Path as _P
+                import sqlite3 as _sq3
+                _candidates = []
+                _dd = os.environ.get("MNEMOSYNE_DATA_DIR")
+                if _dd:
+                    _candidates.append(_P(_dd) / "mnemosyne.db")
+                _hh = os.environ.get("HERMES_HOME")
+                if _hh:
+                    _candidates.append(_P(_hh) / "mnemosyne" / "data" / "mnemosyne.db")
+                _candidates.append(_P.home() / ".hermes" / "mnemosyne" / "data" / "mnemosyne.db")
+                for _dbp in _candidates:
+                    if _dbp.exists():
+                        _con = None
+                        try:
+                            _con = _sq3.connect(f"file:{_dbp}?mode=ro", uri=True)
+                            _cur = _con.cursor()
+                            _cur.execute("SELECT sql FROM sqlite_master WHERE name='vec_working'")
+                            _row = _cur.fetchone()
+                            if _row and _row[0]:
+                                import re as _re
+                                _m = _re.search(r"\[(\d+)\]", _row[0])
+                                if _m:
+                                    _db_dim = int(_m.group(1))
+                                    break
+                        except Exception:
+                            continue
+                        finally:
+                            try:
+                                if _con is not None:
+                                    _con.close()
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+            # Build the seed data: env var value if set, otherwise inherited,
+            # otherwise DB-sniffed dim, otherwise hardcoded default.
             seed_data: Dict[str, Any] = {}
             for key, default_val in DEFAULTS.items():
+                if key in _inherited:
+                    # Inherited from shared HOME config wins over DB/default
+                    # (but env still wins over inherited; handled below).
+                    _use_inherited = True
+                else:
+                    _use_inherited = False
                 env_var = ENV_VAR_MAP.get(key)
+                if (key == "embedding_dim" and not _use_inherited
+                        and _db_dim is None
+                        and not (env_var and env_var in os.environ)):
+                    # No trustworthy source for the dimension: leave the key
+                    # unset so an unknown model still fails loud (#521)
+                    # instead of inheriting a seeded 384 that looks explicit.
+                    continue
                 if env_var and env_var in os.environ:
                     env_val = os.environ[env_var]
                     # Type-coerce env vars to match the default type
@@ -431,6 +705,10 @@ class MnemosyneConfig:
                             seed_data[key] = default_val
                     else:
                         seed_data[key] = env_val
+                elif _use_inherited:
+                    seed_data[key] = _inherited[key]
+                elif key == "embedding_dim" and _db_dim is not None:
+                    seed_data[key] = _db_dim
                 else:
                     seed_data[key] = default_val
 
@@ -588,7 +866,12 @@ class MnemosyneConfig:
     def get(self, key: str, default: Any = None) -> Any:
         """Get a config value.
 
-        Precedence: config.yaml > env var > default.
+        Precedence: config.yaml > env var > default. For embedding/vector
+        keys (``_SHARED_INHERIT_KEYS``) a missing profile value additionally
+        inherits from the shared HOME config, ordered
+        profile YAML > env > shared YAML > default, so an explicit env var
+        still wins over the shared file while a process with no env
+        converges on the shared dimension instead of the builtin default.
 
         Args:
             key: Config key (snake_case, no MNEMOSYNE_ prefix).
@@ -600,16 +883,55 @@ class MnemosyneConfig:
         # an explicit reload call.
         self._maybe_reload()
         if key in self._yaml_cache:
-            return self._yaml_cache[key]
+            _local = self._yaml_cache[key]
+            if key in _SHARED_INHERIT_KEYS:
+                # Blank inherit-keys count as unset so env (or the shared
+                # HOME config) still wins; other keys keep exact
+                # behavior (empty string is a real value there).
+                if _local is not None and str(_local).strip() != "":
+                    return _local
+            else:
+                return _local
 
-        # 2. Check env var
+        # 2. Check env var (non-blank env beats the shared file so tests
+        # and per-process overrides stay hermetic).
         env_var = ENV_VAR_MAP.get(key)
-        if env_var:
-            val = os.environ.get(env_var)
-            if val is not None:
-                return val
+        _env_val = os.environ.get(env_var) if env_var else None
+        if _env_val is not None and str(_env_val).strip() != "":
+            return _env_val
 
-        # 3. Default
+        # 2b. Shared-HOME inheritance for embedding/vector keys: the
+        # profile path stays active, only missing keys are filled from
+        # the shared file so profile-specific model/endpoint values
+        # are preserved. The shared API key stays bound to the shared
+        # endpoint (CWE-201): a profile-specific URL never inherits it.
+        if key in _SHARED_INHERIT_KEYS:
+            _shared_val = get_shared_value(key)
+            if _shared_val is not None:
+                if key == "embedding_api_key":
+                    _yaml_url = self._yaml_cache.get("embedding_api_url")
+                    _env_url = os.environ.get(
+                        ENV_VAR_MAP.get("embedding_api_url", ""), ""
+                    )
+                    _shared_url = get_shared_value("embedding_api_url")
+                    if not _shared_key_allowed(_yaml_url, _env_url, _shared_url):
+                        _shared_val = None
+                    else:
+                        return _shared_val
+                else:
+                    return _shared_val
+            if _shared_val is not None:
+                return _shared_val
+            # Blank env falls through (callers treat it as unset).
+            if _env_val is not None:
+                return _env_val
+
+        # 3. Check env var (blank passthrough preserves legacy behavior
+        # for non-inherit keys).
+        if _env_val is not None:
+            return _env_val
+
+        # 4. Default
         return default
 
     def get_many(self, defaults: Dict[str, Any]) -> Dict[str, Any]:
@@ -635,10 +957,34 @@ class MnemosyneConfig:
         resolved = {}
         for key, default in defaults.items():
             if key in yaml_values:
-                resolved[key] = yaml_values[key]
-                continue
+                _v = yaml_values[key]
+                if key in _SHARED_INHERIT_KEYS and (
+                    _v is None or (isinstance(_v, str) and not _v.strip())
+                ):
+                    pass  # blank inherit-key: fall through to env/shared
+                else:
+                    resolved[key] = _v
+                    continue
             env_var = ENV_VAR_MAP.get(key)
             env_value = os.environ.get(env_var) if env_var else None
+            if env_value is not None and str(env_value).strip() != "":
+                resolved[key] = env_value
+                continue
+            if key in _SHARED_INHERIT_KEYS:
+                _sv = get_shared_value(key)
+                if _sv is not None:
+                    if key == "embedding_api_key":
+                        _y_url = yaml_values.get("embedding_api_url")
+                        _e_var = ENV_VAR_MAP.get("embedding_api_url")
+                        _e_url = os.environ.get(_e_var) if _e_var else None
+                        _s_url = get_shared_value("embedding_api_url")
+                        if _shared_key_allowed(_y_url, _e_url, _s_url):
+                            resolved[key] = _sv
+                            continue
+                        # Paired-credential mismatch: fall through to default.
+                    else:
+                        resolved[key] = _sv
+                        continue
             resolved[key] = env_value if env_value is not None else default
         return resolved
 
@@ -686,16 +1032,20 @@ class MnemosyneConfig:
     def set(self, key: str, value: Any) -> None:
         """Write a config value to config.yaml.
 
-        Creates the file if it doesn't exist.
+        Creates the file if it doesn't exist. When reads currently fall
+        back to the shared HOME file (missing profile), the write goes to
+        the profile candidate so one profile never mutates shared state.
         """
+        target = self._write_target()
         self._load_yaml()
 
-        # Read existing YAML
+        # Read existing YAML from the write target (profile file), not the
+        # shared fallback, so the profile file receives the key.
         import yaml
         existing: Dict[str, Any] = {}
-        if self._config_path.exists():
+        if target.exists():
             try:
-                with open(self._config_path, "r") as f:
+                with open(target, "r") as f:
                     existing = yaml.safe_load(f) or {}
             except Exception:
                 existing = {}
@@ -704,13 +1054,13 @@ class MnemosyneConfig:
         existing[key] = value
 
         # Ensure parent dir
-        self._config_path.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
 
         # Write back
-        with open(self._config_path, "w") as f:
+        with open(target, "w") as f:
             yaml.dump(existing, f, default_flow_style=False, sort_keys=True)
 
-        # Refresh cache
+        # Refresh cache (reads now follow the profile file)
         self._yaml_mtime = 0.0
         self._load_yaml()
 
@@ -723,23 +1073,26 @@ class MnemosyneConfig:
     def set_many(self, items: Dict[str, Any]) -> None:
         """Write multiple config values to config.yaml in a single read-modify-write.
 
-        Avoids the per-key overhead of calling set() in a loop.
+        Avoids the per-key overhead of calling set() in a loop. Like
+        :meth:`set`, writes go to the profile candidate, never the shared
+        HOME fallback.
         """
+        target = self._write_target()
         self._load_yaml()
 
         import yaml
         existing: Dict[str, Any] = {}
-        if self._config_path.exists():
+        if target.exists():
             try:
-                with open(self._config_path, "r") as f:
+                with open(target, "r") as f:
                     existing = yaml.safe_load(f) or {}
             except Exception:
                 existing = {}
 
         existing.update(items)
 
-        self._config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._config_path, "w") as f:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "w") as f:
             yaml.dump(existing, f, default_flow_style=False, sort_keys=True)
 
         self._yaml_mtime = 0.0

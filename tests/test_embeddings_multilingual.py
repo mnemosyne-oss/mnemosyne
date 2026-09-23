@@ -4,6 +4,36 @@ import os
 import pytest
 
 from mnemosyne.core import embeddings
+from mnemosyne.core.config import MnemosyneConfig
+
+
+@pytest.fixture(autouse=True)
+def _isolated_embedding_config(monkeypatch, tmp_path):
+    """Isolate live dimension/endpoint resolution from the ambient config.
+
+    Resolution precedence is config.yaml > env, so an ambient
+    ~/.hermes/mnemosyne/config.yaml would otherwise shadow the dimension
+    table and endpoint routing under test. An empty temp config disables
+    seeding and leaves every key unset.
+    """
+    for key in (
+        "MNEMOSYNE_EMBEDDING_DIM",
+        "MNEMOSYNE_EMBEDDING_API_URL",
+        "MNEMOSYNE_EMBEDDING_API_KEY",
+        "MNEMOSYNE_EMBEDDING_MODEL",
+        "MNEMOSYNE_EMBEDDINGS_VIA_API",
+        "OPENROUTER_BASE_URL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    cfg_dir = tmp_path / "iso-config"
+    cfg_dir.mkdir(exist_ok=True)
+    (cfg_dir / "config.yaml").write_text("")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(cfg_dir))
+    # Isolate the shared-HOME fallback (profile YAML > env > shared YAML).
+    monkeypatch.setenv("HOME", str(tmp_path))
+    MnemosyneConfig.reset_instance()
+    yield
+    MnemosyneConfig.reset_instance()
 
 
 def setup_module():

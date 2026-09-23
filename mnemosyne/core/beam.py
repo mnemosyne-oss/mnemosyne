@@ -1043,9 +1043,65 @@ def _episodic_recall_where(
 
 
 # Vector compression: float32 | int8 | bit
-VEC_TYPE = os.environ.get("MNEMOSYNE_VEC_TYPE", "int8").lower()
-if VEC_TYPE not in ("float32", "int8", "bit"):
-    VEC_TYPE = "float32"
+_VALID_VEC_TYPES = ("float32", "int8", "bit")
+
+
+def _resolve_vec_type() -> str:
+    """Resolve the vector compression type (config.yaml > env > default).
+
+    Read per call so ``mnemosyne config set vec_type`` applies without a
+    process restart. Unset or blank resolves to the ``int8`` default; an
+    explicitly set but invalid value falls back to ``float32`` with a
+    warning, matching the historical import-time behavior. A per-profile
+    config inherits a missing key from the shared HOME config (via
+    ``get_config()``); with no profile file on disk the shared value is
+    consulted directly so read-only callers never seed a file on import.
+    """
+    raw = None
+    try:
+        from mnemosyne.core.config import (
+            _default_config_path,
+            get_config,
+            get_shared_value,
+        )
+        if _default_config_path().exists():
+            raw = get_config().get("vec_type")
+        else:
+            # No profile file: do not seed one as a mere import side
+            # effect. An explicitly isolated store (MNEMOSYNE_DATA_DIR)
+            # never consults the ambient shared HOME config; otherwise
+            # consult it directly when no explicit env overrides it,
+            # then fall through to env below.
+            try:
+                _env_set = bool(
+                    os.environ.get("MNEMOSYNE_VEC_TYPE") is not None
+                    and str(os.environ.get("MNEMOSYNE_VEC_TYPE")).strip()
+                    != ""
+                )
+                if not os.environ.get("MNEMOSYNE_DATA_DIR") and not _env_set:
+                    raw = get_shared_value("vec_type")
+                else:
+                    raw = os.environ.get("MNEMOSYNE_VEC_TYPE")
+            except Exception:
+                raw = os.environ.get("MNEMOSYNE_VEC_TYPE")
+        if raw is not None and not str(raw).strip():
+            # Blank YAML value is treated as unset so an explicit env var
+            # still wins over it (mirrors the embeddings blank handling).
+            raw = os.environ.get("MNEMOSYNE_VEC_TYPE")
+    except Exception:
+        raw = os.environ.get("MNEMOSYNE_VEC_TYPE")
+    if raw is None or not str(raw).strip():
+        return "int8"
+    vv = str(raw).strip().lower()
+    if vv in _VALID_VEC_TYPES:
+        return vv
+    logger.warning("Ignoring invalid vec_type %r; using float32.", raw)
+    return "float32"
+
+
+# Import-time snapshot for backward compatibility (diagnostics payloads and
+# cache keys reference VEC_TYPE); live code paths call _resolve_vec_type().
+VEC_TYPE = _resolve_vec_type()
 
 
 def _get_connection(db_path: Path = None) -> sqlite3.Connection:
@@ -1115,7 +1171,7 @@ def _detect_vec_type(conn: sqlite3.Connection) -> str:
     """
     if not _SQLITE_VEC_AVAILABLE:
         return "float32"
-    if VEC_TYPE == "float32":
+    if _resolve_vec_type() == "float32":
         return "float32"
 
     cursor = conn.cursor()
@@ -1134,7 +1190,7 @@ def _detect_vec_type(conn: sqlite3.Connection) -> str:
             cursor.execute("RELEASE SAVEPOINT vec_type_probe")
             return False
 
-    test_type = VEC_TYPE  # int8 or bit
+    test_type = _resolve_vec_type()  # int8 or bit
     if _probe(test_type):
         return test_type
     if test_type == "bit" and _probe("int8"):
@@ -9973,7 +10029,7 @@ class BeamMemory:
                 "binary_bonus": not _env_disabled("MNEMOSYNE_BINARY_BONUS"),
                 "veracity_multiplier": not _env_disabled("MNEMOSYNE_VERACITY_MULTIPLIER"),
                 "cross_tier_dedup": not _env_disabled("MNEMOSYNE_CROSS_TIER_DEDUP"),
-                "vec_type": VEC_TYPE,
+                "vec_type": _resolve_vec_type(),
                 "recall_stopwords": sorted(_extra_recall_stopwords),
                 "episodic_recall_limit": EPISODIC_RECALL_LIMIT,
                 "tier_days": (TIER2_DAYS, TIER3_DAYS),
