@@ -450,7 +450,7 @@ class OpenAICompatModalityBackend:
     """Describe content via any OpenAI-compatible vision endpoint."""
 
     name: str = NAME
-    modalities: FrozenSet[str] = frozenset({"image", "document", "audio"})
+    modalities: FrozenSet[str] = frozenset({"image", "audio"})
 
     def describe(self, request: DescribeRequest) -> Optional[DescribeResult]:
         base_url = _cfg_str("modality_base_url").rstrip("/")

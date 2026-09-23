@@ -315,7 +315,9 @@ def test_registration_when_configured(stub, configured):
     configured(server.base_url)
     assert adapter.register_if_configured() is True
     assert get_modality_backend("image") is not None
-    assert get_modality_backend("audio") is None, "this adapter does not claim audio"
+    assert get_modality_backend("audio") is not None, "audio goes to /audio/transcriptions"
+    assert get_modality_backend("document") is None, "documents are read locally, not sent"
+    assert get_modality_backend("video") is None, "video needs frame sampling, not this adapter alone"
 
 
 def test_model_selection_is_per_modality(stub, configured):

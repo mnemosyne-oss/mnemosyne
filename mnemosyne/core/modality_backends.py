@@ -260,6 +260,13 @@ def _autoregister_configured_backends() -> None:
     serves the requested modality. A host that registered its own default is
     left alone.
     """
+    if get_modality_backend("document") is None:
+        # Documents are read locally: no endpoint, no model, nothing sent.
+        try:
+            from mnemosyne.core.modality_documents import LocalDocumentBackend
+            set_modality_backend(LocalDocumentBackend(), frozenset({"document"}))
+        except Exception:
+            logger.info("modality: local document backend unavailable", exc_info=True)
     if _default is not None:
         return
     try:
