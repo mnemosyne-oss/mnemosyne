@@ -105,6 +105,22 @@ def is_configured(modality: str = "image") -> bool:
 # Payload construction
 # ---------------------------------------------------------------------------
 
+def _guess_mime(uri: Optional[str]) -> Optional[str]:
+    """Type from the file name when the caller gave none.
+
+    Vision endpoints validate the data URI's media type; OpenAI accepts only
+    ``image/png``, ``image/jpeg``, ``image/gif`` and ``image/webp`` and rejects
+    ``application/octet-stream`` outright, so an unlabeled local PNG would
+    otherwise fail every call.
+    """
+    import mimetypes
+
+    if not uri:
+        return None
+    guessed, _ = mimetypes.guess_type(str(uri), strict=False)
+    return guessed
+
+
 def _image_part(request: DescribeRequest) -> Optional[Dict[str, Any]]:
     """Build the ``image_url`` content part, fetching bytes only when needed.
 
@@ -130,7 +146,7 @@ def _image_part(request: DescribeRequest) -> Optional[Dict[str, Any]]:
     if not raw:
         return None
 
-    mime = request.mime or "application/octet-stream"
+    mime = request.mime or _guess_mime(request.uri) or "application/octet-stream"
     encoded = base64.b64encode(raw).decode("ascii")
     return {
         "type": "image_url",

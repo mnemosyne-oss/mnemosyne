@@ -231,6 +231,14 @@ def call_modality_describe(request: DescribeRequest) -> Optional[DescribeResult]
 
     backend = get_modality_backend(request.modality)
     if backend is None:
+        # The documented setup is configuration only: MNEMOSYNE_MODALITY_*
+        # (or config.yaml) and nothing else. Registration is deferred to here,
+        # the first describe after the operator opted in, so importing a
+        # module still never arms an outbound path. Explicit registrations
+        # win: this only runs when nothing serves the modality.
+        _autoregister_configured_backends()
+        backend = get_modality_backend(request.modality)
+    if backend is None:
         return None
 
     try:
@@ -243,3 +251,20 @@ def call_modality_describe(request: DescribeRequest) -> Optional[DescribeResult]
             getattr(backend, "name", "?"), request.modality, exc_info=True,
         )
         return None
+
+
+def _autoregister_configured_backends() -> None:
+    """Register the built-in adapter as the default when it is configured.
+
+    Called only behind the ``modality_enabled`` gate, and only when no backend
+    serves the requested modality. A host that registered its own default is
+    left alone.
+    """
+    if _default is not None:
+        return
+    try:
+        from mnemosyne.core.modality_openai_compat import register_if_configured
+        register_if_configured()
+    except Exception:
+        logger.info("modality: built-in adapter registration failed", exc_info=True)
+
