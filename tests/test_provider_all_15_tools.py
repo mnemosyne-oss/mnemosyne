@@ -7,7 +7,6 @@ update, forget, import, diagnose) plus the 7 already-existing tools.
 """
 
 import json
-import pytest
 from pathlib import Path
 
 from mnemosyne.core.beam import BeamMemory
