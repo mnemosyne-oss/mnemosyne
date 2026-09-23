@@ -49,6 +49,9 @@ def embeddings_mod(monkeypatch, tmp_path):
     cfg_dir.mkdir(exist_ok=True)
     (cfg_dir / "config.yaml").write_text("")
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(cfg_dir))
+    # Isolate the shared-HOME fallback so an ambient ~/.hermes config
+    # cannot shadow the stub URL/model/key under test.
+    monkeypatch.setenv("HOME", str(tmp_path))
     MnemosyneConfig.reset_instance()
     # The reload below re-reads _DEFAULT_MODEL from the patched env (model
     # "embeddinggemma-300m-q4"); restore the original afterward so later
@@ -71,6 +74,7 @@ def embeddings_mod(monkeypatch, tmp_path):
     embeddings._OPENAI_API_KEY = _orig_api_key
     embeddings._OPENAI_BASE_URL = _orig_base_url
     server.shutdown()
+    MnemosyneConfig.reset_instance()
 
 def test_query_prefix_byte_exact(embeddings_mod):
     # No cache manipulation: the cache is keyed on the PREFIXED text, so prefix
@@ -113,6 +117,8 @@ def test_fastembed_path_applies_prefixes(monkeypatch, tmp_path):
     cfg_dir.mkdir(exist_ok=True)
     (cfg_dir / "config.yaml").write_text("")
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(cfg_dir))
+    # Isolate the shared-HOME fallback as well (profile > env > shared).
+    monkeypatch.setenv("HOME", str(tmp_path))
     MnemosyneConfig.reset_instance()
     monkeypatch.setattr(emb, "_DEFAULT_MODEL", emb._resolve_default_model())
     monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_URL", raising=False)   # force non-API path
@@ -133,3 +139,4 @@ def test_fastembed_path_applies_prefixes(monkeypatch, tmp_path):
     assert fake.received[-1] == [DOC_PREFIX + "local fact"]
     assert emb.embed_query("local query") is not None
     assert fake.received[-1] == [QUERY_PREFIX + "local query"]
+    MnemosyneConfig.reset_instance()

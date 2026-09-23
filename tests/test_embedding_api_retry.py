@@ -29,6 +29,8 @@ def _uncredentialed_embedding_client(monkeypatch, tmp_path):
     cfg_dir.mkdir(exist_ok=True)
     (cfg_dir / "config.yaml").write_text("")
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(cfg_dir))
+    # Isolate the shared-HOME fallback (profile YAML > env > shared YAML).
+    monkeypatch.setenv("HOME", str(tmp_path))
     MnemosyneConfig.reset_instance()
     monkeypatch.setattr(
         embeddings, "_DEFAULT_MODEL", embeddings._resolve_default_model()
@@ -48,6 +50,8 @@ def _uncredentialed_embedding_client(monkeypatch, tmp_path):
         embeddings.urllib.request, "build_opener",
         lambda *handlers: _UrlopenOpener(),
     )
+    yield
+    MnemosyneConfig.reset_instance()
 
 
 class Response:

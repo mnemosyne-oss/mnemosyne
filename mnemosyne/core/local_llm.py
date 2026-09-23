@@ -257,14 +257,14 @@ def _load_llm():
     """
     global _llm_instance, _llm_backend, _llm_available
 
+    if _local_llm_disabled():
+        _llm_available = False
+        return None
+
     if _llm_instance is not None:
         return _llm_instance
 
     if not LLM_ENABLED:
-        _llm_available = False
-        return None
-
-    if _local_llm_disabled():
         _llm_available = False
         return None
 

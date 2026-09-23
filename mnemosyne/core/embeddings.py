@@ -79,12 +79,34 @@ def _cfg_get(key: str):
         from mnemosyne.core.config import (  # local import avoids cycle at top-level
             _default_config_path,
             get_config,
+            get_shared_value,
         )
 
         if not _default_config_path().exists():
-            # No config file: do not seed one as a mere import side
-            # effect. Read-only callers (doctor, fresh data dirs) must
-            # not create config.yaml; env fallback is handled below.
+            # No profile config file: do not seed one as a mere import
+            # side effect. Read-only callers (doctor, fresh data dirs)
+            # must not create config.yaml. An explicitly isolated store
+            # (MNEMOSYNE_DATA_DIR) never consults the ambient shared HOME
+            # config; otherwise a shared HOME config may still hold the
+            # dimension, so consult it directly (no singleton, no
+            # seeding) when no explicit env overrides it; env fallback
+            # is handled below.
+            if not os.environ.get("MNEMOSYNE_DATA_DIR"):
+                try:
+                    from mnemosyne.core.config import ENV_VAR_MAP as _EVM
+
+                    _ev = _EVM.get(key)
+                    _env_set = bool(
+                        _ev
+                        and os.environ.get(_ev) is not None
+                        and str(os.environ.get(_ev)).strip() != ""
+                    )
+                    if not _env_set:
+                        _sv = get_shared_value(key)
+                        if _sv is not None and str(_sv).strip() != "":
+                            return _sv
+                except Exception:
+                    pass
             return None
         cfg = get_config()
         val = cfg.get(key)

@@ -144,6 +144,7 @@ def _clean_room_embedding_defaults(tmp_path_factory):
             if key.startswith("MNEMOSYNE_"):
                 del os.environ[key]
         os.environ.pop("HERMES_HOME", None)
+        os.environ.pop("OPENAI_API_KEY", None)
         os.environ["HOME"] = str(home)
         from mnemosyne.core.config import MnemosyneConfig
         MnemosyneConfig.reset_instance()

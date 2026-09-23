@@ -1052,17 +1052,38 @@ def _resolve_vec_type() -> str:
     Read per call so ``mnemosyne config set vec_type`` applies without a
     process restart. Unset or blank resolves to the ``int8`` default; an
     explicitly set but invalid value falls back to ``float32`` with a
-    warning, matching the historical import-time behavior.
+    warning, matching the historical import-time behavior. A per-profile
+    config inherits a missing key from the shared HOME config (via
+    ``get_config()``); with no profile file on disk the shared value is
+    consulted directly so read-only callers never seed a file on import.
     """
     raw = None
     try:
-        from mnemosyne.core.config import _default_config_path, get_config
+        from mnemosyne.core.config import (
+            _default_config_path,
+            get_config,
+            get_shared_value,
+        )
         if _default_config_path().exists():
             raw = get_config().get("vec_type")
         else:
-            # No config file: do not seed one as a mere import side
-            # effect; fall through to env below.
-            raw = os.environ.get("MNEMOSYNE_VEC_TYPE")
+            # No profile file: do not seed one as a mere import side
+            # effect. An explicitly isolated store (MNEMOSYNE_DATA_DIR)
+            # never consults the ambient shared HOME config; otherwise
+            # consult it directly when no explicit env overrides it,
+            # then fall through to env below.
+            try:
+                _env_set = bool(
+                    os.environ.get("MNEMOSYNE_VEC_TYPE") is not None
+                    and str(os.environ.get("MNEMOSYNE_VEC_TYPE")).strip()
+                    != ""
+                )
+                if not os.environ.get("MNEMOSYNE_DATA_DIR") and not _env_set:
+                    raw = get_shared_value("vec_type")
+                else:
+                    raw = os.environ.get("MNEMOSYNE_VEC_TYPE")
+            except Exception:
+                raw = os.environ.get("MNEMOSYNE_VEC_TYPE")
         if raw is not None and not str(raw).strip():
             # Blank YAML value is treated as unset so an explicit env var
             # still wins over it (mirrors the embeddings blank handling).

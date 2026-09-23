@@ -129,6 +129,17 @@ class TestLoadGuard:
         local_llm = _real_load_llm(monkeypatch)
         assert local_llm._call_local_llm("summarize this") is None
 
+    def test_loaded_then_disabled_returns_none(
+        self, isolated_config, monkeypatch
+    ):
+        """A model loaded before the flag is set must not be reused."""
+        local_llm = _real_load_llm(monkeypatch)
+        sentinel = object()
+        monkeypatch.setattr(local_llm, "_llm_instance", sentinel, raising=False)
+        isolated_config.set("disable_local_llm", True)
+        assert local_llm._load_llm() is None
+        assert local_llm._llm_available is False
+
     def test_fresh_process_env_disables_load(self, tmp_path):
         """Fresh interpreter: env flag alone blocks the loader."""
         code = (
@@ -140,6 +151,10 @@ class TestLoadGuard:
         env = {
             k: v for k, v in os.environ.items() if not k.startswith("MNEMOSYNE_")
         }
+        env.pop("HERMES_HOME", None)
+        isolated_dir = tmp_path / "data-isolated"
+        isolated_dir.mkdir(exist_ok=True)
+        env["MNEMOSYNE_DATA_DIR"] = str(isolated_dir)
         env["MNEMOSYNE_DISABLE_LOCAL_LLM"] = "true"
         env["MNEMOSYNE_NO_EMBEDDINGS"] = "1"
         result = subprocess.run(

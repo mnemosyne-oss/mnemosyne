@@ -34,10 +34,15 @@ def isolated_config(monkeypatch, tmp_path):
         if key.startswith("MNEMOSYNE_"):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+    # Isolate the shared-HOME fallback: resolution is profile YAML > env
+    # > shared YAML, so an ambient ~/.hermes config would otherwise shadow
+    # the env/default values under test.
+    monkeypatch.setenv("HOME", str(tmp_path))
     config_path = tmp_path / "config.yaml"
     config_path.write_text("")
     MnemosyneConfig.reset_instance()
-    config = MnemosyneConfig(config_path=config_path)
+    config = MnemosyneConfig()
     monkeypatch.setattr(
         "mnemosyne.core.config.MnemosyneConfig._instance", config
     )
@@ -110,6 +115,10 @@ class TestHotReload:
 
         _write_config(isolated_config, {"vec_type": "float32"})
         monkeypatch.setattr(beam, "VEC_TYPE", "int8")
+        # Force the resolver path even where sqlite-vec is not installed
+        # (otherwise the ``not _SQLITE_VEC_AVAILABLE`` early return skips
+        # the resolver and the test fails for environment reasons).
+        monkeypatch.setattr(beam, "_SQLITE_VEC_AVAILABLE", True)
         calls = {"n": 0}
         real_resolve = beam._resolve_vec_type
 

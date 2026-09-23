@@ -39,8 +39,13 @@ def isolated_config(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_HOME", raising=False)
     config_path = tmp_path / "config.yaml"
     config_path.write_text("")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+    # Isolate the shared-HOME fallback (profile YAML > env > shared YAML):
+    # an ambient ~/.hermes config would otherwise shadow the env/default
+    # values under test (and break the fail-loud expectation).
+    monkeypatch.setenv("HOME", str(tmp_path))
     MnemosyneConfig.reset_instance()
-    config = MnemosyneConfig(config_path=config_path)
+    config = MnemosyneConfig()
     monkeypatch.setattr(
         "mnemosyne.core.config.MnemosyneConfig._instance", config
     )
@@ -314,3 +319,50 @@ class TestFreshProcessYamlDim:
         )
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "1024"
+
+    def test_profile_keeps_own_model_while_inheriting_dim(
+        self, tmp_path, monkeypatch
+    ):
+        """A profile config keeps its own model/endpoint; only the missing
+        dim is inherited from shared HOME (the profile path stays active)."""
+        from mnemosyne.core.config import _default_config_path
+
+        home = tmp_path / "home"
+        shared_dir = home / ".hermes" / "mnemosyne"
+        shared_dir.mkdir(parents=True)
+        (shared_dir / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "embedding_model": "shared-model",
+                    "embedding_dim": 1024,
+                    "embedding_api_url": "https://shared.test/v1",
+                }
+            )
+        )
+        profile_home = tmp_path / "profile-home"
+        profile_cfg_dir = profile_home / "mnemosyne"
+        profile_cfg_dir.mkdir(parents=True)
+        (profile_cfg_dir / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "embedding_model": "profile-model",
+                    "embedding_api_url": "https://profile.test/v1",
+                }
+            )
+        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.delenv("MNEMOSYNE_DATA_DIR", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_EMBEDDING_DIM", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_EMBEDDING_MODEL", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_URL", raising=False)
+        MnemosyneConfig.reset_instance()
+        try:
+            cfg = MnemosyneConfig()
+            assert cfg.config_path == _default_config_path()
+            assert "profile-home" in str(cfg.config_path)
+            assert cfg.get("embedding_model") == "profile-model"
+            assert cfg.get("embedding_api_url") == "https://profile.test/v1"
+            assert cfg.get("embedding_dim") == 1024
+        finally:
+            MnemosyneConfig.reset_instance()

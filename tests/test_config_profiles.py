@@ -42,6 +42,11 @@ def temp_config(monkeypatch):
             monkeypatch.delenv(key, raising=False)
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        # Isolate the shared-HOME fallback (profile YAML > env > shared
+        # YAML) so an ambient ~/.hermes config cannot shadow assertions
+        # about an empty/local config.
+        monkeypatch.setenv("HOME", tmpdir)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
         config_path = Path(tmpdir) / "config.yaml"
         # Create an empty config.yaml so auto-seed doesn't fire.
         # The auto-seed writes defaults which would override test env vars

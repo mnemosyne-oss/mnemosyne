@@ -29,6 +29,8 @@ def _isolated_embedding_config(monkeypatch, tmp_path):
     cfg_dir.mkdir(exist_ok=True)
     (cfg_dir / "config.yaml").write_text("")
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(cfg_dir))
+    # Isolate the shared-HOME fallback (profile YAML > env > shared YAML).
+    monkeypatch.setenv("HOME", str(tmp_path))
     MnemosyneConfig.reset_instance()
     yield
     MnemosyneConfig.reset_instance()

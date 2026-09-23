@@ -34,6 +34,10 @@ def _isolate_config(monkeypatch, tmp_path):
     cfg_dir.mkdir(exist_ok=True)
     (cfg_dir / "config.yaml").write_text("")
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(cfg_dir))
+    # Isolate the shared-HOME fallback (profile YAML > env > shared YAML):
+    # an ambient ~/.hermes config would otherwise shadow the defaults
+    # under test (e.g. an API model turning _get_model into "api").
+    monkeypatch.setenv("HOME", str(tmp_path))
     MnemosyneConfig.reset_instance()
     monkeypatch.setattr(
         embeddings, "_DEFAULT_MODEL", embeddings._resolve_default_model()
@@ -81,6 +85,7 @@ def _clean_embedding_env(monkeypatch, tmp_path):
         lambda *handlers: _UrlopenOpener(),
     )
     yield
+    MnemosyneConfig.reset_instance()
 
 
 def test_is_disabled_default_false():
