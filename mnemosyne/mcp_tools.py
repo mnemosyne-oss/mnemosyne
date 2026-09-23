@@ -727,6 +727,27 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _handle_remember_media(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_remember_media tool call.
+
+    Validation and the tool-surface guards (allowed local paths, no internal
+    URLs, bounded inline payloads) live in ``core.media_tool`` so MCP and both
+    Hermes providers enforce the same rules.
+    """
+    from mnemosyne.core.media_tool import remember_media_tool
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(
+        author_id=arguments.get("author_id"),
+        author_type=arguments.get("author_type"),
+        channel_id=arguments.get("channel_id"),
+        bank=bank,
+    )
+    payload = remember_media_tool(mem.beam, arguments, default_scope=_resolve_default_scope())
+    payload["bank"] = bank
+    return payload
+
+
 def _handle_get(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_get tool call."""
     memory_id = arguments.get("memory_id", "")
@@ -1290,6 +1311,7 @@ _TOOL_HANDLERS = {
     "mnemosyne_invalidate": _handle_invalidate,
     "mnemosyne_validate": _handle_validate,
     "mnemosyne_get": _handle_get,
+    "mnemosyne_remember_media": _handle_remember_media,
     "mnemosyne_triple_add": _handle_triple_add,
     "mnemosyne_triple_query": _handle_triple_query,
     "mnemosyne_remember_canonical": _handle_remember_canonical,

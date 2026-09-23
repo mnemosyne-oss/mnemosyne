@@ -865,6 +865,50 @@ VALIDATE_SCHEMA = {
     },
 }
 
+REMEMBER_MEDIA_SCHEMA = {
+    "name": "mnemosyne_remember_media",
+    "description": (
+        "Remember a piece of media: an image, audio clip, video or document. It is "
+        "registered by reference and, when media understanding is enabled, turned into "
+        "located text memories (captions, timed transcript lines, timed video shots, "
+        "document passages by page) that mnemosyne_recall finds like any other memory. "
+        "Pass an https:// URL, a data: URI, a blob:// reference, or an absolute local "
+        "path inside MNEMOSYNE_MEDIA_ALLOWED_PATHS. Status 'unavailable' is a success: "
+        "the media was registered but nothing described it (no model configured, or "
+        "understanding is off)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "ref": {
+                "type": "string",
+                "description": "https:// URL, data: URI, blob://sha256/... reference, or an absolute local path inside MNEMOSYNE_MEDIA_ALLOWED_PATHS.",
+            },
+            "modality": {
+                "type": "string",
+                "enum": ["image", "video", "audio", "document"],
+                "description": "Override the modality inferred from the extension or mime type.",
+            },
+            "mime": {"type": "string", "description": "Media type, e.g. image/png. Optional."},
+            "title": {"type": "string", "description": "Short human title for the media. Optional."},
+            "hint": {
+                "type": "string",
+                "description": "Guidance for the describer: what to look for, or names and jargon to expect in speech.",
+            },
+            "max_moments": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Cap on memories created from this media. Default from MNEMOSYNE_MODALITY_MAX_MOMENTS.",
+            },
+            "importance": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5},
+            "scope": {"type": "string", "enum": ["session", "global"], "description": "Defaults to the configured scope."},
+        },
+        "required": ["ref"],
+    },
+}
+
+
 GET_SCHEMA = {
     "name": "mnemosyne_get",
     "description": (
@@ -1400,6 +1444,7 @@ ALL_TOOL_SCHEMAS = [
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,
     *ALL_SYNC_TOOL_SCHEMAS,
     *ALL_PERSONA_TOOL_SCHEMAS,
+    REMEMBER_MEDIA_SCHEMA,
 ]
 
 
@@ -1499,6 +1544,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         "mnemosyne_triple_end",
         "mnemosyne_update",
         "mnemosyne_validate",
+        "mnemosyne_remember_media",
     })
 
     def __init__(self):
@@ -2980,6 +3026,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 return self._handle_validate(args)
             elif tool_name == "mnemosyne_get":
                 return self._handle_get(args)
+            elif tool_name == "mnemosyne_remember_media":
+                return self._handle_remember_media(args)
             elif tool_name == "mnemosyne_triple_add":
                 return self._handle_triple_add(args)
             elif tool_name == "mnemosyne_triple_end":
@@ -3714,6 +3762,23 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "pass store=... instead. The alias is removed in 5.0."
             )
         return json.dumps(result)
+
+    def _handle_remember_media(self, args: Dict[str, Any]) -> str:
+        """Register media and, if understanding is enabled, describe it.
+
+        Guards shared with MCP live in ``mnemosyne.core.media_tool``: local
+        paths only inside MNEMOSYNE_MEDIA_ALLOWED_PATHS, no internal URLs,
+        bounded inline payloads. The provider's bank is fixed per profile, so
+        no tenant ``bank`` argument is accepted.
+        """
+        from mnemosyne.core.media_tool import remember_media_tool
+
+        if not self._beam:
+            return json.dumps({"status": "error", "error": "private beam not initialized"})
+        return json.dumps(
+            remember_media_tool(self._beam, args, default_scope=self._default_scope),
+            default=str,
+        )
 
     def _handle_get(self, args: Dict[str, Any]) -> str:
         memory_id = args.get("memory_id", "")

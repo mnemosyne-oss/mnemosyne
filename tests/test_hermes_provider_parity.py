@@ -179,6 +179,7 @@ PROVIDER_TOOL_NAMES = [
     "mnemosyne_graph_query", "mnemosyne_graph_link", "mnemosyne_sync_push",
     "mnemosyne_sync_pull", "mnemosyne_sync_status", "mnemosyne_persona_promote",
     "mnemosyne_persona_demote", "mnemosyne_persona_list", "mnemosyne_persona_reinforce",
+    "mnemosyne_remember_media",
 ]
 
 

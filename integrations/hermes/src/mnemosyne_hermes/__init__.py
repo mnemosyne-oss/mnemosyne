@@ -1042,6 +1042,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         "mnemosyne_triple_end",
         "mnemosyne_update",
         "mnemosyne_validate",
+        "mnemosyne_remember_media",
     })
 
     # How long on_session_end will wait for sleep/consolidation to finish before
@@ -2775,6 +2776,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return self._handle_validate(args)
         elif tool_name == "mnemosyne_get":
             return self._handle_get(args)
+        elif tool_name == "mnemosyne_remember_media":
+            return self._handle_remember_media(args)
         elif tool_name == "mnemosyne_triple_add":
             return self._handle_triple_add(args)
         elif tool_name == "mnemosyne_triple_query":
@@ -3520,6 +3523,23 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "pass store=... instead. The alias is removed in 5.0."
             )
         return json.dumps(result)
+
+    def _handle_remember_media(self, args: Dict[str, Any]) -> str:
+        """Register media and, if understanding is enabled, describe it.
+
+        Guards shared with MCP live in ``mnemosyne.core.media_tool``: local
+        paths only inside MNEMOSYNE_MEDIA_ALLOWED_PATHS, no internal URLs,
+        bounded inline payloads. The provider's bank is fixed per profile, so
+        no tenant ``bank`` argument is accepted.
+        """
+        from mnemosyne.core.media_tool import remember_media_tool
+
+        if not self._beam:
+            return json.dumps({"status": "error", "error": "private beam not initialized"})
+        return json.dumps(
+            remember_media_tool(self._beam, args, default_scope=self._default_scope),
+            default=str,
+        )
 
     def _handle_get(self, args: Dict[str, Any]) -> str:
         memory_id = args.get("memory_id", "")
