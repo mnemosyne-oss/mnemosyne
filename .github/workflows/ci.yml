@@ -181,6 +181,9 @@ jobs:
           restore-keys: |
             fastembed-bge-small-en-v1.5-${{ matrix.python-version }}-
 
+      - name: Install ffmpeg (video understanding tests)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
