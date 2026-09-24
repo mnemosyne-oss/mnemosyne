@@ -7,6 +7,10 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`mnemosyne media --help` now prints usage instead of triggering media ingestion (#1043).** The CLI's `cmd_media` accepted any string in the positional slot, so a user checking the available options would instead create a `media_assets` row with `ref_kind=file`, `ref_value=--help`, and `understanding_status=unavailable`. `--help` and `-h` now print the usage string and exit 0 before any database or file write; running `mnemosyne media` with no arguments produces the same help text. Behavior for valid paths, URLs and `data:` URIs is unchanged.
+
 ### Added
 
 - **`mnemosyne_remember_media` tool and `mnemosyne media` CLI command.** Media understanding was SDK-only. It is now a tool over MCP (with a per-call tenant `bank`) and in both Hermes providers, and a CLI command. Because a tool caller can be a remote MCP client or a model steered by what it just read, the tool refuses local paths unless they resolve, after symlinks, inside `MNEMOSYNE_MEDIA_ALLOWED_PATHS`, refuses URLs that resolve to loopback, private or link-local addresses unless `MNEMOSYNE_MEDIA_ALLOW_PRIVATE_URLS` is set, and caps inline `data:` payloads at 25 MB. The CLI and SDK stay unrestricted. The Hermes catalog manifest declares the new tool.

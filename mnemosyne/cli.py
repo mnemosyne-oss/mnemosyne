@@ -220,8 +220,18 @@ def cmd_media(args):
     """Remember a piece of media and, if understanding is enabled, describe it."""
     usage = ("Usage: mnemosyne media <path|url|data:uri> [--modality image|video|audio|document] "
              "[--title T] [--hint H] [--max-moments N] [--mime TYPE] [--json]")
-    if not args:
-        _usage(usage)
+    if not args or args[0] in ("--help", "-h"):
+        print(usage)
+        print("  <path>                            Local file path to ingest")
+        print("  <url>                             HTTP(S) URL of remote media")
+        print("  <data:uri>                        Inline data: URI payload")
+        print("  --modality image|video|audio|document   Force modality instead of inferring from path/URL")
+        print("  --title T                         Human-readable title for the asset")
+        print("  --hint H                          Free-form context passed to the understanding model")
+        print("  --max-moments N                   Cap the number of derived moments (default: model default)")
+        print("  --mime TYPE                       Override MIME type detection")
+        print("  --json                            Emit a machine-readable JSON summary on stdout")
+        return
     options = {"modality": None, "title": None, "hint": None, "max-moments": None, "mime": None}
     json_output = False
     positionals = []
