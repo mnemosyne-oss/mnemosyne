@@ -1419,18 +1419,19 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
             synced_at TEXT
         )
     """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_timestamp ON memory_events(timestamp)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_memory_id ON memory_events(memory_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_device_id ON memory_events(device_id)")
-
     # Memory events ALTER TABLE migrations (safe add columns for existing DBs)
     for col, ddl in {
+        "device_id": "device_id TEXT NOT NULL DEFAULT ''",
         "event_hash": "event_hash TEXT",
         "synced_at": "synced_at TEXT",
         "parent_event_ids": "parent_event_ids TEXT DEFAULT '[]'",
         "expiry": "expiry TEXT",
     }.items():
         _add_column_if_missing(conn, "memory_events", col, ddl.split(" ", 1)[1])
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_timestamp ON memory_events(timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_memory_id ON memory_events(memory_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_device_id ON memory_events(device_id)")
 
     # Detect supported vector type
     effective_vec_type = _detect_vec_type(conn)
