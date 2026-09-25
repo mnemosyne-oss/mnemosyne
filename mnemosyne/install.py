@@ -673,5 +673,31 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _uninstall_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mnemosyne-uninstall",
+        description=(
+            "Remove Mnemosyne from Hermes: delegates to the standalone provider's "
+            "uninstall, removes legacy links, and resets memory.provider to null. "
+            "Memory databases are not deleted."
+        ),
+    )
+    parser.add_argument("--hermes-home", help="Hermes home. Defaults to HERMES_HOME or ~/.hermes.")
+    return parser
+
+
+def uninstall_main(argv: list[str] | None = None) -> int:
+    """Console entry point for ``mnemosyne-uninstall``.
+
+    The entry point used to call :func:`uninstall` directly, which never reads
+    its arguments, so ``mnemosyne-uninstall --help`` ran a real uninstall and
+    rewrote the Hermes config. Parsing first means ``--help`` prints usage and
+    any unknown argument is rejected before anything is touched.
+    """
+    args = _uninstall_parser().parse_args(argv)
+    uninstall(args.hermes_home)
+    return 0
+
+
 if __name__ == "__main__":
     sys.exit(main())
