@@ -77,6 +77,10 @@ def _config_schema(module):
 def _write_mnemosyne_config(hermes_home: Path, tools) -> None:
     if tools is None:
         body = "memory:\n  provider: mnemosyne\n  mnemosyne: {}\n"
+    elif isinstance(tools, str):
+        # A quoted scalar, e.g. the serialized sentinel "None"/"null" from
+        # issue #1021, distinct from the YAML null keyword and from `[]`.
+        body = f'memory:\n  provider: mnemosyne\n  mnemosyne:\n    tools: "{tools}"\n'
     elif not tools:
         body = "memory:\n  provider: mnemosyne\n  mnemosyne:\n    tools: []\n"
     else:
@@ -179,6 +183,7 @@ PROVIDER_TOOL_NAMES = [
     "mnemosyne_graph_query", "mnemosyne_graph_link", "mnemosyne_sync_push",
     "mnemosyne_sync_pull", "mnemosyne_sync_status", "mnemosyne_persona_promote",
     "mnemosyne_persona_demote", "mnemosyne_persona_list", "mnemosyne_persona_reinforce",
+    "mnemosyne_remember_media",
 ]
 
 
@@ -733,6 +738,14 @@ def test_uninitialized_primary_tool_call_diverges_by_provider(
         (["mnemosyne_remember", "mnemosyne_recall"], ["mnemosyne_remember", "mnemosyne_recall"], False),
         ([], [], False),
         (["mnemosyne_not_real"], None, True),
+        # issue #1021: a serialized "None"/"null" (any case) or empty
+        # string must resolve the same as real None, not as an unknown
+        # tool name or an empty allowlist.
+        ("None", PROVIDER_TOOL_NAMES, False),
+        ("null", PROVIDER_TOOL_NAMES, False),
+        ("NoNe", PROVIDER_TOOL_NAMES, False),
+        ("  nUlL  ", PROVIDER_TOOL_NAMES, False),
+        ("", PROVIDER_TOOL_NAMES, False),
     ],
 )
 def test_tool_whitelist_without_yaml_matches_pyyaml(

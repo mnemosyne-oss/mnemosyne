@@ -38,6 +38,7 @@ REQUIRED_CORE_API = (
     ("mnemosyne.core.filters", "admit_memory_write"),
     ("mnemosyne.core.verbatim_ledger", "VerbatimLedger"),
     ("mnemosyne.upgrade_hermes", "upgrade_command"),
+    ("mnemosyne.core.media_tool", "remember_media_tool"),
 )
 
 

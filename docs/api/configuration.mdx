@@ -1,7 +1,7 @@
 ---
 title: "Configuration"
 version: 4.0.0b3
-config_key_count: 114
+config_key_count: 116
 env_only_count: 48
 generated_at: "auto"
 ---
@@ -23,13 +23,13 @@ and `wm_max_items` are equivalent.
 Keys marked **restart** are read once at startup. Changing them at runtime warns
 and does not take effect until the process restarts.
 
-There are **114 configuration keys**. A further
+There are **116 configuration keys**. A further
 **48 environment variables** are read directly from the
 environment and are **not** settable in `config.yaml`; they are listed separately below.
 
 ---
 
-## Configuration keys (114)
+## Configuration keys (116)
 
 | Config key | Environment variable | Default | Restart | Description |
 |------------|----------------------|---------|---------|-------------|
@@ -80,6 +80,8 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `llm_n_threads` | `MNEMOSYNE_LLM_N_THREADS` | `4` | no | CPU threads for local GGUF inference. |
 | `llm_repo` | `MNEMOSYNE_LLM_REPO` | *(unset)* | **yes** | Hugging Face repo holding the local GGUF model. |
 | `llm_timeout` | `MNEMOSYNE_LLM_TIMEOUT` | `60` | no | Per-request timeout in seconds for LLM calls. |
+| `media_allow_private_urls` | `MNEMOSYNE_MEDIA_ALLOW_PRIVATE_URLS` | `false` | no | Let the mnemosyne_remember_media tool fetch URLs that resolve to loopback, private or link-local addresses. |
+| `media_allowed_paths` | `MNEMOSYNE_MEDIA_ALLOWED_PATHS` | *(unset)* | no | Directories the mnemosyne_remember_media tool may read local files from (os.pathsep or comma separated). Empty: tool calls cannot name local files. |
 | `modality_api_key` | `MNEMOSYNE_MODALITY_API_KEY` | *(unset)* | no | API key for the modality endpoint. |
 | `modality_audio_model` | `MNEMOSYNE_MODALITY_AUDIO_MODEL` | *(unset)* | **yes** | Model used to transcribe or describe audio. |
 | `modality_base_url` | `MNEMOSYNE_MODALITY_BASE_URL` | *(unset)* | **yes** | Base URL of an OpenAI-compatible vision endpoint. Any provider that speaks the protocol works. |

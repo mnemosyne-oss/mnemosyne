@@ -607,7 +607,12 @@ def _canonical_explicit_match_tokens(content: str, *, cjk_ngram_size: int) -> Se
 
 
 def _canonical_iteration_recall_match(query: str, body: str) -> bool:
-    """Require all local iteration-mark evidence to match within one CJK run."""
+    """Require all local iteration-mark evidence to match within one CJK run.
+
+    Guards both canonical paths since #1023: explicit recall and automatic
+    prefetch. The name still says "recall" because that is where it landed in
+    #1022; the predicate itself never looked at the caller.
+    """
     query_runs = _canonical_iteration_runs(query)
     body_runs = _canonical_iteration_runs(body)
     query_anchors = [anchors for _raw_tokens, _tokens, anchors in query_runs if anchors]
@@ -787,6 +792,12 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
         overlap = query_tokens & row_tokens
         distinctive_overlap = overlap - generic_tokens
         if not distinctive_overlap:
+            continue
+        # #1023: the same run-local iteration-mark predicate that guards explicit
+        # recall. Without it a query such as `佐々野` could still inject the
+        # unrelated sibling `佐々木` here, which is the worse of the two paths
+        # because prefetch content is written into the prompt unasked.
+        if not _canonical_iteration_recall_match(query, body):
             continue
         # One distinctive token can be enough for canonical slots such as
         # profile URLs; broad queries need a little more coverage. Generic
@@ -1047,6 +1058,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         "mnemosyne_triple_end",
         "mnemosyne_update",
         "mnemosyne_validate",
+        "mnemosyne_remember_media",
     })
 
     # How long on_session_end will wait for sleep/consolidation to finish before
@@ -1620,10 +1632,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         Mnemosyne tools. ``tools: []`` exposes no tools while still allowing the
         provider's memory context/prefetch surface to initialize. Unknown names
         fail loudly so operators catch typos during Hermes startup instead of
-        silently losing tools.
+        silently losing tools. The serialized sentinels "None", "null" (any
+        case) and the empty string are also treated as unconfigured, since a
+        config/UI layer can round-trip a real ``None`` into one of those
+        strings instead of YAML ``null``.
         """
         configured = self._read_config_key("tools")
         if configured is None:
+            return list(ALL_TOOL_SCHEMAS)
+        if isinstance(configured, str) and configured.strip().lower() in ("", "none", "null"):
             return list(ALL_TOOL_SCHEMAS)
         if isinstance(configured, str):
             configured = [name.strip() for name in configured.replace(",", "\n").split("\n") if name.strip()]
@@ -2789,6 +2806,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return self._handle_validate(args)
         elif tool_name == "mnemosyne_get":
             return self._handle_get(args)
+        elif tool_name == "mnemosyne_remember_media":
+            return self._handle_remember_media(args)
         elif tool_name == "mnemosyne_triple_add":
             return self._handle_triple_add(args)
         elif tool_name == "mnemosyne_triple_query":
@@ -3534,6 +3553,23 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "pass store=... instead. The alias is removed in 5.0."
             )
         return json.dumps(result)
+
+    def _handle_remember_media(self, args: Dict[str, Any]) -> str:
+        """Register media and, if understanding is enabled, describe it.
+
+        Guards shared with MCP live in ``mnemosyne.core.media_tool``: local
+        paths only inside MNEMOSYNE_MEDIA_ALLOWED_PATHS, no internal URLs,
+        bounded inline payloads. The provider's bank is fixed per profile, so
+        no tenant ``bank`` argument is accepted.
+        """
+        from mnemosyne.core.media_tool import remember_media_tool
+
+        if not self._beam:
+            return json.dumps({"status": "error", "error": "private beam not initialized"})
+        return json.dumps(
+            remember_media_tool(self._beam, args, default_scope=self._default_scope),
+            default=str,
+        )
 
     def _handle_get(self, args: Dict[str, Any]) -> str:
         memory_id = args.get("memory_id", "")

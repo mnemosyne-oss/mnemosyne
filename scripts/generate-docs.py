@@ -316,6 +316,8 @@ CONFIG_DESCRIPTIONS = {
     "modality_audio_model": "Model used to transcribe or describe audio.",
     "modality_timeout": "Timeout in seconds for a modality describe call.",
     "modality_max_moments": "Maximum moments retained per media asset.",
+    "media_allowed_paths": "Directories the mnemosyne_remember_media tool may read local files from (os.pathsep or comma separated). Empty: tool calls cannot name local files.",
+    "media_allow_private_urls": "Let the mnemosyne_remember_media tool fetch URLs that resolve to loopback, private or link-local addresses.",
 
     # Conflict detection
     "llm_conflict_detection": "Enable LLM-based contradiction detection during sleep.",

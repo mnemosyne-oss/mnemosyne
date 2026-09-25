@@ -7,7 +7,6 @@ update, forget, import, diagnose) plus the 7 already-existing tools.
 """
 
 import json
-import pytest
 from pathlib import Path
 
 from mnemosyne.core.beam import BeamMemory
@@ -52,7 +51,7 @@ class TestToolRegistration:
     def test_all_tools_registered(self, tmp_path):
         provider = _provider(tmp_path)
         names = _tool_names(provider)
-        assert len(names) == 40, f"Expected 40 tools, got {len(names)}"
+        assert len(names) == 41, f"Expected 41 tools, got {len(names)}"
 
     def test_canonical_tools_present(self, tmp_path):
         provider = _provider(tmp_path)

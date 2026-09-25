@@ -36,6 +36,7 @@ provides_tools:
   - mnemosyne_recall_diagnostics
   - mnemosyne_remember
   - mnemosyne_remember_canonical
+  - mnemosyne_remember_media
   - mnemosyne_scratchpad_clear
   - mnemosyne_scratchpad_read
   - mnemosyne_scratchpad_write

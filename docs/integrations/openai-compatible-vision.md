@@ -56,6 +56,35 @@ there is no code to call.
 
 ---
 
+## Using it: tool, CLI or SDK
+
+| Surface | Call |
+|---|---|
+| MCP | `mnemosyne_remember_media` with `ref` (plus optional `modality`, `title`, `hint`, `max_moments`, `bank`) |
+| Hermes | the same tool, exposed by the Mnemosyne provider |
+| CLI | `mnemosyne media ./diagram.png` (add `--json` for the full result) |
+| Python | `BeamMemory.remember_media(ref)` |
+
+A tool call may come from a remote MCP client or from a model steered by text it
+just read, so the tool is stricter than the CLI and SDK:
+
+- **Local files need an allow-list.** Set `MNEMOSYNE_MEDIA_ALLOWED_PATHS` to the
+  directories media may be read from (`:`-separated on Linux and macOS, `;` on
+  Windows, or commas). The path is resolved through symlinks before the check,
+  so a link inside an allowed folder cannot reach outside it. With nothing set,
+  the tool accepts no local paths; pass an `https://` URL or a `data:` URI
+  instead.
+- **No internal URLs.** URLs that resolve to loopback, private or link-local
+  addresses are refused, because audio and video are fetched from this machine.
+  `MNEMOSYNE_MEDIA_ALLOW_PRIVATE_URLS=1` allows a trusted media server on your
+  LAN.
+- **Inline payloads are capped** at 25 MB decoded.
+
+The CLI and the SDK are not restricted: there the caller is the person whose
+files they are.
+
+---
+
 ## Configuration
 
 | Env var | Default | Purpose |
@@ -68,6 +97,8 @@ there is no code to call.
 | `MNEMOSYNE_MODALITY_AUDIO_MODEL` | *(unset)* | Transcription model for audio and video soundtracks. |
 | `MNEMOSYNE_MODALITY_TIMEOUT` | `60` | Per-call timeout, seconds. |
 | `MNEMOSYNE_MODALITY_MAX_MOMENTS` | `12` | Cap on moments retained per asset. |
+| `MNEMOSYNE_MEDIA_ALLOWED_PATHS` | *(unset)* | Directories the `mnemosyne_remember_media` tool may read local files from. Unset: tool calls cannot name local files. |
+| `MNEMOSYNE_MEDIA_ALLOW_PRIVATE_URLS` | `false` | Let the tool fetch URLs that resolve to private or loopback addresses. |
 | `MNEMOSYNE_MODALITY_PROMPT` | *(built-in)* | Override the description prompt. `{modality}` and `{max_moments}` are substituted. |
 
 `MNEMOSYNE_MODALITY_BASE_URL` and the three model keys are read once when the

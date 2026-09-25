@@ -216,6 +216,63 @@ def cmd_recall(args):
         print()
 
 
+def cmd_media(args):
+    """Remember a piece of media and, if understanding is enabled, describe it."""
+    usage = ("Usage: mnemosyne media <path|url|data:uri> [--modality image|video|audio|document] "
+             "[--title T] [--hint H] [--max-moments N] [--mime TYPE] [--json]")
+    if not args:
+        _usage(usage)
+    options = {"modality": None, "title": None, "hint": None, "max-moments": None, "mime": None}
+    json_output = False
+    positionals = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--json":
+            json_output = True
+        elif arg.startswith("--") and arg[2:] in options:
+            if i + 1 >= len(args):
+                _usage(usage)
+            options[arg[2:]] = args[i + 1]
+            i += 1
+        else:
+            positionals.append(arg)
+        i += 1
+    if len(positionals) != 1:
+        _usage(usage)
+    ref = positionals[0]
+    if "://" not in ref and not ref.startswith("data:") and os.path.exists(os.path.expanduser(ref)):
+        ref = os.path.abspath(os.path.expanduser(ref))
+    max_moments = _parse_int(options["max-moments"], "max-moments") if options["max-moments"] else None
+
+    mem = _get_memory()
+    try:
+        result = mem.beam.remember_media(
+            ref,
+            modality=options["modality"],
+            mime=options["mime"],
+            title=options["title"],
+            hint=options["hint"],
+            max_moments=max_moments,
+            scope=_resolve_default_scope(),
+        )
+    except ValueError as exc:
+        _fail(str(exc))
+
+    if json_output:
+        from dataclasses import asdict
+
+        print(json.dumps(asdict(result), ensure_ascii=False, default=str))
+        return
+    print(f"Asset: {result.asset_id}")
+    print(f"Status: {result.status}")
+    print(f"Memories: {len(result.memory_ids)} from {len(result.moment_ids)} moment(s)")
+    for warning in result.warnings:
+        print(f"Warning: {warning}")
+    if result.status == "unavailable":
+        print("Registered by reference only. Set MNEMOSYNE_MODALITY_ENABLED=1 and a model to describe it.")
+
+
 def cmd_update(args):
     """Update an existing memory."""
     if len(args) < 2:
@@ -1755,6 +1812,7 @@ COMMANDS = {
     "store": cmd_store,
     "remember": cmd_store,
     "recall": cmd_recall,
+    "media": cmd_media,
     "search": cmd_recall,
     "update": cmd_update,
     "edit": cmd_update,
@@ -1810,6 +1868,7 @@ def run_cli():
         print("  version                                Show installed version")
         print("  store <content> [source] [importance]  Store a memory")
         print("  recall <query> [top_k]                 Search memories")
+        print("  media <path|url> [--modality M] [--json]  Remember an image, audio, video or document")
         print("  update <id> <content> [importance]     Update a memory")
         print("  delete <id>                            Delete a memory")
         print("  stats                                  Show statistics")
