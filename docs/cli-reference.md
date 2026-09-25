@@ -73,7 +73,7 @@ Import is idempotent: annotation collisions are skipped rather than aborting the
 | Command | Usage |
 |---|---|
 | `sync-init` | `sync-init --db-path <path> [--claim-existing --yes]`. Prepares a dedicated shared-surface database |
-| `sync` | `sync --db-path <path> --remote <url> [--mode push\|pull\|bidirectional]` |
+| `sync` | `sync --db-path <path> --remote <url> [--mode push\|pull\|bidirectional] [--encrypt <key>\|--encrypt-key-file <path>] [--api-key <key>\|--api-key-file <path>]` |
 | `sync-serve`, `sync-server` | `sync-serve --db-path <path> [--port 8765] [--host 127.0.0.1] [--api-key\|--api-key-file] [--jwt-secret\|--jwt-secret-file] [--tls-cert --tls-key]` |
 | `sync-status` | `sync-status --db-path <path> [--remote <url>] [--json]` |
 | `sync-generate-key` | Prints a fresh encryption key |
