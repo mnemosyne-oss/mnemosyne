@@ -237,8 +237,8 @@ def migrate_311_tables(
                 continue
             applied_report["columns_added"].append(f"memory_events.{name}")
 
-        # Indices. Let DDL errors propagate so a successful migration means the
-        # selected runtime can open the resulting schema.
+        # Let index DDL errors propagate, as for column DDL above. Existing
+        # device_id columns are checked for presence, not runtime compatibility.
         for index_name, index_ddl in _MEMORY_EVENTS_INDICES:
             if _has_index(conn, index_name):
                 continue
