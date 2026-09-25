@@ -56,3 +56,20 @@ def test_media_help_creates_no_database_or_asset(tmp_path):
     assert not (data_dir / "mnemosyne.db").exists()
     # Sub-directories specific to media (assets dir) should not be created.
     assert not (data_dir / "media_assets").exists()
+
+
+def test_media_help_anywhere_in_the_arguments_prints_usage(tmp_path):
+    result = run_cli(["media", "--json", "--help"], tmp_path)
+
+    assert result.returncode == 0
+    assert "Usage: mnemosyne media" in result.stdout
+    assert not (tmp_path / "mnemosyne-data" / "mnemosyne.db").exists()
+
+
+def test_media_unknown_option_is_rejected_not_ingested(tmp_path):
+    result = run_cli(["media", "--bogus"], tmp_path)
+
+    assert result.returncode != 0
+    assert "Unknown media option: --bogus" in result.stderr
+    assert "Traceback" not in result.stderr
+

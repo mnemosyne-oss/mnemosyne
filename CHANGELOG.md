@@ -7,10 +7,6 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
-### Fixed
-
-- **`mnemosyne media --help` now prints usage instead of triggering media ingestion (#1043).** The CLI's `cmd_media` accepted any string in the positional slot, so a user checking the available options would instead create a `media_assets` row with `ref_kind=file`, `ref_value=--help`, and `understanding_status=unavailable`. `--help` and `-h` now print the usage string and exit 0 before any database or file write; running `mnemosyne media` with no arguments produces the same help text. Behavior for valid paths, URLs and `data:` URIs is unchanged.
-
 ### Added
 
 - **`mnemosyne_remember_media` tool and `mnemosyne media` CLI command.** Media understanding was SDK-only. It is now a tool over MCP (with a per-call tenant `bank`) and in both Hermes providers, and a CLI command. Because a tool caller can be a remote MCP client or a model steered by what it just read, the tool refuses local paths unless they resolve, after symlinks, inside `MNEMOSYNE_MEDIA_ALLOWED_PATHS`, refuses URLs that resolve to loopback, private or link-local addresses unless `MNEMOSYNE_MEDIA_ALLOW_PRIVATE_URLS` is set, and caps inline `data:` payloads at 25 MB. The CLI and SDK stay unrestricted. The Hermes catalog manifest declares the new tool.
@@ -90,6 +86,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **`mnemosyne media --help` now prints usage instead of triggering media ingestion (#1043).** The CLI's `cmd_media` accepted any string in the positional slot, so a user checking the available options would instead create a `media_assets` row with `ref_kind=file`, `ref_value=--help`, and `understanding_status=unavailable`. `--help` and `-h` anywhere in the arguments now print the usage string and exit 0 before any database or file write, and any other unrecognized option is rejected instead of being ingested as a file name; running `mnemosyne media` with no arguments produces the same help text. Behavior for valid paths, URLs and `data:` URIs is unchanged.
 - **Media understanding now works from configuration alone.** The documented setup for describing media is `MNEMOSYNE_MODALITY_ENABLED`, `_BASE_URL`, `_API_KEY` and a model, but nothing ever registered the built-in OpenAI-compatible adapter, so a fully configured install made no request and every `remember_media()` call returned `unavailable`. Only hosts that called `set_modality_backend()` themselves got descriptions. The adapter is now registered on the first describe after the operator opts in, never at import, and never over a backend the host registered. Local files also go out with their real media type (`image/png`, not `application/octet-stream`), which vision endpoints validate and would otherwise reject.
 - **Authorized ID-based forget now reaches episodic memory without crossing tier ownership (#959, #1002).** `BeamMemory.forget_episodic()` and the core/Hermes forget paths delete session-owned or global episodic rows and their tier-specific vectors. Shared `annotations`, `memory_embeddings`, and `gists` rows are deleted only when no parent with the same ID survives in another tier; on a working/episodic ID collision they are retained rather than guessed away. The existing working-memory cascade uses the same symmetric guard. This is a backward-compatible safety boundary for the current untyped child schema; explicit typed child ownership and ambiguous-row migration remain tracked in #1002.
 
