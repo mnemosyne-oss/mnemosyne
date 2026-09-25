@@ -220,8 +220,18 @@ def cmd_media(args):
     """Remember a piece of media and, if understanding is enabled, describe it."""
     usage = ("Usage: mnemosyne media <path|url|data:uri> [--modality image|video|audio|document] "
              "[--title T] [--hint H] [--max-moments N] [--mime TYPE] [--json]")
-    if not args:
-        _usage(usage)
+    if not args or any(arg in ("--help", "-h") for arg in args):
+        print(usage)
+        print("  <path>                            Local file path to ingest")
+        print("  <url>                             HTTP(S) URL of remote media")
+        print("  <data:uri>                        Inline data: URI payload")
+        print("  --modality image|video|audio|document   Force modality instead of inferring from path/URL")
+        print("  --title T                         Human-readable title for the asset")
+        print("  --hint H                          Free-form context passed to the understanding model")
+        print("  --max-moments N                   Cap the number of derived moments (default: model default)")
+        print("  --mime TYPE                       Override MIME type detection")
+        print("  --json                            Emit a machine-readable JSON summary on stdout")
+        return
     options = {"modality": None, "title": None, "hint": None, "max-moments": None, "mime": None}
     json_output = False
     positionals = []
@@ -235,6 +245,8 @@ def cmd_media(args):
                 _usage(usage)
             options[arg[2:]] = args[i + 1]
             i += 1
+        elif arg.startswith("-") and arg != "-":
+            _usage(f"{usage}\nUnknown media option: {arg}")
         else:
             positionals.append(arg)
         i += 1
@@ -1355,7 +1367,7 @@ def cmd_hygiene(args):
     )
     from mnemosyne.doctor import open_readonly_doctor_db
 
-    if not args or args[0] in ("--help", "-h"):
+    if not args or any(arg in ("--help", "-h") for arg in args):
         print("Usage: mnemosyne hygiene audit|status|clean|restore [options]")
         print("  audit [--limit N] [--offset N] [--all [--batch-size N]] [--min-score F] [--json]")
         print("                                          Scan for noise (dry-run; --batch-size only affects --all)")
@@ -1588,7 +1600,7 @@ def cmd_profile(args):
     """profile list|apply|show|create — gamified config templates."""
     from mnemosyne.core.profiles import list_profiles, get_profile, apply_profile, create_profile
 
-    if not args or args[0] in ("--help", "-h"):
+    if not args or any(arg in ("--help", "-h") for arg in args):
         print("Usage: mnemosyne profile <list|apply|show|create> [options]")
         print("  list                           Show all available profiles")
         print("  apply <name> [--dry-run]       Apply a profile to config.yaml")
@@ -1693,7 +1705,7 @@ def cmd_profile(args):
 
 def cmd_config(args):
     """config reload|get|set|migrate — manage config.yaml."""
-    if not args or args[0] in ("--help", "-h"):
+    if not args or any(arg in ("--help", "-h") for arg in args):
         print("Usage: mnemosyne config <reload|get|set|migrate> [options]")
         print("  reload                         Re-read config.yaml (hot-reload)")
         print("  get <key>                      Read a single config value")
