@@ -79,7 +79,7 @@ setup(
     entry_points={
         "console_scripts": [
             "mnemosyne-install=mnemosyne.install:main",
-            "mnemosyne-uninstall=mnemosyne.install:uninstall",
+            "mnemosyne-uninstall=mnemosyne.install:uninstall_main",
             "mnemosyne=mnemosyne.cli:run_cli",
             "mnemosyne-browser=mnemosyne.integrations.memory_browser:main",
             "mnemosyne-auto-save=mnemosyne.integrations.auto_save_openwebui:main",
