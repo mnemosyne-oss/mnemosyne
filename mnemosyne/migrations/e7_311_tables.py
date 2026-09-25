@@ -2,22 +2,16 @@
 Mnemosyne E7 Migration — 3.11.1 schema additions
 ===============================================
 
-Idempotent migration that adds the two tables introduced in
-mnemosyne-memory 3.11.1 to an existing bank at the older 54-table
-schema:
+Adds ``memory_events`` and ``sync_meta`` when absent, and backfills
+``memory_events.device_id`` before creating its index when the table
+already exists. The table definitions below are a 3.11-era snapshot,
+not the current full SyncEngine schema. Historical event rows and other
+legacy sync fields are not converted.
 
-  - memory_events  (created by SyncManager._init_events_table)
-  - sync_meta       (created by SyncManager._init_events_table)
-
-The DDL is copied verbatim from the canonical source at
-``mnemosyne/core/sync.py:641-665`` (SyncManager._init_events_table)
-and the indices that method creates (``sync.py:668-672``). We do
-NOT invent DDL here; if the upstream source changes its DDL, this
-migration should be updated to match.
-
-Safe to re-run (idempotent — uses ``CREATE TABLE IF NOT EXISTS``
-and try/except for indices, matching the upstream behavior). The
-migration does not delete any data or drop any tables.
+Safe to re-run: missing tables, columns and indices are checked before
+DDL. Index and unrelated column DDL failures propagate; earlier DDL may
+remain applied after a later failure, so retry completes only the missing
+steps. The migration does not delete data or drop tables.
 """
 
 from __future__ import annotations
@@ -27,9 +21,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, Union, overload
 
 
-# Canonical DDL from mnemosyne/core/sync.py:641-665
-# (SyncManager._init_events_table). If the upstream source changes
-# its DDL, update this migration to match.
+# 3.11-era table definition; not a copy of the current SyncEngine schema.
 _MEMORY_EVENTS_DDL = """
 CREATE TABLE IF NOT EXISTS memory_events (
     event_id TEXT PRIMARY KEY,
@@ -53,7 +45,7 @@ CREATE TABLE IF NOT EXISTS sync_meta (
 )
 """.strip()
 
-# Canonical index DDL from mnemosyne/core/sync.py:668-672.
+# Indices created by this migration; SyncEngine may create additional ones.
 _MEMORY_EVENTS_INDICES = [
     (
         "idx_me_timestamp",
