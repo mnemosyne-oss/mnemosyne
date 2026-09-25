@@ -225,7 +225,24 @@ def migrate_311_tables(
             applied_report["added"] += 1
 
         for name, ddl in _missing_memory_events_columns(conn):
-            conn.execute(f"ALTER TABLE memory_events ADD COLUMN {ddl}")
+            try:
+                conn.execute(f"ALTER TABLE memory_events ADD COLUMN {ddl}")
+            except sqlite3.OperationalError as exc:
+                if str(exc).lower() != f"duplicate column name: {name}".lower():
+                    raise
+                # A concurrent migrator may have added the column after our
+                # schema read. Only accept the exact declaration we add here.
+                matches = [
+                    row for row in conn.execute("PRAGMA table_info(memory_events)")
+                    if row[1] == name
+                ]
+                if len(matches) != 1 or not (
+                    matches[0][2].strip().upper() == "TEXT"
+                    and matches[0][3] == 1
+                    and matches[0][4] == "''"
+                ):
+                    raise
+                continue
             applied_report["columns_added"].append(f"memory_events.{name}")
 
         # Indices. Let DDL errors propagate so a successful migration means the

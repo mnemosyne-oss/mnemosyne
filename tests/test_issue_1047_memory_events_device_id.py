@@ -173,3 +173,95 @@ def test_migrate_311_device_id_ddl_errors_propagate(tmp_path, monkeypatch):
 
     with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
         e7_311_tables.migrate_311_tables(db_path)
+
+
+@pytest.mark.parametrize(
+    ("winner_declaration", "recovers"),
+    [
+        ("device_id TEXT NOT NULL DEFAULT ''", True),
+        ("device_id INTEGER NOT NULL DEFAULT ''", False),
+        ("device_id TEXT DEFAULT ''", False),
+        ("device_id TEXT NOT NULL DEFAULT 'other'", False),
+        ("device_id TEXT NOT NULL", False),
+    ],
+)
+def test_migrate_311_concurrent_device_id_addition(
+    tmp_path, monkeypatch, winner_declaration, recovers
+):
+    from mnemosyne.migrations import e7_311_tables
+
+    db_path = tmp_path / "legacy.db"
+    _create_reported_legacy_db(db_path)
+    real_connect = sqlite3.connect
+    raced = False
+
+    if winner_declaration == "device_id TEXT NOT NULL":
+        # SQLite permits a NOT NULL column without a default on empty tables.
+        with real_connect(db_path) as conn:
+            conn.execute("DELETE FROM memory_events")
+
+    class RacingConnection:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            nonlocal raced
+            if sql.startswith("ALTER TABLE memory_events ADD COLUMN device_id") and not raced:
+                raced = True
+                with real_connect(db_path) as winner:
+                    winner.execute(
+                        f"ALTER TABLE memory_events ADD COLUMN {winner_declaration}"
+                    )
+            return self._conn.execute(sql, params)
+
+        def commit(self):
+            return self._conn.commit()
+
+        def close(self):
+            return self._conn.close()
+
+    monkeypatch.setattr(
+        e7_311_tables.sqlite3,
+        "connect",
+        lambda *args, **kwargs: RacingConnection(real_connect(*args, **kwargs)),
+    )
+    if recovers:
+        report = e7_311_tables.migrate_311_tables(db_path)
+        assert report["columns_added"] == []
+        assert report["indices_added"] == 3
+        with real_connect(db_path) as conn:
+            assert conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_me_device_id'"
+            ).fetchone() is not None
+    else:
+        with pytest.raises(sqlite3.OperationalError, match="duplicate column name: device_id"):
+            e7_311_tables.migrate_311_tables(db_path)
+    assert raced
+
+
+def test_migrate_311_unrelated_duplicate_error_propagates(tmp_path, monkeypatch):
+    from mnemosyne.migrations import e7_311_tables
+
+    db_path = tmp_path / "legacy.db"
+    _create_reported_legacy_db(db_path)
+    real_connect = sqlite3.connect
+
+    class WrongDuplicateConnection:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            if sql.startswith("ALTER TABLE memory_events ADD COLUMN device_id"):
+                raise sqlite3.OperationalError("duplicate column name: other_device_id")
+            return self._conn.execute(sql, params)
+
+        def close(self):
+            return self._conn.close()
+
+    monkeypatch.setattr(
+        e7_311_tables.sqlite3,
+        "connect",
+        lambda *args, **kwargs: WrongDuplicateConnection(real_connect(*args, **kwargs)),
+    )
+    with pytest.raises(sqlite3.OperationalError, match="duplicate column name: other_device_id"):
+        e7_311_tables.migrate_311_tables(db_path)
