@@ -18,9 +18,13 @@ USAGE_COMMANDS = [
 
 
 def run_cli(args, tmp_path):
+    return run_cli_in(args, tmp_path, tmp_path / "mnemosyne-data")
+
+
+def run_cli_in(args, tmp_path, data_dir):
     env = os.environ.copy()
     env["HOME"] = str(tmp_path / "home")
-    env["MNEMOSYNE_DATA_DIR"] = str(tmp_path / "mnemosyne-data")
+    env["MNEMOSYNE_DATA_DIR"] = str(data_dir)
     return subprocess.run(
         [sys.executable, "-m", "mnemosyne.cli", *args],
         text=True,
@@ -70,3 +74,34 @@ def test_recall_explain_json_outputs_parseable_payload(tmp_path):
     assert payload["top_k"] == 5
     assert isinstance(payload["results"], list)
     assert "explain" in payload
+
+
+def test_reindex_rejects_unknown_option_before_opening_store(tmp_path):
+    result = run_cli(["reindex", "--bogus"], tmp_path)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "Unknown reindex option: --bogus" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_reindex_dry_run_honors_db_override(tmp_path):
+    default_dir = tmp_path / "default-data"
+    custom_dir = tmp_path / "custom-data"
+
+    default_first = run_cli_in(["store", "Default bank memory one", "cli", "0.5"], tmp_path, default_dir)
+    assert default_first.returncode == 0, default_first.stderr
+    default_second = run_cli_in(["store", "Default bank memory two", "cli", "0.5"], tmp_path, default_dir)
+    assert default_second.returncode == 0, default_second.stderr
+
+    custom_store = run_cli_in(["store", "Custom bank memory", "cli", "0.5"], tmp_path, custom_dir)
+    assert custom_store.returncode == 0, custom_store.stderr
+
+    custom_db = custom_dir / "mnemosyne.db"
+    assert custom_db.is_file()
+
+    result = run_cli_in(["reindex", "--dry-run", "--db", str(custom_db)], tmp_path, default_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert str(custom_db) in result.stdout
+    assert "working_memory: 1" in result.stdout

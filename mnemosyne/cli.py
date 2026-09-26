@@ -1267,34 +1267,84 @@ def cmd_bank(args):
         _fail(str(e))
 
 
+def _resolve_reindex_target(db_override, bank_override):
+    """Resolve the (db_path, bank_name) reindex should open, honoring --db/--bank.
+
+    Mirrors ``_get_memory()``'s bank resolution (via ``BankManager``, which
+    may create the bank on first use) but also honors an explicit ``--db``
+    path, which ``_get_memory()`` has no way to accept.
+    """
+    if db_override is not None:
+        return Path(db_override).expanduser(), "default"
+    bank_name = _resolve_bank_name(bank_override)
+    from mnemosyne.core.banks import BankManager
+
+    bm = BankManager(Path(DATA_DIR))
+    try:
+        db_path = bm.get_bank_db_path(bank_name)
+    except ValueError as error:
+        _fail(str(error))
+    return db_path, bank_name
+
+
 def cmd_reindex(args):
     """Rebuild vector indexes from source text with the active embedding model.
 
-    Usage: mnemosyne reindex [--model NAME] [--dry-run] [--yes] [--no-backup]
+    Usage: mnemosyne reindex [--db PATH | --bank NAME] [--model NAME]
+                              [--dry-run] [--yes] [--no-backup]
 
     Use after changing the embedding model/dimension. Synchronous and blocking —
     re-embeds working + episodic memory, so it can take minutes on a large DB.
     Run it with any provider/gateway stopped.
     """
-    dry_run = "--dry-run" in args
-    assume_yes = "--yes" in args or "-y" in args
-    no_backup = "--no-backup" in args
+    usage = (
+        "Usage: mnemosyne reindex [--db PATH | --bank NAME] [--model NAME] "
+        "[--dry-run] [--yes] [--no-backup]"
+    )
+    db_override = None
+    bank_override = None
+    model_override = None
+    dry_run = False
+    assume_yes = False
+    no_backup = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--db":
+            db_override, i = _require_value(args, i, "--db", lambda value, _name: value)
+        elif arg == "--bank":
+            bank_override, i = _require_value(args, i, "--bank", lambda value, _name: value)
+        elif arg == "--model":
+            model_override, i = _require_value(args, i, "--model", lambda value, _name: value)
+        elif arg == "--dry-run":
+            dry_run = True
+            i += 1
+        elif arg in ("--yes", "-y"):
+            assume_yes = True
+            i += 1
+        elif arg == "--no-backup":
+            no_backup = True
+            i += 1
+        else:
+            _usage(f"{usage}\nUnknown reindex option: {arg}")
+
+    if db_override is not None and bank_override is not None:
+        _fail("--db and --bank cannot be used together")
 
     # --model has to win before the embedding module is imported: it freezes the
     # model + dimension from the env at import time.
-    if "--model" in args:
-        try:
-            os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = args[args.index("--model") + 1]
-        except IndexError:
-            _usage("Usage: mnemosyne reindex [--model NAME] [--dry-run] [--yes] [--no-backup]")
+    if model_override is not None:
+        os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = model_override
 
     from mnemosyne.core import embeddings as _emb
+    from mnemosyne.core.memory import Mnemosyne
 
-    mem = _get_memory()
+    db_path, bank_name = _resolve_reindex_target(db_override, bank_override)
+    mem = Mnemosyne(db_path=str(db_path), bank=bank_name)
 
     if dry_run:
         plan = mem.reindex_vectors(dry_run=True)
-        print("Reindex plan (dry run -- nothing written):")
+        print(f"Reindex plan (dry run -- nothing written), db: {db_path}")
         for key in ("model", "dim", "vec_type", "sqlite_vec",
                     "working_memory", "episodic_memory"):
             if key in plan:
@@ -1319,7 +1369,7 @@ def cmd_reindex(args):
     if not no_backup:
         try:
             from mnemosyne.dr.recovery import create_backup
-            backup = create_backup()
+            backup = create_backup(db_path=db_path)
             print(f"Backup created: {backup['backup_path']}")
         except Exception as e:
             _fail(f"Backup failed (use --no-backup to skip): {e}")
