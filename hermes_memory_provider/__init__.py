@@ -4779,19 +4779,13 @@ def register(ctx):
         handler_fn=mnemosyne_command,
     )
 
-    # Also register tools and hooks from hermes_plugin (sibling directory).
-    # This way a single symlink to hermes_memory_provider/ gives us the
-    # full Mnemosyne experience: CLI + tools + hooks.
-    try:
-        _repo_root = str(Path(__file__).resolve().parent.parent)
-        if _repo_root not in sys.path:
-            sys.path.insert(0, _repo_root)
-        from hermes_plugin import register as _plugin_register
-        _plugin_register(ctx)
-    except Exception as _e:
-        logger.warning(
-            "hermes_plugin registration failed (hooks may be missing): %s. "
-            "This is NOT graceful degradation — plugin hooks (pre_llm_call memory "
-            "injection, tools) will be unavailable. Check hermes_plugin module.",
-            _e,
-        )
+    # NOTE: the legacy `hermes_plugin` sibling used to be registered here as
+    # well. It was deleted in 0ee4d80 ("Removed dead code: hermes_plugin/
+    # (pre-MemoryProvider era)") because everything it provided now lives in
+    # this module behind the MemoryProvider contract, but this call site was
+    # left behind. On any install where the module is absent — which is every
+    # install built from this tree — the import below raised ModuleNotFoundError
+    # and logged "hermes_plugin registration failed (hooks may be missing) ...
+    # This is NOT graceful degradation", on every provider load. The message is
+    # wrong on both counts: nothing is missing, and the load is fine.
+
