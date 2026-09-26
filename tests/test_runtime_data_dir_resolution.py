@@ -7,6 +7,22 @@ triples together. These tests never create files under the real home.
 
 from pathlib import Path
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_data_dir_resolver():
+    """Put the process-global data-dir hook back after every test."""
+    from mnemosyne.core import paths as paths_mod
+
+    register = getattr(paths_mod, "register_data_dir_resolver", None)
+    previous = register(None) if register is not None else None
+    try:
+        yield
+    finally:
+        if register is not None:
+            register(previous)
+
 
 def _clear_data_env(monkeypatch):
     monkeypatch.delenv("MNEMOSYNE_DATA_DIR", raising=False)
@@ -122,3 +138,89 @@ def test_t5_fallback_is_user_hermes_data_dir(monkeypatch):
     assert memory._default_data_dir() == expected
     assert beam._default_data_dir() == expected
     assert triples.DEFAULT_DATA_DIR == expected
+
+
+def test_t6_resolver_hook_outranks_hermes_home(monkeypatch, tmp_path):
+    """A registered resolver wins over HERMES_HOME when the explicit pin is unset."""
+    home = tmp_path / "profile"
+    hooked = tmp_path / "brand-new"
+    monkeypatch.delenv("MNEMOSYNE_DATA_DIR", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import mnemosyne.core.banks as banks
+    import mnemosyne.core.memory as memory
+    from mnemosyne.core.paths import default_data_dir, register_data_dir_resolver
+
+    previous = register_data_dir_resolver(lambda: hooked)
+    try:
+        assert default_data_dir() == hooked
+        assert banks._default_data_dir() == hooked
+        assert memory._default_data_dir() == hooked
+    finally:
+        register_data_dir_resolver(previous)
+
+
+def test_t7_raising_or_none_resolver_falls_through(monkeypatch, tmp_path):
+    """A raising resolver and a None result both use the env chain."""
+    home = tmp_path / "profile"
+    monkeypatch.delenv("MNEMOSYNE_DATA_DIR", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    expected = home / "mnemosyne" / "data"
+
+    from mnemosyne.core.paths import default_data_dir, register_data_dir_resolver
+
+    def boom():
+        raise RuntimeError("resolver broken")
+
+    previous = register_data_dir_resolver(boom)
+    try:
+        assert default_data_dir() == expected
+    finally:
+        register_data_dir_resolver(previous)
+
+    previous = register_data_dir_resolver(lambda: None)
+    try:
+        assert default_data_dir() == expected
+    finally:
+        register_data_dir_resolver(previous)
+
+
+def test_t8_clearing_resolver_restores_env(monkeypatch, tmp_path):
+    """register_data_dir_resolver(None) restores environment resolution."""
+    home = tmp_path / "profile"
+    hooked = tmp_path / "brand-new"
+    monkeypatch.delenv("MNEMOSYNE_DATA_DIR", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    expected = home / "mnemosyne" / "data"
+
+    from mnemosyne.core.paths import default_data_dir, register_data_dir_resolver
+
+    previous = register_data_dir_resolver(lambda: hooked)
+    try:
+        assert default_data_dir() == hooked
+        removed = register_data_dir_resolver(None)
+        assert removed is not None
+        assert default_data_dir() == expected
+    finally:
+        register_data_dir_resolver(previous)
+
+
+def test_t9_mnemosyne_data_dir_outranks_resolver_hook(monkeypatch, tmp_path):
+    """MNEMOSYNE_DATA_DIR is an explicit pin and beats a registered resolver."""
+    home = tmp_path / "profile"
+    override = tmp_path / "explicit-data"
+    hooked = tmp_path / "scoped"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(override))
+
+    import mnemosyne.core.banks as banks
+    import mnemosyne.core.memory as memory
+    from mnemosyne.core.paths import default_data_dir, register_data_dir_resolver
+
+    previous = register_data_dir_resolver(lambda: hooked)
+    try:
+        assert default_data_dir() == override
+        assert banks._default_data_dir() == override
+        assert memory._default_data_dir() == override
+    finally:
+        register_data_dir_resolver(previous)

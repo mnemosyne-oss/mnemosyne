@@ -219,6 +219,22 @@ except Exception as _persona_import_exc:  # pragma: no cover - graceful import f
         def _with_persona_block(self, base: str) -> str:
             return base
 
+
+def _hermes_data_dir():
+    """Data dir of the active Hermes home. Hermes is imported only on call."""
+    try:
+        from hermes_constants import get_hermes_home
+    except ImportError:
+        return None
+    return get_hermes_home() / "mnemosyne" / "data"
+
+
+try:
+    from mnemosyne.core.paths import register_data_dir_resolver
+    register_data_dir_resolver(_hermes_data_dir)
+except ImportError:
+    pass
+
 __version__ = "0.7.3"
 
 logger = logging.getLogger(__name__)
