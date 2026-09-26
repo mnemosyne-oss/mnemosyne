@@ -351,6 +351,21 @@ class _CredentialedNoRedirect(urllib.request.HTTPRedirectHandler):
         )
 
 
+_EMBED_MAX_CHARS = int(os.environ.get("MNEMOSYNE_EMBEDDING_MAX_CHARS", "6000"))
+
+
+def _cap_for_api(texts: List[str]) -> List[str]:
+    """Cap each text before the API call: local OpenAI-compatible servers
+    (llama.cpp et al.) reject inputs above their per-slot context window
+    with HTTP 400, and one oversized row aborts the whole embedding batch
+    during reindex. Head-truncation keeps retrieval signal; the env var
+    disables/raises the cap."""
+    limit = _EMBED_MAX_CHARS
+    if limit <= 0:
+        return texts
+    return [t[:limit] if len(t) > limit else t for t in texts]
+
+
 def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint)."""
     global _API_CALL_COUNT
@@ -373,7 +388,7 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     url = f"{base_url.rstrip('/')}/embeddings"
     payload = json.dumps({
         "model": _DEFAULT_MODEL,
-        "input": texts,
+        "input": _cap_for_api(texts),
     }).encode()
 
     headers = {
