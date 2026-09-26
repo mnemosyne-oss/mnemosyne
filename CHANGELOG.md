@@ -85,6 +85,9 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   **Upgrade note for stores created under the old silent-384 fallback:** setting the model's true dimension can trigger the existing dimension-mismatch guard. Use the documented reindex/recovery path rather than treating the override as a one-step fix.
 
 ### Fixed
+- **SHMR local LLM dispatch (#716).** The harmonization path no longer passes
+  unsupported keyword arguments to the prompt-only local LLM helper, so local
+  inference is reachable and failures remain diagnostically visible.
 
 - **Malformed Hermes `sync_roles` config now warns while remaining fail-closed (#1033).** Comma-separated strings and native role lists remain supported; explicit empty values still disable autosave. Invalid non-empty values, including stringified lists, no longer fail silently or broaden capture, and role precedence is recomputed on provider reinitialization so stale overrides do not persist.
 

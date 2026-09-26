@@ -206,11 +206,17 @@ def _call_llm(prompt: str, system: str = "") -> str:
     # Try local LLM first
     try:
         from mnemosyne.core.local_llm import _call_local_llm
-        result = _call_local_llm(prompt, system=system, temperature=SHMR_TEMPERATURE)
+        # ponytail: _call_local_llm's contract is (prompt) only -- see the
+        # two other call sites in local_llm.py. Fold the system instruction
+        # into the prompt so the local path is not bypassed by a TypeError
+        # that the fallback boundary would swallow. Upgrade path: if/when
+        # _call_local_llm grows native system/temperature kwargs, pass them.
+        local_prompt = f"{system}\n\n{prompt}" if system else prompt
+        result = _call_local_llm(local_prompt)
         if result and len(result.strip()) > 10:
             return result
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("SHMR local LLM failed (%s)", type(exc).__name__)
 
     # Fallback to the cloud extraction client.
     #
