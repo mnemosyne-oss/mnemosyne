@@ -2,10 +2,30 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from mnemosyne_hermes import MnemosyneMemoryProvider
+
+# The #1050 canonical write guard compares the HOST-REPORTED turn profile
+# against the bound owner. On a bare interpreter the host module is absent
+# and the guard is exempt; inside a hermes venv a real active profile
+# (typically 'default') would clash with these tests' bound identities and
+# fail closed. Pin the turn profile to whatever the test last bound so the
+# guard sees a concordant owner in every environment.
+_BOUND = {"profile": "profile_a"}
+
+
+@pytest.fixture(autouse=True)
+def _align_turn_profile(monkeypatch):
+    try:
+        import hermes_cli.profiles as _prof
+    except Exception:
+        return
+    monkeypatch.setattr(_prof, "get_active_profile_name", lambda: _BOUND["profile"])
 
 
 def _provider(tmp_path, profile: str = "profile_a") -> MnemosyneMemoryProvider:
+    _BOUND["profile"] = profile
     provider = MnemosyneMemoryProvider()
     provider.initialize(
         "session-1",
