@@ -21,8 +21,6 @@ from datetime import datetime, timezone
 from typing import List, Dict, Optional, Any
 from pathlib import Path
 
-import os
-
 logger = logging.getLogger(__name__)
 
 from mnemosyne.core import embeddings as _embeddings
@@ -30,17 +28,13 @@ from mnemosyne.core import beam as beam_module
 from mnemosyne.core._connection_gc import collect_connection_cycles
 from mnemosyne.core.beam import BeamMemory, _BeamConnection, _deferred_commits
 from mnemosyne.core.journal import journal_mode
+from mnemosyne.core.paths import _hermes_home, default_data_dir, default_db_path
 _thread_local = threading.local()
 
-# Default data directory
-# NOTE: On Fly.io and ephemeral VMs, only ~/.hermes is persisted.
-# This MUST match beam.py's DEFAULT_DATA_DIR to avoid split-brain.
-_DEFAULT_ROOT = Path(
-    os.environ.get("HERMES_HOME")
-    or (Path(os.environ["HOME"]) / ".hermes" if os.environ.get("HOME") else Path.home() / ".hermes")
-)
-DEFAULT_DATA_DIR = _DEFAULT_ROOT / "mnemosyne" / "data"
-DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "mnemosyne.db"
+# Data-dir resolution is paths.default_data_dir, shared with beam.py.
+# This MUST match beam.py under any environment to avoid split-brain.
+# _DEFAULT_ROOT, DEFAULT_DATA_DIR, and DEFAULT_DB_PATH stay importable and
+# resolve on each access (see __getattr__).
 
 # The portable JSON format carries these physical tables through the named
 # sections below. Do not assume a represented table is lossless: this mapping
@@ -187,22 +181,31 @@ def _export_completeness(conn: sqlite3.Connection, *, include_sync_events: bool)
         "partial_surfaces": partial_surfaces,
     }
 
-# Allow override via environment
-if os.environ.get("MNEMOSYNE_DATA_DIR"):
-    DEFAULT_DATA_DIR = Path(os.environ.get("MNEMOSYNE_DATA_DIR"))
-    DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "mnemosyne.db"
-
-
 def _default_data_dir() -> Path:
     """Return the current default data directory, honoring runtime env changes."""
-    if os.environ.get("MNEMOSYNE_DATA_DIR"):
-        return Path(os.environ["MNEMOSYNE_DATA_DIR"])
-    return DEFAULT_DATA_DIR
+    return default_data_dir()
 
 
 def _default_db_path() -> Path:
     """Return the current default DB path, honoring runtime env changes."""
-    return _default_data_dir() / "mnemosyne.db"
+    return default_db_path()
+
+
+def __getattr__(name: str):
+    """Resolve legacy path constants from the current environment."""
+    if name == "_DEFAULT_ROOT":
+        return _hermes_home()
+    if name == "DEFAULT_DATA_DIR":
+        return _default_data_dir()
+    if name == "DEFAULT_DB_PATH":
+        return _default_db_path()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(
+        set(globals()) | {"_DEFAULT_ROOT", "DEFAULT_DATA_DIR", "DEFAULT_DB_PATH"}
+    )
 
 
 def _get_connection(db_path = None) -> sqlite3.Connection:

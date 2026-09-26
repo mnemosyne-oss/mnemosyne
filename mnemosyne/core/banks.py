@@ -21,27 +21,36 @@ API:
     Mnemosyne(bank="work")  # All operations isolated to work bank
 """
 
-import os
 import shutil
 import sqlite3
 from pathlib import Path
 from typing import List
 
-# On Fly.io and other ephemeral VMs, only ~/.hermes is persisted.
-_DEFAULT_ROOT = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
-DEFAULT_DATA_DIR = _DEFAULT_ROOT / "mnemosyne" / "data"
-BANKS_DIR = DEFAULT_DATA_DIR / "banks"
+from mnemosyne.core.paths import _hermes_home, default_data_dir
 
-if os.environ.get("MNEMOSYNE_DATA_DIR"):
-    DEFAULT_DATA_DIR = Path(os.environ.get("MNEMOSYNE_DATA_DIR"))
-    BANKS_DIR = DEFAULT_DATA_DIR / "banks"
+# On Fly.io and other ephemeral VMs, only ~/.hermes is persisted.
+# DEFAULT_DATA_DIR and BANKS_DIR stay importable but resolve on each access
+# so a runtime HERMES_HOME change is visible without reimporting.
 
 
 def _default_data_dir() -> Path:
     """Return the current default data directory, honoring runtime env changes."""
-    if os.environ.get("MNEMOSYNE_DATA_DIR"):
-        return Path(os.environ["MNEMOSYNE_DATA_DIR"])
-    return DEFAULT_DATA_DIR
+    return default_data_dir()
+
+
+def __getattr__(name: str):
+    """Resolve legacy path constants from the current environment."""
+    if name == "_DEFAULT_ROOT":
+        return _hermes_home()
+    if name == "DEFAULT_DATA_DIR":
+        return _default_data_dir()
+    if name == "BANKS_DIR":
+        return _default_data_dir() / "banks"
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | {"_DEFAULT_ROOT", "DEFAULT_DATA_DIR", "BANKS_DIR"})
 
 
 class BankManager:
@@ -209,7 +218,8 @@ def bank_exists_read_only(name: str, data_dir: Path = None) -> bool:
     silently materialize an empty bank directory or DB for invalid input.
 
     Resolution follows the same authoritative rules as the rest of the module:
-    ``MNEMOSYNE_DATA_DIR`` wins, otherwise the cached ``DEFAULT_DATA_DIR``.
+    ``MNEMOSYNE_DATA_DIR`` wins, otherwise ``<HERMES_HOME>/mnemosyne/data``,
+    otherwise ``~/.hermes/mnemosyne/data``. Read on every call.
     """
     _validate_bank_name(name)
     if name == "default":
