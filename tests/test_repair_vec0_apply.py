@@ -84,6 +84,11 @@ def test_vec0_bound_apply_creates_backup_and_is_idempotent(tmp_path):
 def test_write_connection_loader_failure_closes_connection(tmp_path, monkeypatch, failure):
     database = tmp_path / "copy.sqlite"
     _copy_with_vec0(database)
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps(doctor.doctor_report_payload(
+        doctor.build_doctor_report("default", database), include_candidates=True)), encoding="utf-8")
+    before = database.read_bytes()
+    backup = tmp_path / "not-created.sqlite"
     opened = []
     original_connect = sqlite3.connect
 
@@ -95,18 +100,18 @@ def test_write_connection_loader_failure_closes_connection(tmp_path, monkeypatch
     monkeypatch.setattr(repair.sqlite3, "connect", tracked_connect)
     if failure == "load":
         monkeypatch.setattr(repair, "_load_optional_sqlite_vec", lambda _conn: False)
-        connection = repair._open_writable_repair_db(database)
-        try:
-            assert not repair._verifiable_fingerprint(
-                doctor.asdict(doctor.inspect_schema_fingerprint(connection)))
-        finally:
-            connection.close()
     else:
         def failed_disable(_conn):
             raise doctor._SQLiteVecExtensionDisableError()
 
         monkeypatch.setattr(repair, "_load_optional_sqlite_vec", failed_disable)
-        with pytest.raises(repair.RepairError, match="safely opened"):
-            repair._open_writable_repair_db(database)
-        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
-            opened[-1].execute("SELECT 1")
+    with pytest.raises(repair.RepairError, match="fingerprint|safely opened"):
+        repair.run_repair(
+            db_path=database, bank_name="default", report_path=report,
+            selections=["working_memory:selected"], apply=True, backup_path=backup,
+        )
+    assert opened
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        opened[-1].execute("SELECT 1")
+    assert not backup.exists()
+    assert database.read_bytes() == before
