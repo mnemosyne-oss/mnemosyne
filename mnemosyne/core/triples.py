@@ -25,17 +25,37 @@ now routes writes to `AnnotationStore` and emits a DeprecationWarning so
 new code uses the right store directly.
 """
 
-import os
 import sqlite3
 import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict
 
+from mnemosyne.core.paths import default_data_dir
+
+# Legacy triples lived under the user home, not under a profile HERMES_HOME.
+# DEFAULT_DATA_DIR / DEFAULT_DB stay importable and resolve on each access.
+# DEFAULT_DB is triples.db in that data dir, not mnemosyne.db.
 LEGACY_DATA_DIR = Path.home() / ".hermes" / "mnemosyne" / "data"
-DEFAULT_DATA_DIR = Path(os.environ.get("MNEMOSYNE_DATA_DIR", LEGACY_DATA_DIR))
-DEFAULT_DB = DEFAULT_DATA_DIR / "triples.db"
 LEGACY_DB = LEGACY_DATA_DIR / "triples.db"
+
+
+def _default_db() -> Path:
+    """Standalone triples file under the shared runtime data directory."""
+    return default_data_dir() / "triples.db"
+
+
+def __getattr__(name: str):
+    """Resolve legacy path constants from the current environment."""
+    if name == "DEFAULT_DATA_DIR":
+        return default_data_dir()
+    if name == "DEFAULT_DB":
+        return _default_db()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | {"DEFAULT_DATA_DIR", "DEFAULT_DB"})
 
 
 def _copy_legacy_db(source: Path, destination: Path) -> None:
@@ -71,9 +91,11 @@ def _copy_legacy_db(source: Path, destination: Path) -> None:
 
 def _resolve_default_db() -> Path:
     """Return the default triples DB, copying legacy data into place if needed."""
-    if DEFAULT_DATA_DIR != LEGACY_DATA_DIR and not DEFAULT_DB.exists() and LEGACY_DB.exists():
-        _copy_legacy_db(LEGACY_DB, DEFAULT_DB)
-    return DEFAULT_DB
+    data_dir = default_data_dir()
+    db_path = _default_db()
+    if data_dir != LEGACY_DATA_DIR and not db_path.exists() and LEGACY_DB.exists():
+        _copy_legacy_db(LEGACY_DB, db_path)
+    return db_path
 
 
 def _get_conn(db_path = None) -> sqlite3.Connection:
