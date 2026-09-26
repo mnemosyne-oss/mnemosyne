@@ -249,7 +249,7 @@ def open_readonly_doctor_db(db_path: str | Path) -> sqlite3.Connection:
 
 
 def _load_optional_sqlite_vec(conn: sqlite3.Connection) -> bool:
-    """Load the bundled sqlite-vec module into an already read-only connection.
+    """Load bundled sqlite-vec on a connection, then disable extension loading.
 
     The Doctor must remain usable when the optional dependency is absent or
     incompatible with the host SQLite build.  In that case, its existing

@@ -529,6 +529,15 @@ mnemosyne doctor --bank default --format both
 mnemosyne repair --report mnemosyne-doctor.json --select working_memory:<ID> --dry-run
 ```
 
+For a database containing sqlite-vec `vec0` tables, install the optional
+`embeddings` extra (or compatible `sqlite-vec`) in the **same runtime** for
+Doctor and repair, then generate a fresh report on the offline copy. Without
+it Doctor can report `present_but_unloadable`, but the incomplete schema
+fingerprint cannot authorize repair, including `expire`. Repair loads sqlite-vec
+on planning and bound write connections and disables further extension loading
+before checking the schema or selecting rows. This does not relax the separate
+trigger, WAL/sidecar, or filesystem-binding restrictions (#1040 D2–D4).
+
 ### Preflight a direct JSON file import
 
 Before importing a JSON file directly through the Hermes provider, run:
