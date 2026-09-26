@@ -1798,6 +1798,11 @@ def cmd_migrate(args):
         print(
             f"  would add tables: {', '.join(report['tables_would_add']) or '(none)'}"
         )
+        if "columns_would_add" in report:
+            print(
+                "  would add columns: "
+                f"{', '.join(report['columns_would_add']) or '(none)'}"
+            )
         print(f"  would add indices: {report['indices_would_add']}")
     else:
         print(f"  tables added: {', '.join(report['tables_added']) or '(none)'}")
@@ -1805,6 +1810,11 @@ def cmd_migrate(args):
             "  tables already present: "
             f"{', '.join(report['tables_already_present']) or '(none)'}"
         )
+        if "columns_added" in report:
+            print(
+                "  columns added: "
+                f"{', '.join(report['columns_added']) or '(none)'}"
+            )
         print(f"  indices added: {report['indices_added']}")
 
 
