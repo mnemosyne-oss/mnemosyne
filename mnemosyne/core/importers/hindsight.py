@@ -394,7 +394,14 @@ class HindsightImporter(BaseImporter):
         if not (_embeddings and _embeddings.available()):
             logger.debug("backfill: embeddings unavailable, skipping vector for rowid=%s", rowid)
             return
-        vecs = _embeddings.embed([content])
+        try:
+            vecs = _embeddings.embed([content])
+        except Exception as exc:
+            logger.debug(
+                "backfill: embed() raised for rowid=%s (%s: %s); skipping vector",
+                rowid, type(exc).__name__, exc,
+            )
+            return
         if vecs is None:
             logger.debug("backfill: embed() returned None for rowid=%s, content=%.50r", rowid, content)
             return
