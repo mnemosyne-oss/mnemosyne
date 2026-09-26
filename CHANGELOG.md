@@ -86,6 +86,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Doctor and Repair share sqlite-vec capability for `vec0` databases (#1040 D1).** Repair loads the optional extension on planning and bound write connections to match Doctor's schema checks; without the `embeddings` extra, unverifiable schemas remain fail-closed. The separate D2–D4 restrictions remain unresolved.
 - **Malformed Hermes `sync_roles` config now warns while remaining fail-closed (#1033).** Comma-separated strings and native role lists remain supported; explicit empty values still disable autosave. Invalid non-empty values, including stringified lists, no longer fail silently or broaden capture, and role precedence is recomputed on provider reinitialization so stale overrides do not persist.
 
 - **`mnemosyne-uninstall --help` no longer uninstalls (#1048).** The `mnemosyne-uninstall` console script was wired to `uninstall()`, which never reads its arguments, so `--help`, or any argument at all, removed the provider plugin and reset `memory.provider` to `null` in the Hermes config. It now goes through `uninstall_main()`, which parses first: `--help` prints usage, unknown arguments are rejected, and `--hermes-home` is honored. `mnemosyne-install` was already fixed on the 4.0 line by #991. New tests run both scripts, resolved from `pyproject.toml` exactly as packaging does, against a seeded Hermes home and require `--help` and unknown options to leave it untouched, and require every console-script target to import and take only optional parameters.
