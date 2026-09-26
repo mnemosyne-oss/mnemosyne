@@ -300,7 +300,13 @@ def test_file_export_and_import_warn_about_partial_portable_data(tmp_path, monke
     assert "WARNING: portable export is partial" in export_output
     assert "facts (1)" in export_output
     assert "working_memory missing" in export_output
-    assert "author_id (1)" in export_output
+    # channel_id/memory_type remain genuinely omitted from the portable
+    # format; author_id/author_type now round-trip since the author-stamp
+    # export fix, so the manifest must not report them as omitted.
+    assert "channel_id (1)" in export_output
+    assert "memory_type (1)" in export_output
+    assert "author_id" not in export_output
+    assert "author_type" not in export_output
     # pinned survives the portable round-trip since the event-date/pinned
     # export fix; the manifest no longer reports it as omitted.
     assert "pinned" not in export_output
@@ -311,16 +317,20 @@ def test_file_export_and_import_warn_about_partial_portable_data(tmp_path, monke
     assert "WARNING: imported supported data only" in import_output
     assert "facts (1)" in import_output
     assert "working_memory missing" in import_output
-    assert "author_id (1)" in import_output
+    assert "channel_id (1)" in import_output
+    assert "memory_type (1)" in import_output
+    assert "author_id" not in import_output
+    assert "author_type" not in import_output
     # pinned now round-trips; the import manifest no longer reports it.
     assert "pinned" not in import_output
-    # Round-trip proof at the data level: the exported pinned=1 row must
-    # persist as pinned=1 in the imported DB (output text alone cannot
-    # catch a manifest regression that silently drops the field).
+    # Round-trip proof at the data level: the exported pinned=1,
+    # author-stamped row must persist as pinned=1 with author_id intact in
+    # the imported DB (output text alone cannot catch a manifest regression
+    # that silently drops the field).
     with sqlite3.connect(target_data / "mnemosyne.db") as conn:
         assert conn.execute(
-            "SELECT pinned FROM working_memory"
-        ).fetchone() == (1,)
+            "SELECT pinned, author_id FROM working_memory"
+        ).fetchone() == (1, "export-owner")
 
 
 def test_completeness_details_omits_invalid_partial_affected_row_counts():
