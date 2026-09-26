@@ -90,6 +90,7 @@ def test_write_connection_loader_failure_closes_connection(tmp_path, monkeypatch
     before = database.read_bytes()
     backup = tmp_path / "not-created.sqlite"
     opened = []
+    loader_calls = []
     original_connect = sqlite3.connect
 
     def tracked_connect(*args, **kwargs):
@@ -99,9 +100,14 @@ def test_write_connection_loader_failure_closes_connection(tmp_path, monkeypatch
 
     monkeypatch.setattr(repair.sqlite3, "connect", tracked_connect)
     if failure == "load":
-        monkeypatch.setattr(repair, "_load_optional_sqlite_vec", lambda _conn: False)
+        def failed_load(conn):
+            loader_calls.append(conn)
+            return False
+
+        monkeypatch.setattr(repair, "_load_optional_sqlite_vec", failed_load)
     else:
-        def failed_disable(_conn):
+        def failed_disable(conn):
+            loader_calls.append(conn)
             raise doctor._SQLiteVecExtensionDisableError()
 
         monkeypatch.setattr(repair, "_load_optional_sqlite_vec", failed_disable)
@@ -110,7 +116,8 @@ def test_write_connection_loader_failure_closes_connection(tmp_path, monkeypatch
             db_path=database, bank_name="default", report_path=report,
             selections=["working_memory:selected"], apply=True, backup_path=backup,
         )
-    assert opened
+    assert len(loader_calls) == 1
+    assert opened[-1] is loader_calls[0]
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
         opened[-1].execute("SELECT 1")
     assert not backup.exists()
