@@ -198,6 +198,7 @@ INVALIDATE_SCHEMA = {
         "properties": {
             "memory_id": {"type": "string", "description": "ID of memory to invalidate."},
             "replacement_id": {"type": "string", "description": "Optional new memory that replaces this one.", "default": ""},
+            "bank": {"type": "string", "enum": ["private", "surface"], "description": "Which store holds the memory: 'private' (this profile's own memory) or 'surface' (the shared cross-agent surface DB). Default 'private'; ids beginning with 'sf_' auto-route to surface.", "default": "private"},
         },
         "required": ["memory_id"],
     },

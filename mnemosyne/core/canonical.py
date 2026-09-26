@@ -141,6 +141,13 @@ def _init_canonical_with_conn(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_canonical_owner_category "
         "ON canonical_facts(owner_id, category)"
     )
+    # Writer provenance (2026-09-20 incident): owner_id answers "whose fact",
+    # never "who wrote me". Stamp writer identity at write time; idempotent
+    # ALTER so pre-existing tables acquire the columns on next init.
+    _cols = {r[1] for r in cursor.execute("PRAGMA table_info(canonical_facts)")}
+    for _add in ("writer_id", "writer_home"):
+        if _add not in _cols:
+            cursor.execute("ALTER TABLE canonical_facts ADD COLUMN %s TEXT" % _add)
 
     conn.commit()
 
@@ -202,6 +209,8 @@ class CanonicalStore:
         source: str = "",
         confidence: float = 1.0,
         _write_kind: object = "public",
+        writer_id: str = "",
+        writer_home: str = "",
     ) -> Optional[Dict]:
         """Upsert the canonical value for ``(owner_id, category, name)``.
 
@@ -275,10 +284,11 @@ class CanonicalStore:
                 """
                 INSERT INTO canonical_facts
                     (owner_id, category, name, body, source, confidence,
-                     version, valid_from, valid_until)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                     version, valid_from, valid_until, writer_id, writer_home)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
                 """,
-                (owner_id, category, name, body, source, confidence, version, now),
+                (owner_id, category, name, body, source, confidence, version, now,
+                 writer_id or "", writer_home or ""),
             )
             new_id = cursor.lastrowid
             self.conn.commit()
@@ -427,7 +437,8 @@ class CanonicalStore:
         rows = self.conn.execute(
             """
             SELECT id, owner_id, category, name, body, source, confidence,
-                   version, valid_from, valid_until, created_at
+                   version, valid_from, valid_until, created_at,
+                   writer_id, writer_home
             FROM canonical_facts
             ORDER BY id
             """
@@ -484,7 +495,8 @@ class CanonicalStore:
         try:
             existing = cursor.execute(
                 "SELECT id, owner_id, category, name, body, source, confidence, "
-                "version, valid_from, valid_until, created_at FROM canonical_facts"
+                "version, valid_from, valid_until, created_at, writer_id, "
+                "writer_home FROM canonical_facts"
             ).fetchall()
             existing_snapshot = {
                 r[0]: dict(zip(_CONTENT_FIELDS, r[1:])) for r in existing
@@ -495,8 +507,9 @@ class CanonicalStore:
                     """
                     INSERT INTO canonical_facts
                         (id, owner_id, category, name, body, source, confidence,
-                         version, valid_from, valid_until, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         version, valid_from, valid_until, created_at,
+                         writer_id, writer_home)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         row_id, item.get("owner_id"), item.get("category"),
@@ -505,6 +518,11 @@ class CanonicalStore:
                         item.get("confidence", 1.0), item.get("version", 1),
                         item.get("valid_from") or _now(), item.get("valid_until"),
                         item.get("created_at"),
+                        # P3b (2026-09-20 ruling): writer_id is portable
+                        # authorship and survives the round-trip ("imported"
+                        # for pre-P3 rows); writer_home is store-local —
+                        # "which home wrote this row HERE" re-stamps here.
+                        item.get("writer_id") or "imported", str(self.db_path),
                     ),
                 )
 
@@ -513,8 +531,9 @@ class CanonicalStore:
                     """
                     INSERT INTO canonical_facts
                         (owner_id, category, name, body, source, confidence,
-                         version, valid_from, valid_until, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         version, valid_from, valid_until, created_at,
+                         writer_id, writer_home)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         item.get("owner_id"), item.get("category"),
@@ -523,6 +542,7 @@ class CanonicalStore:
                         item.get("confidence", 1.0), item.get("version", 1),
                         item.get("valid_from") or _now(), item.get("valid_until"),
                         item.get("created_at"),
+                        item.get("writer_id") or "imported", str(self.db_path),
                     ),
                 )
 
