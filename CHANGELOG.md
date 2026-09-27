@@ -86,6 +86,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **An unknown `memory.mnemosyne.tools` name now fails at provider `initialize()` instead of the first tool-list or tool-call request (#1063).** The validation in `_configured_tool_schemas()` (#1021) now also runs right after `hermes_home` is bound, in both provider copies, so a config typo surfaces at startup rather than mid-session.
 - **Doctor and Repair share sqlite-vec capability for `vec0` databases (#1040 D1).** Repair loads the optional extension on planning and bound write connections to match Doctor's schema checks; without the `embeddings` extra, unverifiable schemas remain fail-closed. The separate D2–D4 restrictions remain unresolved.
 - **Malformed Hermes `sync_roles` config now warns while remaining fail-closed (#1033).** Comma-separated strings and native role lists remain supported; explicit empty values still disable autosave. Invalid non-empty values, including stringified lists, no longer fail silently or broaden capture, and role precedence is recomputed on provider reinitialization so stale overrides do not persist.
 

@@ -880,6 +880,39 @@ def test_tool_whitelist_unknown_name_fails_loudly(tmp_path, provider_modules):
             provider.get_tool_schemas()
 
 
+def test_tool_whitelist_unknown_name_fails_at_initialize(tmp_path, provider_modules):
+    """issue #1063: initialize() itself must reject a bad allowlist.
+
+    Before this, an unknown tool name passed construction cleanly and only
+    raised once something called get_tool_schemas()/handle_tool_call, i.e. at
+    the first tool-list or tool-call request. hermes_home is not known until
+    initialize() binds it, so the check has to live there, not in __init__.
+    """
+    _write_mnemosyne_config(tmp_path, ["mnemosyne_remember", "mnemosyne_not_real"])
+
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+            provider.initialize("bad-tools", hermes_home=str(tmp_path), agent_context="primary")
+        assert provider._beam is None
+
+        # A skip-context init (subagent/cron/...) binds hermes_home the same
+        # way and must fail just as loudly, not only the primary path.
+        with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+            provider.initialize("bad-tools-subagent", hermes_home=str(tmp_path), agent_context="subagent")
+
+    # Config-reload behavior is unchanged: correcting the file and
+    # initializing again must succeed and see the fix, not a cached failure.
+    _write_mnemosyne_config(tmp_path, ["mnemosyne_remember"])
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize("good-tools", hermes_home=str(tmp_path), agent_context="primary")
+        try:
+            assert _schema_names(provider) == ["mnemosyne_remember"]
+        finally:
+            provider.shutdown()
+
+
 def test_config_reader_tolerates_null_and_non_mapping_levels(tmp_path):
     from mnemosyne.hermes_config import read_hermes_config_key
 
