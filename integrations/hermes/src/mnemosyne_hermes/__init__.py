@@ -1972,8 +1972,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._platform = kwargs.get("platform", "cli")
         self._hermes_home = kwargs.get("hermes_home", "")
         # An unknown memory.mnemosyne.tools name must fail init loudly (#1063)
-        # instead of waiting for the first tool-list/tool-call request.
-        self._configured_tool_schemas()
+        # instead of waiting for the first tool-list/tool-call request. On
+        # failure, release the active registration and backend lease the
+        # same way shutdown() does, then re-raise the original error.
+        try:
+            self._configured_tool_schemas()
+        except Exception:
+            self._release_host_llm_backend_ownership()
+            self._deactivate_in_module()
+            raise
         self._agent_identity = kwargs.get("agent_identity", None) or ""
         self._gateway_session_key = kwargs.get("gateway_session_key") or ""
         self._channel_id_explicit = bool(kwargs.get("channel_id"))

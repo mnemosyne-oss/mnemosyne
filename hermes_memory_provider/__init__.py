@@ -2184,8 +2184,20 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._platform = kwargs.get("platform", "cli")
         self._hermes_home = kwargs.get("hermes_home", "")
         # An unknown memory.mnemosyne.tools name must fail init loudly (#1063)
-        # instead of waiting for the first tool-list/tool-call request.
-        self._configured_tool_schemas()
+        # instead of waiting for the first tool-list/tool-call request. On
+        # failure, run the same deactivation/release path shutdown() uses so
+        # a rejected re-init can't leave the instance active with no beam.
+        try:
+            self._configured_tool_schemas()
+        except Exception:
+            self._deactivate_in_module()
+            if self._agent_context not in self._skip_contexts:
+                try:
+                    from hermes_memory_provider.hermes_llm_adapter import unregister_hermes_host_llm
+                    unregister_hermes_host_llm()
+                except Exception as exc:
+                    logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
+            raise
         self._agent_identity = kwargs.get("agent_identity", None) or ""
         self._gateway_session_key = kwargs.get("gateway_session_key") or ""
 
