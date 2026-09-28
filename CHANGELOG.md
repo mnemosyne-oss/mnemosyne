@@ -198,6 +198,8 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   compression, so subsequent writes, reads, and tools use the active session.
 
 - **After-commit event hooks are now savepoint-aware (#963).** `forget()` defers `MEMORY_INVALIDATED` past a caller-owned transaction so the event fires on commit and is suppressed on rollback, but a `ROLLBACK TO <savepoint>` inside the caller's transaction undid the delete while the queued hook survived, publishing an invalidation for a row that was never deleted. The connection now mirrors savepoint scope for its hook queue through both connection-level `execute()` and a hook-aware cursor: hooks queued inside a savepoint are discarded when it rolls back and kept when it releases, and a bare `ROLLBACK` issued as raw SQL clears them like `rollback()` does. Anything bypassing both paths (e.g. a foreign cursor factory) stays invisible and an untracked name is left alone rather than guessed at. Releasing the outermost savepoint — which implicitly commits — drains the queue at once instead of leaving the event for an unrelated later commit.
+- **HTTP 429 now triggers the fallback model chain (#1000).** `_is_retryable_status()` previously treated 429 as terminal, so a rate limit on `MNEMOSYNE_LLM_REMOTE_MODEL` aborted the chain and degraded consolidation to AAAK even when `MNEMOSYNE_LLM_FALLBACK_MODELS` pointed at sibling models on the same OpenAI-compatible endpoint that still had quota. 429 is now retryable for the same reason 404 and 5xx already are: on shared gateways the quota is attached to the model, not the host, so swapping the model name is the fix. 401/403 stay non-retryable because those are endpoint-wide credentials. The chain still returns `None` (and falls through to local GGUF) when every candidate is rate-limited, matching the terminal-fallback contract. Test coverage: `test_is_retryable_status` now asserts 429 is retryable, and `TestRemoteLLMFallback` gains three regression cases (`test_429_triggers_fallback_when_candidate_remains`, `test_429_on_all_candidates_returns_none`, `test_429_mixed_with_other_failures`).
+
 
 ## [3.15.1] - 2026-07-30
 
@@ -1582,6 +1584,7 @@ endpoint.
 - Thread-local connection bug
 
 ---
+
 
 ## [1.0] - 2026-04-05
 

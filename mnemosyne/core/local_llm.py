@@ -571,12 +571,14 @@ def _is_retryable_status(status_code: int) -> bool:
 
     404/400: the requested model is missing or unrecognized on this endpoint —
     another model name on the same host may exist. 5xx: transient server-side
-    failure. 401/403/429 are NOT retryable: a bad key or rate limit won't be
-    fixed by swapping model names.
+    failure. 401/403 are NOT retryable: a bad key won't be fixed by swapping
+    model names. 429 IS retryable: on OpenAI-compatible gateways and proxies
+    the quota is usually attached to the model, not the endpoint, so a
+    sibling model on the same host may still have quota remaining (#1000).
     """
-    if status_code in (401, 403, 429):
+    if status_code in (401, 403):
         return False
-    if status_code in (404, 400) or 500 <= status_code < 600:
+    if status_code in (404, 400, 429) or 500 <= status_code < 600:
         return True
     return False
 
