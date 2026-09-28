@@ -476,7 +476,14 @@ def render_bank_source(
 ) -> str:
     """The built-in memory-bank source: hybrid recall with temporal weighting,
     relevance + low-quality filtering, strictly session-scoped.
-    Parameterized by *profile*."""
+    Parameterized by *profile*.
+
+    ``ledger`` is the caller's verbatim ledger, keyed by the same session as
+    the Beam (``session_id``, falling back to ``active_session_id``); pass
+    ``None`` when the caller has no ledger. ``lock`` is a re-entrant lock the
+    caller holds across the recall call (the Hermes provider passes its Beam
+    access lock); direct callers own their own synchronization.
+    """
     overfetch = max(profile.top_k * 2, _PREFETCH_OVERFETCH)  # over-fetch; junk filtered below
     recall_kwargs: Dict[str, Any] = dict(
         query=query, top_k=overfetch,

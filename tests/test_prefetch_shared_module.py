@@ -87,6 +87,11 @@ def test_moved_names_reexported_from_provider():
     assert hermes_memory_provider._resolve_profile("general").name == "general"
     assert hermes_memory_provider._is_low_quality_prefetch("still")
     assert hermes_memory_provider._format_prefetch_content("a b c", 0) == "a b c"
+    assert hermes_memory_provider._prefetch_tokens("[USER] prefers dark mode")
+    assert hermes_memory_provider._semantic_dedup_prefetch([]) == []
+    assert hermes_memory_provider._prefetch_content_char_limit() == 0
+    assert hermes_memory_provider._PREFETCH_TOP_K == 5
+    assert "general" in hermes_memory_provider._BUILTIN_PROFILES
 
 
 def test_identity_roundtrip():
