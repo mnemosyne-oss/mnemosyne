@@ -96,7 +96,7 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `persona_interval` | `MNEMOSYNE_PERSONA_INTERVAL` | `50` [^persona_interval] (declared `10`) | no | Turns between persona refreshes. |
 | `persona_token_cap` | `MNEMOSYNE_PERSONA_TOKEN_CAP` | `1500` [^persona_token_cap] (declared `500`) | no | Token budget for injected persona facts. |
 | `polyphonic_recall` | `MNEMOSYNE_POLYPHONIC_RECALL` | `false` | no | Enable the polyphonic multi-voice recall engine with RRF fusion. |
-| `prefetch_content_chars` | `MNEMOSYNE_PREFETCH_CONTENT_CHARS` | `2000` | no | Truncate prefetched memory content to this many characters. `0` disables truncation. |
+| `prefetch_content_chars` | `MNEMOSYNE_PREFETCH_CONTENT_CHARS` | `0` [^prefetch_content_chars] (declared `2000`) | no | Truncate prefetched memory content to this many characters. `0` disables truncation. |
 | `proactive_linking` | `MNEMOSYNE_PROACTIVE_LINKING` | `0` [^proactive_linking] (declared `true`) | no | Create cross-memory graph edges on insertion. |
 | `query_intent` | `MNEMOSYNE_QUERY_INTENT` | `0` [^query_intent] (declared `true`) | no | Classify query intent and adjust scoring weights accordingly. |
 | `recall_diagnostics` | `MNEMOSYNE_RECALL_DIAGNOSTICS` | `false` | no | Collect per-stage recall diagnostics. See `explain=True`. |
@@ -150,7 +150,7 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `wm_ttl_hours` | `MNEMOSYNE_WM_TTL_HOURS` | `168` | no | Age at which a working memory row becomes eligible for consolidation or trim. |
 | `write_classifier` | `MNEMOSYNE_WRITE_CLASSIFIER` | *(unset)* | no | Write classifier mode controlling which content is stored. |
 
-### Keys whose effective default bypasses `config.py` (19)
+### Keys whose effective default bypasses `config.py` (20)
 
 For these keys a module-level constant reads the environment variable directly with its own fallback, so the value in `DEFAULTS` is not what the runtime uses and a `config.yaml` entry alone does not reach the module. Treat the environment variable as authoritative.
 
@@ -162,6 +162,7 @@ This list is derived by scanning the package for `os.environ.get("MNEMOSYNE_..."
 [^llm_max_tokens]: `llm_max_tokens` -- effective default `2048`, set in `mnemosyne/core/local_llm.py`, not the ``512`` declared in `config.py`.
 [^persona_interval]: `persona_interval` -- effective default `50`, set in `mnemosyne/core/persona.py`, not the ``10`` declared in `config.py`.
 [^persona_token_cap]: `persona_token_cap` -- effective default `1500`, set in `mnemosyne/core/persona.py`, not the ``500`` declared in `config.py`.
+[^prefetch_content_chars]: `prefetch_content_chars` -- effective default `0`, set in `mnemosyne/core/prefetch.py`, not the ``2000`` declared in `config.py`.
 [^proactive_linking]: `proactive_linking` -- effective default `0`, set in `mnemosyne/core/beam.py`, not the ``true`` declared in `config.py`.
 [^query_intent]: `query_intent` -- effective default `0`, set in `mnemosyne/core/beam.py`, not the ``true`` declared in `config.py`.
 [^shmr_harmony_threshold]: `shmr_harmony_threshold` -- effective default `0.60`, set in `mnemosyne/core/shmr.py`, not the ``0.5`` declared in `config.py`.
