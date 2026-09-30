@@ -28,6 +28,10 @@ class StubHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def embeddings_mod(monkeypatch):
+    # This loopback stub must exercise enabled API dispatch, not inherit CI's
+    # global opt-out now that public API calls respect the same guard as local.
+    for flag in ("MNEMOSYNE_NO_EMBEDDINGS", "MNEMOSYNE_SKIP_EMBEDDINGS", "MNEMOSYNE_EMBEDDINGS_OFF"):
+        monkeypatch.delenv(flag, raising=False)
     server = HTTPServer(("127.0.0.1", 0), StubHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_port}/v1"

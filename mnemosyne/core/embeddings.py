@@ -108,17 +108,32 @@ def _get_prefix(kind: str) -> str:
 def _is_disabled() -> bool:
     """True when dense retrieval has been opted out via env var.
 
-    Three flags, in priority order:
+    Three equivalent flags (any true value disables embeddings):
     - MNEMOSYNE_NO_EMBEDDINGS: hard off, used in CI and unit tests that
       exercise non-embedding code paths
     - MNEMOSYNE_SKIP_EMBEDDINGS: same intent, shorter alias
     - MNEMOSYNE_EMBEDDINGS_OFF: same intent, longer alias
+
+    Values are trimmed and case-insensitive: 1/true/yes/on are true;
+    0/false/no/off, blank and unset are false. Validate every alias before
+    combining them, so a true flag cannot hide a malformed one. Other
+    nonempty values raise ValueError. This is ENV-only, not YAML resolution.
     """
-    return bool(
-        os.environ.get("MNEMOSYNE_NO_EMBEDDINGS")
-        or os.environ.get("MNEMOSYNE_SKIP_EMBEDDINGS")
-        or os.environ.get("MNEMOSYNE_EMBEDDINGS_OFF")
-    )
+    disabled = False
+    for name in (
+        "MNEMOSYNE_NO_EMBEDDINGS",
+        "MNEMOSYNE_SKIP_EMBEDDINGS",
+        "MNEMOSYNE_EMBEDDINGS_OFF",
+    ):
+        raw = os.environ.get(name, "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            disabled = True
+        elif raw not in ("", "0", "false", "no", "off"):
+            raise ValueError(
+                f"{name} must be 1/true/yes/on or 0/false/no/off "
+                "(blank or unset also means false)."
+            )
+    return disabled
 
 
 def _is_api_model(model_name: str) -> bool:
@@ -484,6 +499,9 @@ def available_api() -> bool:
 #     prevents stale vectors if the prefix env var changes within a process.
 def embed_query(text: str) -> Optional[np.ndarray]:
     """Encode a single query text into a dense vector."""
+    # Check outside the cached function: a warm hit must not bypass opt-out.
+    if _is_disabled():
+        return None
     if not text:
         return None
     return _embed_query_cached(_get_prefix("query") + text)
@@ -508,6 +526,8 @@ def _embed_query_cached(prefixed: str) -> Optional[np.ndarray]:
 #     embed_query — that path stamped the query prefix onto stored documents.
 def embed(texts: List[str]) -> Optional[np.ndarray]:
     """Encode texts (documents) into dense vectors."""
+    if _is_disabled():
+        return None
     if not texts:
         return None
     doc_prefix = _get_prefix("doc")
