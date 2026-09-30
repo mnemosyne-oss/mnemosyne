@@ -15,8 +15,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from mnemosyne.core.sqlite_config import configure_busy_timeout
-
 logger = logging.getLogger(__name__)
 
 _CREATE_TABLE = """
@@ -62,6 +60,12 @@ class AuditLog:
             self._conn = sqlite3.connect(
                 str(self._db_path), timeout=5, check_same_thread=False
             )
+            # Imported here, not at module level: Hermes runs this sibling
+            # before the package __init__ puts the checkout on sys.path, so a
+            # module-level import can bind `mnemosyne` to a data directory in
+            # the gateway's cwd and break the provider (#1056).
+            from mnemosyne.core.sqlite_config import configure_busy_timeout
+
             configure_busy_timeout(self._conn)
             self._conn.execute(_CREATE_TABLE)
             # Migration: add tokens_used column for existing databases
