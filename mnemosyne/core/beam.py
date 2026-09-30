@@ -744,7 +744,7 @@ def _vec_distance_sim(distance: float, vec_type: "Optional[str]" = None,
 
 
 def _wm_vec_row_sim(distance: float, vec_type: "Optional[str]",
-                    query_blob: "Optional[bytes]" = None,
+                    query_ref: "Optional[Any]" = None,
                     row_blob: "Optional[bytes]" = None) -> "Optional[float]":
     """Similarity for a single working-memory vector candidate.
 
@@ -757,14 +757,45 @@ def _wm_vec_row_sim(distance: float, vec_type: "Optional[str]",
     working-memory dense blend with ordering but no amplitude. The caller then
     routes the candidate set through the exact compatibility scan.
 
-    Every other arm keeps its existing mapping.
+    float32 candidates are scored the same way (``_vec_float32_blob_cosine``): the
+    stored blob is the raw float data, so the exact angle is recoverable without
+    assuming unit norms, and a missing blob abstains like int8.
+
+    The ``bit`` arm keeps its existing mapping.
     """
     if vec_type == "int8":
-        if query_blob and row_blob and len(bytes(query_blob)) == len(bytes(row_blob)):
+        if query_ref and row_blob and len(bytes(query_ref)) == len(bytes(row_blob)):
             # Exact: a genuine 0.0 cosine is a valid answer, so this never
             # falls back to the distance mapping.
-            return _vec_int8_blob_cosine(bytes(query_blob), bytes(row_blob))
+            return _vec_int8_blob_cosine(bytes(query_ref), bytes(row_blob))
         return None
+    if vec_type == "float32":
+        # Same contract as the int8 arm: score the candidate from its stored
+        # bytes (the stored blob IS the float data, so there is no
+        # quantization loss) instead of guessing a scale from the L2
+        # distance. The mapping below assumes unit-norm rows and divides by
+        # the dimension instead of 2, so for float32[1024] it collapses every
+        # candidate into a ~0.9993-0.9996 band: the ordering survives, the
+        # amplitude does not, and the dense blend gets a near-constant term.
+        # Scoring from the blob also stays exact for legacy rows written
+        # before normalization was enforced, where the distance-only
+        # conversion clamps them to 0.
+        #
+        # No blob (or an unreadable one) -> abstain, exactly like int8: the
+        # caller drops the candidate and lets the exact compatibility scan
+        # serve the set rather than reporting a guessed number. A blob whose
+        # length cannot be a vector of the query's shape counts as unreadable:
+        # _vec_float32_blob_cosine() reports 0.0 for it, which is
+        # indistinguishable from a genuine orthogonal row, so check the length
+        # here (the int8 arm length-checks for the same reason).
+        if row_blob is None or query_ref is None:
+            return None
+        row_bytes = bytes(row_blob)
+        import numpy as _np
+        query_arr = _np.asarray(query_ref, dtype=_np.float32)
+        if len(row_bytes) != query_arr.nbytes:
+            return None
+        return _vec_float32_blob_cosine(query_arr, row_bytes)
     return max(0.0, min(1.0, 1.0 - (max(float(distance), 0.0) / (2.0 * EMBEDDING_DIM))))
 
 
@@ -5130,21 +5161,27 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
         "bit": "vec_quantize_binary(?)",
         "int8": "vec_quantize_int8(?, 'unit')",
     }.get(vec_type, "?")
-    # int8 rows are scored from their stored bytes (exact cosine), so the query
-    # blob and the vector column are fetched up front. Without them there is no
-    # cosine to report: abstain and let the caller's exact compatibility scan
-    # score the candidate set instead of guessing from the distance.
-    query_blob: "Optional[bytes]" = None
-    use_blobs = vec_type == "int8"
-    if use_blobs:
+    # int8 and float32 rows are scored from their stored bytes (exact cosine),
+    # so the query-side reference and the vector column are fetched up front.
+    # Without them there is no cosine to report: abstain and let the caller's
+    # exact compatibility scan score the candidate set instead of guessing
+    # from the distance.
+    query_ref: "Optional[Any]" = None
+    use_blobs = vec_type in ("int8", "float32")
+    if vec_type == "int8":
         try:
-            query_blob = bytes(conn.execute(
+            query_ref = bytes(conn.execute(
                 "SELECT vec_quantize_int8(?, 'unit')", (emb_json,)
             ).fetchone()[0])
         except Exception:
-            query_blob = None
-        if not query_blob:
+            query_ref = None
+        if not query_ref:
             return []
+    elif vec_type == "float32":
+        # _vec_float32_blob_cosine() takes the query as a vector, not as a
+        # quantized blob: the stored row blob is the raw float data, so there
+        # is nothing to quantize on the query side.
+        query_ref = emb_arr
     blob_col = ", vw.embedding" if use_blobs else ""
     rows = []
     while True:
@@ -5165,6 +5202,29 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
         if len(rows) >= k or scan_k >= total_vectors:
             break
         scan_k = min(total_vectors, scan_k * 2)
+    # Membership has to follow the cosine this function reports, not the L2
+    # order the window arrives in. The two only agree while every row is
+    # unit-normalized: a vec0 KNN ranks by L2 distance, so on a store that may
+    # still hold pre-normalization rows a bounded window can omit the best
+    # cosine match entirely. _classify_vec_store_regime() is the format boundary
+    # for exactly that property (a "pure" store is safe for raw-L2 KNN), so on
+    # a store that is not pure and whose rows did not all fit the window,
+    # abstain and let the caller's exact compatibility scan rank the candidate
+    # set - the same conservative routing the episodic path uses - instead of
+    # returning a wrong top-k.
+    #
+    # Below, a window that holds every candidate ranks exactly for every
+    # blob-scored arm. For float32, a store in the normalized format also keeps
+    # the bounded window exact, because the marker means its rows are stored
+    # unit-length, so distance order is score order. For int8 it does not: the
+    # marker records only that the write path normalized before quantizing, which
+    # does not make the stored byte norms equal, so a bounded int8 window can
+    # still omit a row with a higher blob cosine. That gap predates this change
+    # and is not addressed here.
+    if use_blobs and scan_k < total_vectors and (
+        _classify_vec_store_regime(conn, "vec_working") != "pure"
+    ):
+        return []
     results = []
     keys = rows[0].keys() if rows else []
     for row in rows:
@@ -5175,11 +5235,16 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
         # memory_embeddings cosine fallback instead of collapsing to ~0 on high
         # dimensions.
         row_blob = row["embedding"] if "embedding" in keys else None
-        sim = _wm_vec_row_sim(distance, vec_type, query_blob, row_blob)
+        sim = _wm_vec_row_sim(distance, vec_type, query_ref, row_blob)
         if sim is None:
-            # int8 candidate without a usable blob (see _wm_vec_row_sim).
+            # int8/float32 candidate without a usable blob (see _wm_vec_row_sim).
             return []
         results.append({"id": row["id"], "sim": sim})
+    # Re-rank before truncating. The distance-mapped arms are monotone in the
+    # distance, so this is a no-op for them, but the blob-scored arms report an
+    # exact cosine whose order can differ from the window's (legacy non-unit
+    # rows), and the compatibility scan truncates by cosine too.
+    results.sort(key=lambda item: item["sim"], reverse=True)
     return results[:k]
 
 
