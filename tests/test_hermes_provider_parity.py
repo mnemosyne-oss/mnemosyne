@@ -77,6 +77,10 @@ def _config_schema(module):
 def _write_mnemosyne_config(hermes_home: Path, tools) -> None:
     if tools is None:
         body = "memory:\n  provider: mnemosyne\n  mnemosyne: {}\n"
+    elif isinstance(tools, str):
+        # A quoted scalar, e.g. the serialized sentinel "None"/"null" from
+        # issue #1021, distinct from the YAML null keyword and from `[]`.
+        body = f'memory:\n  provider: mnemosyne\n  mnemosyne:\n    tools: "{tools}"\n'
     elif not tools:
         body = "memory:\n  provider: mnemosyne\n  mnemosyne:\n    tools: []\n"
     else:
@@ -448,7 +452,21 @@ def test_provider_config_defaults_match(provider_modules):
     root_config = _config_schema(provider_modules["hermes_memory_provider"])
     integration_config = _config_schema(provider_modules["mnemosyne_hermes"])
 
-    assert _json_stable(root_config) == _json_stable(integration_config)
+    root_sync_roles = root_config["sync_roles"].copy()
+    integration_sync_roles = integration_config["sync_roles"].copy()
+    sync_roles_description = integration_sync_roles.pop("description")
+    root_sync_roles.pop("description")
+    root_without_sync_roles = root_config.copy()
+    integration_without_sync_roles = integration_config.copy()
+    root_without_sync_roles.pop("sync_roles")
+    integration_without_sync_roles.pop("sync_roles")
+
+    assert _json_stable(root_without_sync_roles) == _json_stable(integration_without_sync_roles)
+    assert _json_stable(root_sync_roles) == _json_stable(integration_sync_roles)
+    assert "stringified YAML/JSON lists are not parsed" in sync_roles_description
+    assert "no valid roles disable it and log one warning" in sync_roles_description
+    assert "initialize() kwarg > Hermes memory.mnemosyne config" in sync_roles_description
+
     assert root_config["auto_sleep"]["default"] is True
     assert root_config["sync_roles"]["default"] == ["user"]
     assert root_config["default_scope"]["choices"] == ["session", "global"]
@@ -720,6 +738,14 @@ def test_uninitialized_primary_tool_call_diverges_by_provider(
         (["mnemosyne_remember", "mnemosyne_recall"], ["mnemosyne_remember", "mnemosyne_recall"], False),
         ([], [], False),
         (["mnemosyne_not_real"], None, True),
+        # issue #1021: a serialized "None"/"null" (any case) or empty
+        # string must resolve the same as real None, not as an unknown
+        # tool name or an empty allowlist.
+        ("None", PROVIDER_TOOL_NAMES, False),
+        ("null", PROVIDER_TOOL_NAMES, False),
+        ("NoNe", PROVIDER_TOOL_NAMES, False),
+        ("  nUlL  ", PROVIDER_TOOL_NAMES, False),
+        ("", PROVIDER_TOOL_NAMES, False),
     ],
 )
 def test_tool_whitelist_without_yaml_matches_pyyaml(

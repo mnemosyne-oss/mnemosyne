@@ -9,7 +9,9 @@ import importlib
 import json
 import logging
 import math
+import ntpath
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -19,7 +21,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from importlib import resources
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Optional
 
 PLUGIN_NAME = "mnemosyne"
@@ -1593,6 +1595,49 @@ def _is_wrapper_plugin_target(target: Path) -> bool:
     return python is not None or site_packages is not None
 
 
+def _hermes_pm_generation_target(python: str | Path, home: str | Path) -> bool:
+    """Recognize the lexical PM layout without resolving venv Python symlinks.
+
+    This is a diagnostic, not proof that other paths persist: filesystem aliases
+    and unrecognized installation layouts are outside its scope.
+    """
+    selected, base = str(python), str(home)
+    windows = bool(ntpath.splitdrive(selected)[0] or ntpath.splitdrive(base)[0])
+    if windows:
+        path = PureWindowsPath(ntpath.normpath(selected))
+        root = PureWindowsPath(ntpath.normpath(base))
+        same = lambda a, b: a.casefold() == b.casefold()
+    else:
+        path = PurePosixPath(posixpath.abspath(selected))
+        root = PurePosixPath(posixpath.abspath(base))
+        same = lambda a, b: a == b
+    prefix = (*root.parts, "installs")
+    parts = path.parts
+    if len(parts) != len(prefix) + 6 or not all(
+        same(a, b) for a, b in zip(parts, prefix)
+    ):
+        return False
+    relative = parts[len(prefix):]
+    return (
+        same(relative[1], "environments")
+        and same(relative[3], "venv")
+        and tuple(part.casefold() for part in relative[4:])
+        in {("bin", "python"), ("bin", "python3"), ("scripts", "python.exe")}
+    )
+
+
+def _pm_wrapper_warning(python: str | Path | None, home: str | Path) -> str | None:
+    if python is None or not _hermes_pm_generation_target(python, home):
+        return None
+    return (
+        f"⚠ Wrapper Python {python} appears to be inside a replaceable Hermes "
+        "PM generation. This wrapper may stop working after a Hermes update. "
+        "For persistence, install Mnemosyne in a side venv outside installs/ "
+        "and re-register with --mode wrapper --force --python <side-venv-python>. "
+        "Existing wrapper registration remains supported."
+    )
+
+
 def _validated_wrapper_environment(
     python: str | Path | None,
     *,
@@ -1964,6 +2009,9 @@ def install_plugin(
     wrapper_python, site_packages = _validated_wrapper_environment(
         python, import_timeout=import_timeout
     )
+    warning = _pm_wrapper_warning(wrapper_python, base)
+    if warning:
+        print(f"  {warning}", file=sys.stderr)
     target.parent.mkdir(parents=True, exist_ok=True)
     staging_parent = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
     staged = staging_parent / target.name
@@ -2526,6 +2574,9 @@ def main(argv: list[str] | None = None) -> int:
                     assert hermes_python is not None
                     wrapper_python = hermes_python.absolute()
                     print(f"  Wrapper Python: {wrapper_python}")
+                    warning = _pm_wrapper_warning(wrapper_python, args.hermes_home or hermes_home())
+                    if warning:
+                        print(f"  {warning}")
                     if wrapper_python.is_file():
                         print(
                             "  Wrapper site-packages: "
@@ -2579,6 +2630,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  Plugin path: {target}")
             print(f"  State: {state.status}")
             print(f"  Mode: {state.mode}")
+            if state.mode == "wrapper":
+                warning = _pm_wrapper_warning(state.wrapper_python, args.hermes_home or hermes_home())
+                if warning:
+                    print(f"  {warning}")
             if installed:
                 if state.mode == "symlink" and state.link_target is not None:
                     print(f"  Target: {state.link_target}")

@@ -1999,10 +1999,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         Mnemosyne tools. ``tools: []`` exposes no tools while still allowing the
         provider's memory context/prefetch surface to initialize. Unknown names
         fail loudly so operators catch typos during Hermes startup instead of
-        silently losing tools.
+        silently losing tools. The serialized sentinels "None", "null" (any
+        case) and the empty string are also treated as unconfigured, since a
+        config/UI layer can round-trip a real ``None`` into one of those
+        strings instead of YAML ``null``.
         """
         configured = self._read_config_key("tools")
         if configured is None:
+            return list(ALL_TOOL_SCHEMAS)
+        if isinstance(configured, str) and configured.strip().lower() in ("", "none", "null"):
             return list(ALL_TOOL_SCHEMAS)
         if isinstance(configured, str):
             configured = [name.strip() for name in configured.replace(",", "\n").split("\n") if name.strip()]

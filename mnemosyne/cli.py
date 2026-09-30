@@ -1279,34 +1279,100 @@ def cmd_bank(args):
         _fail(str(e))
 
 
+def _resolve_reindex_target(db_override, bank_override):
+    """Resolve the database path reindex should open, honoring --db/--bank.
+
+    An explicit ``--db`` or ``--bank`` target must already exist. It is
+    looked up without touching the filesystem, so a typo exits before any
+    store, bank directory or backup is created. Without a target this mirrors
+    ``_get_memory()``'s ambient bank resolution.
+    """
+    if db_override is not None:
+        db_path = Path(db_override).expanduser()
+    elif bank_override is not None:
+        from mnemosyne.core.banks import get_bank_db_path_read_only
+
+        try:
+            db_path = get_bank_db_path_read_only(
+                _resolve_bank_name(bank_override), data_dir=Path(DATA_DIR)
+            )
+        except (ValueError, FileNotFoundError) as error:
+            _fail(str(error))
+    else:
+        from mnemosyne.core.banks import BankManager
+
+        bm = BankManager(Path(DATA_DIR))
+        try:
+            return bm.get_bank_db_path(_resolve_bank_name())
+        except ValueError as error:
+            _fail(str(error))
+    if not db_path.is_file():
+        _fail(f"Database not found: {db_path}")
+    return db_path
+
+
 def cmd_reindex(args):
     """Rebuild vector indexes from source text with the active embedding model.
 
-    Usage: mnemosyne reindex [--model NAME] [--dry-run] [--yes] [--no-backup]
+    Usage: mnemosyne reindex [--db PATH | --bank NAME] [--model NAME]
+                              [--dry-run] [--yes] [--no-backup]
 
     Use after changing the embedding model/dimension. Synchronous and blocking —
     re-embeds working + episodic memory, so it can take minutes on a large DB.
     Run it with any provider/gateway stopped.
     """
-    dry_run = "--dry-run" in args
-    assume_yes = "--yes" in args or "-y" in args
-    no_backup = "--no-backup" in args
+    usage = (
+        "Usage: mnemosyne reindex [--db PATH | --bank NAME] [--model NAME] "
+        "[--dry-run] [--yes] [--no-backup]"
+    )
+    db_override = None
+    bank_override = None
+    model_override = None
+    dry_run = False
+    assume_yes = False
+    no_backup = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--db":
+            db_override, i = _require_value(args, i, "--db", lambda value, _name: value)
+        elif arg == "--bank":
+            bank_override, i = _require_value(args, i, "--bank", lambda value, _name: value)
+        elif arg == "--model":
+            model_override, i = _require_value(args, i, "--model", lambda value, _name: value)
+        elif arg == "--dry-run":
+            dry_run = True
+            i += 1
+        elif arg in ("--yes", "-y"):
+            assume_yes = True
+            i += 1
+        elif arg == "--no-backup":
+            no_backup = True
+            i += 1
+        else:
+            _usage(f"{usage}\nUnknown reindex option: {arg}")
+
+    if db_override is not None and bank_override is not None:
+        _fail("--db and --bank cannot be used together")
+
+    db_path = _resolve_reindex_target(db_override, bank_override)
 
     # --model has to win before the embedding module is imported: it freezes the
     # model + dimension from the env at import time.
-    if "--model" in args:
-        try:
-            os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = args[args.index("--model") + 1]
-        except IndexError:
-            _usage("Usage: mnemosyne reindex [--model NAME] [--dry-run] [--yes] [--no-backup]")
+    if model_override is not None:
+        os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = model_override
 
     from mnemosyne.core import embeddings as _emb
+    # Open the target through BeamMemory, not Mnemosyne: importing
+    # mnemosyne.core.memory runs init_db() on the ambient default database,
+    # which a targeted reindex must leave untouched.
+    from mnemosyne.core.beam import BeamMemory, reindex_vectors
 
-    mem = _get_memory()
+    beam = BeamMemory(db_path=str(db_path))
 
     if dry_run:
-        plan = mem.reindex_vectors(dry_run=True)
-        print("Reindex plan (dry run -- nothing written):")
+        plan = reindex_vectors(beam.conn, dry_run=True)
+        print(f"Reindex plan (dry run -- nothing written), db: {db_path}")
         for key in ("model", "dim", "vec_type", "sqlite_vec",
                     "working_memory", "episodic_memory"):
             if key in plan:
@@ -1331,7 +1397,7 @@ def cmd_reindex(args):
     if not no_backup:
         try:
             from mnemosyne.dr.recovery import create_backup
-            backup = create_backup()
+            backup = create_backup(db_path=db_path)
             print(f"Backup created: {backup['backup_path']}")
         except Exception as e:
             _fail(f"Backup failed (use --no-backup to skip): {e}")
@@ -1343,7 +1409,7 @@ def cmd_reindex(args):
         print(f"  {store}: {done}/{total}", flush=True)
 
     try:
-        result = mem.reindex_vectors(progress=_progress)
+        result = reindex_vectors(beam.conn, progress=_progress)
     except Exception as e:
         _fail(str(e))
 
@@ -1892,7 +1958,7 @@ def run_cli():
         print("  import <file.json>                     Import memories")
         print("  import-hindsight <file|url> [bank]     Import Hindsight memories")
         print("  bank list|create|delete [name]         Manage memory banks")
-        print("  reindex [--model NAME] [--dry-run] [--yes] [--no-backup]")
+        print("  reindex [--db PATH|--bank NAME] [--model NAME] [--dry-run] [--yes] [--no-backup]")
         print("                                      Rebuild vector indexes with the active model")
         print("  backup [output_dir]                    Create database backup")
         print("  restore <backup.db.gz>                 Restore from backup")
@@ -1923,7 +1989,7 @@ def run_cli():
         # machine-readable code, never a traceback (which leaks absolute
         # paths and library internals into logs).
         try:
-            if command not in {"doctor", "repair"}:
+            if command not in {"doctor", "repair", "reindex"}:
                 os.makedirs(DATA_DIR, exist_ok=True)
             handler(sys.argv[2:])
         except SystemExit:

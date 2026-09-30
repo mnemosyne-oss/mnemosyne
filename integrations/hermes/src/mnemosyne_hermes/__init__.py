@@ -1031,6 +1031,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     """Mnemosyne native memory — local SQLite with vector + FTS5 hybrid search."""
 
     _VALID_SYNC_ROLES: frozenset = frozenset({"user", "assistant"})
+    _INVALID_SYNC_ROLES_WARNING = (
+        "Mnemosyne: invalid sync_roles configuration; expected a comma-separated "
+        "string or a list, tuple, or set containing valid roles (user, assistant). "
+        "Conversation autosave remains disabled."
+    )
     _WRITE_POLICY_TOOL_NAMES: frozenset = frozenset({
         "mnemosyne_apply_pending",
         "mnemosyne_batch",
@@ -1140,10 +1145,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # overrides, so membership (not truthiness) controls precedence.
         self._write_policy_overrides: Dict[str, Any] = {}
         self._sync_roles: Set[str] = {"user"}
-        _sync_env = os.environ.get("MNEMOSYNE_SYNC_ROLES")
-        if _sync_env is not None:
-            _parsed_roles = {r.strip().lower() for r in _sync_env.split(",") if r.strip()}
-            self._sync_roles = _parsed_roles & self._VALID_SYNC_ROLES
         self._skip_contexts = {"cron", "flush", "subagent", "background", "skill_loop"}  # Agent contexts to skip
         # Allow override via MNEMOSYNE_SKIP_CONTEXTS env var.
         # Set to empty string to skip nothing (enable all contexts).
@@ -1395,6 +1396,22 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         except Exception:
             return False
 
+    @classmethod
+    def _parse_sync_roles(cls, raw: Any) -> tuple[set[str], bool]:
+        """Return allowed roles and whether a nonempty value is invalid."""
+        if isinstance(raw, str):
+            parsed = {role.strip().lower() for role in raw.split(",") if role.strip()}
+            explicitly_empty = raw == ""
+        elif isinstance(raw, (list, tuple, set)):
+            parsed = {str(role).strip().lower() for role in raw if str(role).strip()}
+            explicitly_empty = len(raw) == 0
+        else:
+            parsed = set()
+            explicitly_empty = False
+
+        roles = parsed & cls._VALID_SYNC_ROLES
+        return roles, not roles and not explicitly_empty
+
     def _apply_provider_config(self, kwargs: Dict[str, Any]) -> None:
         """Apply provider-specific config from Hermes kwargs or config.yaml.
 
@@ -1486,14 +1503,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         _sync_raw = kwargs.get("sync_roles")
         if _sync_raw is None:
             _sync_raw = self._read_config_key("sync_roles")
-        if _sync_raw is not None:
-            if isinstance(_sync_raw, str):
-                parsed = {r.strip().lower() for r in _sync_raw.split(",") if r.strip()}
-            elif isinstance(_sync_raw, (list, tuple, set)):
-                parsed = {str(r).strip().lower() for r in _sync_raw if str(r).strip()}
-            else:
-                parsed = set()
-            self._sync_roles = parsed & self._VALID_SYNC_ROLES
+        if _sync_raw is None:
+            _sync_raw = os.environ.get("MNEMOSYNE_SYNC_ROLES", "user")
+        self._sync_roles, invalid_sync_roles = self._parse_sync_roles(_sync_raw)
+        if invalid_sync_roles:
+            logger.warning(self._INVALID_SYNC_ROLES_WARNING)
 
         # skip_contexts: kwargs > config.yaml > env var (already set in __init__)
         _skip_raw = kwargs.get("skip_contexts")
@@ -1618,10 +1632,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         Mnemosyne tools. ``tools: []`` exposes no tools while still allowing the
         provider's memory context/prefetch surface to initialize. Unknown names
         fail loudly so operators catch typos during Hermes startup instead of
-        silently losing tools.
+        silently losing tools. The serialized sentinels "None", "null" (any
+        case) and the empty string are also treated as unconfigured, since a
+        config/UI layer can round-trip a real ``None`` into one of those
+        strings instead of YAML ``null``.
         """
         configured = self._read_config_key("tools")
         if configured is None:
+            return list(ALL_TOOL_SCHEMAS)
+        if isinstance(configured, str) and configured.strip().lower() in ("", "none", "null"):
             return list(ALL_TOOL_SCHEMAS)
         if isinstance(configured, str):
             configured = [name.strip() for name in configured.replace(",", "\n").split("\n") if name.strip()]
@@ -1686,7 +1705,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             {"key": "shared_surface_path", "description": "SQLite path for shared surface memories. Default is <mnemosyne>/data/shared/mnemosyne.db.", "default": "data/shared/mnemosyne.db"},
             {"key": "shared_surface_read", "description": "When true, mnemosyne_recall merges shared-surface results into private bank recall, tagging each result with its bank ('private' or 'surface'). Default false.", "default": False},
             {"key": "skip_contexts", "description": "Agent contexts where Mnemosyne should skip initialization. Comma-separated list. Defaults to 'cron,flush,subagent,background,skill_loop'. Set to empty string to enable all contexts. Also configurable via MNEMOSYNE_SKIP_CONTEXTS env var.", "default": "cron,flush,subagent,background,skill_loop"},
-            {"key": "sync_roles", "description": "Conversation roles to autosave in sync_turn(). List of role names: 'user', 'assistant'. Default ['user'] saves user turns only to avoid assistant transcript noise. Set to ['user', 'assistant'] only if assistant transcript autosave is explicitly wanted, or [] to disable conversation autosave entirely. Does not affect explicit mnemosyne_remember calls. Identity signal capture is gated by user sync — excluding 'user' also disables identity extraction. Also configurable via MNEMOSYNE_SYNC_ROLES env var.", "default": ["user"]},
+            {"key": "sync_roles", "description": "Conversation roles autosaved by sync_turn(). Accepts a comma-separated string or a list, tuple, or set containing 'user' and/or 'assistant'; stringified YAML/JSON lists are not parsed. Default ['user'] saves user turns only. Empty strings/containers silently disable conversation autosave; non-empty values with no valid roles disable it and log one warning. Unknown roles are dropped silently when at least one valid role remains. Precedence: initialize() kwarg > Hermes memory.mnemosyne config > Mnemosyne config > MNEMOSYNE_SYNC_ROLES env var > default. Does not affect explicit mnemosyne_remember calls. Excluding 'user' also disables identity extraction.", "default": ["user"]},
             {"key": "default_scope", "description": "Default scope for remember() calls when not explicitly specified. 'session' (default) limits memories to the current session. 'global' persists memories across sessions.", "choices": ["session", "global"], "default": "session"},
             {"key": "tools", "description": "Optional list of Mnemosyne tool names to expose to Hermes. Omit or set null to expose all tools. Set [] to expose no tools while keeping memory context/prefetch enabled. Unknown names raise a clear startup/config error.", "default": None},
         ]

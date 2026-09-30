@@ -24,6 +24,7 @@ from typing import Any
 
 from mnemosyne.doctor import (
     _VEC0_VIRTUAL_TABLE,
+    _load_optional_sqlite_vec,
     build_doctor_report,
     inspect_schema_fingerprint,
     open_readonly_doctor_db,
@@ -810,12 +811,22 @@ def _result(status: str, reason: str | None = None) -> dict[str, str]:
     return result
 
 
-def _read_only_plans(db_path: Path, action: str, selections: list[tuple[str, str]]) -> list[dict[str, str]]:
+def _read_only_plans(
+    db_path: Path, action: str, selections: list[tuple[str, str]], expected_fingerprint: dict[str, Any]
+) -> list[dict[str, str]]:
     try:
         conn = open_readonly_doctor_db(db_path)
     except (OSError, ValueError, sqlite3.Error) as error:
         raise RepairError("Database could not be safely opened for repair") from error
     try:
+        # Doctor and repair must inspect vec0 with the same runtime capability.
+        # A missing optional extra remains a diagnostic state, not authorization.
+        _load_optional_sqlite_vec(conn)
+        fingerprint = asdict(inspect_schema_fingerprint(conn))
+        if not _verifiable_fingerprint(fingerprint):
+            raise RepairError("Repair planning requires a verifiable schema (install sqlite-vec for vec0)")
+        if _canonical_json(expected_fingerprint) != _canonical_json(fingerprint):
+            raise RepairError("Repair report fingerprint does not match the current database")
         results = []
         for _table, memory_id in selections:
             _plan, reason = _plan_selection(conn, action, memory_id)
@@ -823,6 +834,8 @@ def _read_only_plans(db_path: Path, action: str, selections: list[tuple[str, str
         return results
     except sqlite3.Error as error:
         raise RepairError("Selected rows could not be safely read") from error
+    except RuntimeError as error:
+        raise RepairError("Database could not be safely opened for repair") from error
     finally:
         conn.close()
 
@@ -830,11 +843,17 @@ def _read_only_plans(db_path: Path, action: str, selections: list[tuple[str, str
 def _open_writable_repair_db(database: Path) -> sqlite3.Connection:
     """Open only an existing DB, mapping filesystem/SQLite failures to RepairError."""
 
+    conn: sqlite3.Connection | None = None
     try:
         conn = sqlite3.connect(f"{database.absolute().as_uri()}?mode=rw", uri=True, timeout=5)
         conn.row_factory = sqlite3.Row
+        # Called only on the private inode-bound stage path, before the lock,
+        # fingerprint, selected-row preflight, and backup.
+        _load_optional_sqlite_vec(conn)
         return conn
-    except (OSError, ValueError, sqlite3.Error) as error:
+    except (OSError, ValueError, sqlite3.Error, RuntimeError) as error:
+        if conn is not None:
+            conn.close()
         raise RepairError("Database could not be safely opened for repair") from error
 
 
@@ -938,7 +957,7 @@ def run_repair(
         "skipped": [],
     }
     if not apply:
-        for item in _read_only_plans(database, action, parsed):
+        for item in _read_only_plans(database, action, parsed, manifest.fingerprint):
             (base["applied"] if item["status"] == "planned" else base["skipped"]).append(item)
         return base
 

@@ -31,7 +31,7 @@ The three flags on `sleep` are parsed but undocumented in the built-in help. `--
 | `doctor` | `doctor [--db PATH \| --bank NAME] [--format json\|markdown\|both]`. Bounded, read-only health report |
 | `repair` | `repair --report REPORT.json --select working_memory:ID [--apply]`. Applies one narrow doctor-gated fix |
 | `verify` | `verify [db_path] [--quick]`. Integrity check |
-| `reindex` | `reindex [--model NAME] [--dry-run] [--yes] [--no-backup]`. Re-embeds everything and rebuilds the sqlite-vec tables |
+| `reindex` | `reindex [--db PATH \| --bank NAME] [--model NAME] [--dry-run] [--yes] [--no-backup]`. Re-embeds everything and rebuilds the sqlite-vec tables |
 
 `reindex` is the recovery path for a vector dimension mismatch. It is synchronous, backs up first unless told otherwise, and prompts unless `--yes`. Its `--dry-run` option prints a rebuild plan without writing.
 
