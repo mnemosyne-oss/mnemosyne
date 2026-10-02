@@ -341,8 +341,8 @@ CONFIG_DESCRIPTIONS = {
 
     # Prefetch and turn limits
     "prefetch_content_chars": "Truncate prefetched memory content to this many characters. `0` disables truncation.",
-    "sync_turn_user_limit": "Maximum user turns captured per sync pass.",
-    "sync_turn_assistant_limit": "Maximum assistant turns captured per sync pass.",
+    "sync_turn_user_limit": "Maximum user message characters captured per sync turn. `0` disables truncation.",
+    "sync_turn_assistant_limit": "Maximum assistant message characters captured per sync turn. `0` disables truncation.",
 
     # Persona (L3)
     "persona_enabled": "Inject L3 persona facts into the system prompt.",
@@ -395,6 +395,9 @@ EFFECTIVE_DEFAULT_PROSE = {
     "fts_weight": "Recall weights resolve as `config.yaml > MNEMOSYNE_*_WEIGHT > defaults` at request time.",
     "importance_weight": "Recall weights resolve as `config.yaml > MNEMOSYNE_*_WEIGHT > defaults` at request time.",
     "llm_enabled": "Note the direction: `config.py` declares this off while the module defaults it on.",
+    "prefetch_content_chars": "Zero disables truncation, but a zero can still fall back to a profile limit downstream -- `0` is not always unlimited.",
+    "sync_turn_user_limit": "Per-message characters, not turns: caps user content per sync turn (500 chars).",
+    "sync_turn_assistant_limit": "Per-message characters, not turns: caps assistant content per sync turn (800 chars).",
 }
 
 # These keys are resolved by _resolve_recall_weights() at request time through
@@ -407,14 +410,24 @@ RUNTIME_CONFIG_RESOLVED_KEYS = {
 }
 
 
-def _scan_effective_defaults(env_map: dict, defaults: dict) -> dict:
+def _scan_effective_defaults(env_map: dict, defaults: dict,
+                               roots=("mnemosyne",)) -> tuple:
     """Find keys whose runtime default differs from the declared one.
 
-    Returns {config_key: (effective_value, source_file)}.
+    Returns (divergences, conflicts): divergences maps
+    {config_key: (effective_value, [source_files])}; conflicts maps
+    {config_key: [(value, source), ...]} for keys whose roots disagree.
 
     Matches module-level `os.environ.get("MNEMOSYNE_X", "literal")`. Values
     that differ only in spelling (`true` vs `1`, `0.7` vs `0.70`, an empty
     declared default) are not divergences and are filtered out.
+
+    `roots` are package directories walked relative to the repo root. The
+    provider packages (`hermes_memory_provider/`, `integrations/`) carry
+    divergent keys of the same class that a single-root scan cannot see
+    (#586). When roots disagree on one key's effective value, the first
+    root in order wins the reported value and every source is listed, so
+    the conflict is visible instead of silently first-wins.
     """
     import glob
     import re
@@ -426,20 +439,30 @@ def _scan_effective_defaults(env_map: dict, defaults: dict) -> dict:
     env_to_key = {v: k for k, v in env_map.items()}
 
     found = {}
-    root = os.path.join(REPO_ROOT, "mnemosyne")
-    for path in glob.glob(os.path.join(root, "**", "*.py"), recursive=True):
-        try:
-            with open(path, encoding="utf-8") as f:
-                text = f.read()
-        except OSError:
-            continue
-        for m in pattern.finditer(text):
-            envvar = m.group(1)
-            value = m.group(2) if m.group(2) is not None else m.group(3)
-            key = env_to_key.get(envvar)
-            if key is None or key in found or key in RUNTIME_CONFIG_RESOLVED_KEYS:
+    for root in roots:
+        root = os.path.join(REPO_ROOT, root)
+        for path in glob.glob(os.path.join(root, "**", "*.py"), recursive=True):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    text = f.read()
+            except OSError:
                 continue
-            found[key] = (value, os.path.relpath(path, REPO_ROOT))
+            for m in pattern.finditer(text):
+                envvar = m.group(1)
+                value = m.group(2) if m.group(2) is not None else m.group(3)
+                key = env_to_key.get(envvar)
+                if key is None or key in RUNTIME_CONFIG_RESOLVED_KEYS:
+                    continue
+                rel = os.path.relpath(path, REPO_ROOT)
+                entry = found.setdefault(key, {"by_value": {}, "sources": []})
+                entry["by_value"].setdefault(value, [])
+                if rel not in entry["by_value"][value]:
+                    entry["by_value"][value].append(rel)
+                if rel not in entry["sources"]:
+                    entry["sources"].append(rel)
+                # Every distinct value keeps its own source list, so a
+                # cross-root conflict reports where each value was seen
+                # instead of cross-pairing every value with every source.
 
     def _same(declared, effective: str) -> bool:
         if declared is None:
@@ -458,7 +481,22 @@ def _scan_effective_defaults(env_map: dict, defaults: dict) -> dict:
             return False
 
     out = {}
-    for key, (value, src) in found.items():
+    conflicts = {}
+    for key, entry in found.items():
+        values = [v for v in entry["by_value"] if v.strip() != ""]
+        first_value = next(iter(entry["by_value"]))
+        sources = sorted(entry["sources"])
+        if len(values) > 1:
+            # Same key, different real fallbacks in different files:
+            # report each value with the sources that set it. Empty
+            # fallbacks are "unset", not competing defaults, and are
+            # excluded the same way the divergence filter excludes them.
+            conflicts[key] = [
+                (v, s)
+                for v in values
+                for s in sorted(entry["by_value"][v])
+            ]
+        value = first_value
         declared = defaults.get(key)
         # An empty declared default means "unset", which the module fallback
         # fills in. That is the documented design, not a contradiction.
@@ -470,8 +508,8 @@ def _scan_effective_defaults(env_map: dict, defaults: dict) -> dict:
         if value.strip() == "":
             continue
         if not _same(declared, value):
-            out[key] = (value, src)
-    return out
+            out[key] = (value, sources)
+    return out, conflicts
 
 # Env vars read directly via os.environ, bypassing MnemosyneConfig. These
 # are NOT in ENV_VAR_MAP, so they cannot be set in config.yaml and are
@@ -616,8 +654,10 @@ def _render_tool_list(tools) -> list:
     return lines
 
 
-def _render_config(env_map, defaults, restart, version: str, effective=None) -> str:
+def _render_config(env_map, defaults, restart, version: str, effective=None,
+                   conflicts=None) -> str:
     effective = effective or {}
+    conflicts = conflicts or {}
     lines = [
         "---",
         'title: "Configuration"',
@@ -685,14 +725,24 @@ def _render_config(env_map, defaults, restart, version: str, effective=None) -> 
             "",
         ]
         for key in sorted(effective):
-            value, src = effective[key]
+            value, sources = effective[key]
             prose = EFFECTIVE_DEFAULT_PROSE.get(key, "")
             tail = f" {prose}" if prose else ""
+            src_list = ", ".join(f"`{s}`" for s in sources)
             lines.append(
                 f"[^{key}]: `{key}` -- effective default `{value}`, set in "
-                f"`{src}`, not the `{_fmt_default(defaults.get(key))}` declared in "
+                f"{src_list}, not the `{_fmt_default(defaults.get(key))}` declared in "
                 f"`config.py`.{tail}"
             )
+            if key in conflicts:
+                each = "; ".join(
+                    f"`{v}` in `{s}`" for v, s in sorted(set(conflicts[key]))
+                )
+                lines.append(
+                    f"[^{key}-conflict]: `{key}` -- provider roots disagree on the "
+                    f"effective default ({each}). The table shows the first root's "
+                    f"value; the disagreement needs a decision, not silent first-wins."
+                )
 
     lines += [
         "",
@@ -829,16 +879,21 @@ def main() -> None:
     tools = _collect_tools()
     env_map, defaults, restart = _collect_config()
     _validate_descriptions(env_map)
-    effective = _scan_effective_defaults(env_map, defaults)
+    effective, conflicts = _scan_effective_defaults(
+        env_map, defaults,
+        roots=("mnemosyne", "hermes_memory_provider", "integrations"),
+    )
 
     mcp_count = sum(1 for t in tools if t["mcp"])
     schema_mdx = _render_tool_schema(tools, version)
-    config_mdx = _render_config(env_map, defaults, restart, version, effective)
+    config_mdx = _render_config(env_map, defaults, restart, version, effective,
+                                conflicts)
 
     if check_only:
         print(f"v{version} | {len(tools)} tools ({mcp_count} over MCP) | "
               f"{len(env_map)} config keys | {len(ENV_ONLY_DESCRIPTIONS)} env-only | "
-              f"{len(effective)} effective-default divergences")
+              f"{len(effective)} effective-default divergences | "
+              f"{len(conflicts)} cross-root conflicts")
         return
 
     canonical = os.path.join(REPO_ROOT, "docs", "api")
