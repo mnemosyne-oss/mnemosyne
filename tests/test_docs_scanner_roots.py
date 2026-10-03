@@ -32,7 +32,8 @@ def _write(tree: Path, rel: str, body: str) -> None:
 
 
 def test_provider_roots_are_scanned():
-    """The three #586 provider keys are found with their real fallbacks."""
+    """The three #586 keys are found with their real fallbacks, and the
+    roots that read each key are covered."""
     gen = _load_gen()
     env_map, defaults, _ = gen._collect_config()
     effective, conflicts = gen._scan_effective_defaults(
@@ -42,14 +43,16 @@ def test_provider_roots_are_scanned():
     assert effective["prefetch_content_chars"][0] == "0"
     assert effective["sync_turn_user_limit"][0] == "500"
     assert effective["sync_turn_assistant_limit"][0] == "800"
-    for key in (
-        "prefetch_content_chars",
-        "sync_turn_user_limit",
-        "sync_turn_assistant_limit",
-    ):
+    for key in ("sync_turn_user_limit", "sync_turn_assistant_limit"):
         sources = effective[key][1]
         assert any("hermes_memory_provider" in s for s in sources), key
         assert any(s.startswith("integrations") for s in sources), key
+    # prefetch_content_chars is no longer read in the packaged provider: it
+    # moved to the shared core module (#1077). Both remaining readers must
+    # stay covered by the scanner.
+    prefetch_sources = effective["prefetch_content_chars"][1]
+    assert any(s.startswith("mnemosyne") for s in prefetch_sources), prefetch_sources
+    assert any(s.startswith("integrations") for s in prefetch_sources), prefetch_sources
     # The two provider files agree today; no live conflict to report.
     assert conflicts == {}
 
