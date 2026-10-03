@@ -49,6 +49,31 @@ Design
   read of the single current row; cheaper than hybrid vector search for a
   known-key identity read.
 
+Timestamps & the tombstone contract
+-----------------------------------
+A row is *current* iff ``valid_until IS NULL``; any non-NULL value means
+retired, whatever date it holds. ``recall`` / ``list`` / ``search`` /
+``model_card`` use exactly that test and ``history`` keeps superseded rows
+version-ordered with their raw stamps — there is intentionally no as-of /
+point-in-time reader over this table.
+
+On current main the native writer mints every stamp (``valid_from``,
+``valid_until``, and SQLite's ``created_at``) as naive-UTC ``YYYY-MM-DD
+HH:MM:SS``, so a row written start-to-finish by this generation shares one
+clock and one format regardless of the host timezone. That does **not** hold
+across the stored corpus: rows carrying a stamp from an earlier writer
+generation, and values supplied explicitly to ``import_all``, are stored
+verbatim and are *not* normalized. A retirement performed now therefore stamps
+a UTC ``valid_until`` beside an older ``valid_from`` that may use a different
+clock or separator.
+
+Treat stored timestamps as data, not a comparable timeline: raw string or
+cross-column comparison can invert (``'T'`` sorts above ``' '``), the shape of a
+stamp is not evidence of which writer or host timezone produced it, and
+shape-only normalization (``T``→space, strip a trailing ``Z``) repairs format
+but cannot recover an unknown historical local offset. The point documented here
+is per-generation stamp provenance, not a promise that rows stop being mixed.
+
 This complements, not replaces, episodic memory and the TripleStore: relational
 facts still belong in triples; free-text identity cards get a deduped
 authoritative slot here.
@@ -56,7 +81,7 @@ authoritative slot here.
 
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -72,9 +97,19 @@ def _default_db_path() -> Path:
 
 
 def _now() -> str:
-    """ISO timestamp used for valid_from / valid_until. Second precision is
-    enough for an identity store and keeps history rows human-readable."""
-    return datetime.now().isoformat(timespec="seconds")
+    """UTC timestamp used for valid_from / valid_until (#1062).
+
+    Rendered as naive-UTC ``YYYY-MM-DD HH:MM:SS``, the exact shape SQLite's
+    ``CURRENT_TIMESTAMP`` writes to ``created_at``, so every stamp *this writer*
+    mints shares one clock and one format regardless of the host timezone (the
+    same discipline #525 established for ``working_memory``). It does not
+    rewrite stamps an earlier writer generation already stored, nor values a
+    caller passed explicitly to ``import_all`` — those keep their own format, so
+    a retirement now can leave a UTC ``valid_until`` beside a legacy
+    ``valid_from`` on the same row (see the module docstring). Second precision
+    is enough for an identity store and keeps history rows human-readable.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _get_conn(db_path: Optional[Path] = None) -> sqlite3.Connection:

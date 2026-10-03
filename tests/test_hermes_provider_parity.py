@@ -880,6 +880,82 @@ def test_tool_whitelist_unknown_name_fails_loudly(tmp_path, provider_modules):
             provider.get_tool_schemas()
 
 
+def test_tool_whitelist_unknown_name_fails_at_initialize(tmp_path, provider_modules):
+    """issue #1063: initialize() itself must reject a bad allowlist.
+
+    Before this, an unknown tool name passed construction cleanly and only
+    raised once something called get_tool_schemas()/handle_tool_call, i.e. at
+    the first tool-list or tool-call request. hermes_home is not known until
+    initialize() binds it, so the check has to live there, not in __init__.
+    """
+    _write_mnemosyne_config(tmp_path, ["mnemosyne_remember", "mnemosyne_not_real"])
+
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+            provider.initialize("bad-tools", hermes_home=str(tmp_path), agent_context="primary")
+        assert provider._beam is None
+
+        # A skip-context init (subagent/cron/...) binds hermes_home the same
+        # way and must fail just as loudly, not only the primary path.
+        with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+            provider.initialize("bad-tools-subagent", hermes_home=str(tmp_path), agent_context="subagent")
+
+    # Config-reload behavior is unchanged: correcting the file and
+    # initializing again must succeed and see the fix, not a cached failure.
+    _write_mnemosyne_config(tmp_path, ["mnemosyne_remember"])
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize("good-tools", hermes_home=str(tmp_path), agent_context="primary")
+        try:
+            assert _schema_names(provider) == ["mnemosyne_remember"]
+        finally:
+            provider.shutdown()
+
+
+def test_tool_whitelist_unknown_name_on_reinit_releases_active_state(tmp_path, provider_modules):
+    """issue #1073 (CodeRabbit): a re-init that fails tool validation must not
+    leave a previously active instance registered as module-active, or
+    holding the host-LLM backend lease, once its beam has been cleared.
+
+    Asserts the per-instance flags rather than the module-global counters:
+    other tests in this file share these same module-scoped provider
+    modules and some leave a provider initialized without shutting it
+    down, so the global count is not a clean signal here.
+    """
+    from mnemosyne.core.llm_backends import get_host_llm_backend, set_host_llm_backend
+
+    for module in provider_modules.values():
+        _write_mnemosyne_config(tmp_path, ["mnemosyne_remember"])
+        provider = module.MnemosyneMemoryProvider()
+        try:
+            provider.initialize("healthy", hermes_home=str(tmp_path), agent_context="primary")
+            assert provider._beam is not None
+            assert provider._is_active_in_module is True
+            assert get_host_llm_backend() is not None
+            owns_backend = getattr(provider, "_owns_host_llm_backend", None)
+            if owns_backend is not None:
+                assert owns_backend is True
+
+            _write_mnemosyne_config(tmp_path, ["mnemosyne_remember", "mnemosyne_not_real"])
+            with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+                provider.initialize("reinit-bad-tools", hermes_home=str(tmp_path), agent_context="primary")
+
+            assert provider._beam is None
+            assert provider._is_active_in_module is False
+            if owns_backend is not None:
+                assert provider._owns_host_llm_backend is False
+            else:
+                # hermes_memory_provider has no per-instance ownership
+                # refcount: it always (un)registers the shared global on
+                # failure, same as shutdown(), so the global is the
+                # correct signal for that module.
+                assert get_host_llm_backend() is None
+        finally:
+            provider.shutdown()
+            set_host_llm_backend(None)
+
+
 def test_config_reader_tolerates_null_and_non_mapping_levels(tmp_path):
     from mnemosyne.hermes_config import read_hermes_config_key
 

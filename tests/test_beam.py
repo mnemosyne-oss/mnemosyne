@@ -2938,6 +2938,40 @@ class TestConsolidationHealth:
         assert h["status"] == "healthy"
         assert h["last_successful_consolidation"] is not None
 
+    def test_health_error_count_ignores_successful_runs_mentioning_fail(self, temp_db):
+        """A successful consolidation whose summary text contains "fail" (#717)."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        conn = sqlite3.connect(temp_db)
+        conn.execute(
+            "INSERT INTO consolidation_log (session_id, items_consolidated, "
+            "summary_preview, created_at) VALUES (?, ?, ?, datetime('now'))",
+            ("s1", 3, "consolidated memory about a failed deployment postmortem"),
+        )
+        conn.commit()
+        conn.close()
+
+        h = beam.health()
+        assert h["error_count"] == 0
+
+    def test_health_error_count_still_counts_genuine_zero_item_failures(self, temp_db):
+        """A real failed run (zero items, error-shaped summary) still counts."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        conn = sqlite3.connect(temp_db)
+        conn.executemany(
+            "INSERT INTO consolidation_log (session_id, items_consolidated, "
+            "summary_preview, created_at) VALUES (?, ?, ?, datetime('now'))",
+            [
+                ("s1", 0, "error: provider timeout during consolidation"),
+                ("s1", 0, "consolidation failed: no working memory read lock"),
+                ("s1", 0, "nothing to consolidate"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        h = beam.health()
+        assert h["error_count"] == 2
+
 
 class TestUpdateRefreshesDerivedState:
     """Issue #110: update() must reindex FTS5 + recompute vector embeddings."""

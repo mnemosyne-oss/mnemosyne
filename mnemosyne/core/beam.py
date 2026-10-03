@@ -744,7 +744,7 @@ def _vec_distance_sim(distance: float, vec_type: "Optional[str]" = None,
 
 
 def _wm_vec_row_sim(distance: float, vec_type: "Optional[str]",
-                    query_blob: "Optional[bytes]" = None,
+                    query_ref: "Optional[Any]" = None,
                     row_blob: "Optional[bytes]" = None) -> "Optional[float]":
     """Similarity for a single working-memory vector candidate.
 
@@ -757,14 +757,45 @@ def _wm_vec_row_sim(distance: float, vec_type: "Optional[str]",
     working-memory dense blend with ordering but no amplitude. The caller then
     routes the candidate set through the exact compatibility scan.
 
-    Every other arm keeps its existing mapping.
+    float32 candidates are scored the same way (``_vec_float32_blob_cosine``): the
+    stored blob is the raw float data, so the exact angle is recoverable without
+    assuming unit norms, and a missing blob abstains like int8.
+
+    The ``bit`` arm keeps its existing mapping.
     """
     if vec_type == "int8":
-        if query_blob and row_blob and len(bytes(query_blob)) == len(bytes(row_blob)):
+        if query_ref and row_blob and len(bytes(query_ref)) == len(bytes(row_blob)):
             # Exact: a genuine 0.0 cosine is a valid answer, so this never
             # falls back to the distance mapping.
-            return _vec_int8_blob_cosine(bytes(query_blob), bytes(row_blob))
+            return _vec_int8_blob_cosine(bytes(query_ref), bytes(row_blob))
         return None
+    if vec_type == "float32":
+        # Same contract as the int8 arm: score the candidate from its stored
+        # bytes (the stored blob IS the float data, so there is no
+        # quantization loss) instead of guessing a scale from the L2
+        # distance. The mapping below assumes unit-norm rows and divides by
+        # the dimension instead of 2, so for float32[1024] it collapses every
+        # candidate into a ~0.9993-0.9996 band: the ordering survives, the
+        # amplitude does not, and the dense blend gets a near-constant term.
+        # Scoring from the blob also stays exact for legacy rows written
+        # before normalization was enforced, where the distance-only
+        # conversion clamps them to 0.
+        #
+        # No blob (or an unreadable one) -> abstain, exactly like int8: the
+        # caller drops the candidate and lets the exact compatibility scan
+        # serve the set rather than reporting a guessed number. A blob whose
+        # length cannot be a vector of the query's shape counts as unreadable:
+        # _vec_float32_blob_cosine() reports 0.0 for it, which is
+        # indistinguishable from a genuine orthogonal row, so check the length
+        # here (the int8 arm length-checks for the same reason).
+        if row_blob is None or query_ref is None:
+            return None
+        row_bytes = bytes(row_blob)
+        import numpy as _np
+        query_arr = _np.asarray(query_ref, dtype=_np.float32)
+        if len(row_bytes) != query_arr.nbytes:
+            return None
+        return _vec_float32_blob_cosine(query_arr, row_bytes)
     return max(0.0, min(1.0, 1.0 - (max(float(distance), 0.0) / (2.0 * EMBEDDING_DIM))))
 
 
@@ -1419,18 +1450,19 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
             synced_at TEXT
         )
     """)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_timestamp ON memory_events(timestamp)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_memory_id ON memory_events(memory_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_device_id ON memory_events(device_id)")
-
     # Memory events ALTER TABLE migrations (safe add columns for existing DBs)
     for col, ddl in {
+        "device_id": "device_id TEXT NOT NULL DEFAULT ''",
         "event_hash": "event_hash TEXT",
         "synced_at": "synced_at TEXT",
         "parent_event_ids": "parent_event_ids TEXT DEFAULT '[]'",
         "expiry": "expiry TEXT",
     }.items():
         _add_column_if_missing(conn, "memory_events", col, ddl.split(" ", 1)[1])
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_timestamp ON memory_events(timestamp)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_memory_id ON memory_events(memory_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_device_id ON memory_events(device_id)")
 
     # Detect supported vector type
     effective_vec_type = _detect_vec_type(conn)
@@ -3735,6 +3767,20 @@ def _wm_vec_delete(conn: sqlite3.Connection, memory_id: str) -> None:
     conn.execute("DELETE FROM vec_working WHERE rowid = ?", (rowid,))
 
 
+def _invalidate_working_embedding(conn: sqlite3.Connection, memory_id: str) -> None:
+    """Best-effort delete of a working row's derived vectors from both stores.
+
+    Used when the content changed but no fresh vector could be produced
+    (embedding provider unavailable, returned no vectors, or raised). The
+    stored embedding describes the OLD content, so leaving it in place lets
+    dense recall score the new content with a stale derived vector. Removing
+    it degrades the row to keyword-only retrieval instead of returning wrong
+    dense results.
+    """
+    conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+    _wm_vec_delete(conn, memory_id)
+
+
 def _store_working_embedding(conn: sqlite3.Connection, memory_id: str, embedding: List[float], *,
                              commit_vec: bool = True, strict_vec: bool = False) -> None:
     """Store working-memory embedding in fallback and sqlite-vec stores.
@@ -3978,8 +4024,18 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     Synchronous and blocking — re-embedding a large DB can take minutes; run it
     offline (with any provider/gateway stopped). Idempotent.
 
+    Atomic: the whole rebuild runs in a single transaction that holds the
+    database write lock until it commits, and the normalized-format marker is
+    set in that same commit. A failed or killed run (SIGKILL included) leaves
+    the store exactly as it was before the call, so the run is safe to repeat;
+    it can never leave emptied vec tables behind a marker that claims health
+    (#1075). The transaction's journal/WAL grows with the rewrite, so leave
+    disk headroom on a large store.
+
     ``dry_run`` returns the plan (model, dim, per-store counts) without writing.
     ``progress`` is an optional ``callable(store, done, total)`` for reporting.
+    It fires after each embedded batch, before the commit, so a count it
+    reports is not durable until the function returns.
     """
     target_dim = int(_embeddings.EMBEDDING_DIM)
     vec_type = _effective_vec_type(conn)
@@ -3989,7 +4045,7 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
         return int(conn.execute(sql).fetchone()[0])
 
     def _commit_reindex_writes() -> None:
-        """Commit a rebuild boundary even when BEAM normally defers commits."""
+        """Really commit, even when BEAM normally defers commits."""
         if isinstance(conn, _BeamConnection):
             conn._real_commit()
         else:
@@ -4074,81 +4130,133 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
             "episodic_memory vector backend unavailable; cannot reindex episodic vectors."
         )
 
-    # 1) Recreate the sqlite-vec tables at the active dimension. vec_facts has no
-    #    writer yet but is recreated so its declared dim can't mismatch a query.
-    #    Clear the normalized-format marker BEFORE the drop: mid-rebuild and
-    #    failed-rebuild readers must route conservatively (the table is
-    #    partial), never on a stale pure verdict. The marker is re-set on
-    #    success below.
-    if vec_ok:
-        try:
-            _uv = conn.execute("PRAGMA user_version").fetchone()[0]
-            if _uv & _VEC_NORM_BIT:
-                conn.execute(f"PRAGMA user_version = {_uv & ~_VEC_NORM_BIT}")
-                _cleared_uv = conn.execute("PRAGMA user_version").fetchone()[0]
-                if _cleared_uv & _VEC_NORM_BIT:
-                    raise RuntimeError("normalized-format marker remained set")
-        except Exception as exc:
-            raise RuntimeError(
-                "Could not clear the normalized-format marker before rebuild; "
-                "aborting before vec tables are changed."
-            ) from exc
-        for table in ("vec_episodes", "vec_working", "vec_facts"):
-            conn.execute(f"DROP TABLE IF EXISTS {table}")
-            conn.execute(
-                f"CREATE VIRTUAL TABLE {table} USING vec0(embedding {vec_type}[{target_dim}])"
-            )
+    # The whole rebuild is ONE transaction (#1075). It drops and recreates the
+    # vec tables, clears the normalized-format marker, and overwrites
+    # memory_embeddings and episodic_memory.binary_vector in place; committing
+    # any of that before the last batch leaves a store that is internally
+    # inconsistent yet passes quick_check (empty vec tables, marker cleared).
+    # Nothing is visible to other connections, and nothing survives a crash
+    # (SIGKILL included), until the single commit at the end: a failed or
+    # killed run leaves the pre-reindex store byte-for-byte intact.
+    # Python's sqlite3 only auto-opens a transaction before DML, so the vec
+    # DDL below needs the explicit BEGIN to share the transaction.
+    if conn.in_transaction:
+        # Flush anything the caller left pending, as the old first commit did.
         _commit_reindex_writes()
-
-    # 2) Working memory -> memory_embeddings (+ vec_working), via the shared write
-    #    helper so the float-JSON and sqlite-vec stores stay consistent.
-    wm_done = 0
-    wm_rows = conn.execute(
-        "SELECT id, content FROM working_memory "
-        "WHERE content IS NOT NULL AND length(content) > 0"
-    ).fetchall()
-    for start in range(0, len(wm_rows), batch_size):
-        chunk = wm_rows[start:start + batch_size]
-        vecs = _embed_chunk("working_memory", chunk)
-        for r, vec in zip(chunk, vecs):
-            _store_working_embedding(
-                conn, r["id"], np.asarray(vec).tolist(), commit_vec=False, strict_vec=True
-            )
-            wm_done += 1
-        _commit_reindex_writes()
-        if progress:
-            progress("working_memory", wm_done, wm_total)
-
-    # 3) Episodic memory -> vec_episodes + binary_vector (mirrors the episodic
-    #    store path).
-    ep_done = 0
-    ep_rows = conn.execute(
-        "SELECT rowid, content FROM episodic_memory "
-        "WHERE content IS NOT NULL AND length(content) > 0"
-    ).fetchall()
-    for start in range(0, len(ep_rows), batch_size):
-        chunk = ep_rows[start:start + batch_size]
-        vecs = _embed_chunk("episodic_memory", chunk)
-        for r, vec in zip(chunk, vecs):
-            arr = np.asarray(vec)
-            rowid = int(r["rowid"])
-            if vec_ok:
-                _vec_table_insert(conn, "vec_episodes", rowid, arr.tolist(), commit=False)
-            if _mib is not None:
-                conn.execute(
-                    "UPDATE episodic_memory SET binary_vector = ? WHERE rowid = ?",
-                    (_mib(arr), rowid),
-                )
-            ep_done += 1
-        _commit_reindex_writes()
-        if progress:
-            progress("episodic_memory", ep_done, ep_total)
-
-    if wm_done != wm_total or ep_done != ep_total:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
         raise RuntimeError(
-            "Reindex incomplete: processed "
-            f"{wm_done}/{wm_total} working and {ep_done}/{ep_total} episodic rows"
-        )
+            "Could not take the database write lock for the vector rebuild "
+            f"({exc}); stop every other process that writes to this database "
+            "and retry. Nothing was changed."
+        ) from exc
+    try:
+        # 1) Recreate the sqlite-vec tables at the active dimension. vec_facts
+        #    has no writer yet but is recreated so its declared dim can't
+        #    mismatch a query. The marker is cleared first and re-set on
+        #    success below; inside the transaction nobody else sees the cleared
+        #    state, but this also proves the header is writable before any
+        #    table is dropped and before minutes of embedding are spent.
+        if vec_ok:
+            try:
+                _uv = conn.execute("PRAGMA user_version").fetchone()[0]
+                if _uv & _VEC_NORM_BIT:
+                    conn.execute(f"PRAGMA user_version = {_uv & ~_VEC_NORM_BIT}")
+                    _cleared_uv = conn.execute("PRAGMA user_version").fetchone()[0]
+                    if _cleared_uv & _VEC_NORM_BIT:
+                        raise RuntimeError("normalized-format marker remained set")
+            except Exception as exc:
+                raise RuntimeError(
+                    "Could not clear the normalized-format marker before rebuild; "
+                    "aborting before vec tables are changed."
+                ) from exc
+            for table in ("vec_episodes", "vec_working", "vec_facts"):
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
+                conn.execute(
+                    f"CREATE VIRTUAL TABLE {table} USING vec0(embedding {vec_type}[{target_dim}])"
+                )
+
+        # 2) Working memory -> memory_embeddings (+ vec_working), via the shared
+        #    write helper so the float-JSON and sqlite-vec stores stay consistent.
+        wm_done = 0
+        wm_rows = conn.execute(
+            "SELECT id, content FROM working_memory "
+            "WHERE content IS NOT NULL AND length(content) > 0"
+        ).fetchall()
+        for start in range(0, len(wm_rows), batch_size):
+            chunk = wm_rows[start:start + batch_size]
+            vecs = _embed_chunk("working_memory", chunk)
+            for r, vec in zip(chunk, vecs):
+                _store_working_embedding(
+                    conn, r["id"], np.asarray(vec).tolist(), commit_vec=False, strict_vec=True
+                )
+                wm_done += 1
+            if progress:
+                progress("working_memory", wm_done, wm_total)
+
+        # 3) Episodic memory -> vec_episodes + binary_vector (mirrors the episodic
+        #    store path).
+        ep_done = 0
+        ep_rows = conn.execute(
+            "SELECT rowid, content FROM episodic_memory "
+            "WHERE content IS NOT NULL AND length(content) > 0"
+        ).fetchall()
+        for start in range(0, len(ep_rows), batch_size):
+            chunk = ep_rows[start:start + batch_size]
+            vecs = _embed_chunk("episodic_memory", chunk)
+            for r, vec in zip(chunk, vecs):
+                arr = np.asarray(vec)
+                rowid = int(r["rowid"])
+                if vec_ok:
+                    _vec_table_insert(conn, "vec_episodes", rowid, arr.tolist(), commit=False)
+                if _mib is not None:
+                    conn.execute(
+                        "UPDATE episodic_memory SET binary_vector = ? WHERE rowid = ?",
+                        (_mib(arr), rowid),
+                    )
+                ep_done += 1
+            if progress:
+                progress("episodic_memory", ep_done, ep_total)
+
+        if wm_done != wm_total or ep_done != ep_total:
+            raise RuntimeError(
+                "Reindex incomplete: processed "
+                f"{wm_done}/{wm_total} working and {ep_done}/{ep_total} episodic rows"
+            )
+
+        # Only a completed sqlite-vec rebuild certifies normalized vec blobs.
+        # JSON/binary-only reindexing leaves the persisted vec table untouched and
+        # must preserve whichever format marker it already had. The marker is
+        # written inside the transaction so it lands atomically with the tables
+        # it certifies.
+        if vec_ok:
+            try:
+                uv = conn.execute("PRAGMA user_version").fetchone()[0]
+                conn.execute(
+                    f"PRAGMA user_version = {(uv & ~0x10000000) | _VEC_NORM_BIT}"
+                )
+            except Exception:
+                logger.warning(
+                    "reindex_vectors: store rebuilt but the normalized-format "
+                    "marker could not be written; episodic vector recall keeps "
+                    "using the conservative full-scan route. Re-run "
+                    "reindex_vectors() when the database is writable.",
+                    exc_info=True,
+                )
+        _commit_reindex_writes()
+    except BaseException:
+        # Includes KeyboardInterrupt: undo the whole rebuild, then re-raise.
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            logger.warning(
+                "reindex_vectors: rollback after a failed rebuild also failed; "
+                "SQLite will discard the uncommitted rebuild when the "
+                "connection closes.",
+                exc_info=True,
+            )
+        raise
 
     plan["status"] = "reindexed"
     plan["working_memory_reindexed"] = wm_done
@@ -4156,25 +4264,9 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     # The rebuild can change the live vec type/dimension and re-quantizes
     # every row: warmed enhanced-recall entries must not survive it
     # (the cache key hashes the process-level VEC_TYPE, which can stay
-    # unchanged while the live table type changes).
+    # unchanged while the live table type changes). Invalidated only after
+    # the commit, so a concurrent reader cannot re-warm from pre-rebuild data.
     _invalidate_query_cache_for_conn(conn, "reindex_vectors")
-    # Only a completed sqlite-vec rebuild certifies normalized vec blobs.
-    # JSON/binary-only reindexing leaves the persisted vec table untouched and
-    # must preserve whichever format marker it already had.
-    if vec_ok:
-        try:
-            uv = conn.execute("PRAGMA user_version").fetchone()[0]
-            conn.execute(
-                f"PRAGMA user_version = {(uv & ~0x10000000) | _VEC_NORM_BIT}"
-            )
-        except Exception:
-            logger.warning(
-                "reindex_vectors: store rebuilt but the normalized-format "
-                "marker could not be written; episodic vector recall keeps "
-                "using the conservative full-scan route. Re-run "
-                "reindex_vectors() when the database is writable.",
-                exc_info=True,
-            )
     return plan
 
 
@@ -5130,21 +5222,27 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
         "bit": "vec_quantize_binary(?)",
         "int8": "vec_quantize_int8(?, 'unit')",
     }.get(vec_type, "?")
-    # int8 rows are scored from their stored bytes (exact cosine), so the query
-    # blob and the vector column are fetched up front. Without them there is no
-    # cosine to report: abstain and let the caller's exact compatibility scan
-    # score the candidate set instead of guessing from the distance.
-    query_blob: "Optional[bytes]" = None
-    use_blobs = vec_type == "int8"
-    if use_blobs:
+    # int8 and float32 rows are scored from their stored bytes (exact cosine),
+    # so the query-side reference and the vector column are fetched up front.
+    # Without them there is no cosine to report: abstain and let the caller's
+    # exact compatibility scan score the candidate set instead of guessing
+    # from the distance.
+    query_ref: "Optional[Any]" = None
+    use_blobs = vec_type in ("int8", "float32")
+    if vec_type == "int8":
         try:
-            query_blob = bytes(conn.execute(
+            query_ref = bytes(conn.execute(
                 "SELECT vec_quantize_int8(?, 'unit')", (emb_json,)
             ).fetchone()[0])
         except Exception:
-            query_blob = None
-        if not query_blob:
+            query_ref = None
+        if not query_ref:
             return []
+    elif vec_type == "float32":
+        # _vec_float32_blob_cosine() takes the query as a vector, not as a
+        # quantized blob: the stored row blob is the raw float data, so there
+        # is nothing to quantize on the query side.
+        query_ref = emb_arr
     blob_col = ", vw.embedding" if use_blobs else ""
     rows = []
     while True:
@@ -5165,6 +5263,29 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
         if len(rows) >= k or scan_k >= total_vectors:
             break
         scan_k = min(total_vectors, scan_k * 2)
+    # Membership has to follow the cosine this function reports, not the L2
+    # order the window arrives in. The two only agree while every row is
+    # unit-normalized: a vec0 KNN ranks by L2 distance, so on a store that may
+    # still hold pre-normalization rows a bounded window can omit the best
+    # cosine match entirely. _classify_vec_store_regime() is the format boundary
+    # for exactly that property (a "pure" store is safe for raw-L2 KNN), so on
+    # a store that is not pure and whose rows did not all fit the window,
+    # abstain and let the caller's exact compatibility scan rank the candidate
+    # set - the same conservative routing the episodic path uses - instead of
+    # returning a wrong top-k.
+    #
+    # Below, a window that holds every candidate ranks exactly for every
+    # blob-scored arm. For float32, a store in the normalized format also keeps
+    # the bounded window exact, because the marker means its rows are stored
+    # unit-length, so distance order is score order. For int8 it does not: the
+    # marker records only that the write path normalized before quantizing, which
+    # does not make the stored byte norms equal, so a bounded int8 window can
+    # still omit a row with a higher blob cosine. That gap predates this change
+    # and is not addressed here.
+    if use_blobs and scan_k < total_vectors and (
+        _classify_vec_store_regime(conn, "vec_working") != "pure"
+    ):
+        return []
     results = []
     keys = rows[0].keys() if rows else []
     for row in rows:
@@ -5175,11 +5296,16 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
         # memory_embeddings cosine fallback instead of collapsing to ~0 on high
         # dimensions.
         row_blob = row["embedding"] if "embedding" in keys else None
-        sim = _wm_vec_row_sim(distance, vec_type, query_blob, row_blob)
+        sim = _wm_vec_row_sim(distance, vec_type, query_ref, row_blob)
         if sim is None:
-            # int8 candidate without a usable blob (see _wm_vec_row_sim).
+            # int8/float32 candidate without a usable blob (see _wm_vec_row_sim).
             return []
         results.append({"id": row["id"], "sim": sim})
+    # Re-rank before truncating. The distance-mapped arms are monotone in the
+    # distance, so this is a no-op for them, but the blob-scored arms report an
+    # exact cosine whose order can differ from the window's (legacy non-unit
+    # rows), and the compatibility scan truncates by cosine too.
+    results.sort(key=lambda item: item["sim"], reverse=True)
     return results[:k]
 
 
@@ -6681,6 +6807,11 @@ class BeamMemory:
 
     def get_working_stats(self, author_id: str = None, author_type: str = None,
                           channel_id: str = None) -> Dict:
+        """Read filtered working totals and stored embedding/ANN presence.
+
+        Presence is not model validity, recall eligibility, or embedder health.
+        Only existing working parents count, independently in each store.
+        """
         cursor = self.conn.cursor()
         where_clauses = []
         params = []
@@ -6712,12 +6843,44 @@ class BeamMemory:
 
         cursor.execute(f"SELECT timestamp FROM working_memory{where_str} ORDER BY timestamp DESC LIMIT 1", params)
         last = cursor.fetchone()
+
+        presence_where = f"{where_str} AND" if where_str else " WHERE"
+        cursor.execute(
+            f"SELECT COUNT(*) FROM working_memory{presence_where} EXISTS ("
+            "SELECT 1 FROM memory_embeddings WHERE memory_id = working_memory.id)",
+            params,
+        )
+        embedding_rows = cursor.fetchone()[0]
+
+        # Probe this connection, not package/model availability. The general
+        # vector helper intentionally swallows errors; stats must not turn a
+        # lock, I/O failure, or corruption into an unavailable/empty index.
+        ann_index_available = True
+        try:
+            cursor.execute("SELECT 1 FROM vec_working LIMIT 0")
+        except sqlite3.OperationalError as exc:
+            if str(exc) not in {"no such table: vec_working", "no such module: vec0"}:
+                raise
+            ann_index_available = False
+
+        ann_indexed_rows = 0
+        if ann_index_available:
+            cursor.execute(
+                f"SELECT COUNT(*) FROM working_memory{presence_where} EXISTS ("
+                "SELECT 1 FROM vec_working WHERE rowid = working_memory.rowid)",
+                params,
+            )
+            ann_indexed_rows = cursor.fetchone()[0]
+
         return {
             "total": total,
             "consolidated": consolidated,
             "unconsolidated": unconsolidated,
             "pinned_unconsolidated": pinned_unconsolidated,
             "last": last[0] if last else None,
+            "embedding_rows": embedding_rows,
+            "ann_indexed_rows": ann_indexed_rows,
+            "ann_index_available": ann_index_available,
         }
 
     def _count_unconsolidated_before(self, cutoff: str) -> int:
@@ -6802,17 +6965,26 @@ class BeamMemory:
         # Refresh derived state when content changed.
         # FTS5 is handled by the wm_au trigger (AFTER UPDATE OF content),
         # but memory_embeddings must be recomputed explicitly.
-        if content_changed and affected > 0 and _embeddings.available():
-            try:
-                vec = _embeddings.embed([content])
-                if vec is not None and len(vec) > 0:
-                    _store_working_embedding(self.conn, memory_id, vec[0])
-            except Exception as exc:
-                logger.warning(
-                    "update_working: embedding refresh failed for %s"
-                    " (%s): %s",
-                    memory_id, type(exc).__name__, exc,
-                )
+        if content_changed and affected > 0:
+            refreshed = False
+            if _embeddings.available():
+                try:
+                    vec = _embeddings.embed([content])
+                    if vec is not None and len(vec) > 0:
+                        _store_working_embedding(self.conn, memory_id, vec[0])
+                        refreshed = True
+                except Exception as exc:
+                    logger.warning(
+                        "update_working: embedding refresh failed for %s"
+                        " (%s): %s",
+                        memory_id, type(exc).__name__, exc,
+                    )
+            if not refreshed:
+                # The content changed but no fresh derived vector was produced
+                # (provider unavailable, no vectors returned, or embed raised):
+                # drop the old vector so dense recall never pairs the new
+                # content with the embedding of its previous content.
+                _invalidate_working_embedding(self.conn, memory_id)
 
         self.conn.commit()
         if affected > 0:
@@ -6838,7 +7010,8 @@ class BeamMemory:
         # Working memory first (fast path)
         cursor.execute("""
             SELECT id, content, source, timestamp, session_id,
-                   importance, metadata_json, veracity, created_at
+                   importance, metadata_json, veracity, created_at,
+                   author_id, author_type, scope
             FROM working_memory
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (memory_id, self.session_id))
@@ -6854,6 +7027,9 @@ class BeamMemory:
                 "metadata": row[6],
                 "veracity": row[7],
                 "created_at": row[8],
+                "author_id": row[9],
+                "author_type": row[10],
+                "scope": row[11],
                 "memory_store": "working",
             }
 
@@ -6861,6 +7037,7 @@ class BeamMemory:
         cursor.execute("""
             SELECT id, content, source, timestamp, session_id,
                    importance, metadata_json, veracity, created_at,
+                   author_id, author_type, scope,
                    event_date, event_date_precision
             FROM episodic_memory
             WHERE id = ? AND (session_id = ? OR scope = 'global')
@@ -6877,8 +7054,11 @@ class BeamMemory:
                 "metadata": row[6],
                 "veracity": row[7],
                 "created_at": row[8],
-                "event_date": row[9],
-                "event_date_precision": row[10],
+                "author_id": row[9],
+                "author_type": row[10],
+                "scope": row[11],
+                "event_date": row[12],
+                "event_date_precision": row[13],
                 "memory_store": "episodic",
             }
 
@@ -11382,9 +11562,9 @@ class BeamMemory:
             SELECT count(*) AS err_count
             FROM consolidation_log
             WHERE created_at > datetime('now', '-7 days')
+              AND items_consolidated = 0
               AND (
-                  items_consolidated = 0
-                  AND summary_preview LIKE '%error%'
+                  summary_preview LIKE '%error%'
                   OR summary_preview LIKE '%fail%'
               )
         """)
@@ -11542,7 +11722,58 @@ class BeamMemory:
             "candidate_ids": candidate_ids,
         }
 
-    def sleep(self, dry_run: bool = False, force: bool = False) -> Dict:
+    def fleet_conflict_census(self) -> Dict:
+        """Read-only census of conflict rows across every bank in the fleet.
+
+        Wraps :func:`mnemosyne.core.fleet_census.census`, which walks the
+        fleet root and reports, per bank holding a ``conflicts`` table, the
+        open-conflict count and the order-normalized pair set, cross-joins
+        those pairs across banks, and flags any normalized pair held by two
+        or more NON-shared banks as a home↔home twin. That count is the
+        accepted-scope bound the disposition policy is stated against, so it
+        is recomputed rather than inherited.
+
+        Discovery only: no writes, no dedup, no LLM, and a bank that cannot
+        be read is reported under ``unreadable`` instead of raising.
+        """
+        from mnemosyne.core import fleet_census
+        return fleet_census.census()
+
+    def _attach_fleet_conflict_census(self, result: Dict, enabled: bool = True) -> Dict:
+        """Attach the fleet census to a sleep result (never fails the sleep).
+
+        The census sits on the sleep-time path because the bound it reports
+        is supposed to be recomputed at every sleep pass. But it is a
+        diagnostic reading OTHER banks, not a consolidation step for this
+        one: an unreadable fleet — or any census bug — must not turn a
+        completed consolidation into an error, so failures are logged and
+        recorded in the result instead of raised.
+
+        Two independent opt-outs, both resolved at call time:
+        ``enabled`` (the private ``_fleet_census`` flag, which
+        ``sleep_all_sessions`` uses to take the census once per pass instead
+        of once per session) and ``MNEMOSYNE_FLEET_CENSUS`` set falsy, which
+        stops the full-fleet walk entirely — ``sleep()`` may run often and
+        the walk's cost tracks the size of the tree, so an operator needs a
+        switch that does not require a code change.
+        """
+        if not enabled:
+            return result
+        from mnemosyne.core import fleet_census
+        if not fleet_census.census_enabled():
+            return result
+        try:
+            result["fleet_conflict_census"] = self.fleet_conflict_census()
+        except Exception as exc:
+            logger.warning(
+                "fleet conflict census failed (%s); sleep result unaffected",
+                type(exc).__name__,
+            )
+            result["fleet_conflict_census"] = {"error": type(exc).__name__}
+        return result
+
+    def sleep(self, dry_run: bool = False, force: bool = False,
+              _fleet_census: bool = True) -> Dict:
         """
         Consolidate old working_memory for this session into episodic summaries.
         Uses a local lightweight LLM when available; falls back to aaak
@@ -11559,6 +11790,16 @@ class BeamMemory:
 
         When force=True, skips the age cutoff and consolidates all
         non-consolidated working memories immediately regardless of age.
+
+        Post-E8b (additive): every sleep pass also emits
+        ``fleet_conflict_census`` — a read-only cross-bank census of conflict
+        rows (see :mod:`mnemosyne.core.fleet_census`) recomputed here rather
+        than inherited, because the disposition policy's accepted-scope bound
+        is stated against it and an asserted bound decays. It runs on the
+        no-op paths too: a pass with nothing to consolidate still owes the
+        bound. ``_fleet_census=False`` is a private opt-out for
+        sleep_all_sessions, which runs this method once per session and
+        therefore takes the census once for the whole pass instead of N times.
         """
         from mnemosyne.core.aaak import encode as aaak_encode
         from mnemosyne.core import local_llm
@@ -11666,7 +11907,9 @@ class BeamMemory:
                         "are exempt from consolidation (import quarantine); "
                         "re-date or unpin via update_working"
                     )
-            return result
+            # The bound is recomputed on the no-op path too: a pass with
+            # nothing to consolidate still ran a sleep.
+            return self._attach_fleet_conflict_census(result, _fleet_census)
 
         # Atomic claim: mark rows consolidated_at BEFORE writing the
         # episodic summary, gated on consolidated_at IS STILL NULL.
@@ -11708,14 +11951,15 @@ class BeamMemory:
                 claimed_ids = {r["id"] for r in cursor.fetchall()}
 
             if not claimed_ids:
-                # Lost the race entirely.
+                # Lost the race entirely. Close the connection, then still
+                # report the fleet bound: this pass ran, even if it did no work.
                 self.conn.commit()
-                return {
-            "status": "no_op",
-            "message": "All eligible rows claimed by concurrent sleep",
-            "conflicts_resolved": 0,
-            "conflicts_detected_only": 0,
-        }
+                return self._attach_fleet_conflict_census({
+                    "status": "no_op",
+                    "message": "All eligible rows claimed by concurrent sleep",
+                    "conflicts_resolved": 0,
+                    "conflicts_detected_only": 0,
+                }, _fleet_census)
 
             # Filter rows to only those we successfully claimed.
             rows = [r for r in rows if r["id"] in claimed_ids]
@@ -11926,8 +12170,9 @@ class BeamMemory:
                 if not dry_run:
                     logger.warning(
                         "sleep: LLM summarization failed for source=%r (items=%d, "
-                        "llm_available=%s) — falling back to AAAK compression",
+                        "llm_available=%s, last_error=%s) — falling back to AAAK compression",
                         source, len(items), local_llm.llm_available(),
+                        local_llm.last_llm_failure(),
                     )
                 combined = " | ".join(lines)
                 compressed = aaak_encode(combined)
@@ -12146,7 +12391,7 @@ class BeamMemory:
             llm_used_count > 0, method,
         )
 
-        return {
+        result = {
             "status": "dry_run" if dry_run else "consolidated",
             "items_consolidated": len(consolidated_ids),
             "summaries_created": summaries_created,
@@ -12161,6 +12406,7 @@ class BeamMemory:
                 "applied": model_refresh_applied,
             }
         }
+        return self._attach_fleet_conflict_census(result, _fleet_census)
 
     def sleep_all_sessions(self, dry_run: bool = False, force: bool = False) -> Dict:
         """
@@ -12195,7 +12441,7 @@ class BeamMemory:
         """, (cutoff,))
         session_rows = cursor.fetchall()
         if not session_rows:
-            return {
+            return self._attach_fleet_conflict_census({
                 "status": "no_op",
                 "message": "No old working memories to consolidate",
                 "conflicts_resolved": 0,
@@ -12208,7 +12454,7 @@ class BeamMemory:
                 "errors": 0,
                 "model_refresh": {"proposals": 0, "applied": 0},
                 "session_results": [],
-            }
+            })
 
         session_results = []
         sessions_consolidated = 0
@@ -12244,7 +12490,7 @@ class BeamMemory:
                     author_id=self.author_id,
                     author_type=self.author_type,
                 )
-                result = beam.sleep(dry_run=dry_run, force=force)
+                result = beam.sleep(dry_run=dry_run, force=force, _fleet_census=False)
                 result = dict(result)
                 result["session_id"] = session_id
                 result["eligible"] = row["eligible"] if hasattr(row, "keys") else row[1]
@@ -12274,7 +12520,7 @@ class BeamMemory:
         if not dry_run:
             self._deduplicate_memoria_cross_session()
 
-        return {
+        result = {
             "status": "dry_run" if dry_run else ("consolidated" if items_consolidated else "no_op"),
             "sessions_scanned": len(session_rows),
             "sessions_consolidated": sessions_consolidated,
@@ -12292,6 +12538,9 @@ class BeamMemory:
             "session_results": session_results,
             "degradation": degrade_result
         }
+        # One census for the whole maintenance pass: the per-session
+        # beam.sleep() calls above ran with _fleet_census=False.
+        return self._attach_fleet_conflict_census(result)
 
     def get_consolidation_log(self, limit: int = 10) -> List[Dict]:
         cursor = self.conn.cursor()

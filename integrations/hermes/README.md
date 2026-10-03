@@ -152,6 +152,16 @@ is a real virtual environment. It then checks the known install roots
 `/usr/local/lib/hermes-agent`, `/usr/lib/hermes-agent`), which are held to the
 same bar.
 
+On Hermes 0.21 and later a checkout's own `venv` is only the macOS TCC anchor. The provider runs from a staged
+runtime under `$HERMES_HOME/installs/<key>/environments/<generation>/venv`, which Hermes records in
+`installs/<key>/facts.json`. For the launcher's checkout and for each install root above, discovery reads that
+record (`<key>` is derived from the checkout path, so `installs/` is never scanned) and returns the staged
+interpreter instead of the anchor. A checkout with no committed runtime keeps the venv-based behavior. A record
+that exists but cannot be used (unreadable, outside that install's `environments/`, or without an executable
+interpreter) makes discovery stop with a warning naming it, rather than fall back to the anchor. `--python`
+still overrides all of this. A staged generation is replaceable by a Hermes update, so a wrapper installed
+against it prints the persistence warning described under wrapper mode.
+
 Wrapper resolution is deliberately bounded: it reads a limited prefix of the
 launcher, follows a limited number of hops, and understands a fixed set of forms
 (`exec /path/to/hermes`, a relative or bare target, and `env`/`VAR=val` prefixes).
