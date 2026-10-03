@@ -11,17 +11,37 @@ This is Mnemosyne's signature reasoning layer -- no Honcho dreams, no Hindsight
 reflections, no Mem0 static graphs. Memories actively resonate and self-correct.
 """
 
+from __future__ import annotations
+
 import os
 import time
 import logging
 import json
-from typing import List, Dict, Optional
+from typing import TYPE_CHECKING, List, Dict, Optional
 
-import numpy as np
+if TYPE_CHECKING:  # pragma: no cover - static analysis only
+    import numpy as np
+else:
+    try:
+        import numpy as np
+    except ModuleNotFoundError:  # pragma: no cover - exercised via subprocess test
+        np = None
 
 from mnemosyne.core import embeddings as _embeddings
 
 logger = logging.getLogger("mnemosyne.shmr")
+
+
+class ShmrDenseCapabilityUnavailable(RuntimeError):
+    """Raised when a dense SHMR operation runs without NumPy installed."""
+
+
+def _require_numpy():
+    if np is None:
+        raise ShmrDenseCapabilityUnavailable(
+            "shmr_dense_unavailable: numpy is not installed"
+        )
+    return np
 
 # --- Config ---
 SHMR_BATCH_SIZE = int(os.environ.get("MNEMOSYNE_SHMR_BATCH_SIZE", "50"))
@@ -74,7 +94,18 @@ def _init_schema(conn):
 
 def _embed(text: str) -> np.ndarray:
     """Embed text using Mnemosyne's embedding pipeline (BAAI/bge-small)."""
-    emb = _embeddings.embed(text)
+    np = _require_numpy()
+    try:
+        emb = _embeddings.embed([text])
+    except Exception as exc:
+        logger.warning(
+            "SHMR embedding failed, using zero vector (%s): %s",
+            type(exc).__name__, exc,
+        )
+        return np.zeros(EMBEDDING_DIM, dtype=np.float32)
+    if emb is None or len(emb) == 0:
+        return np.zeros(EMBEDDING_DIM, dtype=np.float32)
+    emb = emb[0]
     if emb.ndim > 1:
         emb = emb.flatten()
     return emb.astype(np.float32)
@@ -82,6 +113,7 @@ def _embed(text: str) -> np.ndarray:
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     """Cosine similarity between two normalized vectors."""
+    np = _require_numpy()
     a_norm = a / (np.linalg.norm(a) + 1e-8)
     b_norm = b / (np.linalg.norm(b) + 1e-8)
     return float(np.dot(a_norm, b_norm))
@@ -181,11 +213,17 @@ def _call_llm(prompt: str, system: str = "") -> str:
     # Try local LLM first
     try:
         from mnemosyne.core.local_llm import _call_local_llm
-        result = _call_local_llm(prompt, system=system, temperature=SHMR_TEMPERATURE)
+        # ponytail: _call_local_llm's contract is (prompt) only -- see the
+        # two other call sites in local_llm.py. Fold the system instruction
+        # into the prompt so the local path is not bypassed by a TypeError
+        # that the fallback boundary would swallow. Upgrade path: if/when
+        # _call_local_llm grows native system/temperature kwargs, pass them.
+        local_prompt = f"{system}\n\n{prompt}" if system else prompt
+        result = _call_local_llm(local_prompt)
         if result and len(result.strip()) > 10:
             return result
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("SHMR local LLM failed (%s)", type(exc).__name__)
 
     # Fallback to the cloud extraction client.
     #
@@ -226,6 +264,7 @@ def _compute_harmony_score(
     Uses cosine similarity between belief embeddings and cluster centroid,
     plus a consistency bonus for beliefs that don't contradict each other.
     """
+    np = _require_numpy()
     if not beliefs or not cluster:
         return 0.0
 
@@ -367,6 +406,9 @@ def harmonize(beam, batch_size: int = None, max_iterations: int = None,
               similarity_threshold: float = None) -> Dict:
     """Run one harmonic cycle over recent memories.
 
+    Raises:
+        ShmrDenseCapabilityUnavailable: if NumPy is not installed.
+
     NOT wired into anything. There is no caller in the shipped code: sleep()
     does not invoke it, there is no MCP tool, and there is no CLI subcommand.
     Call it directly if you want it:
@@ -398,6 +440,7 @@ def harmonize(beam, batch_size: int = None, max_iterations: int = None,
     if similarity_threshold is None:
         similarity_threshold = SHMR_SIMILARITY_THRESHOLD
 
+    np = _require_numpy()
     t0 = time.perf_counter()
     _init_schema(beam.conn)
     cursor = beam.conn.cursor()
@@ -406,11 +449,10 @@ def harmonize(beam, batch_size: int = None, max_iterations: int = None,
     # Prioritize: recent facts + high-confidence episodic memories
     candidates = []
 
-    # Facts (status = active or NULL)
+    # Facts (beam's `facts` table has no `status` column; all facts are active)
     fact_rows = cursor.execute("""
         SELECT fact_id, subject, predicate, object, confidence, timestamp
         FROM facts
-        WHERE status = 'active' OR status IS NULL
         ORDER BY created_at DESC
         LIMIT ?
     """, (batch_size,)).fetchall()
@@ -548,7 +590,11 @@ def recall_beliefs(beam, query: str, top_k: int = 10) -> List[Dict]:
     """Search harmonic beliefs for a given query.
 
     Used by recall() when harmonic=True flag is set.
+
+    Raises:
+        ShmrDenseCapabilityUnavailable: if NumPy is not installed.
     """
+    _require_numpy()
     cursor = beam.conn.cursor()
     _init_schema(beam.conn)
 

@@ -8,6 +8,9 @@ import os
 import re
 import json
 import logging
+import math
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler
 from typing import Optional, Tuple
 from pathlib import Path
 
@@ -51,13 +54,36 @@ def _calculate_cost(input_tokens: int, output_tokens: int, model: str) -> float:
     return input_cost + output_cost
 
 
-def _call_conflict_llm_with_retry(prompt: str) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
+def conflict_endpoint_is_safe() -> bool:
+    """Require a real HTTP(S) endpoint, and HTTPS when sending credentials."""
+    try:
+        endpoint = urlsplit(CONFLICT_LLM_BASE_URL or "")
+        return bool(
+            endpoint.hostname
+            and endpoint.scheme in ("http", "https")
+            and not endpoint.username and not endpoint.password
+            and (not CONFLICT_LLM_API_KEY or endpoint.scheme == "https")
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+class _NoConflictRedirects(HTTPRedirectHandler):
+    """Never replay memory content or Authorization to a redirect target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _call_conflict_llm_with_retry(
+    prompt: str, *, deadline: Optional[float] = None,
+) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
     """
     Call OpenAI-compatible completions endpoint with exponential backoff retry logic.
     Returns: Tuple[content_str, prompt_tokens, completion_tokens] or None
     """
-    if not CONFLICT_LLM_BASE_URL:
-        logger.warning("Conflict detection: no LLM completion endpoint configured.")
+    if not conflict_endpoint_is_safe():
+        logger.warning("Conflict detection: LLM endpoint missing or unsafe.")
         return None
 
     import time
@@ -85,10 +111,16 @@ def _call_conflict_llm_with_retry(prompt: str) -> Optional[Tuple[str, Optional[i
     backoff_factor = 2.0
     initial_delay = 1.0
 
+    if deadline is not None and not math.isfinite(deadline):
+        return None
     for attempt in range(max_retries + 1):
+        remaining = 15.0 if deadline is None else deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        timeout = min(15.0, remaining)
         try:
             if has_httpx:
-                with httpx.Client(timeout=15.0) as client:
+                with httpx.Client(timeout=timeout, follow_redirects=False) as client:
                     response = client.post(url, json=payload, headers=headers)
                     response.raise_for_status()
                     data = response.json()
@@ -100,7 +132,8 @@ def _call_conflict_llm_with_retry(prompt: str) -> Optional[Tuple[str, Optional[i
                     headers=headers,
                     method="POST"
                 )
-                with urllib.request.urlopen(req, timeout=15.0) as resp:
+                opener = urllib.request.build_opener(_NoConflictRedirects())
+                with opener.open(req, timeout=timeout) as resp:
                     data = json.loads(resp.read().decode())
 
             choices = data.get("choices", [])
@@ -112,17 +145,23 @@ def _call_conflict_llm_with_retry(prompt: str) -> Optional[Tuple[str, Optional[i
                 prompt_tokens = usage.get("prompt_tokens")
                 completion_tokens = usage.get("completion_tokens")
                 
+                if not isinstance(content, str):
+                    raise ValueError("Invalid completion content type")
                 return content, prompt_tokens, completion_tokens
             
             logger.warning("Conflict detection: empty response from LLM on attempt %d", attempt + 1)
         except Exception as exc:
             logger.warning(
-                "Conflict detection: LLM call failed on attempt %d (%s): %s",
-                attempt + 1, type(exc).__name__, exc
+                "Conflict detection: LLM call failed on attempt %d (%s)",
+                attempt + 1, type(exc).__name__
             )
             if attempt < max_retries:
                 sleep_time = initial_delay * (backoff_factor ** attempt)
                 logger.info("Conflict detection: retrying in %0.1fs...", sleep_time)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= sleep_time:
+                        return None
                 time.sleep(sleep_time)
             else:
                 logger.error("Conflict detection: all retries exhausted. Call failed.")
@@ -134,7 +173,8 @@ def validate_conflict_pair(
     older_content: str,
     newer_content: str,
     session_id: str,
-    db_path: Optional[Path] = None
+    db_path: Optional[Path] = None,
+    *, deadline: Optional[float] = None,
 ) -> Tuple[bool, float, Optional[str]]:
     """
     Use an LLM to validate if older_content is contradicted/superseded by newer_content.
@@ -160,11 +200,13 @@ You must respond ONLY with a valid JSON object matching this schema:
   "reason": "Brief explanation"
 }}
 """
-    result = _call_conflict_llm_with_retry(prompt)
+    result = _call_conflict_llm_with_retry(prompt, deadline=deadline)
     if not result:
         return False, 0.0, None
 
     raw_response, actual_prompt_tokens, actual_completion_tokens = result
+    if not isinstance(raw_response, str):
+        return False, 0.0, None
 
     # Strip markdown code blocks if any
     clean_json = raw_response.strip()
@@ -175,9 +217,16 @@ You must respond ONLY with a valid JSON object matching this schema:
 
     try:
         data = json.loads(clean_json)
-        is_conflict = bool(data.get("is_conflict", False))
-        confidence = float(data.get("confidence", 0.0))
+        if not isinstance(data, dict) or type(data.get("is_conflict")) is not bool:
+            raise ValueError("Invalid conflict verdict type")
+        is_conflict = data["is_conflict"]
+        confidence = data.get("confidence")
         correct_fact = data.get("correct_fact")
+        if (type(confidence) not in (int, float)
+                or not math.isfinite(confidence) or not 0 <= confidence <= 1
+                or (correct_fact is not None and not isinstance(correct_fact, str))):
+            raise ValueError("Invalid conflict response schema")
+        confidence = float(confidence)
 
         # Estimate fallback tokens if actual ones are not provided by the API
         input_t = actual_prompt_tokens if actual_prompt_tokens is not None else _estimate_tokens(prompt)
@@ -204,10 +253,10 @@ You must respond ONLY with a valid JSON object matching this schema:
                 db_path=db_path
             )
         except Exception as log_exc:
-            logger.debug("Failed to record cost to database cost_entries: %s", log_exc)
+            logger.debug("Failed to record conflict cost (%s)", type(log_exc).__name__)
 
         return is_conflict, confidence, correct_fact
     except Exception as exc:
-        logger.warning("Conflict detection: failed to parse LLM JSON output (%s): %s", type(exc).__name__, exc)
+        logger.warning("Conflict detection: failed to parse LLM JSON output (%s)", type(exc).__name__)
         return False, 0.0, None
 

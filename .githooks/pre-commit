@@ -4,13 +4,21 @@ HOOK_FILE=".githooks/pre-commit"
 
 PII_PATTERNS="1641797+AxDSan@users.noreply.github.com"
 
-staged=$(git diff --cached --name-only | grep -v "^$HOOK_FILE$" || true)
-if [ -n "$staged" ]; then
-  if echo "$staged" | xargs grep -l "$PII_PATTERNS" 2>/dev/null; then
-    echo "ERROR: PII detected in staged files. Remove before committing."
-    echo "Found pattern: $PII_PATTERNS"
-    exit 1
-  fi
+DIFF_OUTPUT=$(mktemp "${TMPDIR:-/tmp}/pre-commit.XXXXXX") || {
+  echo "ERROR: Unable to create temporary file for staged-diff PII check. Aborting commit." >&2
+  exit 1
+}
+trap 'rm -f "$DIFF_OUTPUT"' 0 HUP INT TERM
+
+if ! git diff --cached --no-color --text -U0 --output-indicator-new='!' -- . ":(exclude)$HOOK_FILE" > "$DIFF_OUTPUT"; then
+  echo "ERROR: Unable to inspect staged changes; git diff failed. Aborting commit." >&2
+  exit 1
+fi
+
+if grep -a '^!' "$DIFF_OUTPUT" | grep -a -F -q "$PII_PATTERNS"; then
+  echo "ERROR: PII detected in staged files. Remove before committing."
+  echo "Found pattern: $PII_PATTERNS"
+  exit 1
 fi
 
 # Also check git config

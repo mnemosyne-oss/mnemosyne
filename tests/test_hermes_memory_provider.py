@@ -11,6 +11,8 @@ import time
 from unittest.mock import MagicMock, patch
 
 from hermes_memory_provider import MnemosyneMemoryProvider
+from datetime import datetime, timedelta, timezone
+from mnemosyne.core.beam import WORKING_MEMORY_TTL_HOURS
 from mnemosyne.core.llm_backends import get_host_llm_backend
 
 
@@ -929,6 +931,69 @@ class TestMaybeAutoSleep:
         provider._auto_sleep_threshold = 10
         provider._AUTO_SLEEP_TIMEOUT_SECONDS = 5
         return provider
+
+    def test_auto_sleep_passes_space_form_utc_cutoff_to_eligibility_gate(self, monkeypatch):
+        """The auto-sleep eligibility cutoff must be SPACE-form naive UTC
+        ('YYYY-MM-DD HH:MM:SS'), matching _count_unconsolidated_before's
+        SQL-side datetime(timestamp) normalization. A T-form isoformat
+        cutoff ('...T...') lexically sorts ABOVE every same-day
+        space-form datetime() output and over-counts the whole cutoff
+        day, wasting no-op sleep passes. A naive-LOCAL cutoff misses rows
+        in the gap between local and UTC midnight. The provider clock is
+        frozen to a fixed AWARE UTC instant and the gate must receive the
+        exact expected naive UTC cutoff."""
+        beam_mock = MagicMock()
+        beam_mock.session_id = "hermes_test123"
+        beam_mock.db_path = "/tmp/test.db"
+        beam_mock.author_id = "agent_1"
+        beam_mock.author_type = "hermes"
+        beam_mock.channel_id = "test:channel"
+        beam_mock.get_working_stats.return_value = {"total": 50}
+        captured = {}
+
+        def spy_count(cutoff):
+            captured["cutoff"] = cutoff
+            return 5
+
+        beam_mock._count_unconsolidated_before = spy_count
+
+        def fake_beam_class(**kwargs):
+            return MagicMock()
+
+        monkeypatch.setattr(
+            "hermes_memory_provider._get_beam_class",
+            lambda: fake_beam_class,
+        )
+        provider = self._make_provider(monkeypatch, beam_mock)
+        monkeypatch.setattr(provider, "_reserve_reflection_budget", lambda name: None)
+
+        # Emulate a UTC+2 host in April: the naive (local-wall) clock reads
+        # 14:30 while the aware UTC instant is 12:30Z. A provider that
+        # builds its cutoff from the naive clock drifts by 2h; the gate
+        # must receive the cutoff derived from the UTC instant.
+        fixed_utc = datetime(2026, 4, 1, 12, 30, 0, tzinfo=timezone.utc)
+
+        class _Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is not None:
+                    return fixed_utc.astimezone(tz)
+                return cls(2026, 4, 1, 14, 30, 0)  # local wall on a UTC+2 host
+
+        monkeypatch.setattr("hermes_memory_provider.datetime", _Frozen)
+
+        provider._maybe_auto_sleep()
+
+        cutoff = captured.get("cutoff")
+        assert cutoff is not None, "eligibility gate was never called"
+        expected = (
+            fixed_utc.replace(tzinfo=None)
+            - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        assert cutoff == expected, (
+            f"gate must receive the naive UTC cutoff derived from the "
+            f"aware UTC clock, got {cutoff!r}, expected {expected!r}"
+        )
 
     def test_auto_sleep_uses_session_scoped_sleep_not_sleep_all_sessions(self, monkeypatch):
         """_maybe_auto_sleep must call beam.sleep(), NOT sleep_all_sessions()."""

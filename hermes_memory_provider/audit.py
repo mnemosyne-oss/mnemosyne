@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -50,11 +51,22 @@ class AuditLog:
     def __init__(self, db_path: Path):
         self._db_path = db_path
         self._conn: Optional[sqlite3.Connection] = None
+        self._lock = threading.Lock()
+        self._record_failure_warned = False
         self._ensure_table()
 
     def _ensure_table(self) -> None:
         try:
-            self._conn = sqlite3.connect(str(self._db_path), timeout=5)
+            self._conn = sqlite3.connect(
+                str(self._db_path), timeout=5, check_same_thread=False
+            )
+            # Imported here, not at module level: Hermes runs this sibling
+            # before the package __init__ puts the checkout on sys.path, so a
+            # module-level import can bind `mnemosyne` to a data directory in
+            # the gateway's cwd and break the provider (#1056).
+            from mnemosyne.core.sqlite_config import configure_busy_timeout
+
+            configure_busy_timeout(self._conn)
             self._conn.execute(_CREATE_TABLE)
             # Migration: add tokens_used column for existing databases
             try:
@@ -81,58 +93,68 @@ class AuditLog:
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Record one audit event. Never raises."""
-        if self._conn is None:
-            return
-        try:
-            meta_str = json.dumps(metadata) if metadata else None
-            self._conn.execute(
-                _INSERT,
-                (
-                    time.time(),
-                    action,
-                    memory_id,
-                    bank,
-                    scope,
-                    profile,
-                    session_id,
-                    source_tool,
-                    tokens_used,
-                    reason,
-                    meta_str,
-                ),
-            )
-            self._conn.commit()
-        except Exception as exc:
-            logger.debug("audit: failed to record event: %s", exc)
+        with self._lock:
+            if self._conn is None:
+                return
+            try:
+                meta_str = json.dumps(metadata) if metadata else None
+                self._conn.execute(
+                    _INSERT,
+                    (
+                        time.time(),
+                        action,
+                        memory_id,
+                        bank,
+                        scope,
+                        profile,
+                        session_id,
+                        source_tool,
+                        tokens_used,
+                        reason,
+                        meta_str,
+                    ),
+                )
+                self._conn.commit()
+            except Exception as exc:
+                if not self._record_failure_warned:
+                    logger.warning("audit: failed to record event: %s", exc)
+                    self._record_failure_warned = True
+                else:
+                    logger.debug("audit: failed to record event: %s", exc)
 
     def query(self, limit: int = 50) -> list[Dict[str, Any]]:
         """Return recent events. For diagnostics/testing."""
-        if self._conn is None:
-            return []
-        try:
-            cur = self._conn.execute(
-                "SELECT event_id, timestamp, action, memory_id, bank, scope, "
-                "profile, session_id, source_tool, tokens_used, reason, metadata_json "
-                "FROM audit_log ORDER BY event_id DESC LIMIT ?",
-                (limit,),
-            )
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, row)) for row in cur.fetchall()]
-        except Exception:
-            return []
+        with self._lock:
+            if self._conn is None:
+                return []
+            try:
+                cur = self._conn.execute(
+                    "SELECT event_id, timestamp, action, memory_id, bank, scope, "
+                    "profile, session_id, source_tool, tokens_used, reason, metadata_json "
+                    "FROM audit_log ORDER BY event_id DESC LIMIT ?",
+                    (limit,),
+                )
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
+            except Exception:
+                return []
 
     def count(self) -> int:
-        if self._conn is None:
-            return 0
-        try:
-            return self._conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
-        except Exception:
-            return 0
+        with self._lock:
+            if self._conn is None:
+                return 0
+            try:
+                return self._conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[
+                    0
+                ]
+            except Exception:
+                return 0
 
     def close(self) -> None:
-        if self._conn:
-            try:
-                self._conn.close()
-            except Exception:
-                pass
-            self._conn = None
+        with self._lock:
+            if self._conn:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None

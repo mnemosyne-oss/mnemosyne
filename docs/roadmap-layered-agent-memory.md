@@ -20,7 +20,7 @@ Mnemosyne already has a strong base for layered agent memory:
 - **Hermes plugin and lifecycle hooks**: native `MemoryProvider` support plus `pre_llm_call`, `on_session_start`, and `post_tool_call` integration points.
 - **Memory banks**: named SQLite-backed banks for isolation across users, projects, agents, or environments.
 - **TripleStore**: temporal subject-predicate-object facts for point-in-time symbolic recall.
-- **MCP support**: stdio and SSE access for MCP-compatible clients without requiring a REST service.
+- **MCP support**: stdio, SSE and Streamable HTTP access for MCP-compatible clients without requiring a REST service.
 - **Optional sync and encryption**: private-by-default local storage with optional encrypted synchronization.
 
 ## Layered Memory Target

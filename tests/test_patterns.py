@@ -2,7 +2,6 @@
 Tests for Mnemosyne memory compression + pattern detection.
 """
 
-import pytest
 from datetime import datetime, timedelta
 
 from mnemosyne.core.patterns import (
@@ -309,3 +308,54 @@ class TestMnemosynePatternMethods:
         contents = [r["content"] for r in mem.get_all_memories()]
         assert "Keep me visible" in contents
         assert "Forget about this rule" not in contents
+
+    def test_get_all_memories_expiry_interpretation(self, tmp_path):
+        """#525: get_all_memories applies the documented validity forms.
+
+        Offset-bearing past values are expired, offset-bearing future
+        values are kept, naive values are interpreted as UTC, and
+        date-only values stay pass-through.
+        """
+        from datetime import datetime, timedelta, timezone
+        from mnemosyne.core.memory import Mnemosyne
+        mem = Mnemosyne(session_id="c26", db_path=tmp_path / "c26.db")
+
+        future_offset = (datetime.now(timezone.utc) + timedelta(hours=4)).astimezone(
+            timezone(timedelta(hours=-2))
+        )
+        past_offset = (datetime.now(timezone.utc) - timedelta(hours=4)).astimezone(
+            timezone(timedelta(hours=14))
+        )
+        mem.remember(
+            "Future offset expiry", source="user", importance=0.5,
+            valid_until=future_offset.isoformat(),
+        )
+        mem.remember(
+            "Past offset expiry", source="user", importance=0.5,
+            valid_until=past_offset.isoformat(),
+        )
+        mem.remember(
+            "Date-only expiry", source="user", importance=0.5,
+            valid_until="2099-12-31",
+        )
+        # Genuinely naive legacy value, written directly to bypass the
+        # write boundary's UTC normalization, is interpreted as UTC and
+        # therefore expired.
+        naive_id = mem.remember(
+            "Naive legacy expiry", source="user", importance=0.5,
+        )
+        past_naive = (
+            datetime.now(timezone.utc) - timedelta(hours=2)
+        ).replace(tzinfo=None).isoformat()
+        assert "+" not in past_naive
+        mem.beam.conn.execute(
+            "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+            (past_naive, naive_id),
+        )
+        mem.beam.conn.commit()
+
+        contents = [r["content"] for r in mem.get_all_memories()]
+        assert "Future offset expiry" in contents
+        assert "Past offset expiry" not in contents
+        assert "Date-only expiry" in contents
+        assert "Naive legacy expiry" not in contents

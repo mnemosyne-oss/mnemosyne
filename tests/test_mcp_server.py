@@ -18,6 +18,7 @@ from mnemosyne.core.beam import BeamMemory
 # Test tool schemas
 from mnemosyne.mcp_tools import (
     TOOLS, get_tool_definitions, handle_tool_call, _create_instance,
+    _TOOL_HANDLERS,
 )
 
 
@@ -1285,12 +1286,17 @@ print(json.dumps({"result": result, "after": after}))
         assert not mnemosyne_home.exists()
 
     def test_get_tool_definitions_returns_all(self):
-        """get_tool_definitions returns all registered tools."""
+        """get_tool_definitions returns every tool with a dispatch handler.
+
+        Schemas without an MCP handler (see #728) must not be advertised:
+        they would appear in ``tools/list`` but fail ``tools/call``.
+        """
         tools = get_tool_definitions()
         names = [t["name"] for t in tools]
-        assert len(tools) == len(TOOLS)
         assert len(names) == len(set(names))
         assert "mnemosyne_remember" in names
+        handler_names = set(_TOOL_HANDLERS)
+        assert set(names) == handler_names
 
     def test_tool_definitions_convertible_to_tool_pydantic(self):
         """Tool dict definitions must be compatible with the ``mcp`` SDK 2.x Tool Pydantic model.
@@ -1344,7 +1350,19 @@ print(json.dumps({"result": result, "after": after}))
                         await client.initialize()
                         listed = await client.list_tools()
                         assert isinstance(listed, ListToolsResult)
-                        assert len(listed.tools) >= 25
+                        names = [tool.name for tool in listed.tools]
+                        # #728: every advertised tool must have a dispatch
+                        # handler, so the wire surface is exactly the handler
+                        # registry, with unique names.
+                        assert len(names) == len(set(names))
+                        assert set(names) == set(_TOOL_HANDLERS), (
+                            f"tools/list surface diverges from handler registry: "
+                            f"{sorted(set(names) - set(_TOOL_HANDLERS))} advertised "
+                            f"without handler; "
+                            f"{sorted(set(_TOOL_HANDLERS) - set(names))} handlers "
+                            f"not advertised"
+                        )
+                        assert "mnemosyne_remember" in names
                         with patch(
                             "mnemosyne.mcp_server.handle_tool_call",
                             return_value={"status": "ok"},
@@ -1600,7 +1618,8 @@ run_cli()
             main(["--transport", "sse", "--port", "19090", "--bank", "work"])
 
         run_mcp_server.assert_called_once_with(
-            transport="sse", port=19090, bank="work", host="127.0.0.1"
+            transport="sse", port=19090, bank="work", host="127.0.0.1",
+            path="/mcp", json_response=False,
         )
 
 

@@ -424,6 +424,74 @@ class TestRecallConfigurableWeights:
         }
 
 
+@pytest.mark.parametrize("tier", ["working", "episodic"])
+@pytest.mark.parametrize("weight_source", ["explicit", "env", "yaml"])
+def test_literal_flag_precedence_survives_importance_only_weight_resolution(
+    tmp_path, monkeypatch, tier, weight_source
+):
+    """A literal flag is a selection invariant across tiers and weight sources."""
+    data_dir = tmp_path / f"{tier}-{weight_source}"
+    data_dir.mkdir()
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    kwargs = {}
+
+    if weight_source == "explicit":
+        kwargs = {
+            "vec_weight": 0.0,
+            "fts_weight": 0.0,
+            "importance_weight": 1.0,
+        }
+    elif weight_source == "env":
+        monkeypatch.setenv("MNEMOSYNE_VEC_WEIGHT", "0")
+        monkeypatch.setenv("MNEMOSYNE_FTS_WEIGHT", "0")
+        monkeypatch.setenv("MNEMOSYNE_IMPORTANCE_WEIGHT", "1")
+    else:
+        (data_dir / "config.yaml").write_text(
+            "vec_weight: 0\nfts_weight: 0\nimportance_weight: 1\n"
+        )
+
+    MnemosyneConfig.reset_instance()
+    beam = BeamMemory(
+        session_id=f"literal-flag-{tier}-{weight_source}",
+        db_path=data_dir / "memory.db",
+    )
+    if tier == "working":
+        expected_id = beam.remember(
+            "Use --force after confirmation.", source="test", importance=0.1
+        )
+        distractor_id = beam.remember(
+            "The force field calibration is complete.",
+            source="test",
+            importance=1.0,
+        )
+    else:
+        expected_id = beam.consolidate_to_episodic(
+            "Use --force after confirmation.",
+            source_wm_ids=[],
+            source="test",
+            importance=0.1,
+        )
+        distractor_id = beam.consolidate_to_episodic(
+            "The force field calibration is complete.",
+            source_wm_ids=[],
+            source="test",
+            importance=1.0,
+        )
+
+    payload = beam.recall("--force", top_k=2, explain=True, **kwargs)
+
+    assert payload["explain"]["weights"] == {
+        "vec": 0.0,
+        "fts": 0.0,
+        "importance": 1.0,
+        "temporal": 0.0,
+    }
+    assert payload["results"][0]["id"] == expected_id
+    assert distractor_id not in {result["id"] for result in payload["results"]}
+    beam.conn.close()
+
+
 class TestPublicRecallConfigurableWeights:
     """Public Mnemosyne recall wrappers should expose BeamMemory scoring weights."""
 

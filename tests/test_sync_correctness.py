@@ -249,6 +249,60 @@ def test_synced_update_preserves_explicit_null_optional_fields(memory, tmp_path)
     assert tuple(row) == ("version two", None, None)
 
 
+def test_push_canonicalizes_offset_bearing_valid_until(memory, tmp_path):
+    """#525: sync-apply normalizes offset-bearing valid_until to UTC.
+
+    A future instant expressed with a non-UTC offset must stay valid on
+    the receiver; a past instant must be excluded; stored values are
+    aware UTC with no offset suffix.
+    """
+    source_memory = Mnemosyne(db_path=tmp_path / "offset-source.db")
+    source = SyncEngine(source_memory, device_id="source")
+    receiver = SyncEngine(memory, device_id="receiver")
+
+    future_offset = (
+        datetime.now(timezone.utc) + timedelta(hours=4)
+    ).astimezone(timezone(timedelta(hours=-2)))
+    created = source.log_event(
+        "offset-future-memory",
+        "CREATE",
+        {
+            "content": "still valid on receiver",
+            "source": "test",
+            "valid_until": future_offset.isoformat(),
+        },
+    ).to_dict()
+    assert receiver.push_changes([created])["accepted"] == 1
+
+    row = memory.beam.conn.execute(
+        "SELECT valid_until FROM working_memory WHERE id = ?",
+        ("offset-future-memory",),
+    ).fetchone()
+    stored = datetime.fromisoformat(row[0])
+    assert stored.utcoffset() == timedelta(0)
+    assert stored > datetime.now(timezone.utc)
+    assert "offset-future-memory" in {
+        r["id"] for r in memory.beam.get_context(limit=10)
+    }
+
+    past_offset = (
+        datetime.now(timezone.utc) - timedelta(hours=4)
+    ).astimezone(timezone(timedelta(hours=14)))
+    expired = source.log_event(
+        "offset-past-memory",
+        "CREATE",
+        {
+            "content": "expired on receiver",
+            "source": "test",
+            "valid_until": past_offset.isoformat(),
+        },
+    ).to_dict()
+    assert receiver.push_changes([expired])["accepted"] == 1
+    assert "offset-past-memory" not in {
+        r["id"] for r in memory.beam.get_context(limit=10)
+    }
+
+
 def test_pull_stops_when_remote_cursor_does_not_advance(memory, monkeypatch):
     import urllib.request
 

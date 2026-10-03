@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -219,7 +220,43 @@ def test_is_installed_stays_false_for_broken_symlink(tmp_path):
     assert install.is_installed(hermes_home_path=tmp_path) is False
 
 
+def test_wrapper_install_accepts_an_11_second_import_with_60_second_timeout(tmp_path, monkeypatch):
+    """A slow but healthy selected runtime must not inherit the old 10s ceiling."""
+    site_packages = tmp_path / "site-packages"
+    site_packages.mkdir()
+    observed_timeouts = []
+
+    def simulated_subprocess(command, **kwargs):
+        timeout = kwargs["timeout"]
+        observed_timeouts.append(timeout)
+        if "-S" in command and timeout < 11:
+            raise subprocess.TimeoutExpired(command, timeout)
+        if "-S" in command:
+            return subprocess.CompletedProcess(command, 0, "0.0-test\n", "")
+        return subprocess.CompletedProcess(command, 0, f"{site_packages}\n", "")
+
+    monkeypatch.setattr(install.subprocess, "run", simulated_subprocess)
+
+    target = install.install_plugin(
+        hermes_home_path=tmp_path,
+        mode="wrapper",
+        python=sys.executable,
+        import_timeout=60.0,
+        link_profiles=False,
+    )
+
+    assert target.is_dir()
+    assert observed_timeouts == [60.0, 60.0]
+
+
 def test_install_plugin_wrapper_creates_persistent_shim(tmp_path):
+    packaged_plugin_path = install._resolve_package_dir() / "plugin.yaml"
+    packaged_plugin_before = packaged_plugin_path.read_bytes()
+    source_plugin_path = Path(__file__).parents[1] / "plugin.yaml"
+    source_plugin_before = source_plugin_path.read_bytes()
+    catalog_plugin_path = Path(__file__).parents[2] / "hermes-catalog" / "plugin.yaml"
+    catalog_plugin_before = catalog_plugin_path.read_bytes()
+
     target = install.install_plugin(
         hermes_home_path=tmp_path,
         force=False,
@@ -246,6 +283,13 @@ def test_install_plugin_wrapper_creates_persistent_shim(tmp_path):
     assert (target / "plugin.yaml").is_file()
     installed_plugin = yaml.safe_load((target / "plugin.yaml").read_text(encoding="utf-8"))
     assert installed_plugin["version"] == mnemosyne_hermes.__version__
+    assert installed_plugin["python_runtime"] == "external"
+    assert "python_runtime" not in yaml.safe_load(packaged_plugin_before)
+    assert "python_runtime" not in yaml.safe_load(source_plugin_before)
+    assert "python_runtime" not in yaml.safe_load(catalog_plugin_before)
+    assert packaged_plugin_path.read_bytes() == packaged_plugin_before
+    assert source_plugin_path.read_bytes() == source_plugin_before
+    assert catalog_plugin_path.read_bytes() == catalog_plugin_before
 
     state = install.plugin_state(hermes_home_path=tmp_path)
     assert state.status == "installed"
@@ -254,6 +298,8 @@ def test_install_plugin_wrapper_creates_persistent_shim(tmp_path):
     assert state.wrapper_python == Path(sys.executable).absolute()
     assert state.wrapper_site_packages is not None
     assert state.wrapper_import_ok is True
+    assert install._is_wrapper_plugin_target(target) is True
+    assert install._provider_init_is_mnemosyne(target / "__init__.py") is True
 
 
 def test_plugin_state_uses_legacy_wrapper_metadata_without_manifest(tmp_path):
@@ -381,6 +427,11 @@ def test_check_wrapper_import_accepts_direct_package_without_dist_metadata(tmp_p
     package = site_packages / "mnemosyne_hermes"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("__version__ = 'test'\n", encoding="utf-8")
+    core = site_packages / "mnemosyne" / "core"
+    core.mkdir(parents=True)
+    (core.parent / "__init__.py").write_text("", encoding="utf-8")
+    (core / "__init__.py").write_text("", encoding="utf-8")
+    (core / "beam.py").write_text("", encoding="utf-8")
 
     ok, error, invalid_runtime = install._check_wrapper_import(site_packages, Path(sys.executable))
 
@@ -394,8 +445,11 @@ def test_plugin_state_classifies_timed_out_wrapper_import_as_stale(tmp_path, mon
     site_packages = install._site_packages_for_python(Path(sys.executable))
     install._write_wrapper_plugin(target, python=Path(sys.executable), site_packages=site_packages)
 
+    observed_timeouts = []
+
     def raise_timeout(*args, **kwargs):
-        raise subprocess.TimeoutExpired(args[0], 10)
+        observed_timeouts.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
 
     monkeypatch.setattr(install.subprocess, "run", raise_timeout)
 
@@ -404,7 +458,14 @@ def test_plugin_state_classifies_timed_out_wrapper_import_as_stale(tmp_path, mon
     assert state.status == "stale_wrapper"
     assert state.installed is False
     assert state.wrapper_import_ok is False
-    assert state.wrapper_import_error == f"wrapper Python import timed out: {Path(sys.executable)}"
+    assert state.wrapper_import_error is not None
+    assert str(Path(sys.executable)) in state.wrapper_import_error
+    assert observed_timeouts == [60.0]
+    assert "fixed default 60-second policy" in state.wrapper_import_error
+    assert "Inspect the selected interpreter and its import performance" in state.wrapper_import_error
+    assert "--import-timeout only affects installer validation" in state.wrapper_import_error
+    assert "--import-timeout 120" not in state.wrapper_import_error
+    assert "Retry with:" not in state.wrapper_import_error
 
 
 def test_plugin_state_reports_stale_wrapper_target(tmp_path):
@@ -514,3 +575,180 @@ def test_install_help_describes_required_wrapper_migration_flags(capsys):
 
     help_text = capsys.readouterr().out
     assert "With --mode symlink and --force" in help_text
+
+
+def _fake_python(root: Path, version: str = "Python 3.12.13") -> Path:
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    python = bin_dir / "python"
+    python.write_text(f"#!/bin/sh\necho '{version}'\n", encoding="utf-8")
+    python.chmod(python.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return python
+
+
+def test_status_mismatch_names_interpreters_and_emits_a_runnable_command(
+    tmp_path, monkeypatch, capsys
+):
+    """#736: status compared interpreter paths but claimed a version mismatch,
+    and printed a bare version number instead of a command to run.
+
+    Two separate venvs over one base interpreter resolve to the same binary,
+    so the check must compare environment roots, not resolved paths.
+    """
+    if sys.platform.startswith("win32"):
+        pytest.skip("POSIX symlink test")
+    base = _fake_python(tmp_path / "base")
+    hermes_venv = tmp_path / "hermes env" / "venv"  # spaces: quoting matters
+    this_venv = tmp_path / "this-env" / "venv"
+    for venv in (hermes_venv, this_venv):
+        (venv / "bin").mkdir(parents=True, exist_ok=True)
+        (venv / "pyvenv.cfg").write_text("home = /base\n", encoding="utf-8")
+        (venv / "bin" / "python").symlink_to(base)
+    hermes_python = hermes_venv / "bin" / "python"
+    this_python = this_venv / "bin" / "python"
+    assert hermes_python.resolve() == this_python.resolve() == base
+
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kw: hermes_python)
+    monkeypatch.setattr(sys, "executable", str(this_python))
+    monkeypatch.setattr(sys, "prefix", str(this_venv))
+    monkeypatch.setattr(sys, "version", "3.12.13 (fake interpreter for test)")
+    monkeypatch.setattr(
+        install,
+        "plugin_state",
+        lambda hermes_home_path=None: install.PluginState(
+            status="installed",
+            installed=True,
+            target=tmp_path / "plugin",
+            link_target=tmp_path / "plugin-target",
+            mode="symlink",
+            message="ok",
+        ),
+    )
+
+    rc = install.main(["--hermes-home", str(tmp_path), "status"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Different Python interpreters" in out
+    assert "version MISMATCH" not in out
+    assert f"  This Python: {this_python} (3.12.13)" in out
+    assert f"  Hermes' Python: {hermes_python} (Python 3.12.13)" in out
+    assert (
+        f"→ Run: {shlex.quote(str(hermes_python))} -m pip install -U 'mnemosyne-hermes[all]'"
+        in out
+    )
+    assert "→ Run: 3.12.13" not in out
+
+
+def _two_venvs_over_one_base(tmp_path):
+    """Two virtualenvs whose bin/python symlink to a single base interpreter."""
+    base = _fake_python(tmp_path / "base")
+    hermes_venv = tmp_path / "hermes env" / "venv"  # spaces: quoting matters
+    this_venv = tmp_path / "this-env" / "venv"
+    for venv in (hermes_venv, this_venv):
+        (venv / "bin").mkdir(parents=True, exist_ok=True)
+        (venv / "pyvenv.cfg").write_text("home = /base\n", encoding="utf-8")
+        (venv / "bin" / "python").symlink_to(base)
+    hermes_python = hermes_venv / "bin" / "python"
+    this_python = this_venv / "bin" / "python"
+    # The premise: resolving really does collapse them onto one binary.
+    assert hermes_python.resolve() == this_python.resolve() == base
+    return hermes_venv, hermes_python, this_venv, this_python
+
+
+def test_hermes_python_mismatch_normalises_a_detour_spelling(tmp_path, monkeypatch):
+    """`<venv>/bin/../bin/python` names the same environment as `<venv>/bin/python`.
+
+    Deriving the root with `.parent.parent` before normalising yields
+    `<venv>/bin/..`, which names `<venv>` but does not compare equal to it, so
+    one environment is reported as two.
+    """
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    python = venv / "bin" / "python"
+    python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    detour = venv / "bin" / ".." / "bin" / "python"
+
+    monkeypatch.setattr(sys, "prefix", str(venv))
+
+    assert install._hermes_python_mismatch(python) is False
+    assert install._hermes_python_mismatch(detour) is False
+    # A genuinely different environment must still be reported.
+    other = tmp_path / "other" / "venv"
+    (other / "bin").mkdir(parents=True)
+    assert install._hermes_python_mismatch(other / "bin" / "python") is True
+
+
+def test_provider_diagnostic_reports_two_venvs_over_one_base(
+    tmp_path, monkeypatch, capsys
+):
+    """#709: the provider's failure diagnostic compared resolved interpreter paths.
+
+    A venv's bin/python is a symlink to the base interpreter it was created
+    from, so resolving collapsed two distinct environments onto that one binary
+    and suppressed the diagnostic in exactly the case it exists to report.
+    """
+    if sys.platform.startswith("win32"):
+        pytest.skip("POSIX symlink test")
+    _, hermes_python, this_venv, this_python = _two_venvs_over_one_base(tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("construction failed for test")
+
+    class _Ctx:
+        def register_memory_provider(self, provider):
+            raise AssertionError("must not register when construction fails")
+
+    monkeypatch.setattr(mnemosyne_hermes, "MnemosyneMemoryProvider", _boom)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kw: hermes_python)
+    # Both point at the other venv. The old check compared resolved interpreter
+    # paths, which are identical for these two venvs, so it prints nothing and
+    # the test fails without the fix. If sys.executable kept pointing at the
+    # real pytest interpreter, the old check would fire anyway and the test
+    # would pass with or without the fix.
+    monkeypatch.setattr(sys, "executable", str(this_python))
+    monkeypatch.setattr(sys, "prefix", str(this_venv))
+
+    with pytest.raises(RuntimeError, match="construction failed for test"):
+        mnemosyne_hermes.register_memory_provider(_Ctx())
+
+    err = capsys.readouterr().err
+    assert f"Hermes' Python: {hermes_python}" in err
+    # The venv path contains a space, so the remediation is only runnable quoted.
+    assert (
+        f"FIX: Run: {shlex.quote(str(hermes_python))}"
+        " -m pip install -U 'mnemosyne-hermes[all]'" in err
+    )
+
+
+def test_provider_diagnostic_stays_quiet_for_one_environment(
+    tmp_path, monkeypatch, capsys
+):
+    """The control: one environment must produce no interpreter diagnostic.
+
+    This passes before and after the change, so it is a guard rather than
+    evidence of the fix. It exists to catch a check that reports a mismatch
+    unconditionally.
+    """
+    if sys.platform.startswith("win32"):
+        pytest.skip("POSIX symlink test")
+    hermes_venv, hermes_python, _, _ = _two_venvs_over_one_base(tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("construction failed for test")
+
+    class _Ctx:
+        def register_memory_provider(self, provider):
+            raise AssertionError("must not register when construction fails")
+
+    monkeypatch.setattr(mnemosyne_hermes, "MnemosyneMemoryProvider", _boom)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kw: hermes_python)
+    monkeypatch.setattr(sys, "executable", str(hermes_python))
+    monkeypatch.setattr(sys, "prefix", str(hermes_venv))
+
+    with pytest.raises(RuntimeError, match="construction failed for test"):
+        mnemosyne_hermes.register_memory_provider(_Ctx())
+
+    err = capsys.readouterr().err
+    assert "Hermes' Python:" not in err
+    assert "FIX: Run:" not in err

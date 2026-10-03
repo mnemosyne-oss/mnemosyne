@@ -99,6 +99,42 @@ class TestScoreNoise:
         assert score >= 0.7
         assert "terminal_output" in reasons or "noise_pattern_match" in reasons
 
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            # A real note: "total" and "installing" mid-sentence, a bullet that
+            # starts with "Total", and "subtotal" (#1074).
+            "# Genova Walking Tour\n\nMeet at the old port at 9:00. In total the "
+            "walk takes about three hours.\nTotal distance: 6 km, mostly flat.\n"
+            "After installing the offline map, follow the coast.\n",
+            "Trip budget\nSubtotal 48 euros for the tickets.\nTotal 48 euros for tickets.",
+            "Reminder: the tour is installing new signage all week.",
+        ],
+    )
+    def test_prose_with_total_or_installing_is_not_terminal_output(self, prose):
+        score, reasons = _score_noise(prose, 0.5, "")
+        assert "terminal_output" not in reasons
+        assert score < 0.8
+        assert _suggest_action(score, []) == "keep"
+
+    @pytest.mark.parametrize(
+        "output",
+        [
+            # ls -l block summary, plain and human-readable, mid-content and CRLF.
+            "Listing of the folder:\ntotal 48\nreadme.md\nnotes.txt",
+            "Listing of the folder:\ntotal 4.0K\nnotes.txt",
+            "Listing:\r\n total 48 \r\nnotes.txt",
+            # pip and brew installer lines, without any other terminal marker.
+            "Build log:\nInstalling collected packages: requests, urllib3",
+            "Build log:\n  Installing collected packages: requests",
+            "Build log:\n==> Installing ripgrep",
+        ],
+    )
+    def test_terminal_shaped_total_and_installing_still_flagged(self, output):
+        score, reasons = _score_noise(output, 0.5, "")
+        assert reasons == ["terminal_output"]
+        assert score == 0.85
+
     def test_stack_trace(self):
         content = "Traceback (most recent call last):\n  File \"test.py\", line 10"
         score, reasons = _score_noise(content, 0.5, "")
@@ -115,6 +151,79 @@ class TestScoreNoise:
         score, reasons = _score_noise("password = hunter2supersecret", 0.5, "")
         assert score >= 0.9
         assert any("secret" in r for r in reasons)
+
+    def test_cjk_secret_flagged(self):
+        """CJK-labelled secrets must be flagged by the hygiene scorer (issue #806)."""
+        # nosec - test fixture
+        score, reasons = _score_noise("数据库密码：s3cr3t_pa55word_x1y2z3w4", 0.5, "user")
+        assert score >= 0.9
+        assert "secret_detected:cjk_secret_assignment" in reasons
+        assert _suggest_action(score, ["cjk_secret_assignment"]) == "flag"
+
+    def test_cjk_secret_with_trailing_prose_flagged(self):
+        """Trailing CJK prose must not hide a CJK-labelled secret."""
+        # nosec - test fixture
+        score, reasons = _score_noise("数据库密码：s3cr3t_pa55word_x1y2z3w4，请勿外传", 0.5, "user")
+        assert "secret_detected:cjk_secret_assignment" in reasons
+
+    def test_cjk_policy_prose_not_flagged(self):
+        """Ordinary Chinese policy prose after a label must stay clean."""
+        score, reasons = _score_noise("密码：建议每90天更换一次", 0.5, "user")
+        assert not any("secret" in r for r in reasons)
+
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            "password：建议每90天更换一次",
+            "password＝建议每90天更换一次",
+        ],
+    )
+    def test_english_label_fullwidth_separator_policy_prose_not_flagged(self, prose):
+        """English labels with fullwidth separators must not flag CJK prose."""
+        _score, reasons = _score_noise(prose, 0.5, "user")
+        assert "secret_detected:secret_assignment" not in reasons
+
+    def test_cjk_ascii_prefix_then_prose_not_flagged(self):
+        """ASCII prefix followed by CJK prose must not be flagged."""
+        score, reasons = _score_noise("密码：abc12345我的密码", 0.5, "user")
+        assert not any("secret" in r for r in reasons)
+
+    def test_cjk_non_bmp_prefix_then_prose_not_flagged(self):
+        """Non-BMP CJK after an ASCII prefix must not be flagged."""
+        score, reasons = _score_noise("密码：abc12345\U00020000", 0.5, "user")
+        assert not any("secret" in r for r in reasons)
+
+    @pytest.mark.parametrize(
+        "character",
+        [
+            "\u3005",
+            "\u3006",
+            "\u3007",
+            "\u31f0",
+            "\U000323b0",
+            "\U0003347f",
+            "\uff21",
+            "\uffa0",
+            "\uffbf",
+            "\uffc1",
+            "\uffc8",
+            "\uffc9",
+            "\uffd0",
+            "\uffd1",
+            "\uffd8",
+            "\uffd9",
+        ],
+    )
+    def test_cjk_boundary_prefix_then_prose_not_flagged(self, character):
+        """CJK or fullwidth prose after an ASCII prefix must not be flagged."""
+        score, reasons = _score_noise(f"密码：abc12345{character}", 0.5, "user")
+        assert not any("secret" in r for r in reasons)
+
+    @pytest.mark.parametrize("character", ["ſ", "ı", "İ", "K"])
+    def test_unicode_casefold_equivalent_not_flagged_as_secret(self, character):
+        """Unicode case-fold equivalents are not ASCII credential characters."""
+        _score, reasons = _score_noise(f"密码：!!!!!!!!{character}", 0.5, "user")
+        assert not any(reason.startswith("secret_detected:") for reason in reasons)
 
     def test_secret_with_value_keyword_not_dampened(self):
         """Secret + value keyword should NOT dampen the score."""
@@ -840,7 +949,12 @@ class TestAuditNoise:
         assert connection is not None
         with pytest.raises(sqlite3.ProgrammingError):
             connection.execute("SELECT 1")
-        assert "hygiene read failed" in capsys.readouterr().err
+        expected_code = (
+            "hygiene_audit_failed"
+            if function_name == "audit_noise"
+            else "hygiene_status_failed"
+        )
+        assert capsys.readouterr().err == f"Error: {expected_code}\n"
 
     @pytest.mark.parametrize("command_args", [["audit"], ["status"]])
     def test_cmd_hygiene_read_commands_report_readonly_open_errors(
@@ -858,7 +972,7 @@ class TestAuditNoise:
         with pytest.raises(SystemExit):
             cmd_hygiene(command_args)
 
-        assert "readonly connection failed" in capsys.readouterr().err
+        assert capsys.readouterr().err == f"Error: hygiene_{command_args[0]}_failed\n"
 
     def test_noise_summary_is_pii_safe(self, temp_db):
         db_path, beam = temp_db
@@ -1127,7 +1241,7 @@ def test_hygiene_suite_does_not_leak_config_into_subagent_provider(tmp_path, mon
     process: the autouse cleanup must discard that singleton before a subagent
     provider resolves its temporary data-directory configuration.
     """
-    from conftest import _close_cached_connections
+    from tests.conftest import _close_cached_connections
     from hermes_memory_provider import MnemosyneMemoryProvider
     from mnemosyne.core.config import MnemosyneConfig
 

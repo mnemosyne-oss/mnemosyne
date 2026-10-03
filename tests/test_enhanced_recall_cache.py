@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -74,6 +74,97 @@ def _close_memory(memory: BeamMemory | None) -> None:
             cache.close()
     finally:
         memory.conn.close()
+
+
+def test_unreadable_marker_bypasses_enhanced_cache_without_log_spam(
+    enhanced, monkeypatch, caplog
+):
+    memory, calls = enhanced
+    marker_reads = []
+    cache_calls = []
+
+    class CacheSpy:
+        def get_opaque(self, key):
+            cache_calls.append(("get", key))
+
+        def put_opaque(self, key, results):
+            cache_calls.append(("put", key, results))
+
+        def close(self):
+            pass
+
+    memory._query_cache = CacheSpy()
+    conn_type = type(memory.conn)
+    real_execute = conn_type.execute
+
+    def execute_without_user_version(conn, sql, parameters=(), *args, **kwargs):
+        normalized = (
+            sql.strip().rstrip(";").casefold() if isinstance(sql, str) else ""
+        )
+        if normalized == "pragma user_version":
+            marker_reads.append(sql)
+            raise RuntimeError("marker header unreadable")
+        return real_execute(conn, sql, parameters, *args, **kwargs)
+
+    monkeypatch.setattr(conn_type, "execute", execute_without_user_version)
+    monkeypatch.setattr(beam_module, "_unknown_marker_warning_emitted", False)
+
+    with caplog.at_level(logging.DEBUG, logger="mnemosyne.core.beam"):
+        first = _call(memory, "unknown marker")
+        second = _call(memory, "unknown marker")
+
+    assert len(marker_reads) == 2
+    assert len(calls) == 2
+    assert first != second
+    assert cache_calls == []
+    marker_warnings = [
+        record for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "vec store format marker unreadable" in record.getMessage()
+    ]
+    assert len(marker_warnings) == 1
+    assert not any(
+        record.levelno == logging.INFO
+        and "full-scan blob scoring this call" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("previous_version", [6, 7])
+def test_cache_version_bump_invalidates_staged_and_admission_entries(
+    enhanced, monkeypatch, tmp_path: Path, previous_version: int
+):
+    """Both prior cache generations miss under the admission algorithm.
+
+    Version 6 predates staged FTS candidate selection; version 7 is current
+    main before #911's admission/ranking change. The ``v2:`` key prefix stays
+    fixed for QueryCache's opaque-key path.
+    """
+    memory, calls = enhanced
+    assert memory._ENHANCED_RECALL_CACHE_VERSION == 8
+
+    with monkeypatch.context() as ctx:
+        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", previous_version)
+        stale = _call(memory, "alpha query")
+    assert len(calls) == 1
+    stale_id = stale[0]["id"]
+
+    # The current-version digest differs from either stale key: cache miss.
+    fresh = _call(memory, "alpha query")
+    assert len(calls) == 2  # base recall ran; the stale entry was not reused
+    assert not any(r.get("id") == stale_id for r in fresh)
+    assert memory._query_cache is not None
+    cache_keys = [
+        row[0]
+        for row in memory._query_cache._conn.execute("SELECT normalized FROM query_cache")
+    ]
+    assert len(cache_keys) == 2
+    assert all(key.startswith("v2:") for key in cache_keys)
+
+    # The current-version entry is now cached and reused.
+    again = _call(memory, "alpha query")
+    assert len(calls) == 2
+    assert again == fresh
 
 
 def test_successful_invalidate_clears_persisted_enhanced_recall_cache(monkeypatch, tmp_path: Path):
@@ -669,6 +760,158 @@ def test_dedup_remember_write_survives_post_commit_cache_invalidation_failure(
         _close_memory(memory)
 
 
+@pytest.mark.parametrize("operation", ["invalidate", "forget_working"])
+def test_post_commit_mutations_survive_query_cache_invalidation_failure(
+    monkeypatch, tmp_path: Path, caplog, operation: str
+):
+    """#594: a committed public mutation is never reported as a cache failure."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        memory_id = memory.remember(
+            f"issue 594 {operation} cache invalidation failure sentinel", source="test"
+        )
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+
+        with caplog.at_level(logging.WARNING, logger=beam_module.__name__):
+            if operation == "invalidate":
+                assert memory.invalidate(memory_id) is True
+                row = memory.conn.execute(
+                    "SELECT valid_until FROM working_memory WHERE id = ?", (memory_id,)
+                ).fetchone()
+                assert row is not None
+                assert row["valid_until"] is not None
+            else:
+                assert memory.forget_working(memory_id) is True
+                row = memory.conn.execute(
+                    "SELECT 1 FROM working_memory WHERE id = ?", (memory_id,)
+                ).fetchone()
+                assert row is None
+
+        assert (
+            f"{operation}: query-cache invalidation failed after commit "
+            "(RuntimeError): cache unavailable"
+        ) in caplog.text
+    finally:
+        _close_memory(memory)
+
+
+@pytest.mark.parametrize("operation", ["invalidate", "forget_working"])
+def test_mutations_keep_cache_invalidation_errors_before_caller_commit(
+    monkeypatch, tmp_path: Path, operation: str
+):
+    """#594's warning-only contract starts only after this instance commits."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        memory_id = memory.remember(
+            f"issue 594 {operation} caller transaction sentinel", source="test"
+        )
+        replacement_id = memory.remember(
+            "issue 594 caller transaction replacement sentinel", source="test"
+        )
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+        memory.conn.execute("BEGIN")
+
+        with pytest.raises(RuntimeError, match="cache unavailable"):
+            if operation == "invalidate":
+                memory.invalidate(memory_id, replacement_id=replacement_id)
+            else:
+                memory.forget_working(memory_id)
+
+        assert memory.conn.in_transaction
+        memory.conn.rollback()
+        if operation == "invalidate":
+            row = memory.conn.execute(
+                "SELECT valid_until FROM working_memory WHERE id = ?", (memory_id,)
+            ).fetchone()
+            assert row is not None
+            assert row["valid_until"] is None
+        else:
+            assert memory.get(memory_id) is not None
+    finally:
+        if memory.conn.in_transaction:
+            memory.conn.rollback()
+        _close_memory(memory)
+
+
+@pytest.mark.parametrize("memory_store", ["working", "episodic"])
+def test_invalidate_without_replacement_keeps_cache_failure_in_caller_transaction(
+    monkeypatch, tmp_path: Path, memory_store: str
+):
+    """#594: caller-owned invalidations must remain rollbackable on cache failure."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        if memory_store == "working":
+            memory_id = memory.remember(
+                "issue 594 caller transaction working invalidation sentinel", source="test"
+            )
+            table = "working_memory"
+        else:
+            memory_id = memory.consolidate_to_episodic(
+                "issue 594 caller transaction episodic invalidation sentinel",
+                source_wm_ids=[],
+                source="test",
+            )
+            table = "episodic_memory"
+
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+        memory.conn.execute("BEGIN")
+
+        with pytest.raises(RuntimeError, match="cache unavailable"):
+            memory.invalidate(memory_id)
+
+        assert memory.conn.in_transaction
+        memory.conn.rollback()
+        row = memory.conn.execute(
+            f"SELECT valid_until FROM {table} WHERE id = ?", (memory_id,)
+        ).fetchone()
+        assert row is not None
+        assert row["valid_until"] is None
+    finally:
+        if memory.conn.in_transaction:
+            memory.conn.rollback()
+        _close_memory(memory)
+
+
+def test_invalidate_keeps_cache_invalidation_error_during_deferred_commit(
+    monkeypatch, tmp_path: Path
+):
+    """A deferred batch has not committed when invalidate() returns."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        memory_id = memory.remember("issue 594 deferred invalidate sentinel", source="test")
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+
+        with pytest.raises(RuntimeError, match="cache unavailable"):
+            with beam_module._deferred_commits(memory.conn):
+                assert memory.invalidate(memory_id) is True
+
+        row = memory.conn.execute(
+            "SELECT valid_until FROM working_memory WHERE id = ?", (memory_id,)
+        ).fetchone()
+        assert row is not None
+        assert row["valid_until"] is None
+    finally:
+        if memory.conn.in_transaction:
+            memory.conn.rollback()
+        _close_memory(memory)
+
+
 def test_successful_invalidate_episodic_memory_invalidates_enhanced_recall_cache(
     monkeypatch, tmp_path: Path
 ):
@@ -844,6 +1087,59 @@ def test_pipeline_flags_and_process_ranking_configuration_change_digest(enhanced
     monkeypatch.undo()
     monkeypatch.setattr(beam_module, "weibull_boost", None)
     assert memory._enhanced_recall_cache_key(**common) != baseline
+
+
+def test_enhanced_cache_key_version_bump_invalidates_literal_flag_ranking_change(
+    enhanced, monkeypatch
+):
+    """The literal-flag ranking adjustment must invalidate pre-change cache entries.
+
+    ``recall_enhanced()`` resolves its request against an opaque digest before
+    the literal-flag selection rule runs. The algorithm ``version`` is part of
+    that hashed payload, so bumping it after a ranking change means a result
+    cached under the previous version can never be returned for the updated
+    algorithm. The ``v2:`` key prefix is preserved so the key still uses the
+    exact-only opaque cache path (``_is_opaque_v2_key``).
+    """
+    memory, calls = enhanced
+
+    # Run once under the previous algorithm version so the cache holds a
+    # bonus-only ranked result, keyed through the real request path.
+    with monkeypatch.context() as ctx:
+        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 3)
+        stale = memory.recall_enhanced(
+            "--force",
+            use_weibull=False,
+            use_mmr=False,
+            use_intent=False,
+            use_synonyms=False,
+        )
+    assert len(calls) == 1
+    stale_id = stale[0]["id"]
+
+    assert memory._ENHANCED_RECALL_CACHE_VERSION >= 4
+
+    # The current-version digest differs from the stale v3 key: cache miss.
+    fresh = memory.recall_enhanced(
+        "--force",
+        use_weibull=False,
+        use_mmr=False,
+        use_intent=False,
+        use_synonyms=False,
+    )
+    assert len(calls) == 2  # base recall ran; the stale v2 result was not reused
+    assert fresh[0]["id"] != stale_id
+
+    # The current-version entry is now cached and reused.
+    again = memory.recall_enhanced(
+        "--force",
+        use_weibull=False,
+        use_mmr=False,
+        use_intent=False,
+        use_synonyms=False,
+    )
+    assert len(calls) == 2
+    assert again == fresh
 
 
 def test_private_enhanced_cache_key_weight_fallback_honors_yaml_over_env(
@@ -1231,3 +1527,259 @@ def test_legacy_entries_and_every_opaque_access_path_are_exact_only(enhanced):
     assert cache.tier2_hits == 0
     assert cache.tier3_hits == 0
     assert cache.tier4_hits == 0
+
+
+def test_consolidate_to_episodic_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
+    """#427 regression: consolidation changes dense-pool eligibility, so a
+    warmed enhanced-recall entry must not be served after it."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    memory = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+        wm_id = memory.remember("consolidation cache sentinel alpha", source="fact")
+
+        warm = _call(memory, "consolidation cache sentinel alpha", top_k=3)
+        assert any(r["id"] == wm_id for r in warm)
+        assert memory._query_cache is not None
+
+        # Prove the warmed entry is actually a cache hit: a second identical
+        # call must NOT recompute (recall call count stays flat).
+        recall_calls = []
+        orig_recall = memory.recall
+        memory.recall = lambda query, top_k=40, **kwargs: (
+            recall_calls.append(1), orig_recall(query, top_k=top_k, **kwargs))[1]
+        again = _call(memory, "consolidation cache sentinel alpha", top_k=3)
+        assert again == warm
+        assert len(recall_calls) == 0  # served from cache, no recompute
+
+        cache_version = memory._query_cache.stats()["version"]
+        episodic_id = memory.consolidate_to_episodic(
+            "consolidation cache sentinel alpha (summary)",
+            source_wm_ids=[wm_id],
+            source="test",
+            importance=0.6,
+        )
+        assert episodic_id
+
+        # Consolidation must have invalidated the warmed entry.
+        assert memory._query_cache.stats()["version"] == cache_version + 1
+
+        # The next request recomputes instead of serving the stale entry.
+        refreshed = _call(memory, "consolidation cache sentinel alpha", top_k=3)
+        assert refreshed is not None
+        assert len(recall_calls) == 1  # recomputed, not served from cache
+    finally:
+        _close_memory(memory)
+
+
+@pytest.mark.parametrize("fail_method", ["_ingest_graph_and_veracity", "_emit_event"])
+def test_consolidate_enrichment_failure_still_invalidates_warmed_v3_cache(
+    monkeypatch, tmp_path, fail_method
+):
+    """The finally-block invalidation must also fire when consolidation
+    enrichment (graph/veracity or event emission) raises."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    memory = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+        wm_id = memory.remember("consolidation failure sentinel delta", source="fact")
+
+        # Warm the enhanced-recall cache, then prove it is a real hit.
+        _call(memory, "consolidation failure sentinel delta", top_k=3)
+        assert memory._query_cache is not None
+        recall_calls = []
+        orig_recall = memory.recall
+        memory.recall = lambda query, top_k=40, **kwargs: (
+            recall_calls.append(1), orig_recall(query, top_k=top_k, **kwargs))[1]
+        again = _call(memory, "consolidation failure sentinel delta", top_k=3)
+        assert again is not None
+        assert len(recall_calls) == 0  # served from cache, no recompute
+
+        cache_version = memory._query_cache.stats()["version"]
+
+        # Make the enrichment step raise; the finally block must still
+        # invalidate the cache before the exception propagates.
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError(f"{fail_method} exploded (test)")
+
+        monkeypatch.setattr(memory, fail_method, _boom)
+        with pytest.raises(RuntimeError, match="exploded"):
+            memory.consolidate_to_episodic(
+                "consolidation failure sentinel delta (summary)",
+                source_wm_ids=[wm_id],
+                source="test",
+                importance=0.6,
+            )
+
+        # finally-block invalidation ran despite the failure.
+        assert memory._query_cache.stats()["version"] == cache_version + 1
+
+        # The next request recomputes instead of serving the stale entry.
+        refreshed = _call(memory, "consolidation failure sentinel delta", top_k=3)
+        assert refreshed is not None
+        assert len(recall_calls) == 1  # recomputed, not served from cache
+    finally:
+        _close_memory(memory)
+
+
+def test_reclaim_orphans_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
+    """reclaim_orphans clears consolidated_at, re-admitting rows to the
+    default dense pool; warmed entries must be dropped."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    memory = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+        wm_id = memory.remember("orphan reclaim cache sentinel beta", source="fact")
+
+        # Plant a stale claim (consolidated but no episodic summary).
+        from datetime import datetime, timedelta
+        stale = (datetime.now() - timedelta(hours=48)).isoformat()
+        memory.conn.execute(
+            "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? "
+            "WHERE id = ?",
+            (stale, stale, wm_id),
+        )
+        memory.conn.commit()
+
+        # Warm the enhanced-recall cache for this query.
+        _call(memory, "orphan reclaim cache sentinel beta", top_k=3)
+        assert memory._query_cache is not None
+
+        # Prove the warmed entry is a real cache hit (no recompute on an
+        # identical call), then instrument recall for the post-mutation check.
+        recall_calls = []
+        orig_recall = memory.recall
+        memory.recall = lambda query, top_k=40, **kwargs: (
+            recall_calls.append(1), orig_recall(query, top_k=top_k, **kwargs))[1]
+        again = _call(memory, "orphan reclaim cache sentinel beta", top_k=3)
+        assert again is not None
+        assert len(recall_calls) == 0  # served from cache, no recompute
+
+        cache_version = memory._query_cache.stats()["version"]
+
+        result = memory.reclaim_orphans(stale_after_seconds=3600)
+        assert result["status"] == "reclaimed"
+        assert memory._query_cache.stats()["version"] == cache_version + 1
+
+        # The next request must recompute, not serve the stale entry.
+        _call(memory, "orphan reclaim cache sentinel beta", top_k=3)
+        assert len(recall_calls) == 1  # recomputed, not served from cache
+    finally:
+        _close_memory(memory)
+
+
+def test_degrade_episodic_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
+    """degrade_episodic() mutates episodic content/embeddings; a warmed
+    enhanced-recall entry must be invalidated even when called directly
+    (not only via sleep()). The test plants a real tier-2 row old enough
+    to be degraded, so the mutation actually happens."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    memory = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+        memory.remember("degrade cache sentinel epsilon", source="fact")
+
+        # Plant an old tier-2 episodic row (older than TIER3_DAYS=180) so
+        # degrade_episodic() really performs a tier2->tier3 transition.
+        old_ts = (datetime.now() - timedelta(days=400)).isoformat()
+        memory.conn.execute(
+            "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, "
+            "importance, tier, created_at) VALUES (?, ?, ?, ?, ?, ?, 2, ?)",
+            ("old-tier2-row", "old episodic content epsilon " * 5, "fact",
+             old_ts, "session-a", 0.5, old_ts),
+        )
+        memory.conn.commit()
+
+        # Warm the enhanced-recall cache for this query.
+        _call(memory, "degrade cache sentinel epsilon", top_k=3)
+        assert memory._query_cache is not None
+
+        # Prove the warmed entry is a real cache hit (no recompute on an
+        # identical call), then instrument recall for the post-mutation check.
+        recall_calls = []
+        orig_recall = memory.recall
+        memory.recall = lambda query, top_k=40, **kwargs: (
+            recall_calls.append(1), orig_recall(query, top_k=top_k, **kwargs))[1]
+        again = _call(memory, "degrade cache sentinel epsilon", top_k=3)
+        assert again is not None
+        assert len(recall_calls) == 0  # served from cache, no recompute
+
+        cache_version = memory._query_cache.stats()["version"]
+
+        result = memory.degrade_episodic(dry_run=False)
+        assert result["status"] == "degraded"
+        assert result["tier2_to_tier3"] == 1  # the planted row really degraded
+        tier = memory.conn.execute(
+            "SELECT tier FROM episodic_memory WHERE id = ?", ("old-tier2-row",)
+        ).fetchone()
+        assert tier is not None and tier[0] == 3
+        assert memory._query_cache.stats()["version"] == cache_version + 1
+
+        # The next request must recompute, not serve the stale entry.
+        _call(memory, "degrade cache sentinel epsilon", top_k=3)
+        assert len(recall_calls) == 1  # recomputed, not served from cache
+    finally:
+        _close_memory(memory)
+
+
+def test_sleep_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
+    """sleep() flips consolidated_at and writes summaries — both change
+    dense-pool eligibility; a warmed entry must be invalidated."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    memory = None
+    try:
+        memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+        # sleep() only consolidates rows older than WORKING_MEMORY_TTL_HOURS//2.
+        old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
+        memory.conn.execute(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("old-sleep-row", "sleep cache sentinel gamma", "conversation", old_ts, "session-a"),
+        )
+        memory.conn.commit()
+
+        # Warm the enhanced-recall cache for this query.
+        _call(memory, "sleep cache sentinel gamma", top_k=3)
+        assert memory._query_cache is not None
+
+        # Prove the warmed entry is a real cache hit (no recompute on an
+        # identical call), then instrument recall for the post-mutation check.
+        recall_calls = []
+        orig_recall = memory.recall
+        memory.recall = lambda query, top_k=40, **kwargs: (
+            recall_calls.append(1), orig_recall(query, top_k=top_k, **kwargs))[1]
+        again = _call(memory, "sleep cache sentinel gamma", top_k=3)
+        assert again is not None
+        assert len(recall_calls) == 0  # served from cache, no recompute
+
+        cache_version = memory._query_cache.stats()["version"]
+
+        result = memory.sleep(dry_run=False)
+        assert result["status"] == "consolidated"
+        assert memory._query_cache.stats()["version"] >= cache_version + 1
+
+        # The next request must recompute, not serve the stale entry.
+        _call(memory, "sleep cache sentinel gamma", top_k=3)
+        assert len(recall_calls) == 1  # recomputed, not served from cache
+    finally:
+        _close_memory(memory)

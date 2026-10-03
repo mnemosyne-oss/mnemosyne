@@ -27,6 +27,7 @@ from mnemosyne_hermes.cli import (
     _BANK_RESOLUTION_FAILED,
     _EXPORT_REQUIRED_COLUMNS,
     _EXPORT_REQUIRED_TABLES,
+    _completeness_details,
     _export_schema_is_complete_read_only,
     _get_provider_class,
     _resolve_cli_bank,
@@ -47,6 +48,23 @@ def _write_config(home, isolation):
 
 def _export_args(output, bank=None):
     return _args(mnemosyne_cmd="export", output=str(output), bank=bank)
+
+
+def _file_import_args(input_path):
+    return _args(
+        mnemosyne_cmd="import",
+        input=str(input_path),
+        bank=None,
+        force=False,
+        dry_run=False,
+        list_providers=False,
+        generate_script=False,
+        agentic=False,
+        from_provider=None,
+        output_script=None,
+        session_id=None,
+        channel_id=None,
+    )
 
 
 def _seed_export_sections(bank, label, *, include_episodic_embedding=False):
@@ -258,6 +276,110 @@ def test_export_without_selected_bank_keeps_legacy_default_behavior(tmp_path, mo
     output = tmp_path / "default.json"
     assert mnemosyne_command(_export_args(output)) == 0
     _assert_export_has_only_label(_read_export(output), "default", "work")
+
+
+def test_file_export_and_import_warn_about_partial_portable_data(tmp_path, monkeypatch, capsys):
+    """The standalone Hermes CLI exposes core completeness results on both paths."""
+    source_data = tmp_path / "source-data"
+    target_data = tmp_path / "target-data"
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(source_data))
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    source = Mnemosyne(session_id="hermes_default")
+    source.remember("portable source")
+    with sqlite3.connect(source.db_path) as conn:
+        conn.execute(
+            "INSERT INTO facts (fact_id, session_id, subject, predicate, object, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("omitted-fact", "hermes_default", "portable", "has", "omitted fact", 1.0),
+        )
+        conn.execute("UPDATE working_memory SET pinned = 1, author_id = 'export-owner'")
+
+    export_path = tmp_path / "partial.json"
+    assert mnemosyne_command(_export_args(export_path)) == 0
+    export_output = capsys.readouterr().out
+    assert "WARNING: portable export is partial" in export_output
+    assert "facts (1)" in export_output
+    assert "working_memory missing" in export_output
+    assert "author_id (1)" in export_output
+    # pinned survives the portable round-trip since the event-date/pinned
+    # export fix; the manifest no longer reports it as omitted.
+    assert "pinned" not in export_output
+
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(target_data))
+    assert mnemosyne_command(_file_import_args(export_path)) == 0
+    import_output = capsys.readouterr().out
+    assert "WARNING: imported supported data only" in import_output
+    assert "facts (1)" in import_output
+    assert "working_memory missing" in import_output
+    assert "author_id (1)" in import_output
+    # pinned now round-trips; the import manifest no longer reports it.
+    assert "pinned" not in import_output
+    # Round-trip proof at the data level: the exported pinned=1 row must
+    # persist as pinned=1 in the imported DB (output text alone cannot
+    # catch a manifest regression that silently drops the field).
+    with sqlite3.connect(target_data / "mnemosyne.db") as conn:
+        assert conn.execute(
+            "SELECT pinned FROM working_memory"
+        ).fetchone() == (1,)
+
+
+def test_completeness_details_omits_invalid_partial_affected_row_counts():
+    """Manifest counts are terminal-safe only when they are real row counts."""
+    details = _completeness_details(
+        {
+            "partial_surfaces": [
+                {
+                    "section": "working_memory",
+                    "omitted_fields": [
+                        {"field": "author_id", "affected_rows": 3},
+                        {"field": "negative", "affected_rows": -1},
+                        {"field": "boolean", "affected_rows": True},
+                        {"field": "malformed", "affected_rows": "3"},
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert details == "working_memory missing author_id (3), negative, boolean, malformed"
+
+
+def test_file_import_completeness_warnings_are_terminal_safe_and_handle_unknown(
+    tmp_path, monkeypatch, capsys
+):
+    """Imported manifests cannot inject terminal text; legacy manifests remain explicit."""
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "source-data"))
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    source = Mnemosyne(session_id="hermes_default")
+    source.remember("portable source")
+    export_path = tmp_path / "source.json"
+    assert mnemosyne_command(_export_args(export_path)) == 0
+    capsys.readouterr()
+
+    payload = _read_export(export_path)
+    payload["mnemosyne_export"]["completeness"] = {
+        "complete": False,
+        "omitted_surfaces": [{"table": "facts\x1b[31m", "row_count": "untrusted"}],
+        "partial_surfaces": [
+            {"section": "working\n_memory", "omitted_fields": [{"field": "author\t_id"}]}
+        ],
+    }
+    unsafe_path = tmp_path / "unsafe.json"
+    unsafe_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "partial-target"))
+    assert mnemosyne_command(_file_import_args(unsafe_path)) == 0
+    partial_output = capsys.readouterr().out
+    assert "WARNING: imported supported data only" in partial_output
+    assert "\x1b" not in partial_output
+    assert "\n_memory" not in partial_output
+    assert "\tauthor" not in partial_output
+
+    payload["mnemosyne_export"].pop("completeness")
+    legacy_path = tmp_path / "legacy.json"
+    legacy_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "legacy-target"))
+    assert mnemosyne_command(_file_import_args(legacy_path)) == 0
+    assert "NOTE: source export predates completeness reporting" in capsys.readouterr().out
 
 
 def test_export_explicit_default_bank_keeps_legacy_default_behavior(tmp_path, monkeypatch):
