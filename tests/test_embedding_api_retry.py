@@ -9,17 +9,39 @@ from unittest.mock import patch
 import pytest
 
 from mnemosyne.core import embeddings
+from mnemosyne.core.config import MnemosyneConfig
 
 
 @pytest.fixture(autouse=True)
-def _uncredentialed_embedding_client(monkeypatch):
+def _uncredentialed_embedding_client(monkeypatch, tmp_path):
     """These tests drive `_embed_api` against plain-http endpoints; the client
     refuses credentialed non-HTTPS URLs, so blank the key regardless of the
     developer shell. Tests that need a key set it themselves AFTER this (on an
-    https:// URL)."""
+    https:// URL). The config is isolated too: resolution precedence is
+    config.yaml > env, so an ambient config would shadow the URLs under test.
+    The import-time snapshots are re-resolved after the reset.
+    """
     monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "")
+    cfg_dir = tmp_path / "mnemosyne-data"
+    cfg_dir.mkdir(exist_ok=True)
+    (cfg_dir / "config.yaml").write_text("")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(cfg_dir))
+    # Isolate the shared-HOME fallback (profile YAML > env > shared YAML).
+    monkeypatch.setenv("HOME", str(tmp_path))
+    MnemosyneConfig.reset_instance()
+    monkeypatch.setattr(
+        embeddings, "_DEFAULT_MODEL", embeddings._resolve_default_model()
+    )
+    monkeypatch.setattr(
+        embeddings, "_OPENAI_API_KEY", embeddings._resolve_api_key()
+    )
+    monkeypatch.setattr(
+        embeddings, "_OPENAI_BASE_URL", embeddings._resolve_api_base_url()
+    )
+
+    yield
+    MnemosyneConfig.reset_instance()
 
 
 class Response:
@@ -102,7 +124,7 @@ def test_embed_api_logs_final_client_error_without_input_or_credentials(monkeypa
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_KEY", "secret-key")
     error = urllib.error.HTTPError("https://example.test/v1/embeddings", 401, "unauthorized", {}, None)
 
-    with patch("urllib.request.urlopen", side_effect=error):
+    with patch("urllib.request.OpenerDirector.open", side_effect=error):
         with caplog.at_level(logging.WARNING, logger="mnemosyne.core.embeddings"):
             assert embeddings._embed_api(["private memory content"]) is None
 

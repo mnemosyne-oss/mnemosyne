@@ -24,11 +24,61 @@ from pathlib import Path
 
 import pytest
 
+from mnemosyne.core import embeddings
+from mnemosyne.core.config import MnemosyneConfig
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INTEGRATION_SRC = PROJECT_ROOT / "integrations" / "hermes" / "src"
 
 _ERROR_MARKERS = ("Unknown embedding model", "MNEMOSYNE_EMBEDDING_DIM")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_embedding_config(monkeypatch, tmp_path):
+    """Isolate in-process tests from the ambient config.
+
+    Resolution precedence is config.yaml > env, so an ambient
+    ~/.hermes/mnemosyne/config.yaml (model, api_url, dim) would otherwise
+    shadow the env vars under test. An empty temp config disables seeding
+    and leaves every key unset; the import-time snapshots are re-resolved
+    after the reset, and the credentialed opener is routed through
+    `urlopen` so tests mock a single transport seam (redirect refusal
+    keeps the dedicated tests below in this file).
+    """
+    for key in (
+        "MNEMOSYNE_EMBEDDING_API_URL",
+        "MNEMOSYNE_EMBEDDING_API_KEY",
+        "MNEMOSYNE_EMBEDDING_MODEL",
+        "MNEMOSYNE_EMBEDDING_DIM",
+        "MNEMOSYNE_EMBEDDINGS_VIA_API",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    cfg_dir = tmp_path / "iso-config"
+    cfg_dir.mkdir(exist_ok=True)
+    (cfg_dir / "config.yaml").write_text("")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(cfg_dir))
+    MnemosyneConfig.reset_instance()
+    monkeypatch.setattr(
+        embeddings, "_DEFAULT_MODEL", embeddings._resolve_default_model()
+    )
+    monkeypatch.setattr(
+        embeddings, "_OPENAI_API_KEY", embeddings._resolve_api_key()
+    )
+    monkeypatch.setattr(
+        embeddings, "_OPENAI_BASE_URL", embeddings._resolve_api_base_url()
+    )
+
+    class _UrlopenOpener:
+        def open(self, req, timeout=None):
+            return embeddings.urllib.request.urlopen(req, timeout=timeout)
+
+    monkeypatch.setattr(
+        embeddings.urllib.request, "build_opener",
+        lambda *handlers: _UrlopenOpener(),
+    )
+    yield
+    MnemosyneConfig.reset_instance()
 
 
 def _run_fresh(
@@ -50,6 +100,18 @@ def _run_fresh(
     env["MNEMOSYNE_DATA_DIR"] = str(tmp_path / "data")
     env["HOME"] = str(tmp_path / "home")
     env.pop("MNEMOSYNE_EMBEDDING_DIM", None)
+    # Isolate from ambient Hermes state: HERMES_HOME would redirect config
+    # resolution and DB-dimension sniffing at real profile directories,
+    # defeating the no-database / fail-loud assertions below.
+    env.pop("HERMES_HOME", None)
+    # Pre-create an empty config so the child never auto-seeds: seeding
+    # would bake the writer child's ephemeral endpoint URL into
+    # config.yaml, and config.yaml > env precedence would then shadow the
+    # reader child's own URL (same DATA_DIR, different port).
+    _data_dir = Path(env["MNEMOSYNE_DATA_DIR"])
+    _data_dir.mkdir(parents=True, exist_ok=True)
+    if not (_data_dir / "config.yaml").exists():
+        (_data_dir / "config.yaml").write_text("")
     # Strip embedding-disable flags so the subprocess exercises the fail-loud
     # path, not the _is_disabled() 384 fallback (these are set in some CI).
     for _flag in ("MNEMOSYNE_NO_EMBEDDINGS", "MNEMOSYNE_SKIP_EMBEDDINGS", "MNEMOSYNE_EMBEDDINGS_OFF"):

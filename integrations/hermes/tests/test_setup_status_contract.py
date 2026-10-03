@@ -69,7 +69,7 @@ def test_package_entry_point_targets_package_and_preserves_cli():
     metadata = tomllib.loads((HERMES_PROJECT / "pyproject.toml").read_text(encoding="utf-8"))
     entry_points = metadata["project"]["entry-points"]
 
-    assert entry_points["hermes_agent.memory_providers"]["mnemosyne"] == "mnemosyne_hermes"
+    assert entry_points["hermes_agent.memory_providers"]["hermes-mnemosyne"] == "mnemosyne_hermes"
     assert (PACKAGE_DIR / "cli.py").is_file()
     assert not (PACKAGE_DIR / "config_schema.py").exists()
 
