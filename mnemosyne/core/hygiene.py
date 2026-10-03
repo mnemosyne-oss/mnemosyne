@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import sqlite3
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -265,6 +266,19 @@ _VALUE_KEYWORDS = {
 }
 
 
+# Output-shape anchors for the two terminal markers that are also prose: the
+# ``total 48`` / ``total 4.0K`` summary line of ``ls -l``, and the installer
+# lines pip (``Installing collected packages: ...``) and brew (``==> Installing
+# ...``) print at the start of a line.  Matched against lowercased content, one
+# line at a time.
+_TERMINAL_LINE_RE = re.compile(
+    r"^[ \t]*(?:total [0-9]+(?:\.[0-9]+)?[kmgtp]?[ \t\r]*$"
+    r"|installing collected packages\b"
+    r"|==> installing )",
+    re.MULTILINE,
+)
+
+
 def _score_noise(content: str, importance: float, source: str) -> Tuple[float, List[str]]:
     """Score a single content string for noise likelihood.
 
@@ -295,11 +309,16 @@ def _score_noise(content: str, importance: float, source: str) -> Tuple[float, L
         score = max(score, 0.7)
         reasons.append("trivial_keyword")
 
-    # 4. Terminal output markers
-    terminal_markers = ["collecting ", "downloading ", "installing ", "requirement already",
+    # 4. Terminal output markers. ``total`` and ``installing`` are ordinary
+    # English words, so they only count in the shape a terminal prints them
+    # (``_TERMINAL_LINE_RE``), not mid-sentence (#1074).
+    terminal_markers = ["collecting ", "downloading ", "requirement already",
                         "successfully installed", "npm warn", "npm error",
-                        "total ", "drwx", "-rw-r--r--"]
-    if any(m in content_lower for m in terminal_markers):
+                        "drwx", "-rw-r--r--"]
+    if (
+        any(m in content_lower for m in terminal_markers)
+        or _TERMINAL_LINE_RE.search(content_lower)
+    ):
         score = max(score, 0.85)
         reasons.append("terminal_output")
 

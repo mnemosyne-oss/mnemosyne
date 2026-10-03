@@ -77,6 +77,10 @@ def _config_schema(module):
 def _write_mnemosyne_config(hermes_home: Path, tools) -> None:
     if tools is None:
         body = "memory:\n  provider: mnemosyne\n  mnemosyne: {}\n"
+    elif isinstance(tools, str):
+        # A quoted scalar, e.g. the serialized sentinel "None"/"null" from
+        # issue #1021, distinct from the YAML null keyword and from `[]`.
+        body = f'memory:\n  provider: mnemosyne\n  mnemosyne:\n    tools: "{tools}"\n'
     elif not tools:
         body = "memory:\n  provider: mnemosyne\n  mnemosyne:\n    tools: []\n"
     else:
@@ -448,7 +452,21 @@ def test_provider_config_defaults_match(provider_modules):
     root_config = _config_schema(provider_modules["hermes_memory_provider"])
     integration_config = _config_schema(provider_modules["mnemosyne_hermes"])
 
-    assert _json_stable(root_config) == _json_stable(integration_config)
+    root_sync_roles = root_config["sync_roles"].copy()
+    integration_sync_roles = integration_config["sync_roles"].copy()
+    sync_roles_description = integration_sync_roles.pop("description")
+    root_sync_roles.pop("description")
+    root_without_sync_roles = root_config.copy()
+    integration_without_sync_roles = integration_config.copy()
+    root_without_sync_roles.pop("sync_roles")
+    integration_without_sync_roles.pop("sync_roles")
+
+    assert _json_stable(root_without_sync_roles) == _json_stable(integration_without_sync_roles)
+    assert _json_stable(root_sync_roles) == _json_stable(integration_sync_roles)
+    assert "stringified YAML/JSON lists are not parsed" in sync_roles_description
+    assert "no valid roles disable it and log one warning" in sync_roles_description
+    assert "initialize() kwarg > Hermes memory.mnemosyne config" in sync_roles_description
+
     assert root_config["auto_sleep"]["default"] is True
     assert root_config["sync_roles"]["default"] == ["user"]
     assert root_config["default_scope"]["choices"] == ["session", "global"]
@@ -720,6 +738,14 @@ def test_uninitialized_primary_tool_call_diverges_by_provider(
         (["mnemosyne_remember", "mnemosyne_recall"], ["mnemosyne_remember", "mnemosyne_recall"], False),
         ([], [], False),
         (["mnemosyne_not_real"], None, True),
+        # issue #1021: a serialized "None"/"null" (any case) or empty
+        # string must resolve the same as real None, not as an unknown
+        # tool name or an empty allowlist.
+        ("None", PROVIDER_TOOL_NAMES, False),
+        ("null", PROVIDER_TOOL_NAMES, False),
+        ("NoNe", PROVIDER_TOOL_NAMES, False),
+        ("  nUlL  ", PROVIDER_TOOL_NAMES, False),
+        ("", PROVIDER_TOOL_NAMES, False),
     ],
 )
 def test_tool_whitelist_without_yaml_matches_pyyaml(
@@ -852,6 +878,82 @@ def test_tool_whitelist_unknown_name_fails_loudly(tmp_path, provider_modules):
         provider = _provider_for_config(module, tmp_path)
         with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
             provider.get_tool_schemas()
+
+
+def test_tool_whitelist_unknown_name_fails_at_initialize(tmp_path, provider_modules):
+    """issue #1063: initialize() itself must reject a bad allowlist.
+
+    Before this, an unknown tool name passed construction cleanly and only
+    raised once something called get_tool_schemas()/handle_tool_call, i.e. at
+    the first tool-list or tool-call request. hermes_home is not known until
+    initialize() binds it, so the check has to live there, not in __init__.
+    """
+    _write_mnemosyne_config(tmp_path, ["mnemosyne_remember", "mnemosyne_not_real"])
+
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+            provider.initialize("bad-tools", hermes_home=str(tmp_path), agent_context="primary")
+        assert provider._beam is None
+
+        # A skip-context init (subagent/cron/...) binds hermes_home the same
+        # way and must fail just as loudly, not only the primary path.
+        with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+            provider.initialize("bad-tools-subagent", hermes_home=str(tmp_path), agent_context="subagent")
+
+    # Config-reload behavior is unchanged: correcting the file and
+    # initializing again must succeed and see the fix, not a cached failure.
+    _write_mnemosyne_config(tmp_path, ["mnemosyne_remember"])
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize("good-tools", hermes_home=str(tmp_path), agent_context="primary")
+        try:
+            assert _schema_names(provider) == ["mnemosyne_remember"]
+        finally:
+            provider.shutdown()
+
+
+def test_tool_whitelist_unknown_name_on_reinit_releases_active_state(tmp_path, provider_modules):
+    """issue #1073 (CodeRabbit): a re-init that fails tool validation must not
+    leave a previously active instance registered as module-active, or
+    holding the host-LLM backend lease, once its beam has been cleared.
+
+    Asserts the per-instance flags rather than the module-global counters:
+    other tests in this file share these same module-scoped provider
+    modules and some leave a provider initialized without shutting it
+    down, so the global count is not a clean signal here.
+    """
+    from mnemosyne.core.llm_backends import get_host_llm_backend, set_host_llm_backend
+
+    for module in provider_modules.values():
+        _write_mnemosyne_config(tmp_path, ["mnemosyne_remember"])
+        provider = module.MnemosyneMemoryProvider()
+        try:
+            provider.initialize("healthy", hermes_home=str(tmp_path), agent_context="primary")
+            assert provider._beam is not None
+            assert provider._is_active_in_module is True
+            assert get_host_llm_backend() is not None
+            owns_backend = getattr(provider, "_owns_host_llm_backend", None)
+            if owns_backend is not None:
+                assert owns_backend is True
+
+            _write_mnemosyne_config(tmp_path, ["mnemosyne_remember", "mnemosyne_not_real"])
+            with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+                provider.initialize("reinit-bad-tools", hermes_home=str(tmp_path), agent_context="primary")
+
+            assert provider._beam is None
+            assert provider._is_active_in_module is False
+            if owns_backend is not None:
+                assert provider._owns_host_llm_backend is False
+            else:
+                # hermes_memory_provider has no per-instance ownership
+                # refcount: it always (un)registers the shared global on
+                # failure, same as shutdown(), so the global is the
+                # correct signal for that module.
+                assert get_host_llm_backend() is None
+        finally:
+            provider.shutdown()
+            set_host_llm_backend(None)
 
 
 def test_config_reader_tolerates_null_and_non_mapping_levels(tmp_path):

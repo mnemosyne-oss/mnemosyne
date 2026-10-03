@@ -89,6 +89,19 @@ Only the paths differ. See
 pip install mnemosyne-hermes
 ```
 
+> **Which Mnemosyne core does the plugin need?** `mnemosyne-hermes` 0.7.3 requires
+> `mnemosyne-memory>=4.0.0b3`, and no stable 4.0 core exists yet, so a stable-only
+> install (prereleases disabled) cannot resolve it. Choose a channel:
+>
+> - **4.0 beta:** allow prereleases and pin the pair:
+>   `pip install --pre 'mnemosyne-memory[embeddings]==4.0.0b3' 'mnemosyne-hermes==0.7.3'`
+> - **Stable:** stay on the last audited stable pair:
+>   `pip install 'mnemosyne-memory[embeddings]==3.15.1' 'mnemosyne-hermes==0.7.1'`
+>
+> Do not use `mnemosyne-hermes` 0.7.2. Its declared floor allows a core that lacks
+> the APIs it imports, so it installs cleanly and then fails when the provider
+> initializes. Once 4.0.0 is released as stable, the plain command above works again.
+
 **Debian / Trixie users:** newer Debian releases block bare pip installs. Use a venv:
 
 ```bash
@@ -528,6 +541,15 @@ mnemosyne import-hindsight hindsight-export.json hermes
 mnemosyne doctor --bank default --format both
 mnemosyne repair --report mnemosyne-doctor.json --select working_memory:<ID> --dry-run
 ```
+
+For a database containing sqlite-vec `vec0` tables, install the optional
+`embeddings` extra (or compatible `sqlite-vec`) in the **same runtime** for
+Doctor and repair, then generate a fresh report on the offline copy. Without
+it Doctor can report `present_but_unloadable`, but the incomplete schema
+fingerprint cannot authorize repair, including `expire`. Repair loads sqlite-vec
+on planning and bound write connections and disables further extension loading
+before checking the schema or selecting rows. This does not relax the separate
+trigger, WAL/sidecar, or filesystem-binding restrictions (#1040 D2–D4).
 
 ### Preflight a direct JSON file import
 
