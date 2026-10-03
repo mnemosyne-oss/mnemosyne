@@ -9,6 +9,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **`mnemosyne backup` and `mnemosyne restore` follow `MNEMOSYNE_BANK` (#1034).** Both commands read the default bank's database whatever `MNEMOSYNE_BANK` said, so `MNEMOSYNE_BANK=work mnemosyne backup` saved the default bank and `restore` overwrote it, and both reported success. They now resolve the bank at the CLI boundary, the way `store` and `recall` do, and pass its database to `create_backup` and `restore_backup`. A named bank that does not exist exits with code 2 before anything is written. Without `MNEMOSYNE_BANK`, both commands behave as before.
 - **Hermes prefetch now injects raw conversation transcripts under polyphonic recall (#696, #615, #677).** The Hermes prefetch adapter drops a result when it lacks the linear per-signal fields (`keyword_score`/`fts_score`/`dense_score`) and its `score` is below 0.20. Polyphonic engine results carry only `voice_scores` provenance (RRF-ranked) and a small combined `score`, so raw `[USER]` transcript rows were silently filtered out and never surfaced in prefetch under `MNEMOSYNE_POLYPHONIC_RECALL=1`. The adapter now recognises polyphonic results (`voice_scores` with vector/graph/fact/temporal keys), lets them pass their existing lexical gate without applying the linear per-signal signal and 0.20 score floors, and uses the strongest voice contribution for ranking. The core recall pipeline is unchanged.
 
 ### Added

@@ -1157,8 +1157,26 @@ def _normalize_backup_output_dir_arg(value: str, *, windows: bool | None = None)
     )
 
 
+def _resolve_recovery_bank_db_path() -> Path | None:
+    """Return the database ``backup`` and ``restore`` use for MNEMOSYNE_BANK.
+
+    The default bank returns None, so ``mnemosyne.dr.recovery`` keeps its own
+    default path. A named bank must already exist. It is looked up without
+    creating a bank directory, so a typo exits before anything is written.
+    """
+    bank = _resolve_bank_name()
+    if bank == "default":
+        return None
+    from mnemosyne.core.banks import get_bank_db_path_read_only
+
+    try:
+        return get_bank_db_path_read_only(bank, data_dir=Path(DATA_DIR))
+    except (ValueError, FileNotFoundError) as error:
+        _fail(str(error))
+
+
 def cmd_backup(args):
-    """Create a compressed backup of the database."""
+    """Create a compressed backup of the database MNEMOSYNE_BANK selects."""
     from mnemosyne.dr.recovery import create_backup
     try:
         output_dir = Path(_normalize_backup_output_dir_arg(args[0])) if args else None
@@ -1166,8 +1184,9 @@ def cmd_backup(args):
         # Rejected at the CLI boundary before the backend runs: keep the
         # caller-visible message (arg-validation contract, exit 2).
         _fail(str(e))
+    db_path = _resolve_recovery_bank_db_path()
     try:
-        result = create_backup(backup_dir=output_dir)
+        result = create_backup(db_path=db_path, backup_dir=output_dir)
         print(f"Backup created: {result['backup_path']}")
         print(f"  Original size: {result['original_size']:,} bytes")
         print(f"  Backup size:   {result['backup_size']:,} bytes")
@@ -1177,12 +1196,13 @@ def cmd_backup(args):
 
 
 def cmd_restore(args):
-    """Restore database from a backup file."""
+    """Restore the database MNEMOSYNE_BANK selects from a backup file."""
     if not args:
         _usage("Usage: mnemosyne restore <backup_file.db.gz>")
     from mnemosyne.dr.recovery import restore_backup
+    db_path = _resolve_recovery_bank_db_path()
     try:
-        result = restore_backup(Path(args[0]))
+        result = restore_backup(Path(args[0]), db_path)
         status = "valid" if result["integrity_check"] else "corrupt"
         if not result["integrity_check"]:
             _fail("restore_failed", exit_code=1)
