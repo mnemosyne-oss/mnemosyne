@@ -441,7 +441,12 @@ def _scan_effective_defaults(env_map: dict, defaults: dict,
     found = {}
     for root in roots:
         root = os.path.join(REPO_ROOT, root)
-        for path in glob.glob(os.path.join(root, "**", "*.py"), recursive=True):
+        # Sorted: glob returns filesystem order, which varies between
+        # machines. Insertion order decides the reported fallback, so an
+        # unsorted walk would make the reference nondeterministic.
+        # Cross-root precedence is unaffected: the outer loop still
+        # follows roots order.
+        for path in sorted(glob.glob(os.path.join(root, "**", "*.py"), recursive=True)):
             # Build outputs are copies, not sources: `pip install -e` drops
             # e.g. integrations/hermes/build/lib/... into the tree, and the
             # test job installs before running the suite. Scanning those
@@ -732,20 +737,32 @@ def _render_config(env_map, defaults, restart, version: str, effective=None,
         ))
 
     if effective or conflicts:
-        lines += [
-            "",
-            f"### Keys whose effective default bypasses `config.py` ({len(effective)})",
-            "",
-            "For these keys a module-level constant reads the environment variable "
-            "directly with its own fallback, so the value in `DEFAULTS` is not what "
-            "the runtime uses and a `config.yaml` entry alone does not reach the "
-            "module. Treat the environment variable as authoritative.",
-            "",
-            "This list is derived by scanning the package for "
-            "`os.environ.get(\"MNEMOSYNE_...\", default)` and diffing against "
-            "`DEFAULTS`, so it cannot fall out of date.",
-            "",
-        ]
+        if effective:
+            lines += [
+                "",
+                f"### Keys whose effective default bypasses `config.py` ({len(effective)})",
+                "",
+                "For these keys a module-level constant reads the environment variable "
+                "directly with its own fallback, so the value in `DEFAULTS` is not what "
+                "the runtime uses and a `config.yaml` entry alone does not reach the "
+                "module. Treat the environment variable as authoritative.",
+                "",
+                "This list is derived by scanning the package for "
+                "`os.environ.get(\"MNEMOSYNE_...\", default)` and diffing against "
+                "`DEFAULTS`, so it cannot fall out of date.",
+                "",
+            ]
+        else:
+            lines += [
+                "",
+                "### Keys with conflicting defaults across roots "
+                f"({len(conflicts)})",
+                "",
+                "These keys resolve to different fallbacks in different "
+                "provider roots. Each value is listed with the sources "
+                "that set it.",
+                "",
+            ]
         for key in sorted(set(effective) | set(conflicts)):
             if key in effective:
                 value, sources = effective[key]

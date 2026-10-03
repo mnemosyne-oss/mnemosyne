@@ -211,6 +211,10 @@ def test_conflict_without_divergence_renders(tmp_path, monkeypatch):
     assert "[^demo_limit-conflict]" in out
     row = next(l for l in out.splitlines() if l.startswith("| `demo_limit`"))
     assert "[^demo_limit-conflict]" in row
+    # No divergence section: the conflicts-only heading renders instead,
+    # so the "(0)"-count bypasses heading can never appear.
+    assert "### Keys with conflicting defaults across roots (1)" in out
+    assert "### Keys whose effective default bypasses" not in out
 
 
 def test_build_output_copies_are_not_scanned(tmp_path, monkeypatch):
