@@ -630,14 +630,20 @@ class Mnemosyne:
                 return None
             timestamp = datetime.now().isoformat()
 
-            # Legacy dual-write with same ID (INSERT OR REPLACE for dedup safety)
+            # Legacy dual-write with same ID (INSERT OR REPLACE for dedup safety).
+            # The memories table has no scope column, so scope MUST ride in
+            # metadata_json or it is lost entirely from this table. Assignment
+            # keeps the mirror authoritative even if caller metadata carries a
+            # scope key.
+            _meta = dict(metadata or {})
+            _meta["scope"] = scope
             cursor = self.conn.cursor()
             cursor.execute("""
                 INSERT OR REPLACE INTO memories (id, content, source, timestamp, session_id, importance, metadata_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
                 memory_id, _content, source, timestamp, self.session_id,
-                importance, json.dumps(metadata or {})
+                importance, json.dumps(_meta)
             ))
 
             # Legacy embedding store

@@ -110,7 +110,10 @@ def test_push_tool_discovers_shared_global_memory_with_surface_id(
     payload = json.loads(event["payload"])
     assert payload["content"] == "shared sync probe"
     assert "session_id" not in payload
-    assert json.loads(payload["metadata_json"]) == {"safe": "kept"}
+    # Scope mirrors into metadata_json on every write path (#644), so the
+    # relayed metadata carries it alongside the caller's keys; the sanitizer
+    # still strips source_profile_session.
+    assert json.loads(payload["metadata_json"]) == {"safe": "kept", "scope": "global"}
 
 
 def test_pull_tool_and_status_report_real_persisted_remote_cursor(
