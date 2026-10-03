@@ -128,6 +128,8 @@ def apply_beam_batch(
     audit_event: Callable[..., Any] | None = None,
     extract_defaults_global: bool = False,
     write_policy: Any = None,
+    default_author_id: str | None = None,
+    default_author_type: str | None = None,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     audit_events: list[tuple[str, dict[str, Any]]] = []
@@ -146,6 +148,8 @@ def apply_beam_batch(
                     remember_source_tool=remember_source_tool,
                     audit_events=audit_events,
                     extract_defaults_global=extract_defaults_global,
+                    default_author_id=default_author_id,
+                    default_author_type=default_author_type,
                 ))
     except Exception:
         if isinstance(current, dict):
@@ -183,6 +187,8 @@ def _apply_one(
     remember_source_tool: str,
     audit_events: list[tuple[str, dict[str, Any]]],
     extract_defaults_global: bool,
+    default_author_id: str | None = None,
+    default_author_type: str | None = None,
 ) -> dict[str, Any]:
     index = op["index"]
     action = op["action"]
@@ -204,6 +210,15 @@ def _apply_one(
             extract=extract,
             metadata=metadata,
             veracity=veracity,
+            # #926 (CodeRabbit F3): validate_batch_operations() copies the
+            # whole op into payload, so an explicit `author_id: None` key
+            # would defeat the `dict.get(key, default)` form — the key IS
+            # present, so the resolution returned None and the resolved
+            # batch default was lost. `or` keeps the default for explicit
+            # nulls, matching the staging path's
+            # `payload.get("author_id") or batch_author_id`.
+            author_id=payload.get("author_id") or default_author_id,
+            author_type=payload.get("author_type") or default_author_type,
         )
         if memory_id is None:
             raise BatchOperationError("write_policy_rejected")
