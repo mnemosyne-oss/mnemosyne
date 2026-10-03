@@ -34,7 +34,21 @@ memory:
     auto_sleep: true
     sleep_threshold: 50
     vector_type: float32  # float32 | int8 | bit
+    ignore_patterns:
+      - "^\\s*\\$\\s*pip\\s"
+    write_classifier: "off"  # off | warn | strict
 ```
+
+The corresponding environment variables are `MNEMOSYNE_IGNORE_PATTERNS`
+(newline-separated regular expressions, empty by default) and
+`MNEMOSYNE_WRITE_CLASSIFIER` (`off` by default). For these settings, an explicit
+`initialize(...)` keyword argument takes precedence. Without that override,
+the provider resolves Hermes `config.yaml` `memory.mnemosyne.*` settings before
+the corresponding core `config.yaml` settings, then the environment variable
+and default. `off` still applies `ignore_patterns`; `warn` runs the noise/secret
+classifier but stores classified content with warnings; and `strict` rejects
+content classified as noise or secret-like. Unset, blank, or invalid classifier
+values fall back to `off` (invalid values also log a warning).
 
 ## Verify
 

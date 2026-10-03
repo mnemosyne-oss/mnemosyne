@@ -20,6 +20,7 @@ Local-first, zero-cloud memory for AI agents. SQLite-backed. Sub-millisecond. Fu
 | [Security & Privacy](security.md) | Threat model, encryption internals, BYOK comparison |
 | [Benchmarking](benchmarking.md) | Maintainer guide: per-tool A/B benchmark env vars, diagnostics, pure-recall mode, test sequence template |
 | [Benchmark Results Analysis](benchmark-results-analysis.md) | Output-file schemas + analysis recipes (per-ability scores, paired bootstrap CIs, voice attribution). AI-assistant-friendly reference |
+| [Migrating to 4.0](migration-4.0.md) | The single breaking change in 4.0, who it affects, and the reindex path for stores created under the old silent-384 fallback |
 | [Changelog](changelog.md) | Pointer to the root `CHANGELOG.md`, plus release-state notes |
 
 ## Generated references

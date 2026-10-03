@@ -6,9 +6,19 @@ on:
   pull_request:
     branches: [main, master]
 
+# One live run per pull request. Pushing again cancels the superseded run
+# instead of leaving it to finish against a commit nobody will merge. Runs on
+# main are never cancelled: those are the ones we check tags and releases
+# against.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   docs-check:
     runs-on: ubuntu-latest
+    # Runs in seconds; a minute-scale budget is already generous.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -32,6 +42,8 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
+    # Runs in seconds; a minute-scale budget is already generous.
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -128,6 +140,9 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    # About 9 minutes uncontended and roughly 25 under load, so 50
+    # leaves headroom while still killing a hang inside the hour.
+    timeout-minutes: 50
     permissions:
       contents: read
     strategy:
@@ -166,10 +181,13 @@ jobs:
           restore-keys: |
             fastembed-bge-small-en-v1.5-${{ matrix.python-version }}-
 
+      - name: Install ffmpeg (video understanding tests)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[embeddings,mcp,sync,test]"
+          pip install -e ".[embeddings,mcp,sync,test,media]"
           pip install -e ./integrations/hermes
 
       - name: Pre-download embedding model
@@ -191,13 +209,15 @@ jobs:
           "
 
       - name: Run core tests
-        run: pytest tests/ -v --tb=short
+        run: pytest tests/ -v --tb=short --timeout=900 --timeout-method=thread
 
       - name: Run Hermes integration tests
-        run: pytest integrations/hermes/tests/ -v --tb=short
+        run: pytest integrations/hermes/tests/ -v --tb=short --timeout=900 --timeout-method=thread
 
   build:
     runs-on: ubuntu-latest
+    # Runs in seconds; a minute-scale budget is already generous.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 

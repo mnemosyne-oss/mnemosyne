@@ -1585,6 +1585,8 @@ class SyncEngine:
         embedding: Optional[Any] = None,
     ) -> None:
         """Materialize one event without committing the active transaction."""
+        from mnemosyne.core.beam import _normalize_valid_until
+
         if payload is None:  # blind relay: never materialize opaque operations
             return
 
@@ -1651,7 +1653,7 @@ class SyncEngine:
             "metadata_json": json.dumps(metadata or {}, sort_keys=True),
             "memory_type": payload.get("memory_type"),
             "veracity": payload.get("veracity") or "unknown",
-            "valid_until": payload.get("valid_until"),
+            "valid_until": _normalize_valid_until(payload.get("valid_until")),
             "scope": "global",
             "sync_surface_id": self.surface_id,
         }

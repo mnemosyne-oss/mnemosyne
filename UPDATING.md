@@ -3,8 +3,10 @@
 Covers all upgrade paths: v2.7 → latest, source installs, PyPI installs,
 and systems with Python's `externally-managed-environment` (PEP 668).
 
-If you're on **v3.10.1** and want the latest (v3.11.0), jump to
-[Upgrading to v3.11.0](#upgrading-to-v3110-automated-sleep-model-refresh).
+If you want the latest (**v4.0.0**), jump to
+[Upgrading to v4.0.0](#upgrading-to-v400-multimodal-memory-and-the-embedding-dimension-guard).
+It is a major release and contains one breaking change; read that section
+before upgrading.
 Already on v3.8.0? See
 [Upgrading to v3.8.0](#upgrading-to-v380-sync-vecworking-and-reindex).
 
@@ -27,7 +29,95 @@ Already on v3.0.0? See [Upgrading to v3.0.0](#upgrading-to-v300-memoria-architec
 
 ---
 
-## Current / Unreleased — Hermes wrapper install safety
+## Upgrading to v4.0.0: Multimodal memory and the embedding-dimension guard
+
+A major release. Most installations can upgrade without doing anything; one
+group must set an environment variable first. Full detail in
+[docs/migration-4.0.md](docs/migration-4.0.md).
+
+This release also changes Hermes wrapper install behavior. See
+[Hermes wrapper install safety](#v400-hermes-wrapper-install-safety) below.
+
+### What changed
+
+- **Multimodal memory.** `BeamMemory.remember_media(ref)` registers a piece of
+  media, describes it through a configured provider, and writes the description
+  back as an ordinary memory that hybrid recall already understands. Text
+  recall is unchanged.
+- **MCP Streamable HTTP transport.** `mnemosyne mcp` gains
+  `--transport streamable-http` (alias `http`). The MCP extras now require
+  `mcp>=2.0.0`; the lockfile previously resolved 1.28.1. If your environment
+  pins the MCP SDK transitively, relax a `mcp<2` constraint or move to 2.0.0
+  or newer before upgrading.
+- **Unknown embedding models now fail loud** instead of silently resolving to
+  384 dimensions. This is the breaking change.
+
+### User action required
+
+Only if **both** of these are true: you point `MNEMOSYNE_EMBEDDING_API_URL` at
+a custom endpoint, **and** your model is not in the built-in model table and you
+have not set `MNEMOSYNE_EMBEDDING_DIM`.
+
+If that is you, startup now exits at import with an actionable error. Set the
+dimension your model actually produces:
+
+```bash
+mnemosyne config set embedding_dim 1024   # your model's real dimension
+```
+
+**If your store was created under the old silent-384 fallback**, setting the
+true dimension will trip the existing dimension-mismatch guard. That guard is
+not a corruption report; your memories are intact and recall falls back to
+keyword search until the index is rebuilt. Either keep the existing vectors by
+running with the dimension already in the database, or re-embed:
+
+```bash
+MNEMOSYNE_EMBEDDING_DIM=<N> mnemosyne reindex   # backs up first
+mnemosyne doctor                                # confirm embeddings_dim
+```
+
+Everyone else: no action. Default model users, anyone already setting
+`MNEMOSYNE_EMBEDDING_DIM`, and embeddings-disabled installs are unaffected.
+
+### New environment variables
+
+All multimodal, all opt-in, all defaulting to off or empty. Nothing dials out
+until `modality_enabled` is true.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MNEMOSYNE_MODALITY_ENABLED` | `false` | Master switch |
+| `MNEMOSYNE_MODALITY_BASE_URL` | *(unset)* | OpenAI-compatible endpoint |
+| `MNEMOSYNE_MODALITY_API_KEY` | *(unset)* | Bearer token |
+| `MNEMOSYNE_MODALITY_VISION_MODEL` | *(unset)* | Images and documents |
+| `MNEMOSYNE_MODALITY_VIDEO_MODEL` | *(unset)* | Video |
+| `MNEMOSYNE_MODALITY_AUDIO_MODEL` | *(unset)* | Audio |
+| `MNEMOSYNE_MODALITY_TIMEOUT` | `60` | Per-call timeout, seconds |
+
+**Setting these as environment variables may not work.** `config.yaml` takes
+precedence over the environment, and presence in the file decides it rather
+than the value. A config seeded on first run already contains these keys, so
+an `export` afterwards is ignored. Use `mnemosyne config set modality_enabled
+true` and the matching `modality_*` keys, or `mnemosyne config migrate` to
+import your current variables.
+
+### Schema changes
+
+Two new tables, `media_assets` and `media_moments`, created `IF NOT EXISTS`
+when a bank is opened. No migration step, no existing table altered, no action
+required. Databases that never use multimodal simply carry two empty tables.
+
+### Rollback to v3.15.1
+
+```bash
+pip install 'mnemosyne-memory==3.15.1'
+```
+
+The new tables are additive and are ignored by older versions, so no schema
+rollback is needed. If you set `MNEMOSYNE_EMBEDDING_DIM` to satisfy the new
+guard, leaving it set is harmless on the older version.
+
+## v4.0.0: Hermes wrapper install safety
 
 ### Updating a Hermes wrapper install
 
@@ -219,7 +309,7 @@ Not recommended for shared/multi-app systems.
 **Solution 4: Source install with editable mode**
 
 ```bash
-git clone https://github.com/AxDSan/mnemosyne.git
+git clone https://github.com/mnemosyne-oss/mnemosyne.git
 cd mnemosyne
 pip install -e . --break-system-packages
 ```
@@ -855,7 +945,7 @@ hermes memory status
 PyPI does not serve individual files at browsable URLs. The file is
 available at the GitHub repo:
 
-  https://github.com/AxDSan/mnemosyne/blob/main/UPDATING.md
+  https://github.com/mnemosyne-oss/mnemosyne/blob/main/UPDATING.md
 
 ### Option B: Source install (`pip install -e .`)
 
@@ -1063,7 +1153,7 @@ hermes mnemosyne import --input ~/backup.json
 PyPI does not serve individual package files at browsable URLs.
 The correct URL for the latest version is:
 
-  https://github.com/AxDSan/mnemosyne/blob/main/UPDATING.md
+  https://github.com/mnemosyne-oss/mnemosyne/blob/main/UPDATING.md
 
 The file IS included in the sdist and wheel — `pip show -f
 mnemosyne-memory` will confirm it ships.

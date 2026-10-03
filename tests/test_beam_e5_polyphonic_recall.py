@@ -30,7 +30,7 @@ instead of the inline bonus shortcut.
 import os
 import sqlite3
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -388,6 +388,49 @@ class TestE5FilterEnforcement:
             assert r.get("author_id") == "alice", (
                 f"engine path ignored author_id filter: {r}"
             )
+
+    def test_engine_path_valid_until_aware_utc_under_non_utc_tz(
+        self, temp_db, monkeypatch, disable_llm
+    ):
+        """#525: engine-path validity filter uses aware UTC on a UTC+02 host.
+
+        A still-valid aware-UTC timestamp must be accepted even though the
+        host's local wall clock is two hours ahead.
+        """
+        import time as _time
+
+        monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+        if not hasattr(_time, "tzset"):
+            pytest.skip("time.tzset() unavailable on this platform")
+        original_tz = os.environ.get("TZ")
+        monkeypatch.setenv("TZ", "Europe/Copenhagen")
+        _time.tzset()
+        try:
+            beam = BeamMemory(session_id="s1", db_path=temp_db)
+            mid = beam.remember(
+                "Alice keeps her keys in the vault", source="conv", importance=0.9
+            )
+            # Still valid in two hours (aware UTC): must survive the filter.
+            future_utc = (
+                datetime.now(timezone.utc) + timedelta(hours=2)
+            ).isoformat()
+            beam.conn.execute(
+                "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+                (future_utc, mid),
+            )
+            beam.conn.commit()
+
+            results = beam.recall("Alice vault keys", top_k=20)
+            assert mid in {r["id"] for r in results}, (
+                "polyphonic recall rejected a still-valid aware-UTC row; "
+                f"got: {[r['id'] for r in results]}"
+            )
+        finally:
+            if original_tz is None:
+                monkeypatch.delenv("TZ", raising=False)
+            else:
+                monkeypatch.setenv("TZ", original_tz)
+            _time.tzset()
 
 
 class TestE5MultiplierComposition:

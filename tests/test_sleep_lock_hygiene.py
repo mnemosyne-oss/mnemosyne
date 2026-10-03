@@ -85,7 +85,7 @@ class TestSleepLockHygiene:
             txn_open_during_summarize.append(beam.conn.in_transaction)
             return f"summary of {len(lines)} items"
 
-        monkeypatch.setattr(local_llm, "summarize_memories", fake_summarize)
+        monkeypatch.setattr(local_llm, "_summarize_memories", fake_summarize)
 
         result = beam.sleep()
 

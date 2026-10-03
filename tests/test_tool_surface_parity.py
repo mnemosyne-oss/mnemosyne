@@ -122,12 +122,15 @@ def test_generated_docs_match_the_code():
     tools = gen._collect_tools()
     env_map, defaults, restart = gen._collect_config()
     gen._validate_descriptions(env_map)
-    effective = gen._scan_effective_defaults(env_map, defaults)
+    effective, conflicts = gen._scan_effective_defaults(
+        env_map, defaults,
+        roots=("mnemosyne", "hermes_memory_provider", "integrations"),
+    )
 
     expected = {
         "docs/api/tool-schema.mdx": gen._render_tool_schema(tools, version),
         "docs/api/configuration.mdx": gen._render_config(
-            env_map, defaults, restart, version, effective
+            env_map, defaults, restart, version, effective, conflicts
         ),
     }
     for rel, want in expected.items():
@@ -176,3 +179,23 @@ def test_tool_definitions_are_constructible():
     assert defs, "no tool definitions produced"
     for d in defs:
         mcp_types.Tool(**d)
+
+
+def test_mcp_advertised_surface_has_handlers():
+    """Every tool advertised by get_tool_definitions() must be dispatchable.
+
+    #728: eight schemas (mnemosyne_triple_end, mnemosyne_sync_push/pull/
+    status, mnemosyne_persona_promote/demote/list/reinforce) were advertised
+    in ``tools/list`` without a handler in ``_TOOL_HANDLERS``, so every
+    ``tools/call`` for them failed with ``Unknown tool``. The advertised
+    surface must be exactly the handler registry.
+    """
+    from mnemosyne import mcp_tools
+
+    advertised = {t["name"] for t in mcp_tools.get_tool_definitions()}
+    handlers = set(mcp_tools._TOOL_HANDLERS)
+    assert advertised == handlers, (
+        f"advertised surface diverges from handler registry: "
+        f"advertised without handler: {sorted(advertised - handlers)}; "
+        f"handlers without advertisement: {sorted(handlers - advertised)}"
+    )

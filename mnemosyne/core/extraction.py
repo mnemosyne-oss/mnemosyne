@@ -220,6 +220,10 @@ def extract_facts(text: str) -> List[str]:
 
     if attempted:
         diag.record_attempt("host")
+        if local_llm._is_invalid_reasoning_output(host_text):
+            diag.record_failure("host", reason="malformed_reasoning_trace")
+            diag.record_call(succeeded=False)
+            return []
         if host_text:
             facts = _parse_facts(host_text)
             if facts:
@@ -244,7 +248,12 @@ def extract_facts(text: str) -> List[str]:
         if llm is not None:
             try:
                 raw_output = _call_local_extraction_llm(llm, prompt)
-                facts = _parse_facts(local_llm._clean_output(raw_output))
+                cleaned_output = local_llm._clean_output(raw_output)
+                if local_llm._is_invalid_reasoning_output(cleaned_output):
+                    diag.record_failure("local", reason="malformed_reasoning_trace")
+                    diag.record_call(succeeded=False)
+                    return []
+                facts = _parse_facts(cleaned_output)
                 if facts:
                     diag.record_success("local", fact_count=len(facts))
                     diag.record_call(succeeded=True)
@@ -279,7 +288,12 @@ def extract_facts(text: str) -> List[str]:
             )
             raw_output = ""
         if raw_output:
-            facts = _parse_facts(local_llm._clean_output(raw_output))
+            cleaned_output = local_llm._clean_output(raw_output)
+            if local_llm._is_invalid_reasoning_output(cleaned_output):
+                diag.record_failure("remote", reason="malformed_reasoning_trace")
+                diag.record_call(succeeded=False)
+                return []
+            facts = _parse_facts(cleaned_output)
             if facts:
                 diag.record_success("remote", fact_count=len(facts))
                 diag.record_call(succeeded=True)
@@ -303,7 +317,12 @@ def extract_facts(text: str) -> List[str]:
     if llm is not None:
         try:
             raw_output = _call_local_extraction_llm(llm, prompt)
-            facts = _parse_facts(local_llm._clean_output(raw_output))
+            cleaned_output = local_llm._clean_output(raw_output)
+            if local_llm._is_invalid_reasoning_output(cleaned_output):
+                diag.record_failure("local", reason="malformed_reasoning_trace")
+                diag.record_call(succeeded=False)
+                return []
+            facts = _parse_facts(cleaned_output)
             if facts:
                 diag.record_success("local", fact_count=len(facts))
                 diag.record_call(succeeded=True)

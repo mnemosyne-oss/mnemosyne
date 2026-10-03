@@ -9,13 +9,9 @@ Covers:
 - Backward compat: classifier off = only regex patterns apply
 """
 
-import os
 import pytest
 
 from mnemosyne.core.filters import (
-    DEFAULT_NOISE_PATTERNS,
-    SECRET_PATTERNS,
-    WriteDecision,
     classify_memory_write,
     detect_secrets,
     matches_patterns,
@@ -117,6 +113,163 @@ class TestDetectSecrets:
 
     def test_empty_content(self):
         assert detect_secrets("") == []
+
+
+# ---------------------------------------------------------------------------
+# detect_secrets — CJK-labelled secrets (issue #806, lane 1)
+# ---------------------------------------------------------------------------
+
+class TestDetectSecretsCJK:
+    @pytest.mark.parametrize(
+        ("label", "value"),
+        [
+            ("密码", "s3cr3t_pa55word_x1y2z3w4"),
+            ("密钥", "AbCdEfGhIjKlMnOp"),
+            ("令牌", "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123"),
+            ("口令", "qwerty1234567890"),
+            ("私钥", "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"),
+            ("パスワード", "abcdefgh1234"),
+            ("秘密鍵", "Jw8kLm2pQr7sVx9z"),
+            ("トークン", "token_AbCdEfGhIjKlMn"),
+            ("비밀번호", "qwerty123456"),
+            ("키", "key_AbCdEfGhIjKlMn"),
+        ],
+    )
+    @pytest.mark.parametrize("separator", [":", "=", "：", "＝"])
+    def test_all_cjk_labels_and_separators(self, label, value, separator):
+        # nosec - test fixtures
+        hits = detect_secrets(f"{label}{separator}{value}")
+        assert "cjk_secret_assignment" in hits
+
+    def test_chinese_quoted_value(self):
+        # nosec - test fixture
+        hits = detect_secrets('令牌："ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123"')
+        assert "cjk_secret_assignment" in hits
+
+    def test_positive_secret_with_trailing_cjk_prose(self):
+        """Trailing CJK punctuation + prose must not hide a secret."""
+        # nosec - test fixture
+        hits = detect_secrets("数据库密码：s3cr3t_pa55word_x1y2z3w4，请勿外传")
+        assert "cjk_secret_assignment" in hits
+
+    def test_positive_secret_with_trailing_cjk_period(self):
+        # nosec - test fixture
+        hits = detect_secrets("数据库密码：s3cr3t_pa55word_x1y2z3w4。")
+        assert "cjk_secret_assignment" in hits
+
+    @pytest.mark.parametrize("separator", ["：", "＝"])
+    def test_positive_english_label_fullwidth_separator(self, separator):
+        """An English label with a fullwidth separator must be detected."""
+        # nosec - test fixture
+        hits = detect_secrets(f"password{separator}s3cr3t_pa55word_x1y2z3w4")
+        assert "secret_assignment" in hits
+
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            "password：建议每90天更换一次",
+            "password＝建议每90天更换一次",
+        ],
+    )
+    def test_english_label_fullwidth_separator_policy_prose_not_detected(self, prose):
+        """Fullwidth separators must not make English labels match CJK prose."""
+        assert detect_secrets(prose) == []
+
+    def test_negative_chinese_policy_prose_after_label(self):
+        """Ordinary Chinese policy prose after a label must not be a secret."""
+        hits = detect_secrets("密码：建议每90天更换一次")
+        assert hits == []
+
+    def test_negative_chinese_architecture_prose(self):
+        hits = detect_secrets("配置：采用微服务架构部署项目，并约定所有配置走环境变量")
+        assert hits == []
+
+    def test_negative_chinese_plain_name(self):
+        hits = detect_secrets("名称：Alice 的昵称")
+        assert hits == []
+
+    def test_negative_value_too_short(self):
+        hits = detect_secrets("数据库密码：abc1234")
+        assert hits == []
+
+    def test_negative_symbols_only_value(self):
+        hits = detect_secrets("密码：！！！！！！！！")
+        assert hits == []
+
+    def test_negative_ascii_symbols_followed_by_text(self):
+        hits = detect_secrets("密码：!!!!!!!! nextword")
+        assert hits == []
+
+    def test_exact_eight_character_alphanumeric_value_is_detected(self):
+        # nosec - test fixture
+        assert "cjk_secret_assignment" in detect_secrets("密码：Abc12345")
+
+    def test_exact_eight_character_all_digit_value_is_detected(self):
+        # nosec - test fixture
+        assert "cjk_secret_assignment" in detect_secrets("密码：12345678")
+
+    def test_exact_eight_character_ascii_symbol_value_is_rejected(self):
+        assert detect_secrets("密码：!!!!!!!!") == []
+
+    @pytest.mark.parametrize("character", ["ſ", "ı", "İ", "K"])
+    def test_unicode_casefold_equivalent_is_not_ascii_alphanumeric(self, character):
+        """Unicode case-fold equivalents must not satisfy the ASCII boundary."""
+        assert detect_secrets(f"密码：!!!!!!!!{character}") == []
+
+    def test_japanese_policy_prose_is_not_detected(self):
+        assert detect_secrets("パスワード：定期的に変更してください") == []
+
+    def test_korean_policy_prose_is_not_detected(self):
+        assert detect_secrets("비밀번호: 90일마다변경") == []
+
+    def test_negative_mixed_cjk_value(self):
+        """A value mixing CJK prose with digits is still prose, not a secret."""
+        hits = detect_secrets("数据库密码：我的密码是12345678")
+        assert hits == []
+
+    def test_negative_ascii_prefix_then_cjk(self):
+        """An ASCII prefix followed by CJK prose must not be a secret."""
+        hits = detect_secrets("密码：abc12345我的密码")
+        assert hits == []
+
+    @pytest.mark.parametrize(
+        "char",
+        [
+            "\u4e00",  # Han unified (Chinese)
+            "\u3042",  # Hiragana (Japanese)
+            "\uac00",  # Hangul syllable (Korean)
+            "\u3400",  # CJK Extension A
+            "\uf900",  # CJK Compatibility Ideograph
+            "\U00020000",  # CJK Extension B (non-BMP)
+            "\u1100",  # Hangul Jamo
+            "\u3130",  # Hangul Compatibility Jamo
+            "\uff86",  # halfwidth Katakana
+            "\u2e80",  # CJK Radicals Supplement
+            "\u2f00",  # Kangxi Radical
+            "\u3005",  # Ideographic iteration mark
+            "\u3006",  # Ideographic closing mark
+            "\u3007",  # Ideographic number zero
+            "\u31f0",  # Katakana Phonetic Extensions
+            "\U000323b0",  # CJK Extension J boundary
+            "\U0003347f",  # CJK Extension J upper boundary
+            "\uff10",  # fullwidth digit
+            "\uff21",  # fullwidth Latin uppercase letter
+            "\uff41",  # fullwidth Latin lowercase letter
+            "\uffa0",  # halfwidth Hangul filler
+            "\uffbf",
+            "\uffc1",
+            "\uffc8",
+            "\uffc9",
+            "\uffd0",
+            "\uffd1",
+            "\uffd8",
+            "\uffd9",
+        ],
+    )
+    def test_negative_ascii_prefix_then_cjk_block(self, char):
+        """CJK or fullwidth prose after an ASCII prefix must reject it."""
+        hits = detect_secrets(f"密码：abc12345{char}")
+        assert hits == []
 
 
 # ---------------------------------------------------------------------------

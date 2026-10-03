@@ -62,7 +62,7 @@ def test_llm_conflict_detector_success(mock_call, temp_db):
 @patch("time.sleep")
 def test_llm_conflict_detector_retry_logic(mock_sleep, mock_client_class):
     """Test that _call_conflict_llm_with_retry retries on failure with exponential backoff."""
-    from mnemosyne.core.llm_conflict_detector import _call_conflict_llm_with_retry, CONFLICT_LLM_BASE_URL
+    from mnemosyne.core.llm_conflict_detector import _call_conflict_llm_with_retry
     
     # Force a valid URL
     with patch("mnemosyne.core.llm_conflict_detector.CONFLICT_LLM_BASE_URL", "https://api.openai.com/v1"):
@@ -124,11 +124,25 @@ def test_beam_integration_with_llm_conflict(mock_call, temp_db):
     # Mock the heuristic candidate seam directly instead of depending on
     # embedding implementation details or phrase overlap thresholds.
     with patch.object(mem, "_detect_conflicts", return_value=[(id1, id2)]):
-        with patch("mnemosyne.core.llm_conflict_detector.LLM_CONFLICT_DETECTION_ENABLED", True):
+        with patch("mnemosyne.core.llm_conflict_detector.LLM_CONFLICT_DETECTION_ENABLED", True), \
+             patch("mnemosyne.core.llm_conflict_detector.CONFLICT_LLM_BASE_URL", "https://conflict-llm.test"):
+            # endpoint patched truthy: exercises the LLM-validated path this
+            # test targets (no-endpoint now routes to detected-only accounting)
             res = mem.sleep()
-            assert res.get("conflicts_resolved", 0) >= 1
-
-            cursor = mem.conn.cursor()
-            cursor.execute("SELECT superseded_by FROM working_memory WHERE id = ?", (id1,))
-            superseded = cursor.fetchone()[0]
-            assert superseded == id2
+            assert res["conflicts_resolved"] == 1
+            assert res["conflicts_detected_only"] == 0
+            state = mem.conn.execute(
+                "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?", (id1,)
+            ).fetchone()
+            assert state["valid_until"] is not None
+            assert state["superseded_by"] == id2
+            records = mem.conn.execute(
+                "SELECT memory_id, validator, action, new_content, note FROM memory_validations"
+            ).fetchall()
+            assert len(records) == 1
+            assert tuple(records[0][:4]) == (
+                id1, "llm_conflict", "invalidated", "The event is on June 5th"
+            )
+            assert json.loads(records[0]["note"]) == {
+                "confidence": 0.98, "replacement_id": id2,
+            }

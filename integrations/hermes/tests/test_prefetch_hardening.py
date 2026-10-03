@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 
 import pytest
+from mnemosyne.core.canonical import CanonicalStore
 
 from mnemosyne_hermes import (
     MnemosyneMemoryProvider,
+    _canonical_cjk_ngram_size,
+    _canonical_match_tokens,
     _canonical_prefetch_rows,
+    _canonical_recall_rows,
     _prefetch_canonical_generic_tokens,
     _prefetch_min_query_coverage,
+    _prefetch_tokens,
 )
 
 
@@ -380,3 +385,290 @@ def test_canonical_prefetch_respects_higher_distinctive_token_minimum(monkeypatc
     rows = _canonical_prefetch_rows(store, "default", "fragrant jasmine soup")
 
     assert rows == []
+
+
+@pytest.mark.parametrize(
+    ("script", "query", "ordinary", "unrelated"),
+    [
+        (
+            "japanese",
+            "ArchiveBoxの運用方針はどうなってる？",
+            "ArchiveBoxの運用方針は週次バックアップです。",
+            "家族の健康方針と旅行予定を優先する。",
+        ),
+        (
+            "korean",
+            "서울 여행 숙소는 어디야?",
+            "서울 여행 숙소는 한강 근처다.",
+            "업무 회의 장소는 조용한 방이다.",
+        ),
+        (
+            "chinese",
+            "上海旅行计划是什么？",
+            "上海旅行计划包括外滩和博物馆。",
+            "用户喜欢海边和计划性工作。",
+        ),
+    ],
+)
+def test_cjk_canonical_matching_rejects_noise_without_displacing_public_results(
+    script, query, ordinary, unrelated
+):
+    unrelated_store = FakeCanonicalStore([
+        {"name": f"unrelated-{script}", "body": unrelated, "category": "model:user"},
+    ])
+    assert _canonical_recall_rows(unrelated_store, "default", query, limit=5) == []
+    assert _canonical_prefetch_rows(unrelated_store, "default", query, limit=5) == []
+
+    provider = _provider([{
+        "content": ordinary,
+        "source": "fact",
+        "timestamp": "2026-09-17T00:00:00Z",
+        "importance": 0.7,
+        "score": 0.60,
+        "keyword_score": 0.60,
+        "trust_tier": "STATED",
+    }])
+    assert provider._beam is not None
+    provider._beam.canonical = unrelated_store
+    block = provider.prefetch(query)
+    response = json.loads(provider.handle_tool_call(
+        "mnemosyne_recall", {"query": query, "limit": 1},
+    ))
+    assert ordinary in block
+    assert unrelated not in block
+    assert [row["content"] for row in response["results"]] == [ordinary]
+
+    positive_provider = _provider([])
+    assert positive_provider._beam is not None
+    positive_provider._beam.canonical = FakeCanonicalStore([{
+        "name": f"matching-{script}", "body": ordinary, "category": "model:user",
+    }])
+    assert ordinary in positive_provider.prefetch(query)
+    positive_response = json.loads(positive_provider.handle_tool_call(
+        "mnemosyne_recall", {"query": query, "limit": 1},
+    ))
+    assert [row["content"] for row in positive_response["results"]] == [ordinary]
+
+
+@pytest.mark.parametrize(
+    ("query", "body", "expected_token"),
+    [
+        ("東京", "東京の喫茶店を好む。", "東京"),
+        ("서울", "서울의 박물관을 좋아한다.", "서울"),
+        ("上海", "上海的博物馆很安静。", "上海"),
+        ("茶", "用户喜欢茶。", "茶"),
+        ("茶？", "用户喜欢茶。", "茶"),
+    ],
+)
+def test_canonical_matching_preserves_short_cjk_terms(query, body, expected_token):
+    ngram_size = _canonical_cjk_ngram_size(query)
+    store = FakeCanonicalStore([
+        {"name": "short-term", "body": body, "category": "model:user"},
+    ])
+    assert expected_token in _canonical_match_tokens(query, cjk_ngram_size=ngram_size)
+    assert [row["canonical_name"] for row in _canonical_recall_rows(store, "default", query)] == [
+        "short-term"
+    ]
+    assert [row["canonical_name"] for row in _canonical_prefetch_rows(store, "default", query)] == [
+        "short-term"
+    ]
+
+
+def test_canonical_matching_keeps_japanese_iteration_mark_in_cjk_run():
+    store = FakeCanonicalStore([
+        {"name": "japanese-name", "body": "佐々木", "category": "model:user"},
+    ])
+
+    assert _canonical_match_tokens("佐々木") == {"佐々", "々木"}
+    assert [row["canonical_name"] for row in _canonical_recall_rows(store, "default", "佐々木")] == [
+        "japanese-name"
+    ]
+    assert [
+        row["canonical_name"] for row in _canonical_prefetch_rows(store, "default", "佐々木")
+    ] == ["japanese-name"]
+
+
+def test_iteration_mark_canonical_slots_recall_only_the_exact_name(tmp_path):
+    store = CanonicalStore(db_path=tmp_path / "canonical.db")
+    store.remember("default", "model:user", "sasaki", "佐々木")
+    store.remember("default", "model:user", "sasano", "佐々野")
+    provider = _provider([])
+    provider._beam.canonical = store
+
+    sasaki = json.loads(provider.handle_tool_call(
+        "mnemosyne_recall", {"query": "佐々木", "limit": 5},
+    ))
+    sasano = json.loads(provider.handle_tool_call(
+        "mnemosyne_recall", {"query": "佐々野", "limit": 5},
+    ))
+
+    assert [row["canonical_name"] for row in sasaki["results"]] == ["sasaki"]
+    assert [row["canonical_name"] for row in sasano["results"]] == ["sasano"]
+    assert [
+        row["canonical_name"] for row in _canonical_prefetch_rows(store, "default", "佐々木")
+    ] == ["sasaki"]
+    assert [
+        row["canonical_name"] for row in _canonical_prefetch_rows(store, "default", "佐々野")
+    ] == ["sasano"]
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_name"),
+    [
+        ("佐々あ", "saa"),
+        ("佐佐あ", "saa"),
+        ("佐々い", "sai"),
+        ("佐佐い", "sai"),
+    ],
+)
+def test_iteration_mark_canonical_slots_keep_kana_suffix_discriminator(
+    tmp_path, query, expected_name
+):
+    store = CanonicalStore(db_path=tmp_path / "canonical.db")
+    store.remember("default", "model:user", "saa", "佐々あ")
+    store.remember("default", "model:user", "sai", "佐々い")
+    provider = _provider([])
+    provider._beam.canonical = store
+
+    response = json.loads(provider.handle_tool_call(
+        "mnemosyne_recall", {"query": query, "limit": 5},
+    ))
+
+    assert [row["canonical_name"] for row in response["results"]] == [expected_name]
+
+
+@pytest.mark.parametrize(
+    ("query", "body", "sibling_body"),
+    [
+        ("佐々木", "佐佐木", "佐佐野"),
+        ("佐佐木", "佐々木", "佐々野"),
+        ("佐々々木", "佐佐佐木", "佐佐佐野"),
+        ("人々", "人人", "人海"),
+        ("ID-佐々木-A", "ID-佐佐木-A", "ID-佐佐野-A"),
+    ],
+)
+def test_explicit_recall_treats_iteration_marks_as_literal_han_repetition(
+    query, body, sibling_body
+):
+    store = FakeCanonicalStore([
+        {"name": "matching", "body": body, "category": "model:user"},
+        {"name": "sibling", "body": sibling_body, "category": "model:user"},
+    ])
+
+    assert [
+        row["canonical_name"] for row in _canonical_recall_rows(store, "default", query, limit=5)
+    ] == ["matching"]
+
+
+@pytest.mark.parametrize(
+    ("query", "body"),
+    [
+        ("々木", "佐々木"),
+        ("佐 々木", "佐々木"),
+        ("佐、々木", "佐々木"),
+        ("佐々木", "佐 々木"),
+        ("の々木", "のの木"),
+    ],
+)
+def test_explicit_recall_does_not_expand_iteration_marks_across_boundaries(query, body):
+    store = FakeCanonicalStore([
+        {"name": "non-matching", "body": body, "category": "model:user"},
+    ])
+
+    assert _canonical_recall_rows(store, "default", query, limit=5) == []
+
+
+def test_start_of_run_iteration_marks_keep_literal_compatibility():
+    store = FakeCanonicalStore([
+        {"name": "matching", "body": "々木", "category": "model:user"},
+        {"name": "sibling", "body": "々野", "category": "model:user"},
+    ])
+
+    assert [
+        row["canonical_name"] for row in _canonical_recall_rows(store, "default", "々木", limit=5)
+    ] == ["matching"]
+
+
+def test_start_of_run_literal_match_survives_unrelated_iteration_run():
+    store = FakeCanonicalStore([
+        {"name": "matching", "body": "々木 佐々野", "category": "model:user"},
+    ])
+
+    assert [
+        row["canonical_name"] for row in _canonical_recall_rows(store, "default", "々木", limit=5)
+    ] == ["matching"]
+
+
+@pytest.mark.parametrize(
+    ("query", "body"),
+    [
+        ("Caldrin basalt", "Caldrin catalogs basalt formations."),
+        ("тёмную копию", "Пользователь предпочитает тёмную резервную копию."),
+    ],
+)
+def test_canonical_matching_preserves_latin_and_cyrillic_terms(query, body):
+    store = FakeCanonicalStore([
+        {"name": "matching", "body": body, "category": "model:user"},
+    ])
+    assert [row["canonical_name"] for row in _canonical_recall_rows(store, "default", query)] == [
+        "matching"
+    ]
+    assert [row["canonical_name"] for row in _canonical_prefetch_rows(store, "default", query)] == [
+        "matching"
+    ]
+
+
+def test_canonical_recall_owner_isolation_survives_cjk_matching():
+    store = FakeCanonicalStore({
+        "default": [
+            {"name": "tokyo", "body": "東京の喫茶店を好む。", "category": "model:user"},
+        ],
+        "other-owner": [
+            {"name": "seoul", "body": "서울의 박물관을 좋아한다.", "category": "model:user"},
+        ],
+    })
+    assert [
+        row["canonical_name"] for row in _canonical_recall_rows(store, "default", "東京")
+    ] == ["tokyo"]
+    assert _canonical_recall_rows(store, "other-owner", "東京") == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Caldrin catalogs basalt formations.",
+        "Пользователь предпочитает тёмную резервную копию.",
+        "https://example.test/archive_path",
+    ],
+)
+def test_canonical_matching_preserves_non_cjk_tokenization(content):
+    assert _canonical_match_tokens(content) == _prefetch_tokens(content)
+
+
+def test_prefixed_single_character_cjk_query_uses_exact_compatibility_path():
+    store = FakeCanonicalStore([
+        {"name": "tea", "body": "用户喜欢茶。", "category": "model:user"},
+    ])
+    assert [
+        row["canonical_name"] for row in _canonical_recall_rows(store, "default", "[USER] 茶")
+    ] == ["tea"]
+
+
+@pytest.mark.parametrize(
+    ("query", "body"),
+    [
+        ("納豆は？", "納豆が苦手です。"),
+        ("숙소가?", "숙소는 한강 근처다."),
+        ("茶叶呢？", "用户喜欢茶叶。"),
+    ],
+)
+def test_canonical_matching_keeps_one_strong_bigram_for_short_queries(query, body):
+    store = FakeCanonicalStore([
+        {"name": "matching", "body": body, "category": "model:user"},
+    ])
+    assert [row["canonical_name"] for row in _canonical_recall_rows(store, "default", query)] == [
+        "matching"
+    ]
+    assert [row["canonical_name"] for row in _canonical_prefetch_rows(store, "default", query)] == [
+        "matching"
+    ]

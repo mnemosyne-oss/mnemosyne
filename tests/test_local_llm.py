@@ -465,11 +465,19 @@ class TestThinkTagStripping:
         raw = "<think>only thinking, no output</think>"
         assert local_llm._clean_output(raw) == ""
 
-    def test_clean_output_does_not_strip_unclosed_think_tag(self):
-        """Unclosed think tags are left as-is since we cannot determine
-        where thinking ends and the response begins."""
-        raw = "middle<think>reasoning that never closes"
-        assert local_llm._clean_output(raw) == raw
+    def test_clean_output_rejects_nested_think_tags(self):
+        assert local_llm._is_invalid_reasoning_output(
+            local_llm._clean_output("<think>outer<think>inner</think>outer</think>")
+        )
+
+    def test_clean_output_rejects_unclosed_think_tag(self):
+        raw = "middle<think>reasoning truncated at the token limit"
+        assert local_llm._is_invalid_reasoning_output(local_llm._clean_output(raw))
+
+    def test_clean_output_rejects_unmatched_closing_think_tag(self):
+        assert local_llm._is_invalid_reasoning_output(
+            local_llm._clean_output("safe prefix</think> malformed ordering")
+        )
 
     def test_try_host_llm_strips_think_tags(self, monkeypatch):
         """Host LLM output with closed think tags should be cleaned."""
@@ -484,8 +492,8 @@ class TestThinkTagStripping:
         assert attempted is True
         assert text == "Summary of memories."
 
-    def test_try_host_llm_does_not_strip_unclosed_think_tag(self, monkeypatch):
-        """Unclosed think tags in host output are left as-is."""
+    def test_try_host_llm_rejects_unclosed_think_tag(self, monkeypatch):
+        """Token-truncated host reasoning must not reach a persistence caller."""
         monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
         monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", True)
         monkeypatch.setattr(local_llm, "HOST_LLM_TIMEOUT", 5.0)
@@ -495,8 +503,7 @@ class TestThinkTagStripping:
 
         attempted, text = local_llm._try_host_llm("test prompt", max_tokens=128, temperature=0.3)
         assert attempted is True
-        # Unclosed tag is not stripped - we can't tell where thinking ends
-        assert "<think>" in text
+        assert local_llm._is_invalid_reasoning_output(text)
 
 
 class TestRemoteLLMFallback:

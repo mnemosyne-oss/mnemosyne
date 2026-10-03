@@ -6,8 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from mnemosyne import upgrade_hermes as upgrade
 
-from mnemosyne_hermes import install, upgrade
+from mnemosyne_hermes import install
 
 
 @pytest.mark.parametrize(

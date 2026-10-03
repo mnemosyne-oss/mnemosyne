@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from mnemosyne.core.beam import BeamMemory
@@ -112,9 +112,9 @@ class TestAuditIntegration:
             "content": "will be invalidated",
             "source": "fact",
         })
-        before_invalidate = datetime.now()
+        before_invalidate = datetime.now(timezone.utc)
         result = _call(provider, "mnemosyne_invalidate", {"memory_id": stored["memory_id"]})
-        after_invalidate = datetime.now()
+        after_invalidate = datetime.now(timezone.utc)
         assert result["status"] == "invalidated"
         assert result["memory_id"] == stored["memory_id"]
         row = provider._beam.conn.execute(
@@ -139,12 +139,12 @@ class TestAuditIntegration:
             "content": "replacement fact",
             "source": "fact",
         })
-        before_invalidate = datetime.now()
+        before_invalidate = datetime.now(timezone.utc)
         result = _call(provider, "mnemosyne_invalidate", {
             "memory_id": original["memory_id"],
             "replacement_id": replacement["memory_id"],
         })
-        after_invalidate = datetime.now()
+        after_invalidate = datetime.now(timezone.utc)
         assert result["status"] == "invalidated"
         row = provider._beam.conn.execute(
             "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?",

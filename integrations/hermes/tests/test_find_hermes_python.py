@@ -599,24 +599,89 @@ def test_no_bootstrap_continues_without_a_validated_interpreter(tmp_path, monkey
     assert "Continuing without dependency validation" in capsys.readouterr().err
 
 
-def test_wrapper_mode_is_unaffected_by_failed_discovery(tmp_path, monkeypatch):
-    """Wrapper installs validate their own interpreter and must not be blocked."""
-    system_bin = tmp_path / "usr" / "bin"
-    _write_executable(system_bin / "hermes", "#!/bin/sh\nexit 0\n")
+@pytest.mark.parametrize("mode", ["symlink", "wrapper"])
+@pytest.mark.parametrize("blank_python", ["", " \t\n "])
+def test_run_install_rejects_blank_python_before_any_preflight(
+    tmp_path, monkeypatch, blank_python, mode
+):
+    """A supplied blank --python never reaches preflight, discovery, or install."""
+    calls: list[str] = []
+
+    def fail(name):
+        def _fail(*args, **kwargs):
+            calls.append(name)
+            raise AssertionError(f"blank --python reached {name}")
+
+        return _fail
+
+    monkeypatch.setattr(install, "check_mnemosyne_core", fail("core preflight"))
+    monkeypatch.setattr(install, "_find_hermes_python", fail("discovery"))
+    monkeypatch.setattr(install, "install_plugin", fail("plugin install"))
+
+    with pytest.raises(ValueError, match="--python was given an empty value"):
+        install.run_install(
+            hermes_home_path=tmp_path / "home", mode=mode, python=blank_python
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("blank_python", ["", " \t\n "])
+def test_wrapper_explicit_blank_python_fails_without_target_or_fallback(
+    tmp_path, monkeypatch, capsys, blank_python
+):
+    """An explicit blank wrapper --python is invalid, not a request for this Python."""
+    fallback_python = tmp_path / "fallback-python"
+    _write_executable(fallback_python, "#!/bin/sh\nexit 0\n")
+    hermes_home = tmp_path / "hermes-home"
+    target = install.plugin_target_dir(hermes_home)
+
+    monkeypatch.setattr(sys, "executable", str(fallback_python))
+
+    def fail_if_fallback_is_validated(*args, **kwargs):
+        raise AssertionError("blank --python must not fall back to sys.executable")
+
+    monkeypatch.setattr(install, "_site_packages_for_python", fail_if_fallback_is_validated)
+
+    rc = install.main(
+        [
+            "--hermes-home",
+            str(hermes_home),
+            "install",
+            "--mode",
+            "wrapper",
+            "--python",
+            blank_python,
+        ]
+    )
+
+    assert rc == 1
+    assert "--python was given an empty value" in capsys.readouterr().err
+    assert not target.exists()
+
+
+def test_wrapper_without_python_uses_discovered_hermes_interpreter(
+    tmp_path, monkeypatch
+):
+    """An omitted wrapper --python records and validates Hermes' runtime, not ours."""
+    discovered = _make_venv(tmp_path / "hermes-venv")
+    installer_python = tmp_path / "installer-python"
+    _write_executable(installer_python, "#!/bin/sh\nexit 0\n")
+    selected: list[Path | None] = []
+    target = tmp_path / "wrapper-target"
+    target.mkdir()
 
     class _SkillResult:
         message = "skipped"
 
-    target = tmp_path / "wrapper-target"
-    target.mkdir()
-
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-home"))
-    monkeypatch.setenv("PATH", str(system_bin))
-    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
-    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+    monkeypatch.setattr(sys, "executable", str(installer_python))
     monkeypatch.setattr(install, "check_mnemosyne_core", lambda: True)
-    monkeypatch.setattr(install, "install_plugin", lambda **kwargs: target)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: discovered)
+    monkeypatch.setattr(
+        install,
+        "install_plugin",
+        lambda **kwargs: (selected.append(kwargs["python"]), target)[1],
+    )
     monkeypatch.setattr(install, "install_bundled_skill", lambda **kwargs: _SkillResult())
     monkeypatch.setattr(
         install,
@@ -630,9 +695,68 @@ def test_wrapper_mode_is_unaffected_by_failed_discovery(tmp_path, monkeypatch):
         ),
     )
 
-    rc = install.run_install(hermes_home_path=tmp_path / "empty-home", mode="wrapper")
+    assert install.run_install(hermes_home_path=tmp_path / "home", mode="wrapper") == 0
+    assert selected == [discovered]
+    assert selected != [Path(sys.executable)]
 
-    assert rc == 0
+
+def test_wrapper_without_discovered_python_fails_closed(tmp_path, monkeypatch, capsys):
+    """An omitted wrapper --python must not fall back to this Python or mutate."""
+    fallback_python = tmp_path / "installer-python"
+    _write_executable(fallback_python, "#!/bin/sh\nexit 0\n")
+    target = install.plugin_target_dir(tmp_path / "home")
+    calls: list[str] = []
+
+    def fail(name):
+        def _fail(*args, **kwargs):
+            calls.append(name)
+            raise AssertionError(f"missing wrapper runtime reached {name}")
+
+        return _fail
+
+    monkeypatch.setattr(sys, "executable", str(fallback_python))
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: None)
+    monkeypatch.setattr(install, "check_mnemosyne_core", fail("core preflight"))
+    monkeypatch.setattr(install, "_site_packages_for_python", fail("fallback probe"))
+    monkeypatch.setattr(install, "install_plugin", fail("plugin install"))
+    monkeypatch.setattr(install, "install_bundled_skill", fail("skill install"))
+
+    assert install.run_install(hermes_home_path=tmp_path / "home", mode="wrapper") == 1
+    assert "Pass --python" in capsys.readouterr().err
+    assert calls == []
+    assert not target.exists()
+
+
+def test_relative_wrapper_python_is_lexically_absolute_before_isolated_probe(
+    tmp_path, monkeypatch
+):
+    """A relative --python survives the probe's different temporary cwd intact."""
+    selected = tmp_path / "venv" / "bin" / "python"
+    selected.parent.mkdir(parents=True)
+    selected.symlink_to(Path(sys.executable))
+    site_packages = tmp_path / "site-packages"
+    _write_executable(site_packages / "mnemosyne_hermes" / "__init__.py", "__version__ = 'test'\n")
+    (site_packages / "mnemosyne" / "core").mkdir(parents=True)
+    (site_packages / "mnemosyne" / "__init__.py").write_text("", encoding="utf-8")
+    (site_packages / "mnemosyne" / "core" / "__init__.py").write_text("", encoding="utf-8")
+    (site_packages / "mnemosyne" / "core" / "beam.py").write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    relative_python = os.path.relpath(selected, start=tmp_path)
+    expected = Path(relative_python).absolute()
+    seen: list[Path] = []
+
+    def site_for_python(python, **kwargs):
+        seen.append(Path(python))
+        return site_packages
+
+    monkeypatch.setattr(install, "_site_packages_for_python", site_for_python)
+
+    wrapper_python, returned_site = install._validated_wrapper_environment(relative_python)
+
+    assert wrapper_python == expected == selected
+    assert wrapper_python.resolve() == Path(sys.executable).resolve()
+    assert seen == [expected]
+    assert returned_site == site_packages
 
 
 def test_run_install_bootstraps_hermes_venv_not_path_sibling(
@@ -725,6 +849,88 @@ def test_wrapper_dry_run_does_not_report_a_bootstrap(tmp_path, monkeypatch, caps
     assert "Will bootstrap: True" in capsys.readouterr().out
 
 
+def test_wrapper_dry_run_uses_discovered_interpreter_for_display_and_probe(
+    tmp_path, monkeypatch, capsys
+):
+    """The public dry-run path matches wrapper install's discovered runtime."""
+    discovered = _make_venv(tmp_path / "hermes-venv")
+    installer_python = tmp_path / "installer-python"
+    _write_executable(installer_python, "#!/bin/sh\nexit 0\n")
+    site_packages = tmp_path / "site-packages"
+    probed: list[Path] = []
+
+    monkeypatch.setattr(sys, "executable", str(installer_python))
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: discovered)
+    monkeypatch.setattr(
+        install,
+        "_site_packages_for_python",
+        lambda python, **kwargs: (probed.append(Path(python)), site_packages)[1],
+    )
+
+    rc = install.main(["install", "--mode", "wrapper", "--dry-run"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"Wrapper Python: {discovered}" in out
+    assert f"Wrapper site-packages: {site_packages}" in out
+    assert str(installer_python) not in out
+    assert probed == [discovered]
+
+
+def test_wrapper_dry_run_without_discovered_python_fails_without_fallback_or_probe(
+    tmp_path, monkeypatch, capsys
+):
+    """Dry-run has the same fail-closed wrapper-runtime boundary as installation."""
+    fallback_python = tmp_path / "installer-python"
+    _write_executable(fallback_python, "#!/bin/sh\nexit 0\n")
+    calls: list[str] = []
+
+    def fail(name):
+        def _fail(*args, **kwargs):
+            calls.append(name)
+            raise AssertionError(f"missing wrapper runtime reached {name}")
+
+        return _fail
+
+    monkeypatch.setattr(sys, "executable", str(fallback_python))
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: None)
+    monkeypatch.setattr(install, "_site_packages_for_python", fail("fallback probe"))
+    monkeypatch.setattr(install, "install_bundled_skill", fail("skill planning"))
+    monkeypatch.setattr(install, "plugin_target_dir", fail("target planning"))
+
+    assert install.main(["install", "--mode", "wrapper", "--dry-run"]) == 1
+    assert "Pass --python" in capsys.readouterr().err
+    assert calls == []
+
+
+def test_wrapper_dry_run_makes_explicit_relative_python_absolute_before_probe(
+    tmp_path, monkeypatch, capsys
+):
+    """The public dry-run path probes and reports relative --python lexically."""
+    selected = _make_venv(tmp_path / "hermes-venv")
+    site_packages = tmp_path / "site-packages"
+    relative_python = os.path.relpath(selected, start=tmp_path)
+    probed: list[Path] = []
+
+    monkeypatch.chdir(tmp_path)
+    expected = Path(relative_python).absolute()
+    monkeypatch.setattr(
+        install,
+        "_site_packages_for_python",
+        lambda python, **kwargs: (probed.append(Path(python)), site_packages)[1],
+    )
+
+    rc = install.main(
+        ["install", "--mode", "wrapper", "--dry-run", "--python", relative_python]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"Wrapper Python: {expected}" in out
+    assert f"Wrapper site-packages: {site_packages}" in out
+    assert probed == [expected]
+
+
 def test_run_install_honours_explicit_python(hermes_world, tmp_path, monkeypatch):
     """--python reaches discovery in symlink mode, not just wrapper mode."""
     bootstrapped: list[Path] = []
@@ -750,3 +956,302 @@ def test_run_install_honours_explicit_python(hermes_world, tmp_path, monkeypatch
 
     assert rc == 0
     assert bootstrapped == [chosen]
+
+
+@pytest.mark.parametrize(
+    ("mode", "cli_core_present", "selected_core_present", "expected_rc"),
+    [
+        pytest.param("wrapper", False, False, 0, id="wrapper-cli-missing-selected-missing"),
+        pytest.param("wrapper", False, True, 0, id="wrapper-cli-missing-selected-present"),
+        pytest.param("wrapper", True, False, 0, id="wrapper-cli-present-selected-missing"),
+        pytest.param("wrapper", True, True, 0, id="wrapper-cli-present-selected-present"),
+        pytest.param("symlink", False, False, 1, id="symlink-cli-missing-selected-missing"),
+        pytest.param("symlink", False, True, 1, id="symlink-cli-missing-selected-present"),
+        pytest.param("symlink", True, False, 1, id="symlink-cli-present-selected-missing"),
+        pytest.param("symlink", True, True, 0, id="symlink-cli-present-selected-present"),
+    ],
+)
+def test_explicit_python_core_preflight_matrix(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    mode,
+    cli_core_present,
+    selected_core_present,
+    expected_rc,
+):
+    """Wrapper --python bypasses CLI preflight; symlink mode retains it."""
+    selected_python = tmp_path / "selected-python"
+    selected_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    selected_python.chmod(0o755)
+    target = tmp_path / "plugin-target"
+    target.mkdir()
+    symlink_target = tmp_path / "plugin-link"
+    symlink_target.symlink_to(target, target_is_directory=True)
+    cli_checks: list[bool] = []
+    selected_checks: list[Path] = []
+    install_calls: list[dict[str, object]] = []
+
+    class _SkillResult:
+        message = "skipped"
+
+    def check_cli_core():
+        cli_checks.append(True)
+        return cli_core_present
+
+    def check_selected_core(python):
+        selected_checks.append(Path(python))
+        return "4.0" if selected_core_present else None
+
+    def install_selected(**kwargs):
+        install_calls.append(kwargs)
+        return target if mode == "wrapper" else symlink_target
+
+    monkeypatch.setattr(install, "check_mnemosyne_core", check_cli_core)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: selected_python)
+    monkeypatch.setattr(install, "check_mnemosyne_core_for_hermes_python", check_selected_core)
+    monkeypatch.setattr(install, "install_plugin", install_selected)
+    monkeypatch.setattr(install, "install_bundled_skill", lambda **kwargs: _SkillResult())
+    monkeypatch.setattr(
+        install,
+        "plugin_state",
+        lambda **kwargs: install.PluginState(
+            status="installed",
+            installed=True,
+            target=target,
+            mode="wrapper",
+            message="ok",
+        ),
+    )
+
+    rc = install.run_install(
+        hermes_home_path=tmp_path / "home",
+        mode=mode,
+        python=selected_python,
+        no_bootstrap=True,
+    )
+
+    captured = capsys.readouterr()
+    stderr = captured.err
+    stdout = captured.out
+    assert rc == expected_rc
+    if mode == "wrapper":
+        assert cli_checks == []
+        assert selected_checks == []
+        assert install_calls and install_calls[0]["python"] == selected_python
+        assert "mnemosyne-memory NOT found in this Python" not in stderr
+    else:
+        assert cli_checks == [True]
+        if not cli_core_present:
+            assert selected_checks == []
+            assert install_calls == []
+            assert "mnemosyne-memory NOT found in this Python" in stderr
+        else:
+            assert selected_checks == [selected_python]
+            if selected_core_present:
+                assert install_calls and install_calls[0]["python"] == selected_python
+            else:
+                assert install_calls == []
+                assert "Hermes' Python at" in stdout
+
+
+def test_default_wrapper_without_explicit_python_defers_core_validation_to_wrapper(
+    tmp_path, monkeypatch
+):
+    """The discovered wrapper runtime reaches its own selected-env validation."""
+    cli_checks: list[bool] = []
+    discovered = _make_venv(tmp_path / "hermes-venv")
+    selected: list[Path | None] = []
+    target = tmp_path / "wrapper-target"
+    target.mkdir()
+
+    class _SkillResult:
+        message = "skipped"
+
+    def check_cli_core():
+        cli_checks.append(True)
+        return False
+
+    monkeypatch.setattr(install, "default_install_mode", lambda: "wrapper")
+    monkeypatch.setattr(install, "check_mnemosyne_core", check_cli_core)
+    monkeypatch.setattr(install, "_find_hermes_python", lambda **kwargs: discovered)
+    monkeypatch.setattr(
+        install,
+        "install_plugin",
+        lambda **kwargs: (selected.append(kwargs["python"]), target)[1],
+    )
+    monkeypatch.setattr(install, "install_bundled_skill", lambda **kwargs: _SkillResult())
+    monkeypatch.setattr(
+        install,
+        "plugin_state",
+        lambda **kwargs: install.PluginState(
+            status="installed",
+            installed=True,
+            target=target,
+            mode="wrapper",
+            message="ok",
+        ),
+    )
+
+    rc = install.run_install(hermes_home_path=tmp_path / "home")
+
+    assert rc == 0
+    assert cli_checks == []
+    assert selected == [discovered]
+
+
+def test_default_symlink_retains_cli_core_preflight(tmp_path, monkeypatch, capsys):
+    """The default symlink path still stops before discovery or installation."""
+    cli_checks: list[bool] = []
+
+    def check_cli_core():
+        cli_checks.append(True)
+        return False
+
+    def fail(*args, **kwargs):
+        raise AssertionError("symlink preflight must stop before later install work")
+
+    monkeypatch.setattr(install, "default_install_mode", lambda: "symlink")
+    monkeypatch.setattr(install, "check_mnemosyne_core", check_cli_core)
+    monkeypatch.setattr(install, "_find_hermes_python", fail)
+    monkeypatch.setattr(install, "install_plugin", fail)
+
+    rc = install.run_install(hermes_home_path=tmp_path / "home")
+
+    assert rc == 1
+    assert cli_checks == [True]
+    assert "mnemosyne-memory NOT found in this Python" in capsys.readouterr().err
+
+
+def test_explicit_hermes_home_excludes_path_launcher(tmp_path, monkeypatch):
+    """A scoped home wins over a different valid Hermes launcher on PATH."""
+    selected_home = tmp_path / "selected-home"
+    selected_python = _make_venv(selected_home / "hermes-agent" / "venv")
+
+    other_venv = tmp_path / "other-hermes-venv"
+    _make_venv(other_venv)
+    _write_executable(other_venv / "bin" / "hermes", "#!/bin/sh\nexit 0\n")
+    monkeypatch.setenv("PATH", str(other_venv / "bin"))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+
+    assert install._find_hermes_python(hermes_home_path=selected_home) == selected_python
+
+
+def test_explicit_hermes_home_fails_closed_without_its_runtime(tmp_path, monkeypatch):
+    """A scoped home cannot fall back to an unrelated valid launcher on PATH."""
+    selected_home = tmp_path / "selected-home"
+    other_venv = tmp_path / "other-hermes-venv"
+    _make_venv(other_venv)
+    _write_executable(other_venv / "bin" / "hermes", "#!/bin/sh\nexit 0\n")
+    monkeypatch.setenv("PATH", str(other_venv / "bin"))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+
+    assert install._find_hermes_python(hermes_home_path=selected_home) is None
+
+
+def _make_windows_venv(root: Path) -> Path:
+    """Create a native Windows venv layout without changing ``os.name``."""
+    scripts = root / "Scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (root / "pyvenv.cfg").write_text("home = C:/Python\n", encoding="utf-8")
+    return _write_executable(scripts / "python.exe", "#!/bin/sh\nexit 0\n")
+
+
+def _isolate_windows_discovery(tmp_path, monkeypatch):
+    """Neutralize every implicit route; each test enables one route explicitly."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-home"))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+    # Keep the simulated layout local to the installer module. In particular,
+    # changing process-global ``os.name`` would make pathlib and shutil act as
+    # though this Linux test process were Windows.
+    monkeypatch.setattr(install, "_is_windows_platform", lambda: True, raising=False)
+
+
+def test_windows_launcher_sibling_discovers_scripts_python_exe(tmp_path, monkeypatch):
+    """Route 1: a native launcher sibling must find its validated Windows venv."""
+    _isolate_windows_discovery(tmp_path, monkeypatch)
+    venv = tmp_path / "launcher-venv"
+    python = _make_windows_venv(venv)
+    launcher = _write_executable(venv / "Scripts" / "hermes.exe", "#!/bin/sh\nexit 0\n")
+    monkeypatch.setattr(install.shutil, "which", lambda _: str(launcher))
+
+    assert install._find_hermes_python() == python
+
+
+def test_windows_known_root_discovers_scripts_python_exe(tmp_path, monkeypatch):
+    """Route 2: a known Hermes install root must support ``Scripts/python.exe``."""
+    _isolate_windows_discovery(tmp_path, monkeypatch)
+    home = tmp_path / "hermes-home"
+    python = _make_windows_venv(home / "hermes-agent" / "venv")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert install._find_hermes_python() == python
+
+
+def test_windows_active_prefix_discovers_scripts_python_exe(tmp_path, monkeypatch):
+    """Route 3: the active venv prefix must find its native Windows runtime."""
+    _isolate_windows_discovery(tmp_path, monkeypatch)
+    prefix = tmp_path / "active-venv"
+    python = _make_windows_venv(prefix)
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+
+    assert install._find_hermes_python() == python
+
+
+def test_windows_virtual_env_discovers_scripts_python_exe(tmp_path, monkeypatch):
+    """Route 4: VIRTUAL_ENV must find its validated native Windows runtime."""
+    _isolate_windows_discovery(tmp_path, monkeypatch)
+    venv = tmp_path / "virtual-env"
+    python = _make_windows_venv(venv)
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+
+    assert install._find_hermes_python() == python
+
+
+@pytest.mark.parametrize("kind", ["missing", "nonexecutable", "unrelated"])
+def test_windows_known_root_rejects_invalid_scripts_candidates(tmp_path, monkeypatch, kind):
+    """Windows-shaped candidates retain the existing marker and executable checks."""
+    _isolate_windows_discovery(tmp_path, monkeypatch)
+    home = tmp_path / "hermes-home"
+    root = home / "hermes-agent" / "venv"
+    candidate = root / "Scripts" / "python.exe"
+    if kind == "nonexecutable":
+        _make_windows_venv(root).chmod(0o644)
+    elif kind == "unrelated":
+        _write_executable(candidate, "#!/bin/sh\nexit 0\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert install._find_hermes_python() is None
+
+
+def test_windows_explicit_python_still_precedes_implicit_discovery(tmp_path, monkeypatch):
+    """An explicit path remains authoritative over a valid Windows route."""
+    _isolate_windows_discovery(tmp_path, monkeypatch)
+    discovered = _make_windows_venv(tmp_path / "virtual-env")
+    chosen = tmp_path / "chosen" / "python.exe"
+    monkeypatch.setenv("VIRTUAL_ENV", str(discovered.parent.parent))
+
+    assert install._find_hermes_python(explicit_python=chosen) == chosen
+
+
+def test_posix_known_root_precedence_stays_python_then_python3(tmp_path, monkeypatch):
+    """Windows support does not alter the established POSIX candidate order."""
+    home = tmp_path / "hermes-home"
+    venv = home / "hermes-agent" / "venv"
+    python = _make_venv(venv)
+    python3 = _write_executable(venv / "bin" / "python3", "#!/bin/sh\nexit 0\n")
+    windows_python = _make_windows_venv(venv)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "user-home"))
+    monkeypatch.setattr(install, "_is_windows_platform", lambda: False, raising=False)
+
+    assert install._find_hermes_python() == python
+    assert python != python3 != windows_python

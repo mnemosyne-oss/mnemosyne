@@ -362,7 +362,7 @@ hermes mnemosyne import --file {provider}_export.json
 
 ### Option C: Request an importer
 Open an issue on GitHub requesting a {provider.title()} importer:
-https://github.com/AxDSan/mnemosyne/issues
+https://github.com/mnemosyne-oss/mnemosyne/issues
 """
 
 
