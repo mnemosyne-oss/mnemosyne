@@ -7,11 +7,13 @@ import pytest
 from mnemosyne_hermes import MnemosyneMemoryProvider
 
 # The #1050 canonical write guard compares the HOST-REPORTED turn profile
-# against the bound owner. On a bare interpreter the host module is absent
-# and the guard is exempt; inside a hermes venv a real active profile
-# (typically 'default') would clash with these tests' bound identities and
-# fail closed. Pin the turn profile to whatever the test last bound so the
-# guard sees a concordant owner in every environment.
+# against the bound owner and fails closed when no turn profile can be
+# resolved — a bare interpreter used to be exempt; an unresolvable profile
+# now proves nothing, so canonical writes are refused there too (reads are
+# unaffected). Inside a hermes venv a real active profile (typically
+# 'default') would clash with these tests' bound identities. Pin the turn
+# profile to whatever the test last bound in every environment: patch the
+# host module when it exists, install a minimal stand-in when it does not.
 _BOUND = {"profile": "profile_a"}
 
 
@@ -20,7 +22,16 @@ def _align_turn_profile(monkeypatch):
     try:
         import hermes_cli.profiles as _prof
     except Exception:
-        return
+        _prof = None
+    if _prof is None:
+        import sys as _sys
+        import types as _types
+        _cli = _types.ModuleType("hermes_cli")
+        _prof = _types.ModuleType("hermes_cli.profiles")
+        _prof.get_active_profile_name = lambda: _BOUND["profile"]
+        _cli.profiles = _prof
+        monkeypatch.setitem(_sys.modules, "hermes_cli", _cli)
+        monkeypatch.setitem(_sys.modules, "hermes_cli.profiles", _prof)
     monkeypatch.setattr(_prof, "get_active_profile_name", lambda: _BOUND["profile"])
 
 

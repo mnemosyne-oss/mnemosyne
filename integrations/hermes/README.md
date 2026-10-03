@@ -351,7 +351,7 @@ Hermes calls `mnemosyne_recall`, finds the relevant prior failure and fix, and d
 
 If Mnemosyne's database is unavailable or disk is full, the provider logs the error and Hermes continues answering. Memory is additive: it never blocks the user.
 
-Memory issues are logged but never surface as user-facing errors.
+Lifecycle failures (prefetch, turn sync, session-end, cleanup) are logged and never surface as user-facing errors. The one deliberate exception is canonical-write ownership: when ownership cannot be established because the active profile mismatches or no active profile can be resolved, a canonical remember or forget returns a structured refusal (`canonical_owner_mismatch` / `canonical_profile_unavailable`) to the tool caller instead of writing an unowned row. A refusal means nothing was written; it never raises into the lifecycle.
 
 ## Contributing
 

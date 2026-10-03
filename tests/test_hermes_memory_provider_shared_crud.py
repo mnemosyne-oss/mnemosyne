@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from hermes_memory_provider import MnemosyneMemoryProvider
@@ -177,6 +178,62 @@ def test_invalidate_missing_target_stays_memory_not_found(tmp_path, monkeypatch)
 
     assert result["status"] == "memory_not_found"
     assert result["bank"] == "private"
+
+
+def test_invalidate_inactive_target_stays_memory_not_found(tmp_path, monkeypatch):
+    """The replacement is healthy; the target is not. Re-invalidating an
+    already-superseded row must report the target, not blame the live
+    replacement (review on #1113) — invalidate() only touches ACTIVE rows."""
+    provider, _ = _provider(tmp_path, monkeypatch)
+    first = _call(provider, "mnemosyne_remember", {
+        "content": "row that gets superseded first", "source": "fact",
+    })
+    successor = _call(provider, "mnemosyne_remember", {
+        "content": "healthy successor row", "source": "fact",
+    })
+
+    retired = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": first["memory_id"],
+        "replacement_id": successor["memory_id"],
+    })
+    assert retired["status"] == "invalidated"
+
+    result = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": first["memory_id"],
+        "replacement_id": successor["memory_id"],
+    })
+    assert result["status"] == "memory_not_found"
+
+
+def test_invalidate_expired_target_stays_memory_not_found(tmp_path, monkeypatch):
+    """The predicate under test also handles `valid_until`, not just
+    superseded_by (review on #1113, second round). The expired stamp is
+    written in the same naive-local ISO family that
+    BeamMemory.invalidate(replacement_id=...) compares against, one day in
+    the past — so the row is expired on every host timezone, and the case
+    isolates the valid_until half of the predicate (superseded_by stays
+    NULL). A bare get() still returns the row, which is exactly what used
+    to make the failed invalidation wrongly blame the healthy replacement."""
+    provider, _ = _provider(tmp_path, monkeypatch)
+    target = _call(provider, "mnemosyne_remember", {
+        "content": "row expired through valid_until", "source": "fact",
+    })
+    replacement = _call(provider, "mnemosyne_remember", {
+        "content": "healthy replacement row", "source": "fact",
+    })
+
+    past = (datetime.now() - timedelta(days=1)).isoformat()
+    provider._beam.conn.execute(
+        "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+        (past, target["memory_id"]),
+    )
+    provider._beam.conn.commit()
+
+    result = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": target["memory_id"],
+        "replacement_id": replacement["memory_id"],
+    })
+    assert result["status"] == "memory_not_found"
 
 
 def test_invalidate_rejects_self_replacement(tmp_path, monkeypatch):

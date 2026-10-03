@@ -61,10 +61,17 @@ class _RecordingBeam:
         self.canonical = None
         self.session_id = session_id
         self.invalidated: list[tuple] = []
+        self.rows: dict = {}
+        # None keeps invalidate() reporting success (the common path);
+        # set False to exercise the failed-invalidation reporting below.
+        self.invalidate_result = None
 
     def invalidate(self, memory_id, replacement_id=None):
         self.invalidated.append((memory_id, replacement_id))
-        return True
+        return True if self.invalidate_result is None else self.invalidate_result
+
+    def get(self, memory_id):
+        return self.rows.get(memory_id)
 
 
 def _provider(tmp_path, monkeypatch, **init_kwargs):
@@ -317,6 +324,29 @@ def test_canonical_write_guard_fails_closed_on_mismatch(tmp_path, monkeypatch):
     assert err["active_profile"] == "bob"
 
 
+def test_canonical_write_guard_fails_closed_on_unresolvable_profile(tmp_path, monkeypatch):
+    # An unresolvable turn profile proves nothing about ownership, so a
+    # canonical write through it is refused — the fail-closed intent the
+    # dispatch site documents. Both anomaly shapes count: an empty name
+    # and a lookup that raises.
+    profiles = _install_fake_hermes_modules(monkeypatch, tmp_path, "alice")
+    p = _provider(tmp_path, monkeypatch)
+    p._agent_identity = "alice"
+
+    profiles.get_active_profile_name = lambda: ""
+    err = json.loads(p._canonical_write_guard("mnemosyne_remember_canonical"))
+    assert err["status"] == "canonical_profile_unavailable"
+    assert err["tool"] == "mnemosyne_remember_canonical"
+
+    def _boom():
+        raise RuntimeError("profiles module down")
+
+    profiles.get_active_profile_name = _boom
+    err = json.loads(p._canonical_write_guard("mnemosyne_forget_canonical"))
+    assert err["status"] == "canonical_profile_unavailable"
+    assert err["tool"] == "mnemosyne_forget_canonical"
+
+
 # --------------------------------------------------------------------------
 # Invalidate bank routing (surface branch)
 # --------------------------------------------------------------------------
@@ -347,3 +377,88 @@ def test_invalidate_routes_by_id_namespace_and_explicit_bank(tmp_path, monkeypat
     # Unknown bank is refused, not defaulted.
     out = json.loads(p._handle_invalidate({"memory_id": "x1", "bank": "public"}))
     assert "unknown bank" in out["error"]
+
+
+def test_invalidate_self_replacement_rejected_before_lookup(tmp_path, monkeypatch):
+    # Parity with the root provider: a row cannot supersede itself, and the
+    # caller must not have to read that off a memory_not_found.
+    p = _provider(tmp_path, monkeypatch)
+    out = json.loads(p._handle_invalidate(
+        {"memory_id": "abc123", "replacement_id": "abc123"}))
+    assert "replacement_id must differ" in out["error"]
+    assert p._beam.invalidated == []  # refused before any beam call
+
+
+def test_invalidate_reports_missing_replacement(tmp_path, monkeypatch):
+    # Parity with the root provider: when the target is visible but the
+    # invalidation still fails, name the replacement id as the bad input —
+    # never a bare memory_not_found that sends the caller hunting for the
+    # wrong id.
+    p = _provider(tmp_path, monkeypatch)
+    p._beam.invalidate_result = False
+    p._beam.rows["abc123"] = {"id": "abc123"}
+
+    out = json.loads(p._handle_invalidate(
+        {"memory_id": "abc123", "replacement_id": "gone"}))
+    assert out["status"] == "replacement_not_found"
+    assert out["replacement_id"] == "gone"
+    assert out["memory_id"] == "abc123"
+
+    # Target itself invisible: still memory_not_found.
+    out = json.loads(p._handle_invalidate(
+        {"memory_id": "absent", "replacement_id": "gone"}))
+    assert out["status"] == "memory_not_found"
+
+
+def test_invalidate_inactive_target_stays_memory_not_found(tmp_path, monkeypatch):
+    # get() returns superseded and expired rows too, so a bare existence
+    # check would let an already-dead target wrongly blame a healthy
+    # replacement (review on #1113). Only an ACTIVE target makes the
+    # replacement the suspect. The stand-in beam carries no live connection,
+    # so the active-state helper falls back to the metadata get() reports.
+    p = _provider(tmp_path, monkeypatch)
+    p._beam.invalidate_result = False
+    p._beam.rows["abc123"] = {"id": "abc123", "superseded_by": "earlier"}
+    p._beam.rows["gone"] = {"id": "gone"}
+
+    out = json.loads(p._handle_invalidate(
+        {"memory_id": "abc123", "replacement_id": "gone"}))
+    assert out["status"] == "memory_not_found"
+
+
+def test_invalidate_active_helper_uses_sql_when_beam_has_connection(tmp_path, monkeypatch):
+    # The metadata fallback above is only half the helper. With a live
+    # connection the decision goes through core's own active-row predicate
+    # (review on #1113, second round): an EXPIRED target (valid_until in the
+    # past) must report the target even though get() still sees the row,
+    # while an ACTIVE target keeps letting the replacement take the blame.
+    p = _provider(tmp_path, monkeypatch)
+    p._beam.invalidate_result = False
+    conn = sqlite3.connect(str(tmp_path / "beam.db"))
+    for table in ("working_memory", "episodic_memory"):
+        conn.execute(
+            f"CREATE TABLE {table} (id TEXT, session_id TEXT, scope TEXT,"
+            " superseded_by TEXT, valid_until TEXT)"
+        )
+    conn.execute(
+        "INSERT INTO working_memory VALUES ('dead', 'sess', 'global', NULL, ?)",
+        ("2000-01-01T00:00:00",),
+    )
+    conn.execute(
+        "INSERT INTO working_memory VALUES ('alive', 'sess', 'global', NULL, NULL)"
+    )
+    conn.commit()
+    p._beam.conn = conn
+    # Metadata says both rows are alive; only the SQL predicate knows 'dead'
+    # expired. If the test ever silently falls back, this is the line that
+    # would flip the expired case and fail the assertion below.
+    p._beam.rows.update({"dead": {"id": "dead"}, "alive": {"id": "alive"}})
+
+    out = json.loads(p._handle_invalidate(
+        {"memory_id": "dead", "replacement_id": "alive"}))
+    assert out["status"] == "memory_not_found"
+
+    out = json.loads(p._handle_invalidate(
+        {"memory_id": "alive", "replacement_id": "gone"}))
+    assert out["status"] == "replacement_not_found"
+    conn.close()
