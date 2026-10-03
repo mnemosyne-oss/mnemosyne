@@ -25,6 +25,10 @@ class _Provider:
     def handle_tool_call(self, _tool_name, _arguments):
         return '{"status": "ok"}'
 
+    def _handle_persona_tool(self, tool_name, arguments):
+        adapter = persona_adapter.PersonaAdapter(beam_instance=self._beam)
+        return adapter.handle_tool_call(tool_name, arguments)
+
     def get_tool_schemas(self):
         return [{"name": "mnemosyne_persona_promote", "description": ""}]
 

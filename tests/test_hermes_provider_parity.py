@@ -77,6 +77,10 @@ def _config_schema(module):
 def _write_mnemosyne_config(hermes_home: Path, tools) -> None:
     if tools is None:
         body = "memory:\n  provider: mnemosyne\n  mnemosyne: {}\n"
+    elif isinstance(tools, str):
+        # A quoted scalar, e.g. the serialized sentinel "None"/"null" from
+        # issue #1021, distinct from the YAML null keyword and from `[]`.
+        body = f'memory:\n  provider: mnemosyne\n  mnemosyne:\n    tools: "{tools}"\n'
     elif not tools:
         body = "memory:\n  provider: mnemosyne\n  mnemosyne:\n    tools: []\n"
     else:
@@ -100,6 +104,70 @@ def _filtered_schemas(module, names: list[str]):
     return [schemas[name] for name in names]
 
 
+def test_graph_link_write_admission_provider_parity(
+    tmp_path, monkeypatch, provider_modules
+):
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            f"graph-link-{name}",
+            hermes_home=str(tmp_path / name),
+            profile_isolation=False,
+            agent_context="primary",
+            ignore_patterns=[r"^ISSUE821"],
+            write_classifier="strict",
+        )
+        assert provider._beam is not None
+        original_resolve = provider._resolve_effective_write_policy
+        resolutions = 0
+
+        def resolve_once():
+            nonlocal resolutions
+            resolutions += 1
+            return original_resolve()
+
+        provider._resolve_effective_write_policy = resolve_once
+        rejected_source = f"source-rejected-{name}"
+        rejected_target = f"target-rejected-{name}"
+        allowed_source = f"ISSUE821 source identifier {name}"
+        allowed_target = f"ISSUE821 target identifier {name}"
+        try:
+            rejected = json.loads(provider.handle_tool_call(
+                "mnemosyne_graph_link",
+                {
+                    "source_id": rejected_source,
+                    "target_id": rejected_target,
+                    "relationship": "ISSUE821 blocked relationship",
+                },
+            ))
+            assert rejected == {"status": "filtered"}
+            assert provider._beam.episodic_graph.find_related_memories(
+                rejected_source, depth=1
+            ) == []
+
+            allowed = json.loads(provider.handle_tool_call(
+                "mnemosyne_graph_link",
+                {
+                    "source_id": allowed_source,
+                    "target_id": allowed_target,
+                    "relationship": "references",
+                },
+            ))
+            assert allowed["status"] == "linked"
+            assert allowed["source"] == allowed_source
+            assert allowed["target"] == allowed_target
+            assert allowed["relationship"] == "references"
+            related = provider._beam.episodic_graph.find_related_memories(
+                allowed_source, depth=1
+            )
+            assert [row["memory_id"] for row in related] == [allowed_target]
+            assert resolutions == 2
+        finally:
+            provider.shutdown()
+
+
 PROVIDER_TOOL_NAMES = [
     "mnemosyne_remember", "mnemosyne_recall", "mnemosyne_shared_remember",
     "mnemosyne_shared_recall", "mnemosyne_shared_forget", "mnemosyne_shared_stats",
@@ -115,6 +183,7 @@ PROVIDER_TOOL_NAMES = [
     "mnemosyne_graph_query", "mnemosyne_graph_link", "mnemosyne_sync_push",
     "mnemosyne_sync_pull", "mnemosyne_sync_status", "mnemosyne_persona_promote",
     "mnemosyne_persona_demote", "mnemosyne_persona_list", "mnemosyne_persona_reinforce",
+    "mnemosyne_remember_media",
 ]
 
 
@@ -199,6 +268,140 @@ def _json_stable(value):
     return json.loads(json.dumps(value, sort_keys=True))
 
 
+def test_staged_pending_response_keys_match_across_providers(
+    tmp_path, monkeypatch, provider_modules
+):
+    """A staged mnemosyne_batch response must expose the SAME keys on both surfaces.
+
+    dplush's #936 review (blocking): the legacy surface returned the documented
+    ``pending_ids``/``count`` compatibility aliases while the standalone surface
+    returned only ``staged``/``staged_actions``/``staged_count``, so a client
+    forwarding ``pending_ids`` raised KeyError against one of the two supported
+    providers. The assertion is deliberately unconditional — an
+    ``if key in resp`` guard is what previously hid the divergence and is
+    forbidden here (the keys must exist on BOTH surfaces).
+    """
+    import types
+
+    stub = types.ModuleType("hermes_constants")
+    stub.get_hermes_home = lambda: tmp_path
+    monkeypatch.setitem(sys.modules, "hermes_constants", stub)
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MNEMOSYNE_HOST_LLM_ENABLED", "0")
+
+    responses = {}
+    for name, module in provider_modules.items():
+        monkeypatch.setattr(module, "_write_approval_enabled", lambda: True)
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            f"staged-parity-{name}",
+            hermes_home=str(tmp_path / name),
+            profile_isolation=False,
+            agent_context="primary",
+        )
+        assert provider._beam is not None
+        responses[name] = json.loads(provider._handle_batch({
+            "operations": [
+                {"action": "remember", "content": "parity staged one"},
+                {"action": "forget", "memory_id": "00000000-dead-beef"},
+            ],
+        }))
+        provider._beam.conn.close()
+
+    legacy = responses["hermes_memory_provider"]
+    standalone = responses["mnemosyne_hermes"]
+
+    # Unconditional key presence on both surfaces.
+    for resp in (legacy, standalone):
+        assert "pending_ids" in resp, sorted(resp)
+        assert "count" in resp, sorted(resp)
+        assert "staged" in resp, sorted(resp)
+        assert "staged_actions" in resp, sorted(resp)
+        assert "staged_count" in resp, sorted(resp)
+
+    assert set(legacy) == set(standalone)
+    assert legacy["staged_count"] == standalone["staged_count"] == 2
+    assert legacy["count"] == standalone["count"] == 2
+    assert legacy["pending_ids"] == legacy["staged"]
+    assert standalone["pending_ids"] == standalone["staged"]
+    assert legacy["message"] == standalone["message"]
+    assert [e["action"] for e in legacy["staged_actions"]] == \
+        [e["action"] for e in standalone["staged_actions"]] == ["remember", "forget"]
+
+
+def test_session_switch_without_key_preserves_configured_gateway_scope(
+    tmp_path, monkeypatch, provider_modules
+):
+    """A later callback omission must not replace the configured gateway scope."""
+    stub = types.ModuleType("hermes_constants")
+    setattr(stub, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setitem(sys.modules, "hermes_constants", stub)
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MNEMOSYNE_HOST_LLM_ENABLED", "0")
+
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            f"initial-{name}",
+            hermes_home=str(tmp_path / name),
+            gateway_session_key="configured-gateway",
+            profile_isolation=False,
+            agent_context="primary",
+        )
+        assert provider._beam is not None
+
+        provider.on_session_switch(f"rotated-{name}")
+        provider.on_memory_write("add", "project", f"direct write from {name}")
+        direct_scope = provider._beam.conn.execute(
+            "SELECT session_id FROM working_memory WHERE content = ?",
+            (f"direct write from {name}",),
+        ).fetchone()[0]
+
+        monkeypatch.setattr(module, "_write_approval_enabled", lambda: True)
+        staged = json.loads(provider.handle_tool_call(
+            "mnemosyne_remember",
+            {"content": f"staged write from {name}", "scope": "session"},
+        ))
+        pending_id = staged.get("pending_id") or staged["staged"][0]["pending_id"]
+        record = json.loads(
+            (tmp_path / "pending" / "memory" / f"{pending_id}.json").read_text()
+        )
+
+        assert provider._session_id == "hermes_configured-gateway"
+        assert direct_scope == "hermes_configured-gateway"
+        assert record["session_scope"] == "hermes_configured-gateway"
+        provider._beam.conn.close()
+
+
+def test_session_switch_callback_can_replace_configured_gateway_scope(
+    tmp_path, monkeypatch, provider_modules
+):
+    """An explicit non-empty callback key remains the durable gateway scope."""
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MNEMOSYNE_HOST_LLM_ENABLED", "0")
+
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            f"initial-{name}",
+            hermes_home=str(tmp_path / name),
+            gateway_session_key="configured-gateway",
+            profile_isolation=False,
+            agent_context="primary",
+        )
+        assert provider._beam is not None
+
+        provider.on_session_switch(
+            f"rotated-{name}", gateway_session_key="replacement-gateway"
+        )
+        provider.on_session_switch(f"rotated-again-{name}")
+
+        assert provider._gateway_session_key == "replacement-gateway"
+        assert provider._session_id == "hermes_replacement-gateway"
+        assert provider._beam.session_id == "hermes_replacement-gateway"
+        provider._beam.conn.close()
+
+
 def test_provider_tool_sets_match(provider_modules):
     tool_sets = {name: set(_tool_schemas(module)) for name, module in provider_modules.items()}
 
@@ -249,11 +452,28 @@ def test_provider_config_defaults_match(provider_modules):
     root_config = _config_schema(provider_modules["hermes_memory_provider"])
     integration_config = _config_schema(provider_modules["mnemosyne_hermes"])
 
-    assert _json_stable(root_config) == _json_stable(integration_config)
+    root_sync_roles = root_config["sync_roles"].copy()
+    integration_sync_roles = integration_config["sync_roles"].copy()
+    sync_roles_description = integration_sync_roles.pop("description")
+    root_sync_roles.pop("description")
+    root_without_sync_roles = root_config.copy()
+    integration_without_sync_roles = integration_config.copy()
+    root_without_sync_roles.pop("sync_roles")
+    integration_without_sync_roles.pop("sync_roles")
+
+    assert _json_stable(root_without_sync_roles) == _json_stable(integration_without_sync_roles)
+    assert _json_stable(root_sync_roles) == _json_stable(integration_sync_roles)
+    assert "stringified YAML/JSON lists are not parsed" in sync_roles_description
+    assert "no valid roles disable it and log one warning" in sync_roles_description
+    assert "initialize() kwarg > Hermes memory.mnemosyne config" in sync_roles_description
+
     assert root_config["auto_sleep"]["default"] is True
     assert root_config["sync_roles"]["default"] == ["user"]
     assert root_config["default_scope"]["choices"] == ["session", "global"]
     assert root_config["default_scope"]["default"] == "session"
+    assert root_config["write_classifier"]["choices"] == ["off", "warn", "strict"]
+    assert root_config["write_classifier"]["default"] == "off"
+    assert "kwarg overrides" in root_config["write_classifier"]["description"]
     assert root_config["tools"]["default"] is None
 
 
@@ -518,6 +738,14 @@ def test_uninitialized_primary_tool_call_diverges_by_provider(
         (["mnemosyne_remember", "mnemosyne_recall"], ["mnemosyne_remember", "mnemosyne_recall"], False),
         ([], [], False),
         (["mnemosyne_not_real"], None, True),
+        # issue #1021: a serialized "None"/"null" (any case) or empty
+        # string must resolve the same as real None, not as an unknown
+        # tool name or an empty allowlist.
+        ("None", PROVIDER_TOOL_NAMES, False),
+        ("null", PROVIDER_TOOL_NAMES, False),
+        ("NoNe", PROVIDER_TOOL_NAMES, False),
+        ("  nUlL  ", PROVIDER_TOOL_NAMES, False),
+        ("", PROVIDER_TOOL_NAMES, False),
     ],
 )
 def test_tool_whitelist_without_yaml_matches_pyyaml(
@@ -652,6 +880,82 @@ def test_tool_whitelist_unknown_name_fails_loudly(tmp_path, provider_modules):
             provider.get_tool_schemas()
 
 
+def test_tool_whitelist_unknown_name_fails_at_initialize(tmp_path, provider_modules):
+    """issue #1063: initialize() itself must reject a bad allowlist.
+
+    Before this, an unknown tool name passed construction cleanly and only
+    raised once something called get_tool_schemas()/handle_tool_call, i.e. at
+    the first tool-list or tool-call request. hermes_home is not known until
+    initialize() binds it, so the check has to live there, not in __init__.
+    """
+    _write_mnemosyne_config(tmp_path, ["mnemosyne_remember", "mnemosyne_not_real"])
+
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+            provider.initialize("bad-tools", hermes_home=str(tmp_path), agent_context="primary")
+        assert provider._beam is None
+
+        # A skip-context init (subagent/cron/...) binds hermes_home the same
+        # way and must fail just as loudly, not only the primary path.
+        with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+            provider.initialize("bad-tools-subagent", hermes_home=str(tmp_path), agent_context="subagent")
+
+    # Config-reload behavior is unchanged: correcting the file and
+    # initializing again must succeed and see the fix, not a cached failure.
+    _write_mnemosyne_config(tmp_path, ["mnemosyne_remember"])
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize("good-tools", hermes_home=str(tmp_path), agent_context="primary")
+        try:
+            assert _schema_names(provider) == ["mnemosyne_remember"]
+        finally:
+            provider.shutdown()
+
+
+def test_tool_whitelist_unknown_name_on_reinit_releases_active_state(tmp_path, provider_modules):
+    """issue #1073 (CodeRabbit): a re-init that fails tool validation must not
+    leave a previously active instance registered as module-active, or
+    holding the host-LLM backend lease, once its beam has been cleared.
+
+    Asserts the per-instance flags rather than the module-global counters:
+    other tests in this file share these same module-scoped provider
+    modules and some leave a provider initialized without shutting it
+    down, so the global count is not a clean signal here.
+    """
+    from mnemosyne.core.llm_backends import get_host_llm_backend, set_host_llm_backend
+
+    for module in provider_modules.values():
+        _write_mnemosyne_config(tmp_path, ["mnemosyne_remember"])
+        provider = module.MnemosyneMemoryProvider()
+        try:
+            provider.initialize("healthy", hermes_home=str(tmp_path), agent_context="primary")
+            assert provider._beam is not None
+            assert provider._is_active_in_module is True
+            assert get_host_llm_backend() is not None
+            owns_backend = getattr(provider, "_owns_host_llm_backend", None)
+            if owns_backend is not None:
+                assert owns_backend is True
+
+            _write_mnemosyne_config(tmp_path, ["mnemosyne_remember", "mnemosyne_not_real"])
+            with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+                provider.initialize("reinit-bad-tools", hermes_home=str(tmp_path), agent_context="primary")
+
+            assert provider._beam is None
+            assert provider._is_active_in_module is False
+            if owns_backend is not None:
+                assert provider._owns_host_llm_backend is False
+            else:
+                # hermes_memory_provider has no per-instance ownership
+                # refcount: it always (un)registers the shared global on
+                # failure, same as shutdown(), so the global is the
+                # correct signal for that module.
+                assert get_host_llm_backend() is None
+        finally:
+            provider.shutdown()
+            set_host_llm_backend(None)
+
+
 def test_config_reader_tolerates_null_and_non_mapping_levels(tmp_path):
     from mnemosyne.hermes_config import read_hermes_config_key
 
@@ -708,6 +1012,7 @@ class _FakeBeam:
 
     def remember(self, **kwargs):
         self.calls.append(kwargs)
+        return "fake-memory-id"
 
 
 def _new_provider(module, *, scope="session", roles=("user", "assistant")):
@@ -806,6 +1111,12 @@ class _ObservedLock:
         self.release()
 
 
+class _ObservedRLock(_ObservedLock):
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.waiting = threading.Event()
+
+
 def test_provider_lazy_beam_lock_initialization_is_thread_safe(monkeypatch, provider_modules):
     """Concurrent __new__ callers publish and receive one lock in both providers."""
     real_lock = threading.Lock
@@ -836,7 +1147,11 @@ def test_provider_lazy_beam_lock_initialization_is_thread_safe(monkeypatch, prov
         workers = [threading.Thread(target=get_lock) for _ in range(2)]
         # `threading` is a shared stdlib module, so replace only this provider
         # module's binding rather than patching threading.Lock process-wide.
-        monkeypatch.setattr(module, "threading", types.SimpleNamespace(Lock=racing_lock))
+        monkeypatch.setattr(
+            module,
+            "threading",
+            types.SimpleNamespace(RLock=racing_lock),
+        )
         try:
             for worker in workers:
                 worker.start()
@@ -1416,6 +1731,98 @@ def test_provider_sync_construction_race_retries_current_surface(
         assert shutdown == [surface_a, surface_b]
 
 
+def test_public_sync_dispatch_releases_publication_lock_and_retries_generation(
+    monkeypatch, provider_modules
+):
+    """A public dispatch must not publish an adapter for an invalidated surface."""
+    for name, module in provider_modules.items():
+        surface_a = object()
+        surface_b = object()
+        construction_started = threading.Event()
+        release_construction = threading.Event()
+        publication_acquired = threading.Event()
+        constructed = []
+        handled = []
+        shutdown = []
+        errors = []
+        result = []
+
+        class _Adapter:
+            def __init__(self, beam, _config):
+                self.beam = beam
+                constructed.append(beam)
+                if beam is surface_a:
+                    construction_started.set()
+                    assert release_construction.wait(5)
+
+            def handle_tool_call(self, _tool_name, _args):
+                handled.append(self.beam)
+                return "ok"
+
+            def shutdown(self):
+                shutdown.append(self.beam)
+
+        fake_sync_module = types.ModuleType(f"{name}.sync_adapter")
+        setattr(fake_sync_module, "SyncAdapter", _Adapter)
+        monkeypatch.setitem(sys.modules, f"{name}.sync_adapter", fake_sync_module)
+        provider = module.MnemosyneMemoryProvider()
+        provider._beam = types.SimpleNamespace(
+            session_id="stable-session", channel_id="stable-session"
+        )
+        provider._session_id = "stable-session"
+        provider._surface_beam = surface_a
+        provider.has_tool = lambda _tool_name: True
+        if name == "mnemosyne_hermes":
+            provider._maybe_retry_init = lambda: None
+            provider._ensure_initialized_for_tools = lambda: None
+
+        def dispatch() -> None:
+            try:
+                result.append(
+                    provider.handle_tool_call("mnemosyne_sync_status", {})
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        def invalidate_surface() -> None:
+            try:
+                with provider._ensure_surface_adapter_lock():
+                    provider._surface_generation += 1
+                    provider._surface_beam = surface_b
+                    publication_acquired.set()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        worker = threading.Thread(target=dispatch)
+        lifecycle = threading.Thread(target=invalidate_surface)
+        worker.start()
+        assert construction_started.wait(5)
+        lifecycle.start()
+        try:
+            assert publication_acquired.wait(2)
+        finally:
+            release_construction.set()
+            worker.join(5)
+            lifecycle.join(5)
+
+        assert not worker.is_alive()
+        assert not lifecycle.is_alive()
+        assert not errors
+        assert result == ["ok"]
+        assert constructed == [surface_a, surface_b]
+        assert handled == [surface_b]
+        assert shutdown == [surface_a]
+        cache_name = (
+            "_sync_adapter"
+            if name == "hermes_memory_provider"
+            else "_provider_sync_adapter"
+        )
+        assert getattr(provider, cache_name).beam is surface_b
+
+        provider.shutdown()
+        assert shutdown == [surface_a, surface_b]
+
+
 def test_standalone_sync_construction_race_retries_current_surface(
     monkeypatch, provider_modules
 ):
@@ -1922,3 +2329,409 @@ def test_provider_batch_dispatch_matches(tmp_path, provider_modules):
         "operations_count": 1,
         "result_statuses": ["stored"],
     }
+
+
+class _ForgetFallbackBeam:
+    def __init__(self, *, episodic_result=True):
+        self.calls = []
+        self.episodic_result = episodic_result
+
+    def forget_working(self, memory_id):
+        self.calls.append(("working", memory_id))
+        return False
+
+    def forget_episodic(self, memory_id):
+        self.calls.append(("episodic", memory_id))
+        return self.episodic_result
+
+
+class _BeamWithoutEpisodicForget:
+    def forget_working(self, memory_id):
+        return False
+
+
+def test_forget_falls_back_to_episodic_in_both_providers(provider_modules):
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider.__new__(
+            module.MnemosyneMemoryProvider
+        )
+        provider._beam = _ForgetFallbackBeam()
+        provider._audit_event = lambda *args, **kwargs: None
+
+        result = json.loads(provider._handle_forget({"memory_id": "episode"}))
+
+        assert result == {"status": "deleted", "memory_id": "episode"}, name
+        assert provider._beam.calls == [
+            ("working", "episode"),
+            ("episodic", "episode"),
+        ], name
+
+
+def test_forget_returns_not_found_when_both_tiers_miss(provider_modules):
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider.__new__(
+            module.MnemosyneMemoryProvider
+        )
+        provider._beam = _ForgetFallbackBeam(episodic_result=False)
+        provider._audit_event = lambda *args, **kwargs: None
+
+        result = json.loads(provider._handle_forget({"memory_id": "missing"}))
+
+        assert result == {"status": "not_found", "memory_id": "missing"}, name
+        assert provider._beam.calls == [
+            ("working", "missing"),
+            ("episodic", "missing"),
+        ], name
+
+
+def test_forget_keeps_older_core_compatibility_in_both_providers(provider_modules):
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider.__new__(
+            module.MnemosyneMemoryProvider
+        )
+        provider._beam = _BeamWithoutEpisodicForget()
+        provider._audit_event = lambda *args, **kwargs: None
+
+        result = json.loads(provider._handle_forget({"memory_id": "episode"}))
+
+        assert result == {"status": "not_found", "memory_id": "episode"}, name
+
+
+class _ScopeRecordingBeam:
+    def __init__(self):
+        self.session_id = "active-session"
+        self.channel_id = "active-channel"
+        self.db_path = "active.db"
+        self.author_id = "active-author"
+        self.author_type = "human"
+        self.calls = []
+
+    def get_working_stats(self):
+        return {"total": 1}
+
+    def _count_unconsolidated_before(self, _cutoff):
+        return 1
+
+    def remember(self, **kwargs):
+        self.calls.append(
+            (kwargs.get("content"), self.session_id, self.channel_id)
+        )
+        return "memory-id"
+
+
+def _replay_lock_provider(module):
+    provider = module.MnemosyneMemoryProvider()
+    beam = _ScopeRecordingBeam()
+    provider._beam = beam
+    provider._memory = None
+    provider._session_id = beam.session_id
+    provider._agent_context = ""
+    provider._reflect_disabled_for_cron = False
+    provider.has_tool = lambda _name: True
+    provider._maybe_retry_init = lambda: None
+    provider._ensure_initialized_for_tools = lambda: None
+    provider._audit_event = lambda *args, **kwargs: None
+    provider._handle_remember = lambda args: json.dumps({
+        "memory_id": beam.remember(content=args["content"]),
+    })
+    return provider, beam
+
+
+@pytest.mark.parametrize("callback", ["on_memory_write", "handle_tool_call"])
+def test_scoped_replay_serializes_root_beam_callbacks(
+    provider_modules, callback
+):
+    """Concurrent callbacks cannot write under the temporary replay scope."""
+    for module in provider_modules.values():
+        provider, beam = _replay_lock_provider(module)
+        beam_lock = _ObservedRLock()
+        provider._beam_access_lock = beam_lock
+        replay_entered = threading.Event()
+        release_replay = threading.Event()
+        callback_started = threading.Event()
+        failures = []
+
+        def replay():
+            try:
+                with provider._replay_scope_locked(
+                    "staged-session", "staged-channel"
+                ):
+                    replay_entered.set()
+                    assert release_replay.wait(timeout=5)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        def invoke_callback():
+            try:
+                callback_started.set()
+                if callback == "on_memory_write":
+                    provider.on_memory_write("add", "session", "concurrent")
+                else:
+                    provider.handle_tool_call(
+                        "mnemosyne_remember", {"content": "concurrent"}
+                    )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        replay_thread = threading.Thread(target=replay)
+        callback_thread = threading.Thread(target=invoke_callback)
+        replay_thread.start()
+        assert replay_entered.wait(timeout=1)
+        beam_lock.waiting.clear()
+        callback_thread.start()
+        assert callback_started.wait(timeout=1)
+        assert beam_lock.waiting.wait(timeout=1), (
+            f"{callback} did not attempt the Beam lock"
+        )
+
+        try:
+            assert callback_thread.is_alive(), (
+                f"{callback} reached the Beam during scoped replay"
+            )
+            assert beam.calls == []
+        finally:
+            release_replay.set()
+            replay_thread.join(timeout=2)
+            callback_thread.join(timeout=2)
+
+        assert not replay_thread.is_alive()
+        assert not callback_thread.is_alive()
+        assert failures == []
+        assert beam.calls == [
+            ("concurrent", "active-session", "active-channel")
+        ]
+
+
+@pytest.mark.parametrize("callback", ["auto_sleep", "session_end"])
+def test_scoped_replay_serializes_background_beam_snapshots(
+    provider_modules, monkeypatch, callback
+):
+    """Background workers snapshot the active scope, never the replay scope."""
+    for module in provider_modules.values():
+        provider, _beam = _replay_lock_provider(module)
+        beam_lock = _ObservedRLock()
+        provider._beam_access_lock = beam_lock
+        provider._auto_sleep_threshold = 0
+        provider._AUTO_SLEEP_TIMEOUT_SECONDS = 2
+        provider.SESSION_END_SLEEP_TIMEOUT_SECONDS = 2
+        provider._reserve_reflection_budget = lambda _reason: None
+        provider._reserve_reflection_budget_locked = lambda _reason: None
+        worker_args = []
+        replay_entered = threading.Event()
+        release_replay = threading.Event()
+        callback_started = threading.Event()
+        failures = []
+
+        class _WorkerBeam:
+            def __init__(self, **kwargs):
+                worker_args.append(kwargs)
+
+            def sleep(self):
+                return None
+
+        monkeypatch.setattr(module, "_get_beam_class", lambda: _WorkerBeam)
+
+        def replay():
+            try:
+                with provider._replay_scope_locked(
+                    "staged-session", "staged-channel"
+                ):
+                    replay_entered.set()
+                    assert release_replay.wait(timeout=5)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        def invoke_callback():
+            try:
+                callback_started.set()
+                if callback == "auto_sleep":
+                    provider._maybe_auto_sleep()
+                else:
+                    provider.on_session_end([])
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        replay_thread = threading.Thread(target=replay)
+        callback_thread = threading.Thread(target=invoke_callback)
+        replay_thread.start()
+        assert replay_entered.wait(timeout=1)
+        beam_lock.waiting.clear()
+        callback_thread.start()
+        assert callback_started.wait(timeout=1)
+        assert beam_lock.waiting.wait(timeout=1), (
+            f"{callback} did not attempt the Beam lock"
+        )
+
+        try:
+            assert callback_thread.is_alive(), (
+                f"{callback} captured the Beam during scoped replay"
+            )
+            assert worker_args == []
+        finally:
+            release_replay.set()
+            replay_thread.join(timeout=2)
+            callback_thread.join(timeout=2)
+
+        assert not replay_thread.is_alive()
+        assert not callback_thread.is_alive()
+        assert failures == []
+        assert len(worker_args) == 1
+        assert worker_args[0] == {
+            "session_id": "active-session",
+            "channel_id": "active-channel",
+            "db_path": "active.db",
+            "author_id": "active-author",
+            "author_type": "human",
+        }
+
+
+def test_scoped_replay_serializes_complete_root_prefetch(
+    provider_modules, monkeypatch
+):
+    """All root prefetch sources read the active scope after replay restores it."""
+    module = provider_modules["hermes_memory_provider"]
+    provider, beam = _replay_lock_provider(module)
+    beam_lock = _ObservedRLock()
+    provider._beam_access_lock = beam_lock
+    provider._skip_contexts = set()
+    provider._prefetch_profile = "test"
+    provider._prefetch_sources = {}
+    observed = []
+    replay_entered = threading.Event()
+    release_replay = threading.Event()
+    prefetch_started = threading.Event()
+    failures = []
+
+    profile = types.SimpleNamespace(sources=["bank"], dedup=False)
+    monkeypatch.setattr(module, "_resolve_profile", lambda _name: profile)
+    provider._prefetch_bank = lambda *_args: observed.append(
+        ("bank", beam.session_id, beam.channel_id)
+    ) or ""
+    provider._prefetch_model_slots = lambda *_args: observed.append(
+        ("model", beam.session_id, beam.channel_id)
+    ) or ""
+    provider._prefetch_identity = lambda *_args: observed.append(
+        ("identity", beam.session_id, beam.channel_id)
+    ) or ""
+
+    def replay():
+        try:
+            with provider._replay_scope_locked(
+                "staged-session", "staged-channel"
+            ):
+                replay_entered.set()
+                assert release_replay.wait(timeout=5)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    def prefetch():
+        try:
+            prefetch_started.set()
+            provider.prefetch("query")
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    replay_thread = threading.Thread(target=replay)
+    prefetch_thread = threading.Thread(target=prefetch)
+    replay_thread.start()
+    assert replay_entered.wait(timeout=1)
+    beam_lock.waiting.clear()
+    prefetch_thread.start()
+    assert prefetch_started.wait(timeout=1)
+    assert beam_lock.waiting.wait(timeout=1)
+
+    try:
+        assert prefetch_thread.is_alive()
+        assert observed == []
+    finally:
+        release_replay.set()
+        replay_thread.join(timeout=2)
+        prefetch_thread.join(timeout=2)
+
+    assert not replay_thread.is_alive()
+    assert not prefetch_thread.is_alive()
+    assert failures == []
+    assert observed == [
+        ("bank", "active-session", "active-channel"),
+        ("model", "active-session", "active-channel"),
+        ("identity", "active-session", "active-channel"),
+    ]
+
+
+def test_scoped_replay_restores_beam_and_memory_on_success_and_failure(
+    provider_modules
+):
+    for module in provider_modules.values():
+        provider, beam = _replay_lock_provider(module)
+        memory = types.SimpleNamespace(
+            session_id="active-session", channel_id="active-channel"
+        )
+        provider._memory = memory
+
+        with provider._replay_scope_locked("staged-session", "staged-channel"):
+            assert (beam.session_id, beam.channel_id) == (
+                "staged-session", "staged-channel"
+            )
+            assert (memory.session_id, memory.channel_id) == (
+                "staged-session", "staged-channel"
+            )
+        assert (beam.session_id, beam.channel_id) == (
+            "active-session", "active-channel"
+        )
+        assert (memory.session_id, memory.channel_id) == (
+            "active-session", "active-channel"
+        )
+
+        with pytest.raises(RuntimeError, match="replay failed"):
+            with provider._replay_scope_locked(
+                "failed-session", "failed-channel"
+            ):
+                raise RuntimeError("replay failed")
+        assert (beam.session_id, beam.channel_id) == (
+            "active-session", "active-channel"
+        )
+        assert (memory.session_id, memory.channel_id) == (
+            "active-session", "active-channel"
+        )
+
+
+def test_apply_pending_dispatch_can_reenter_replay_lock(provider_modules):
+    """handle_tool_call -> apply_pending -> replay must not deadlock."""
+    for module in provider_modules.values():
+        provider, beam = _replay_lock_provider(module)
+        del provider._beam_access_lock
+        failures = []
+        results = []
+
+        def apply_pending(_args):
+            with provider._replay_scope_locked(
+                "staged-session", "staged-channel"
+            ):
+                return json.dumps({
+                    "session_id": beam.session_id,
+                    "channel_id": beam.channel_id,
+                })
+
+        provider._handle_apply_pending = apply_pending
+
+        def dispatch():
+            try:
+                results.append(provider.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": ["pending-id"]}
+                ))
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        worker = threading.Thread(target=dispatch)
+        worker.start()
+        worker.join(timeout=1)
+
+        assert not worker.is_alive(), "nested pending replay deadlocked"
+        assert failures == []
+        assert json.loads(results[0]) == {
+            "session_id": "staged-session",
+            "channel_id": "staged-channel",
+        }
+        assert (beam.session_id, beam.channel_id) == (
+            "active-session", "active-channel"
+        )

@@ -10,7 +10,7 @@ Example:
     >>> results = recall("user preferences")
 """
 
-__version__ = "4.0.0b2"
+__version__ = "4.0.0b3"
 __author__ = "Abdias J"
 __license__ = "MIT"
 
@@ -35,6 +35,7 @@ _lazy_exports = {
 
 
 def __getattr__(name: str):
+    """Lazily resolve public package exports to keep import-time dependencies optional."""
     if name in _lazy_exports:
         mod_path, attr_name = _lazy_exports[name]
         mod = __import__(f"mnemosyne{mod_path}", fromlist=[attr_name])

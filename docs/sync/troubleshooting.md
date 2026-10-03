@@ -249,5 +249,5 @@ pip install --upgrade mnemosyne-memory
 
 - Check the [Sync Protocol Reference](../sync.md) for full CLI reference
 - Read the [Security Model](../security.md) for encryption internals
-- Open an issue: [github.com/AxDSan/mnemosyne/issues](https://github.com/AxDSan/mnemosyne/issues)
+- Open an issue: [github.com/mnemosyne-oss/mnemosyne/issues](https://github.com/mnemosyne-oss/mnemosyne/issues)
 - Ask in Discord: the `#mnemosyne` channel

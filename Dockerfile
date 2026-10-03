@@ -32,7 +32,7 @@ FROM python:3.11-slim
 
 LABEL org.opencontainers.image.title="Mnemosyne MCP Server"
 LABEL org.opencontainers.image.description="Universal memory layer MCP server for any AI agent"
-LABEL org.opencontainers.image.source="https://github.com/AxDSan/mnemosyne"
+LABEL org.opencontainers.image.source="https://github.com/mnemosyne-oss/mnemosyne"
 LABEL org.opencontainers.image.licenses="MIT"
 
 # Install Mnemosyne with MCP + SSE extras

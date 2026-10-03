@@ -89,8 +89,13 @@ def _close_cached_connections():
         pass
 
 
+@pytest.fixture
+def _before_connection_reset():
+    """Overridable hook for setup that must precede connection imports."""
+
+
 @pytest.fixture(autouse=True)
-def _reset_thread_local_connections():
+def _reset_thread_local_connections(_before_connection_reset):
     """
     Auto-use fixture that resets thread-local SQLite connection caches
     before and after every test. This prevents connection leakage between

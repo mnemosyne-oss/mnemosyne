@@ -1,6 +1,6 @@
 # OpenAI-Compatible Vision
 
-Mnemosyne can ask an external model to describe an image, and store the
+Mnemosyne can turn an image, audio clip, video or document into located text, and store the
 description as ordinary, recallable memory. This page is the primary guide for
 configuring that.
 
@@ -33,6 +33,58 @@ strictly more than you had before.
 
 ---
 
+## What each modality does
+
+| Modality | Sent where | Moments | Needs |
+|---|---|---|---|
+| Image | `POST {base_url}/chat/completions`, one `image_url` part | `caption`, `ocr` | `MNEMOSYNE_MODALITY_VISION_MODEL` |
+| Audio | `POST {base_url}/audio/transcriptions`, multipart, `response_format=verbose_json` | `transcript`, timed | `MNEMOSYNE_MODALITY_AUDIO_MODEL` (e.g. `whisper-1`, `whisper-large-v3`) |
+| Video | Up to 8 sampled frames to `/chat/completions` in one call; soundtrack to `/audio/transcriptions` | `shot` and `transcript`, timed | `ffmpeg` and `ffprobe` on PATH; `MNEMOSYNE_MODALITY_VIDEO_MODEL`, or the vision model if unset |
+| Document | Nowhere. Read locally | `page`, located by page, slide, chapter or character range | Nothing for txt, md, docx, pptx, epub; `pip install 'mnemosyne-memory[media]'` for PDF |
+
+Documents never leave the machine. A PDF page with no text layer (a scan) is
+the one exception: it is rendered and sent to the image model like any other
+image, so a scanned page is described instead of skipped.
+
+Audio uploads over 25 MB are refused locally rather than sent and rejected.
+Long documents are packed up to `MNEMOSYNE_MODALITY_MAX_MOMENTS` passages; when
+that cap stops extraction early, the result warns with how far it got.
+
+Setting the variables below is the whole setup. The adapter registers itself
+the first time something is described after `MNEMOSYNE_MODALITY_ENABLED` is on;
+there is no code to call.
+
+---
+
+## Using it: tool, CLI or SDK
+
+| Surface | Call |
+|---|---|
+| MCP | `mnemosyne_remember_media` with `ref` (plus optional `modality`, `title`, `hint`, `max_moments`, `bank`) |
+| Hermes | the same tool, exposed by the Mnemosyne provider |
+| CLI | `mnemosyne media ./diagram.png` (add `--json` for the full result) |
+| Python | `BeamMemory.remember_media(ref)` |
+
+A tool call may come from a remote MCP client or from a model steered by text it
+just read, so the tool is stricter than the CLI and SDK:
+
+- **Local files need an allow-list.** Set `MNEMOSYNE_MEDIA_ALLOWED_PATHS` to the
+  directories media may be read from (`:`-separated on Linux and macOS, `;` on
+  Windows, or commas). The path is resolved through symlinks before the check,
+  so a link inside an allowed folder cannot reach outside it. With nothing set,
+  the tool accepts no local paths; pass an `https://` URL or a `data:` URI
+  instead.
+- **No internal URLs.** URLs that resolve to loopback, private or link-local
+  addresses are refused, because audio and video are fetched from this machine.
+  `MNEMOSYNE_MEDIA_ALLOW_PRIVATE_URLS=1` allows a trusted media server on your
+  LAN.
+- **Inline payloads are capped** at 25 MB decoded.
+
+The CLI and the SDK are not restricted: there the caller is the person whose
+files they are.
+
+---
+
 ## Configuration
 
 | Env var | Default | Purpose |
@@ -40,11 +92,13 @@ strictly more than you had before.
 | `MNEMOSYNE_MODALITY_ENABLED` | `false` | Master switch. Nothing happens until this is on. |
 | `MNEMOSYNE_MODALITY_BASE_URL` | *(unset)* | Base URL of the endpoint, including `/v1` if the provider uses one. |
 | `MNEMOSYNE_MODALITY_API_KEY` | *(unset)* | Bearer token. Required — a base URL alone is treated as an unfinished config. |
-| `MNEMOSYNE_MODALITY_VISION_MODEL` | *(unset)* | Model for images and documents. |
-| `MNEMOSYNE_MODALITY_VIDEO_MODEL` | *(unset)* | Model for video. |
-| `MNEMOSYNE_MODALITY_AUDIO_MODEL` | *(unset)* | Model for audio. |
+| `MNEMOSYNE_MODALITY_VISION_MODEL` | *(unset)* | Model for images, scanned PDF pages, and video frames when no video model is set. |
+| `MNEMOSYNE_MODALITY_VIDEO_MODEL` | *(unset)* | Vision model for sampled video frames. Falls back to the vision model. |
+| `MNEMOSYNE_MODALITY_AUDIO_MODEL` | *(unset)* | Transcription model for audio and video soundtracks. |
 | `MNEMOSYNE_MODALITY_TIMEOUT` | `60` | Per-call timeout, seconds. |
 | `MNEMOSYNE_MODALITY_MAX_MOMENTS` | `12` | Cap on moments retained per asset. |
+| `MNEMOSYNE_MEDIA_ALLOWED_PATHS` | *(unset)* | Directories the `mnemosyne_remember_media` tool may read local files from. Unset: tool calls cannot name local files. |
+| `MNEMOSYNE_MEDIA_ALLOW_PRIVATE_URLS` | `false` | Let the tool fetch URLs that resolve to private or loopback addresses. |
 | `MNEMOSYNE_MODALITY_PROMPT` | *(built-in)* | Override the description prompt. `{modality}` and `{max_moments}` are substituted. |
 
 `MNEMOSYNE_MODALITY_BASE_URL` and the three model keys are read once when the

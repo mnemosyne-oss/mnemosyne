@@ -114,9 +114,16 @@ def test_legacy_scan_filters_before_bounded_selection(store, monkeypatch, filter
 @pytest.mark.parametrize("store", ["float32", "int8"], indirect=True)
 def test_legacy_low_norm_target_beyond_knn_and_admission(store, monkeypatch):
     beam, query, kind = store
+    # This fixture is calibrated against a 0.80 floor: the distractors sit at
+    # cosine 0.75 (8 of 64 signs flipped) and are deliberately nearer in L2
+    # than the 0.1-magnitude target, which is what pushes the target outside
+    # the KNN budget. At the shipped 0.62 default those distractors would be
+    # admitted instead and the target would no longer be the only survivor,
+    # so pin the floor this geometry was built for.
+    monkeypatch.setattr(bm, "EM_VEC_ADMIT", 0.80)
     for i in range(75):
         distractor = query.copy()
-        distractor[:8] *= -1  # cosine .75: below the .80 admission boundary
+        distractor[:8] *= -1  # cosine .75: below the pinned .80 admission boundary
         _write(beam, monkeypatch, distractor, f"directional distractor {i}")
     mid, rowid = _write(beam, monkeypatch, query, "small magnitude legacy target")
     # Ordinary writes normalize. Replace only this blob to model a pre-normalization row.
@@ -187,8 +194,13 @@ def test_linear_legacy_scan_filters_scope_before_bounded_selection(
 
 def test_pure_polyphonic_uses_shared_blob_admission(store, monkeypatch):
     beam, query, kind = store
+    # 24 of 64 flipped signs stays below admission in every representation:
+    # cosine 0.25 for float32/int8, and cos(pi*24/64) = 0.383 for the bit arm,
+    # whose Hamming distance maps onto the same monotone 0..1 scale. The
+    # count is chosen to hold at any floor the constant can reasonably take,
+    # rather than tracking one default.
     below = query.copy()
-    below[:16] *= -1
+    below[:24] *= -1
     rejected, rejected_rowid = _write(
         beam, monkeypatch, below, "below-admission pure record"
     )
@@ -230,8 +242,13 @@ def test_legacy_vec_authority_without_json_only_fusion(store, monkeypatch):
     target = query.copy()
     target[:4] *= -1
     mid, rowid = _write(beam, monkeypatch, target, "dual representation record")
+    # 24 of 64 flipped signs stays below admission in every representation:
+    # cosine 0.25 for float32/int8, and cos(pi*24/64) = 0.383 for the bit arm,
+    # whose Hamming distance maps onto the same monotone 0..1 scale. The
+    # count is chosen to hold at any floor the constant can reasonably take,
+    # rather than tracking one default.
     below = query.copy()
-    below[:16] *= -1
+    below[:24] *= -1
     rejected, _ = _write(beam, monkeypatch, below, "below admission record")
     json_mid, json_rowid = _write(beam, monkeypatch, query, "JSON only record")
     beam.conn.execute("DELETE FROM vec_episodes WHERE rowid=?", (json_rowid,))
@@ -437,8 +454,13 @@ def test_polyphonic_post_filter_preserves_cross_session_filter_scope(
 def test_pure_polyphonic_stops_after_twenty_eligible_below_admission(
         store, monkeypatch):
     beam, query, kind = store
+    # 24 of 64 flipped signs stays below admission in every representation:
+    # cosine 0.25 for float32/int8, and cos(pi*24/64) = 0.383 for the bit arm,
+    # whose Hamming distance maps onto the same monotone 0..1 scale. The
+    # count is chosen to hold at any floor the constant can reasonably take,
+    # rather than tracking one default.
     below = query.copy()
-    below[:16] *= -1
+    below[:24] *= -1
     stored = []
     for index in range(20):
         _, rowid = _write(
@@ -495,6 +517,13 @@ def test_pure_polyphonic_stops_after_twenty_eligible_below_admission(
 def test_pure_int8_refills_when_l2_boundary_cannot_prove_admission(
         store, monkeypatch):
     beam, _, _ = store
+    # The literal vectors below encode a 0.80 boundary: the decoy measures
+    # 0.7999 cosine against the query. They cannot be re-derived for a lower
+    # floor, because the fixture's whole point is a decoy that is *nearer in
+    # L2* than the target while scoring *lower* on cosine, and on a 64d
+    # sign-flip fixture no granularity satisfies both below 0.62. Pin the
+    # floor the vectors were tuned to.
+    monkeypatch.setattr(bm, "EM_VEC_ADMIT", 0.80)
     query = np.ones(64, dtype=np.float32)
     query /= np.linalg.norm(query)
     below = np.array([
