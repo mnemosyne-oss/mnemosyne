@@ -22,6 +22,20 @@ def _uncredentialed_embedding_client(monkeypatch):
     monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "")
 
 
+@pytest.fixture
+def _embedding_dispatch_enabled(monkeypatch):
+    """The fail-loud tests exercise `embed()` end to end, but CI runs the suite
+    with `MNEMOSYNE_NO_EMBEDDINGS=1`, and #1083 makes the opt-out short-circuit
+    `embed()` before any dispatch. Clear the opt-out aliases so the tests reach
+    the API path they are about."""
+    for key in (
+        "MNEMOSYNE_NO_EMBEDDINGS",
+        "MNEMOSYNE_SKIP_EMBEDDINGS",
+        "MNEMOSYNE_EMBEDDINGS_OFF",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
 class Response:
     def __init__(self, payload):
         self.body = io.BytesIO(json.dumps(payload).encode())
@@ -283,7 +297,9 @@ def test_embed_query_raises_when_api_request_fails(monkeypatch):
     embeddings._embed_query_cached.cache_clear()
 
 
-def test_embed_raise_message_is_redacted_and_retries_transient_failures(monkeypatch):
+def test_embed_raise_message_is_redacted_and_retries_transient_failures(
+    monkeypatch, _embedding_dispatch_enabled
+):
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "https://user:password@example.test/v1?token=secret")
     monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
     embeddings._embed_query_cached.cache_clear()
@@ -305,7 +321,9 @@ def test_embed_raise_message_is_redacted_and_retries_transient_failures(monkeypa
     assert request.call_count == 3
 
 
-def test_embed_raise_message_names_missing_openrouter_key(monkeypatch):
+def test_embed_raise_message_names_missing_openrouter_key(
+    monkeypatch, _embedding_dispatch_enabled
+):
     # OpenRouter base + no API key is the previously-silent path: _embed_api
     # logged nothing and returned None. It must now log, and the public API
     # must name the missing key instead of a generic failure.
@@ -319,7 +337,9 @@ def test_embed_raise_message_names_missing_openrouter_key(monkeypatch):
     assert "openrouter.ai" in str(excinfo.value)
 
 
-def test_embed_raises_redacted_runtime_error_on_malformed_endpoint_url(monkeypatch):
+def test_embed_raises_redacted_runtime_error_on_malformed_endpoint_url(
+    monkeypatch, _embedding_dispatch_enabled
+):
     # urlsplit() raises ValueError on malformed URLs (e.g. "http://["); host
     # classification must not leak that as a raw ValueError -- the API path
     # should still fail loud with the redacted RuntimeError and never echo
@@ -339,7 +359,9 @@ def test_embed_raises_redacted_runtime_error_on_malformed_endpoint_url(monkeypat
     assert "test-embedding-model" in str(excinfo.value)
 
 
-def test_custom_endpoint_with_openrouter_ai_in_query_needs_no_key(monkeypatch):
+def test_custom_endpoint_with_openrouter_ai_in_query_needs_no_key(
+    monkeypatch, _embedding_dispatch_enabled
+):
     # Substring-based OpenRouter detection would misclassify this custom
     # endpoint because its query contains "openrouter.ai", blocking it from
     # the keyless custom path. Hostname matching must let it through, and the
