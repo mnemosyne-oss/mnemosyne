@@ -28,11 +28,14 @@ except ImportError:
 # --- fastembed (local ONNX) ---
 import warnings
 
-# fastembed >=0.7 switched multilingual-e5-large from CLS -> mean pooling.
-# The new behaviour is correct for E5 models; suppress the noise.
+# fastembed >=0.7 switched several supported models (multilingual-e5-large,
+# paraphrase-multilingual-MiniLM-L12-v2, paraphrase-multilingual-mpnet-base-v2,
+# thenlper/gte-large) from CLS -> mean pooling. The new behaviour matches their
+# SentenceTransformers pooling configuration; suppress the migration warning.
 warnings.filterwarnings(
     "ignore",
-    message=".*multilingual-e5-large.*now uses mean pooling.*",
+    message=".*now uses mean pooling instead of CLS embedding.*",
+    category=UserWarning,
 )
 
 try:
