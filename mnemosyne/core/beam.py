@@ -28,6 +28,7 @@ from mnemosyne.core._connection_gc import collect_connection_cycles
 from mnemosyne.core.config import resolve_beam_runtime
 from mnemosyne.core.filters import _SYSTEM_DERIVED_WRITE_CAPABILITY
 from mnemosyne.core.journal import journal_mode
+from mnemosyne.core.paths import _hermes_home, default_data_dir, default_db_path
 from mnemosyne.core.recall_provenance import append_recall_provenance
 from mnemosyne.core.sqlite_config import configure_busy_timeout
 
@@ -321,13 +322,9 @@ _VERSION_STRING_RE = re.compile(
 )
 
 # On Fly.io and other ephemeral VMs, only ~/.hermes is persisted.
-# Default to the legacy Hermes path so memories survive restarts.
-_DEFAULT_ROOT = Path(
-    os.environ.get("HERMES_HOME")
-    or (Path(os.environ["HOME"]) / ".hermes" if os.environ.get("HOME") else Path.home() / ".hermes")
-)
-DEFAULT_DATA_DIR = _DEFAULT_ROOT / "mnemosyne" / "data"
-DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "mnemosyne.db"
+# Data-dir resolution is paths.default_data_dir, shared with memory.py.
+# This MUST match memory.py under any environment to avoid split-brain.
+# _DEFAULT_ROOT, DEFAULT_DATA_DIR, and DEFAULT_DB_PATH resolve on each access.
 
 _thread_local = threading.local()
 
@@ -354,21 +351,31 @@ def _env_truthy(name: str) -> bool:
 # Set MNEMOSYNE_BEAM_OPTIMIZATIONS=1 to activate for BEAM benchmarking only.
 _BEAM_MODE = _env_truthy("MNEMOSYNE_BEAM_OPTIMIZATIONS")
 
-if os.environ.get("MNEMOSYNE_DATA_DIR"):
-    DEFAULT_DATA_DIR = Path(os.environ.get("MNEMOSYNE_DATA_DIR"))
-    DEFAULT_DB_PATH = DEFAULT_DATA_DIR / "mnemosyne.db"
-
-
 def _default_data_dir() -> Path:
     """Return the current default data directory, honoring runtime env changes."""
-    if os.environ.get("MNEMOSYNE_DATA_DIR"):
-        return Path(os.environ["MNEMOSYNE_DATA_DIR"])
-    return DEFAULT_DATA_DIR
+    return default_data_dir()
 
 
 def _default_db_path() -> Path:
     """Return the current default DB path, honoring runtime env changes."""
-    return _default_data_dir() / "mnemosyne.db"
+    return default_db_path()
+
+
+def __getattr__(name: str):
+    """Resolve legacy path constants from the current environment."""
+    if name == "_DEFAULT_ROOT":
+        return _hermes_home()
+    if name == "DEFAULT_DATA_DIR":
+        return _default_data_dir()
+    if name == "DEFAULT_DB_PATH":
+        return _default_db_path()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(
+        set(globals()) | {"_DEFAULT_ROOT", "DEFAULT_DATA_DIR", "DEFAULT_DB_PATH"}
+    )
 
 # Re-export the constant resolved at embeddings module load. The unknown-model
 # ValueError already fires there (binary_vectors imports EMBEDDING_DIM from
