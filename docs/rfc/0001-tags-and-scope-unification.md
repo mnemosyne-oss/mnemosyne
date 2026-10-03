@@ -2,7 +2,7 @@
 
 **Status:** Draft
 **Author:** achrllrogia45
-**Related issue:** https://github.com/AxDSan/mnemosyne/issues/205
+**Related issue:** https://github.com/mnemosyne-oss/mnemosyne/issues/205
 **Target version:** TBD
 
 ---

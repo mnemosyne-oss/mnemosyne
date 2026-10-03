@@ -207,6 +207,44 @@ MNEMOSYNE_EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L
 MNEMOSYNE_EMBEDDING_MODEL=intfloat/multilingual-e5-large
 ```
 
+#### Query and document prefixes
+
+Some asymmetric embedding models expect different text prefixes for retrieval
+queries and indexed documents. Mnemosyne exposes two environment-only settings:
+
+| Variable | Default | Applied to |
+|---|---|---|
+| `MNEMOSYNE_EMBEDDING_QUERY_PREFIX` | empty | Every query passed to `embed_query()` |
+| `MNEMOSYNE_EMBEDDING_DOC_PREFIX` | empty | Every document passed to `embed()`, including single-document writes |
+
+Both values are prepended verbatim, so preserve any trailing space required by
+the model. When they are unset or empty, Mnemosyne sends the original text
+unchanged. These variables are read directly from the environment and cannot be
+set in `config.yaml`. When `MNEMOSYNE_EMBEDDING_API_URL` is configured with a
+remote endpoint, prefixed text may be sent to that embedding API;
+privacy-sensitive deployments should remain local-first by using local
+embeddings or a locally hosted endpoint.
+
+For multilingual-E5:
+
+```bash
+export MNEMOSYNE_EMBEDDING_QUERY_PREFIX='query: '
+export MNEMOSYNE_EMBEDDING_DOC_PREFIX='passage: '
+```
+
+For EmbeddingGemma retrieval:
+
+```bash
+export MNEMOSYNE_EMBEDDING_QUERY_PREFIX='task: search result | query: '
+export MNEMOSYNE_EMBEDDING_DOC_PREFIX='title: none | text: '
+```
+
+These are fixed prefixes applied to every query or document. The mechanism added
+by [#401](https://github.com/mnemosyne-oss/mnemosyne/pull/401) does not provide
+automatic model-specific templates, query-type classification, or per-request
+free-form retrieval instructions. Those ideas were discussed as separate future
+work in [#966](https://github.com/mnemosyne-oss/mnemosyne/issues/966).
+
 The embedding dimension resolves in this order: a non-empty explicit `MNEMOSYNE_EMBEDDING_DIM` (positive integer) takes precedence for every model; otherwise Mnemosyne uses its built-in mappings, including the examples below; an unknown model with no explicit dimension **fails loudly at startup** rather than silently assuming 384. Blank/whitespace-only `MNEMOSYNE_EMBEDDING_DIM` is treated as unset (common in Docker Compose and `.env` files).
 
 Examples of models with built-in dimension mappings (not an exhaustive model catalog):
@@ -287,8 +325,10 @@ Use a remote model instead of the local MiniCPM5-1B GGUF:
 | `MNEMOSYNE_LLM_API_KEY` | *(none)* | API key for authenticated endpoints |
 | `MNEMOSYNE_LLM_MODEL` | *(none)* | Model identifier sent in requests |
 | `MNEMOSYNE_LLM_TIMEOUT` | `60` | HTTP timeout in seconds for remote LLM calls. Increase for slow proxies or models with long generation times (e.g. `300` for reasoning models routed through local proxies). |
+| `MNEMOSYNE_LLM_EXTRA_BODY` | *(none)* | JSON object merged last into every request body, for provider-specific keys the OpenAI shape has no name for (e.g. `{"thinking":{"type":"disabled"}}` to keep a thinking model from spending the whole `max_tokens` budget on reasoning). Ignored when unset, blank or not a JSON object; `messages`, `model` and `stream` are reserved and dropped from an otherwise valid object. Every rejected case is noted on stderr. Read at module import, so `mnemosyne config set` does not reach it and a change needs a restart. |
+| `MNEMOSYNE_LLM_FALLBACK_EXTRA_BODY` | *(none)* | Same, including the reserved keys and the import-time read, for requests to `MNEMOSYNE_LLM_FALLBACK_MODELS`. |
 
-With `MNEMOSYNE_LLM_ENABLED` enabled, Mnemosyne uses the remote endpoint when no host call was attempted, an explicit or provider-preset-resolved remote base URL is available, and `MNEMOSYNE_FORCE_LOCAL` is not enabled. On failure it falls back to the local GGUF backend, then AAAK encoding.
+With `MNEMOSYNE_LLM_ENABLED` enabled, Mnemosyne uses the remote endpoint when no host call was attempted, an explicit or provider-preset-resolved remote base URL is available, and `MNEMOSYNE_FORCE_LOCAL` is not enabled. A retryable failure from the primary model tries each model in `MNEMOSYNE_LLM_FALLBACK_MODELS` in order first; once every remote candidate has failed it falls back to the local GGUF backend, then AAAK encoding. An empty answer (a 2xx with no answer text) is not retried; it ends the remote stage and `last_llm_failure()` keeps the reason for the AAAK WARNING.
 
 Works with: llama.cpp server, vLLM, Ollama, LM Studio, or any OpenAI-compatible API.
 
@@ -340,7 +380,9 @@ With `MNEMOSYNE_LLM_ENABLED=true`:
 0. Host LLM adapter (if MNEMOSYNE_HOST_LLM_ENABLED=true AND a backend is registered)
    ↓ (on failure: skip remote, go to local)
 1. Remote LLM (if no host call was attempted, an explicit or provider-preset-resolved remote base URL is available, AND MNEMOSYNE_FORCE_LOCAL is not enabled)
-   ↓ (on failure)
+   ↓ (on a retryable failure; an empty answer is not retried)
+1b. Each model in MNEMOSYNE_LLM_FALLBACK_MODELS, in order
+   ↓ (on failure of every remote candidate)
 2. Local LLM (llama-cpp-python / ctransformers + MiniCPM5-1B GGUF)
    ↓ (on failure or not installed)
 3. AAAK encoding (keyword-based, no LLM required)

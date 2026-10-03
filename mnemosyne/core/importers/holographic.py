@@ -25,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 
+from mnemosyne.core.filters import _RESTORE_WRITE_CAPABILITY
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
 
 
@@ -268,8 +269,12 @@ class HolographicImporter(BaseImporter):
                         metadata=mem_dict.get("metadata", {}),
                         valid_until=mem_dict.get("valid_until"),
                         scope=mem_dict.get("scope", "session"),
+                        _write_kind=_RESTORE_WRITE_CAPABILITY,
                         extract_entities=self.extract_entities,
                     )
+                    if mid is None:
+                        result.skipped += 1
+                        continue
                     result.memory_ids.append(mid)
                     result.imported += 1
 

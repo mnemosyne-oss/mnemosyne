@@ -143,6 +143,8 @@ def test_all_plugin_manifests_have_an_explicit_version_contract():
         ROOT / "hermes_memory_provider" / "plugin.yaml": core_version,
         hermes_root / "plugin.yaml": hermes_version,
         hermes_root / "src" / "mnemosyne_hermes" / "plugin.yaml": hermes_version,
+        # Hermes plugin-catalog wrapper: same plugin, same version as the package it pins.
+        ROOT / "integrations" / "hermes-catalog" / "plugin.yaml": hermes_version,
     }
 
     assert _source_manifest_paths() == set(expected_versions)

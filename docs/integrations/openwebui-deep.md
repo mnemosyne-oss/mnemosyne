@@ -44,7 +44,7 @@ WantedBy=multi-user.target
 ```yaml
 services:
   mnemosyne-mcp:
-    image: ghcr.io/axdsan/mnemosyne-mcp
+    image: ghcr.io/mnemosyne-oss/mnemosyne-mcp
     volumes:
       - mnemosyne-data:/data
     environment:

@@ -315,7 +315,9 @@ def test_registration_when_configured(stub, configured):
     configured(server.base_url)
     assert adapter.register_if_configured() is True
     assert get_modality_backend("image") is not None
-    assert get_modality_backend("audio") is None, "this adapter does not claim audio"
+    assert get_modality_backend("audio") is not None, "audio goes to /audio/transcriptions"
+    assert get_modality_backend("document") is None, "documents are read locally, not sent"
+    assert get_modality_backend("video") is None, "video needs frame sampling, not this adapter alone"
 
 
 def test_model_selection_is_per_modality(stub, configured):
@@ -575,3 +577,71 @@ def test_describe_does_not_preflight(stub, configured):
     configured(server.base_url)
     adapter.OpenAICompatModalityBackend().describe(_request())
     assert server.model_probes == 0
+
+
+# ---------------------------------------------------------------------------
+# Configuration alone is enough (no host registration)
+# ---------------------------------------------------------------------------
+
+def test_configuration_alone_registers_the_adapter(stub, configured):
+    """The documented setup is env/config only. Before this, nothing ever
+    called ``register_if_configured()``, so a fully configured install sent
+    no request and every asset came back ``unavailable``."""
+    from mnemosyne.core.modality_backends import call_modality_describe, get_modality_backend
+
+    s = stub([(200, _OK_REPLY)])
+    configured(s.base_url)
+    assert get_modality_backend("image") is None
+
+    result = call_modality_describe(_request())
+
+    assert result is not None and result.summary == "a terminal window"
+    assert len(s.requests) == 1
+
+
+def test_remember_media_describes_a_local_image_from_configuration_alone(stub, configured, tmp_path, monkeypatch):
+    from mnemosyne.core.beam import BeamMemory
+
+    s = stub([(200, _OK_REPLY)])
+    configured(s.base_url)
+    monkeypatch.setenv("MNEMOSYNE_BLOB_DIR", str(tmp_path / "blobs"))
+    image = tmp_path / "shot.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    beam = BeamMemory(session_id="autoreg", db_path=tmp_path / "m.db")
+
+    result = beam.remember_media(str(image))
+
+    assert result.status == "ok"
+    assert len(result.moment_ids) == 1
+    part = s.requests[0]["messages"][0]["content"][1]
+    assert part["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_autoregistration_leaves_a_host_default_alone(stub, configured):
+    from mnemosyne.core.modality_backends import (
+        CallableModalityBackend, call_modality_describe, get_modality_backend,
+        set_modality_backend,
+    )
+
+    s = stub([(200, _OK_REPLY)])
+    configured(s.base_url)
+    host = CallableModalityBackend(name="host", func=lambda r: None,
+                                   modalities=frozenset({"audio"}))
+    set_modality_backend(host)
+
+    assert call_modality_describe(_request()) is None
+    assert s.requests == []
+    assert get_modality_backend("audio") is host
+
+
+def test_autoregistration_never_runs_with_the_gate_off(stub, configured, monkeypatch):
+    from mnemosyne.core.config import MnemosyneConfig
+    from mnemosyne.core.modality_backends import call_modality_describe, get_modality_backend
+
+    s = stub([(200, _OK_REPLY)])
+    configured(s.base_url, MNEMOSYNE_MODALITY_ENABLED="0")
+    MnemosyneConfig.reset_instance()
+
+    assert call_modality_describe(_request()) is None
+    assert get_modality_backend("image") is None
+    assert s.requests == []

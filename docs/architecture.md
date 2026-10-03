@@ -99,7 +99,7 @@ print(f"Consolidated {result['consolidated']} memories")
 
 ## SQLite Backend
 
-By default, the main database lives at `~/.hermes/mnemosyne/data/mnemosyne.db`. Named memory banks use separate SQLite files under `~/.hermes/mnemosyne/data/banks/<name>/`, and standalone `TripleStore()` may use `triples.db` in the data directory.
+By default, the main database lives at `~/.hermes/mnemosyne/data/mnemosyne.db`. Named memory banks use separate SQLite files under `~/.hermes/mnemosyne/data/banks/<name>/`, and standalone `TripleStore()` uses its own `triples.db` in the data directory rather than any bank's `mnemosyne.db`; see the Temporal Knowledge Graph section below for what that means for triples specifically.
 
 ### Tables
 
@@ -272,6 +272,13 @@ kg.add("Maya", "assigned_to", "api-gateway", valid_from="2026-03-01")
 ```
 
 When a triple is added for an existing `(subject, predicate)` pair, the previous triple's `valid_until` is automatically set, enabling point-in-time queries.
+
+Bare `TripleStore()` above is a standalone store: it always opens its own `triples.db`, never the calling bank's `mnemosyne.db`. The `mnemosyne_triple_add`/`mnemosyne_triple_query` MCP tools resolve the bank's `mnemosyne.db` instead, so triples written through the bare constructor are not visible to them (#548). Use `TripleStore.for_bank(bank)` to get the store instance backed by the same file a given bank's MCP tools use:
+
+```python
+kg = TripleStore.for_bank("work")   # same file as Mnemosyne(bank="work")'s MCP tools
+kg.add("Maya", "assigned_to", "auth-migration", valid_from="2026-01-15")
+```
 
 ## Data Flow
 

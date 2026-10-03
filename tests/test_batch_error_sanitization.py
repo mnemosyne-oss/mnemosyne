@@ -28,7 +28,8 @@ class _FakeBeam:
         return "fake-id"
 
 
-def _without_transactions(_conn):
+def _without_transactions(_conn, *, immediate=False):
+    del immediate
     return contextlib.nullcontext()
 
 

@@ -1,8 +1,8 @@
 ---
 title: "Configuration"
-version: 4.0.0b2
-config_key_count: 114
-env_only_count: 46
+version: 4.0.0b3
+config_key_count: 116
+env_only_count: 50
 generated_at: "auto"
 ---
 
@@ -23,13 +23,13 @@ and `wm_max_items` are equivalent.
 Keys marked **restart** are read once at startup. Changing them at runtime warns
 and does not take effect until the process restarts.
 
-There are **114 configuration keys**. A further
-**46 environment variables** are read directly from the
+There are **116 configuration keys**. A further
+**50 environment variables** are read directly from the
 environment and are **not** settable in `config.yaml`; they are listed separately below.
 
 ---
 
-## Configuration keys (114)
+## Configuration keys (116)
 
 | Config key | Environment variable | Default | Restart | Description |
 |------------|----------------------|---------|---------|-------------|
@@ -80,6 +80,8 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `llm_n_threads` | `MNEMOSYNE_LLM_N_THREADS` | `4` | no | CPU threads for local GGUF inference. |
 | `llm_repo` | `MNEMOSYNE_LLM_REPO` | *(unset)* | **yes** | Hugging Face repo holding the local GGUF model. |
 | `llm_timeout` | `MNEMOSYNE_LLM_TIMEOUT` | `60` | no | Per-request timeout in seconds for LLM calls. |
+| `media_allow_private_urls` | `MNEMOSYNE_MEDIA_ALLOW_PRIVATE_URLS` | `false` | no | Let the mnemosyne_remember_media tool fetch URLs that resolve to loopback, private or link-local addresses. |
+| `media_allowed_paths` | `MNEMOSYNE_MEDIA_ALLOWED_PATHS` | *(unset)* | no | Directories the mnemosyne_remember_media tool may read local files from (os.pathsep or comma separated). Empty: tool calls cannot name local files. |
 | `modality_api_key` | `MNEMOSYNE_MODALITY_API_KEY` | *(unset)* | no | API key for the modality endpoint. |
 | `modality_audio_model` | `MNEMOSYNE_MODALITY_AUDIO_MODEL` | *(unset)* | **yes** | Model used to transcribe or describe audio. |
 | `modality_base_url` | `MNEMOSYNE_MODALITY_BASE_URL` | *(unset)* | **yes** | Base URL of an OpenAI-compatible vision endpoint. Any provider that speaks the protocol works. |
@@ -94,7 +96,7 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `persona_interval` | `MNEMOSYNE_PERSONA_INTERVAL` | `50` [^persona_interval] (declared `10`) | no | Turns between persona refreshes. |
 | `persona_token_cap` | `MNEMOSYNE_PERSONA_TOKEN_CAP` | `1500` [^persona_token_cap] (declared `500`) | no | Token budget for injected persona facts. |
 | `polyphonic_recall` | `MNEMOSYNE_POLYPHONIC_RECALL` | `false` | no | Enable the polyphonic multi-voice recall engine with RRF fusion. |
-| `prefetch_content_chars` | `MNEMOSYNE_PREFETCH_CONTENT_CHARS` | `2000` | no | Truncate prefetched memory content to this many characters. `0` disables truncation. |
+| `prefetch_content_chars` | `MNEMOSYNE_PREFETCH_CONTENT_CHARS` | `0` [^prefetch_content_chars] (declared `2000`) | no | Truncate prefetched memory content to this many characters. `0` disables truncation. |
 | `proactive_linking` | `MNEMOSYNE_PROACTIVE_LINKING` | `0` [^proactive_linking] (declared `true`) | no | Create cross-memory graph edges on insertion. |
 | `query_intent` | `MNEMOSYNE_QUERY_INTENT` | `0` [^query_intent] (declared `true`) | no | Classify query intent and adjust scoring weights accordingly. |
 | `recall_diagnostics` | `MNEMOSYNE_RECALL_DIAGNOSTICS` | `false` | no | Collect per-stage recall diagnostics. See `explain=True`. |
@@ -131,8 +133,8 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `sync_port` | `MNEMOSYNE_SYNC_PORT` | `8765` | **yes** | Bind port for `mnemosyne sync-serve`. |
 | `sync_remote` | `MNEMOSYNE_SYNC_REMOTE` | *(unset)* | **yes** | Remote sync server URL. |
 | `sync_roles` | `MNEMOSYNE_SYNC_ROLES` | `user` | no | Conversation roles synced into memory. Defaults to user turns only. |
-| `sync_turn_assistant_limit` | `MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT` | `10` | no | Maximum assistant turns captured per sync pass. |
-| `sync_turn_user_limit` | `MNEMOSYNE_SYNC_TURN_USER_LIMIT` | `10` | no | Maximum user turns captured per sync pass. |
+| `sync_turn_assistant_limit` | `MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT` | `800` [^sync_turn_assistant_limit] (declared `10`) | no | Maximum assistant message characters captured per sync turn. `0` disables truncation. |
+| `sync_turn_user_limit` | `MNEMOSYNE_SYNC_TURN_USER_LIMIT` | `500` [^sync_turn_user_limit] (declared `10`) | no | Maximum user message characters captured per sync turn. `0` disables truncation. |
 | `temporal_halflife_hours` | `MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS` | `24` [^temporal_halflife_hours] (declared `168`) | no | Hours until the temporal recall boost decays by half. |
 | `tier1_weight` | `MNEMOSYNE_TIER1_WEIGHT` | `1.0` | no | Recall score multiplier for tier 1 (fresh) episodic memories. |
 | `tier2_days` | `MNEMOSYNE_TIER2_DAYS` | `30` | no | Age in days at which an episodic memory degrades to tier 2. |
@@ -148,7 +150,7 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `wm_ttl_hours` | `MNEMOSYNE_WM_TTL_HOURS` | `168` | no | Age at which a working memory row becomes eligible for consolidation or trim. |
 | `write_classifier` | `MNEMOSYNE_WRITE_CLASSIFIER` | *(unset)* | no | Write classifier mode controlling which content is stored. |
 
-### Keys whose effective default bypasses `config.py` (19)
+### Keys whose effective default bypasses `config.py` (22)
 
 For these keys a module-level constant reads the environment variable directly with its own fallback, so the value in `DEFAULTS` is not what the runtime uses and a `config.yaml` entry alone does not reach the module. Treat the environment variable as authoritative.
 
@@ -160,6 +162,7 @@ This list is derived by scanning the package for `os.environ.get("MNEMOSYNE_..."
 [^llm_max_tokens]: `llm_max_tokens` -- effective default `2048`, set in `mnemosyne/core/local_llm.py`, not the ``512`` declared in `config.py`.
 [^persona_interval]: `persona_interval` -- effective default `50`, set in `mnemosyne/core/persona.py`, not the ``10`` declared in `config.py`.
 [^persona_token_cap]: `persona_token_cap` -- effective default `1500`, set in `mnemosyne/core/persona.py`, not the ``500`` declared in `config.py`.
+[^prefetch_content_chars]: `prefetch_content_chars` -- effective default `0`, set in `hermes_memory_provider/__init__.py`, `integrations/hermes/src/mnemosyne_hermes/__init__.py`, not the ``2000`` declared in `config.py`. Zero disables truncation, but a zero can still fall back to a profile limit downstream -- `0` is not always unlimited.
 [^proactive_linking]: `proactive_linking` -- effective default `0`, set in `mnemosyne/core/beam.py`, not the ``true`` declared in `config.py`.
 [^query_intent]: `query_intent` -- effective default `0`, set in `mnemosyne/core/beam.py`, not the ``true`` declared in `config.py`.
 [^shmr_harmony_threshold]: `shmr_harmony_threshold` -- effective default `0.60`, set in `mnemosyne/core/shmr.py`, not the ``0.5`` declared in `config.py`.
@@ -172,11 +175,13 @@ This list is derived by scanning the package for `os.environ.get("MNEMOSYNE_..."
 [^sleep_model_refresh_max_tokens]: `sleep_model_refresh_max_tokens` -- effective default `2048`, set in `mnemosyne/core/model_refresh.py`, not the ``1024`` declared in `config.py`.
 [^sleep_model_refresh_min_evidence]: `sleep_model_refresh_min_evidence` -- effective default `2`, set in `mnemosyne/core/model_refresh.py`, not the ``3`` declared in `config.py`.
 [^sleep_model_refresh_temperature]: `sleep_model_refresh_temperature` -- effective default `0.1`, set in `mnemosyne/core/model_refresh.py`, not the ``0.3`` declared in `config.py`.
+[^sync_turn_assistant_limit]: `sync_turn_assistant_limit` -- effective default `800`, set in `hermes_memory_provider/__init__.py`, `integrations/hermes/src/mnemosyne_hermes/__init__.py`, not the ``10`` declared in `config.py`. Per-message characters, not turns: caps assistant content per sync turn (800 chars).
+[^sync_turn_user_limit]: `sync_turn_user_limit` -- effective default `500`, set in `hermes_memory_provider/__init__.py`, `integrations/hermes/src/mnemosyne_hermes/__init__.py`, not the ``10`` declared in `config.py`. Per-message characters, not turns: caps user content per sync turn (500 chars).
 [^temporal_halflife_hours]: `temporal_halflife_hours` -- effective default `24`, set in `mnemosyne/core/beam.py`, not the ``168`` declared in `config.py`.
 
 ---
 
-## Environment-only variables (46)
+## Environment-only variables (50)
 
 These are read with `os.environ` at their point of use and bypass
 `MnemosyneConfig` entirely. They cannot be set in `config.yaml`.
@@ -194,8 +199,8 @@ These are read with `os.environ` at their point of use and bypass
 | `MNEMOSYNE_CHANNEL_ID` | Channel or session identifier for memory scoping. |
 | `MNEMOSYNE_CONTEXT_INCLUDE_CONSOLIDATED` | Include already-consolidated rows in assembled context. |
 | `MNEMOSYNE_CROSS_TIER_DEDUP` | A/B toggle for deduplication across working and episodic results. |
-| `MNEMOSYNE_EMBEDDING_DOC_PREFIX` | Prefix prepended to documents before embedding. Applied verbatim. |
-| `MNEMOSYNE_EMBEDDING_QUERY_PREFIX` | Prefix prepended to queries before embedding. Applied verbatim. |
+| `MNEMOSYNE_EMBEDDING_DOC_PREFIX` | Prefix prepended verbatim to every document before embedding. Unset or empty by default, preserving the original text. When `MNEMOSYNE_EMBEDDING_API_URL` is configured with a remote endpoint, prefixed text may be sent to that embedding API; privacy-sensitive deployments should remain local-first by using local embeddings or a locally hosted endpoint. |
+| `MNEMOSYNE_EMBEDDING_QUERY_PREFIX` | Prefix prepended verbatim to every retrieval query before embedding. Unset or empty by default, preserving the original text. When `MNEMOSYNE_EMBEDDING_API_URL` is configured with a remote endpoint, prefixed text may be sent to that embedding API; privacy-sensitive deployments should remain local-first by using local embeddings or a locally hosted endpoint. |
 | `MNEMOSYNE_EMBEDDING_THREADS` | Thread count for local ONNX embedding inference. |
 | `MNEMOSYNE_EXTRACTION_MODEL` | Model used by the cloud extraction client. |
 | `MNEMOSYNE_EXTRACTION_PROMPT` | Override the fact extraction prompt. |
@@ -205,15 +210,19 @@ These are read with `os.environ` at their point of use and bypass
 | `MNEMOSYNE_IMPORTED_WEIGHT` | Veracity multiplier for imported memories. |
 | `MNEMOSYNE_INFERRED_WEIGHT` | Veracity multiplier for inferred memories. |
 | `MNEMOSYNE_LEXICAL_GATE_MIN` | Override the lexical admission gate (float 0.0–1.0, clamped; non-finite/invalid values fall back to the historical query-length thresholds 0.15/0.5/0.3). `0.0` admits purely-vector candidates (recall-first, at a precision cost). Read on every recall call; retrieval stays local (sqlite-vec + JSON/NumPy embeddings, or lexical-only FTS5 when embeddings are unavailable). |
-| `MNEMOSYNE_MCP_ALLOWED_HOSTS` | Comma-separated Host header values allowed for a non-loopback MCP Streamable HTTP bind (exact names or `name:*` patterns covering any port). A non-loopback bind exposes the selected local SQLite-backed memory bank to network clients, so this variable and `MNEMOSYNE_MCP_TOKEN` together form the security boundary. Required to start a non-loopback server; requests presenting any other Host are rejected with HTTP 421. |
+| `MNEMOSYNE_LLM_EXTRA_BODY` | JSON object merged last into every chat-completions request to the primary remote endpoint, for provider-specific keys the OpenAI shape has no name for (a thinking-mode toggle, provider routing). Unset, blank, invalid JSON or a non-object value means nothing is merged, and the reserved keys `messages`, `model` and `stream` are dropped from an otherwise valid object so the escape hatch cannot silently change the request the logs describe. Read at import. |
+| `MNEMOSYNE_LLM_FALLBACK_EXTRA_BODY` | Same as `MNEMOSYNE_LLM_EXTRA_BODY`, for requests to the fallback endpoint (`MNEMOSYNE_LLM_FALLBACK_MODELS`). Read at import. |
+| `MNEMOSYNE_MCP_ALLOWED_HOSTS` | Comma-separated Host header values allowed for a non-loopback MCP Streamable HTTP bind (exact names or `name:*` patterns covering any port). A non-loopback Streamable HTTP bind additionally requires this variable; HTTP authentication can be supplied by `MNEMOSYNE_MCP_TOKENS` (which takes precedence) or `MNEMOSYNE_MCP_TOKEN`. Requests presenting any other Host are rejected with HTTP 421. |
 | `MNEMOSYNE_MCP_ALLOWED_ORIGINS` | Optional comma-separated browser Origins allowed for a non-loopback MCP Streamable HTTP bind. Requests with no Origin header (CLI/SDK clients) always pass; any Origin not listed is rejected with HTTP 403. Origins only narrow the exposure boundary; the token and Host policy above are always required. |
 | `MNEMOSYNE_MCP_BANK` | Memory bank used by the MCP server. |
-| `MNEMOSYNE_MCP_TOKEN` | Bearer token for MCP HTTP (SSE and Streamable HTTP) auth. Required for any non-loopback bind, which exposes the selected local SQLite-backed memory bank to network clients. |
+| `MNEMOSYNE_MCP_TOKEN` | Single bearer token for MCP HTTP (SSE and Streamable HTTP) authentication. Either `MNEMOSYNE_MCP_TOKENS` or this variable supplies HTTP authentication, with `MNEMOSYNE_MCP_TOKENS` taking precedence. Authentication is required for any non-loopback bind, which exposes the selected local SQLite-backed memory bank to network clients. |
+| `MNEMOSYNE_MCP_TOKENS` | JSON object mapping unique, non-empty string token names to unique, non-empty string secrets for MCP HTTP (SSE and Streamable HTTP) bearer authentication. When set, it takes precedence over `MNEMOSYNE_MCP_TOKEN` and requires authentication on every host, including loopback; when unset, loopback is tokenless and non-loopback requires `MNEMOSYNE_MCP_TOKEN`. In multi-agent mode, the matched token name is the authoritative `author_id`: conflicting client-supplied values are rejected, while matching or omitted values are accepted. The legacy `MNEMOSYNE_MCP_TOKEN` remains backward compatible and does not bind an author identity. The mapping is validated at startup, which fails for blank, malformed, non-object, empty, non-string, duplicate-name, normalized-name collision, empty-name/secret, or duplicate-secret values. |
 | `MNEMOSYNE_MODEL_CACHE_DIR` | Directory holding the local GGUF consolidation model. Unset or blank keeps `~/.hermes/mnemosyne/models`. Read at import; an explicitly set path is authoritative, so an unusable one fails rather than falling back to the default. |
 | `MNEMOSYNE_PERSONA_FILE` | Path to an external persona facts file. |
 | `MNEMOSYNE_PREFETCH_MODEL_SLOT_LIMIT` | Maximum canonical slots prefetched per turn. |
 | `MNEMOSYNE_PREFETCH_MODEL_SLOT_MIN_OVERLAP` | Minimum token overlap for a canonical slot to count as relevant. |
 | `MNEMOSYNE_PREFETCH_PROFILE` | Prefetch profile name, for example `general` or `coding`. |
+| `MNEMOSYNE_RECALL_PROVENANCE` | Set to `1` to make linear `recall()` append one JSONL audit line per call to `<db>.recall_provenance.jsonl` (plaintext: up to 200 chars of raw query text, plus the first 20 results with id/tier/score/importance/timestamp). Default OFF, read per call. The file is created `0600`, rotates at 1 MB (the current file plus one `.1` are retained), and reads are bounded to a 256 KB tail of the current generation. `explain=True` calls are intentionally excluded: their trace object is the audit surface for that call. Provenance is suppressed only when `recall_enhanced()` takes its enhanced branch (`MNEMOSYNE_ENHANCED_RECALL=1`); with the flag unset it is a plain passthrough into `recall()` and its calls ARE logged. Polyphonic paths are never logged. Fail-open: a provenance failure never breaks recall. When enabled, each call pays one small locked append (no fsync); local filesystems only. |
 | `MNEMOSYNE_SESSION_END_TIMEOUT` | Seconds allowed for end-of-session memory writes. |
 | `MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT` | Seconds allowed to drain pending writes on shutdown. |
 | `MNEMOSYNE_STATED_WEIGHT` | Veracity multiplier for directly stated memories. |

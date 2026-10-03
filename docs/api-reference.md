@@ -30,11 +30,11 @@ These functions create a default `Mnemosyne` instance and delegate to it. The op
 
 | Function | Signature | Description |
 |---|---|---|
-| `remember()` | `(content, source="conversation", importance=0.5, **kwargs) -> str` | Store a memory, returns memory ID |
+| `remember()` | `(content, source="conversation", importance=0.5, **kwargs) -> Optional[str]` | Store a memory; returns its ID, or `None` when write policy rejects it |
 | `recall()` | `(query, top_k=5, **kwargs) -> list` | Search memories |
 | `get_stats()` | `() -> dict` | Memory statistics |
 | `forget()` | `(memory_id) -> bool` | Delete a memory |
-| `update()` | `(memory_id, **kwargs) -> bool` | Update a memory |
+| `update()` | `(memory_id, **kwargs) -> Optional[bool]` | Update a memory; returns `None` when write policy rejects it |
 | `get_context()` | `(limit=10, bank=None) -> list[dict]` | Get recent working-memory context |
 
 ---
@@ -555,7 +555,8 @@ from mnemosyne.core.canonical import CanonicalStore
 
 store = CanonicalStore(db_path)
 
-# Upsert the canonical value for a slot (returns the current row + status).
+# Upsert the canonical value for a slot (returns the current row + status,
+# or None without mutation when write policy rejects the body).
 store.remember("jessi", "identity", "name", "My name is Jessi.")   # status="created"
 store.remember("jessi", "identity", "name", "My name is Jessi.")   # status="unchanged" (no-op)
 store.remember("jessi", "identity", "name", "I go by Jess now.")    # status="updated"
@@ -622,6 +623,38 @@ A frequently used subset, for orientation:
 
 There is no `mnemosyne_get_stats`. The tool is `mnemosyne_stats` on both the MCP
 server and the Hermes plugin.
+
+### Working embedding statistics
+
+`BeamMemory.get_working_stats()` adds these fields to the existing working totals:
+
+| Field | Meaning |
+|---|---|
+| `embedding_rows` | Existing working rows with a stored `memory_embeddings` entry (JSON presence). |
+| `ann_indexed_rows` | Existing working rows with a `vec_working` ANN entry; `0` when that index is unavailable. |
+| `ann_index_available` | Whether this connection can read the ANN index, including an available but empty index. |
+
+Each count uses the same selected database and the same optional `author_id`,
+`author_type`, and `channel_id` filters as `total`. Orphan and episodic-only
+embedding entries do not count as working rows; duplicate representations do not
+multiply parents. JSON and ANN presence are independent: a missing mirror does
+not erase JSON presence, and an ANN-only entry still counts as ANN presence.
+
+These are **storage-presence counts**, not validated vectors, recall-readiness,
+or global embedder health. Malformed JSON and stale-model entries still count;
+expiry, supersession, consolidation, and recall admission are not evaluated.
+An unavailable ANN index does not disable JSON-based working dense recall.
+Stats do not load a model, backfill, repair, or change persisted state. Missing
+ANN tables/modules report unavailable; unrelated database failures propagate,
+and a missing `memory_embeddings` table is an error, not zero coverage.
+
+The standalone Hermes `mnemosyne_stats` response exposes these fields under
+`working`; its selected private bank totals are not limited to the displayed
+`session_id`. The SDK `get_stats()` and MCP stats response retain them under
+`beam.working_memory` (inside MCP's `stats` envelope). Existing keys and episodic
+`vectors`/`vec_type` semantics are unchanged: episodic `0`/`none` describes that
+tier only. The diagnostic `vec_working_coverage().status == "complete"` means
+stored embeddings are mirrored, not that every working row has an embedding.
 
 ---
 

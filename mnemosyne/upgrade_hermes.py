@@ -1,5 +1,9 @@
 """Upgrade command for mnemosyne-hermes.
 
+NOTE: this module intentionally lives in the core ``mnemosyne`` package,
+not in the hermes plugin (``integrations/hermes``), so the Hermes
+plugin-catalog build ships no self-updater (catalog rule 3).
+
 Detects the installation method (pipx / uv-tool / pip) and runs the
 correct upgrade command, then re-registers the plugin with Hermes.
 """

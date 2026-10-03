@@ -105,6 +105,22 @@ def is_configured(modality: str = "image") -> bool:
 # Payload construction
 # ---------------------------------------------------------------------------
 
+def _guess_mime(uri: Optional[str]) -> Optional[str]:
+    """Type from the file name when the caller gave none.
+
+    Vision endpoints validate the data URI's media type; OpenAI accepts only
+    ``image/png``, ``image/jpeg``, ``image/gif`` and ``image/webp`` and rejects
+    ``application/octet-stream`` outright, so an unlabeled local PNG would
+    otherwise fail every call.
+    """
+    import mimetypes
+
+    if not uri:
+        return None
+    guessed, _ = mimetypes.guess_type(str(uri), strict=False)
+    return guessed
+
+
 def _image_part(request: DescribeRequest) -> Optional[Dict[str, Any]]:
     """Build the ``image_url`` content part, fetching bytes only when needed.
 
@@ -130,7 +146,7 @@ def _image_part(request: DescribeRequest) -> Optional[Dict[str, Any]]:
     if not raw:
         return None
 
-    mime = request.mime or "application/octet-stream"
+    mime = request.mime or _guess_mime(request.uri) or "application/octet-stream"
     encoded = base64.b64encode(raw).decode("ascii")
     return {
         "type": "image_url",
@@ -434,7 +450,7 @@ class OpenAICompatModalityBackend:
     """Describe content via any OpenAI-compatible vision endpoint."""
 
     name: str = NAME
-    modalities: FrozenSet[str] = frozenset({"image", "document"})
+    modalities: FrozenSet[str] = frozenset({"image", "audio"})
 
     def describe(self, request: DescribeRequest) -> Optional[DescribeResult]:
         base_url = _cfg_str("modality_base_url").rstrip("/")
@@ -448,6 +464,14 @@ class OpenAICompatModalityBackend:
                 "no modality model configured for %r; skipping", request.modality
             )
             return None
+
+        if str(request.modality).strip().lower() == "audio":
+            from mnemosyne.core.modality_openai_audio import describe_audio
+
+            request.timeout = float(request.timeout or _cfg_int("modality_timeout", 60))
+            request.max_moments = int(request.max_moments or _cfg_int("modality_max_moments", 12))
+            return describe_audio(request, base_url=base_url, api_key=api_key,
+                                  model=model, provider=self.name)
 
         part = _image_part(request)
         if part is None:

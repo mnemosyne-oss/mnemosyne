@@ -254,6 +254,50 @@ VALIDATE_SCHEMA = {
     },
 }
 
+REMEMBER_MEDIA_SCHEMA = {
+    "name": "mnemosyne_remember_media",
+    "description": (
+        "Remember a piece of media: an image, audio clip, video or document. It is "
+        "registered by reference and, when media understanding is enabled, turned into "
+        "located text memories (captions, timed transcript lines, timed video shots, "
+        "document passages by page) that mnemosyne_recall finds like any other memory. "
+        "Pass an https:// URL, a data: URI, a blob:// reference, or an absolute local "
+        "path inside MNEMOSYNE_MEDIA_ALLOWED_PATHS. Status 'unavailable' is a success: "
+        "the media was registered but nothing described it (no model configured, or "
+        "understanding is off)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "ref": {
+                "type": "string",
+                "description": "https:// URL, data: URI, blob://sha256/... reference, or an absolute local path inside MNEMOSYNE_MEDIA_ALLOWED_PATHS.",
+            },
+            "modality": {
+                "type": "string",
+                "enum": ["image", "video", "audio", "document"],
+                "description": "Override the modality inferred from the extension or mime type.",
+            },
+            "mime": {"type": "string", "description": "Media type, e.g. image/png. Optional."},
+            "title": {"type": "string", "description": "Short human title for the media. Optional."},
+            "hint": {
+                "type": "string",
+                "description": "Guidance for the describer: what to look for, or names and jargon to expect in speech.",
+            },
+            "max_moments": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Cap on memories created from this media. Default from MNEMOSYNE_MODALITY_MAX_MOMENTS.",
+            },
+            "importance": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5},
+            "scope": {"type": "string", "enum": ["session", "global"], "description": "Defaults to the configured scope."},
+        },
+        "required": ["ref"],
+    },
+}
+
+
 GET_SCHEMA = {
     "name": "mnemosyne_get",
     "description": (
@@ -813,4 +857,5 @@ ALL_TOOL_SCHEMAS = [
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,
     SYNC_PUSH_SCHEMA, SYNC_PULL_SCHEMA, SYNC_STATUS_SCHEMA,
     PERSONA_PROMOTE_SCHEMA, PERSONA_DEMOTE_SCHEMA, PERSONA_LIST_SCHEMA, PERSONA_REINFORCE_SCHEMA,
+    REMEMBER_MEDIA_SCHEMA,
 ]  # noqa: E501

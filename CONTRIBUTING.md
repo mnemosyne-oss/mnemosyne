@@ -5,7 +5,7 @@ Mnemosyne is a personal project that grew into something useful. If you're here,
 ## Getting Started
 
 ```bash
-git clone https://github.com/AxDSan/mnemosyne.git
+git clone https://github.com/mnemosyne-oss/mnemosyne.git
 cd mnemosyne
 
 # Core tests (matches the CI default and avoids embedding-model downloads)
@@ -51,9 +51,9 @@ Releases are fully automated via GitHub Actions:
    git tag -a v1.X.Y -m "Release v1.X.Y"
    git push origin v1.X.Y
    ```
-4. The [release workflow](https://github.com/AxDSan/mnemosyne/actions/workflows/release.yml) handles the rest:
+4. The [release workflow](https://github.com/mnemosyne-oss/mnemosyne/actions/workflows/release.yml) handles the rest:
    - Builds wheel + sdist
-   - Creates a [GitHub Release](https://github.com/AxDSan/mnemosyne/releases) with auto-generated notes
+   - Creates a [GitHub Release](https://github.com/mnemosyne-oss/mnemosyne/releases) with auto-generated notes
    - Publishes to [PyPI](https://pypi.org/project/mnemosyne-memory/) via trusted publishing (OIDC)
 
 No manual uploads. No API tokens.
@@ -107,7 +107,7 @@ These are not mandates — just directions where help would be valuable:
 
 ## Community
 
-- **Issues & bugs:** [GitHub Issues](https://github.com/AxDSan/mnemosyne/issues)
+- **Issues & bugs:** [GitHub Issues](https://github.com/mnemosyne-oss/mnemosyne/issues)
 - **Feature ideas & questions:** [Join our Discord](https://discord.gg/nousresearch) or open an issue
 
 ## Contributor License Agreement (CLA)

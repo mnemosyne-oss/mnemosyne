@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import sqlite3
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -83,6 +84,83 @@ class NoiseCandidate:
 
 _ALLOWED_HYGIENE_TABLES = {"working_memory", "memories", "episodic_memory"}
 _ALLOWED_HYGIENE_ACTIONS = {"delete", "archive", "keep", "flag"}
+
+# Base table -> sqlite-vec mirror for the delete cascade below. FTS needs
+# no handling: the em_ad/wm_ad triggers maintain fts_episodes/fts_working
+# on base-table DELETE. The legacy `memories` table has no vec mirror.
+_HYGIENE_VEC_MIRRORS = {
+    "working_memory": "vec_working",
+    "episodic_memory": "vec_episodes",
+}
+
+
+def _hygiene_ensure_vec(conn: sqlite3.Connection) -> bool:
+    """Best-effort sqlite-vec load on a standalone hygiene connection.
+
+    Never raises: any import or load failure (including non-ImportError
+    ones from a broken native module) disables the vec cascade, and the
+    base/annotation/embedding deletes still apply.
+    """
+    try:
+        import sqlite_vec
+
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        return True
+    except Exception:
+        logger.info("hygiene vec support unavailable", exc_info=True)
+        return False
+
+
+def _hygiene_delete_cascade(
+    cursor: sqlite3.Cursor,
+    conn: sqlite3.Connection,
+    table_name: str,
+    memory_id: str,
+    vec_loaded: bool,
+) -> None:
+    """Delete a hygiene row plus its orphan-prone side rows (see #960).
+
+    Removes the base row, its annotations/memory_embeddings/gists rows
+    (keyed by memory_id), and its sqlite-vec entry (keyed by rowid).
+
+    The required deletes run inside a per-candidate savepoint: a failure
+    rolls them back and re-raises (the caller records the error), so a
+    half-applied cascade can never persist. The vec delete stays outside
+    the savepoint as best-effort — it is logged and never aborts the
+    base delete.
+    """
+    row = cursor.execute(
+        f"SELECT rowid FROM {table_name} WHERE id = ?", (memory_id,)
+    ).fetchone()
+    rowid = row["rowid"] if row is not None else None
+    cursor.execute("SAVEPOINT hygiene_delete")
+    try:
+        cursor.execute(f"DELETE FROM {table_name} WHERE id = ?", (memory_id,))
+        cursor.execute("DELETE FROM annotations WHERE memory_id = ?", (memory_id,))
+        cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+        gists_table = cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
+        ).fetchone()
+        if gists_table is not None:
+            cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
+    except Exception:
+        cursor.execute("ROLLBACK TO SAVEPOINT hygiene_delete")
+        cursor.execute("RELEASE hygiene_delete")
+        raise
+    else:
+        cursor.execute("RELEASE hygiene_delete")
+    vec_table = _HYGIENE_VEC_MIRRORS.get(table_name)
+    if rowid is None or vec_table is None or not vec_loaded:
+        return
+    try:
+        cursor.execute(f"SELECT 1 FROM {vec_table} LIMIT 0")
+    except Exception:
+        return
+    try:
+        cursor.execute(f"DELETE FROM {vec_table} WHERE rowid = ?", (int(rowid),))
+    except Exception:
+        logger.info("hygiene vec cascade skipped", exc_info=True)
 
 
 def validate_hygiene_candidate(candidate_data: Any) -> None:
@@ -188,6 +266,19 @@ _VALUE_KEYWORDS = {
 }
 
 
+# Output-shape anchors for the two terminal markers that are also prose: the
+# ``total 48`` / ``total 4.0K`` summary line of ``ls -l``, and the installer
+# lines pip (``Installing collected packages: ...``) and brew (``==> Installing
+# ...``) print at the start of a line.  Matched against lowercased content, one
+# line at a time.
+_TERMINAL_LINE_RE = re.compile(
+    r"^[ \t]*(?:total [0-9]+(?:\.[0-9]+)?[kmgtp]?[ \t\r]*$"
+    r"|installing collected packages\b"
+    r"|==> installing )",
+    re.MULTILINE,
+)
+
+
 def _score_noise(content: str, importance: float, source: str) -> Tuple[float, List[str]]:
     """Score a single content string for noise likelihood.
 
@@ -218,11 +309,16 @@ def _score_noise(content: str, importance: float, source: str) -> Tuple[float, L
         score = max(score, 0.7)
         reasons.append("trivial_keyword")
 
-    # 4. Terminal output markers
-    terminal_markers = ["collecting ", "downloading ", "installing ", "requirement already",
+    # 4. Terminal output markers. ``total`` and ``installing`` are ordinary
+    # English words, so they only count in the shape a terminal prints them
+    # (``_TERMINAL_LINE_RE``), not mid-sentence (#1074).
+    terminal_markers = ["collecting ", "downloading ", "requirement already",
                         "successfully installed", "npm warn", "npm error",
-                        "total ", "drwx", "-rw-r--r--"]
-    if any(m in content_lower for m in terminal_markers):
+                        "drwx", "-rw-r--r--"]
+    if (
+        any(m in content_lower for m in terminal_markers)
+        or _TERMINAL_LINE_RE.search(content_lower)
+    ):
         score = max(score, 0.85)
         reasons.append("terminal_output")
 
@@ -665,6 +761,7 @@ def clean_noise(
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
+    vec_loaded = _hygiene_ensure_vec(conn)
 
     try:
         _ensure_hygiene_log_table(conn)
@@ -689,10 +786,7 @@ def clean_noise(
                 original_metadata = row["metadata_json"] or "{}"
 
                 if effective_action == "delete":
-                    cursor.execute(
-                        f"DELETE FROM {c.table_name} WHERE id = ?",
-                        (c.memory_id,),
-                    )
+                    _hygiene_delete_cascade(cursor, conn, c.table_name, c.memory_id, vec_loaded)
                     result.deleted += 1
                     log_action = "deleted"
                 elif effective_action == "archive":

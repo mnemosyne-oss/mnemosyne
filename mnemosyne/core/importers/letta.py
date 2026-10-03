@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import List, Dict
 from pathlib import Path
 
+from mnemosyne.core.filters import _RESTORE_WRITE_CAPABILITY
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
 
 
@@ -287,7 +288,11 @@ class LettaImporter(BaseImporter):
                         metadata=meta,
                         valid_until=mem_dict.get("valid_until"),
                         scope=mem_dict.get("scope", "session"),
+                        _write_kind=_RESTORE_WRITE_CAPABILITY,
                     )
+                    if mid is None:
+                        result.skipped += 1
+                        continue
                     if author_id or author_type or chan:
                         try:
                             mnemosyne.beam.conn.execute("""

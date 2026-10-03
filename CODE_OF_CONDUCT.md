@@ -59,7 +59,7 @@ representative at an online or offline event.
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported to the community leaders responsible for enforcement by opening a
-**[GitHub Issue](https://github.com/AxDSan/mnemosyne/issues)** (mark it as sensitive if needed) or by contacting **@AxDSan** on GitHub.
+**[GitHub Issue](https://github.com/mnemosyne-oss/mnemosyne/issues)** (mark it as sensitive if needed) or by contacting **@AxDSan** on GitHub.
 
 All complaints will be reviewed and investigated promptly and fairly.
 

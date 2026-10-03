@@ -207,9 +207,10 @@ remember("Met with Abdias about the v2 release",
 remember("User said they prefer Python for backend work",
          extract=True)
 
-# Temporal triples (knowledge graph)
+# Temporal triples (knowledge graph), scoped to a bank so it shares the
+# bank's MCP tools instead of writing a standalone triples.db.
 from mnemosyne.core.triples import TripleStore
-kg = TripleStore()
+kg = TripleStore.for_bank("default")
 kg.add("Maya", "assigned_to", "auth-migration",
        valid_from="2026-01-15")
 kg.query("Maya", as_of="2026-02-01")
@@ -458,7 +459,7 @@ mnemosyne sync-status --remote https://my-vps:8765
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
-Full docs: [`docs/`](docs/README.md) . Changelog: [`CHANGELOG.md`](CHANGELOG.md) . Releases: [GitHub Releases](https://github.com/AxDSan/mnemosyne/releases) . Integrations: [docs/integrations/](docs/integrations/README.md)
+Full docs: [`docs/`](docs/README.md) . Changelog: [`CHANGELOG.md`](CHANGELOG.md) . Releases: [GitHub Releases](https://github.com/mnemosyne-oss/mnemosyne/releases) . Integrations: [docs/integrations/](docs/integrations/README.md)
 
 ---
 
@@ -482,7 +483,7 @@ Sponsorship is paid, in cash or in credits, and every placement is disclosed. To
 
 <div align="center">
 
-**Discord:** [Join the Mnemosyne community](https://discord.gg/nousresearch) . **Issues:** [GitHub Issues](https://github.com/AxDSan/mnemosyne/issues)
+**Discord:** [Join the Mnemosyne community](https://discord.gg/nousresearch) . **Issues:** [GitHub Issues](https://github.com/mnemosyne-oss/mnemosyne/issues)
 
 <a href="https://github.com/sponsors/AxDSan"><img src="https://img.shields.io/badge/%F0%9F%92%96_GitHub_Sponsors-30363D?style=for-the-badge&logo=github&logoColor=white" alt="GitHub Sponsors"/></a>
 <a href="https://ko-fi.com/axdsan"><img src="https://img.shields.io/badge/%E2%98%95_Ko-fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white" alt="Ko-fi"/></a>
