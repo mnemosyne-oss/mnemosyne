@@ -498,6 +498,36 @@ class EpisodicGraph:
         ))
         self.conn.commit()
     
+    def _store_gist_if_working_parent(
+        self, gist: Gist, memory_id: str, parent_session_id: str
+    ) -> bool:
+        """Atomically admit a gist against its expected working parent."""
+        owns_transaction = not self.conn.in_transaction
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO gists
+            (id, text, timestamp, participants_json, location, emotion, time_scope, memory_id)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE EXISTS (
+                SELECT 1 FROM working_memory
+                WHERE id = ? AND session_id = ?
+            )
+        """, (
+            gist.id,
+            gist.text,
+            gist.timestamp,
+            json.dumps(gist.participants),
+            gist.location,
+            gist.emotion,
+            gist.time_scope,
+            memory_id,
+            memory_id,
+            parent_session_id,
+        ))
+        if owns_transaction:
+            self.conn.commit()
+        return cursor.rowcount > 0
+
     def store_fact(self, fact: Fact, memory_id: str, session_id: str = "default"):
         """Store a fact in the database."""
         cursor = self.conn.cursor()

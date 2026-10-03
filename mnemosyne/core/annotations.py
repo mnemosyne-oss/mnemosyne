@@ -270,11 +270,27 @@ class AnnotationStore:
         confidence: float = 1.0,
         *,
         _write_policy=None,
+        _working_parent_session_id: str | None = None,
     ) -> int:
         """Batch-insert helper for multiple values under one (memory_id, kind).
 
         Returns the count of rows inserted. Skips empty / blank values silently.
+
+        ``_working_parent_session_id`` is an internal admission hook for delayed
+        enrichment: when supplied, each insert is atomically conditioned on the
+        expected working-memory parent still existing in that session.
         """
+        if _working_parent_session_id is not None:
+            return self._add_many_if_working_parent(
+                memory_id,
+                _working_parent_session_id,
+                kind,
+                values,
+                source,
+                confidence,
+                _write_kind="public",
+                _write_policy=_write_policy,
+            )
         return self._add_many(
             memory_id,
             kind,
@@ -323,6 +339,61 @@ class AnnotationStore:
         )
         self.conn.commit()
         return cursor.rowcount
+
+    def _add_many_if_working_parent(
+        self,
+        memory_id: str,
+        session_id: str,
+        kind: str,
+        values: List[str],
+        source: str = "",
+        confidence: float = 1.0,
+        *,
+        _write_kind: object,
+        _write_policy=None,
+    ) -> int:
+        """Append values only while the expected working parent exists.
+
+        Each child insert carries the parent/session admission predicate in the
+        same SQL statement, so a concurrent forget is ordered before or after
+        the write. The session predicate rejects a same-ID parent recreated in
+        another session. Same-ID recreation inside the same session remains an
+        ABA limitation until the storage contract has a parent generation.
+
+        ``executemany`` keeps the writes in one SQLite transaction until the
+        existing commit point and does not commit a caller-owned transaction.
+        """
+        if not values:
+            return 0
+
+        candidates = [v for v in values if v and v.strip()]
+        admitted = _admit_annotation_values(
+            candidates,
+            write_kind=_write_kind,
+            write_policy=_write_policy,
+        )
+        if not admitted:
+            return 0
+
+        owns_transaction = not self.conn.in_transaction
+        cursor = self.conn.cursor()
+        cursor.executemany(
+            """
+            INSERT OR IGNORE INTO annotations (memory_id, kind, value, source, confidence)
+            SELECT ?, ?, ?, ?, ?
+            WHERE EXISTS (
+                SELECT 1 FROM working_memory
+                WHERE id = ? AND session_id = ?
+            )
+            """,
+            [
+                (memory_id, kind, value, source, confidence, memory_id, session_id)
+                for value in admitted
+            ],
+        )
+        if owns_transaction:
+            self.conn.commit()
+        return max(cursor.rowcount, 0)
 
     # ------------------------------------------------------------------
     # Reads

@@ -2798,8 +2798,9 @@ def _extract_and_store_entities(beam: "BeamMemory", memory_id: str, content: str
         # instance, shares the thread-local connection). UNIQUE constraint
         # on (memory_id, kind, value) plus INSERT OR IGNORE makes this
         # idempotent -- re-extraction on duplicate-content writes is a no-op.
-        beam.annotations._add_many(
+        beam.annotations._add_many_if_working_parent(
             memory_id=memory_id,
+            session_id=beam.session_id,
             kind="mentions",
             values=entities,
             source="regex",
@@ -2849,6 +2850,7 @@ def _extract_and_store_facts(
                 source=source,
                 confidence=0.7,
                 _write_policy=write_policy,
+                _working_parent_session_id=beam.session_id,
             )
 
         # ALSO store every policy-admitted fact in the facts table (new cloud
@@ -6137,32 +6139,55 @@ class BeamMemory:
         return result_ids
 
     def _ingest_graph_and_veracity(self, memory_id: str, content: str,
-                                    source: str, veracity: str = "unknown"):
+                                    source: str, veracity: str = "unknown", *,
+                                    require_working_parent: bool = True):
         """Phase 3-4: Extract gists + facts, store in graph, consolidate veracity.
         Non-blocking -- failures in graph/veracity don't affect memory storage."""
 
         gist = None
         facts = []
 
-        # Phase 3: Episodic graph extraction
+        # Phase 3: Episodic graph extraction. Keep the potentially
+        # expensive extraction work outside SQLite writes. The gist write
+        # performs parent admission in the same SQL statement, so a concurrent
+        # forget is ordered before or after that child write rather than racing
+        # an earlier existence probe (#1100).
         if self.episodic_graph is not None:
             try:
+                parent_session_id = self.session_id
                 gist = self.episodic_graph.extract_gist(content, memory_id)
-                self.episodic_graph.store_gist(gist, memory_id)
+                extracted_facts = self.episodic_graph.extract_facts(
+                    content, memory_id
+                )
 
-                facts = self.episodic_graph.extract_facts(content, memory_id)
-                for fact in facts:
-                    self.episodic_graph.store_fact(fact, memory_id)
+                if require_working_parent:
+                    gist_stored = self.episodic_graph._store_gist_if_working_parent(
+                        gist, memory_id, parent_session_id
+                    )
+                else:
+                    self.episodic_graph.store_gist(gist, memory_id)
+                    gist_stored = True
 
-                # Link graph edges between gist and facts
-                for fact in facts:
-                    self.episodic_graph.add_edge(GraphEdge(
-                        source=gist.id,
-                        target=fact.id,
-                        edge_type="ctx",
-                        weight=fact.confidence,
-                        timestamp=datetime.now().isoformat()
-                    ))
+                if not gist_stored:
+                    # The parent was already gone at the gist write boundary.
+                    # Stop this graph tail here instead of creating derivatives
+                    # whose originating working row no longer exists.
+                    gist = None
+                    facts = []
+                else:
+                    facts = extracted_facts
+                    for fact in facts:
+                        self.episodic_graph.store_fact(fact, memory_id)
+
+                    # Link graph edges between gist and facts
+                    for fact in facts:
+                        self.episodic_graph.add_edge(GraphEdge(
+                            source=gist.id,
+                            target=fact.id,
+                            edge_type="ctx",
+                            weight=fact.confidence,
+                            timestamp=datetime.now().isoformat()
+                        ))
             except Exception:
                 pass  # Graph failures are non-blocking
 
@@ -6311,19 +6336,21 @@ class BeamMemory:
         try:
             date_str = timestamp[:10]  # YYYY-MM-DD
             # Reuse the cached AnnotationStore handle on self.
-            self.annotations.add(
+            self.annotations._add_many_if_working_parent(
                 memory_id=memory_id,
+                session_id=self.session_id,
                 kind="occurred_on",
-                value=date_str,
+                values=[date_str],
                 _write_kind=_write_kind,
                 _write_policy=_write_policy,
             )
             # Also tag source type
             if source and source not in ("conversation", "user", "assistant"):
-                self.annotations.add(
+                self.annotations._add_many_if_working_parent(
                     memory_id=memory_id,
+                    session_id=self.session_id,
                     kind="has_source",
-                    value=source,
+                    values=[source],
                     _write_kind=_write_kind,
                     _write_policy=_write_policy,
                 )
@@ -7462,7 +7489,13 @@ class BeamMemory:
             # weight in its confidence update -- undermining the very signal
             # we just preserved in the episodic INSERT.
             if _owned_txn:
-                self._ingest_graph_and_veracity(memory_id, summary, source, veracity=row_veracity)
+                self._ingest_graph_and_veracity(
+                    memory_id,
+                    summary,
+                    source,
+                    veracity=row_veracity,
+                    require_working_parent=False,
+                )
 
             if emit_event:
                 self._emit_event(
