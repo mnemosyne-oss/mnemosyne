@@ -428,13 +428,19 @@ class TestReviewHardening:
         )
 
     def test_partial_conflict_rollback_undoes_fact_insert(self, temp_db):
-        """If a conflict-record INSERT fails mid-loop (after the
-        fact INSERT but before all conflicts are recorded), the
-        BEGIN IMMEDIATE scope's rollback should undo the fact
-        INSERT. Pre-fix _record_conflict's commit between the
-        fact INSERT and the conflict INSERT meant a failed
-        second conflict would leave the fact + first conflict
-        durable but later conflicts missing — partial state."""
+        """If a conflict-queue INSERT fails mid-loop (after the fact
+        INSERT but before all pairs are enqueued), the BEGIN
+        IMMEDIATE scope's rollback must undo the fact INSERT and
+        every queue row written so far.
+
+        Pre-fix, _record_conflict's commit between the fact INSERT
+        and the conflict INSERT meant a failed second conflict would
+        leave the fact + first conflict durable but later conflicts
+        missing — partial state. The queue row is the exact
+        replacement of that in-transaction conflict-record write:
+        same transaction, same all-or-nothing guarantee (and now it
+        also survives a crash after commit, which the old inline
+        path could not guarantee once the probe refused)."""
         from mnemosyne.core.veracity_consolidation import VeracityConsolidator
 
         cons = VeracityConsolidator(db_path=temp_db)
@@ -444,25 +450,25 @@ class TestReviewHardening:
         cons.consolidate_fact("Kate", "is", "Y", "stated", "src_y")
         # Both Kate-is-X and Kate-is-Y are in the DB.
 
-        # Now monkey-patch _record_conflict to fail on the second
-        # call. The first call should be deferred (commit=False);
-        # the failure on the second should trigger the outer
-        # rollback, undoing the fact INSERT entirely.
+        # Now monkey-patch the queue step to fail on the second
+        # call. The first call should be deferred (in the outer
+        # transaction); the failure on the second should trigger
+        # the outer rollback, undoing the fact INSERT entirely.
         call_count = {"n": 0}
-        original = cons._record_conflict
+        original = cons._enqueue_conflict_pair
 
-        def fail_second(*args, **kwargs):
+        def fail_second(cursor, *args, **kwargs):
             call_count["n"] += 1
             if call_count["n"] == 2:
                 raise sqlite3.OperationalError("simulated mid-loop failure")
-            return original(*args, **kwargs)
+            return original(cursor, *args, **kwargs)
 
-        cons._record_conflict = fail_second  # type: ignore
+        cons._enqueue_conflict_pair = fail_second  # type: ignore
 
         with pytest.raises(sqlite3.OperationalError, match="simulated"):
             cons.consolidate_fact("Kate", "is", "Z", "stated", "src_z")
 
-        del cons._record_conflict  # type: ignore
+        del cons._enqueue_conflict_pair  # type: ignore
 
         # The new fact (Kate, is, Z) must NOT be in the DB.
         rows = cons.conn.execute(
@@ -472,6 +478,22 @@ class TestReviewHardening:
         assert len(rows) == 0, (
             "fact INSERT not rolled back after conflict-record "
             "failure — partial state leaked"
+        )
+
+        # And the FIRST queue row must be gone with it: the table
+        # is created in the same transaction, so a clean rollback
+        # leaves no queue artefacts at all.
+        has_table = cons.conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE name = 'conflict_probe_pending'"
+        ).fetchone()
+        pending = 0
+        if has_table is not None:
+            pending = cons.conn.execute(
+                "SELECT COUNT(*) FROM conflict_probe_pending"
+            ).fetchone()[0]
+        assert pending == 0, (
+            "queued pair leaked past the rollback — partial state"
         )
 
     def test_race_window_widening_demonstrates_serialization(

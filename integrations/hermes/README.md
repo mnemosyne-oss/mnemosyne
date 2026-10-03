@@ -68,9 +68,9 @@ This is how Hermes builds memory from what it says *and* what it does.
 
 ### 2. Recall
 
-Recall is intentional. Agents decide when to recall, what scope, and how many results. There is no automatic retrieval dumping context into every prompt.
+Explicit `mnemosyne_recall` is intentional — agents decide when to recall, what scope, and how many results. In addition, the provider performs **automatic pre-turn prefetch**: before an LLM call it injects relevant memories into the prompt as a `## Mnemosyne Context` block. Prefetch is deliberately conservative and is not "automatic retrieval dumping context into every prompt." It applies a lexical gate — a memory must share multiple distinctive non-generic terms with the query and meet a minimum query-coverage fraction — before silent injection. Linear recall results must additionally clear per-signal signal and score floors, which favors distilled facts and preferences over raw transcripts. Under `MNEMOSYNE_POLYPHONIC_RECALL=1`, results ranked by the polyphonic engine (RRF over vector/graph/fact/temporal voices) pass the lexical gate without the linear score floors, so raw `[USER]` conversation transcripts surface in prefetch too.
 
-When `mnemosyne_recall` fires, Mnemosyne runs hybrid search: vector similarity finds semantic matches, FTS5 full-text finds keyword matches, and importance scoring boosts what matters. All three weights are tunable per-query so you can bias toward recency, relevance, or both.
+When `mnemosyne_recall` fires, Mnemosyne also runs hybrid search: vector similarity finds semantic matches, FTS5 full-text finds keyword matches, and importance scoring boosts what matters. All three weights are tunable per-query so you can bias toward recency, relevance, or both.
 
 Returned context can include prior decisions, constraints, failure modes, project patterns, and execution outcomes: without stuffing irrelevant history into the prompt.
 
@@ -272,10 +272,15 @@ No required config. Everything defaults to `~/.mnemosyne/`. Optional overrides:
 | `MNEMOSYNE_PREFETCH_CONTENT_CHARS` | `0` | Per-memory prefetch content cap (`0` = full content) |
 | `MNEMOSYNE_PREFETCH_MIN_DISTINCTIVE_TOKENS` | `2` | Shared non-generic terms required for automatic prefetch injection |
 | `MNEMOSYNE_PREFETCH_MIN_QUERY_COVERAGE` | `0.30` | Minimum fraction of non-generic query terms covered by a prefetched memory. Exempt for a canonical slot whose entire body is one CJK bigram that also appears in the query, so a short topical fact is reachable from a contextual sentence; separators around that bigram (`。`, `／`, `｡`, quotes, brackets) are removed before the check, so `部署／` qualifies while `部署／計画` still counts as two units. Automatic prefetch also runs the same run-local U+3005 iteration-mark predicate as explicit canonical recall before scoring, so a candidate that clears these thresholds can still be excluded when its iteration-mark evidence does not match a CJK run. Automatic prefetch still applies the rarity cap below, and explicit canonical recall needs no coverage fraction at all |
+| `MNEMOSYNE_POLYPHONIC_RECALL` | `0` | Route recall through the polyphonic engine (RRF over vector/graph/fact/temporal voices); prefetch then admits raw transcripts past the lexical gate without the linear score floors |
 | `MNEMOSYNE_PREFETCH_CANONICAL_RARE_TOKEN_MAX_FREQUENCY` | `1` | Maximum canonical document frequency that permits a one-token match (`0` disables the exception). A whole-body CJK bigram match counts as a one-token match, so it stays subject to this cap |
 | `MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS` | path-specific built-in canonical set | Complete replacement for the canonical generic-token set used by automatic and explicit canonical lookup; does not affect working/episodic prefetch |
 | `MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS` | _(empty)_ | Extra owner/deployment terms added to automatic canonical prefetch only |
 | `MNEMOSYNE_DEFAULT_SCOPE` | `session` | Default scope for remember (`global` enables cross-session immediate recall) |
+| `MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION` | `0` | Enables the `mnemosyne_resolve_conflicts` tool for global-scope memories. It does **not** run automatically: supersession only happens on an explicit apply. `dry_run=True` reports candidate pairs without mutating; `dry_run=False` applies superseding changes (LLM-confirmed when `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on). Automatic resolution during sleep is not yet enabled. |
+| `MNEMOSYNE_CROSS_SESSION_MIN_GAP_HOURS` | `0` | Minimum hour-gap between cross-session candidate pairs before they are flagged for contradiction (relaxed to 0 for independent threads) |
+| `MNEMOSYNE_CROSS_SESSION_MAX_CANDIDATES` | `10000` | Per-bank row cap for the cross-session candidate scan (bounds the pairwise comparison and embedding load); truncation is reported in the tool result |
+| `MNEMOSYNE_CROSS_SESSION_MAX_LLM_VALIDATIONS` | `20` | Per-run cap on LLM confirmation calls during an apply. Each call is a network round-trip that runs while the shared Beam access lock is held (it serializes auto-sleep and every other tool); the cap bounds that work. The tool reports `llm_cap_reached` in its result when the cap was hit (alongside `candidates_truncated` for the row cap), so operators can tell when candidate pairs remain pending for a later explicit run |
 
 Or in `~/.hermes/config.yaml`:
 
@@ -314,9 +319,9 @@ invalid classifier values fall back to `off` (invalid values also log a warning)
 
 ## Tools
 
-40 tools. All surfaced through Hermes' tool system.
+42 tools. All surfaced through Hermes' tool system.
 
-**Core memory:** `remember`, `recall`, `sleep`, `stats`, `get`, `update`, `forget`, `invalidate`, `validate`
+**Core memory:** `remember`, `recall`, `sleep`, `stats`, `get`, `update`, `forget`, `invalidate`, `validate`, `resolve_conflicts`
 
 **Knowledge graph:** `triple_add`, `triple_query`, `graph_query`, `graph_link`
 

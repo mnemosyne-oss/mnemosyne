@@ -1,8 +1,8 @@
 ---
 title: "Configuration"
-version: 4.0.0b3
-config_key_count: 116
-env_only_count: 50
+version: 4.0.0b4
+config_key_count: 117
+env_only_count: 52
 generated_at: "auto"
 ---
 
@@ -23,13 +23,13 @@ and `wm_max_items` are equivalent.
 Keys marked **restart** are read once at startup. Changing them at runtime warns
 and does not take effect until the process restarts.
 
-There are **116 configuration keys**. A further
-**50 environment variables** are read directly from the
+There are **117 configuration keys**. A further
+**52 environment variables** are read directly from the
 environment and are **not** settable in `config.yaml`; they are listed separately below.
 
 ---
 
-## Configuration keys (116)
+## Configuration keys (117)
 
 | Config key | Environment variable | Default | Restart | Description |
 |------------|----------------------|---------|---------|-------------|
@@ -46,6 +46,7 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `default_owner` | `MNEMOSYNE_DEFAULT_OWNER` | *(unset)* | **yes** | Default owner ID for canonical facts and shared memory. |
 | `default_scope` | `MNEMOSYNE_DEFAULT_SCOPE` | `session` | no | Default scope for new memories: `session` or `global`. |
 | `degrade_batch` | `MNEMOSYNE_DEGRADE_BATCH` | `100` | no | Rows degraded per maintenance pass. |
+| `dream_active` | `MNEMOSYNE_DREAM_ACTIVE` | `false` | no | Whether Dream mode is active, disabling automated model-refresh mutations. |
 | `embedding_api_key` | `MNEMOSYNE_EMBEDDING_API_KEY` | *(unset)* | no | API key for a remote embedding provider. Falls back to `OPENAI_API_KEY`. |
 | `embedding_api_url` | `MNEMOSYNE_EMBEDDING_API_URL` | *(unset)* | **yes** | Base URL of an OpenAI-compatible embedding endpoint. |
 | `embedding_dim` | `MNEMOSYNE_EMBEDDING_DIM` | `384` | **yes** | Override the embedding dimension. Must match the dimension stored in the existing vec tables. |
@@ -181,7 +182,7 @@ This list is derived by scanning the package for `os.environ.get("MNEMOSYNE_..."
 
 ---
 
-## Environment-only variables (50)
+## Environment-only variables (52)
 
 These are read with `os.environ` at their point of use and bypass
 `MnemosyneConfig` entirely. They cannot be set in `config.yaml`.
@@ -197,6 +198,7 @@ These are read with `os.environ` at their point of use and bypass
 | `MNEMOSYNE_BINARY_BONUS` | A/B toggle for the binary vector bonus in episodic scoring. |
 | `MNEMOSYNE_BUSY_TIMEOUT_MS` | SQLite `busy_timeout` in milliseconds. |
 | `MNEMOSYNE_CHANNEL_ID` | Channel or session identifier for memory scoping. |
+| `MNEMOSYNE_CONSOLIDATION_TIER` | Initial tier for sleep/consolidation summaries, applied to **newly inserted rows only**. Sets **ranking weight only** — the configured tier selects the recall multiplier a summary enters at (tier 1 = 1.0×, tier 2 = 0.5×, tier 3 = 0.25×), so the default of `3` places summaries at 0.25× instead of tier 1's full weight, which reduces the ranking pressure derived rows place on the sources they paraphrase; it is a weight, not a guarantee of ordering, since vector, FTS and temporal signals also contribute to the final score. Stored text is not truncated (`degrade_episodic()` rewrites content only for rows it moves down from tier 1 or 2). Set `1` for the legacy behavior. Clamped to {1,2,3}. Default `3`. Existing rows are **not** migrated — see [Migrating existing banks](#migrating-existing-banks). |
 | `MNEMOSYNE_CONTEXT_INCLUDE_CONSOLIDATED` | Include already-consolidated rows in assembled context. |
 | `MNEMOSYNE_CROSS_TIER_DEDUP` | A/B toggle for deduplication across working and episodic results. |
 | `MNEMOSYNE_EMBEDDING_DOC_PREFIX` | Prefix prepended verbatim to every document before embedding. Unset or empty by default, preserving the original text. When `MNEMOSYNE_EMBEDDING_API_URL` is configured with a remote endpoint, prefixed text may be sent to that embedding API; privacy-sensitive deployments should remain local-first by using local embeddings or a locally hosted endpoint. |
@@ -222,6 +224,7 @@ These are read with `os.environ` at their point of use and bypass
 | `MNEMOSYNE_PREFETCH_MODEL_SLOT_LIMIT` | Maximum canonical slots prefetched per turn. |
 | `MNEMOSYNE_PREFETCH_MODEL_SLOT_MIN_OVERLAP` | Minimum token overlap for a canonical slot to count as relevant. |
 | `MNEMOSYNE_PREFETCH_PROFILE` | Prefetch profile name, for example `general` or `coding`. |
+| `MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP` | Ceiling on the ranking importance of newly written `sleep_model_refresh_proposal` rows. The generating LLM's raw self-reported confidence is preserved in metadata (which the review/auto-apply flow reads) rather than used as a retrieval priority. Clamped to [0, 1]. Default `0.5`. Existing rows are **not** migrated — see [Migrating existing banks](#migrating-existing-banks). |
 | `MNEMOSYNE_RECALL_PROVENANCE` | Set to `1` to make linear `recall()` append one JSONL audit line per call to `<db>.recall_provenance.jsonl` (plaintext: up to 200 chars of raw query text, plus the first 20 results with id/tier/score/importance/timestamp). Default OFF, read per call. The file is created `0600`, rotates at 1 MB (the current file plus one `.1` are retained), and reads are bounded to a 256 KB tail of the current generation. `explain=True` calls are intentionally excluded: their trace object is the audit surface for that call. Provenance is suppressed only when `recall_enhanced()` takes its enhanced branch (`MNEMOSYNE_ENHANCED_RECALL=1`); with the flag unset it is a plain passthrough into `recall()` and its calls ARE logged. Polyphonic paths are never logged. Fail-open: a provenance failure never breaks recall. When enabled, each call pays one small locked append (no fsync); local filesystems only. |
 | `MNEMOSYNE_SESSION_END_TIMEOUT` | Seconds allowed for end-of-session memory writes. |
 | `MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT` | Seconds allowed to drain pending writes on shutdown. |
@@ -249,3 +252,29 @@ at query time. They are the highest-leverage tuning knobs in the system.
 They resolve at request time as `config.yaml > MNEMOSYNE_*_WEIGHT > defaults`.
 A config reload applies to the next request, and enhanced-recall cache entries
 are isolated by the effective weight snapshot.
+
+---
+
+## Migrating existing banks
+
+`MNEMOSYNE_CONSOLIDATION_TIER` and `MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP` apply when a
+row is written, so upgrading does not reweight rows already in the bank. Sleep summaries
+written before the upgrade keep their current stored tier, and model-refresh proposals
+keep their current stored importance until migrated.
+
+Existing banks can be demoted in place using the same fields the writer sets:
+
+```sql
+-- Derived summaries: full ranking weight (1.0x) -> tier 3 (0.25x)
+UPDATE episodic_memory SET tier = 3 WHERE source = 'sleep_consolidation';
+
+-- Model-refresh proposals: drop below the 0.65 prefetch rescue floor
+-- (monotonic: only demotes rows currently above 0.35)
+UPDATE working_memory SET importance = MIN(importance, 0.35)
+  WHERE source = 'sleep_model_refresh_proposal' AND importance > 0.35;
+```
+
+Neither statement is applied automatically: silently reweighting a user's existing
+memories on upgrade is worse than requiring one deliberate statement. Back up the
+database first (`VACUUM INTO` works on a live WAL bank), and note that both fields
+affect ranking only — no content is modified or deleted.

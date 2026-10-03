@@ -526,7 +526,7 @@ class TestRemoteLLMFallback:
         assert local_llm._is_retryable_status(503) is True
         assert local_llm._is_retryable_status(401) is False
         assert local_llm._is_retryable_status(403) is False
-        assert local_llm._is_retryable_status(429) is False
+        assert local_llm._is_retryable_status(429) is True
         assert local_llm._is_retryable_status(200) is False
 
     def test_primary_success_skips_fallback(self, monkeypatch):
@@ -579,16 +579,53 @@ class TestRemoteLLMFallback:
             assert local_llm._call_remote_llm("p") is None
             assert m.call_count == 1
 
-    def test_429_does_not_trigger_fallback(self, monkeypatch):
+    def test_429_triggers_fallback_when_candidate_remains(self, monkeypatch):
+        # 429 on the primary must not abort the chain when fallback candidates
+        # remain: per-model quotas on shared endpoints are normal (#1000).
         monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://x/v1")
         monkeypatch.setattr(local_llm, "LLM_REMOTE_MODEL", "primary")
         monkeypatch.setattr(local_llm, "LLM_FALLBACK_MODELS", ["fb1"])
 
         with patch.object(
-            local_llm, "_call_remote_llm_with_model", return_value=self._err(429)
+            local_llm,
+            "_call_remote_llm_with_model",
+            side_effect=[self._err(429), self._ok("fb-out")],
+        ) as m:
+            assert local_llm._call_remote_llm("p") == "fb-out"
+            assert m.call_count == 2
+            assert m.call_args_list[0].args[1] == "primary"
+            assert m.call_args_list[1].args[1] == "fb1"
+
+    def test_429_on_all_candidates_returns_none(self, monkeypatch):
+        # If every candidate is rate-limited, the chain exhausts and returns
+        # None - the caller falls through to local GGUF. No silent abort at
+        # the first 429.
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://x/v1")
+        monkeypatch.setattr(local_llm, "LLM_REMOTE_MODEL", "primary")
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_MODELS", ["fb1", "fb2"])
+
+        with patch.object(
+            local_llm,
+            "_call_remote_llm_with_model",
+            side_effect=[self._err(429), self._err(429), self._err(429)],
         ) as m:
             assert local_llm._call_remote_llm("p") is None
-            assert m.call_count == 1
+            assert m.call_count == 3
+
+    def test_429_mixed_with_other_failures(self, monkeypatch):
+        # 429 must be treated like any other retryable status in the chain:
+        # the loop continues past it to find a healthy candidate.
+        monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://x/v1")
+        monkeypatch.setattr(local_llm, "LLM_REMOTE_MODEL", "primary")
+        monkeypatch.setattr(local_llm, "LLM_FALLBACK_MODELS", ["fb1", "fb2"])
+
+        with patch.object(
+            local_llm,
+            "_call_remote_llm_with_model",
+            side_effect=[self._err(429), self._err(500), self._ok("fb2-out")],
+        ) as m:
+            assert local_llm._call_remote_llm("p") == "fb2-out"
+            assert m.call_count == 3
 
     def test_connection_error_triggers_fallback(self, monkeypatch):
         monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://x/v1")

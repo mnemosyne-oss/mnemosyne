@@ -16,6 +16,8 @@ import re
 from pathlib import Path
 from typing import List, Optional
 
+from mnemosyne.core.user_agent import application_user_agent
+
 # --- Config ------------------------------------------------------------------
 DEFAULT_MODEL_REPO = "openbmb/MiniCPM5-1B-GGUF"
 DEFAULT_MODEL_FILE = "MiniCPM5-1B-Q4_K_M.gguf"
@@ -616,12 +618,14 @@ def _is_retryable_status(status_code: int) -> bool:
 
     404/400: the requested model is missing or unrecognized on this endpoint —
     another model name on the same host may exist. 5xx: transient server-side
-    failure. 401/403/429 are NOT retryable: a bad key or rate limit won't be
-    fixed by swapping model names.
+    failure. 401/403 are NOT retryable: a bad key won't be fixed by swapping
+    model names. 429 IS retryable: on OpenAI-compatible gateways and proxies
+    the quota is usually attached to the model, not the endpoint, so a
+    sibling model on the same host may still have quota remaining (#1000).
     """
-    if status_code in (401, 403, 429):
+    if status_code in (401, 403):
         return False
-    if status_code in (404, 400) or 500 <= status_code < 600:
+    if status_code in (404, 400, 429) or 500 <= status_code < 600:
         return True
     return False
 
@@ -718,7 +722,10 @@ def _call_remote_llm_with_model(
         has_httpx = False
 
     url = f"{base_url}/chat/completions"
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": application_user_agent(),
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 

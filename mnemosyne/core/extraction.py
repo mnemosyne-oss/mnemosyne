@@ -85,13 +85,44 @@ def _parse_facts(raw_output: str) -> List[str]:
         try:
             parsed = _json.loads(raw_clean)
             if isinstance(parsed, dict):
-                # Collect all extracted items across categories
+                # Collect all extracted items across categories.
+                # The categories overlap by design — "always use tabs" is both a
+                # fact and an instruction, and a dated statement is both a fact
+                # and a timeline — so a model that files one statement under
+                # every category it belongs to is behaving correctly. Without a
+                # dedupe here that correctness is punished: the same string is
+                # returned once per category and stored once per copy.
                 all_items = []
+                seen = set()
+                saw_supported_category = False
                 for category in ('facts', 'instructions', 'preferences', 'timelines'):
-                    items = parsed.get(category, [])
+                    if category not in parsed:
+                        continue
+                    # Presence decides, not usability. A document that parsed as
+                    # a dict and names a supported category is complete, not
+                    # partial, so `"facts": null` or a bare string means "no
+                    # facts" rather than "try the streaming recovery regex".
+                    saw_supported_category = True
+                    items = parsed.get(category)
                     if isinstance(items, list):
-                        all_items.extend(str(item) for item in items if item)
-                if all_items:
+                        for item in items:
+                            if not item:
+                                continue
+                            text = str(item)
+                            key = text.strip().casefold()
+                            if not key or key in seen:
+                                continue
+                            seen.add(key)
+                            all_items.append(text)
+                # Answered by presence, not by yield: a payload that supplies a
+                # supported category and no usable entries means "nothing to
+                # extract", so return that. Falling through would hand the raw
+                # text to the partial-JSON regex, which matches any quoted run
+                # of ten or more characters — including the schema's own key
+                # names, making "instructions" and "preferences" stored facts.
+                # No supported category still falls through, which keeps the
+                # malformed/unsupported and kg-only paths intact.
+                if saw_supported_category:
                     return all_items
         except (_json.JSONDecodeError, Exception):
             pass

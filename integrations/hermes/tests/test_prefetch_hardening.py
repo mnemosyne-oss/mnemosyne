@@ -387,6 +387,99 @@ def test_canonical_prefetch_respects_higher_distinctive_token_minimum(monkeypatc
     assert rows == []
 
 
+def test_prefetch_injects_polyphonic_user_transcript():
+    """A raw [USER] conversation row returned by the polyphonic engine (which
+    carries only `voice_scores` provenance -- no linear keyword/fts/dense
+    fields and an RRF-scale `score`) is now injected by prefetch.
+
+    Regression: the adapter used to drop these on the missing per-signal
+    signal together with the 0.20 score floor, so raw conversation transcripts
+    never surfaced in prefetch under MNEMOSYNE_POLYPHONIC_RECALL=1."""
+    p = _provider([
+        {
+            "content": "[USER] carol said the norway news marker is on page two",
+            "source": "conversation",
+            "timestamp": "2026-08-11T09:00:00Z",
+            "importance": 0.5,
+            "score": 0.034,                       # RRF-scale combined score
+            "voice_scores": {"vector": 0.019, "temporal": 0.016},  # polyphonic
+            "trust_tier": "STATED",
+        },
+    ])
+
+    block = p.prefetch("norway news marker")
+
+    assert "norway news marker" in block
+
+
+def test_prefetch_excludes_polyphonic_row_without_lexical_evidence():
+    """A polyphonic [USER] row that shares no topical terms with the query must
+    not be injected -- the adapter still enforces the lexical gate for
+    polyphonic results, so a matching transcript is injected while an unrelated
+    one is kept out. (Session/channel scope isolation is not the adapter's job:
+    `BeamMemory.recall()` already returns only in-scope rows via its candidate
+    queries -- see the core `test_recall_session_scope_excludes_foreign_row_sharing_query_terms`
+    for the two-session shared-term case.)"""
+    p = _provider([
+        {
+            "content": "[USER] carol said the norway news marker is on page two",
+            "source": "conversation",
+            "timestamp": "2026-08-11T09:00:00Z",
+            "importance": 0.5,
+            "score": 0.034,
+            "voice_scores": {"vector": 0.019, "temporal": 0.016},
+            "trust_tier": "STATED",
+        },
+        {
+            "content": "[USER] unrelated sentinelxyz chat about quantum logs",
+            "source": "conversation",
+            "timestamp": "2026-08-11T10:00:00Z",
+            "importance": 0.9,
+            "score": 0.05,
+            "voice_scores": {"graph": 0.02, "fact": 0.015},
+            "trust_tier": "STATED",
+        },
+    ])
+
+    block = p.prefetch("norway news marker")
+
+    assert "norway news marker" in block
+    assert "sentinelxyz" not in block
+
+
+def test_prefetch_ranks_polyphonic_rows_by_strongest_voice():
+    """When multiple polyphonic rows all clear the lexical gate, prefetch ranks
+    them by the strongest voice contribution (`_prefetch_topic_signal` uses
+    max(voice_scores)), so the row with the stronger voice is injected first.
+    The adapter ranks honestly from `voice_scores` rather than fabricating
+    linear per-signal values."""
+    p = _provider([
+        {
+            "content": "[USER] carol said the norway news marker is on page two",
+            "source": "conversation",
+            "timestamp": "2026-08-11T09:00:00Z",
+            "importance": 0.5,
+            "score": 0.034,
+            "voice_scores": {"vector": 0.019, "temporal": 0.016},
+            "trust_tier": "STATED",
+        },
+        {
+            "content": "[USER] bob tracked the norway news marker in the log",
+            "source": "conversation",
+            "timestamp": "2026-08-11T09:01:00Z",
+            "importance": 0.5,
+            "score": 0.034,
+            "voice_scores": {"vector": 0.050, "temporal": 0.012},
+            "trust_tier": "STATED",
+        },
+    ])
+
+    block = p.prefetch("norway news marker")
+
+    assert "bob tracked" in block and "carol said" in block
+    assert block.index("bob tracked") < block.index("carol said"), (
+        "row with the stronger voice contribution should rank first"
+    )
 @pytest.mark.parametrize(
     ("script", "query", "ordinary", "unrelated"),
     [

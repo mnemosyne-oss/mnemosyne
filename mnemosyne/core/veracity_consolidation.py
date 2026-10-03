@@ -28,6 +28,7 @@ import logging
 import sqlite3
 import json
 import threading
+import time
 import unicodedata
 from mnemosyne.core.journal import journal_mode
 from datetime import datetime
@@ -278,7 +279,21 @@ class VeracityConsolidator:
     - Our novel veracity-weighted Bayesian updating
     """
     
-    def __init__(self, db_path: Path = None, conn=None):
+    def __init__(self, db_path: Path = None, conn=None,
+                 federation_probe: Optional[bool] = None):
+        """Build a consolidator.
+
+        federation_probe: whether to run the cross-bank federation handshake
+            (policy v3 R3/R7/R8, see
+            :mod:`mnemosyne.core.federation_handshake`) BEFORE a conflict row
+            is written. ``None`` (default) follows
+            ``MNEMOSYNE_FEDERATION_HANDSHAKE``, which is on unless set falsy;
+            ``True``/``False`` pin it for this instance. The handshake is
+            scoped to the fleet that contains this consolidator's bank, so a
+            standalone bank (or a test's temp bank) has no peers and its
+            insert is unaffected. It never writes to a peer bank, and any
+            probe failure refuses the insert (fail-closed).
+        """
         if conn is not None:
             self.conn = conn
             self.db_path = db_path or Path(":memory:")
@@ -303,6 +318,13 @@ class VeracityConsolidator:
                 pass
         self.conn.row_factory = sqlite3.Row
         self._owns_connection = conn is None
+        # Federation handshake opt-in/out for this instance. Resolved lazily
+        # per conflict row (never frozen at construction) so an env change
+        # takes effect without rebuilding the consolidator, and so the
+        # fleet root is re-derived at call time -- policy v3 R3 §(e) makes
+        # the expanded probe permanent, so nothing here may be cached from
+        # a previous call.
+        self._federation_probe = federation_probe
 
         # Same-connection writer serialization. `BEGIN IMMEDIATE` provides
         # database-level serialization across CONNECTIONS, but two threads
@@ -495,7 +517,20 @@ class VeracityConsolidator:
         share one canonical pattern AND the instance RLock
         protects all four (including consolidate_fact, which
         previously lacked RLock acquisition).
+
+        Federation probe placement (PR #1082 review): the handshake
+        does NOT run inside this transaction. Detected conflict pairs
+        are queued in ``conflict_probe_pending`` inside the same
+        transaction that inserts the fact -- durable at COMMIT, so a
+        crash or a refused probe cannot lose the contradiction -- and
+        probed after the commit by :meth:`retry_pending_conflicts`.
+        The home bank's write lock is held only for local SQL; peer
+        I/O (filesystem walk + one connection per bank, R8's budget)
+        happens outside it, where a stalled peer cannot make an
+        unrelated home-bank writer fail on ``database is locked``.
         """
+        queued_new_pair = False
+        result: Optional[ConsolidatedFact] = None
         with self._serialized_write():
             cursor = self.conn.cursor()
 
@@ -566,17 +601,19 @@ class VeracityConsolidator:
                 """, (fact_id, subject, predicate, object, base_confidence, 1,
                       now, now, json.dumps(sources), veracity))
 
-                # Record conflicts. Pass `commit=False` so the helper's
-                # internal commit doesn't end our `_serialized_write`
-                # transaction mid-loop -- see _record_conflict docstring
-                # for the atomicity rationale.
+                # Queue conflicts, do NOT probe here. Each pair is
+                # enqueued inside this transaction (atomic with the
+                # fact INSERT) and the federation handshake runs after
+                # the commit -- see the docstring and
+                # _drain_pending_conflict_probes for the lock-scope and
+                # no-lost-contradictions guarantees.
                 for conflict in conflicts:
-                    self._record_conflict(
-                        fact_id, conflict["id"], "contradiction",
-                        commit=False,
+                    self._enqueue_conflict_pair(
+                        cursor, fact_id, conflict["id"], "contradiction",
                     )
+                    queued_new_pair = True
 
-                return ConsolidatedFact(
+                result = ConsolidatedFact(
                     subject=subject,
                     predicate=predicate,
                     object=object,
@@ -587,6 +624,130 @@ class VeracityConsolidator:
                     sources=sources,
                     veracity=veracity
                 )
+
+        if queued_new_pair:
+            # Outside the write transaction: probe the fleet for every
+            # queued pair (this call's and any left by earlier refused
+            # attempts) and settle them. Never raises; a pair that
+            # cannot settle now stays queued for the next pass.
+            self.retry_pending_conflicts()
+
+        return result
+
+    def _federation_gate(self, fact_a_id: str, fact_b_id: str):
+        """Probe the fleet for this conflict pair before it is persisted.
+
+        Policy v3 R3 §(e)–(i), R7, R8 — the engineering handoff whose module
+        is :mod:`mnemosyne.core.federation_handshake`. Returns ``None`` when
+        the handshake is off or this bank is not in a fleet; otherwise a
+        :class:`~mnemosyne.core.federation_handshake.HandshakeDecision`
+        whose ``proceed`` decides whether the caller may write its row.
+
+        Enabled unless ``MNEMOSYNE_FEDERATION_HANDSHAKE`` is falsy or this
+        instance was built with ``federation_probe=False``. Nothing about the
+        probe scope is cached: R3 §(e) makes the expanded probe permanent, and
+        the fleet is re-enumerated at call time so the scope cannot drift from
+        the census's enumeration.
+        """
+        enabled = self._federation_probe
+        if enabled is not None and not enabled:
+            return None
+        if not self.db_path or str(self.db_path) == ":memory:":
+            return None
+        from mnemosyne.core import federation_handshake
+        if enabled is None and not federation_handshake.probe_enabled():
+            return None
+        return federation_handshake.probe_fleet(
+            (fact_a_id, fact_b_id), Path(self.db_path)
+        )
+
+    #: Same DDL the Hermes provider's audit log uses
+    #: (integrations/hermes/src/mnemosyne_hermes/audit.py) — the table is
+    #: meant to be co-located with the active bank, so this does not create a
+    #: competing schema. Created on first federated write only, which keeps a
+    #: bank that never federates at the schema it already had.
+    _AUDIT_TABLE_DDL = """
+        CREATE TABLE IF NOT EXISTS memory_audit_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            action TEXT NOT NULL,
+            memory_id TEXT,
+            bank TEXT,
+            scope TEXT,
+            profile TEXT,
+            session_id TEXT,
+            source_tool TEXT,
+            tokens_used INTEGER,
+            reason TEXT,
+            metadata_json TEXT
+        )
+    """
+
+    #: Conflict pairs detected at upsert but not yet settled by the
+    #: federation handshake (PR #1082 review). Rows are inserted inside
+    #: the same transaction as the conflicting fact, so the contradiction
+    #: is durable the moment it is detected even if the probe later fails
+    #: or the process dies. Settled pairs are deleted; refused pairs stay
+    #: queued and are re-probed by every subsequent drain (including the
+    #: one at the top of ``run_consolidation_pass`` -- the sleep path's
+    #: retry hook). Created on first queued pair only: a bank that never
+    #: detects a conflict keeps the schema it already had.
+    _PENDING_PAIR_TABLE_DDL = """
+        CREATE TABLE IF NOT EXISTS conflict_probe_pending (
+            fact_a_id TEXT NOT NULL,
+            fact_b_id TEXT NOT NULL,
+            conflict_type TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (fact_a_id, fact_b_id, conflict_type)
+        )
+    """
+
+    def _record_federation_audit(self, decision) -> None:
+        """Persist the handshake's audit rows. Best-effort, never raises.
+
+        R3 §(f) requires ONE entry per upsert carrying the full chain;
+        R3 §(g) requires one ``federation_probe_failed`` row per failed
+        probe. Both come from ``decision.audit_events()``, so the policy's
+        shape is defined in one place. An audit failure must not turn a
+        memory write into an error — the same rule the provider's audit log
+        follows — so this logs and returns.
+        """
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(self._AUDIT_TABLE_DDL)
+            for event in decision.audit_events():
+                metadata = event.get("metadata") or {}
+                reason = (
+                    "federated_to_" + str(metadata.get("federated_to"))
+                    if metadata.get("federated_to")
+                    else ("refused" if metadata.get("refused") else "proceeded")
+                )
+                cursor.execute(
+                    "INSERT INTO memory_audit_events "
+                    "(timestamp, action, memory_id, bank, scope, profile, "
+                    " session_id, source_tool, tokens_used, reason, metadata_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        time.time(),
+                        event["action"],
+                        None,
+                        decision.home_bank,
+                        None,
+                        None,
+                        None,
+                        "veracity_consolidator",
+                        None,
+                        reason,
+                        json.dumps(metadata),
+                    ),
+                )
+            if not self.conn.in_transaction:
+                self.conn.commit()
+        except Exception:
+            logger.warning(
+                "federation handshake: audit write failed for pair %s at %s",
+                decision.pair, decision.home_bank, exc_info=True,
+            )
 
     def _record_conflict(self, fact_a_id: str, fact_b_id: str,
                          conflict_type: str, commit: bool = True):
@@ -602,7 +763,36 @@ class VeracityConsolidator:
             allowing later conflict-record failures to leak partial
             state. /review (E2.a.5 4-source HIGH) caught this pattern
             in the inline version; preserved in the DRY refactor.
+
+        Federation gate (policy v3 R3, before the INSERT): the pair is probed
+            across the fleet. A holder elsewhere → the row is NOT written and
+            an audit entry names the canonical holder (R3 §(f), R7). Any
+            probe failure → the row is NOT written and a
+            ``federation_probe_failed`` row records it (R3 §(g), fail-closed).
+            No peers (standalone bank) → unchanged behaviour.
+
+        Note (PR #1082 review): ``consolidate_fact`` no longer routes
+        conflicts through this method -- it queues them into
+        ``conflict_probe_pending`` and settles them via
+        :meth:`retry_pending_conflicts` after its transaction commits, so
+        the fleet probe never runs under the home bank's write lock. This
+        method is kept as the direct, in-transaction entry point for any
+        caller that needs it.
         """
+        decision = self._federation_gate(fact_a_id, fact_b_id)
+        if decision is not None:
+            self._record_federation_audit(decision)
+            if not decision.proceed:
+                logger.info(
+                    "federation handshake: skipping conflict row for pair %s at %s "
+                    "(federated_to=%s, refused=%s, chain=%d)",
+                    decision.pair, decision.home_bank, decision.federated_to,
+                    decision.refused, len(decision.chain),
+                )
+                # R3 §(f)/(g): the caller's transaction is NOT poisoned — the
+                # consolidated fact still commits; only this cross-bank
+                # duplicate is refused.
+                return
         cursor = self.conn.cursor()
         # Targetless upsert, paired with idx_conflicts_pair_norm (created
         # here for fresh banks and by the E8 package migration for existing
@@ -619,6 +809,104 @@ class VeracityConsolidator:
         """, (fact_a_id, fact_b_id, conflict_type))
         if commit:
             self.conn.commit()
+
+    def _enqueue_conflict_pair(self, cursor, fact_a_id: str, fact_b_id: str,
+                               conflict_type: str) -> None:
+        """Queue a detected conflict pair for the post-commit handshake.
+
+        Runs on the caller's cursor, inside the caller's transaction: the
+        queue row and the fact INSERT commit together, so the
+        contradiction is durable at the moment it is detected. ``INSERT
+        OR IGNORE`` on the pair PK keeps re-queuing idempotent.
+        """
+        cursor.execute(self._PENDING_PAIR_TABLE_DDL)
+        cursor.execute(
+            "INSERT OR IGNORE INTO conflict_probe_pending "
+            "(fact_a_id, fact_b_id, conflict_type, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (fact_a_id, fact_b_id, conflict_type, time.time()),
+        )
+
+    def retry_pending_conflicts(self) -> int:
+        """Probe every queued conflict pair and settle what the fleet allows.
+
+        The handshake runs OUTSIDE the home bank's write transaction; only
+        the short settling write (audit rows + conflict row when the
+        decision says proceed + removal from the queue, atomically) takes
+        ``_serialized_write``. Outcomes per pair:
+
+        - gate disabled or standalone bank (decision ``None``) / probe
+          clean (``proceed``) → the conflict row is written, pair leaves
+          the queue;
+        - holder found elsewhere (federated) → no home row by policy
+          (R3 §(f)), pair leaves the queue, audit names the holder;
+        - probe failure (refused) → fail-closed: no home row now, but the
+          pair STAYS QUEUED (R3 §(g) plus PR #1082 review: a transient
+          peer error must not silently drop the contradiction) and every
+          later drain re-probes it -- including the one at the top of
+          ``run_consolidation_pass``, the sleep path's retry hook.
+
+        Never raises: a pair that cannot settle now stays queued. Returns
+        the number of pairs settled (removed from the queue).
+        """
+        settled = 0
+        try:
+            self.conn.execute(self._PENDING_PAIR_TABLE_DDL)
+            queued = self.conn.execute(
+                "SELECT fact_a_id, fact_b_id, conflict_type "
+                "FROM conflict_probe_pending ORDER BY created_at"
+            ).fetchall()
+        except sqlite3.Error:
+            logger.warning(
+                "federation handshake: could not read the pending-pair queue",
+                exc_info=True,
+            )
+            return settled
+
+        for item in queued:
+            fact_a_id = item["fact_a_id"]
+            fact_b_id = item["fact_b_id"]
+            conflict_type = item["conflict_type"]
+            try:
+                decision = self._federation_gate(fact_a_id, fact_b_id)
+            except Exception:
+                # The handshake contract is to classify, not to raise;
+                # anything escaping it is a defect, and the queue -- not
+                # the caller's write -- is where the pair stays safe.
+                logger.warning(
+                    "federation handshake: probe errored unexpectedly for "
+                    "pair %s/%s; pair stays queued",
+                    fact_a_id, fact_b_id, exc_info=True,
+                )
+                continue
+            try:
+                with self._serialized_write():
+                    cursor = self.conn.cursor()
+                    if decision is not None:
+                        self._record_federation_audit(decision)
+                    if decision is None or decision.proceed:
+                        cursor.execute(
+                            "INSERT INTO conflicts "
+                            "(fact_a_id, fact_b_id, conflict_type) "
+                            "VALUES (?, ?, ?)",
+                            (fact_a_id, fact_b_id, conflict_type),
+                        )
+                    if decision is None or not decision.refused:
+                        cursor.execute(
+                            "DELETE FROM conflict_probe_pending "
+                            "WHERE fact_a_id = ? AND fact_b_id = ? "
+                            "AND conflict_type = ?",
+                            (fact_a_id, fact_b_id, conflict_type),
+                        )
+                        settled += 1
+            except sqlite3.Error:
+                logger.warning(
+                    "federation handshake: could not settle queued pair "
+                    "%s/%s; pair stays queued",
+                    fact_a_id, fact_b_id, exc_info=True,
+                )
+        return settled
+
     
     def resolve_conflict(self, conflict_id: int, winning_fact_id: str):
         """
@@ -819,7 +1107,13 @@ class VeracityConsolidator:
         ``resolve_conflict_by_facts`` calls participate in this scope's
         transaction (their own ``_serialized_write`` will detect the
         outer tx and skip BEGIN).
+
+        Sleep retry hook (PR #1082 review): conflict pairs left queued
+        by an earlier refused probe are re-probed here, outside the
+        pass's transaction, before anything else runs -- a transient
+        peer failure delays a conflict row, it does not lose it.
         """
+        self.retry_pending_conflicts()
         with self._serialized_write():
             cursor = self.conn.cursor()
 

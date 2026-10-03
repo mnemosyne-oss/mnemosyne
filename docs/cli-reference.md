@@ -37,7 +37,7 @@ The three flags on `sleep` are parsed but undocumented in the built-in help. `--
 
 For automation, do not treat a non-zero exit from a non-dry-run `mnemosyne reindex` as success: it means the vector rebuild did not complete. A rebuild that did not complete changes nothing: it runs as a single transaction (and holds the database write lock until it commits), so a failed or killed run leaves the previous vectors and format marker in place and the command can simply be run again. Likewise, non-dry-run `mnemosyne diagnose --repair-vec-working` exits non-zero unless the requested repair reaches `repaired`; its `--dry-run` mode reports what it would repair without writing.
 
-`doctor` and `repair` are the only commands that do not create the data directory as a side effect.
+`doctor` and `repair` do not create the data directory as a side effect. `reindex` without `--db` or `--bank` creates it. `reindex --db PATH` creates it only when `MNEMOSYNE_DATA_DIR` is set, since `config.yaml` lives there in that case. A missing `--db` file or `--bank` name, or an invalid option, makes `reindex` exit before it creates anything.
 
 ## Backup and restore
 
@@ -46,6 +46,8 @@ For automation, do not treat a non-zero exit from a non-dry-run `mnemosyne reind
 | `backup` | `backup [output_dir]`. Compressed snapshot |
 | `restore` | `restore <backup.db.gz>` |
 | `backups` | `backups [backup_dir]`. List available snapshots |
+
+`reindex --db` and `reindex --bank` back up their target to `<backup dir>/stores/<db stem>-<first 32 hex of the sha256 of the resolved path>/`, and each `.gz.json` file names the source database in `source_db`. `backups`, rotation, the health check and emergency restore read only the backup directory they are given, so they do not list, rotate or pick these snapshots. `backups <store dir>` lists them, and `mnemosyne.dr.recovery.rotate_backups(backup_dir=Path(store_dir))` rotates them. `restore` always writes to the default database; restore a targeted store with `mnemosyne.dr.recovery.restore_backup(Path(backup), db_path=Path(store))`. Emergency restore picks only backups whose `source_db` names the database it restores. Backups without `source_db`, including every backup written before this field existed, stay on disk and are never picked automatically. One can be restored explicitly with `restore <backup.db.gz>` after checking that it belongs to the default database, but only when its `.gz.json` metadata sidecar is present: a backup without a sidecar has no recorded checksums, and `restore` refuses it under the checksum-verification contract.
 
 ## Import and export
 

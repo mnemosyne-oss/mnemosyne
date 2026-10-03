@@ -178,6 +178,31 @@ SLEEP_SCHEMA = {
     },
 }
 
+CROSS_SESSION_RESOLVE_SCHEMA = {
+    "name": "mnemosyne_resolve_conflicts",
+    "description": (
+        "Resolve factual contradictions among global-scope memories across "
+        "sessions. Marks the stale (older) copy superseded so recall and "
+        "prefetch stop presenting the outdated and current versions together, "
+        "while preserving history. Requires MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION=1."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "dry_run": {
+                "type": "boolean",
+                "description": "If true, report what would be resolved without writing changes.",
+                "default": False,
+            },
+            "llm_eval": {
+                "type": "boolean",
+                "description": "Only meaningful with dry_run=true: also run LLM verification on flagged pairs (without mutating) so the exact apply-time verdict can be previewed. Default false keeps the dry run deterministic (no LLM calls).",
+                "default": False,
+            },
+        },
+    },
+}
+
 STATS_SCHEMA = {
     "name": "mnemosyne_stats",
     "description": "Return Mnemosyne memory statistics: working count, episodic count, BEAM tiers.",
@@ -198,6 +223,7 @@ INVALIDATE_SCHEMA = {
         "properties": {
             "memory_id": {"type": "string", "description": "ID of memory to invalidate."},
             "replacement_id": {"type": "string", "description": "Optional new memory that replaces this one.", "default": ""},
+            "bank": {"type": "string", "enum": ["private", "surface"], "description": "Which store holds the memory: 'private' (this profile's own memory) or 'surface' (the shared cross-agent surface DB). Default 'private'; ids beginning with 'sf_' auto-route to surface.", "default": "private"},
         },
         "required": ["memory_id"],
     },
@@ -846,7 +872,7 @@ APPLY_PENDING_SCHEMA = {
 
 ALL_TOOL_SCHEMAS = [
     REMEMBER_SCHEMA, RECALL_SCHEMA, SHARED_REMEMBER_SCHEMA, SHARED_RECALL_SCHEMA,
-    SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
+    SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, CROSS_SESSION_RESOLVE_SCHEMA, STATS_SCHEMA,
     INVALIDATE_SCHEMA, VALIDATE_SCHEMA, GET_SCHEMA, TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA,
     TRIPLE_END_SCHEMA,
     REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA, FORGET_CANONICAL_SCHEMA, APPLY_PENDING_SCHEMA, MODEL_CARD_SCHEMA,

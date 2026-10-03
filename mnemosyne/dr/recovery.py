@@ -46,31 +46,55 @@ def get_default_paths():
     return data_dir, backup_dir, db_path
 
 
+_STORE_DIGEST_CHARS = 32
+_STORE_BACKUPS_DIRNAME = "stores"
+
+
+def _resolved(path: Path) -> Path:
+    return Path(path).expanduser().resolve()
+
+
+def _store_backup_dir(db_path: Path, backup_root: Path, default_db: Path) -> Path:
+    """Return the directory for automatic backups of ``db_path``.
+
+    The default store keeps ``backup_root``. Any other store gets its own
+    subdirectory named after its file stem and a digest of its resolved path,
+    so backups of different stores never share a directory or a filename.
+    """
+    source = _resolved(db_path)
+    if source == _resolved(default_db):
+        return backup_root
+    digest = hashlib.sha256(os.fsencode(str(source))).hexdigest()[:_STORE_DIGEST_CHARS]
+    return backup_root / _STORE_BACKUPS_DIRNAME / f"{source.stem}-{digest}"
+
+
 def _allocate_unique_backup_path(backup_dir: Path, timestamp: str) -> tuple[Path, Path, Path]:
     """Atomically allocate a unique backup filename and private staging paths.
 
     Uses ``O_CREAT | O_EXCL`` on a hidden reservation file and private staging
     paths so in-progress backups are never visible to ``rotate_backups()``,
-    ``list_backups()``, or other glob consumers until fully published.
+    ``list_backups()``, or other glob consumers until fully published. A name
+    that is already taken gets a numbered ``_01`` to ``_99`` suffix instead of
+    being replaced.
     """
     import secrets
 
     suffix = ""
-    for _ in range(64):
+    for attempt in range(100):
         name = f"mnemosyne_backup_{timestamp}{suffix}.db.gz"
         final_path = backup_dir / name
         reservation = backup_dir / f".{name}.reserve"
         staged_path = backup_dir / f".{name}.staging-{os.getpid()}-{secrets.token_hex(4)}"
 
         if final_path.exists():
-            suffix = "_" + secrets.token_hex(3)
+            suffix = f"_{attempt + 1:02d}"
             continue
 
         try:
             fd = os.open(str(reservation), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
             os.close(fd)
         except FileExistsError:
-            suffix = "_" + secrets.token_hex(3)
+            suffix = f"_{attempt + 1:02d}"
             continue
 
         if final_path.exists():
@@ -78,7 +102,7 @@ def _allocate_unique_backup_path(backup_dir: Path, timestamp: str) -> tuple[Path
                 reservation.unlink()
             except OSError:
                 pass
-            suffix = "_" + secrets.token_hex(3)
+            suffix = f"_{attempt + 1:02d}"
             continue
 
         try:
@@ -129,21 +153,28 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
     """
     Create a compressed backup of the database.
 
+    Without ``backup_dir``, backups of the default database go to the default
+    backup directory and backups of any other database go to its own
+    ``stores/<stem>-<digest>`` subdirectory there. Backup names carry
+    microseconds and are never overwritten.
+
     Returns:
-        Dict with backup_path, size, checksum, and timestamp
+        Dict with backup_path, size, checksum, timestamp and source_db
     """
     _, default_backup_dir, default_db = get_default_paths()
     db_path = db_path or default_db
-    backup_dir = backup_dir or default_backup_dir
+    if backup_dir is None:
+        backup_dir = _store_backup_dir(db_path, default_backup_dir, default_db)
 
     if not db_path.exists():
         raise FileNotFoundError(f"Database not found: {db_path}")
 
     backup_dir.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    now = datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
     backup_path, staged_backup_path, reservation_path = _allocate_unique_backup_path(
-        backup_dir, timestamp
+        backup_dir, now.strftime("%Y%m%d_%H%M%S_%f")
     )
     meta_path = backup_path.with_suffix(".gz.json")
     staged_meta_path = staged_backup_path.with_suffix(".gz.json")
@@ -192,6 +223,7 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
             "backup_checksum": backup_checksum,
             "dump_checksum": dump_checksum,
             "compressed": True,
+            "source_db": str(_resolved(db_path)),
         }
 
         # Save metadata to staging path then publish both atomically
@@ -517,9 +549,25 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
     }
 
 
+def _recorded_source(backup: Path):
+    """Return the ``source_db`` recorded in the metadata of ``backup``, or None."""
+    try:
+        with open(backup.with_suffix(".gz.json")) as f:
+            source = json.load(f).get("source_db")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return source if isinstance(source, str) else None
+
+
 def emergency_restore(backup_dir: Path = None, db_path: Path = None) -> Dict:
     """
     Automatically restore from the most recent valid backup.
+
+    Only backups whose metadata records ``db_path`` as ``source_db`` are
+    selected. Backups without a recorded source, such as files written before
+    ``source_db`` existed, stay on disk and are never selected automatically.
+    ``restore_backup`` accepts one only when its metadata sidecar is present
+    and checksum-verifiable; a backup without a sidecar is refused.
 
     Returns:
         Dict with restore status
@@ -527,11 +575,21 @@ def emergency_restore(backup_dir: Path = None, db_path: Path = None) -> Dict:
     _, default_backup_dir, default_db = get_default_paths()
     backup_dir = backup_dir or default_backup_dir
     db_path = db_path or default_db
+    target = str(_resolved(db_path))
 
-    # Find all backups
-    backups = sorted(backup_dir.glob("mnemosyne_backup_*.db.gz"), reverse=True)
+    # Find all backups of this database
+    candidates = sorted(backup_dir.glob("mnemosyne_backup_*.db.gz"), reverse=True)
+    sources = {backup: _recorded_source(backup) for backup in candidates}
+    backups = [backup for backup in candidates if sources[backup] == target]
 
     if not backups:
+        unverified = sum(1 for backup in candidates if sources[backup] is None)
+        if unverified:
+            raise FileNotFoundError(
+                f"No backups of {target} found in {backup_dir}; {unverified} "
+                "backup(s) there have no recorded source_db and need an "
+                "explicit restore"
+            )
         raise FileNotFoundError("No backups found in " + str(backup_dir))
 
     # Try each backup until one works

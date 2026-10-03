@@ -61,6 +61,121 @@ def test_parse_facts_with_numbering():
     print("PASS: test_parse_facts_with_numbering")
 
 
+def test_parse_facts_json_dedupes_across_categories():
+    """A statement filed under several categories is returned once."""
+    import json as _json
+    raw = _json.dumps({
+        "facts": [
+            "Servers must clock out through the tablet",
+            "The POS system goes live October 1st",
+        ],
+        # Correct categorisation: the first is also an instruction, the second
+        # is also a timeline. Both belong in more than one bucket.
+        "instructions": ["Servers must clock out through the tablet"],
+        "preferences": [],
+        "timelines": ["The POS system goes live October 1st"],
+    })
+    facts = _parse_facts(raw)
+    assert len(facts) == 2, facts
+    assert len({f.casefold() for f in facts}) == 2, facts
+    # First-seen order is preserved, so 'facts' entries keep their position.
+    assert facts[0] == "Servers must clock out through the tablet"
+    assert facts[1] == "The POS system goes live October 1st"
+    print("PASS: test_parse_facts_json_dedupes_across_categories")
+
+
+def test_parse_facts_json_dedupe_ignores_case_and_padding():
+    """Dedupe compares trimmed, case-folded text."""
+    import json as _json
+    raw = _json.dumps({
+        "facts": ["The user prefers dark mode"],
+        "instructions": ["  the user prefers DARK MODE  "],
+        "preferences": [],
+        "timelines": [],
+    })
+    facts = _parse_facts(raw)
+    assert len(facts) == 1, facts
+    # The surviving copy keeps its original text, untrimmed variants dropped.
+    assert facts[0] == "The user prefers dark mode"
+    print("PASS: test_parse_facts_json_dedupe_ignores_case_and_padding")
+
+
+def test_parse_facts_json_keeps_distinct_items():
+    """Dedupe must not collapse genuinely different statements."""
+    import json as _json
+    raw = _json.dumps({
+        "facts": ["The user works evenings"],
+        "instructions": ["Always use tabs"],
+        "preferences": ["The user likes dark mode"],
+        "timelines": ["Release on 2026-12-01"],
+    })
+    facts = _parse_facts(raw)
+    assert facts == [
+        "The user works evenings",
+        "Always use tabs",
+        "The user likes dark mode",
+        "Release on 2026-12-01",
+    ], facts
+    print("PASS: test_parse_facts_json_keeps_distinct_items")
+
+
+def test_parse_facts_json_empty_categories_yield_no_facts():
+    """A supported payload with nothing to extract returns no facts.
+
+    Falling through to the partial-JSON fallback would hand the raw text to a
+    regex matching any quoted run of ten or more characters, which the schema's
+    own key names satisfy — 'instructions' and 'preferences' would be stored.
+    """
+    import json as _json
+    for payload in (
+        {"facts": [], "instructions": [], "preferences": [], "timelines": []},
+        {"facts": ["   "], "instructions": [], "preferences": [], "timelines": []},
+        {"facts": [], "instructions": [], "preferences": [], "timelines": [], "kg": []},
+    ):
+        facts = _parse_facts(_json.dumps(payload))
+        assert facts == [], facts
+    print("PASS: test_parse_facts_json_empty_categories_yield_no_facts")
+
+
+def test_parse_facts_json_unusable_supported_values_yield_no_key_names():
+    """A supported key present but unusable still suppresses the fallback.
+
+    A model that answers `"facts": null` rather than `[]` reaches the same
+    trap as an empty payload: the partial-JSON regex matches the schema's own
+    key names. Presence of the category is what marks the document complete,
+    not whether its value happened to be a list.
+    """
+    import json as _json
+    for payload in (
+        {"facts": None, "instructions": None, "preferences": None, "timelines": None},
+        {"facts": {}, "instructions": None, "preferences": None, "timelines": None},
+        {"facts": 0, "instructions": None, "preferences": None, "timelines": None},
+    ):
+        facts = _parse_facts(_json.dumps(payload))
+        assert facts == [], facts
+
+    # A scalar where a list belongs is unusable too. It yields nothing rather
+    # than smuggling the key names in beside its content: the schema promises a
+    # list, and coercing a bare string into a fact would invent a contract the
+    # prompt never stated.
+    scalar = _parse_facts(_json.dumps({
+        "facts": "the user works evenings",
+        "instructions": None, "preferences": None, "timelines": None,
+    }))
+    assert scalar == [], scalar
+    print("PASS: test_parse_facts_json_unusable_supported_values_yield_no_key_names")
+
+
+def test_parse_facts_json_without_supported_categories_falls_back():
+    """No supported category present still falls through to the fallback."""
+    import json as _json
+    raw = _json.dumps({"kg": ["user prefers vim", "project uses fastapi"]})
+    facts = _parse_facts(raw)
+    assert "user prefers vim" in facts, facts
+    assert "project uses fastapi" in facts, facts
+    print("PASS: test_parse_facts_json_without_supported_categories_falls_back")
+
+
 def test_parse_facts_no_facts():
     """Test parsing 'NO_FACTS' response."""
     facts = _parse_facts("NO_FACTS")

@@ -59,8 +59,12 @@ def test_every_locale_negation_pattern_is_boundary_anchored(locale):
         "Hi never mind the config change we discussed",
     ],
 )
-def test_extractor_end_to_end_does_not_store_third_person_negation(content):
+def test_extractor_end_to_end_does_not_store_third_person_negation(monkeypatch, content):
     """Third-person text must not reach the stored user-negation path (#559)."""
+    # The regex KG writer is opt-in behind MNEMOSYNE_REGEX_KG since the #840
+    # containment; enabled here so the boundary is exercised rather than the
+    # default-off gate making the assertion vacuous.
+    monkeypatch.setenv("MNEMOSYNE_REGEX_KG", "1")
     with tempfile.TemporaryDirectory() as tmp:
         mem = BeamMemory(session_id="test-559", db_path=Path(tmp) / "memories.db")
         try:
@@ -79,8 +83,9 @@ def test_extractor_end_to_end_does_not_store_third_person_negation(content):
             mem.conn.close()
 
 
-def test_extractor_end_to_end_still_stores_first_person_negation():
+def test_extractor_end_to_end_still_stores_first_person_negation(monkeypatch):
     """The boundary must preserve genuine first-person negation extraction."""
+    monkeypatch.setenv("MNEMOSYNE_REGEX_KG", "1")
     with tempfile.TemporaryDirectory() as tmp:
         mem = BeamMemory(session_id="test-559-positive", db_path=Path(tmp) / "memories.db")
         try:
@@ -146,8 +151,10 @@ def test_every_locale_negation_runtime_boundary_and_positive_control(
 
     The language detector is fixed only to isolate the locale pattern contract;
     both inputs otherwise go through ``extract_and_store_facts`` and its real
-    knowledge-graph insertion path.
+    knowledge-graph insertion path. The regex KG writer is opt-in behind
+    MNEMOSYNE_REGEX_KG since the #840 containment, so it is enabled explicitly.
     """
+    monkeypatch.setenv("MNEMOSYNE_REGEX_KG", "1")
     with tempfile.TemporaryDirectory() as tmp:
         mem = BeamMemory(session_id=f"test-559-{locale}", db_path=Path(tmp) / "memories.db")
         monkeypatch.setattr(mem, "detect_language", lambda _content: locale)

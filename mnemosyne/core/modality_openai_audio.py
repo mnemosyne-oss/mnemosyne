@@ -21,6 +21,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from mnemosyne.core.modality_backends import DescribedMoment, DescribeRequest, DescribeResult
+from mnemosyne.core.user_agent import application_user_agent
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,10 @@ def _download(url: str, timeout: float) -> Optional[bytes]:
     try:
         import urllib.request
 
-        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 - caller-named public media
+        req = urllib.request.Request(
+            url, headers={"User-Agent": application_user_agent()},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - caller-named public media
             raw = resp.read(MAX_AUDIO_BYTES + 1)
         return raw if len(raw) <= MAX_AUDIO_BYTES else None
     except Exception:
@@ -97,7 +101,11 @@ def _post_transcription(url: str, api_key: str, body: bytes, content_type: str,
 
     req = urllib.request.Request(
         url, data=body, method="POST",
-        headers={"Content-Type": content_type, "Authorization": f"Bearer {api_key}"},
+        headers={
+            "Content-Type": content_type,
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": application_user_agent(),
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - operator-configured endpoint

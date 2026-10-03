@@ -217,6 +217,32 @@ class TestExportImport(_TempDBTest):
         # Re-importing the same export into the same DB is a no-op.
         self.assertEqual(stats["skipped"], len(exported))
 
+    def test_import_collision_compares_writer_identity(self):
+        # CodeRabbit round on #1050: the collision equality check ignored the
+        # writer columns — an imported row that repeats a stored row's bytes
+        # under a DIFFERENT writer was silently skipped as "identical".
+        # Content equality now includes writer_id (blank == "imported" so
+        # legacy exports keep round-tripping); a divergence must go down the
+        # renumber path instead. The slot here is fully closed (head
+        # forgotten) so the open-head unique index cannot mask the outcome.
+        v1 = self.store.remember("jessi", "identity", "name", "I am Jessi.")
+        self.store.remember("jessi", "identity", "name", "I am Jessi 2.")
+        self.assertTrue(self.store.forget("jessi", "identity", "name"))
+        old = next(r for r in self.store.export_all() if r["id"] == v1["id"])
+
+        control = self.store.import_all([dict(old)])
+        self.assertEqual(control["skipped"], 1,
+                         "same writer must still compare equal (idempotent)")
+
+        divergent = dict(old, writer_id="someone-else")
+        stats = self.store.import_all([divergent])
+        self.assertEqual(stats["imported_renumbered"], 1,
+                         "same content under a different writer was skipped "
+                         "as identical — provenance divergence went unseen")
+        landed = next(r for r in self.store.export_all()
+                      if r["writer_id"] == "someone-else")
+        self.assertEqual(landed["body"], old["body"])
+
 
 class TestModuleConvenience(_TempDBTest):
     def test_module_level_functions(self):

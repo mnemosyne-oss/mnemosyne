@@ -21,6 +21,7 @@ from pathlib import Path
 
 from mnemosyne.core.filters import _RESTORE_WRITE_CAPABILITY
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
+from mnemosyne.core.user_agent import application_user_agent
 
 
 class LettaImporter(BaseImporter):
@@ -134,7 +135,7 @@ class LettaImporter(BaseImporter):
         import urllib.request
 
         base = self.base_url or "https://api.letta.com"
-        headers = {}
+        headers = {"User-Agent": application_user_agent()}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         headers["Content-Type"] = "application/json"

@@ -7,6 +7,16 @@ between tests, and that default-disable the local LLM so tests don't
 make real CPU inference calls when a model is available on disk.
 """
 
+import os
+
+# Scrub deployment env BEFORE any test module imports mnemosyne.core.beam:
+# the module-level RECALL_CONTENT_CAP constant resolves at
+# first import, so a deployment-exported value baked in during collection
+# (alphabetical order controls which file imports first) would otherwise make
+# default-behavior tests environment-dependent. Tests that want custom values
+# set them explicitly on the resolved module attributes.
+os.environ.pop("MNEMOSYNE_RECALL_CONTENT_CAP", None)
+
 import pytest
 
 

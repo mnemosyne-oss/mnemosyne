@@ -10,6 +10,8 @@ import os
 import time
 import urllib.request
 
+from mnemosyne.core.user_agent import application_user_agent
+
 logger = logging.getLogger(__name__)
 
 # ── Defaults ──────────────────────────────────────────────────────────────
@@ -137,6 +139,7 @@ class ExtractionClient:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            "User-Agent": application_user_agent(),
         }
         req = urllib.request.Request(url, data=payload, headers=headers)
         resp = urllib.request.urlopen(req, timeout=60)

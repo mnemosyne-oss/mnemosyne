@@ -17,6 +17,8 @@ import urllib.request
 from typing import List, Optional
 from functools import lru_cache
 
+from mnemosyne.core.user_agent import application_user_agent
+
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +368,46 @@ class _CredentialedNoRedirect(urllib.request.HTTPRedirectHandler):
         )
 
 
+def _embedding_max_chars() -> int:
+    """Resolve the optional per-input character cap at call time (default:
+    disabled). Set MNEMOSYNE_EMBEDDING_MAX_CHARS for local OpenAI-compatible
+    servers (llama.cpp et al.) whose per-slot context window rejects long
+    inputs with HTTP 400, aborting the whole batch; 0 or negative disables."""
+    raw = os.environ.get("MNEMOSYNE_EMBEDDING_MAX_CHARS", "").strip()
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "invalid MNEMOSYNE_EMBEDDING_MAX_CHARS=%r; embedding cap disabled",
+            raw,
+        )
+        return 0
+
+
+def _cap_for_api(texts: List[str]) -> List[str]:
+    """Cap each text before the API call when MNEMOSYNE_EMBEDDING_MAX_CHARS
+    is set. Off by default: characters are not a token budget, and silent
+    head-truncation can drop retrieval content on endpoints that accept the
+    full text. When enabled, every truncation is logged."""
+    limit = _embedding_max_chars()
+    if limit <= 0:
+        return texts
+    capped: List[str] = []
+    for text in texts:
+        if len(text) > limit:
+            logger.warning(
+                "embedding input truncated: %d -> %d chars (model=%s, cap=MNEMOSYNE_EMBEDDING_MAX_CHARS)",
+                len(text),
+                limit,
+                _DEFAULT_MODEL,
+            )
+            text = text[:limit]
+        capped.append(text)
+    return capped
+
+
 def _is_openrouter_url(base_url: str) -> bool:
     """Whether the embedding endpoint is OpenRouter proper (hostname-based).
 
@@ -474,13 +516,14 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
         url = f"{base_url.rstrip('/')}/embeddings"
     payload = json.dumps({
         "model": _DEFAULT_MODEL,
-        "input": texts,
+        "input": _cap_for_api(texts),
     }).encode()
 
     headers = {
         "Content-Type": "application/json",
         "HTTP-Referer": "https://mnemosyne.site",
         "X-Title": "Mnemosyne Embedding",
+        "User-Agent": application_user_agent(),
     }
     if _OPENAI_API_KEY:
         headers["Authorization"] = f"Bearer {_OPENAI_API_KEY}"
@@ -590,11 +633,13 @@ def embed_query(text: str) -> Optional[np.ndarray]:
         return None
     if not text:
         return None
-    return _embed_query_cached(_get_prefix("query") + text)
+    # The effective cap is part of the key: _embed_api reads MNEMOSYNE_EMBEDDING_MAX_CHARS at call time, so a
+    # vector embedded under one cap must not be served after the cap changes (review #1052).
+    return _embed_query_cached(_get_prefix("query") + text, _embedding_max_chars())
 
 
 @lru_cache(maxsize=512)
-def _embed_query_cached(prefixed: str) -> Optional[np.ndarray]:
+def _embed_query_cached(prefixed: str, _cap: int = 0) -> Optional[np.ndarray]:
     if _is_api_model(_DEFAULT_MODEL):
         result = _embed_api([prefixed])
         _ensure_api_vectors(result, os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1"), 1)

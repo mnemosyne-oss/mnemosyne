@@ -530,6 +530,26 @@ SLEEP_SCHEMA = {
     },
 }
 
+CROSS_SESSION_RESOLVE_SCHEMA = {
+    "name": "mnemosyne_resolve_conflicts",
+    "description": (
+        "Resolve factual contradictions among global-scope memories across "
+        "sessions. Marks the stale (older) copy superseded so recall and "
+        "prefetch stop presenting the outdated and current versions together, "
+        "while preserving history. Requires MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION=1."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "dry_run": {
+                "type": "boolean",
+                "description": "If true, report what would be resolved without writing changes.",
+                "default": False,
+            },
+        },
+    },
+}
+
 STATS_SCHEMA = {
     "name": "mnemosyne_stats",
     "description": "Return Mnemosyne memory statistics: working count, episodic count, BEAM tiers.",
@@ -550,6 +570,7 @@ INVALIDATE_SCHEMA = {
         "properties": {
             "memory_id": {"type": "string", "description": "ID of memory to invalidate."},
             "replacement_id": {"type": "string", "description": "Optional new memory that replaces this one.", "default": ""},
+            "bank": {"type": "string", "enum": ["private", "surface"], "description": "Which store holds the memory: 'private' (this profile's own memory) or 'surface' (the shared cross-agent surface DB). Default 'private'; ids beginning with 'sf_' auto-route to surface.", "default": "private"},
         },
         "required": ["memory_id"],
     },
@@ -1175,7 +1196,7 @@ except Exception:  # pragma: no cover - persona extras are optional at import ti
 
 ALL_TOOL_SCHEMAS = [
     REMEMBER_SCHEMA, RECALL_SCHEMA, SHARED_REMEMBER_SCHEMA, SHARED_RECALL_SCHEMA,
-    SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
+    SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, CROSS_SESSION_RESOLVE_SCHEMA, STATS_SCHEMA,
     INVALIDATE_SCHEMA, VALIDATE_SCHEMA, GET_SCHEMA, TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA,
     TRIPLE_END_SCHEMA,
     REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA, FORGET_CANONICAL_SCHEMA, APPLY_PENDING_SCHEMA, MODEL_CARD_SCHEMA,
@@ -2612,6 +2633,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 return self._handle_shared_stats(args)
             elif tool_name == "mnemosyne_sleep":
                 return self._handle_sleep(args)
+            elif tool_name == "mnemosyne_resolve_conflicts":
+                return self._handle_resolve_conflicts(args)
             elif tool_name == "mnemosyne_stats":
                 return self._handle_stats(args)
             elif tool_name == "mnemosyne_invalidate":
@@ -3136,6 +3159,44 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             )
         return json.dumps({"status": result.get("status", "consolidated"), "result": result, "working": working, "episodic": episodic})
 
+    def _handle_resolve_conflicts(self, args: Dict[str, Any]) -> str:
+        """Invoke the opt-in cross-session conflict resolver.
+
+        `dry_run=True` reports candidate pairs without mutating; `dry_run=False`
+        applies supersessions. The apply path reserves the reflection budget (it
+        can issue one LLM validation request per flagged pair when
+        `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on)."""
+        dry_run = bool(args.get("dry_run", False))
+        if not hasattr(self._beam, "resolve_cross_session_conflicts"):
+            return json.dumps({
+                "status": "unavailable",
+                "message": "resolve_cross_session_conflicts is not available on this beam",
+            })
+        # Apply can issue one LLM validation request per flagged pair when
+        # MNEMOSYNE_LLM_CONFLICT_DETECTION is on; reserve the reflection budget
+        # like _handle_sleep does for the same class of work. Dry runs are
+        # deterministic and make no LLM calls, so they need no budget.
+        if not dry_run:
+            skip = self._reserve_reflection_budget("tool")
+            if skip is not None:
+                return json.dumps(skip)
+        result = self._beam.resolve_cross_session_conflicts(dry_run=dry_run)
+        if not dry_run and int(result.get("invalidated", 0)):
+            try:
+                self._audit_event(
+                    "resolve_conflicts",
+                    bank="private",
+                    source_tool="mnemosyne_resolve_conflicts",
+                    metadata={
+                        "pairs_flagged": int(result.get("pairs_flagged", 0)),
+                        "conflicts_resolved": int(result.get("conflicts_resolved", 0)),
+                        "invalidated": int(result.get("invalidated", 0)),
+                    },
+                )
+            except Exception:
+                pass
+        return json.dumps(result)
+
     def _handle_stats(self, args: Dict[str, Any]) -> str:
         working = self._beam.get_working_stats()
         episodic = self._beam.get_episodic_stats()
@@ -3145,17 +3206,54 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _handle_invalidate(self, args: Dict[str, Any]) -> str:
         memory_id = args.get("memory_id", "")
         replacement_id = args.get("replacement_id", None) or None
+        bank = str(args.get("bank", "") or "").strip().lower() or None
         if not memory_id:
             return json.dumps({"error": "memory_id is required"})
-        ok = self._beam.invalidate(memory_id, replacement_id=replacement_id)
+        if bank not in (None, "private", "surface"):
+            return json.dumps({"error": f"unknown bank: {bank}"})
+        if replacement_id == memory_id:
+            # A row can never supersede itself; core rejects this before any
+            # visibility lookup. Say so here so the reporting below stays
+            # truthful about ids that were actually looked up.
+            return json.dumps({"error": "replacement_id must differ from memory_id"})
+        # Surface routing: an explicit bank= surface wins; otherwise the id
+        # namespace decides. Every shared-surface row carries the generation-
+        # pinned "sf_" prefix minted by _handle_shared_remember; private ids are
+        # bare hex. Without this branch the private beam answered
+        # memory_not_found for every sf_ id, so a replacement-bearing
+        # invalidation could never land on the surface (#1050 work-order (a)).
+        if bank is None:
+            bank = "surface" if memory_id.startswith("sf_") else "private"
+        if bank == "surface":
+            err = self._require_surface_beam()
+            if err:
+                return json.dumps({"error": err})
+            target_beam = self._surface_beam
+        else:
+            if not self._beam:
+                return json.dumps({"error": "private beam not initialized"})
+            target_beam = self._beam
+        ok = target_beam.invalidate(
+            memory_id, replacement_id=replacement_id if replacement_id else None
+        )
         self._audit_event(
-            "invalidate", memory_id=memory_id, bank="private",
+            "invalidate", memory_id=memory_id, bank=bank,
             source_tool="mnemosyne_invalidate",
             metadata={"replacement_id": replacement_id, "invalidated": ok} if replacement_id else {"invalidated": ok},
         )
-        if ok:
-            return json.dumps({"status": "invalidated", "memory_id": memory_id})
-        return json.dumps({"status": "memory_not_found", "memory_id": memory_id})
+        if not ok:
+            if replacement_id and target_beam.get(memory_id) is not None:
+                # The target is visible in this bank, so the only remaining
+                # reason the invalidation can fail is that the replacement id
+                # is not visible there. Tell the caller which id to correct.
+                return json.dumps({
+                    "status": "replacement_not_found",
+                    "memory_id": memory_id,
+                    "replacement_id": replacement_id,
+                    "bank": bank,
+                })
+            return json.dumps({"status": "memory_not_found", "memory_id": memory_id, "bank": bank})
+        return json.dumps({"status": "invalidated", "memory_id": memory_id, "bank": bank})
 
     def _handle_validate(self, args: Dict[str, Any]) -> str:
         """Collaborative attestation: any agent can attest, update, invalidate,

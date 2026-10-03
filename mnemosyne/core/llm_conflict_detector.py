@@ -15,6 +15,7 @@ from typing import Optional, Tuple
 from pathlib import Path
 
 from mnemosyne.core.cost_log import log_cost
+from mnemosyne.core.user_agent import application_user_agent
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +96,10 @@ def _call_conflict_llm_with_retry(
         has_httpx = False
 
     url = f"{CONFLICT_LLM_BASE_URL}/chat/completions"
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": application_user_agent(),
+    }
     if CONFLICT_LLM_API_KEY:
         headers["Authorization"] = f"Bearer {CONFLICT_LLM_API_KEY}"
 

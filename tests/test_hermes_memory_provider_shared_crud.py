@@ -135,3 +135,143 @@ def test_private_remember_does_not_write_shared_db(tmp_path, monkeypatch):
     assert private["status"] == "stored"
     assert shared_count == 0
 
+
+def test_invalidate_missing_replacement_reports_its_own_status(tmp_path, monkeypatch):
+    """A visible target with an invisible replacement must not be reported
+    as if the target itself were missing."""
+    provider, _ = _provider(tmp_path, monkeypatch)
+    stored = _call(provider, "mnemosyne_remember", {
+        "content": "target with an unreadable replacement", "source": "fact",
+    })
+
+    result = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": stored["memory_id"],
+        "replacement_id": "0000000000000000",
+    })
+
+    assert result == {
+        "status": "replacement_not_found",
+        "memory_id": stored["memory_id"],
+        "replacement_id": "0000000000000000",
+        "bank": "private",
+    }
+    row = provider._beam.conn.execute(
+        "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?",
+        (stored["memory_id"],),
+    ).fetchone()
+    assert tuple(row) == (None, None)
+
+
+def test_invalidate_missing_target_stays_memory_not_found(tmp_path, monkeypatch):
+    """The existing target-not-found status is preserved even when the
+    replacement itself is valid."""
+    provider, _ = _provider(tmp_path, monkeypatch)
+    replacement = _call(provider, "mnemosyne_remember", {
+        "content": "healthy replacement row", "source": "fact",
+    })
+
+    result = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": "ffffffffffffffff",
+        "replacement_id": replacement["memory_id"],
+    })
+
+    assert result["status"] == "memory_not_found"
+    assert result["bank"] == "private"
+
+
+def test_invalidate_rejects_self_replacement(tmp_path, monkeypatch):
+    provider, _ = _provider(tmp_path, monkeypatch)
+    stored = _call(provider, "mnemosyne_remember", {
+        "content": "row guarded against self-supersede", "source": "fact",
+    })
+
+    result = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": stored["memory_id"],
+        "replacement_id": stored["memory_id"],
+    })
+
+    assert "error" in result
+    row = provider._beam.conn.execute(
+        "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?",
+        (stored["memory_id"],),
+    ).fetchone()
+    assert tuple(row) == (None, None)
+
+
+def test_invalidate_replacement_must_be_visible_in_the_routed_bank(tmp_path, monkeypatch):
+    provider, _ = _provider(tmp_path, monkeypatch)
+    surface = _call(provider, "mnemosyne_shared_remember", {
+        "content": "surface target for cross-bank check", "kind": "meta",
+    })
+    private = _call(provider, "mnemosyne_remember", {
+        "content": "private replacement lives in the other bank", "source": "fact",
+    })
+
+    result = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": surface["memory_id"],
+        "replacement_id": private["memory_id"],
+    })
+    assert result["status"] == "replacement_not_found"
+    assert result["bank"] == "surface"
+
+    surface_repl = _call(provider, "mnemosyne_shared_remember", {
+        "content": "surface replacement for chaining", "kind": "meta",
+    })
+    ok = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": surface["memory_id"],
+        "replacement_id": surface_repl["memory_id"],
+    })
+    assert ok["status"] == "invalidated"
+    assert ok["bank"] == "surface"
+    row = provider._surface_beam.conn.execute(
+        "SELECT superseded_by FROM working_memory WHERE id = ?",
+        (surface["memory_id"],),
+    ).fetchone()
+    assert row[0] == surface_repl["memory_id"]
+
+
+def test_invalidate_explicit_surface_selector_beats_prefix_inference(tmp_path, monkeypatch):
+    """A bare (no sf_ prefix) id must invalidate through the surface beam when
+    the caller names the bank, and through the private bank when it does not —
+    so prefix inference can never mask a broken selector."""
+    provider, _ = _provider(tmp_path, monkeypatch)
+    provider._ensure_surface_beam()
+    target = provider._surface_beam.remember(
+        "explicit selector target", source="surface_manual", scope="global",
+    )
+    replacement = provider._surface_beam.remember(
+        "explicit selector replacement", source="surface_manual", scope="global",
+    )
+    assert not target.startswith("sf_")
+
+    # Without the selector the bare id resolves to the private bank, where it
+    # does not exist.
+    inferred = _call(provider, "mnemosyne_invalidate", {"memory_id": target})
+    assert inferred == {
+        "status": "memory_not_found", "memory_id": target, "bank": "private",
+    }
+
+    # Selector plus no replacement: the surface beam answers.
+    out = _call(provider, "mnemosyne_invalidate", {"memory_id": target, "bank": "surface"})
+    assert out == {"status": "invalidated", "memory_id": target, "bank": "surface"}
+    row = provider._surface_beam.conn.execute(
+        "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?",
+        (target,),
+    ).fetchone()
+    assert row[0] is not None and row[1] is None
+
+    # Selector plus replacement: both ids resolve on the surface and chain.
+    target2 = provider._surface_beam.remember(
+        "chained selector target", source="surface_manual", scope="global",
+    )
+    out = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": target2, "replacement_id": replacement, "bank": "surface",
+    })
+    assert out["status"] == "invalidated"
+    assert out["bank"] == "surface"
+    row = provider._surface_beam.conn.execute(
+        "SELECT superseded_by FROM working_memory WHERE id = ?",
+        (target2,),
+    ).fetchone()
+    assert row[0] == replacement
+

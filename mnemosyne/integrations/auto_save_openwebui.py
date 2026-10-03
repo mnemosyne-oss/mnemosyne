@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from mnemosyne.core.memory import Mnemosyne
+from mnemosyne.core.user_agent import application_user_agent
 
 logger = logging.getLogger("mnemosyne-auto-save")
 
@@ -85,7 +86,11 @@ def _save_processed_ids():
 
 def _api_get(url: str, api_key: str = "") -> Any:
     """Make a GET request to the OpenWebUI API using stdlib."""
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": application_user_agent(),
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, headers=headers, method="GET")
