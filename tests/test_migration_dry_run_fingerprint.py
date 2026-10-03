@@ -130,6 +130,7 @@ def test_e7_dry_run_leaves_schema_fingerprint_unchanged(tmp_path, monkeypatch):
     assert report["indices_added"] == 0
     assert report["would_add"] == 2
     assert sorted(report["tables_would_add"]) == ["memory_events", "sync_meta"]
+    assert report["columns_would_add"] == []
     assert report["indices_would_add"] == 3
     assert _schema_fingerprint(db_path) == before
     assert db_path.stat().st_size == before_size
@@ -171,9 +172,11 @@ def test_e7_dry_run_report_fields_are_not_notrequired():
         "added",
         "tables_added",
         "tables_already_present",
+        "columns_added",
         "indices_added",
         "would_add",
         "tables_would_add",
+        "columns_would_add",
         "indices_would_add",
     }
 
@@ -203,6 +206,7 @@ def test_cli_migrate_dry_run_leaves_schema_fingerprint_unchanged(
     assert "DRY RUN" in out
     assert "memory_events" in out
     assert "sync_meta" in out
+    assert "would add columns: (none)" in out
     assert "would add indices: 3" in out
     assert _schema_fingerprint(db_path) == before
     assert db_path.stat().st_size == before_size

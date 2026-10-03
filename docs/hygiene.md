@@ -18,7 +18,7 @@ The score is **not additive**. Each rule raises the score to at least its own va
 |---|---|---|
 | Empty or whitespace-only content | `1.0` | `empty_content` |
 | A detected secret | `0.9` | `secret_detected:<labels>` |
-| Terminal or package-manager output (`Collecting `, `npm warn`, `drwx`, `-rw-r--r--`, ...) | `0.85` | `terminal_output` |
+| Terminal or package-manager output (`Collecting `, `npm warn`, `drwx`, `-rw-r--r--`, a whole `total 48` line, a line-start `Installing collected packages`, ...) | `0.85` | `terminal_output` |
 | A stack trace (`Traceback`, `  File "`) | `0.85` | `stack_trace` |
 | Matches one of the 24 built-in noise patterns | `0.8` | `noise_pattern_match` |
 | Trivial keyword under 15 characters (`ok`, `done`, `ping`, `heartbeat`, ...) | `0.7` | `trivial_keyword` |

@@ -102,8 +102,28 @@ def _rollback_staged_writes(pending_ids: List[str]) -> None:
         (pending_dir / f"{pending_id}.json").unlink(missing_ok=True)
 
 
+class PendingClaimError(OSError):
+    """A pending record existed but could not be claimed into private state.
+
+    Distinct from "the record is gone" (which is a benign race, reported by
+    returning None). The caller MUST NOT report this as "already claimed": the
+    record is still there and still pending, and the real reason is an OS-level
+    failure that an operator can act on.
+    """
+
+
 def _claim_pending_record(record_path: Path) -> Optional[Path]:
-    """Atomically move a pending record into a private claim state."""
+    """Atomically move a pending record into a private claim state.
+
+    Returns None only when the record is absent (a benign race with another
+    claimer). Raises PendingClaimError when the record exists but the rename
+    fails for another reason — permission, full filesystem, cross-device link.
+
+    The call site runs outside the per-record try/except, so a propagating
+    OSError aborted the replay of every REMAINING pending record. Raising a
+    dedicated subclass lets the caller catch it, report the true cause, and
+    continue with the next record.
+    """
     claim_path = record_path.with_name(
         f".{record_path.name}.{uuid.uuid4().hex}.claim"
     )
@@ -111,6 +131,15 @@ def _claim_pending_record(record_path: Path) -> Optional[Path]:
         record_path.rename(claim_path)
     except FileNotFoundError:
         return None
+    except OSError as exc:
+        # Includes PermissionError, ENOSPC, EXDEV, EISDIR, EBUSY. The pending
+        # record is left untouched and still replayable.
+        logger.warning(
+            "Could not claim pending record %s (%s). Leaving it pending.",
+            record_path.name,
+            exc,
+        )
+        raise PendingClaimError(str(exc)) from exc
     return claim_path
 
 
@@ -1043,6 +1072,14 @@ def _parse_env_optional_int(key: str, default: Optional[int]) -> Optional[int]:
     return _coerce_optional_int(os.environ.get(key), default)
 
 
+class ToolConfigValidationError(ValueError):
+    """Raised only by _configured_tool_schemas() for a bad memory.mnemosyne.tools config.
+
+    A dedicated subclass so _maybe_retry_init() can catch this one failure by
+    provenance instead of every ValueError that initialize() might raise (#1091).
+    """
+
+
 class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     """Mnemosyne native memory — local SQLite with vector + FTS5 hybrid search."""
 
@@ -1376,7 +1413,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # Keep initialization serialized with on_session_switch(). This
             # prevents a retry that already selected session A from publishing
             # A after a concurrent switch to session B.
-            self.initialize(session_id, **kwargs)
+            try:
+                self.initialize(session_id, **kwargs)
+            except ToolConfigValidationError as e:
+                # An automatic retry must not let a validation failure (#1063)
+                # escape into the per-turn caller; report it like a direct
+                # init failure instead. Any OTHER ValueError raised during
+                # initialize() is not this provider's to swallow (#1091) and
+                # propagates to the caller like a direct initialize() would.
+                logger.warning("Mnemosyne retry init failed validation: %s", e)
+                self._init_error = e
+                self._unavailable_reason_code = "init_failed"
+                self._unavailable_reason = ""
 
     def _ensure_initialized_for_tools(self) -> None:
         """Initialize on first tool use when PluginManager never called initialize().
@@ -1661,14 +1709,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if isinstance(configured, str):
             configured = [name.strip() for name in configured.replace(",", "\n").split("\n") if name.strip()]
         if not isinstance(configured, list):
-            raise ValueError("memory.mnemosyne.tools must be a list of tool names")
+            raise ToolConfigValidationError("memory.mnemosyne.tools must be a list of tool names")
 
         available = {schema["name"]: schema for schema in ALL_TOOL_SCHEMAS}
         unknown = [name for name in configured if name not in available]
         if unknown:
             known = ", ".join(sorted(available))
             bad = ", ".join(str(name) for name in unknown)
-            raise ValueError(f"Unknown Mnemosyne tool(s) in memory.mnemosyne.tools: {bad}. Known tools: {known}")
+            raise ToolConfigValidationError(f"Unknown Mnemosyne tool(s) in memory.mnemosyne.tools: {bad}. Known tools: {known}")
         return [available[name] for name in configured]
 
     def _configured_tool_names(self) -> Set[str]:
@@ -1987,6 +2035,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             self._verbatim_ledger.reset_session(_prev_active)
         self._platform = kwargs.get("platform", "cli")
         self._hermes_home = kwargs.get("hermes_home", "")
+        # An unknown memory.mnemosyne.tools name must fail init loudly (#1063)
+        # instead of waiting for the first tool-list/tool-call request. On
+        # failure, release the active registration and backend lease the
+        # same way shutdown() does, then re-raise the original error.
+        try:
+            self._configured_tool_schemas()
+        except Exception:
+            self._release_host_llm_backend_ownership()
+            self._deactivate_in_module()
+            raise
         self._agent_identity = kwargs.get("agent_identity", None) or ""
         self._gateway_session_key = kwargs.get("gateway_session_key") or ""
         self._channel_id_explicit = bool(kwargs.get("channel_id"))
@@ -3776,7 +3834,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 failed.append({"id": pid, "error": "not found"})
                 continue
 
-            claim_path = _claim_pending_record(rp)
+            try:
+                claim_path = _claim_pending_record(rp)
+            except PendingClaimError as claim_exc:
+                failed.append({
+                    "id": pid,
+                    "error": f"pending record not claimable: {claim_exc}",
+                })
+                continue
             if claim_path is None:
                 failed.append({"id": pid, "error": "pending record already claimed"})
                 continue

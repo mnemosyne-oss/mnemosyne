@@ -9,7 +9,9 @@ import importlib
 import json
 import logging
 import math
+import ntpath
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -19,7 +21,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from importlib import resources
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Optional
 
 PLUGIN_NAME = "mnemosyne"
@@ -989,6 +991,77 @@ def _validate_explicit_python(explicit_python: str | Path | None) -> None:
         )
 
 
+# Returned by _staged_runtime_python() when Hermes has committed no staged
+# runtime for a checkout, so callers fall through to the checkout's own venv.
+_NOT_STAGED = object()
+
+
+def _hermes_install_key(project_root: Path) -> str:
+    """Return Hermes' PM state key for a checkout (``pm.environments.install_key``)."""
+    canonical = str(Path(project_root).resolve())
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _staged_runtime_python(project_root: Path, hermes_home_path: Path):
+    """Return the interpreter of the runtime Hermes committed for a checkout.
+
+    Hermes 0.21 keeps ``<checkout>/venv`` only as a macOS TCC anchor. The
+    provider executes from a staged generation,
+    ``<home>/installs/<key>/environments/<generation>/venv``, which Hermes' PM
+    selects through ``installs/<key>/facts.json`` (``packages.venv.environment``).
+    ``<key>`` is derived from the checkout path, so the active install is found
+    by construction: ``installs/`` is never scanned and no directory is chosen
+    among several. This mirrors ``pm.environments.selected_venv``; the installer
+    runs in its own venv and cannot import Hermes' ``pm`` package.
+
+    Returns ``_NOT_STAGED`` when nothing is committed for the checkout (no
+    record, or no recorded environment), which is what Hermes itself answers
+    with the checkout's own venv. Returns the interpreter when the recorded
+    generation is usable. Returns ``None`` when a record exists but cannot be
+    used (unreadable, outside this install's ``environments/``, or without an
+    executable interpreter): Hermes refuses to run then, and falling back to the
+    anchor would target an interpreter the provider never runs under (#1068).
+    The interpreter path stays under ``<home>``, unresolved, like the rest of
+    discovery.
+    """
+    facts = hermes_home_path / "installs" / _hermes_install_key(project_root) / "facts.json"
+
+    def unusable(reason: str) -> None:
+        LOGGER.warning(
+            "Hermes recorded a staged runtime in %s that cannot be used: %s. "
+            "Not falling back to the checkout's venv, which is not the runtime "
+            "Hermes executes. Pass --python to select the interpreter explicitly.",
+            facts,
+            reason,
+        )
+
+    try:
+        data = json.loads(facts.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return _NOT_STAGED
+    except (OSError, ValueError) as exc:
+        return unusable(f"it cannot be read ({exc})")
+    try:
+        recorded = data.get("packages", {}).get("venv", {}).get("environment")
+    except AttributeError:
+        return unusable("it has an unexpected structure")
+    if recorded is None:
+        return _NOT_STAGED
+    if not isinstance(recorded, str):
+        return unusable("the recorded environment is not a path")
+
+    generations = facts.parent / "environments"
+    try:
+        relative = Path(recorded).resolve().relative_to(generations.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return unusable(f"{recorded} is outside {generations}")
+    venv = generations / relative
+    for candidate in _venv_python_candidates(venv):
+        if _is_validated_venv_python(candidate):
+            return candidate
+    return unusable(f"{venv} has no executable interpreter in a virtual environment")
+
+
 def _find_hermes_python(
     explicit_python: str | Path | None = None,
     hermes_home_path: str | Path | None = None,
@@ -997,6 +1070,12 @@ def _find_hermes_python(
 
     ``hermes_home_path`` scopes known-root discovery to an explicit CLI home;
     otherwise the configured default Hermes home is used.
+
+    On Hermes 0.21+ the checkout's venv is only a macOS TCC anchor and the
+    provider runs from a staged generation under ``<home>/installs/``. For a
+    checkout that has one, discovery returns that generation's interpreter, never
+    the anchor (see ``_staged_runtime_python``); checkouts without one keep the
+    venv-based discovery below.
 
     Returns None when no *validated* Hermes runtime is found. A candidate is
     never returned on the strength of sitting next to the launcher alone: the
@@ -1048,6 +1127,12 @@ def _find_hermes_python(
         if hermes_bin:
             resolved = _resolve_hermes_bin(hermes_bin)
             if resolved:
+                if _is_venv_bin_dir(resolved.parent):
+                    staged = _staged_runtime_python(
+                        resolved.parent.parent.parent, hermes_home_path
+                    )
+                    if staged is not _NOT_STAGED:
+                        return staged
                 for candidate in _venv_python_candidates(resolved.parent.parent):
                     if _is_validated_venv_python(candidate):
                         return candidate
@@ -1063,6 +1148,9 @@ def _find_hermes_python(
             Path("/usr/lib/hermes-agent"),
         ])
     for root in roots:
+        staged = _staged_runtime_python(root, hermes_home_path)
+        if staged is not _NOT_STAGED:
+            return staged
         for venv_name in ("venv", ".venv"):
             for candidate in _venv_python_candidates(root / venv_name):
                 if _is_validated_venv_python(candidate):
@@ -1593,6 +1681,49 @@ def _is_wrapper_plugin_target(target: Path) -> bool:
     return python is not None or site_packages is not None
 
 
+def _hermes_pm_generation_target(python: str | Path, home: str | Path) -> bool:
+    """Recognize the lexical PM layout without resolving venv Python symlinks.
+
+    This is a diagnostic, not proof that other paths persist: filesystem aliases
+    and unrecognized installation layouts are outside its scope.
+    """
+    selected, base = str(python), str(home)
+    windows = bool(ntpath.splitdrive(selected)[0] or ntpath.splitdrive(base)[0])
+    if windows:
+        path = PureWindowsPath(ntpath.normpath(selected))
+        root = PureWindowsPath(ntpath.normpath(base))
+        same = lambda a, b: a.casefold() == b.casefold()
+    else:
+        path = PurePosixPath(posixpath.abspath(selected))
+        root = PurePosixPath(posixpath.abspath(base))
+        same = lambda a, b: a == b
+    prefix = (*root.parts, "installs")
+    parts = path.parts
+    if len(parts) != len(prefix) + 6 or not all(
+        same(a, b) for a, b in zip(parts, prefix)
+    ):
+        return False
+    relative = parts[len(prefix):]
+    return (
+        same(relative[1], "environments")
+        and same(relative[3], "venv")
+        and tuple(part.casefold() for part in relative[4:])
+        in {("bin", "python"), ("bin", "python3"), ("scripts", "python.exe")}
+    )
+
+
+def _pm_wrapper_warning(python: str | Path | None, home: str | Path) -> str | None:
+    if python is None or not _hermes_pm_generation_target(python, home):
+        return None
+    return (
+        f"⚠ Wrapper Python {python} appears to be inside a replaceable Hermes "
+        "PM generation. This wrapper may stop working after a Hermes update. "
+        "For persistence, install Mnemosyne in a side venv outside installs/ "
+        "and re-register with --mode wrapper --force --python <side-venv-python>. "
+        "Existing wrapper registration remains supported."
+    )
+
+
 def _validated_wrapper_environment(
     python: str | Path | None,
     *,
@@ -1964,6 +2095,9 @@ def install_plugin(
     wrapper_python, site_packages = _validated_wrapper_environment(
         python, import_timeout=import_timeout
     )
+    warning = _pm_wrapper_warning(wrapper_python, base)
+    if warning:
+        print(f"  {warning}", file=sys.stderr)
     target.parent.mkdir(parents=True, exist_ok=True)
     staging_parent = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
     staged = staging_parent / target.name
@@ -2526,6 +2660,9 @@ def main(argv: list[str] | None = None) -> int:
                     assert hermes_python is not None
                     wrapper_python = hermes_python.absolute()
                     print(f"  Wrapper Python: {wrapper_python}")
+                    warning = _pm_wrapper_warning(wrapper_python, args.hermes_home or hermes_home())
+                    if warning:
+                        print(f"  {warning}")
                     if wrapper_python.is_file():
                         print(
                             "  Wrapper site-packages: "
@@ -2579,6 +2716,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  Plugin path: {target}")
             print(f"  State: {state.status}")
             print(f"  Mode: {state.mode}")
+            if state.mode == "wrapper":
+                warning = _pm_wrapper_warning(state.wrapper_python, args.hermes_home or hermes_home())
+                if warning:
+                    print(f"  {warning}")
             if installed:
                 if state.mode == "symlink" and state.link_target is not None:
                     print(f"  Target: {state.link_target}")

@@ -127,8 +127,14 @@ def test_row_sim_has_no_legacy_switch(monkeypatch):
     assert _wm_vec_row_sim(107.0, "int8", q, orthogonal) == pytest.approx(0.0, abs=0.01)
 
 
-@pytest.mark.parametrize("vec_type", [None, "", "float32", "bit", "unknown"])
-def test_row_sim_non_int8_arms_keep_legacy_mapping(vec_type):
+@pytest.mark.parametrize("vec_type", [None, "", "bit", "unknown"])
+def test_row_sim_other_arms_keep_legacy_mapping(vec_type):
+    """Arms without a blob-scoring path keep the distance mapping.
+
+    ``float32`` was removed from this list by #1069: that arm now scores from
+    the stored blob, so the single-byte blobs used here no longer describe it.
+    See ``test_wm_vec_float32_blob_scoring.py``.
+    """
     assert _wm_vec_row_sim(107.0, vec_type, b"\x7f", b"\x00") == pytest.approx(_legacy_sim(107.0))
 
 

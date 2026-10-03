@@ -1089,18 +1089,28 @@ class TestPolyphonicVecVoiceBoundary:
 
 
 class TestReindexMarkerLifecycle:
-    """A failed rebuild must not leave the store on a stale pure verdict;
-    the marker is cleared before the rebuild starts."""
+    """A failed rebuild rolls back completely (#1075): the marker and the vec
+    tables it certifies both stay exactly as they were. The rebuild used to
+    commit its destructive first step, so the marker had to stay cleared after
+    a failure; now the pre-rebuild store, marker included, is what survives."""
 
     @requires_vec
-    def test_failed_rebuild_leaves_store_unmarked(self, beam_db, monkeypatch):
+    def test_failed_rebuild_leaves_marker_and_vec_tables_untouched(self, beam_db, monkeypatch):
+        import json as _json
         import mnemosyne.core.beam as bm
 
         conn = beam_db.conn
         conn.execute("DROP TABLE IF EXISTS vec_episodes")
         conn.execute("CREATE VIRTUAL TABLE vec_episodes USING vec0(embedding int8[32])")
+        conn.execute(
+            "INSERT INTO vec_episodes(rowid, embedding) VALUES (1, vec_quantize_int8(?, 'unit'))",
+            (_json.dumps([0.1] * 32),),
+        )
         bm._mark_vec_store_norm_bit(conn)
+        conn.commit()
         assert _regime(conn) == "pure"
+        marked_uv = conn.execute("PRAGMA user_version").fetchone()[0]
+        rows_before = conn.execute("SELECT rowid, embedding FROM vec_episodes").fetchall()
         # two embedded episodic rows so the rebuild gets going
         for rid in ("e1", "e2"):
             conn.execute(
@@ -1124,8 +1134,10 @@ class TestReindexMarkerLifecycle:
         monkeypatch.setattr(bm._embeddings, "embed", failing_embed)
         with __import__("pytest").raises(RuntimeError):
             bm.reindex_vectors(conn)
-        uv = conn.execute("PRAGMA user_version").fetchone()[0]
-        assert not (uv & bm._VEC_NORM_BIT), (
-            "failed rebuild must leave the marker cleared (conservative routing)"
-        )
-        assert _regime(conn) == "legacy"
+        assert not conn.in_transaction
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == marked_uv
+        assert _regime(conn) == "pure"
+        assert "int8[32]" in conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'vec_episodes'"
+        ).fetchone()[0]
+        assert conn.execute("SELECT rowid, embedding FROM vec_episodes").fetchall() == rows_before

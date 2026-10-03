@@ -220,8 +220,18 @@ def cmd_media(args):
     """Remember a piece of media and, if understanding is enabled, describe it."""
     usage = ("Usage: mnemosyne media <path|url|data:uri> [--modality image|video|audio|document] "
              "[--title T] [--hint H] [--max-moments N] [--mime TYPE] [--json]")
-    if not args:
-        _usage(usage)
+    if not args or any(arg in ("--help", "-h") for arg in args):
+        print(usage)
+        print("  <path>                            Local file path to ingest")
+        print("  <url>                             HTTP(S) URL of remote media")
+        print("  <data:uri>                        Inline data: URI payload")
+        print("  --modality image|video|audio|document   Force modality instead of inferring from path/URL")
+        print("  --title T                         Human-readable title for the asset")
+        print("  --hint H                          Free-form context passed to the understanding model")
+        print("  --max-moments N                   Cap the number of derived moments (default: model default)")
+        print("  --mime TYPE                       Override MIME type detection")
+        print("  --json                            Emit a machine-readable JSON summary on stdout")
+        return
     options = {"modality": None, "title": None, "hint": None, "max-moments": None, "mime": None}
     json_output = False
     positionals = []
@@ -235,6 +245,8 @@ def cmd_media(args):
                 _usage(usage)
             options[arg[2:]] = args[i + 1]
             i += 1
+        elif arg.startswith("-") and arg != "-":
+            _usage(f"{usage}\nUnknown media option: {arg}")
         else:
             positionals.append(arg)
         i += 1
@@ -1267,34 +1279,100 @@ def cmd_bank(args):
         _fail(str(e))
 
 
+def _resolve_reindex_target(db_override, bank_override):
+    """Resolve the database path reindex should open, honoring --db/--bank.
+
+    An explicit ``--db`` or ``--bank`` target must already exist. It is
+    looked up without touching the filesystem, so a typo exits before any
+    store, bank directory or backup is created. Without a target this mirrors
+    ``_get_memory()``'s ambient bank resolution.
+    """
+    if db_override is not None:
+        db_path = Path(db_override).expanduser()
+    elif bank_override is not None:
+        from mnemosyne.core.banks import get_bank_db_path_read_only
+
+        try:
+            db_path = get_bank_db_path_read_only(
+                _resolve_bank_name(bank_override), data_dir=Path(DATA_DIR)
+            )
+        except (ValueError, FileNotFoundError) as error:
+            _fail(str(error))
+    else:
+        from mnemosyne.core.banks import BankManager
+
+        bm = BankManager(Path(DATA_DIR))
+        try:
+            return bm.get_bank_db_path(_resolve_bank_name())
+        except ValueError as error:
+            _fail(str(error))
+    if not db_path.is_file():
+        _fail(f"Database not found: {db_path}")
+    return db_path
+
+
 def cmd_reindex(args):
     """Rebuild vector indexes from source text with the active embedding model.
 
-    Usage: mnemosyne reindex [--model NAME] [--dry-run] [--yes] [--no-backup]
+    Usage: mnemosyne reindex [--db PATH | --bank NAME] [--model NAME]
+                              [--dry-run] [--yes] [--no-backup]
 
     Use after changing the embedding model/dimension. Synchronous and blocking —
     re-embeds working + episodic memory, so it can take minutes on a large DB.
     Run it with any provider/gateway stopped.
     """
-    dry_run = "--dry-run" in args
-    assume_yes = "--yes" in args or "-y" in args
-    no_backup = "--no-backup" in args
+    usage = (
+        "Usage: mnemosyne reindex [--db PATH | --bank NAME] [--model NAME] "
+        "[--dry-run] [--yes] [--no-backup]"
+    )
+    db_override = None
+    bank_override = None
+    model_override = None
+    dry_run = False
+    assume_yes = False
+    no_backup = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--db":
+            db_override, i = _require_value(args, i, "--db", lambda value, _name: value)
+        elif arg == "--bank":
+            bank_override, i = _require_value(args, i, "--bank", lambda value, _name: value)
+        elif arg == "--model":
+            model_override, i = _require_value(args, i, "--model", lambda value, _name: value)
+        elif arg == "--dry-run":
+            dry_run = True
+            i += 1
+        elif arg in ("--yes", "-y"):
+            assume_yes = True
+            i += 1
+        elif arg == "--no-backup":
+            no_backup = True
+            i += 1
+        else:
+            _usage(f"{usage}\nUnknown reindex option: {arg}")
+
+    if db_override is not None and bank_override is not None:
+        _fail("--db and --bank cannot be used together")
+
+    db_path = _resolve_reindex_target(db_override, bank_override)
 
     # --model has to win before the embedding module is imported: it freezes the
     # model + dimension from the env at import time.
-    if "--model" in args:
-        try:
-            os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = args[args.index("--model") + 1]
-        except IndexError:
-            _usage("Usage: mnemosyne reindex [--model NAME] [--dry-run] [--yes] [--no-backup]")
+    if model_override is not None:
+        os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = model_override
 
     from mnemosyne.core import embeddings as _emb
+    # Open the target through BeamMemory, not Mnemosyne: importing
+    # mnemosyne.core.memory runs init_db() on the ambient default database,
+    # which a targeted reindex must leave untouched.
+    from mnemosyne.core.beam import BeamMemory, reindex_vectors
 
-    mem = _get_memory()
+    beam = BeamMemory(db_path=str(db_path))
 
     if dry_run:
-        plan = mem.reindex_vectors(dry_run=True)
-        print("Reindex plan (dry run -- nothing written):")
+        plan = reindex_vectors(beam.conn, dry_run=True)
+        print(f"Reindex plan (dry run -- nothing written), db: {db_path}")
         for key in ("model", "dim", "vec_type", "sqlite_vec",
                     "working_memory", "episodic_memory"):
             if key in plan:
@@ -1319,7 +1397,7 @@ def cmd_reindex(args):
     if not no_backup:
         try:
             from mnemosyne.dr.recovery import create_backup
-            backup = create_backup()
+            backup = create_backup(db_path=db_path)
             print(f"Backup created: {backup['backup_path']}")
         except Exception as e:
             _fail(f"Backup failed (use --no-backup to skip): {e}")
@@ -1331,7 +1409,7 @@ def cmd_reindex(args):
         print(f"  {store}: {done}/{total}", flush=True)
 
     try:
-        result = mem.reindex_vectors(progress=_progress)
+        result = reindex_vectors(beam.conn, progress=_progress)
     except Exception as e:
         _fail(str(e))
 
@@ -1355,7 +1433,7 @@ def cmd_hygiene(args):
     )
     from mnemosyne.doctor import open_readonly_doctor_db
 
-    if not args or args[0] in ("--help", "-h"):
+    if not args or any(arg in ("--help", "-h") for arg in args):
         print("Usage: mnemosyne hygiene audit|status|clean|restore [options]")
         print("  audit [--limit N] [--offset N] [--all [--batch-size N]] [--min-score F] [--json]")
         print("                                          Scan for noise (dry-run; --batch-size only affects --all)")
@@ -1588,7 +1666,7 @@ def cmd_profile(args):
     """profile list|apply|show|create — gamified config templates."""
     from mnemosyne.core.profiles import list_profiles, get_profile, apply_profile, create_profile
 
-    if not args or args[0] in ("--help", "-h"):
+    if not args or any(arg in ("--help", "-h") for arg in args):
         print("Usage: mnemosyne profile <list|apply|show|create> [options]")
         print("  list                           Show all available profiles")
         print("  apply <name> [--dry-run]       Apply a profile to config.yaml")
@@ -1693,7 +1771,7 @@ def cmd_profile(args):
 
 def cmd_config(args):
     """config reload|get|set|migrate — manage config.yaml."""
-    if not args or args[0] in ("--help", "-h"):
+    if not args or any(arg in ("--help", "-h") for arg in args):
         print("Usage: mnemosyne config <reload|get|set|migrate> [options]")
         print("  reload                         Re-read config.yaml (hot-reload)")
         print("  get <key>                      Read a single config value")
@@ -1750,11 +1828,17 @@ def cmd_config(args):
 
 
 def cmd_migrate(args):
-    """Add the 3.11.1 schema tables to an existing bank.
+    """Bring an existing bank up to the packaged schema.
 
-    Bank selection: ``--bank <name>`` flag, else ``$MNEMOSYNE_BANK``,
-    else the default bank. ``--dry-run`` reports pending DDL without
-    writing.
+    Applies the 3.11.1 tables (E7) and the order-normalized conflicts pair
+    key (E8), bank-scoped. Bank selection: ``--bank <name>`` flag, else
+    ``$MNEMOSYNE_BANK``, else the default bank. ``--dry-run`` reports
+    pending DDL without writing.
+
+    E8 is index-only. When pre-existing duplicate conflict pairs make the
+    unique index impossible, the pairs are reported and a real run exits
+    non-zero with the bank's rows untouched — choosing a winner per pair
+    is adjudication, not migration.
     """
     usage = "Usage: mnemosyne migrate [--bank <name>] [--dry-run]"
     bank_override = None
@@ -1777,6 +1861,11 @@ def cmd_migrate(args):
 
     from mnemosyne.core.banks import BankManager
     from mnemosyne.migrations.e7_311_tables import migrate_311_tables
+    from mnemosyne.migrations.e8_conflict_pair_key import (
+        ConflictSchemaUnreadableError,
+        IndexDefinitionMismatchError,
+        migrate_conflict_pair_key,
+    )
 
     bm = BankManager(Path(DATA_DIR))
     try:
@@ -1798,6 +1887,11 @@ def cmd_migrate(args):
         print(
             f"  would add tables: {', '.join(report['tables_would_add']) or '(none)'}"
         )
+        if "columns_would_add" in report:
+            print(
+                "  would add columns: "
+                f"{', '.join(report['columns_would_add']) or '(none)'}"
+            )
         print(f"  would add indices: {report['indices_would_add']}")
     else:
         print(f"  tables added: {', '.join(report['tables_added']) or '(none)'}")
@@ -1805,7 +1899,47 @@ def cmd_migrate(args):
             "  tables already present: "
             f"{', '.join(report['tables_already_present']) or '(none)'}"
         )
+        if "columns_added" in report:
+            print(
+                "  columns added: "
+                f"{', '.join(report['columns_added']) or '(none)'}"
+            )
         print(f"  indices added: {report['indices_added']}")
+
+    # E8: order-normalized unique pair key on conflicts, bank-scoped.
+    # Existing banks only ever received the 311 tables above; without this
+    # call the pair constraint was unreachable through `mnemosyne migrate`.
+    try:
+        e8_report = migrate_conflict_pair_key(db_path, dry_run=dry_run)
+    except (
+        IndexDefinitionMismatchError,
+        ConflictSchemaUnreadableError,
+    ) as e:
+        _fail(f"migrate_failed: {e}", exit_code=1)
+    except Exception:
+        _fail("migrate_failed: e8", exit_code=1)
+
+    print(f"migrate e8 [{mode}]: bank={bank} db={db_path}")
+    if e8_report["conflicts_table_missing"]:
+        print("  conflicts table absent — nothing to index")
+    elif e8_report["index_already_present"]:
+        print("  index already present (definition validated): "
+              "idx_conflicts_pair_norm")
+    elif e8_report["duplicate_pairs"]:
+        pairs = e8_report["duplicate_pairs"]
+        print(
+            f"  NOT APPLIED — {len(pairs)} duplicate normalized pair(s) "
+            f"block the unique index: {', '.join(pairs)}"
+        )
+        print("  rows left untouched; adjudicate a winner per pair, "
+              "then re-run migrate")
+        if not dry_run:
+            _fail("migrate_incomplete: conflicts pair key (E8) not applied",
+                  exit_code=1)
+    elif dry_run:
+        print("  would add index: idx_conflicts_pair_norm")
+    else:
+        print("  index added: idx_conflicts_pair_norm")
 
 
 COMMANDS = {
@@ -1880,7 +2014,7 @@ def run_cli():
         print("  import <file.json>                     Import memories")
         print("  import-hindsight <file|url> [bank]     Import Hindsight memories")
         print("  bank list|create|delete [name]         Manage memory banks")
-        print("  reindex [--model NAME] [--dry-run] [--yes] [--no-backup]")
+        print("  reindex [--db PATH|--bank NAME] [--model NAME] [--dry-run] [--yes] [--no-backup]")
         print("                                      Rebuild vector indexes with the active model")
         print("  backup [output_dir]                    Create database backup")
         print("  restore <backup.db.gz>                 Restore from backup")
@@ -1911,7 +2045,7 @@ def run_cli():
         # machine-readable code, never a traceback (which leaks absolute
         # paths and library internals into logs).
         try:
-            if command not in {"doctor", "repair"}:
+            if command not in {"doctor", "repair", "reindex"}:
                 os.makedirs(DATA_DIR, exist_ok=True)
             handler(sys.argv[2:])
         except SystemExit:

@@ -972,32 +972,55 @@ class PolyphonicRecallEngine:
             if not cursor.fetchone():
                 return []
 
-            # Get memories from last 7 days
-            week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+            # Get memories from last 7 days. working_memory.timestamp is naive UTC
+            # (the beam writers stamp datetime.now(timezone.utc).replace(tzinfo=None)),
+            # so the cutoff has to be naive UTC too — a local `now` compares a UTC string
+            # against a local one and the window shifts by the host offset. #1094.
+            #
+            # julianday() rather than a raw `timestamp > ?`: these are TEXT columns, so a
+            # TEXT comparison orders an offset-bearing row by its written digits rather than
+            # by its instant, which gets both window membership and pre-LIMIT chronology
+            # wrong for mixed-format rows.
+            #
+            # The cost is a full scan: julianday() is not indexable under idx_wm_timestamp,
+            # so the plan degrades from SEARCH USING INDEX to SCAN + temp B-tree. Measured
+            # locally on 50k rows, median of 20 runs: 4.7 ms against 0.013 ms for the raw
+            # form. That is the accepted price — #1094 requires the instant-correct
+            # behaviour, and an expression index on julianday(timestamp) would restore the
+            # SEARCH but is a schema migration, which is not authorised here.
+            # tests/test_temporal_query_plan.py pins this plan and this budget on a synthetic
+            # 50k fixture — a regression guard, not an execution bound. If an expression index
+            # ever lands, the plan assertion flips to SEARCH and that test is the thing to
+            # revisit.
+            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+            week_ago = (now_utc - timedelta(days=7)).isoformat()
             echo_clause, echo_params = exclusion_sql(excluded_wm_ids)
             cursor.execute(f"""
                 SELECT id, content, timestamp, importance
                 FROM working_memory
-                WHERE timestamp > ? {echo_clause}
-                ORDER BY timestamp DESC
+                WHERE julianday(timestamp) > julianday(?) {echo_clause}
+                ORDER BY julianday(timestamp) DESC
                 LIMIT 20
             """, (week_ago, *echo_params))
 
             results = []
             for row in cursor.fetchall():
-                # Calculate temporal score. Timestamps may be naive-local
-                # (production writers) or aware-UTC (imports/migrations):
-                # normalize to naive before subtracting or fromisoformat
-                # raises 'can't subtract offset-naive and offset-aware'.
+                # Calculate temporal score. A naive value is UTC (the storage contract
+                # that #1087 settled for canonical_facts, and what beam.py writes here);
+                # an aware value is normalised to UTC rather than to local. Converting to
+                # local with a bare astimezone() then subtracting local `now` is the same
+                # value on both sides, so it looks right — but a row stamped at UTC reads
+                # as if it were `offset` hours older than it is, and the ranking is off by
+                # exactly the host offset. #1094.
                 try:
                     row_dt = datetime.fromisoformat(row["timestamp"])
                 except (TypeError, ValueError):
                     continue
                 if row_dt.tzinfo is not None:
-                    row_dt = row_dt.astimezone().replace(tzinfo=None)
-                age = datetime.now() - row_dt
+                    row_dt = row_dt.astimezone(timezone.utc).replace(tzinfo=None)
+                age = datetime.now(timezone.utc).replace(tzinfo=None) - row_dt
                 age_days = age.total_seconds() / 86400
-                temporal_score = np.exp(-age_days / 7)  # 7-day half-life
+                temporal_score = np.exp(-age_days / 7)  # 7-day time constant (unchanged)
 
                 results.append(RecallResult(
                     memory_id=row["id"],
