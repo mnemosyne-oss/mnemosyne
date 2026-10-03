@@ -9,6 +9,7 @@ import venv
 from pathlib import Path
 
 import pytest
+import yaml
 from mnemosyne_hermes import install as install_mod
 from mnemosyne_hermes.install import install_plugin
 
@@ -22,6 +23,27 @@ def _source() -> Path:
     return install_mod._resolve_package_dir()
 
 
+def _isolate_hermes_python_sources(tmp_path, monkeypatch):
+    """Patch fallback interpreter sources so tests only see the mocked hermes launcher."""
+    monkeypatch.setattr(install_mod, "hermes_home", lambda: tmp_path / "no_hermes_home")
+    monkeypatch.setattr(install_mod.sys, "prefix", install_mod.sys.base_prefix)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+
+
+def _mark_as_venv(bin_dir):
+    """Give a fixture's ``bin/`` the ``pyvenv.cfg`` that makes it a real venv.
+
+    Discovery accepts an interpreter beside the launcher only once the directory
+    is shown to be a virtual environment, so a fixture modelling a pip/pipx
+    install needs the marker a real one always has. Without it the layout is
+    indistinguishable from ``~/.local/bin``, which holds a launcher and an
+    unrelated ``python`` and is exactly the #618 failure.
+    """
+    (bin_dir.parent / "pyvenv.cfg").write_text(
+        "home = /usr/bin\ninclude-system-site-packages = false\n", encoding="utf-8"
+    )
+
+
 def _make_profile(hermes_home, name, provider):
     profile = hermes_home / "profiles" / name
     profile.mkdir(parents=True)
@@ -31,14 +53,369 @@ def _make_profile(hermes_home, name, provider):
     return profile
 
 
+def test_find_hermes_python_follows_wrapper_script_to_real_venv(tmp_path, monkeypatch):
+    """A PATH shim that execs the real Hermes binary must not pick a stray python beside the shim."""
+    # Real Hermes venv layout.
+    real_venv = tmp_path / "hermes-agent" / "venv"
+    real_bin = real_venv / "bin"
+    real_bin.mkdir(parents=True)
+    real_hermes = real_bin / "hermes"
+    real_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_hermes.chmod(0o755)
+    real_python = real_bin / "python"
+    real_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_python.chmod(0o755)
+    _mark_as_venv(real_bin)
+
+    # PATH shim in ~/.local/bin that execs the real Hermes binary.
+    shim_dir = tmp_path / ".local" / "bin"
+    shim_dir.mkdir(parents=True)
+    shim = shim_dir / "hermes"
+    shim.write_text(
+        f'#!/usr/bin/env bash\nexec "{real_hermes}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+
+    # A decoy python next to the shim: this is the bug case.
+    decoy_python = shim_dir / "python"
+    decoy_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    decoy_python.chmod(0o755)
+
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+    found = install_mod._find_hermes_python()
+    assert found == real_python
+
+
+def test_resolve_hermes_bin_returns_direct_executable_for_plain_entrypoint(
+    tmp_path, monkeypatch
+):
+    _skip_on_windows()
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    hermes = bin_dir / "hermes"
+    hermes.write_text("#!/usr/bin/env python3\nimport hermes.cli\n", encoding="utf-8")
+    hermes.chmod(0o755)
+    python = bin_dir / "python"
+    python.write_text("#!/bin/sh\n", encoding="utf-8")
+    python.chmod(0o755)
+    _mark_as_venv(bin_dir)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(hermes))
+
+    assert install_mod._resolve_hermes_bin(str(hermes)) == hermes
+    assert install_mod._find_hermes_python() == python
+
+
+def test_resolve_hermes_bin_follows_symlink_to_wrapper_script_to_real_venv(
+    tmp_path, monkeypatch
+):
+    _skip_on_windows()
+
+    real_venv = tmp_path / "hermes-agent" / "venv"
+    real_bin = real_venv / "bin"
+    real_bin.mkdir(parents=True)
+    real_hermes = real_bin / "hermes"
+    real_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_hermes.chmod(0o755)
+    real_python = real_bin / "python"
+    real_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_python.chmod(0o755)
+    _mark_as_venv(real_bin)
+
+    shim_dir = tmp_path / ".local" / "bin"
+    shim_dir.mkdir(parents=True)
+    shim = shim_dir / "hermes"
+    shim.write_text(
+        f'#!/usr/bin/env bash\nexec "{real_hermes}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+
+    launcher = tmp_path / "hermes"
+    launcher.symlink_to(shim)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(launcher))
+
+    assert install_mod._resolve_hermes_bin(str(launcher)) == real_hermes
+    assert install_mod._find_hermes_python() == real_python
+
+
+def test_resolve_hermes_bin_resolves_relative_exec_target(tmp_path, monkeypatch):
+    _skip_on_windows()
+
+    real_bin = tmp_path / "bin"
+    real_bin.mkdir(parents=True)
+    real_hermes = real_bin / "hermes"
+    real_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_hermes.chmod(0o755)
+    real_python = real_bin / "python"
+    real_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_python.chmod(0o755)
+    _mark_as_venv(real_bin)
+
+    shim = tmp_path / "hermes"
+    shim.write_text(
+        '#!/usr/bin/env bash\nexec "./bin/hermes" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+
+    assert install_mod._resolve_hermes_bin(str(shim)) == real_hermes
+    assert install_mod._find_hermes_python() == real_python
+
+
+def test_resolve_hermes_bin_resolves_bare_exec_target_via_path(tmp_path, monkeypatch):
+    _skip_on_windows()
+
+    real_bin = tmp_path / "real" / "bin"
+    real_bin.mkdir(parents=True)
+    real_hermes = real_bin / "hermes"
+    real_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_hermes.chmod(0o755)
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir(parents=True)
+    shim = shim_dir / "hermes-launcher"
+    shim.write_text(
+        '#!/usr/bin/env bash\nexec hermes "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+
+    # Decoy executable next to the wrapper. A bare command name must NOT be
+    # resolved relative to the wrapper directory; it should use PATH.
+    decoy = shim_dir / "hermes"
+    decoy.write_text("#!/bin/sh\n", encoding="utf-8")
+    decoy.chmod(0o755)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    # Place the real hermes earlier on PATH so the bare exec target resolves to it.
+    monkeypatch.setenv("PATH", str(real_bin), prepend=":")
+
+    result = install_mod._resolve_hermes_bin(str(shim))
+    assert result == real_hermes
+    assert result != decoy
+
+
+def test_resolve_hermes_bin_returns_none_for_broken_symlink(tmp_path, monkeypatch):
+    _skip_on_windows()
+
+    shim = tmp_path / "hermes"
+    shim.symlink_to(tmp_path / "missing" / "hermes")
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+
+    assert install_mod._resolve_hermes_bin(str(shim)) is None
+    assert install_mod._find_hermes_python() is None
+
+
+def test_resolve_hermes_bin_returns_none_for_non_executable_symlink_target(
+    tmp_path, monkeypatch
+):
+    _skip_on_windows()
+
+    real = tmp_path / "real_hermes"
+    real.write_text("#!/bin/sh\n", encoding="utf-8")
+    real.chmod(0o644)
+
+    shim = tmp_path / "hermes"
+    shim.symlink_to(real)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+
+    assert install_mod._resolve_hermes_bin(str(shim)) is None
+    assert install_mod._find_hermes_python() is None
+
+
+def test_resolve_hermes_bin_returns_none_for_symlink_loop(tmp_path, monkeypatch):
+    _skip_on_windows()
+
+    a = tmp_path / "hermes_a"
+    b = tmp_path / "hermes_b"
+    a.symlink_to(b)
+    b.symlink_to(a)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(a))
+    assert install_mod._resolve_hermes_bin(str(a)) is None
+
+
+def test_resolve_hermes_bin_returns_none_for_wrapper_loop(tmp_path, monkeypatch):
+    _skip_on_windows()
+
+    shim = tmp_path / "hermes"
+    shim.write_text(
+        f'#!/usr/bin/env bash\nexec "{shim}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+
+    assert install_mod._resolve_hermes_bin(str(shim)) is None
+
+
+def test_resolve_hermes_bin_ignores_cwd_decoy_for_dot_slash_target(
+    tmp_path, monkeypatch
+):
+    """`exec ./hermes-real` must resolve beside the wrapper, not a CWD decoy."""
+    _skip_on_windows()
+
+    real_bin = tmp_path / "bin"
+    real_bin.mkdir(parents=True)
+    shim = real_bin / "hermes"
+    shim.write_text(
+        '#!/usr/bin/env bash\nexec ./hermes-real "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    real_hermes = real_bin / "hermes-real"
+    real_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_hermes.chmod(0o755)
+    real_python = real_bin / "python"
+    real_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_python.chmod(0o755)
+    _mark_as_venv(real_bin)
+
+    # A same-named decoy in the process working directory must not win.
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    decoy_hermes = cwd / "hermes-real"
+    decoy_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    decoy_hermes.chmod(0o755)
+    decoy_python = cwd / "python"
+    decoy_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    decoy_python.chmod(0o755)
+    monkeypatch.chdir(cwd)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+
+    assert install_mod._resolve_hermes_bin(str(shim)) == real_hermes
+    assert install_mod._find_hermes_python() == real_python
+
+
+def test_resolve_hermes_bin_follows_env_prefix_exec_target(tmp_path, monkeypatch):
+    """`exec env FOO=bar /real/hermes` must resolve to the real binary, not env."""
+    _skip_on_windows()
+
+    real_bin = tmp_path / "real" / "bin"
+    real_bin.mkdir(parents=True)
+    real_hermes = real_bin / "hermes"
+    real_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_hermes.chmod(0o755)
+    real_python = real_bin / "python"
+    real_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_python.chmod(0o755)
+    _mark_as_venv(real_bin)
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "hermes"
+    shim.write_text(
+        f'#!/usr/bin/env bash\nexec env FOO=bar "{real_hermes}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    # Decoy python beside the wrapper: proves we did not stop at the wrapper.
+    decoy_python = shim_dir / "python"
+    decoy_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    decoy_python.chmod(0o755)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+
+    assert install_mod._resolve_hermes_bin(str(shim)) == real_hermes
+    assert install_mod._find_hermes_python() == real_python
+
+
+def test_resolve_hermes_bin_follows_pre_exec_assignment_target(tmp_path, monkeypatch):
+    """`FOO=bar exec /real/hermes` must resolve to the real binary."""
+    _skip_on_windows()
+
+    real_bin = tmp_path / "real" / "bin"
+    real_bin.mkdir(parents=True)
+    real_hermes = real_bin / "hermes"
+    real_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_hermes.chmod(0o755)
+    real_python = real_bin / "python"
+    real_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_python.chmod(0o755)
+    _mark_as_venv(real_bin)
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "hermes"
+    shim.write_text(
+        f'#!/usr/bin/env bash\nFOO=bar exec "{real_hermes}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    decoy_python = shim_dir / "python"
+    decoy_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    decoy_python.chmod(0o755)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+
+    assert install_mod._resolve_hermes_bin(str(shim)) == real_hermes
+    assert install_mod._find_hermes_python() == real_python
+
+
+def test_resolve_hermes_bin_rejects_unsupported_env_option(tmp_path, monkeypatch):
+    """`exec env -u FOO ...` takes an argument we will not parse, so it is unresolved."""
+    _skip_on_windows()
+
+    real_bin = tmp_path / "real" / "bin"
+    real_bin.mkdir(parents=True)
+    real_hermes = real_bin / "hermes"
+    real_hermes.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_hermes.chmod(0o755)
+
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "hermes"
+    shim.write_text(
+        f'#!/usr/bin/env bash\nexec env -u FOO "{real_hermes}" "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    # A decoy python beside the wrapper must NOT be selected via a fallback.
+    decoy_python = shim_dir / "python"
+    decoy_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    decoy_python.chmod(0o755)
+
+    _isolate_hermes_python_sources(tmp_path, monkeypatch)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _bin: str(shim))
+
+    assert install_mod._resolve_hermes_bin(str(shim)) is None
+    assert install_mod._find_hermes_python() is None
+
+
 def test_default_install_links_single_home(tmp_path):
     _skip_on_windows()
+    source_manifest = _source() / "plugin.yaml"
+    source_manifest_before = source_manifest.read_bytes()
 
     target = install_plugin(hermes_home_path=tmp_path)
 
     assert target == tmp_path / "plugins" / "mnemosyne"
     assert target.is_symlink()
     assert target.resolve() == _source().resolve()
+    assert "python_runtime" not in yaml.safe_load(
+        (target / "plugin.yaml").read_text(encoding="utf-8")
+    )
+    assert source_manifest.read_bytes() == source_manifest_before
     assert install_mod._iter_mnemosyne_profiles(tmp_path) == []
 
 
@@ -52,6 +429,399 @@ def test_only_opted_in_profile_gets_link(tmp_path):
     link_a = profile_a / "plugins" / "mnemosyne"
     assert link_a.is_symlink() and link_a.resolve() == _source().resolve()
     assert not (profile_b / "plugins" / "mnemosyne").exists()
+
+
+def test_wrapper_install_root_only_does_not_link_opted_in_child_profile(tmp_path):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+
+    target = install_plugin(
+        hermes_home_path=tmp_path,
+        mode="wrapper",
+        python=sys.executable,
+        link_profiles=False,
+    )
+
+    assert target == tmp_path / "plugins" / "mnemosyne"
+    assert target.is_dir() and not target.is_symlink()
+    assert not (child / "plugins" / "mnemosyne").exists()
+
+
+@pytest.mark.parametrize(
+    ("initial_mode", "root_only_mode"),
+    [
+        ("symlink", "symlink"),
+        ("wrapper", "wrapper"),
+        ("symlink", "wrapper"),
+        ("wrapper", "symlink"),
+    ],
+)
+def test_root_only_transition_removes_only_recognized_profile_links(
+    tmp_path, initial_mode, root_only_mode
+):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+    foreign_profile = _make_profile(tmp_path, "foreign", "mnemosyne")
+    directory_profile = _make_profile(tmp_path, "directory", "mnemosyne")
+    initial_kwargs = {"hermes_home_path": tmp_path, "mode": initial_mode}
+    if initial_mode == "wrapper":
+        initial_kwargs["python"] = sys.executable
+    install_plugin(**initial_kwargs)
+
+    child_link = child / "plugins" / "mnemosyne"
+    foreign_link = foreign_profile / "plugins" / "mnemosyne"
+    foreign_target = tmp_path / "foreign-provider"
+    foreign_target.mkdir()
+    foreign_link.unlink()
+    os.symlink(str(foreign_target), str(foreign_link))
+    directory_target = directory_profile / "plugins" / "mnemosyne"
+    directory_target.unlink()
+    directory_target.mkdir()
+    marker = directory_target / "foreign.txt"
+    marker.write_text("keep", encoding="utf-8")
+
+    root_only_kwargs = {
+        "hermes_home_path": tmp_path,
+        "mode": root_only_mode,
+        "force": True,
+        "link_profiles": False,
+    }
+    if root_only_mode == "wrapper":
+        root_only_kwargs["python"] = sys.executable
+    elif initial_mode == "wrapper":
+        root_only_kwargs["migrate_wrapper_to_symlink"] = True
+    install_plugin(**root_only_kwargs)
+
+    assert not child_link.is_symlink() and not child_link.exists()
+    assert foreign_link.is_symlink()
+    assert foreign_link.resolve() == foreign_target.resolve()
+    assert directory_target.is_dir()
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_root_only_cleanup_preserves_link_repointed_after_snapshot(tmp_path, monkeypatch):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+    install_plugin(hermes_home_path=tmp_path, mode="wrapper", python=sys.executable)
+    child_link = child / "plugins" / "mnemosyne"
+    foreign_target = tmp_path / "foreign-provider"
+    foreign_target.mkdir()
+    original_swap = install_mod._replace_plugin_target_with_staged
+
+    def swap_then_repoint(target, staged):
+        original_swap(target, staged)
+        child_link.unlink()
+        child_link.symlink_to(foreign_target, target_is_directory=True)
+
+    monkeypatch.setattr(install_mod, "_replace_plugin_target_with_staged", swap_then_repoint)
+
+    install_plugin(
+        hermes_home_path=tmp_path,
+        force=True,
+        mode="wrapper",
+        python=sys.executable,
+        link_profiles=False,
+    )
+
+    assert child_link.is_symlink()
+    assert child_link.resolve() == foreign_target.resolve()
+
+
+def test_root_only_transition_preserves_compatible_foreign_provider_link(tmp_path):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+    foreign_provider = tmp_path / "foreign-provider"
+    foreign_provider.mkdir()
+    (foreign_provider / "__init__.py").write_text(
+        "class MnemosyneMemoryProvider:\n    pass\n",
+        encoding="utf-8",
+    )
+    (foreign_provider / "plugin.yaml").write_text(
+        "name: hermes-mnemosyne\n",
+        encoding="utf-8",
+    )
+    root_link = tmp_path / "plugins" / "mnemosyne"
+    root_link.parent.mkdir(parents=True)
+    root_link.symlink_to(foreign_provider, target_is_directory=True)
+    child_link = child / "plugins" / "mnemosyne"
+    child_link.parent.mkdir(parents=True)
+    child_link.symlink_to(foreign_provider, target_is_directory=True)
+
+    install_plugin(
+        hermes_home_path=tmp_path,
+        force=True,
+        link_profiles=False,
+    )
+
+    assert child_link.is_symlink()
+    assert child_link.resolve() == foreign_provider.resolve()
+
+
+def test_root_only_cleanup_rename_failure_restores_preference(tmp_path, monkeypatch):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+    install_plugin(hermes_home_path=tmp_path)
+    child_link = child / "plugins" / "mnemosyne"
+    preference = install_mod._profile_links_preference_path(tmp_path)
+    original_replace = Path.replace
+
+    def deny_profile_quarantine(self, target):
+        if self == child_link:
+            raise PermissionError("profile quarantine denied")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", deny_profile_quarantine)
+
+    with pytest.raises(PermissionError, match="profile quarantine denied"):
+        install_plugin(
+            hermes_home_path=tmp_path,
+            force=True,
+            link_profiles=False,
+        )
+
+    assert child_link.is_symlink()
+    assert install_mod.profile_links_enabled(hermes_home_path=tmp_path) is True
+    assert preference.read_text(encoding="utf-8") == '{"link_profiles": true}\n'
+
+
+def test_root_only_cleanup_failure_restores_effective_legacy_preference(
+    tmp_path, monkeypatch
+):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+    install_plugin(hermes_home_path=tmp_path)
+    child_link = child / "plugins" / "mnemosyne"
+    preference = install_mod._profile_links_preference_path(tmp_path)
+    preference.unlink()
+    assert install_mod.profile_links_enabled(hermes_home_path=tmp_path) is True
+    original_replace = Path.replace
+
+    def deny_profile_quarantine(self, target):
+        if self == child_link:
+            raise PermissionError("profile quarantine denied")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", deny_profile_quarantine)
+
+    with pytest.raises(PermissionError, match="profile quarantine denied"):
+        install_plugin(
+            hermes_home_path=tmp_path,
+            mode="wrapper",
+            python=sys.executable,
+            force=True,
+            link_profiles=False,
+        )
+
+    assert child_link.is_symlink()
+    assert install_mod.profile_links_enabled(hermes_home_path=tmp_path) is True
+    assert preference.read_text(encoding="utf-8") == '{"link_profiles": true}\n'
+
+
+def test_root_only_cleanup_failure_remains_primary_when_preference_rollback_fails(
+    tmp_path, monkeypatch, capsys
+):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+    install_plugin(hermes_home_path=tmp_path)
+    child_link = child / "plugins" / "mnemosyne"
+    original_replace = Path.replace
+
+    def deny_profile_quarantine(self, target):
+        if self == child_link:
+            raise PermissionError("profile quarantine denied")
+        return original_replace(self, target)
+
+    def fail_preference_rollback(*args, **kwargs):
+        raise OSError("preference rollback denied")
+
+    monkeypatch.setattr(Path, "replace", deny_profile_quarantine)
+    monkeypatch.setattr(
+        install_mod,
+        "_restore_profile_links_preference",
+        fail_preference_rollback,
+    )
+
+    with pytest.raises(PermissionError, match="profile quarantine denied"):
+        install_plugin(
+            hermes_home_path=tmp_path,
+            force=True,
+            link_profiles=False,
+        )
+
+    assert child_link.is_symlink()
+    assert "Profile-link preference rollback failed" in capsys.readouterr().err
+
+
+def test_profile_link_snapshot_rejects_repoint_during_classification(tmp_path, monkeypatch):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+    target = install_plugin(hermes_home_path=tmp_path)
+    child_link = child / "plugins" / "mnemosyne"
+    foreign_target = tmp_path / "foreign-provider"
+    foreign_target.mkdir()
+    original_resolve = Path.resolve
+    repointed = False
+
+    def resolve_then_repoint(self, *args, **kwargs):
+        nonlocal repointed
+        resolved = original_resolve(self, *args, **kwargs)
+        if self == child_link and not repointed:
+            repointed = True
+            child_link.unlink()
+            child_link.symlink_to(foreign_target, target_is_directory=True)
+        return resolved
+
+    monkeypatch.setattr(Path, "resolve", resolve_then_repoint)
+
+    snapshots = install_mod._recognized_profile_links(
+        hermes_home_path=tmp_path,
+        recognized_targets=(target,),
+    )
+
+    assert snapshots == []
+    assert child_link.is_symlink()
+    assert child_link.resolve() == foreign_target.resolve()
+
+
+def test_profile_link_cleanup_restores_repointed_quarantined_link(tmp_path, monkeypatch):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+    target = install_plugin(hermes_home_path=tmp_path)
+    child_link = child / "plugins" / "mnemosyne"
+    snapshots = install_mod._recognized_profile_links(
+        hermes_home_path=tmp_path,
+        recognized_targets=(target,),
+    )
+    foreign_target = tmp_path / "foreign-provider"
+    foreign_target.mkdir()
+    original_replace = Path.replace
+    repointed = False
+
+    def repoint_before_quarantine(self, destination):
+        nonlocal repointed
+        if self == child_link and not repointed:
+            repointed = True
+            child_link.unlink()
+            child_link.symlink_to(foreign_target, target_is_directory=True)
+        return original_replace(self, destination)
+
+    monkeypatch.setattr(Path, "replace", repoint_before_quarantine)
+
+    install_mod._unlink_profile_links(snapshots)
+
+    assert child_link.is_symlink()
+    assert child_link.resolve() == foreign_target.resolve()
+
+
+def test_profile_link_cleanup_restores_directory_replacing_snapshot(tmp_path, monkeypatch):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+    target = install_plugin(hermes_home_path=tmp_path)
+    child_link = child / "plugins" / "mnemosyne"
+    snapshots = install_mod._recognized_profile_links(
+        hermes_home_path=tmp_path,
+        recognized_targets=(target,),
+    )
+    original_replace = Path.replace
+    replaced = False
+
+    def replace_with_directory_before_quarantine(self, destination):
+        nonlocal replaced
+        if self == child_link and not replaced:
+            replaced = True
+            child_link.unlink()
+            child_link.mkdir()
+            (child_link / "keep.txt").write_text("keep", encoding="utf-8")
+        return original_replace(self, destination)
+
+    monkeypatch.setattr(Path, "replace", replace_with_directory_before_quarantine)
+
+    install_mod._unlink_profile_links(snapshots)
+
+    assert child_link.is_dir() and not child_link.is_symlink()
+    assert (child_link / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_root_only_transition_keeps_links_to_foreign_hermes_provider(tmp_path):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+    foreign_provider = tmp_path / "foreign-provider"
+    foreign_provider.mkdir()
+    (foreign_provider / "__init__.py").write_text(
+        "# Compatibility note: MnemosyneMemoryProvider is not defined here.\n"
+        "def register_memory_provider():\n    return None\n",
+        encoding="utf-8",
+    )
+    (foreign_provider / "plugin.yaml").write_text(
+        "name: foreign-memory-provider\n",
+        encoding="utf-8",
+    )
+    root_link = tmp_path / "plugins" / "mnemosyne"
+    root_link.parent.mkdir(parents=True)
+    os.symlink(str(foreign_provider), str(root_link))
+    child_link = child / "plugins" / "mnemosyne"
+    child_link.parent.mkdir(parents=True)
+    os.symlink(str(root_link), str(child_link))
+    original_child_target = child_link.readlink()
+
+    install_plugin(
+        hermes_home_path=tmp_path,
+        force=True,
+        link_profiles=False,
+    )
+
+    assert child_link.is_symlink()
+    assert child_link.readlink() == original_child_target
+
+
+def test_root_only_transition_removes_legacy_wrapper_profile_link(tmp_path):
+    _skip_on_windows()
+    child = _make_profile(tmp_path, "child", "mnemosyne")
+    legacy_site = tmp_path / "legacy-site-packages"
+    legacy_package = legacy_site / "mnemosyne_hermes"
+    legacy_package.mkdir(parents=True)
+    root_plugin = tmp_path / "plugins" / "mnemosyne"
+    root_plugin.mkdir(parents=True)
+    (root_plugin / "__init__.py").write_text(
+        f"_PYTHON = {sys.executable!r}\n"
+        f"_SITE = {str(legacy_site)!r}\n"
+        "from mnemosyne_hermes import *  # noqa: F401,F403,E402\n",
+        encoding="utf-8",
+    )
+    (root_plugin / "plugin.yaml").write_text(
+        "name: hermes-mnemosyne\n",
+        encoding="utf-8",
+    )
+    child_link = child / "plugins" / "mnemosyne"
+    child_link.parent.mkdir(parents=True)
+    os.symlink(str(legacy_package), str(child_link))
+
+    install_plugin(
+        hermes_home_path=tmp_path,
+        force=True,
+        link_profiles=False,
+        migrate_wrapper_to_symlink=True,
+    )
+
+    assert not child_link.is_symlink() and not child_link.exists()
+
+
+def test_profile_links_preference_preserves_default_when_profiles_are_added_later(tmp_path):
+    _skip_on_windows()
+
+    install_plugin(hermes_home_path=tmp_path)
+    _make_profile(tmp_path, "child", "mnemosyne")
+
+    assert install_mod.profile_links_enabled(hermes_home_path=tmp_path) is True
+
+
+def test_profile_links_enabled_is_false_for_root_only_install(tmp_path):
+    _skip_on_windows()
+    _make_profile(tmp_path, "child", "mnemosyne")
+
+    install_plugin(hermes_home_path=tmp_path, link_profiles=False)
+
+    assert install_mod.profile_links_enabled(hermes_home_path=tmp_path) is False
 
 
 def test_rerun_is_idempotent(tmp_path):
@@ -200,6 +970,78 @@ def test_forced_wrapper_refresh_preflights_before_preserving_existing_wrapper_li
     assert foreign_link.is_symlink() and foreign_link.resolve() == foreign.resolve()
 
 
+def test_failed_root_only_wrapper_refresh_preserves_target_links_and_preference(tmp_path):
+    _skip_on_windows()
+    selected = _make_profile(tmp_path, "alice", "mnemosyne")
+    target = install_plugin(hermes_home_path=tmp_path, mode="wrapper", python=sys.executable)
+    selected_link = selected / "plugins" / "mnemosyne"
+    original_init = (target / "__init__.py").read_bytes()
+    preference = install_mod._profile_links_preference_path(tmp_path)
+    original_preference = preference.read_bytes()
+
+    with pytest.raises(FileNotFoundError, match="Python interpreter not found"):
+        install_plugin(
+            hermes_home_path=tmp_path,
+            force=True,
+            mode="wrapper",
+            python=tmp_path / "missing-python",
+            link_profiles=False,
+        )
+
+    assert target.is_dir() and not target.is_symlink()
+    assert (target / "__init__.py").read_bytes() == original_init
+    assert selected_link.is_symlink() and selected_link.resolve() == target.resolve()
+    assert preference.read_bytes() == original_preference
+    assert install_mod.profile_links_enabled(hermes_home_path=tmp_path) is True
+
+
+def test_root_only_wrapper_refresh_preference_failure_preserves_target_and_links(
+    tmp_path, monkeypatch
+):
+    _skip_on_windows()
+    selected = _make_profile(tmp_path, "alice", "mnemosyne")
+    foreign_profile = _make_profile(tmp_path, "bob", "mnemosyne")
+    real_profile = _make_profile(tmp_path, "carol", "mnemosyne")
+    target = install_plugin(hermes_home_path=tmp_path, mode="wrapper", python=sys.executable)
+    selected_link = selected / "plugins" / "mnemosyne"
+    foreign_link = foreign_profile / "plugins" / "mnemosyne"
+    foreign_link.unlink()
+    foreign_target = tmp_path / "foreign-plugin"
+    foreign_target.mkdir()
+    foreign_link.symlink_to(foreign_target, target_is_directory=True)
+    real_plugin = real_profile / "plugins" / "mnemosyne"
+    real_plugin.unlink()
+    real_plugin.mkdir()
+    marker = real_plugin / "keep.txt"
+    marker.write_text("foreign directory", encoding="utf-8")
+    original_init = (target / "__init__.py").read_bytes()
+    original_inode = target.stat().st_ino
+    preference = install_mod._profile_links_preference_path(tmp_path)
+    original_preference = preference.read_bytes()
+
+    def fail_preference_write(*args, **kwargs):
+        raise OSError("preference write failed")
+
+    monkeypatch.setattr(install_mod, "_write_profile_links_preference", fail_preference_write)
+
+    with pytest.raises(OSError, match="preference write failed"):
+        install_plugin(
+            hermes_home_path=tmp_path,
+            force=True,
+            mode="wrapper",
+            python=sys.executable,
+            link_profiles=False,
+        )
+
+    assert target.is_dir() and not target.is_symlink()
+    assert target.stat().st_ino == original_inode
+    assert (target / "__init__.py").read_bytes() == original_init
+    assert selected_link.is_symlink() and selected_link.resolve() == target.resolve()
+    assert foreign_link.is_symlink() and foreign_link.resolve() == foreign_target.resolve()
+    assert marker.read_text(encoding="utf-8") == "foreign directory"
+    assert preference.read_bytes() == original_preference
+
+
 def test_force_wrapper_refresh_replaces_wrapper_and_keeps_selected_profile_link(tmp_path):
     _skip_on_windows()
     profile = _make_profile(tmp_path, "alice", "mnemosyne")
@@ -298,6 +1140,8 @@ def test_failed_wrapper_swap_restores_wrapper_and_profile_link(tmp_path, monkeyp
     target = install_plugin(hermes_home_path=tmp_path, mode="wrapper", python=sys.executable)
     profile_link = profile / "plugins" / "mnemosyne"
     original_init = (target / "__init__.py").read_bytes()
+    preference = install_mod._profile_links_preference_path(tmp_path)
+    original_preference = preference.read_bytes()
     original_replace = Path.replace
 
     def fail_staged_swap(self, destination):
@@ -313,12 +1157,15 @@ def test_failed_wrapper_swap_restores_wrapper_and_profile_link(tmp_path, monkeyp
             force=True,
             mode="wrapper",
             python=sys.executable,
+            link_profiles=False,
         )
 
     assert target.is_dir() and not target.is_symlink()
     assert (target / "__init__.py").read_bytes() == original_init
     assert profile_link.is_symlink()
     assert profile_link.resolve() == target.resolve()
+    assert preference.read_bytes() == original_preference
+    assert install_mod.profile_links_enabled(hermes_home_path=tmp_path) is True
 
 
 def test_wrapper_preflight_and_bootstrap_support_real_pep660_editable_install(tmp_path):
@@ -336,6 +1183,12 @@ def test_wrapper_preflight_and_bootstrap_support_real_pep660_editable_install(tm
 
     site_packages = install_mod._site_packages_for_python(python)
     assert not (site_packages / "mnemosyne_hermes").exists()
+    # The wrapper's selected interpreter must contain both the editable Hermes
+    # package and the operational Mnemosyne core. Model the latter with a
+    # second editable-style .pth entry, without downloading dependencies.
+    (site_packages / "mnemosyne-memory.pth").write_text(
+        f"{project.parent.parent}\n", encoding="utf-8"
+    )
     assert install_mod._check_wrapper_import(site_packages, python) == (True, None, False)
 
     wrapper = tmp_path / "hermes-home" / "plugins" / "mnemosyne"

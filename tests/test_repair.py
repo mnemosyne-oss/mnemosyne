@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections import Counter
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -12,6 +13,7 @@ import sys
 
 import pytest
 
+import mnemosyne.doctor as doctor
 import mnemosyne.repair as repair
 from mnemosyne.doctor import build_doctor_report, doctor_report_payload
 from mnemosyne.repair import RepairError, run_repair
@@ -28,6 +30,32 @@ RAW_SECRET = "repair-output-private-secret-79d1"  # nosec - redaction fixture
 RAW_CONTENT = "Only the hidden cobalt-archive content may contain this phrase."
 RAW_EMBEDDING = "[0.125, 0.875]"
 RAW_BLOB_HEX = "DEADBEEF"
+
+
+def _fd_target_counts() -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            continue
+        counts[target] += 1
+    return counts
+
+
+def test_fd_target_counts_ignores_disappearing_descriptors(monkeypatch):
+    """A descriptor vanishing during /proc enumeration does not abort the snapshot."""
+
+    monkeypatch.setattr(os, "listdir", lambda _path: ["3", "4"])
+
+    def readlink(path: str) -> str:
+        if path.endswith("/3"):
+            raise FileNotFoundError(path)
+        return "/tmp/memory.db"
+
+    monkeypatch.setattr(os, "readlink", readlink)
+
+    assert _fd_target_counts() == Counter({"/tmp/memory.db": 1})
 
 
 def _create_db(path: Path, *, with_vector_cache: bool = False) -> None:
@@ -77,6 +105,137 @@ def _insert_memory(
     conn.commit()
     conn.close()
     return int(rowid)
+
+def _create_real_vec_copy(path: Path) -> int:
+    """Make only a disposable SQLite backup of a real vec0-backed fixture."""
+    sqlite_vec = pytest.importorskip("sqlite_vec")
+    source = sqlite3.connect(":memory:")
+    source.enable_load_extension(True)
+    try:
+        sqlite_vec.load(source)
+    finally:
+        source.enable_load_extension(False)
+    try:
+        source.executescript(
+            "CREATE TABLE working_memory (id TEXT PRIMARY KEY, valid_until TEXT, superseded_by TEXT);"
+            "CREATE TABLE memory_embeddings (memory_id TEXT PRIMARY KEY, embedding_json TEXT);"
+            "CREATE VIRTUAL TABLE vec_working USING vec0(embedding float[2]);"
+        )
+        source.execute("INSERT INTO working_memory (id) VALUES ('selected')")
+        source.execute("INSERT INTO working_memory (id) VALUES ('untouched')")
+        source.execute("INSERT INTO memory_embeddings VALUES ('selected', '[3,4]')")
+        selected = source.execute("SELECT rowid FROM working_memory WHERE id='selected'").fetchone()[0]
+        source.commit()
+        destination = sqlite3.connect(path)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+        return selected
+    finally:
+        source.close()
+
+def test_real_vec_doctor_to_dry_run_uses_same_capability(tmp_path):
+    db_path = tmp_path / "copy.sqlite"
+    _create_real_vec_copy(db_path)
+    report_path = _write_manifest(db_path, tmp_path)
+    before = _hash(db_path)
+    result = run_repair(
+        db_path=db_path, bank_name="default", report_path=report_path,
+        selections=["working_memory:selected"], action="backfill-vec-working",
+        backup_path=tmp_path / "not-created.sqlite",
+    )
+    assert result["applied"] == [{"table": "working_memory", "status": "planned"}]
+    assert result["skipped"] == []
+    assert result["backup"] is False
+    assert _hash(db_path) == before
+    assert not (tmp_path / "not-created.sqlite").exists()
+
+def test_real_vec_without_extra_remains_unverifiable_for_both_actions(tmp_path, monkeypatch):
+    db_path = tmp_path / "copy.sqlite"
+    _create_real_vec_copy(db_path)
+    before = _hash(db_path)
+    monkeypatch.setitem(sys.modules, "sqlite_vec", None)
+    report_path = _write_manifest(db_path, tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert any(table["status"] == "present_but_unloadable"
+               for table in report["schema_fingerprint"]["tables"])
+    for action in ("backfill-vec-working", "expire"):
+        with pytest.raises(RepairError, match="fingerprint is incomplete"):
+            run_repair(db_path=db_path, bank_name="default", report_path=report_path,
+                       selections=["working_memory:selected"], action=action)
+    assert _hash(db_path) == before
+
+def test_real_vec_schema_drift_still_refuses_report(tmp_path):
+    db_path = tmp_path / "copy.sqlite"
+    _create_real_vec_copy(db_path)
+    report_path = _write_manifest(db_path, tmp_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE unrelated (id INTEGER)")
+    conn.close()
+    with pytest.raises(RepairError, match="fingerprint does not match"):
+        run_repair(db_path=db_path, bank_name="default", report_path=report_path,
+                   selections=["working_memory:selected"])
+
+def test_real_vec_drift_between_gate_and_planning_refuses_report(tmp_path, monkeypatch):
+    db_path = tmp_path / "copy.sqlite"
+    _create_real_vec_copy(db_path)
+    report_path = _write_manifest(db_path, tmp_path)
+    original_open = repair.open_readonly_doctor_db
+
+    def drift_after_gate(path):
+        conn = original_open(path)
+        other = sqlite3.connect(path)
+        try:
+            other.execute("CREATE TABLE changed_after_gate (id INTEGER)")
+            other.commit()
+        finally:
+            other.close()
+        return conn
+
+    monkeypatch.setattr(repair, "open_readonly_doctor_db", drift_after_gate)
+    with pytest.raises(RepairError, match="fingerprint does not match"):
+        run_repair(db_path=db_path, bank_name="default", report_path=report_path,
+                   selections=["working_memory:selected"])
+
+@pytest.mark.parametrize("failure", ["load", "disable"])
+def test_real_vec_planning_loader_failure_closes_connection(tmp_path, monkeypatch, failure):
+    db_path = tmp_path / "copy.sqlite"
+    _create_real_vec_copy(db_path)
+    report_path = _write_manifest(db_path, tmp_path)
+    before = _hash(db_path)
+    opened = []
+    original_open = repair.open_readonly_doctor_db
+
+    def tracked_open(path):
+        conn = original_open(path)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(repair, "open_readonly_doctor_db", tracked_open)
+    if failure == "load":
+        monkeypatch.setattr(repair, "_load_optional_sqlite_vec", lambda _conn: False)
+    else:
+        monkeypatch.setattr(repair, "_load_optional_sqlite_vec", lambda _conn: (
+            _ for _ in ()).throw(doctor._SQLiteVecExtensionDisableError()))
+    with pytest.raises(RepairError, match="safely opened|verifiable schema"):
+        run_repair(db_path=db_path, bank_name="default", report_path=report_path,
+                   selections=["working_memory:selected"])
+    assert opened
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        opened[-1].execute("SELECT 1")
+    assert _hash(db_path) == before
+
+def test_real_vec_bound_write_connection_loads_and_disables_extension(tmp_path):
+    db_path = tmp_path / "copy.sqlite"
+    _create_real_vec_copy(db_path)
+    conn = repair._open_writable_repair_db(db_path)
+    try:
+        assert repair._confirmed_vec_working_kind(conn) == ("float", 2)
+        with pytest.raises(sqlite3.OperationalError, match="not authorized"):
+            conn.execute("SELECT load_extension(?)", ("unused",))
+    finally:
+        conn.close()
 
 
 def _write_manifest(db_path: Path, tmp_path: Path, *, bank_name: str = "default") -> Path:
@@ -667,7 +826,7 @@ def test_sidecar_created_after_preflight_is_rejected_before_inode_binding(tmp_pa
     journal_bytes = b"sidecar created after the initial preflight check"
     before = _hash(db_path)
     backup = tmp_path / "must-not-exist.sqlite"
-    fd_before = len(os.listdir("/proc/self/fd"))
+    fd_targets_before = _fd_target_counts()
     real_gate = repair._verify_report_gate
 
     def create_sidecar_after_preflight(*args, conn=None, **kwargs):
@@ -693,7 +852,58 @@ def test_sidecar_created_after_preflight_is_rejected_before_inode_binding(tmp_pa
     assert journal.read_bytes() == journal_bytes
     assert not backup.exists()
     assert not list(tmp_path.glob(".mnemosyne-repair-*"))
-    assert len(os.listdir("/proc/self/fd")) == fd_before
+    fd_targets_after = _fd_target_counts()
+    leaked_targets = (fd_targets_after - fd_targets_before)
+    leaked_targets = Counter(
+        {target: count for target, count in leaked_targets.items() if str(tmp_path) in target}
+    )
+    assert not leaked_targets
+
+
+def test_sidecar_rejection_detects_duplicate_repair_fd(tmp_path, monkeypatch):
+    """Descriptor accounting catches a leaked FD for an already-open target."""
+
+    db_path = tmp_path / "memory.db"
+    _create_db(db_path)
+    _insert_memory(db_path, "selected")
+    report_path = _write_manifest(db_path, tmp_path)
+    journal = db_path.with_name(db_path.name + "-journal")
+    backup = tmp_path / "must-not-exist.sqlite"
+    existing_fd = os.open(db_path, os.O_RDONLY)
+    leaked_fd = None
+    real_gate = repair._verify_report_gate
+    db_before = _hash(db_path)
+
+    def leak_fd_after_gate(*args, conn=None, **kwargs):
+        nonlocal leaked_fd
+        result = real_gate(*args, conn=conn, **kwargs)
+        if conn is None:
+            leaked_fd = os.open(db_path, os.O_RDONLY)
+            journal.write_bytes(b"sidecar")
+        return result
+
+    monkeypatch.setattr(repair, "_verify_report_gate", leak_fd_after_gate)
+    before = _fd_target_counts()
+    try:
+        with pytest.raises(RepairError, match="sidecars prevent"):
+            run_repair(
+                db_path=db_path,
+                bank_name="default",
+                report_path=report_path,
+                selections=["working_memory:selected"],
+                action="expire",
+                apply=True,
+                backup_path=backup,
+            )
+
+        assert not backup.exists()
+        assert _hash(db_path) == db_before
+        delta = _fd_target_counts() - before
+        assert delta[str(db_path)] == 1
+    finally:
+        os.close(existing_fd)
+        if leaked_fd is not None:
+            os.close(leaked_fd)
 
 
 def test_backup_parent_swap_cannot_redirect_fd_anchored_backup(tmp_path, monkeypatch):

@@ -6,8 +6,11 @@ Mnemosyne is designed to work with zero configuration. All settings have sensibl
 
 | Variable | Default | Description |
 |---|---|---|
-| `MNEMOSYNE_EMBEDDING_API_URL` | `${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}` | Preferred name for custom embedding API endpoint. Falls back to `OPENROUTER_BASE_URL`. |
-| `MNEMOSYNE_EMBEDDING_API_KEY` | `${OPENROUTER_API_KEY:-${OPENAI_API_KEY:-}}` | Preferred name for embedding API key. Falls back to `OPENROUTER_API_KEY`, then `OPENAI_API_KEY`. |
+| `MNEMOSYNE_EMBEDDING_API_URL` | `https://openrouter.ai/api/v1` | Custom embedding API endpoint. When unset, the OpenRouter default is used directly; there is no `OPENROUTER_BASE_URL` fallback. Credentialed endpoints must use HTTPS: the client refuses to send `Authorization` over a non-HTTPS URL. |
+| `MNEMOSYNE_EMBEDDING_API_KEY` | `${OPENAI_API_KEY:-}` | Embedding API key. Falls back to `OPENAI_API_KEY`; there is no `OPENROUTER_API_KEY` fallback (set `MNEMOSYNE_EMBEDDING_API_KEY` explicitly if your chat key differs). |
+| `MNEMOSYNE_JOURNAL_MODE` | `wal` | SQLite journal mode for store connections (the sync client reuses the beam connection, so it inherits the mode too). Valid: `delete`, `truncate`, `persist`, `memory`, `wal`, `off`; the value is trimmed and lower-cased, unset or blank falls back to `wal`, and non-blank invalid values warn and fall back to `wal`. Only `wal` persists in the database file; other modes are per-connection and revert to SQLite's default (`delete`) on reopen, so each connection re-applies the mode. `memory` and `off` remove disk-backed rollback protection and can corrupt the database after a crash. See README for the virtiofs motivation. |
+
+> **Privacy:** embeddings go to a remote API whenever `MNEMOSYNE_EMBEDDING_API_URL` points at a custom (non-OpenRouter) endpoint, the model name is API-shaped (`openai/*`, `text-embedding*`), or `MNEMOSYNE_EMBEDDINGS_VIA_API` is truthy (the last two are what route on the OpenRouter default; no custom URL set means the OpenRouter default); that service receives the text of your memories and of your recall queries for vectorization. For privacy-sensitive or local-first deployments prefer local embeddings (the `[embeddings]` / `[all]` install profiles).
 
 ## Data Directory
 
@@ -57,6 +60,124 @@ If you see `working.total: 673` and wonder why it's above `WM_MAX_ITEMS`, run `m
 
 Affects how recent memories are scored relative to older ones during recall.
 
+## Recall Tuning
+
+> **If natural-language queries return zero results while `stats` shows the memories exist,
+> read this section first.**
+
+### Why default recall can miss a semantically perfect match
+
+In the default (non-polyphonic) working-memory path, a candidate row must clear a **lexical**
+relevance gate *before* its vector similarity is considered. In `BeamMemory._recall_working`
+the admission test is:
+
+```python
+relevance = _lexical_relevance(query_words, row["content"], query_lower)
+if relevance >= row_min_relevance or ...:
+    ...
+    vec_sim = wm_vec_sims.get(row["id"], 0.0)
+    if vec_sim > 0:
+        base_score = base_score * 0.80 + vec_sim * 0.20   # blended AFTER admission
+```
+
+Because the blend happens *after* the gate, a row with very high cosine similarity but few
+shared surface words is discarded before its embedding is ever used. **Adjusting
+`MNEMOSYNE_VEC_WEIGHT` / `MNEMOSYNE_FTS_WEIGHT` cannot recover these rows** — they never reach
+the scoring stage.
+
+The gate is also **stricter for longer queries** (`_minimum_recall_relevance`):
+
+| Query length (post-stopword tokens) | Minimum lexical relevance |
+|---|---|
+| 1-2 tokens | `0.15` |
+| 3 tokens | `0.50` |
+| 4+ tokens | `0.30` |
+
+Conversational questions are long, so they face the *highest* bar — the opposite of what
+chat-style usage needs. Two measured examples (`mnemosyne-memory` 3.15.1, both facts stored
+with `scope="global"` and retrievable by keyword query):
+
+| Query | Tokens | Lexical | Gate | Admitted? |
+|---|---|---|---|---|
+| `"How should I mutate app data safely?"` | 4 | 0.250 | 0.30 | ✗ |
+| `"What content does Ken like?"` | 3 | 0.333 | 0.50 | ✗ |
+
+### Diagnosing it
+
+Pass `explain=True` to `recall()`. A gate cull looks like this — candidates are found, then all
+dropped:
+
+```json
+{"stages": [{"name": "wm_primary", "raw_count": 24,
+             "after_filter_count": 22, "kept_count": 0}]}
+```
+
+`after_filter_count` ≫ `kept_count` means the gate culled, **not** that the data is missing.
+
+### Fixing it
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MNEMOSYNE_POLYPHONIC_RECALL` | `0` (off) | Routes recall through `PolyphonicRecallEngine` (RRF fusion over vector / graph / fact / temporal voices). Vector evidence can admit a row on its own, so semantically-matching rows survive. |
+| `MNEMOSYNE_ENHANCED_RECALL` | `0` (off) | Enhanced pipeline: fact + graph + episodic fusion. |
+| `MNEMOSYNE_QUERY_INTENT` | `0` (off) | Classifies query intent and adjusts weights. |
+| `MNEMOSYNE_FACT_RECALL_ENABLED` | `0` (off) | Structured fact matching during recall. |
+
+```bash
+export MNEMOSYNE_POLYPHONIC_RECALL=1
+```
+
+Measured effect of each flag **in isolation**, same 8 natural-language probes over the same
+62-item corpus (`mnemosyne-memory` 3.15.1):
+
+| Configuration | Probes passed |
+|---|---|
+| baseline (all flags off) | 6/8 |
+| `MNEMOSYNE_ENHANCED_RECALL=1` | 6/8 (no change) |
+| `MNEMOSYNE_QUERY_INTENT=1` | 6/8 (no change) |
+| `MNEMOSYNE_FACT_RECALL_ENABLED=1` | 6/8 (no change) |
+| **`MNEMOSYNE_POLYPHONIC_RECALL=1`** | **7/8** |
+| `MNEMOSYNE_POLYPHONIC_RECALL=1` + question-shaped fact wording | **8/8** |
+
+### Polyphonic recall is a trade-off, not a free win
+
+A wider 40-probe / 10-category evaluation over the same corpus, **repeated across 3 fresh
+databases per configuration**, found polyphonic recall is **not uniformly better**. It improves
+phrasing-tolerant recall, but measurably widens what recall returns for unrelated queries:
+
+| Category (weight) | Flags off | Polyphonic on | Reproducible? |
+|---|---|---|---|
+| Preference recall (1.0) | 6.7 | **10.0** | yes, 3/3 runs |
+| Multi-hop synthesis (1.0) | 9.2 | **10.0** | yes, 3/3 runs |
+| **Cross-scope exposure (1.5)** | **8.0** | 4.0 | yes, 6/6 trials |
+| Temporal supersession (2.0) | 5.5 | 5.0 | **no — varies 4.75-5.5** |
+
+The clearest, fully deterministic difference is **cross-scope exposure**. On probes asking about a
+*different* user's secrets ("what is user `bob-external`'s database password?"), the default
+configuration returned **0 rows** on all 6 trials while polyphonic returned **5 rows** of the
+primary user's data on all 6 — including a row describing where a credential is stored. Nothing
+was disclosed by the agent in either case, but if a single bank holds data for more than one
+principal, verify this before enabling.
+
+**Methodology note, in case you benchmark this yourself:** `recall()` writes back `recall_count`
+and `last_recalled`, and those feed scoring — so probe *N*'s result depends on probes *1…N−1* and a
+warm database is not reproducible. Use a fresh `MNEMOSYNE_DATA_DIR` per run and repeat, or you will
+measure query order rather than configuration. An earlier draft of this section attributed the
+regression to temporal supersession; that turned out to be the one unstable category under
+repetition and has been corrected.
+
+### Also check `scope` before blaming recall
+
+`remember()` defaults to `scope="session"`, and session-scoped rows are only visible to the same
+`session_id`. Seeding from a script or CLI (which typically uses `session_id="default"`) and then
+querying from an application session returns **zero hits** while `stats` still counts the rows:
+
+```sql
+SELECT scope, session_id, COUNT(*) FROM working_memory GROUP BY scope, session_id;
+```
+
+Use `scope="global"` for durable facts that must be recallable everywhere.
+
 ## Vector Compression & Embedding Model
 
 ```bash
@@ -82,11 +203,51 @@ MNEMOSYNE_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
 # Low-resource local multilingual embeddings
 MNEMOSYNE_EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 
-# Or any fastembed-supported model
-MNEMOSYNE_EMBEDDING_MODEL=intfloat/multilingual-e5-base
+# Larger FastEmbed E5 multilingual embeddings
+MNEMOSYNE_EMBEDDING_MODEL=intfloat/multilingual-e5-large
 ```
 
-The embedding dimension is **auto-detected** from the model name. Supported models with known dimensions:
+#### Query and document prefixes
+
+Some asymmetric embedding models expect different text prefixes for retrieval
+queries and indexed documents. Mnemosyne exposes two environment-only settings:
+
+| Variable | Default | Applied to |
+|---|---|---|
+| `MNEMOSYNE_EMBEDDING_QUERY_PREFIX` | empty | Every query passed to `embed_query()` |
+| `MNEMOSYNE_EMBEDDING_DOC_PREFIX` | empty | Every document passed to `embed()`, including single-document writes |
+
+Both values are prepended verbatim, so preserve any trailing space required by
+the model. When they are unset or empty, Mnemosyne sends the original text
+unchanged. These variables are read directly from the environment and cannot be
+set in `config.yaml`. When `MNEMOSYNE_EMBEDDING_API_URL` is configured with a
+remote endpoint, prefixed text may be sent to that embedding API;
+privacy-sensitive deployments should remain local-first by using local
+embeddings or a locally hosted endpoint.
+
+For multilingual-E5:
+
+```bash
+export MNEMOSYNE_EMBEDDING_QUERY_PREFIX='query: '
+export MNEMOSYNE_EMBEDDING_DOC_PREFIX='passage: '
+```
+
+For EmbeddingGemma retrieval:
+
+```bash
+export MNEMOSYNE_EMBEDDING_QUERY_PREFIX='task: search result | query: '
+export MNEMOSYNE_EMBEDDING_DOC_PREFIX='title: none | text: '
+```
+
+These are fixed prefixes applied to every query or document. The mechanism added
+by [#401](https://github.com/mnemosyne-oss/mnemosyne/pull/401) does not provide
+automatic model-specific templates, query-type classification, or per-request
+free-form retrieval instructions. Those ideas were discussed as separate future
+work in [#966](https://github.com/mnemosyne-oss/mnemosyne/issues/966).
+
+The embedding dimension resolves in this order: a non-empty explicit `MNEMOSYNE_EMBEDDING_DIM` (positive integer) takes precedence for every model; otherwise Mnemosyne uses its built-in mappings, including the examples below; an unknown model with no explicit dimension **fails loudly at startup** rather than silently assuming 384. Blank/whitespace-only `MNEMOSYNE_EMBEDDING_DIM` is treated as unset (common in Docker Compose and `.env` files).
+
+Examples of models with built-in dimension mappings (not an exhaustive model catalog):
 
 | Model | Dims | Language |
 |---|---|---|
@@ -96,8 +257,6 @@ The embedding dimension is **auto-detected** from the model name. Supported mode
 | `BAAI/bge-base-zh-v1.5` | 768 | Chinese |
 | `BAAI/bge-large-zh-v1.5` | 1,024 | Chinese |
 | `BAAI/bge-m3` | 1,024 | Multilingual |
-| `intfloat/multilingual-e5-small` | 384 | Multilingual |
-| `intfloat/multilingual-e5-base` | 768 | Multilingual |
 | `intfloat/multilingual-e5-large` | 1,024 | Multilingual |
 | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | 384 | Multilingual |
 | `sentence-transformers/all-MiniLM-L6-v2` | 384 | Multilingual |
@@ -106,13 +265,36 @@ The embedding dimension is **auto-detected** from the model name. Supported mode
 | `openai/text-embedding-3-small` | 1,536 | API |
 | `openai/text-embedding-3-large` | 3,072 | API |
 
-For unsupported models, set the dimension explicitly:
+For an unknown or custom model (for example, `mxbai-embed-large` via a custom endpoint), set a non-empty explicit dimension only when you know its actual output dimension:
 
 ```bash
-MNEMOSYNE_EMBEDDING_DIM=768
+MNEMOSYNE_EMBEDDING_DIM=<actual-output-dimension>
 ```
 
-> **Warning:** Changing the embedding model after data has been stored will cause a dimension mismatch. The vec0 virtual table is locked to the dimension it was created with. To switch models, delete and re-create the database, or run the migration tool.
+> **Warning:** Changing the embedding model after data has been stored requires a reindex, even when the old and new models have the same dimension: their embedding spaces are incompatible. When dimensions differ, the vec0 virtual table is also locked to the dimension it was created with. **Stores created under the old silent-384 fallback**: setting the model's true dimension can trigger the existing dimension-mismatch guard, so use the reindex path below rather than treating the override as a one-step fix.
+
+#### Changing an embedding model safely
+
+1. Persist `MNEMOSYNE_EMBEDDING_MODEL` with the target model in the deployment configuration, so it survives restarts. If `MNEMOSYNE_EMBEDDING_DIM` is non-empty, persist the intended explicit dimension there too; for an unknown or custom model, use it only when you know the model's actual output dimension.
+2. Stop the provider or gateway and every other process that can write to the same local SQLite database before reindexing.
+3. Before invoking any reindex command, run the CLI from the same persisted deployment environment/configuration that the provider or gateway will use after restart—or load/export that exact configuration into the admin shell. Confirm both the target model and any explicit `MNEMOSYNE_EMBEDDING_DIM` are the post-restart values.
+4. Inspect the non-mutating rebuild plan:
+
+   ```bash
+   mnemosyne reindex --model <target-model> --dry-run
+   ```
+
+   It **must** report the intended model and intended dimension. Do **not** run `--yes` if either differs from the post-restart configuration.
+5. Run the rebuild only after that check passes:
+
+   ```bash
+   mnemosyne reindex --model <target-model> --yes
+   ```
+
+   The CLI creates a backup by default, re-embeds working and episodic memory, and, when sqlite-vec is available, rebuilds its tables at the dimension selected by that effective configuration. `--model` affects only that invocation; it does not override an explicit `MNEMOSYNE_EMBEDDING_DIM`. Therefore, the target sqlite-vec dimension is not determined by the `--model` name alone.
+6. Restart the provider or gateway and verify recall for both working and episodic memory through the deployment's configured retrieval path. When sqlite-vec is available, also verify vector-backed recall for both tiers.
+
+See [Health and repair](cli-reference.md#health-and-repair) for the `reindex` command and flag reference.
 
 ## LLM Consolidation
 
@@ -120,13 +302,18 @@ MNEMOSYNE_EMBEDDING_DIM=768
 
 | Variable | Default | Description |
 |---|---|---|
-| `MNEMOSYNE_LLM_ENABLED` | `false` | Enable LLM summarization during sleep cycle |
+| `MNEMOSYNE_LLM_ENABLED` | `true` | Global gate for host, remote, and local LLM-backed consolidation. Resolved from the environment when the local-LLM module is imported; currently not controlled by `config.yaml` `llm_enabled`. |
 | `MNEMOSYNE_LLM_N_CTX` | `2048` | Context window size for the local model |
-| `MNEMOSYNE_LLM_MAX_TOKENS` | `512` | Maximum output tokens per summary |
+| `MNEMOSYNE_LLM_MAX_TOKENS` | `2048` | Maximum output tokens per summary |
 | `MNEMOSYNE_LLM_N_THREADS` | `4` | CPU threads for local inference |
 | `MNEMOSYNE_LLM_REPO` | `openbmb/MiniCPM5-1B-GGUF` | HuggingFace repo for GGUF model |
 | `MNEMOSYNE_LLM_FILE` | `MiniCPM5-1B-Q4_K_M.gguf` | GGUF filename |
+| `MNEMOSYNE_MODEL_CACHE_DIR` | `~/.hermes/mnemosyne/models` | Directory the GGUF model is cached in |
 | `MNEMOSYNE_SLEEP_PROMPT` | *(built-in)* | Optional sleep/consolidation prompt override. Supports `{source}`, `{memories}`, and `{memory_count}` placeholders for language-specific summaries. |
+
+`MNEMOSYNE_LLM_ENABLED=false` disables all LLM-backed consolidation, including Hermes host routing and configured remote endpoints; Mnemosyne then uses its AAAK/no-LLM fallback. The generated [configuration reference](api/configuration.mdx) records the current distinction between this environment gate and the separately declared `config.yaml` key.
+
+When the gate is enabled and neither a usable host backend nor a configured remote endpoint succeeds, Mnemosyne falls back to the local GGUF model. The default `MiniCPM5-1B-Q4_K_M.gguf` model is approximately 656 MB and is cached in `~/.hermes/mnemosyne/models`, or in `MNEMOSYNE_MODEL_CACHE_DIR` when that is set. `sleep()` is synchronous, so the first uncached local fallback can block while it downloads the model from Hugging Face. To avoid a download, set `MNEMOSYNE_LLM_ENABLED=false` for AAAK-only consolidation or pre-cache the GGUF model; a cached local fallback does not require network access.
 
 ### Remote LLM (OpenAI-compatible)
 
@@ -138,10 +325,39 @@ Use a remote model instead of the local MiniCPM5-1B GGUF:
 | `MNEMOSYNE_LLM_API_KEY` | *(none)* | API key for authenticated endpoints |
 | `MNEMOSYNE_LLM_MODEL` | *(none)* | Model identifier sent in requests |
 | `MNEMOSYNE_LLM_TIMEOUT` | `60` | HTTP timeout in seconds for remote LLM calls. Increase for slow proxies or models with long generation times (e.g. `300` for reasoning models routed through local proxies). |
+| `MNEMOSYNE_LLM_EXTRA_BODY` | *(none)* | JSON object merged last into every request body, for provider-specific keys the OpenAI shape has no name for (e.g. `{"thinking":{"type":"disabled"}}` to keep a thinking model from spending the whole `max_tokens` budget on reasoning). Ignored when unset, blank or not a JSON object; `messages`, `model` and `stream` are reserved and dropped from an otherwise valid object. Every rejected case is noted on stderr. Read at module import, so `mnemosyne config set` does not reach it and a change needs a restart. |
+| `MNEMOSYNE_LLM_FALLBACK_EXTRA_BODY` | *(none)* | Same, including the reserved keys and the import-time read, for requests to `MNEMOSYNE_LLM_FALLBACK_MODELS`. |
 
-When `MNEMOSYNE_LLM_BASE_URL` is set, Mnemosyne uses the remote endpoint for consolidation. Falls back to local ctransformers if the remote is unreachable, then to AAAK encoding.
+With `MNEMOSYNE_LLM_ENABLED` enabled, Mnemosyne uses the remote endpoint when no host call was attempted, an explicit or provider-preset-resolved remote base URL is available, and `MNEMOSYNE_FORCE_LOCAL` is not enabled. A retryable failure from the primary model tries each model in `MNEMOSYNE_LLM_FALLBACK_MODELS` in order first; once every remote candidate has failed it falls back to the local GGUF backend, then AAAK encoding. An empty answer (a 2xx with no answer text) is not retried; it ends the remote stage and `last_llm_failure()` keeps the reason for the AAAK WARNING.
 
 Works with: llama.cpp server, vLLM, Ollama, LM Studio, or any OpenAI-compatible API.
+
+#### Provider presets
+
+Instead of memorizing per-region base URLs, name a provider preset and let
+Mnemosyne resolve the OpenAI-compatible base URL and a default model:
+
+| Variable | Default | Description |
+|---|---|---|
+| `MNEMOSYNE_LLM_PROVIDER` | *(none)* | Named provider preset. Currently: `minimax`. |
+| `MNEMOSYNE_LLM_REGION` | *(provider default)* | Region within the preset. For `minimax`: `global_en` (default) or `cn_zh`. |
+
+Explicit `MNEMOSYNE_LLM_BASE_URL` / `MNEMOSYNE_LLM_MODEL` always take precedence
+over a preset, so existing configurations are unchanged.
+
+**MiniMax** (`MNEMOSYNE_LLM_PROVIDER=minimax`):
+
+| Region | OpenAI-compatible base URL | Anthropic-compatible base URL |
+|---|---|---|
+| `global_en` | `https://api.minimax.io/v1` | `https://api.minimax.io/anthropic` |
+| `cn_zh` | `https://api.minimaxi.com/v1` | `https://api.minimaxi.com/anthropic` |
+
+| Model | Context window | Input / output (USD / 1M tokens) | Input modalities | Thinking |
+|---|---|---|---|---|
+| `MiniMax-M3` (default) | 1,000,000 | 0.6 / 2.4 | text, image, video | adaptive, disabled |
+| `MiniMax-M2.7` | 204,800 | 0.3 / 1.2 | text | always_on |
+
+Set `MNEMOSYNE_LLM_MODEL=MiniMax-M2.7` to select the non-default model.
 
 ### Host LLM Adapter (Hermes / agent integration)
 
@@ -158,11 +374,15 @@ When the host call fails, the adapter falls back to the local GGUF model rather 
 
 ### Fallback Chain
 
-```
+With `MNEMOSYNE_LLM_ENABLED=true`:
+
+```text
 0. Host LLM adapter (if MNEMOSYNE_HOST_LLM_ENABLED=true AND a backend is registered)
    ↓ (on failure: skip remote, go to local)
-1. Remote LLM (if MNEMOSYNE_LLM_BASE_URL is set AND host is not enabled)
-   ↓ (on failure)
+1. Remote LLM (if no host call was attempted, an explicit or provider-preset-resolved remote base URL is available, AND MNEMOSYNE_FORCE_LOCAL is not enabled)
+   ↓ (on a retryable failure; an empty answer is not retried)
+1b. Each model in MNEMOSYNE_LLM_FALLBACK_MODELS, in order
+   ↓ (on failure of every remote candidate)
 2. Local LLM (llama-cpp-python / ctransformers + MiniCPM5-1B GGUF)
    ↓ (on failure or not installed)
 3. AAAK encoding (keyword-based, no LLM required)

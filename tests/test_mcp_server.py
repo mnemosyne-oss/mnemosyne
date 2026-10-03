@@ -13,10 +13,12 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 import mnemosyne.mcp_tools as mcp_tools
+from mnemosyne.core.beam import BeamMemory
 
 # Test tool schemas
 from mnemosyne.mcp_tools import (
     TOOLS, get_tool_definitions, handle_tool_call, _create_instance,
+    _TOOL_HANDLERS,
 )
 
 
@@ -30,6 +32,11 @@ class TestToolSchemas:
         assert len(names) >= 25
         assert "mnemosyne_remember_canonical" in names
         assert "mnemosyne_recall_canonical" in names
+        assert "mnemosyne_forget_canonical" in names
+        forget_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_forget_canonical")
+        assert forget_tool["input_schema"]["required"] == ["category", "name"]
+        for field in ("category", "name"):
+            assert forget_tool["input_schema"]["properties"][field]["type"] == "string"
         assert "mnemosyne_remember" in names
         assert "mnemosyne_batch" in names
         assert "mnemosyne_recall" in names
@@ -103,6 +110,16 @@ class TestToolSchemas:
         assert "mnemosyne_invalidate" in names
         assert "mnemosyne_export" in names
         assert "mnemosyne_import" in names
+
+    def test_invalidate_schema_documents_scope_safe_failure(self):
+        """Invalidate must not reveal whether an out-of-scope ID exists."""
+        invalidate_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_invalidate")
+        assert invalidate_tool["description"] == (
+            "Mark a memory as expired or superseded. Provide memory_id from recall results. "
+            "Optionally provide a replacement_id that must resolve to a working-memory or episodic-memory "
+            "record that is accessible in the current session or global scope to chain old to new. "
+            "An unknown or out-of-scope target or replacement returns status: memory_not_found."
+        )
 
     def test_batch_schema_has_operations(self):
         batch_tool = next(t for t in TOOLS if t["name"] == "mnemosyne_batch")
@@ -182,6 +199,72 @@ class TestToolHandlers:
         assert row is not None
         assert row[0] == "tool"
 
+    def test_forget_canonical_retires_only_the_current_owner_slot(self, tmp_path, monkeypatch):
+        """MCP canonical retirement preserves history and owner isolation."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("MNEMOSYNE_DEFAULT_OWNER", "owner-a")
+        args = {"category": "identity", "name": "name", "body": "Owner A"}
+
+        remembered = handle_tool_call("mnemosyne_remember_canonical", args)
+        assert remembered["status"] == "created"
+        monkeypatch.setenv("MNEMOSYNE_DEFAULT_OWNER", "owner-b")
+        assert handle_tool_call("mnemosyne_remember_canonical", {
+            **args, "body": "Owner B",
+        })["status"] == "created"
+
+        monkeypatch.setenv("MNEMOSYNE_DEFAULT_OWNER", "owner-a")
+        retired = handle_tool_call("mnemosyne_forget_canonical", {
+            "category": "identity", "name": "name",
+        })
+        assert retired == {
+            "retired": True, "owner_id": "owner-a", "category": "identity",
+            "name": "name", "store": "canonical",
+        }
+        assert handle_tool_call("mnemosyne_recall_canonical", {
+            "category": "identity", "name": "name",
+        })["found"] is False
+        history = handle_tool_call("mnemosyne_recall_canonical", {
+            "category": "identity", "name": "name", "include_history": True,
+        })
+        assert history["results_count"] == 1
+        assert history["results"][0]["body"] == "Owner A"
+        assert history["results"][0]["valid_until"] is not None
+
+        assert handle_tool_call("mnemosyne_forget_canonical", {
+            "category": "identity", "name": "name",
+        })["retired"] is False
+
+        monkeypatch.setenv("MNEMOSYNE_DEFAULT_OWNER", "owner-b")
+        assert handle_tool_call("mnemosyne_recall_canonical", {
+            "category": "identity", "name": "name",
+        })["found"] is True
+        assert handle_tool_call("mnemosyne_forget_canonical", {
+            "category": "identity", "name": "name",
+        })["retired"] is True
+
+    def test_forget_canonical_requires_category_and_name(self):
+        for arguments in ({}, {"category": "   ", "name": "name"},
+                          {"category": "identity", "name": "\t"},
+                          {"category": 1, "name": "name"},
+                          {"category": "identity", "name": False}):
+            assert handle_tool_call("mnemosyne_forget_canonical", arguments) == {
+                "error": "category and name are required",
+            }
+
+    def test_forget_canonical_uses_mcp_bank_default(self, monkeypatch, mock_mnemosyne):
+        """Canonical retirement uses the selected MCP bank when no bank is passed."""
+        monkeypatch.setenv("MNEMOSYNE_MCP_BANK", "team")
+        canonical = MagicMock()
+        canonical.forget.return_value = True
+        mock_mnemosyne.beam.canonical = canonical
+        with patch("mnemosyne.mcp_tools._create_instance", return_value=mock_mnemosyne) as create:
+            result = handle_tool_call("mnemosyne_forget_canonical", {
+                "category": "identity", "name": "name",
+            })
+        create.assert_called_once_with(bank="team")
+        assert result["retired"] is True
+
     def test_handle_remember_uses_mcp_bank_env_default(self, mock_mnemosyne, monkeypatch):
         """MCP server bank default applies when tool call omits bank."""
         monkeypatch.setenv("MNEMOSYNE_MCP_BANK", "work")
@@ -216,6 +299,146 @@ class TestToolHandlers:
         assert result["status"] == "stored"
         assert result["bank"] == "personal"
         assert create_instance.call_args.kwargs["bank"] == "personal"
+
+    def test_handle_invalidate_preserves_session_scope_and_reports_not_found(self, tmp_path, monkeypatch):
+        """MCP invalidate must not report success for a foreign session row."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        foreign = _create_instance(session_id="foreign-session", bank="default")
+        foreign_id = foreign.beam.remember("foreign session memory", scope="session")
+
+        mcp = _create_instance(bank="default")
+        same_session_id = mcp.beam.remember("mcp session memory", scope="session")
+        global_id = mcp.beam.remember("global memory", scope="global")
+
+        wrapper_events = []
+        monkeypatch.setattr(
+            mcp_tools.Mnemosyne,
+            "_emit_wrapper",
+            lambda _self, event_type, memory_id, **kwargs: wrapper_events.append(
+                (event_type, memory_id, kwargs)
+            ),
+        )
+        failed = handle_tool_call("mnemosyne_invalidate", {
+            "memory_id": foreign_id,
+            "replacement_id": same_session_id,
+        })
+        assert failed["status"] == "memory_not_found"
+        assert failed["memory_id"] == foreign_id
+        assert wrapper_events == []
+        foreign_row = mcp.beam.conn.execute(
+            "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?", (foreign_id,)
+        ).fetchone()
+        assert tuple(foreign_row) == (None, None)
+
+        assert handle_tool_call("mnemosyne_invalidate", {"memory_id": same_session_id}) == {
+            "status": "invalidated",
+            "memory_id": same_session_id,
+        }
+        assert handle_tool_call("mnemosyne_invalidate", {"memory_id": global_id}) == {
+            "status": "invalidated",
+            "memory_id": global_id,
+        }
+        successful_rows = mcp.beam.conn.execute(
+            "SELECT valid_until FROM working_memory WHERE id IN (?, ?)",
+            (same_session_id, global_id),
+        ).fetchall()
+        assert len(successful_rows) == 2
+        assert all(row[0] for row in successful_rows)
+
+    def test_handle_invalidate_validates_replacement_in_current_scope(self, tmp_path, monkeypatch):
+        """MCP replacement links must be resolvable before invalidating a target."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        mcp = _create_instance(bank="default")
+        target_id = mcp.beam.remember("replacement validation target", scope="session")
+        replacement_id = mcp.beam.remember("authorized replacement", scope="session")
+        global_target_id = mcp.beam.remember("global replacement target", scope="global")
+        global_replacement_id = mcp.beam.remember("global replacement", scope="global")
+
+        foreign = _create_instance(session_id="foreign-session", bank="default")
+        foreign_replacement_id = foreign.beam.remember(
+            "foreign replacement", scope="session"
+        )
+
+        wrapper_events = []
+        monkeypatch.setattr(
+            mcp_tools.Mnemosyne,
+            "_emit_wrapper",
+            lambda _self, event_type, memory_id, **kwargs: wrapper_events.append(
+                (event_type, memory_id, kwargs)
+            ),
+        )
+        cache_invalidations = []
+        monkeypatch.setattr(
+            BeamMemory,
+            "_invalidate_query_cache",
+            lambda self: cache_invalidations.append(self),
+        )
+
+        assert handle_tool_call("mnemosyne_invalidate", {
+            "memory_id": target_id,
+            "replacement_id": "unknown-replacement",
+        }) == {"status": "memory_not_found", "memory_id": target_id}
+        target_row = mcp.beam.conn.execute(
+            "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?", (target_id,)
+        ).fetchone()
+        assert tuple(target_row) == (None, None)
+        assert wrapper_events == []
+        assert cache_invalidations == []
+
+        assert handle_tool_call("mnemosyne_invalidate", {
+            "memory_id": target_id,
+            "replacement_id": foreign_replacement_id,
+        }) == {"status": "memory_not_found", "memory_id": target_id}
+        target_row = mcp.beam.conn.execute(
+            "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?", (target_id,)
+        ).fetchone()
+        assert tuple(target_row) == (None, None)
+        assert wrapper_events == []
+        assert cache_invalidations == []
+
+        assert handle_tool_call("mnemosyne_invalidate", {
+            "memory_id": target_id,
+            "replacement_id": target_id,
+        }) == {"status": "memory_not_found", "memory_id": target_id}
+        target_row = mcp.beam.conn.execute(
+            "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?", (target_id,)
+        ).fetchone()
+        assert tuple(target_row) == (None, None)
+        assert wrapper_events == []
+        assert cache_invalidations == []
+
+        assert handle_tool_call("mnemosyne_invalidate", {
+            "memory_id": target_id,
+            "replacement_id": replacement_id,
+        }) == {"status": "invalidated", "memory_id": target_id}
+        target_row = mcp.beam.conn.execute(
+            "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?", (target_id,)
+        ).fetchone()
+        assert target_row[0] is not None
+        assert target_row[1] == replacement_id
+
+        assert handle_tool_call("mnemosyne_invalidate", {
+            "memory_id": global_target_id,
+            "replacement_id": global_replacement_id,
+        }) == {"status": "invalidated", "memory_id": global_target_id}
+        global_target_row = mcp.beam.conn.execute(
+            "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?", (global_target_id,)
+        ).fetchone()
+        assert global_target_row[0] is not None
+        assert global_target_row[1] == global_replacement_id
+        assert len(cache_invalidations) == 2
+        assert wrapper_events == [
+            ("MEMORY_INVALIDATED", target_id, {"replacement_id": replacement_id}),
+            (
+                "MEMORY_INVALIDATED",
+                global_target_id,
+                {"replacement_id": global_replacement_id},
+            ),
+        ]
 
     def test_handle_batch_multiple_remember(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
@@ -692,9 +915,7 @@ class TestToolHandlers:
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "noise_score": True}]),
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "noise_score": 10**1000}]),
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "importance": float("inf")}]),
-            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "importance": 1.1}]),
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "importance": True}]),
-            json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "importance": 10**1000}]),
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "content_length": -1}]),
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "content_length": 1.5}]),
             json.dumps([{"memory_id": "memory-1", "table_name": "working_memory", "content_length": True}]),
@@ -770,6 +991,73 @@ class TestToolHandlers:
         assert candidate.timestamp == "2026-07-21T00:00:00Z"
         assert candidate.suggested_action == "archive"
         assert candidate.content_length == 4
+
+    @pytest.mark.parametrize("importance", [2.0, -0.25])
+    def test_hygiene_audit_candidates_with_out_of_range_importance_clean_from_stored_row(
+        self, tmp_path, monkeypatch, importance
+    ):
+        """MCP audit output can be confirmed for finite legacy importance values.
+
+        Candidate importance is audit metadata: archive must preserve the
+        current stored value, not the stale value supplied by the audit.
+        """
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        stored = handle_tool_call(
+            "mnemosyne_remember",
+            {"content": "heartbeat", "source": "heartbeat", "importance": importance},
+        )
+        assert stored["status"] == "stored"
+        memory_id = stored["memory_id"]
+
+        audited = handle_tool_call(
+            "mnemosyne_hygiene_audit",
+            {"tables": ["working_memory"], "min_score": 0.0},
+        )
+        candidates = audited["report"]["candidates"]
+        assert len(candidates) == 1
+        assert candidates[0]["memory_id"] == memory_id
+        assert candidates[0]["importance"] == importance
+
+        # Simulate a legitimate intervening row update: the audit candidate
+        # remains the exact input to clean, but it must not overwrite storage.
+        mem = _create_instance(bank="default")
+        try:
+            mem.beam.conn.execute(
+                "UPDATE working_memory SET importance = ? WHERE id = ?", (0.75, memory_id)
+            )
+            mem.beam.conn.commit()
+        finally:
+            mem.beam.conn.close()
+
+        cleaned = handle_tool_call(
+            "mnemosyne_hygiene_clean",
+            {
+                "candidates_json": json.dumps(candidates),
+                "action": "archive",
+                "confirm": True,
+            },
+        )
+
+        assert cleaned["status"] == "applied"
+        assert cleaned["result"] == {
+            "deleted": 0,
+            "archived": 1,
+            "kept": 0,
+            "flagged": 0,
+            "errors": [],
+            "log_entries": 1,
+        }
+        mem = _create_instance(bank="default")
+        try:
+            row = mem.beam.conn.execute(
+                "SELECT importance, metadata_json FROM working_memory WHERE id = ?", (memory_id,)
+            ).fetchone()
+            assert row[0] == 0
+            assert json.loads(row[1])["_original_importance"] == 0.75
+        finally:
+            mem.beam.conn.close()
 
     def test_unknown_tool(self):
         """Unknown tool raises ValueError."""
@@ -998,12 +1286,17 @@ print(json.dumps({"result": result, "after": after}))
         assert not mnemosyne_home.exists()
 
     def test_get_tool_definitions_returns_all(self):
-        """get_tool_definitions returns all registered tools."""
+        """get_tool_definitions returns every tool with a dispatch handler.
+
+        Schemas without an MCP handler (see #728) must not be advertised:
+        they would appear in ``tools/list`` but fail ``tools/call``.
+        """
         tools = get_tool_definitions()
         names = [t["name"] for t in tools]
-        assert len(tools) == len(TOOLS)
         assert len(names) == len(set(names))
         assert "mnemosyne_remember" in names
+        handler_names = set(_TOOL_HANDLERS)
+        assert set(names) == handler_names
 
     def test_tool_definitions_convertible_to_tool_pydantic(self):
         """Tool dict definitions must be compatible with the ``mcp`` SDK 2.x Tool Pydantic model.
@@ -1057,7 +1350,19 @@ print(json.dumps({"result": result, "after": after}))
                         await client.initialize()
                         listed = await client.list_tools()
                         assert isinstance(listed, ListToolsResult)
-                        assert len(listed.tools) >= 25
+                        names = [tool.name for tool in listed.tools]
+                        # #728: every advertised tool must have a dispatch
+                        # handler, so the wire surface is exactly the handler
+                        # registry, with unique names.
+                        assert len(names) == len(set(names))
+                        assert set(names) == set(_TOOL_HANDLERS), (
+                            f"tools/list surface diverges from handler registry: "
+                            f"{sorted(set(names) - set(_TOOL_HANDLERS))} advertised "
+                            f"without handler; "
+                            f"{sorted(set(_TOOL_HANDLERS) - set(names))} handlers "
+                            f"not advertised"
+                        )
+                        assert "mnemosyne_remember" in names
                         with patch(
                             "mnemosyne.mcp_server.handle_tool_call",
                             return_value={"status": "ok"},
@@ -1112,6 +1417,64 @@ print(json.dumps({"result": result, "after": after}))
         build.assert_called_once_with()
         sse_route = next(route for route in app.routes if getattr(route, "path", None) == "/sse")
         assert any(cell.cell_contents is build.return_value for cell in (sse_route.endpoint.__closure__ or ()))
+
+    def test_sse_messages_transport_uses_matching_mount_path(self):
+        """The advertised POST URI and mounted raw ASGI app must agree."""
+        from mnemosyne import mcp_server
+        from starlette.routing import Mount
+        from unittest.mock import AsyncMock, patch
+
+        handle_post_message = AsyncMock()
+        transport = type("FakeTransport", (), {"handle_post_message": handle_post_message})()
+        transport_factory = patch("mcp.server.sse.SseServerTransport")
+        with (
+            patch.object(mcp_server, "_build_mcp_server", return_value=object()),
+            transport_factory as build_transport,
+        ):
+            build_transport.return_value = transport
+            app = mcp_server._build_sse_app(host="127.0.0.1")
+
+        build_transport.assert_called_once_with("/messages/")
+        message_mount = next(
+            route
+            for route in app.routes
+            if isinstance(route, Mount) and route.path == "/messages"
+        )
+        assert message_mount.app is handle_post_message
+
+    def test_sse_messages_invalid_session_returns_clean_error(self):
+        """An invalid session POST must return an error without a second ASGI response."""
+        from mnemosyne import mcp_server
+        from starlette.testclient import TestClient
+        from unittest.mock import patch
+
+        with patch.object(mcp_server, "_build_mcp_server", return_value=object()):
+            app = mcp_server._build_sse_app(host="127.0.0.1")
+
+        response = TestClient(app).post(
+            "/messages/?session_id=missing",
+            json={"jsonrpc": "2.0", "method": "ping"},
+        )
+
+        assert response.status_code == 400
+        assert response.text == "Invalid session ID"
+
+    def test_sse_messages_missing_session_returns_clean_error(self):
+        """A valid-but-missing session must return 404 without an ASGI exception."""
+        from mnemosyne import mcp_server
+        from starlette.testclient import TestClient
+        from unittest.mock import patch
+
+        with patch.object(mcp_server, "_build_mcp_server", return_value=object()):
+            app = mcp_server._build_sse_app(host="127.0.0.1")
+
+        response = TestClient(app).post(
+            "/messages/?session_id=00000000-0000-0000-0000-000000000000",
+            json={"jsonrpc": "2.0", "method": "ping"},
+        )
+
+        assert response.status_code == 404
+        assert response.text == "Could not find session"
 
     def test_build_mcp_server_list_tools_returns_listtoolsresult(self):
         """SDK 2.x contract: the tools/list callback must return a ListToolsResult.
@@ -1255,7 +1618,8 @@ run_cli()
             main(["--transport", "sse", "--port", "19090", "--bank", "work"])
 
         run_mcp_server.assert_called_once_with(
-            transport="sse", port=19090, bank="work", host="127.0.0.1"
+            transport="sse", port=19090, bank="work", host="127.0.0.1",
+            path="/mcp", json_response=False,
         )
 
 

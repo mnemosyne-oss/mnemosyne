@@ -29,6 +29,17 @@
 | Repo settings / org admin | AJ only |
 | Docs, tests, CI | Either maintainer |
 
+## Review and Merge
+
+Either maintainer may review any pull request, including one opened by an outside
+contributor. There is no routing restriction on who reviews what.
+
+An approval means the code is correct. It does not by itself decide that the change
+ships. Merge authority follows the Decision Framework above, so a pull request that
+changes a supported public API, the storage schema, or a configuration contract
+carries the `needs-decision` label and escalates to that table rather than being
+settled in review. Review continues while it is labelled; only the merge waits.
+
 ## Governance
 
 - All contributors must sign the [CLA](CLA.md) before contributions are accepted
@@ -38,4 +49,4 @@
 
 ---
 
-*Last updated: 2026-08-01*
+*Last updated: 2026-08-24*

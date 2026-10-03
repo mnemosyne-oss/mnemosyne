@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from hermes_memory_provider import MnemosyneMemoryProvider
 from mnemosyne.core.beam import BeamMemory
 
@@ -78,6 +80,37 @@ def test_batch_update_and_invalidate(tmp_path):
     assert invalidated[0]
 
 
+def test_batch_update_then_invalidate_with_replacement_preserves_outer_transaction(tmp_path):
+    provider = _provider(tmp_path)
+    target_id = provider._beam.remember("batch replacement target", importance=0.3)
+    replacement_id = provider._beam.remember("batch replacement", importance=0.3)
+
+    result = json.loads(provider.handle_tool_call("mnemosyne_batch", {
+        "operations": [
+            {
+                "action": "update",
+                "memory_id": target_id,
+                "content": "batch replacement target updated",
+            },
+            {
+                "action": "invalidate",
+                "memory_id": target_id,
+                "replacement_id": replacement_id,
+            },
+        ],
+    }))
+
+    assert result["status"] == "ok"
+    assert [item["status"] for item in result["results"]] == ["updated", "invalidated"]
+    target = provider._beam.get(target_id)
+    assert target["content"] == "batch replacement target updated"
+    row = provider._beam.conn.execute(
+        "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?", (target_id,)
+    ).fetchone()
+    assert row[0] is not None
+    assert row[1] == replacement_id
+
+
 def test_batch_extract_remember_uses_provider_default_scope(tmp_path):
     provider = _provider(tmp_path)
     provider._default_scope = "session"
@@ -129,6 +162,42 @@ def test_batch_failure_rolls_back_earlier_update(tmp_path):
     assert provider._beam.get(memory_id)["content"] == "before update"
 
 
+@pytest.mark.parametrize("rejected_action", ["remember", "update"])
+def test_batch_policy_rejection_rolls_back_all_operations(
+    tmp_path, rejected_action
+):
+    from mnemosyne.batch_tool import apply_beam_batch, validate_batch_operations
+    from mnemosyne.core.filters import WritePolicySnapshot
+
+    beam = _beam(tmp_path)
+    target_id = beam.remember("unchanged update target")
+    rejected = {
+        "action": rejected_action,
+        "content": "ISSUE821 rejected batch content",
+    }
+    if rejected_action == "update":
+        rejected["memory_id"] = target_id
+    normalized = validate_batch_operations([
+        {"action": "remember", "content": "must roll back"},
+        rejected,
+    ])
+
+    result = apply_beam_batch(
+        beam,
+        normalized,
+        write_policy=WritePolicySnapshot((r"^ISSUE821",), "strict"),
+    )
+
+    assert result == {
+        "status": "error",
+        "error": "batch_failed",
+        "failed_index": 1,
+        "action": rejected_action,
+    }
+    assert _count_matching(beam, "must roll back") == 0
+    assert beam.get(target_id)["content"] == "unchanged update target"
+
+
 def test_batch_audit_events_emit_only_after_successful_commit(tmp_path):
     provider = _provider(tmp_path)
     events = []
@@ -150,6 +219,56 @@ def test_batch_audit_events_emit_only_after_successful_commit(tmp_path):
     }))
     assert ok["status"] == "ok"
     assert [event[0] for event in events] == ["remember"]
+
+
+def test_batch_audit_failure_after_commit_preserves_success(tmp_path, caplog):
+    provider = _provider(tmp_path)
+    canary = "/private/audit/path\ncanary"
+
+    def fail_audit(action, **_kwargs):
+        raise RuntimeError(canary)
+
+    provider._audit_event = fail_audit
+    result = json.loads(provider.handle_tool_call("mnemosyne_batch", {
+        "operations": [
+            {"action": "remember", "content": "audit failure stays committed"},
+        ],
+    }))
+
+    assert result["status"] == "ok"
+    memory_id = result["results"][0]["memory_id"]
+    assert provider._beam is not None
+    assert provider._beam.get(memory_id)["content"] == "audit failure stays committed"
+    assert "mnemosyne_batch audit publication failed" in caplog.text
+    assert canary not in caplog.text
+
+
+def test_mcp_wrapper_replay_failure_after_commit_preserves_success(
+    tmp_path, monkeypatch, caplog
+):
+    from mnemosyne import mcp_tools
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    canary = "/private/replay/path\ncanary"
+
+    def fail_replay(self):
+        raise RuntimeError(canary)
+
+    monkeypatch.setattr(mcp_tools._WrapperBatchAdapter, "replay_wrapper_events", fail_replay)
+    result = mcp_tools.handle_tool_call("mnemosyne_batch", {
+        "operations": [
+            {"action": "remember", "content": "replay failure stays committed"},
+        ],
+    })
+
+    assert result is not None
+    assert result["status"] == "ok"
+    memory_id = result["results"][0]["memory_id"]
+    memory = mcp_tools._create_instance(bank="default")
+    assert memory.beam.get(memory_id)["content"] == "replay failure stays committed"
+    assert "mnemosyne_batch wrapper replay failed" in caplog.text
+    assert canary not in caplog.text
 
 
 def test_batch_dry_run_writes_nothing(tmp_path):

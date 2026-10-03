@@ -6,9 +6,19 @@ on:
   pull_request:
     branches: [main, master]
 
+# One live run per pull request. Pushing again cancels the superseded run
+# instead of leaving it to finish against a commit nobody will merge. Runs on
+# main are never cancelled: those are the ones we check tags and releases
+# against.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   docs-check:
     runs-on: ubuntu-latest
+    # Runs in seconds; a minute-scale budget is already generous.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -32,12 +42,21 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
+    # Runs in seconds; a minute-scale budget is already generous.
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          persist-credentials: false
+          # Fetch enough history for `git diff origin/main...HEAD` to
+          # work on PR builds. Default depth=1 breaks this — `Actions
+          # checkout@4+` exposes `fetch-depth` explicitly.
+          fetch-depth: 0
+          # Persist the auto-issued GITHUB_TOKEN so the F-rules step
+          # can `git fetch origin base-ref` on fork PRs (the default
+          # `persist-credentials: false` would block that with a 403).
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
@@ -47,11 +66,85 @@ jobs:
       - name: Install Ruff
         run: python -m pip install ruff==0.15.22
 
+      # ------------------------------------------------------------------
+      # Step A: project-wide fatal gate.
+      #
+      # Pure syntax / undefined-name / unparsable cases. These are the
+      # ones that have always been enforced and would ship broken code
+      # otherwise — they stay fatal across the whole tree.
+      # ------------------------------------------------------------------
       - name: Check fatal Python errors
         run: ruff check --select E9,F63,F7,F82 mnemosyne tests integrations/hermes/src integrations/hermes/tests hermes_memory_provider
 
+      # ------------------------------------------------------------------
+      # Step B: PR-scoped F/RUF022 sweep over CHANGED files only.
+      #
+      # Why scoped: turning the F-ruleset on tree-wide would surface
+      # ~423 legacy violations on current `main`, fail every open PR,
+      # and reintroduce the original problem this job was supposed to
+      # prevent (any push can stop the project). The family we're
+      # adding — F401/F841/F541/RUF022 — is cheap to write, so we
+      # enforce it on new code and let historical violations get
+      # cleaned up via dedicated PRs.
+      #
+      # Behavior:
+      #   - pull_request: list .py files changed vs the PR base, run
+      #     ruff with the broader rubric. Fails if any DIFF file has
+      #     new F/RUF022 violations.
+      #   - push to main: skip. The F-rules live in PR-only land until
+      #     someone files the cleanup PR that brings main itself under
+      #     the same rubric.
+      #
+      # See PR #483 followup for context.
+      # ------------------------------------------------------------------
+      - name: Check F-rules on changed files (PRs only)
+        if: github.event_name == 'pull_request'
+        env:
+          # Pin the PR base ref from the workflow event into the shell
+          # environment so we don't have to splice it through ${{ }}
+          # inside the bash script (which interacts poorly with quoting
+          # and would let a hostile base.ref break out of the string).
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          # Fetch the base branch explicitly (shallow — we only need
+          # the diff walker) and resolve BASE_REF after the fetch so
+          # `origin/${PR_BASE_REF}` exists locally.
+          git fetch --depth=1 origin "${PR_BASE_REF}"
+          BASE_REF="origin/${PR_BASE_REF}"
+          # NUL-delimited so paths with spaces / newlines survive.
+          # No `|| true` — if the diff walker itself breaks, the step
+          # should fail loudly rather than silently skipping lint.
+          #
+          # Why a temp file instead of a process substitution feeding
+          # `mapfile`: mapfile reports the exit code of the array
+          # *assignment*, not the substituted command, so a failing
+          # `git diff` would leave `CHANGED` empty and exit 0 — silently
+          # bypassing the PR lint gate. Writing to a file first lets
+          # `set -e` observe and propagate the failure (the script
+          # aborts before `mapfile` runs).
+          changed_files="$(mktemp)"
+          trap 'rm -f "${changed_files}"' EXIT
+          git diff --name-only --diff-filter=ACMRT -z \
+            "${BASE_REF}...HEAD" -- '*.py' > "${changed_files}"
+          mapfile -d '' -t CHANGED < "${changed_files}"
+          if [ "${#CHANGED[@]}" -eq 0 ]; then
+            echo "No Python files changed — skipping F-rules sweep."
+            exit 0
+          fi
+          echo "Python files changed on this PR:"
+          printf '  - %s\n' "${CHANGED[@]}"
+          # `--` so a path like `--something.py` is treated as a
+          # positional argument rather than a ruff option.
+          ruff check --select F,RUF022 -- "${CHANGED[@]}"
+
   test:
     runs-on: ubuntu-latest
+    # About 9 minutes uncontended and roughly 25 under load, so 50
+    # leaves headroom while still killing a hang inside the hour.
+    timeout-minutes: 50
+    permissions:
+      contents: read
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
@@ -88,10 +181,13 @@ jobs:
           restore-keys: |
             fastembed-bge-small-en-v1.5-${{ matrix.python-version }}-
 
+      - name: Install ffmpeg (video understanding tests)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[embeddings,mcp,sync,test]"
+          pip install -e ".[embeddings,mcp,sync,test,media]"
           pip install -e ./integrations/hermes
 
       - name: Pre-download embedding model
@@ -112,11 +208,16 @@ jobs:
           print('embedding model cached')
           "
 
-      - name: Run tests
-        run: pytest tests/ -v --tb=short
+      - name: Run core tests
+        run: pytest tests/ -v --tb=short --timeout=900 --timeout-method=thread
+
+      - name: Run Hermes integration tests
+        run: pytest integrations/hermes/tests/ -v --tb=short --timeout=900 --timeout-method=thread
 
   build:
     runs-on: ubuntu-latest
+    # Runs in seconds; a minute-scale budget is already generous.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 

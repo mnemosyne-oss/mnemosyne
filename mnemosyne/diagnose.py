@@ -272,7 +272,10 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, 
             log("db", "vec_working_orphans", str(after.get("orphan_vec_working_rows", 0)))
             log("db", "working_embedding_rows", str(after.get("working_embedding_rows", 0)))
         except Exception as exc:
-            log("db", "vec_working_coverage", "ERROR", str(exc))
+            if repair_vec_working:
+                log("db", "vec_working_repair_status", "ERROR", str(exc))
+            else:
+                log("db", "vec_working_coverage", "ERROR", str(exc))
     except Exception as e:
         log("db", "stats", "ERROR", str(e))
 
@@ -299,7 +302,9 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, 
         "log_path": str(log_path),
         "checks_total": len(entries),
         "checks_passed": sum(1 for e in entries if e["status"] in non_failure_statuses),
-        "checks_failed": sum(1 for e in entries if e["status"] in ("MISSING", "NO", "ERROR")),
+        "checks_failed": sum(
+            1 for e in entries if str(e["status"]).upper() in ("MISSING", "NO", "ERROR")
+        ),
         "key_findings": [],
         "fixable": [],
         "entries": entries,

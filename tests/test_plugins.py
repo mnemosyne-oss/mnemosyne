@@ -10,12 +10,10 @@ Validates:
 6. Global manager convenience functions
 """
 
-import os
 import sys
 import pytest
 import tempfile
 from pathlib import Path
-from typing import Any, Dict
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -23,12 +21,9 @@ from mnemosyne.core.plugins import (
     MnemosynePlugin,
     PluginManager,
     LoggingPlugin,
-    MetricsPlugin,
-    FilterPlugin,
     CompressionPlugin,
     get_manager,
     reset_manager,
-    DEFAULT_PLUGIN_DIR,
 )
 
 
@@ -690,8 +685,12 @@ class TestPluginDiscovery:
             discovered = mgr.discover_plugins()
             assert "private" not in discovered
 
-    def test_discover_does_not_duplicate(self, manager):
+    def test_discover_does_not_duplicate(self, manager, monkeypatch):
         """Already-registered plugins are not duplicated."""
+        # Discovery loads this fixture under its filename before rejecting the
+        # duplicate plugin name. Restore stdlib logging after the test so later
+        # provider imports do not receive the fixture module.
+        monkeypatch.setitem(sys.modules, "logging", sys.modules["logging"])
         with tempfile.TemporaryDirectory() as tmpdir:
             plugin_file = Path(tmpdir) / "logging.py"
             plugin_file.write_text(
@@ -808,7 +807,7 @@ class TestCompressionPlugin:
     def test_unknown_provider_fallback(self, manager):
         """Unknown provider falls back gracefully, returning lines unchanged."""
         import warnings
-        with warnings.catch_warnings(record=True) as w:
+        with warnings.catch_warnings(record=True):
             warnings.simplefilter("always")
             plugin = CompressionPlugin(config={"enabled": True, "provider": "unknown_provider_xyz"})
             lines = ["Hello"]

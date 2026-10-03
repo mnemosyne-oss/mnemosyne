@@ -31,7 +31,6 @@ import sqlite3
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List
 from unittest.mock import patch
 
 import pytest
@@ -567,7 +566,9 @@ class TestReviewHardening:
         class _FakeEngine:
             def __init__(self, results):
                 self._results = results
-            def recall(self, *, query, query_embedding, top_k):
+            def recall(self, *, query, query_embedding, top_k,
+                       default_dense_source_filter=True, source=None, topic=None,
+                       episodic_where=None, episodic_params=()):
                 return self._results
 
         engine = _FakeEngine([

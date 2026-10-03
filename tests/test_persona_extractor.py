@@ -1,9 +1,5 @@
 """Tests for the L3 persona extractor + file generator (v3.10.0)."""
 
-import os
-import tempfile
-from pathlib import Path
-
 import pytest
 
 from mnemosyne.core.beam import BeamMemory
@@ -193,6 +189,30 @@ class TestFileGeneration:
         md = render_persona_markdown(candidates, token_cap=200)
         # Should be truncated
         assert len(md.split()) < 200  # approximate check
+
+    def test_render_token_cap_skips_oversized_topic_for_later_topic(self):
+        candidates = [
+            {"content": "large rule " * 30, "topic": "large", "importance": 0.9},
+            {"content": "keep this identity", "topic": "identity", "importance": 0.8},
+        ]
+
+        md = render_persona_markdown(candidates, token_cap=50)
+
+        assert "## large" not in md
+        assert "## identity" in md
+        assert "keep this identity" in md
+        assert int(len(md.split()) * 1.3) <= 50
+
+    def test_render_token_cap_uses_cumulative_estimate(self):
+        candidates = [
+            {"content": "large rule " * 30, "topic": "large", "importance": 0.9},
+            {"content": "x", "topic": "t0", "importance": 0.8},
+        ]
+
+        md = render_persona_markdown(candidates, token_cap=9)
+
+        assert "## t0" not in md
+        assert int(len(md.split()) * 1.3) <= 9
 
     def test_write_atomic(self, tmp_path):
         candidates = [{"content": "test", "topic": "t", "importance": 0.5}]

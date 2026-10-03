@@ -1,20 +1,32 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
+import pytest
+
 from hermes_memory_provider import MnemosyneMemoryProvider
+from mnemosyne_hermes import MnemosyneMemoryProvider as PackagedMemoryProvider
+
+# The provider is duplicated between hermes_memory_provider/ and
+# integrations/hermes/src/mnemosyne_hermes/ (docs/rfc/0003-media-moments.md).
+# Delete-cascade behaviour must stay identical in both copies.
+PROVIDER_CLASSES = [MnemosyneMemoryProvider, PackagedMemoryProvider]
 
 
-def _provider(tmp_path: Path, monkeypatch, agent_identity="Sisyphus"):
+def _provider(tmp_path: Path, monkeypatch, agent_identity="Sisyphus",
+              provider_cls=MnemosyneMemoryProvider, session_id=None):
     data_dir = tmp_path / "mnemosyne-data"
     hermes_home = tmp_path / "profiles" / agent_identity.lower()
-    hermes_home.mkdir(parents=True)
+    # exist_ok so a second provider can share one identity (and therefore one
+    # database) while running under a different session.
+    hermes_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir / "private"))
     monkeypatch.setenv("MNEMOSYNE_HOST_LLM_ENABLED", "0")
-    provider = MnemosyneMemoryProvider()
+    provider = provider_cls()
     provider.initialize(
-        session_id=f"{agent_identity.lower()}-session",
+        session_id=session_id or f"{agent_identity.lower()}-session",
         hermes_home=str(hermes_home),
         agent_identity=agent_identity,
         shared_surface_path=str(data_dir / "shared" / "mnemosyne.db"),
@@ -206,9 +218,272 @@ def test_validate_delete_removes_row(tmp_path, monkeypatch):
     assert _row(provider, mid) is None
 
 
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES,
+                         ids=lambda c: c.__module__)
+def test_validate_delete_cascades_support_rows(tmp_path, monkeypatch, provider_cls):
+    """Deleting through the provider must not leave the memory's children behind.
+
+    The provider used to remove only the working_memory row, so every delete
+    orphaned the memory's gist (and its annotations and fallback embedding)
+    permanently -- see #904.
+    """
+    provider = _provider(tmp_path, monkeypatch, provider_cls=provider_cls)
+    conn = provider._beam.conn
+    delete_id = _seed_private(provider, "stale fact with children")
+    keep_id = _seed_private(provider, "unrelated fact with children")
+
+    def seed_children(memory_id):
+        conn.execute(
+            "INSERT INTO gists (id, text, memory_id) VALUES (?, ?, ?)",
+            (f"gist-{memory_id}", "gist text", memory_id),
+        )
+        # OR REPLACE so the fixture is idempotent: with embeddings enabled,
+        # remember() has already written this row, and memory_embeddings.memory_id
+        # is a PRIMARY KEY.
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json) "
+            "VALUES (?, ?)",
+            (memory_id, "[0.1, 0.2]"),
+        )
+        conn.execute(
+            "INSERT INTO annotations "
+            "(memory_id, kind, value, source, confidence, created_at) "
+            "VALUES (?, 'fact', 'note', 'test', 1.0, CURRENT_TIMESTAMP)",
+            (memory_id,),
+        )
+        conn.commit()
+
+    def count(table, memory_id):
+        return conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE memory_id = ?", (memory_id,)
+        ).fetchone()[0]
+
+    seed_children(delete_id)
+    seed_children(keep_id)
+    keep_counts = {
+        table: count(table, keep_id)
+        for table in ("gists", "memory_embeddings", "annotations")
+    }
+
+    res = _call(provider, "mnemosyne_validate", {
+        "memory_id": delete_id,
+        "action": "delete",
+        "validator": "Albedo",
+    })
+
+    assert res["status"] == "validation_delete"
+    assert _row(provider, delete_id) is None
+    for table in ("gists", "memory_embeddings", "annotations"):
+        assert count(table, delete_id) == 0, f"{table} orphaned by delete"
+        assert count(table, keep_id) == keep_counts[table]
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES,
+                         ids=lambda c: c.__module__)
+def test_validate_delete_rolls_back_when_validation_log_fails(tmp_path, monkeypatch,
+                                                              provider_cls):
+    """A failure after the cascade must not leave the deletes pending.
+
+    The handler returns validation_failed without rolling back, so the
+    support-row and parent-row deletes stayed in the connection's implicit
+    transaction and a later unrelated commit would make them permanent.
+    """
+    provider = _provider(tmp_path, monkeypatch, provider_cls=provider_cls)
+    conn = provider._beam.conn
+    mid = _seed_private(provider, "must survive a failed delete")
+    conn.execute(
+        "INSERT INTO gists (id, text, memory_id) VALUES (?, ?, ?)",
+        (f"gist-{mid}", "gist text", mid),
+    )
+    conn.execute(
+        "CREATE TRIGGER fail_validation_log "
+        "BEFORE INSERT ON memory_validations "
+        "BEGIN SELECT RAISE(ABORT, 'forced validation-log failure'); END"
+    )
+    conn.commit()
+    # remember() writes a gist of its own, so count rather than assume one.
+    gist_count = conn.execute(
+        "SELECT COUNT(*) FROM gists WHERE memory_id = ?", (mid,)
+    ).fetchone()[0]
+    assert gist_count > 0
+
+    res = _call(provider, "mnemosyne_validate", {
+        "memory_id": mid,
+        "action": "delete",
+        "validator": "Albedo",
+    })
+
+    assert res["error"] == "validation_failed"
+    assert "forced validation-log failure" in res["reason"]
+    assert not conn.in_transaction
+    assert _row(provider, mid) is not None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM gists WHERE memory_id = ?", (mid,)
+    ).fetchone()[0] == gist_count
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES,
+                         ids=lambda c: c.__module__)
+def test_validate_delete_logs_the_failure_it_swallows(tmp_path, monkeypatch, provider_cls,
+                                                      caplog):
+    """A failed cascade must leave a server-side trace, not just a JSON error."""
+    provider = _provider(tmp_path, monkeypatch, provider_cls=provider_cls)
+    conn = provider._beam.conn
+    mid = _seed_private(provider, "delete that fails")
+    conn.execute(
+        "CREATE TRIGGER fail_validation_log "
+        "BEFORE INSERT ON memory_validations "
+        "BEGIN SELECT RAISE(ABORT, 'forced validation-log failure'); END"
+    )
+    conn.commit()
+
+    with caplog.at_level(logging.ERROR, logger=provider_cls.__module__):
+        res = _call(provider, "mnemosyne_validate", {
+            "memory_id": mid,
+            "action": "delete",
+            "validator": "Albedo",
+        })
+
+    assert res["error"] == "validation_failed"
+    assert any(
+        "forced validation-log failure" in r.getMessage()
+        or (r.exc_info and "forced validation-log failure" in str(r.exc_info[1]))
+        for r in caplog.records
+    ), "cascade failure was swallowed without a log record"
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES,
+                         ids=lambda c: c.__module__)
+def test_validate_delete_removes_vec_working_row(tmp_path, monkeypatch, provider_cls):
+    """The provider delete removes the target's vector row when present."""
+    provider = _provider(tmp_path, monkeypatch, provider_cls=provider_cls)
+    conn = provider._beam.conn
+    delete_id = _seed_private(provider, "delete with vec")
+    keep_id = _seed_private(provider, "keep with vec")
+    rowids = {
+        mid: conn.execute(
+            "SELECT rowid FROM working_memory WHERE id = ?", (mid,)
+        ).fetchone()[0]
+        for mid in (delete_id, keep_id)
+    }
+    conn.execute("DROP TABLE IF EXISTS vec_working")
+    conn.execute("CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY)")
+    for rowid in rowids.values():
+        conn.execute("INSERT INTO vec_working (rowid) VALUES (?)", (rowid,))
+    conn.commit()
+
+    res = _call(provider, "mnemosyne_validate", {
+        "memory_id": delete_id,
+        "action": "delete",
+        "validator": "Albedo",
+    })
+
+    assert res["status"] == "validation_delete"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM vec_working WHERE rowid = ?", (rowids[delete_id],)
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM vec_working WHERE rowid = ?", (rowids[keep_id],)
+    ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES,
+                         ids=lambda c: c.__module__)
+def test_validate_delete_refuses_a_foreign_session_private_memory(tmp_path, monkeypatch,
+                                                                  provider_cls):
+    """A private memory owned by another session must be untouchable.
+
+    forget_working already refuses this. The provider's validate(delete) cascade
+    must decide the same way, and before it removes any support row.
+    """
+    owner = _provider(tmp_path, monkeypatch, provider_cls=provider_cls,
+                      session_id="owner-session")
+    conn = owner._beam.conn
+    mid = _seed_private(owner, "private to the owning session")
+    conn.execute(
+        "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json) "
+        "VALUES (?, ?)", (mid, "[0.1, 0.2]"))
+    conn.execute(
+        "INSERT INTO gists (id, text, memory_id) VALUES (?, ?, ?)",
+        (f"gist-{mid}", "gist text", mid))
+    conn.commit()
+    assert conn.execute(
+        "SELECT scope FROM working_memory WHERE id = ?", (mid,)
+    ).fetchone()[0] == "session"
+    conn_db_path = owner._beam.db_path
+    before = {
+        table: conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE memory_id = ?", (mid,)
+        ).fetchone()[0]
+        for table in ("memory_embeddings", "gists")
+    }
+
+    # Same agent identity, different session: mnemosyne_hermes derives its
+    # database from hermes_home (per identity), so varying the identity would
+    # put the two providers on separate databases and the test would pass for
+    # the wrong reason.
+    foreign = _provider(tmp_path, monkeypatch, provider_cls=provider_cls,
+                        session_id="foreign-session")
+    assert foreign._beam.db_path == conn_db_path
+    assert foreign._beam.session_id != owner._beam.session_id
+    res = _call(foreign, "mnemosyne_validate", {
+        "memory_id": mid,
+        "action": "delete",
+        "validator": "Foreign",
+    })
+
+    assert res["error"] == "memory_not_found"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid,)
+    ).fetchone()[0] == 1
+    for table, count in before.items():
+        assert conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE memory_id = ?", (mid,)
+        ).fetchone()[0] == count, f"{table} was touched"
+
+
+@pytest.mark.parametrize("provider_cls", PROVIDER_CLASSES,
+                         ids=lambda c: c.__module__)
+def test_validate_delete_handles_missing_gists_table(tmp_path, monkeypatch, provider_cls):
+    """The optional gists table may be absent on older databases."""
+    provider = _provider(tmp_path, monkeypatch, provider_cls=provider_cls)
+    mid = _seed_private(provider, "delete without gists")
+    provider._beam.conn.execute("DROP TABLE gists")
+    provider._beam.conn.commit()
+
+    res = _call(provider, "mnemosyne_validate", {
+        "memory_id": mid,
+        "action": "delete",
+        "validator": "Albedo",
+    })
+
+    assert res["status"] == "validation_delete"
+    assert _row(provider, mid) is None
+
+
 # --- Cross-bank: surface validation ---------------------------------------
 
 def test_validate_works_on_shared_surface(tmp_path, monkeypatch):
+    provider = _provider(tmp_path, monkeypatch)
+    mid = _seed_surface(provider, "User prefers Tailscale over OpenVPN")
+
+    res = _call(provider, "mnemosyne_validate", {
+        "memory_id": mid,
+        "action": "attest",
+        "validator": "Albedo",
+        "store": "surface",
+    })
+
+    assert res["status"] == "validation_attest"
+    assert res["store"] == "surface"
+    assert "deprecated" not in res
+    row = _row(provider, mid, bank="surface")
+    assert row[3] == "Albedo"
+
+
+def test_validate_bank_alias_still_routes_to_surface_and_says_so(tmp_path, monkeypatch):
+    """Pre-4.0 callers passed the store selector as ``bank``. Keep them working
+    through the deprecation window, and tell them in the response."""
     provider = _provider(tmp_path, monkeypatch)
     mid = _seed_surface(provider, "User prefers Tailscale over OpenVPN")
 
@@ -220,7 +495,8 @@ def test_validate_works_on_shared_surface(tmp_path, monkeypatch):
     })
 
     assert res["status"] == "validation_attest"
-    assert res["bank"] == "surface"
+    assert res["store"] == "surface"
+    assert "store" in res["deprecated"]
     row = _row(provider, mid, bank="surface")
     assert row[3] == "Albedo"
 
@@ -281,7 +557,20 @@ def test_validate_unknown_action_rejected(tmp_path, monkeypatch):
     assert "unknown action" in res["error"]
 
 
-def test_validate_unknown_bank_rejected(tmp_path, monkeypatch):
+def test_validate_unknown_store_rejected(tmp_path, monkeypatch):
+    provider = _provider(tmp_path, monkeypatch)
+    mid = _seed_private(provider, "fact")
+    res = _call(provider, "mnemosyne_validate", {
+        "memory_id": mid,
+        "action": "attest",
+        "store": "weird",
+    })
+    assert "unknown store" in res["error"]
+
+
+def test_validate_unknown_bank_alias_rejected(tmp_path, monkeypatch):
+    """A ``bank`` value outside the alias set is not a tenant bank on the
+    Hermes provider, whose bank is fixed per profile; reject it plainly."""
     provider = _provider(tmp_path, monkeypatch)
     mid = _seed_private(provider, "fact")
     res = _call(provider, "mnemosyne_validate", {
@@ -289,7 +578,7 @@ def test_validate_unknown_bank_rejected(tmp_path, monkeypatch):
         "action": "attest",
         "bank": "weird",
     })
-    assert "unknown bank" in res["error"]
+    assert "unknown store" in res["error"]
 
 
 def test_validate_missing_memory_id_rejected(tmp_path, monkeypatch):

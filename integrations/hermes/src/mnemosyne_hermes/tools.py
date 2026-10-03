@@ -55,7 +55,8 @@ RECALL_SCHEMA = {
         "Search Mnemosyne for relevant memories. Uses hybrid ranking: by default "
         "50% vector similarity + 30% FTS5 text rank + 20% importance + optional "
         "temporal boost. Tune the per-query weights via vec_weight, fts_weight, "
-        "importance_weight (omit to use environment defaults). Returns ranked results."
+        "importance_weight (omit or pass null to resolve config.yaml, then environment variables, "
+        "then built-in defaults). Returns ranked results."
     ),
     "parameters": {
         "type": "object",
@@ -78,16 +79,16 @@ RECALL_SCHEMA = {
                 "default": 24,
             },
             "vec_weight": {
-                "type": "number",
-                "description": "Vector similarity weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_VEC_WEIGHT env var or built-in default 0.5.",
+                "type": ["number", "null"],
+                "description": "Vector similarity weight in hybrid scoring. Omit (or pass null) to resolve config.yaml, then MNEMOSYNE_VEC_WEIGHT, then built-in default 0.5.",
             },
             "fts_weight": {
-                "type": "number",
-                "description": "Full-text search weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_FTS_WEIGHT env var or built-in default 0.3.",
+                "type": ["number", "null"],
+                "description": "Full-text search weight in hybrid scoring. Omit (or pass null) to resolve config.yaml, then MNEMOSYNE_FTS_WEIGHT, then built-in default 0.3.",
             },
             "importance_weight": {
-                "type": "number",
-                "description": "Importance score weight in hybrid scoring. Omit (or pass null) to use MNEMOSYNE_IMPORTANCE_WEIGHT env var or built-in default 0.2.",
+                "type": ["number", "null"],
+                "description": "Importance score weight in hybrid scoring. Omit (or pass null) to resolve config.yaml, then MNEMOSYNE_IMPORTANCE_WEIGHT, then built-in default 0.2.",
             },
             "explain": {
                 "type": "boolean",
@@ -237,16 +238,65 @@ VALIDATE_SCHEMA = {
                 "description": "Optional reason or evidence for this validation.",
                 "default": "",
             },
+            "store": {
+                "type": "string",
+                "enum": ["private", "surface"],
+                "description": "Which store holds the memory: 'private' (this profile's own memory) or 'surface' (the shared cross-agent surface). Default 'private'.",
+                "default": "private",
+            },
             "bank": {
                 "type": "string",
                 "enum": ["private", "surface"],
-                "description": "Which bank holds the memory. Default 'private'.",
-                "default": "private",
+                "description": "Deprecated alias for 'store'. Accepted until 5.0; pass 'store' instead.",
             },
         },
         "required": ["memory_id", "action"],
     },
 }
+
+REMEMBER_MEDIA_SCHEMA = {
+    "name": "mnemosyne_remember_media",
+    "description": (
+        "Remember a piece of media: an image, audio clip, video or document. It is "
+        "registered by reference and, when media understanding is enabled, turned into "
+        "located text memories (captions, timed transcript lines, timed video shots, "
+        "document passages by page) that mnemosyne_recall finds like any other memory. "
+        "Pass an https:// URL, a data: URI, a blob:// reference, or an absolute local "
+        "path inside MNEMOSYNE_MEDIA_ALLOWED_PATHS. Status 'unavailable' is a success: "
+        "the media was registered but nothing described it (no model configured, or "
+        "understanding is off)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "ref": {
+                "type": "string",
+                "description": "https:// URL, data: URI, blob://sha256/... reference, or an absolute local path inside MNEMOSYNE_MEDIA_ALLOWED_PATHS.",
+            },
+            "modality": {
+                "type": "string",
+                "enum": ["image", "video", "audio", "document"],
+                "description": "Override the modality inferred from the extension or mime type.",
+            },
+            "mime": {"type": "string", "description": "Media type, e.g. image/png. Optional."},
+            "title": {"type": "string", "description": "Short human title for the media. Optional."},
+            "hint": {
+                "type": "string",
+                "description": "Guidance for the describer: what to look for, or names and jargon to expect in speech.",
+            },
+            "max_moments": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Cap on memories created from this media. Default from MNEMOSYNE_MODALITY_MAX_MOMENTS.",
+            },
+            "importance": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5},
+            "scope": {"type": "string", "enum": ["session", "global"], "description": "Defaults to the configured scope."},
+        },
+        "required": ["ref"],
+    },
+}
+
 
 GET_SCHEMA = {
     "name": "mnemosyne_get",
@@ -807,4 +857,5 @@ ALL_TOOL_SCHEMAS = [
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,
     SYNC_PUSH_SCHEMA, SYNC_PULL_SCHEMA, SYNC_STATUS_SCHEMA,
     PERSONA_PROMOTE_SCHEMA, PERSONA_DEMOTE_SCHEMA, PERSONA_LIST_SCHEMA, PERSONA_REINFORCE_SCHEMA,
+    REMEMBER_MEDIA_SCHEMA,
 ]  # noqa: E501

@@ -63,15 +63,15 @@ class MnemosyneTool:
         )
         vec_weight: Optional[float] = Field(
             default=None,
-            description="Vector search weight (None = env default)",
+            description="Vector search weight (None = config.yaml, then MNEMOSYNE_VEC_WEIGHT, then built-in default 0.5)",
         )
         fts_weight: Optional[float] = Field(
             default=None,
-            description="Full-text search weight (None = env default)",
+            description="Full-text search weight (None = config.yaml, then MNEMOSYNE_FTS_WEIGHT, then built-in default 0.3)",
         )
         importance_weight: Optional[float] = Field(
             default=None,
-            description="Importance boost weight (None = env default)",
+            description="Importance boost weight (None = config.yaml, then MNEMOSYNE_IMPORTANCE_WEIGHT, then built-in default 0.2)",
         )
         show_citations: bool = Field(
             default=True,

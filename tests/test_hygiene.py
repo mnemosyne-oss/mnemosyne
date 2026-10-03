@@ -20,8 +20,6 @@ from mnemosyne.cli import cmd_hygiene
 from mnemosyne.core.beam import BeamMemory, init_beam
 from mnemosyne.core.filters import SECRET_LABELED_PATTERNS
 from mnemosyne.core.hygiene import (
-    AuditReport,
-    CleanResult,
     NoiseCandidate,
     audit_noise,
     clean_noise,
@@ -101,6 +99,42 @@ class TestScoreNoise:
         assert score >= 0.7
         assert "terminal_output" in reasons or "noise_pattern_match" in reasons
 
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            # A real note: "total" and "installing" mid-sentence, a bullet that
+            # starts with "Total", and "subtotal" (#1074).
+            "# Genova Walking Tour\n\nMeet at the old port at 9:00. In total the "
+            "walk takes about three hours.\nTotal distance: 6 km, mostly flat.\n"
+            "After installing the offline map, follow the coast.\n",
+            "Trip budget\nSubtotal 48 euros for the tickets.\nTotal 48 euros for tickets.",
+            "Reminder: the tour is installing new signage all week.",
+        ],
+    )
+    def test_prose_with_total_or_installing_is_not_terminal_output(self, prose):
+        score, reasons = _score_noise(prose, 0.5, "")
+        assert "terminal_output" not in reasons
+        assert score < 0.8
+        assert _suggest_action(score, []) == "keep"
+
+    @pytest.mark.parametrize(
+        "output",
+        [
+            # ls -l block summary, plain and human-readable, mid-content and CRLF.
+            "Listing of the folder:\ntotal 48\nreadme.md\nnotes.txt",
+            "Listing of the folder:\ntotal 4.0K\nnotes.txt",
+            "Listing:\r\n total 48 \r\nnotes.txt",
+            # pip and brew installer lines, without any other terminal marker.
+            "Build log:\nInstalling collected packages: requests, urllib3",
+            "Build log:\n  Installing collected packages: requests",
+            "Build log:\n==> Installing ripgrep",
+        ],
+    )
+    def test_terminal_shaped_total_and_installing_still_flagged(self, output):
+        score, reasons = _score_noise(output, 0.5, "")
+        assert reasons == ["terminal_output"]
+        assert score == 0.85
+
     def test_stack_trace(self):
         content = "Traceback (most recent call last):\n  File \"test.py\", line 10"
         score, reasons = _score_noise(content, 0.5, "")
@@ -117,6 +151,79 @@ class TestScoreNoise:
         score, reasons = _score_noise("password = hunter2supersecret", 0.5, "")
         assert score >= 0.9
         assert any("secret" in r for r in reasons)
+
+    def test_cjk_secret_flagged(self):
+        """CJK-labelled secrets must be flagged by the hygiene scorer (issue #806)."""
+        # nosec - test fixture
+        score, reasons = _score_noise("数据库密码：s3cr3t_pa55word_x1y2z3w4", 0.5, "user")
+        assert score >= 0.9
+        assert "secret_detected:cjk_secret_assignment" in reasons
+        assert _suggest_action(score, ["cjk_secret_assignment"]) == "flag"
+
+    def test_cjk_secret_with_trailing_prose_flagged(self):
+        """Trailing CJK prose must not hide a CJK-labelled secret."""
+        # nosec - test fixture
+        score, reasons = _score_noise("数据库密码：s3cr3t_pa55word_x1y2z3w4，请勿外传", 0.5, "user")
+        assert "secret_detected:cjk_secret_assignment" in reasons
+
+    def test_cjk_policy_prose_not_flagged(self):
+        """Ordinary Chinese policy prose after a label must stay clean."""
+        score, reasons = _score_noise("密码：建议每90天更换一次", 0.5, "user")
+        assert not any("secret" in r for r in reasons)
+
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            "password：建议每90天更换一次",
+            "password＝建议每90天更换一次",
+        ],
+    )
+    def test_english_label_fullwidth_separator_policy_prose_not_flagged(self, prose):
+        """English labels with fullwidth separators must not flag CJK prose."""
+        _score, reasons = _score_noise(prose, 0.5, "user")
+        assert "secret_detected:secret_assignment" not in reasons
+
+    def test_cjk_ascii_prefix_then_prose_not_flagged(self):
+        """ASCII prefix followed by CJK prose must not be flagged."""
+        score, reasons = _score_noise("密码：abc12345我的密码", 0.5, "user")
+        assert not any("secret" in r for r in reasons)
+
+    def test_cjk_non_bmp_prefix_then_prose_not_flagged(self):
+        """Non-BMP CJK after an ASCII prefix must not be flagged."""
+        score, reasons = _score_noise("密码：abc12345\U00020000", 0.5, "user")
+        assert not any("secret" in r for r in reasons)
+
+    @pytest.mark.parametrize(
+        "character",
+        [
+            "\u3005",
+            "\u3006",
+            "\u3007",
+            "\u31f0",
+            "\U000323b0",
+            "\U0003347f",
+            "\uff21",
+            "\uffa0",
+            "\uffbf",
+            "\uffc1",
+            "\uffc8",
+            "\uffc9",
+            "\uffd0",
+            "\uffd1",
+            "\uffd8",
+            "\uffd9",
+        ],
+    )
+    def test_cjk_boundary_prefix_then_prose_not_flagged(self, character):
+        """CJK or fullwidth prose after an ASCII prefix must not be flagged."""
+        score, reasons = _score_noise(f"密码：abc12345{character}", 0.5, "user")
+        assert not any("secret" in r for r in reasons)
+
+    @pytest.mark.parametrize("character", ["ſ", "ı", "İ", "K"])
+    def test_unicode_casefold_equivalent_not_flagged_as_secret(self, character):
+        """Unicode case-fold equivalents are not ASCII credential characters."""
+        _score, reasons = _score_noise(f"密码：!!!!!!!!{character}", 0.5, "user")
+        assert not any(reason.startswith("secret_detected:") for reason in reasons)
 
     def test_secret_with_value_keyword_not_dampened(self):
         """Secret + value keyword should NOT dampen the score."""
@@ -465,6 +572,182 @@ class TestAuditNoise:
 
         assert message in capsys.readouterr().err
 
+    def _prepare_clean_db(self, temp_db, monkeypatch):
+        """Insert a heartbeat row and point the CLI at a copy of the database."""
+        db_path, beam = temp_db
+        _insert_row(beam, "working_memory", "n1", "heartbeat", source="heartbeat")
+        cli_db = db_path.parent / "mnemosyne.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("VACUUM INTO ?", (str(cli_db),))
+        finally:
+            conn.close()
+        monkeypatch.setattr("mnemosyne.cli.DATA_DIR", str(db_path.parent))
+        return db_path, beam, cli_db
+
+    def test_cmd_hygiene_clean_unwraps_audit_envelope(self, temp_db, monkeypatch, capsys):
+        """Regression test for #606: clean must unwrap the audit JSON envelope."""
+        db_path, _beam, cli_db = self._prepare_clean_db(temp_db, monkeypatch)
+        report = audit_noise(db_path=db_path, min_score=0.0)
+
+        candidates_file = db_path.parent / "audit.json"
+        candidates_file.write_text(json.dumps(report.to_dict()))
+
+        cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        captured = capsys.readouterr()
+        assert "deleted=1" in captured.out
+        conn = sqlite3.connect(str(cli_db))
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM working_memory WHERE id = ?", ("n1",)
+            ).fetchone()
+            assert row is None
+        finally:
+            conn.close()
+
+    def test_cmd_hygiene_clean_accepts_raw_candidate_array(self, temp_db, monkeypatch, capsys):
+        """clean must also accept the candidates array without an envelope."""
+        db_path, _beam, _cli_db = self._prepare_clean_db(temp_db, monkeypatch)
+
+        candidates_file = db_path.parent / "candidates.json"
+        candidates_file.write_text(json.dumps([
+            {
+                "memory_id": "n1",
+                "table_name": "working_memory",
+                "content_preview": "heartbeat",
+                "noise_score": 0.8,
+                "noise_reasons": ["trivial_keyword"],
+                "suggested_action": "delete",
+            }
+        ]))
+
+        cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        assert "deleted=1" in capsys.readouterr().out
+
+    def test_cmd_hygiene_clean_fails_on_invalid_candidate_container(self, temp_db, monkeypatch, capsys):
+        """Non-list, non-envelope containers must route to _fail."""
+        db_path, _beam, _cli_db = self._prepare_clean_db(temp_db, monkeypatch)
+
+        candidates_file = db_path.parent / "bad.json"
+        candidates_file.write_text(json.dumps("not a list"))
+
+        with pytest.raises(SystemExit):
+            cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        assert "JSON array" in capsys.readouterr().err
+
+    def test_cmd_hygiene_clean_fails_on_missing_candidates_field(self, temp_db, monkeypatch, capsys):
+        """An envelope without 'candidates' must route to _fail."""
+        db_path, _beam, _cli_db = self._prepare_clean_db(temp_db, monkeypatch)
+
+        candidates_file = db_path.parent / "bad.json"
+        candidates_file.write_text(json.dumps({"total_scanned": 1}))
+
+        with pytest.raises(SystemExit):
+            cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        assert "'candidates'" in capsys.readouterr().err
+
+    def test_cmd_hygiene_clean_fails_on_non_object_candidate(self, temp_db, monkeypatch, capsys):
+        """A candidate entry that is not a JSON object must route to _fail."""
+        db_path, _beam, _cli_db = self._prepare_clean_db(temp_db, monkeypatch)
+
+        candidates_file = db_path.parent / "bad.json"
+        candidates_file.write_text(json.dumps(["not an object"]))
+
+        with pytest.raises(SystemExit):
+            cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        assert "JSON object" in capsys.readouterr().err
+
+    def test_cmd_hygiene_clean_fails_on_missing_required_field(self, temp_db, monkeypatch, capsys):
+        """A candidate missing a required field must route to _fail."""
+        db_path, _beam, _cli_db = self._prepare_clean_db(temp_db, monkeypatch)
+
+        candidates_file = db_path.parent / "bad.json"
+        candidates_file.write_text(json.dumps([{"table_name": "working_memory"}]))
+
+        with pytest.raises(SystemExit):
+            cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        assert "Missing required field" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "malformed_candidate",
+        [
+            {"noise_score": "high"},
+            {"table_name": "unknown_table"},
+            {"suggested_action": "destroy"},
+            {"noise_score": 1.1},
+            {"importance": float("inf")},
+            {"importance": float("nan")},
+            {"content_length": -1},
+            {"noise_reasons": "short"},
+        ],
+    )
+    def test_cmd_hygiene_clean_rejects_malformed_envelope_candidate(
+        self, temp_db, monkeypatch, capsys, malformed_candidate
+    ):
+        """Malformed envelope candidates abort through _fail, preserve the row, and do not write an audit log."""
+        db_path, _beam, cli_db = self._prepare_clean_db(temp_db, monkeypatch)
+        report = audit_noise(db_path=db_path, min_score=0.0)
+        candidate = report.candidates[0].to_dict()
+        candidate.update(malformed_candidate)
+
+        candidates_file = db_path.parent / "bad.json"
+        candidates_file.write_text(json.dumps({"candidates": [candidate]}))
+
+        with pytest.raises(SystemExit):
+            cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        assert "Candidate #0" in capsys.readouterr().err
+        conn = sqlite3.connect(str(cli_db))
+        try:
+            row = conn.execute("SELECT 1 FROM working_memory WHERE id = ?", ("n1",)).fetchone()
+            assert row is not None
+            audit_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='hygiene_audit_log'"
+            ).fetchone()
+            assert audit_table is None
+        finally:
+            conn.close()
+
+    def test_cmd_hygiene_clean_accepts_audit_output_with_out_of_range_importance(
+        self, temp_db, monkeypatch, capsys
+    ):
+        """Regression for the reported blocker: audit --json → clean --confirm must work
+        even when BeamMemory persisted an importance value outside [0, 1]."""
+        db_path, beam = temp_db
+        _insert_row(beam, "working_memory", "n1", "heartbeat", source="heartbeat", importance=2.0)
+
+        cli_db = db_path.parent / "mnemosyne.db"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("VACUUM INTO ?", (str(cli_db),))
+        finally:
+            conn.close()
+        monkeypatch.setattr("mnemosyne.cli.DATA_DIR", str(db_path.parent))
+
+        cmd_hygiene(["audit", "--json", "--min-score", "0.0"])
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["candidates"]
+
+        candidates_file = db_path.parent / "audit.json"
+        candidates_file.write_text(json.dumps(envelope))
+
+        cmd_hygiene(["clean", "--action", "delete", "--confirm", str(candidates_file)])
+
+        captured = capsys.readouterr()
+        assert "deleted=1" in captured.out
+        conn = sqlite3.connect(str(cli_db))
+        try:
+            row = conn.execute("SELECT 1 FROM working_memory WHERE id = ?", ("n1",)).fetchone()
+            assert row is None
+        finally:
+            conn.close()
+
     def test_hygiene_status_without_audit_log(self, temp_db):
         db_path, _beam = temp_db
 
@@ -666,7 +949,12 @@ class TestAuditNoise:
         assert connection is not None
         with pytest.raises(sqlite3.ProgrammingError):
             connection.execute("SELECT 1")
-        assert "hygiene read failed" in capsys.readouterr().err
+        expected_code = (
+            "hygiene_audit_failed"
+            if function_name == "audit_noise"
+            else "hygiene_status_failed"
+        )
+        assert capsys.readouterr().err == f"Error: {expected_code}\n"
 
     @pytest.mark.parametrize("command_args", [["audit"], ["status"]])
     def test_cmd_hygiene_read_commands_report_readonly_open_errors(
@@ -684,7 +972,7 @@ class TestAuditNoise:
         with pytest.raises(SystemExit):
             cmd_hygiene(command_args)
 
-        assert "readonly connection failed" in capsys.readouterr().err
+        assert capsys.readouterr().err == f"Error: hygiene_{command_args[0]}_failed\n"
 
     def test_noise_summary_is_pii_safe(self, temp_db):
         db_path, beam = temp_db
@@ -953,7 +1241,7 @@ def test_hygiene_suite_does_not_leak_config_into_subagent_provider(tmp_path, mon
     process: the autouse cleanup must discard that singleton before a subagent
     provider resolves its temporary data-directory configuration.
     """
-    from conftest import _close_cached_connections
+    from tests.conftest import _close_cached_connections
     from hermes_memory_provider import MnemosyneMemoryProvider
     from mnemosyne.core.config import MnemosyneConfig
 

@@ -30,9 +30,9 @@ The tool provides a settings panel in OpenWebUI with these Valves:
 | `db_path` | `~/.hermes/mnemosyne/data/` | Path to memory database directory |
 | `bank` | `default` | Memory bank name for isolation |
 | `top_k` | `5` | Max results returned by recall |
-| `vec_weight` | `null` (env default) | Vector search weighting |
-| `fts_weight` | `null` (env default) | Full-text search weighting |
-| `importance_weight` | `null` (env default) | Importance boost weighting |
+| `vec_weight` | `null` (`config.yaml` > `MNEMOSYNE_VEC_WEIGHT` > `0.5`) | Vector search weighting |
+| `fts_weight` | `null` (`config.yaml` > `MNEMOSYNE_FTS_WEIGHT` > `0.3`) | Full-text search weighting |
+| `importance_weight` | `null` (`config.yaml` > `MNEMOSYNE_IMPORTANCE_WEIGHT` > `0.2`) | Importance boost weighting |
 | `show_citations` | `true` | Show source citations in output |
 
 These settings are persisted per-user in OpenWebUI's database.

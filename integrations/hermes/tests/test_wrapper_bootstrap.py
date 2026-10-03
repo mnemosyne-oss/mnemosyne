@@ -282,3 +282,146 @@ assert sys.path == before
     )
 
     assert result.returncode == 0, result.stderr
+
+
+
+@pytest.mark.parametrize("entrypoint", ["__init__.py", "cli.py"])
+@pytest.mark.parametrize(
+    "config_kind", ["same_major_different_minor", "malformed", "pyvenv_cfg_directory"]
+)
+def test_generated_wrapper_rejects_incompatible_side_venv_before_site_activation(
+    tmp_path, entrypoint, config_kind
+):
+    site_packages = tmp_path / "side-venv" / "lib" / "python-current" / "site-packages"
+    if config_kind == "same_major_different_minor":
+        selected_version = f"{sys.version_info.major}.{sys.version_info.minor + 1}"
+        config_line = f"version = {selected_version}.0"
+    else:
+        selected_version = "unknown"
+        config_line = "version_info = malformed" if config_kind == "malformed" else None
+    package = site_packages / "mnemosyne_hermes"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("SIDE_VALUE = 'selected-side-package'\n", encoding="utf-8")
+    (package / "cli.py").write_text(
+        "def register_cli(*args): return 'selected-cli'\n",
+        encoding="utf-8",
+    )
+    config_path = site_packages.parents[2] / "pyvenv.cfg"
+    if config_line is None:
+        config_path.mkdir()
+    else:
+        config_path.write_text(config_line + "\n", encoding="utf-8")
+
+    wrapper = tmp_path / "hermes-home" / "plugins" / "mnemosyne"
+    install._write_wrapper_plugin(
+        wrapper,
+        python=Path(sys.executable),
+        site_packages=site_packages,
+    )
+
+    code = f"""
+import importlib.util
+import sys
+import types
+from pathlib import Path
+
+wrapper = Path({str(wrapper)!r})
+site_packages = {str(site_packages.resolve())!r}
+before = list(sys.path)
+if {entrypoint!r} == '__init__.py':
+    parent = types.ModuleType('synthetic_hermes_plugins')
+    parent.__path__ = []
+    sys.modules[parent.__name__] = parent
+    name = 'synthetic_hermes_plugins.mnemosyne'
+    spec = importlib.util.spec_from_file_location(
+        name, wrapper / '__init__.py', submodule_search_locations=[str(wrapper)]
+    )
+else:
+    name = 'standalone_mnemosyne_cli'
+    spec = importlib.util.spec_from_file_location(name, wrapper / 'cli.py')
+module = importlib.util.module_from_spec(spec)
+sys.modules[name] = module
+try:
+    spec.loader.exec_module(module)
+except RuntimeError as exc:
+    message = str(exc)
+    assert 'runtime Python' in message
+    assert 'selected Mnemosyne environment Python {selected_version}' in message
+else:
+    raise AssertionError('incompatible selected virtualenv should fail activation')
+assert site_packages not in sys.path
+assert sys.path == before
+assert 'mnemosyne_hermes' not in sys.modules
+"""
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("entrypoint", ["__init__.py", "cli.py"])
+def test_generated_wrapper_accepts_matching_side_venv_version_info_for_both_entrypoints(tmp_path, entrypoint):
+    site_packages = tmp_path / "side-venv" / "lib" / "current" / "site-packages"
+    package = site_packages / "mnemosyne_hermes"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("SIDE_VALUE = 'selected-side-package'\n", encoding="utf-8")
+    (package / "cli.py").write_text(
+        "def register_cli(*args): return 'selected-cli'\n",
+        encoding="utf-8",
+    )
+    current_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro + 1}"
+    (site_packages.parents[2] / "pyvenv.cfg").write_text(
+        f"version_info = {current_version}\n",
+        encoding="utf-8",
+    )
+
+    wrapper = tmp_path / "hermes-home" / "plugins" / "mnemosyne"
+    install._write_wrapper_plugin(
+        wrapper,
+        python=Path(sys.executable),
+        site_packages=site_packages,
+    )
+
+    code = f"""
+import importlib.util
+import sys
+import types
+from pathlib import Path
+
+wrapper = Path({str(wrapper)!r})
+site_packages = {str(site_packages.resolve())!r}
+if {entrypoint!r} == '__init__.py':
+    parent = types.ModuleType('synthetic_hermes_plugins')
+    parent.__path__ = []
+    sys.modules[parent.__name__] = parent
+    name = 'synthetic_hermes_plugins.mnemosyne'
+    spec = importlib.util.spec_from_file_location(
+        name, wrapper / '__init__.py', submodule_search_locations=[str(wrapper)]
+    )
+else:
+    name = 'standalone_mnemosyne_cli'
+    spec = importlib.util.spec_from_file_location(name, wrapper / 'cli.py')
+module = importlib.util.module_from_spec(spec)
+sys.modules[name] = module
+spec.loader.exec_module(module)
+assert site_packages == sys.path[0]
+assert Path(sys.modules['mnemosyne_hermes'].__file__).parent == Path({str(package.resolve())!r})
+"""
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr

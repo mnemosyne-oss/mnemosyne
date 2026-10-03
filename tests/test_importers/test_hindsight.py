@@ -133,6 +133,102 @@ def test_hindsight_importer_adds_quality_metadata_and_can_skip_low_value(tmp_pat
     assert "import_quality_flags" not in metadata
 
 
+def test_hindsight_importer_canonicalizes_offset_bearing_valid_until(tmp_path):
+    """#525: Hindsight _insert_episodic writes raw valid_until to
+    episodic_memory, so offset-bearing and space-separated naive values
+    must be canonicalized to aware UTC at the import boundary. Otherwise
+    the SQL chronological predicates misjudge them."""
+    from datetime import datetime, timedelta, timezone
+
+    future_offset = (datetime.now(timezone.utc) + timedelta(hours=4)).astimezone(
+        timezone(timedelta(hours=-2))
+    )
+    past_offset = (datetime.now(timezone.utc) - timedelta(hours=4)).astimezone(
+        timezone(timedelta(hours=14))
+    )
+    space_naive = (datetime.now(timezone.utc) + timedelta(hours=2)).replace(
+        tzinfo=None
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+    export = tmp_path / "hindsight-valid-until.json"
+    export.write_text(json.dumps({"items": [
+        {**_sample_items()[0], "id": "hs-future", "valid_until": future_offset.isoformat()},
+        {**_sample_items()[1], "id": "hs-past", "valid_until": past_offset.isoformat()},
+        {
+            "id": "hs-space",
+            "text": "Space-separated naive expiry imported from Hindsight.",
+            "fact_type": "world",
+            "mentioned_at": "2026-05-07T00:57:24.052845+00:00",
+            "valid_until": space_naive,
+        },
+    ]}), encoding="utf-8")
+
+    db_path = tmp_path / "mnemosyne.db"
+    mem = Mnemosyne(session_id="default", db_path=db_path)
+    result = HindsightImporter(file_path=str(export), bank="hermes").run(mem)
+
+    assert result.failed == 0
+    assert result.imported == 3
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    future_row = conn.execute(
+        "SELECT valid_until FROM episodic_memory WHERE content = ?",
+        ("Phin prefers full subject names instead of subject codes.",),
+    ).fetchone()
+    future_dt = datetime.fromisoformat(future_row["valid_until"])
+    assert future_dt.utcoffset() == timedelta(0)
+    assert future_dt > datetime.now(timezone.utc)
+
+    past_row = conn.execute(
+        "SELECT valid_until FROM episodic_memory WHERE content = ?",
+        ("Hindsight to Mnemosyne migration must preserve timestamps.",),
+    ).fetchone()
+    past_dt = datetime.fromisoformat(past_row["valid_until"])
+    assert past_dt.utcoffset() == timedelta(0)
+    assert past_dt < datetime.now(timezone.utc)
+
+    space_row = conn.execute(
+        "SELECT valid_until FROM episodic_memory WHERE content = ?",
+        ("Space-separated naive expiry imported from Hindsight.",),
+    ).fetchone()
+    assert "T" in space_row["valid_until"]
+    assert datetime.fromisoformat(space_row["valid_until"]).utcoffset() == timedelta(0)
+
+    # A still-valid imported summary must survive episodic recall; an
+    # expired one must not.
+    recall_contents = {r["content"] for r in mem.beam.recall("subject codes", top_k=20)}
+    assert "Phin prefers full subject names instead of subject codes." in recall_contents
+    recall_past = {r["content"] for r in mem.beam.recall("preserve timestamps", top_k=20)}
+    assert "Hindsight to Mnemosyne migration must preserve timestamps." not in recall_past
+
+
+def test_hindsight_importer_date_only_valid_until_passes_through(tmp_path):
+    """#525: date-only valid_until values keep pass-through semantics
+    across the Hindsight import boundary."""
+    export = tmp_path / "hindsight-date-only.json"
+    export.write_text(json.dumps({"items": [
+        {
+            **_sample_items()[0],
+            "id": "hs-date",
+            "valid_until": "2099-12-31",
+        },
+    ]}), encoding="utf-8")
+
+    db_path = tmp_path / "mnemosyne.db"
+    mem = Mnemosyne(session_id="default", db_path=db_path)
+    result = HindsightImporter(file_path=str(export), bank="hermes").run(mem)
+    assert result.imported == 1
+
+    conn = sqlite3.connect(db_path)
+    stored = conn.execute(
+        "SELECT valid_until FROM episodic_memory WHERE content = ?",
+        ("Phin prefers full subject names instead of subject codes.",),
+    ).fetchone()[0]
+    assert stored == "2099-12-31"
+
+
 def test_hindsight_importer_generates_binary_vectors_when_embedding_backend_available(tmp_path, monkeypatch):
     class FakeEmbeddingBackend:
         @staticmethod

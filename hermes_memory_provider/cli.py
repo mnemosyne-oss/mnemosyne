@@ -6,12 +6,67 @@ Available via: hermes mnemosyne <subcommand>
 from __future__ import annotations
 
 import json
+import importlib.metadata
+import re
 import sys
 from pathlib import Path
 
+
+def _guard_selected_site_packages_python_compatibility(selected_site_packages: Path) -> None:
+    """Reject a selected virtualenv that targets another Python minor version."""
+    selected_site_packages = selected_site_packages.resolve()
+    # Standard POSIX layouts put pyvenv.cfg three levels above site-packages
+    # (/venv/lib/pythonX/site-packages); Windows needs only two. Do not let
+    # this early bootstrap probe inspect arbitrary filesystem ancestors.
+    for candidate in (selected_site_packages, *selected_site_packages.parents[:3]):
+        config_path = candidate / "pyvenv.cfg"
+        if not config_path.exists():
+            continue
+        selected_version: tuple[int, int] | None = None
+        try:
+            config_text = config_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            config_text = ""
+        for line in config_text.splitlines():
+            name, separator, value = line.partition("=")
+            if separator and name.strip().lower() in {"version_info", "version"}:
+                match = re.search(r"(?<!\d)(\d+)\.(\d+)(?!\d)", value)
+                if match:
+                    selected_version = (int(match.group(1)), int(match.group(2)))
+                    break
+        runtime_version = sys.version_info[:2]
+        if selected_version is None or selected_version != runtime_version:
+            selected_text = (
+                f"{selected_version[0]}.{selected_version[1]}"
+                if selected_version is not None
+                else "unknown"
+            )
+            raise RuntimeError(
+                "Mnemosyne runtime Python compatibility error: "
+                f"runtime Python {runtime_version[0]}.{runtime_version[1]}; "
+                f"selected Mnemosyne environment Python {selected_text}. "
+                "Recreate the Mnemosyne environment using Hermes' Python, "
+                "then reinstall mnemosyne-hermes."
+            )
+        return
+
+
 _mnemosyne_root = Path(__file__).resolve().parent.parent
+# Standalone source-checkout CLI discovery uses the repository root here.
+# Guard only the direct virtualenv site-packages target selected by the issue
+# path, not arbitrary source-root ancestors.
+if _mnemosyne_root.name == "site-packages":
+    _guard_selected_site_packages_python_compatibility(_mnemosyne_root)
 if str(_mnemosyne_root) not in sys.path:
     sys.path.insert(0, str(_mnemosyne_root))
+
+
+def _distribution_version(distribution: str) -> str:
+    """Return an installed distribution version without importing package globals."""
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return "unavailable"
 
 
 def register_cli(subparser):
@@ -69,6 +124,11 @@ def mnemosyne_command(args):
         print("Usage: hermes mnemosyne {stats|sleep|version|inspect|clear|export|import}")
         return 1
 
+    if cmd == "version":
+        print(f"Mnemosyne {_distribution_version('mnemosyne-memory')}")
+        print(f"Mnemosyne Hermes {_distribution_version('mnemosyne-hermes')}")
+        return 0
+
     # Register Hermes host LLM backend so sleep uses Hermes' provider.
     # Use a try/except fallback chain: the relative import works when loaded
     # as part of the hermes_memory_provider package; the absolute import is
@@ -99,10 +159,6 @@ def mnemosyne_command(args):
         episodic = beam.get_episodic_stats()
         memoria = beam.get_memoria_stats()
         print(json.dumps({"working": working, "episodic": episodic, "memoria": memoria}, indent=2))
-
-    elif cmd == "version":
-        from mnemosyne import __version__
-        print(f"Mnemosyne v{__version__}")
 
     elif cmd == "sleep":
         dry_run = bool(getattr(args, "dry_run", False))
@@ -244,13 +300,13 @@ def mnemosyne_command(args):
             base_url = getattr(args, "base_url", None)
 
             def _print_import_result(result):
-                print(f"\nImport complete:")
+                print("\nImport complete:")
                 print(f"  Total found: {result.total}")
                 print(f"  Imported:    {result.imported}")
                 print(f"  Skipped:     {result.skipped}")
                 print(f"  Failed:      {result.failed}")
                 if result.errors:
-                    print(f"  Errors:")
+                    print("  Errors:")
                     for err in result.errors[:10]:
                         print(f"    - {err}")
                     if len(result.errors) > 10:
@@ -360,22 +416,28 @@ def mnemosyne_command(args):
         # File import
         force = getattr(args, "force", False)
         if not input_path:
-            print("Usage: hermes mnemosyne import --input <path> [--force]")
+            print("Usage: hermes mnemosyne import --input <path> [--force] [--dry-run]")
             print("       hermes mnemosyne import --from <provider> --api-key <key> [--dry-run]")
             print("       hermes mnemosyne import --list-providers")
             return 1
         try:
-            stats = mem.import_from_file(input_path, force=force)
+            stats = mem.import_from_file(input_path, force=force, dry_run=dry_run)
             beam_stats = stats.get("beam", {})
             legacy_stats = stats.get("legacy", {})
             triples_stats = stats.get("triples", {})
-            print(f"Import complete:")
+            print("Import complete:")
             print(f"  Working: +{beam_stats.get('working_memory', {}).get('inserted', 0)}")
             print(f"  Episodic: +{beam_stats.get('episodic_memory', {}).get('inserted', 0)}")
             print(f"  Legacy: +{legacy_stats.get('inserted', 0)}")
             print(f"  Triples: +{triples_stats.get('inserted', 0)}")
             if force:
-                print(f"  (force mode: overwrites applied)")
+                print(
+                    "  (force mode: overwrites would be applied)"
+                    if dry_run
+                    else "  (force mode: overwrites applied)"
+                )
+            if dry_run:
+                print("  (dry-run mode: no memories were written)")
         except Exception as e:
             print(f"Import failed: {e}")
             return 1

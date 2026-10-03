@@ -14,6 +14,8 @@ import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
+from mnemosyne.core.filters import _SYSTEM_DERIVED_WRITE_CAPABILITY
+
 
 DEFAULT_MODEL_CATEGORIES: Set[str] = {
     "model:user",
@@ -219,12 +221,17 @@ def infer_model_update_proposals(
         attempted_host = False
         raw = None
 
+    if local_llm._is_invalid_reasoning_output(raw):
+        return []
+
     if raw is None and not attempted_host:
         try:
             raw = local_llm._call_remote_llm(prompt, temperature=0.1)
         except Exception:
             raw = None
-    if not raw:
+    if isinstance(raw, str):
+        raw = local_llm._sanitize_reasoning_output(raw)
+    if not isinstance(raw, str) or not raw or local_llm._is_invalid_reasoning_output(raw):
         return []
     return parse_model_update_proposals(raw, allowed_categories=allowed)
 
@@ -393,6 +400,7 @@ def apply_model_refresh_proposal(
         metadata["body"],
         source="sleep_model_refresh",
         confidence=coerce_confidence(metadata.get("confidence"), 0.5),
+        _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
     )
     metadata["status"] = "applied"
     metadata["applied_by"] = validator or "system"

@@ -1,6 +1,8 @@
 """Tests for embedding multilingual model dimension detection and API model routing."""
 import os
 
+import pytest
+
 from mnemosyne.core import embeddings
 
 
@@ -30,7 +32,15 @@ def test_get_embedding_dim_multilingual_models():
     assert embeddings._get_embedding_dim("intfloat/multilingual-e5-small") == 384
     assert embeddings._get_embedding_dim("intfloat/multilingual-e5-base") == 768
     assert embeddings._get_embedding_dim("intfloat/multilingual-e5-large") == 1024
-    assert embeddings._get_embedding_dim("BAAI/bge-m3") == 1024
+
+
+@pytest.mark.parametrize("model", ["BAAI/bge-m3", "bge-m3"])
+def test_get_embedding_dim_bge_m3_aliases(monkeypatch, model):
+    """Both canonical and common bge-m3 names resolve to 1024 dimensions."""
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_DIM", raising=False)
+    for key in ("MNEMOSYNE_NO_EMBEDDINGS", "MNEMOSYNE_SKIP_EMBEDDINGS", "MNEMOSYNE_EMBEDDINGS_OFF"):
+        monkeypatch.delenv(key, raising=False)
+    assert embeddings._get_embedding_dim(model) == 1024
 
 
 def test_get_embedding_dim_jina_models():
@@ -67,10 +77,69 @@ def test_get_embedding_dim_env_override():
         del os.environ["MNEMOSYNE_EMBEDDING_DIM"]
 
 
-def test_get_embedding_dim_unknown_model_fallback():
-    """Unknown models fall back to 384 (bge-small default)."""
+def test_get_embedding_dim_unknown_model_raises(monkeypatch):
+    """An unlisted model with no MNEMOSYNE_EMBEDDING_DIM override raises instead
+    of silently assuming 384 (which corrupts vector search when the model's true
+    dimension differs)."""
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_DIM", raising=False)
+    for k in ("MNEMOSYNE_NO_EMBEDDINGS", "MNEMOSYNE_SKIP_EMBEDDINGS", "MNEMOSYNE_EMBEDDINGS_OFF"):
+        monkeypatch.delenv(k, raising=False)
+    # Assert the actionable message, not just the exception type: the error is
+    # the operator-facing contract (names the model and the fix).
+    with pytest.raises(ValueError, match="Unknown embedding model 'some/unknown-model'"):
+        embeddings._get_embedding_dim("some/unknown-model")
+    # Full actionable message for the empty model too: the quoted empty value
+    # and the MNEMOSYNE_EMBEDDING_DIM remediation, not just the prefix.
+    with pytest.raises(
+        ValueError,
+        match=r"Unknown embedding model ''.*Set MNEMOSYNE_EMBEDDING_DIM=<N>",
+    ):
+        embeddings._get_embedding_dim("")
+
+
+def test_get_embedding_dim_unknown_model_disabled_falls_back(monkeypatch):
+    """With embeddings disabled, the dimension is unused — keep the 384 fallback
+    so CI/opt-out invocations still import cleanly."""
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_DIM", raising=False)
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     assert embeddings._get_embedding_dim("some/unknown-model") == 384
-    assert embeddings._get_embedding_dim("") == 384
+
+
+@pytest.mark.parametrize(
+    "blank_value",
+    ["", "   ", "\t"],
+    ids=["empty", "spaces", "tab"],
+)
+def test_get_embedding_dim_blank_env_treated_as_unset(monkeypatch, blank_value):
+    """A set-but-blank MNEMOSYNE_EMBEDDING_DIM (empty or whitespace-only;
+    routine in Docker Compose `- VAR=${X}` with X unset, .env files, CI
+    matrices) is normalized to unset, not treated as an explicit value that
+    raises: a known model still resolves via the table, and an unknown model
+    still fails loud (blank == unset)."""
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_DIM", blank_value)
+    for k in ("MNEMOSYNE_NO_EMBEDDINGS", "MNEMOSYNE_SKIP_EMBEDDINGS", "MNEMOSYNE_EMBEDDINGS_OFF"):
+        monkeypatch.delenv(k, raising=False)
+    # Known model: blank override falls through to the table (no raise).
+    assert embeddings._get_embedding_dim("BAAI/bge-small-en-v1.5") == 384
+    # Unknown model: blank override == unset, so still fails loud.
+    with pytest.raises(ValueError):
+        embeddings._get_embedding_dim("some/unknown-model")
+
+
+def test_get_embedding_dim_invalid_explicit_raises(monkeypatch):
+    """An explicit but non-integer MNEMOSYNE_EMBEDDING_DIM is a config error."""
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_DIM", "not-a-number")
+    with pytest.raises(ValueError):
+        embeddings._get_embedding_dim("some/unknown-model")
+
+
+def test_get_embedding_dim_non_positive_explicit_raises(monkeypatch):
+    """MNEMOSYNE_EMBEDDING_DIM must be a positive integer; 0 and negatives are
+    not usable vector dimensions."""
+    for bad in ("0", "-1", "-384"):
+        monkeypatch.setenv("MNEMOSYNE_EMBEDDING_DIM", bad)
+        with pytest.raises(ValueError):
+            embeddings._get_embedding_dim("some/unknown-model")
 
 
 def test_get_embedding_dim_openai_models():

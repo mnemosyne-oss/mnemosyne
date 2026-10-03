@@ -9,6 +9,7 @@ Model cache: ~/.hermes/mnemosyne/models/
 Default model: openbmb/MiniCPM5-1B-GGUF (Q4_K_M, ~656MB)
 """
 
+import logging
 import os
 import sys
 import re
@@ -19,6 +20,8 @@ from typing import List, Optional
 DEFAULT_MODEL_REPO = "openbmb/MiniCPM5-1B-GGUF"
 DEFAULT_MODEL_FILE = "MiniCPM5-1B-Q4_K_M.gguf"
 MODEL_CACHE_DIR = Path.home() / ".hermes" / "mnemosyne" / "models"
+
+logger = logging.getLogger(__name__)
 
 LLM_ENABLED = os.environ.get("MNEMOSYNE_LLM_ENABLED", "true").lower() in ("1", "true", "yes")
 LLM_MAX_TOKENS=int(os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "2048") or "2048")
@@ -32,10 +35,41 @@ if _env_repo and _env_file:
     DEFAULT_MODEL_REPO = _env_repo
     DEFAULT_MODEL_FILE = _env_file
 
+# Override the cache location via env. Environment-only and read at import, like
+# the repo/file overrides above. Unset or blank keeps the historical path.
+#
+# `strip()` decides only whether anything was named; the raw value is what
+# becomes the path, because a POSIX directory name may legitimately begin or end
+# with whitespace and stripping it would silently select a different one.
+_env_cache_dir = os.environ.get("MNEMOSYNE_MODEL_CACHE_DIR", "")
+# Provenance, not a derived fact: the user may set the variable to exactly the
+# default path, so the value alone cannot say whether it was chosen explicitly.
+# The error message below reads differently in each case.
+MODEL_CACHE_DIR_FROM_ENV = bool(_env_cache_dir.strip())
+if MODEL_CACHE_DIR_FROM_ENV:
+    MODEL_CACHE_DIR = Path(_env_cache_dir).expanduser()
+
 # Remote API config
 LLM_BASE_URL = os.environ.get("MNEMOSYNE_LLM_BASE_URL", "").rstrip("/")
 LLM_API_KEY = os.environ.get("MNEMOSYNE_LLM_API_KEY", "")
 LLM_REMOTE_MODEL = os.environ.get("MNEMOSYNE_LLM_MODEL", "")
+
+# Optional named provider preset. When MNEMOSYNE_LLM_PROVIDER names a known
+# preset (see mnemosyne.core.llm_providers), it fills in the OpenAI-compatible
+# base URL and a default model for the selected MNEMOSYNE_LLM_REGION. Explicit
+# MNEMOSYNE_LLM_BASE_URL / MNEMOSYNE_LLM_MODEL always win, so existing
+# raw-env-var configurations behave exactly as before.
+LLM_PROVIDER = os.environ.get("MNEMOSYNE_LLM_PROVIDER", "").strip()
+LLM_REGION = os.environ.get("MNEMOSYNE_LLM_REGION", "").strip()
+if LLM_PROVIDER:
+    from mnemosyne.core.llm_providers import resolve_provider_defaults
+
+    _preset_base_url, _preset_model = resolve_provider_defaults(LLM_PROVIDER, LLM_REGION)
+    if not LLM_BASE_URL and _preset_base_url:
+        LLM_BASE_URL = _preset_base_url.rstrip("/")
+    if not LLM_REMOTE_MODEL and _preset_model:
+        LLM_REMOTE_MODEL = _preset_model
+
 LLM_TIMEOUT = float(os.environ.get("MNEMOSYNE_LLM_TIMEOUT", "60"))
 
 # Retryable errors only: 404/400 (model-not-found), 5xx, connection. Not 401/403/429.
@@ -45,6 +79,51 @@ LLM_FALLBACK_MODELS = [
 ]
 LLM_FALLBACK_BASE_URL = os.environ.get("MNEMOSYNE_LLM_FALLBACK_BASE_URL", "").rstrip("/") or LLM_BASE_URL
 LLM_FALLBACK_API_KEY = os.environ.get("MNEMOSYNE_LLM_FALLBACK_API_KEY", "") or LLM_API_KEY
+
+
+# Payload keys the extra body may not set. The merge happens last, so without
+# this a typo'd key would silently send different messages or a different model
+# than every log line and config value says, and the bug report would be
+# unreadable. Provider-specific keys, which is what the escape hatch is for,
+# are unaffected.
+_EXTRA_BODY_RESERVED = ("messages", "model", "stream")
+
+
+def _parse_extra_body(var: str) -> dict:
+    """Read a JSON object from ``var`` for merging into the request payload.
+
+    Carries keys the OpenAI-compatible shape has no name for (a thinking-mode
+    toggle, provider routing), one object per endpoint. Unset, blank, invalid
+    JSON or a non-object value all mean nothing is merged; a reserved key
+    (``messages``, ``model``, ``stream``) is dropped and the rest of the object
+    is kept. The rejected cases say so on stderr, since this runs at import
+    before logging is configured.
+    """
+    raw = os.environ.get(var, "").strip()
+    if not raw:
+        return {}
+    import json
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        print(f"[mnemosyne] {var} is not valid JSON, ignored: {exc}", file=sys.stderr)
+        return {}
+    if not isinstance(data, dict):
+        print(f"[mnemosyne] {var} must be a JSON object, ignored", file=sys.stderr)
+        return {}
+    reserved = [k for k in _EXTRA_BODY_RESERVED if k in data]
+    if reserved:
+        print(
+            f"[mnemosyne] {var} may not set {', '.join(reserved)}, "
+            "dropped from the request body",
+            file=sys.stderr,
+        )
+        data = {k: v for k, v in data.items() if k not in _EXTRA_BODY_RESERVED}
+    return data
+
+
+LLM_EXTRA_BODY = _parse_extra_body("MNEMOSYNE_LLM_EXTRA_BODY")
+LLM_FALLBACK_EXTRA_BODY = _parse_extra_body("MNEMOSYNE_LLM_FALLBACK_EXTRA_BODY")
 
 # Host LLM adapter (Hermes or another agent). Disabled by default to preserve
 # existing standalone behavior. When MNEMOSYNE_HOST_LLM_ENABLED=true and a
@@ -83,9 +162,47 @@ def _model_path() -> Optional[Path]:
     return candidate if candidate.exists() else None
 
 
+def _ensure_model_cache_dir() -> Path:
+    """Create the model cache directory, or fail naming it and why.
+
+    An explicitly set ``MNEMOSYNE_MODEL_CACHE_DIR`` is authoritative. Falling
+    back to the default on failure would reinstate the very location the user
+    moved away from, quietly, which is the substitution this override exists to
+    prevent.
+
+    The error is logged as well as raised. ``_load_llm()`` catches every
+    exception from the download path and degrades to AAAK, so a raised message
+    alone would never reach the user; logging is what makes "fail clearly"
+    actually clear.
+    """
+    if MODEL_CACHE_DIR_FROM_ENV:
+        source = f"MNEMOSYNE_MODEL_CACHE_DIR is set to {MODEL_CACHE_DIR}"
+        remedy = "Point it at a writable directory, or unset it to use the default."
+    else:
+        source = f"The model cache directory {MODEL_CACHE_DIR}"
+        remedy = "Set MNEMOSYNE_MODEL_CACHE_DIR to relocate it."
+
+    try:
+        MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        message = f"{source}, which could not be created ({exc}). {remedy}"
+        logger.error("%s", message)
+        raise RuntimeError(message) from exc
+
+    # Write *and* search: a directory can be mode 0o200, which passes W_OK while
+    # creating anything inside it still fails with PermissionError, because
+    # traversing into a directory needs the execute bit.
+    if not os.access(MODEL_CACHE_DIR, os.W_OK | os.X_OK):
+        message = f"{source}, which is not writable. {remedy}"
+        logger.error("%s", message)
+        raise RuntimeError(message)
+
+    return MODEL_CACHE_DIR
+
+
 def _download_model() -> Path:
     """Download the GGUF model from HuggingFace if not present."""
-    MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_model_cache_dir()
     local_path = MODEL_CACHE_DIR / DEFAULT_MODEL_FILE
     if local_path.exists():
         return local_path
@@ -97,6 +214,21 @@ def _download_model() -> Path:
             "huggingface_hub not installed. Run: pip install huggingface-hub"
         )
 
+    default_artifact = (
+        DEFAULT_MODEL_REPO == "openbmb/MiniCPM5-1B-GGUF"
+        and DEFAULT_MODEL_FILE == "MiniCPM5-1B-Q4_K_M.gguf"
+    )
+    size_notice = " (approximately 656 MB)" if default_artifact else ""
+    logger.warning(
+        "Downloading local LLM model %s from %s%s to %s. "
+        "The current operation will block until the download completes. "
+        "Set MNEMOSYNE_LLM_ENABLED=false for AAAK-only consolidation, "
+        "or pre-cache the GGUF to avoid this download.",
+        DEFAULT_MODEL_FILE,
+        DEFAULT_MODEL_REPO,
+        size_notice,
+        MODEL_CACHE_DIR,
+    )
     downloaded = hf_hub_download(
         repo_id=DEFAULT_MODEL_REPO,
         filename=DEFAULT_MODEL_FILE,
@@ -340,13 +472,52 @@ def _try_host_llm(
     # so _parse_facts() can consume them. Just trim whitespace.
     text = raw.strip() if isinstance(raw, str) and raw.strip() else None
     if text:
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        text = _sanitize_reasoning_output(text)
     return (True, text)
 
 
-def _clean_output(text: str) -> str:
+class _InvalidReasoningOutput:
+    """Private marker for a model response that must never be persisted."""
+
+    def __bool__(self) -> bool:
+        return False
+
+
+_INVALID_REASONING_OUTPUT = _InvalidReasoningOutput()
+
+
+def _is_invalid_reasoning_output(value: object) -> bool:
+    """Return whether *value* is an unsafe, malformed reasoning response."""
+    return value is _INVALID_REASONING_OUTPUT
+
+
+def _sanitize_reasoning_output(text: str):
+    """Remove balanced think traces and reject malformed traces fail-closed."""
+    if not isinstance(text, str):
+        return _INVALID_REASONING_OUTPUT
+    tags = list(re.finditer(r"<(/?)think\b[^>]*>", text, flags=re.IGNORECASE))
+    depth = 0
+    for tag in tags:
+        if tag.group(1):
+            depth -= 1
+            if depth < 0:
+                return _INVALID_REASONING_OUTPUT
+        else:
+            depth += 1
+            if depth > 1:
+                return _INVALID_REASONING_OUTPUT
+    if depth:
+        return _INVALID_REASONING_OUTPUT
+    return re.sub(
+        r"<think\b[^>]*>.*?</think\b[^>]*>", "", text, flags=re.DOTALL | re.IGNORECASE
+    ).strip()
+
+
+def _clean_output(text: str):
     """Strip assistant tokens and extra whitespace from model output."""
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = _sanitize_reasoning_output(text)
+    if _is_invalid_reasoning_output(text):
+        return text
     text = text.replace("<|assistant|>", "").replace("<|user|>", "")
     text = text.replace("</s>", "").strip()
     text = re.sub(r"^(Summarize the following memories.*?[.!?:]\s*)", "", text, flags=re.IGNORECASE | re.DOTALL)
@@ -455,6 +626,57 @@ def _is_retryable_status(status_code: int) -> bool:
     return False
 
 
+_DIAG_ESCAPES = {"\r": "\\r", "\n": "\\n", "\t": "\\t"}
+_DIAG_MAX_LEN = 60
+
+
+def _diag(value) -> str:
+    """Render one field from a remote body for a log line.
+
+    The value is whatever the endpoint sent, so it is neither trusted nor
+    bounded. Control characters are escaped, because this ends up in a
+    WARNING and a reply that could inject line breaks could forge log lines,
+    and the text is truncated, because a long field must not bury the rest
+    of the diagnostic.
+    """
+    out = []
+    for ch in str(value).replace("\\", "\\\\"):
+        if ch in _DIAG_ESCAPES:
+            out.append(_DIAG_ESCAPES[ch])
+        elif ch.isprintable():
+            out.append(ch)
+        else:
+            out.append(f"\\x{ord(ch):02x}")
+    text = "".join(out)
+    if len(text) > _DIAG_MAX_LEN:
+        text = text[:_DIAG_MAX_LEN] + "..."
+    return text
+
+
+class EmptyAnswer(Exception):
+    """A 2xx reply whose answer text is empty.
+
+    Carries what the body said about why. A thinking model that spends the
+    whole ``max_tokens`` budget on reasoning comes back ``finish_reason=length``
+    with ``reasoning_content`` set and ``content`` empty.
+
+    The attributes keep the raw values for callers; only the message text is
+    escaped and bounded, since that is what reaches a log line.
+    """
+
+    def __init__(self, finish_reason=None, reasoning_tokens=None, has_reasoning=False):
+        self.finish_reason = finish_reason
+        self.reasoning_tokens = reasoning_tokens
+        self.has_reasoning = has_reasoning
+        shown = _diag(finish_reason) if finish_reason else "n/a"
+        parts = [f"finish_reason={shown}"]
+        if reasoning_tokens is not None:
+            parts.append(f"reasoning_tokens={_diag(reasoning_tokens)}")
+        parts.append("reasoning_content present, content empty" if has_reasoning
+                     else "content empty")
+        super().__init__(", ".join(parts))
+
+
 def _call_remote_llm_with_model(
     prompt: str,
     model: str,
@@ -463,6 +685,7 @@ def _call_remote_llm_with_model(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     timeout: float = LLM_TIMEOUT,
+    extra_body: Optional[dict] = None,
 ) -> "tuple[Optional[str], Optional[int], Optional[Exception]]":
     """Call an OpenAI-compatible endpoint with a specific model name.
 
@@ -473,6 +696,10 @@ def _call_remote_llm_with_model(
       status code when available, else None. ``exc`` is the underlying exception
       (HTTPStatusError, ConnectError, TimeoutException, etc.) or None.
     - ``(None, None, exc)`` for non-HTTP failures (JSON decode, malformed body).
+    - ``(None, status, EmptyAnswer)`` for a 2xx whose answer text is empty.
+
+    ``extra_body`` is merged into the payload last, so a provider-specific
+    key such as a thinking toggle rides the same request.
 
     Callers (see ``_call_remote_llm``) use ``status`` to decide whether to
     retry against ``LLM_FALLBACK_MODELS``.
@@ -503,6 +730,8 @@ def _call_remote_llm_with_model(
         "stop": ["</s>", "<|user|>"],
         "stream": False
     }
+    if extra_body:
+        payload.update(extra_body)
 
     try:
         if has_httpx:
@@ -539,9 +768,29 @@ def _call_remote_llm_with_model(
         choices = data.get("choices", []) if isinstance(data, dict) else []
         if choices and choices[0].get("message", {}).get("content"):
             return (choices[0]["message"]["content"], status, None)
-        return (None, status, None)
+        first = choices[0] if choices and isinstance(choices[0], dict) else {}
+        message = first.get("message")
+        usage = data.get("usage") if isinstance(data, dict) else None
+        details = usage.get("completion_tokens_details") if isinstance(usage, dict) else None
+        return (None, status, EmptyAnswer(
+            finish_reason=first.get("finish_reason"),
+            reasoning_tokens=details.get("reasoning_tokens") if isinstance(details, dict) else None,
+            has_reasoning=bool(isinstance(message, dict) and message.get("reasoning_content")),
+        ))
     except Exception as exc:
         return (None, None, exc)
+
+
+# Most recent remote-call failure, for the caller's fallback WARNING.
+# _call_remote_llm_with_model returns the status and exception, but
+# _call_remote_llm returns only text or None, so without this the caller
+# could report that summarization failed, never why.
+_last_llm_failure: Optional[str] = None
+
+
+def last_llm_failure() -> Optional[str]:
+    """Return the most recent remote-call failure as "model: reason", or None."""
+    return _last_llm_failure
 
 
 def _call_remote_llm(prompt: str, temperature: float = 0.3) -> Optional[str]:
@@ -556,21 +805,35 @@ def _call_remote_llm(prompt: str, temperature: float = 0.3) -> Optional[str]:
     order. Returns the first successful response, or ``None`` if every
     model fails (caller falls through to local GGUF / None).
     """
+    global _last_llm_failure
     if not LLM_BASE_URL:
+        _last_llm_failure = "remote LLM not configured (MNEMOSYNE_LLM_BASE_URL unset)"
         return None
 
     primary = LLM_REMOTE_MODEL or "local"
-    candidates: List[tuple[str, str, str]] = [(primary, LLM_BASE_URL, LLM_API_KEY)]
+    candidates: List[tuple[str, str, str, dict]] = [
+        (primary, LLM_BASE_URL, LLM_API_KEY, LLM_EXTRA_BODY)]
     for fb in LLM_FALLBACK_MODELS:
         if fb and fb != primary:
-            candidates.append((fb, LLM_FALLBACK_BASE_URL or LLM_BASE_URL, LLM_FALLBACK_API_KEY or LLM_API_KEY))
+            candidates.append((fb, LLM_FALLBACK_BASE_URL or LLM_BASE_URL,
+                               LLM_FALLBACK_API_KEY or LLM_API_KEY, LLM_FALLBACK_EXTRA_BODY))
 
-    for model, base_url, api_key in candidates:
+    for model, base_url, api_key, extra_body in candidates:
         text, status, exc = _call_remote_llm_with_model(
-            prompt, model, temperature, base_url=base_url, api_key=api_key
+            prompt, model, temperature, base_url=base_url, api_key=api_key,
+            extra_body=extra_body,
         )
         if text:
             return text
+        if isinstance(exc, EmptyAnswer):
+            _last_llm_failure = f"{model}: HTTP {status} with no usable choices ({exc})"
+        elif exc is not None:
+            _last_llm_failure = (
+                f"{model}: {type(exc).__name__}: {str(exc) or repr(exc)} "
+                f"(timeout={LLM_TIMEOUT:g}s)"
+            )
+        else:
+            _last_llm_failure = f"{model}: HTTP {status} with no usable choices"
         if status is None:
             continue
         if not _is_retryable_status(status):
@@ -578,7 +841,9 @@ def _call_remote_llm(prompt: str, temperature: float = 0.3) -> Optional[str]:
     return None
 
 
-def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
+def _summarize_memories(
+    memories: List[str], source: str = ""
+):
     """Summarize a batch of working-memory items into a single episodic string.
 
     Fallback chain:
@@ -595,6 +860,9 @@ def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
     3. ctransformers (x86_64 only, legacy).
     4. Return None → caller falls back to AAAK encoding.
     """
+    # A failure left by an earlier call must not be reported for this one.
+    global _last_llm_failure
+    _last_llm_failure = None
     if not memories:
         return None
 
@@ -602,7 +870,7 @@ def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
     # chunk_memories_by_budget() respects LLM_N_CTX and safety margins.
     chunks = chunk_memories_by_budget(memories, source=source)
 
-    def _summarize_chunk(chunk_memories: List[str], chunk_source: str = "") -> Optional[str]:
+    def _summarize_chunk(chunk_memories: List[str], chunk_source: str = ""):
         """Summarize a single chunk of memories via the fallback chain."""
         host_prompt = _build_host_prompt(chunk_memories, source=chunk_source)
         prompt = _build_prompt(chunk_memories, source=chunk_source)
@@ -610,11 +878,15 @@ def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
         # 0. Host backend.
         attempted, text = _try_host_llm(host_prompt, max_tokens=LLM_MAX_TOKENS, temperature=0.3)
         if attempted:
+            if _is_invalid_reasoning_output(text):
+                return _INVALID_REASONING_OUTPUT
             if text:
                 return text
             raw = _call_local_llm(prompt)
             if raw:
                 cleaned = _clean_output(raw)
+                if _is_invalid_reasoning_output(cleaned):
+                    return _INVALID_REASONING_OUTPUT
                 return cleaned if cleaned else None
             return None
 
@@ -623,12 +895,16 @@ def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
             raw = _call_remote_llm(prompt)
             if raw:
                 cleaned = _clean_output(raw)
+                if _is_invalid_reasoning_output(cleaned):
+                    return _INVALID_REASONING_OUTPUT
                 return cleaned if cleaned else None
 
         # 2. Local LLM (llama-cpp-python or ctransformers fallback).
         raw = _call_local_llm(prompt)
         if raw:
             cleaned = _clean_output(raw)
+            if _is_invalid_reasoning_output(cleaned):
+                return _INVALID_REASONING_OUTPUT
             return cleaned if cleaned else None
         return None
 
@@ -636,6 +912,8 @@ def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
     chunk_summaries = []
     for chunk in chunks:
         summary = _summarize_chunk(chunk, chunk_source=source)
+        if _is_invalid_reasoning_output(summary):
+            return _INVALID_REASONING_OUTPUT
         if summary:
             chunk_summaries.append(summary)
 
@@ -645,6 +923,14 @@ def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
     # If multiple chunks, do a second-pass summary to consolidate chunk summaries.
     if len(chunk_summaries) > 1:
         final = _summarize_chunk(chunk_summaries, chunk_source=f"{source} [chunked {len(chunks)} parts]")
+        if _is_invalid_reasoning_output(final):
+            return _INVALID_REASONING_OUTPUT
         return final if final else chunk_summaries[0]
 
     return chunk_summaries[0]
+
+
+def summarize_memories(memories: List[str], source: str = "") -> Optional[str]:
+    """Public summary API; malformed reasoning degrades to no LLM output."""
+    summary = _summarize_memories(memories, source=source)
+    return summary if isinstance(summary, str) else None

@@ -27,7 +27,6 @@ These tests pin:
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 
 import numpy as np
@@ -178,6 +177,82 @@ def test_vector_voice_skips_expired_wm_rows(temp_db):
     ids = {r.memory_id for r in results}
     assert "wm-exp" not in ids, "expired WM row surfaced by vector voice"
     assert "wm-live" in ids
+
+
+def test_vector_voice_valid_until_offset_interpretation(temp_db):
+    """#525: vector voice applies the documented valid_until forms.
+
+    Writes go through remember(), whose write boundary canonicalizes
+    offset-bearing values to aware UTC; the vector voice then must keep
+    future and date-only rows, and drop past rows. Naive rows persisted
+    directly (bypassing write normalization) are interpreted as UTC, so
+    a future naive value must surface and a past one must be dropped.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    beam = BeamMemory(session_id="e5a-offset", db_path=temp_db)
+    future_offset = (
+        datetime.now(timezone.utc) + timedelta(hours=4)
+    ).astimezone(timezone(timedelta(hours=-2))).isoformat()
+    past_offset = (
+        datetime.now(timezone.utc) - timedelta(hours=4)
+    ).astimezone(timezone(timedelta(hours=14))).isoformat()
+
+    futures_id = beam.remember(
+        "future offset", source="test", importance=0.5,
+        valid_until=future_offset,
+    )
+    past_id = beam.remember(
+        "past offset", source="test", importance=0.5,
+        valid_until=past_offset,
+    )
+    naive_id = beam.remember("naive", source="test", importance=0.5)
+    date_id = beam.remember(
+        "date-only", source="test", importance=0.5, valid_until="2099-12-31",
+    )
+    past_date_id = beam.remember(
+        "past date-only", source="test", importance=0.5, valid_until="2000-01-01",
+    )
+    # Legacy naive timestamps, persisted directly to bypass the write
+    # boundary's UTC normalization, so the voice must parse them as UTC.
+    future_naive_id = beam.remember(
+        "future naive", source="test", importance=0.5,
+    )
+    past_naive_id = beam.remember(
+        "past naive", source="test", importance=0.5,
+    )
+    future_naive = (
+        datetime.now(timezone.utc) + timedelta(hours=4)
+    ).replace(tzinfo=None).isoformat()
+    past_naive = (
+        datetime.now(timezone.utc) - timedelta(hours=4)
+    ).replace(tzinfo=None).isoformat()
+    assert "+" not in future_naive and "+" not in past_naive
+    beam.conn.execute(
+        "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+        (future_naive, future_naive_id),
+    )
+    beam.conn.execute(
+        "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+        (past_naive, past_naive_id),
+    )
+    beam.conn.commit()
+
+    for mid in (
+        futures_id, past_id, naive_id, date_id, past_date_id,
+        future_naive_id, past_naive_id,
+    ):
+        _seed_embedding(beam.conn, mid, _unit_vec(seed=20))
+
+    engine = PolyphonicRecallEngine(db_path=temp_db, conn=beam.conn)
+    results = {r.memory_id for r in engine._vector_voice(_unit_vec(seed=20))}
+    assert futures_id in results, "future offset row dropped by vector voice"
+    assert past_id not in results, "past offset row surfaced by vector voice"
+    assert naive_id in results, "naive row dropped by vector voice"
+    assert date_id in results, "future date-only row dropped by vector voice"
+    assert past_date_id not in results, "past date-only row surfaced by vector voice"
+    assert future_naive_id in results, "future legacy-naive row dropped by vector voice"
+    assert past_naive_id not in results, "past legacy-naive row surfaced by vector voice"
 
 
 # ---------------------------------------------------------------------------

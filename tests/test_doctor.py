@@ -25,6 +25,7 @@ from mnemosyne.doctor import (
     STATUS_OK,
     STATUS_PRESENT_BUT_UNLOADABLE,
     STATUS_UNKNOWN,
+    STATUS_WARNING,
     SchemaFingerprint,
     TableFingerprint,
     build_doctor_report,
@@ -119,7 +120,7 @@ def test_open_readonly_doctor_db_rejects_schema_and_data_writes(tmp_path):
 
 
 def test_optional_sqlite_vec_load_keeps_doctor_connection_write_protected(tmp_path):
-    sqlite_vec = pytest.importorskip("sqlite_vec")
+    pytest.importorskip("sqlite_vec")
     db_path = tmp_path / "doctor.db"
     sqlite3.connect(db_path).close()
 
@@ -437,6 +438,107 @@ def test_runtime_metadata_is_retained_in_safe_doctor_artifacts(
         assert detail in markdown_artifact
 
 
+def test_safe_preview_redacts_cjk_labeled_secret():
+    """CJK-labelled secrets must be redacted in doctor previews (issue #806)."""
+    # nosec - test fixture
+    raw_secret = "s3cr3t_pa55word_x1y2z3w4"
+    preview = doctor.safe_preview(f"数据库密码：{raw_secret}", max_length=120)
+    assert raw_secret not in preview
+    assert "<redact" in preview
+
+
+def test_safe_preview_redacts_cjk_secret_with_trailing_prose():
+    """Trailing CJK prose must not let a CJK-labelled secret survive."""
+    # nosec - test fixture
+    raw_secret = "s3cr3t_pa55word_x1y2z3w4"
+    preview = doctor.safe_preview(f"数据库密码：{raw_secret}，请勿外传", max_length=120)
+    assert raw_secret not in preview
+    assert "<redact" in preview
+
+
+def test_safe_preview_keeps_cjk_policy_prose():
+    """Ordinary Chinese policy prose after a label must not be redacted."""
+    prose = "密码：建议每90天更换一次"
+    preview = doctor.safe_preview(prose, max_length=120)
+    assert prose in preview
+    assert "<redact" not in preview
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "password：建议每90天更换一次",
+        "password＝建议每90天更换一次",
+    ],
+)
+def test_safe_preview_keeps_english_label_fullwidth_separator_policy_prose(prose):
+    """English labels with fullwidth separators must not redact CJK prose."""
+    assert doctor.safe_preview(prose, max_length=120) == prose
+
+
+def test_safe_preview_keeps_cjk_ascii_prefix_then_prose():
+    """ASCII prefix followed by CJK prose must not be redacted."""
+    prose = "密码：abc12345我的密码"
+    preview = doctor.safe_preview(prose, max_length=120)
+    assert prose in preview
+    assert "<redact" not in preview
+
+
+def test_safe_preview_keeps_cjk_non_bmp_prefix_then_prose():
+    """Non-BMP CJK after an ASCII prefix must not be redacted."""
+    prose = "密码：abc12345\U00020000"
+    preview = doctor.safe_preview(prose, max_length=120)
+    assert prose in preview
+    assert "<redact" not in preview
+
+
+@pytest.mark.parametrize(
+    "character",
+    [
+        "\u3005",
+        "\u3006",
+        "\u3007",
+        "\u31f0",
+        "\U000323b0",
+        "\U0003347f",
+        "\uff21",
+        "\uffa0",
+        "\uffbf",
+        "\uffc1",
+        "\uffc8",
+        "\uffc9",
+        "\uffd0",
+        "\uffd1",
+        "\uffd8",
+        "\uffd9",
+    ],
+)
+def test_safe_preview_keeps_cjk_boundary_prefix_then_prose(character):
+    """CJK or fullwidth prose after an ASCII prefix must not be redacted."""
+    prose = f"密码：abc12345{character}"
+    preview = doctor.safe_preview(prose, max_length=120)
+    assert preview == prose
+    assert "<redacted>" not in preview
+
+
+@pytest.mark.parametrize("character", ["ſ", "ı", "İ", "K"])
+def test_safe_preview_keeps_unicode_casefold_equivalent_values(character):
+    """Unicode case-fold equivalents are not ASCII credential characters."""
+    prose = f"密码：!!!!!!!!{character}"
+    assert doctor.safe_preview(prose, max_length=120) == prose
+
+
+def test_safe_preview_redacts_cjk_secret_before_truncating():
+    """Truncation must not let a CJK-labelled secret value survive."""
+    # nosec - test fixture
+    raw_secret = "s3cr3t_pa55word_x1y2z3w4"
+    preview = doctor.safe_preview("x" * 90 + f" 数据库密码：{raw_secret}" + " trailing", max_length=120)
+    assert len(preview) <= 120
+    assert "<redacted>" in preview
+    assert raw_secret[:8] not in preview
+    assert raw_secret not in preview
+
+
 def test_safe_preview_caps_raw_text_before_regex_redaction(monkeypatch):
     """Unbounded input must not be handed to Doctor's regex redactors."""
 
@@ -716,6 +818,7 @@ def test_adapter_catalog_errors_are_unknown_and_redacted():
         "episodic_memory",
         "canonical_facts",
         "triples",
+        "media_moments",
     }
     assert all(metric == {"status": STATUS_UNKNOWN, "error_class": "database_error"} for metric in result.metrics.values())
     assert "private body" not in json.dumps(result.metrics)
@@ -1366,3 +1469,186 @@ def test_vector_coverage_treats_unloadable_vec0_as_degraded_not_corrupt(tmp_path
     assert coverage["working"]["vec0_status"] == STATUS_PRESENT_BUT_UNLOADABLE
     assert coverage["working"]["error_class"] == "operational_error"
     assert set(coverage["working"]) == {"status", "vec0_status", "error_class"}
+
+
+@pytest.mark.parametrize(
+    ("user_version", "expected_status", "warns"),
+    [
+        (0, "legacy_unnormalized", True),
+        (0x10000000, "legacy_unnormalized", True),
+        (0x20000000, "normalized", False),
+    ],
+)
+def test_vector_coverage_reports_the_vec_store_format_marker(
+    tmp_path, user_version, expected_status, warns
+):
+    """The dense=0 defect is invisible to every row count.
+
+    ``vec_working`` reports ``complete`` with a row present either way, because
+    blobs quantized without normalization are still well-formed, correctly sized
+    and fully counted.  Only the normalized-format marker separates them from
+    blobs written by the current code, and an unmarked store is routed
+    conservatively, so its dense scores stay unusable until a reindex.
+    """
+
+    conn = _queryable_vec0_fixture(
+        tmp_path,
+        f"""
+        CREATE TABLE working_memory (id TEXT PRIMARY KEY, valid_until TEXT, superseded_by TEXT);
+        CREATE TABLE memory_embeddings (memory_id TEXT PRIMARY KEY, embedding_json TEXT);
+        CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY);
+        INSERT INTO working_memory VALUES ('working-live', NULL, NULL);
+        INSERT INTO memory_embeddings VALUES ('working-live', '[0]');
+        INSERT INTO vec_working VALUES (1);
+        PRAGMA user_version = {user_version};
+        """,
+    )
+    try:
+        result = VectorCoverageAdapter(conn).inspect()
+    finally:
+        conn.close()
+
+    assert result.metrics["working"]["status"] == "complete"
+    assert result.metrics["vec_store_format"] == {
+        "status": expected_status,
+        "vec_tables": ["vec_working"],
+    }
+    if not warns:
+        assert result.findings == []
+        assert result.repair_candidates == []
+        return
+    assert [finding.code for finding in result.findings] == ["vectors.legacy_unnormalized_blobs"]
+    finding = result.findings[0]
+    assert finding.status == STATUS_WARNING
+    assert finding.severity == SEVERITY_WARNING
+    assert "mnemosyne reindex" in finding.message
+    assert [candidate.id for candidate in result.repair_candidates] == ["reindex-vector-store"]
+    candidate = result.repair_candidates[0]
+    assert candidate.finding_codes == ["vectors.legacy_unnormalized_blobs"]
+    assert candidate.requires_explicit_confirmation is True
+
+
+def test_vector_coverage_does_not_warn_about_an_unmarked_but_empty_vec_store(tmp_path):
+    """An unmarked store with no blobs has nothing that could be mis-encoded.
+
+    The marker is absent, which is the signal for "may hold pre-format rows",
+    but with no rows there is no dense score to lose, so the format is reported
+    without proposing a reindex.  A 3.x bank that only ever used JSON fallback
+    embeddings migrates to exactly this shape.
+    """
+
+    conn = _queryable_vec0_fixture(
+        tmp_path,
+        """
+        CREATE TABLE working_memory (id TEXT PRIMARY KEY, valid_until TEXT, superseded_by TEXT);
+        CREATE TABLE memory_embeddings (memory_id TEXT PRIMARY KEY, embedding_json TEXT);
+        CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY);
+        INSERT INTO working_memory VALUES ('working-live', NULL, NULL);
+        """,
+    )
+    try:
+        result = VectorCoverageAdapter(conn).inspect()
+    finally:
+        conn.close()
+
+    assert result.metrics["working"]["vec_working_rows"] == 0
+    assert result.metrics["vec_store_format"] == {
+        "status": "no_vectors",
+        "vec_tables": ["vec_working"],
+    }
+    assert result.findings == []
+    assert result.repair_candidates == []
+
+
+def test_vector_coverage_reports_no_vec_store_format_without_a_vec0_table(tmp_path):
+    """A plain table named ``vec_working`` is not a vector store to judge."""
+
+    conn = _readonly_fixture(
+        tmp_path,
+        """
+        CREATE TABLE working_memory (id TEXT PRIMARY KEY);
+        CREATE TABLE memory_embeddings (memory_id TEXT PRIMARY KEY, embedding_json TEXT);
+        CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY);
+        INSERT INTO working_memory VALUES ('working-live');
+        INSERT INTO memory_embeddings VALUES ('working-live', '[0]');
+        INSERT INTO vec_working VALUES (1);
+        """,
+    )
+    try:
+        result = VectorCoverageAdapter(conn).inspect()
+    finally:
+        conn.close()
+
+    assert result.metrics["vec_store_format"] == {"status": "not_configured", "vec_tables": []}
+    assert result.findings == []
+    assert result.repair_candidates == []
+
+
+def test_vector_coverage_reports_the_vec_store_format_when_the_catalog_is_unreadable(tmp_path, monkeypatch):
+    """The format key survives the catalog-error path like every other key."""
+
+    conn = _queryable_vec0_fixture(
+        tmp_path,
+        """
+        CREATE TABLE working_memory (id TEXT PRIMARY KEY, valid_until TEXT, superseded_by TEXT);
+        CREATE TABLE memory_embeddings (memory_id TEXT PRIMARY KEY, embedding_json TEXT);
+        CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY);
+        """,
+    )
+
+    def _broken_catalog(_conn, _scan_limit=doctor.DEFAULT_SCAN_LIMIT):
+        return doctor._CatalogResult(error_class="sqlite_error")
+
+    monkeypatch.setattr(doctor, "_catalog", _broken_catalog)
+    try:
+        result = VectorCoverageAdapter(conn).inspect()
+    finally:
+        conn.close()
+
+    assert result.metrics["vec_store_format"] == {
+        "status": STATUS_UNKNOWN,
+        "error_class": "sqlite_error",
+    }
+    assert result.findings == []
+
+
+def test_vector_coverage_does_not_assert_an_empty_format_when_vec0_is_unreadable(tmp_path):
+    """An unreadable vec0 table leaves no row count, so the format abstains.
+
+    Reporting ``no_vectors`` here would claim the store is empty when doctor
+    could not read it at all.  The coverage entry already reports the table as
+    unavailable, and this key must not contradict it.
+    """
+
+    db_path = tmp_path / "vec-format-unreadable.db"
+    writable = sqlite3.connect(db_path)
+    writable.executescript(
+        """
+        CREATE TABLE working_memory (id TEXT PRIMARY KEY);
+        CREATE TABLE memory_embeddings (memory_id TEXT PRIMARY KEY, embedding_json TEXT);
+        CREATE TABLE vec_working (id INTEGER PRIMARY KEY);
+        INSERT INTO working_memory VALUES ('working-live');
+        INSERT INTO memory_embeddings VALUES ('working-live', '[0]');
+        PRAGMA writable_schema = ON;
+        UPDATE sqlite_master SET sql =
+          'CREATE VIRTUAL TABLE vec_working USING vec0(embedding float[3])'
+          WHERE name = 'vec_working';
+        PRAGMA writable_schema = OFF;
+        """
+    )
+    writable.commit()
+    writable.close()
+
+    readonly = open_readonly_doctor_db(db_path)
+    try:
+        result = VectorCoverageAdapter(readonly).inspect()
+    finally:
+        readonly.close()
+
+    assert result.metrics["working"]["status"] == "unavailable"
+    assert result.metrics["vec_store_format"] == {
+        "status": STATUS_UNKNOWN,
+        "vec_tables": ["vec_working"],
+    }
+    assert result.findings == []
+    assert result.repair_candidates == []

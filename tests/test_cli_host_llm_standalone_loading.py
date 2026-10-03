@@ -81,35 +81,34 @@ def _clear_backend():
 
 
 @pytest.mark.parametrize("cli_path", CLI_COPIES, ids=[str(p.relative_to(REPO_ROOT)) for p in CLI_COPIES])
-def test_register_host_llm_reached_under_standalone_loading(fake_agent_module, cli_path):
-    """Loading cli.py via spec_from_file_location must still reach
-    register_hermes_host_llm() — the fallback import chain must succeed
-    even though the relative import fails.
-    """
+def test_register_host_llm_reached_under_standalone_loading(fake_agent_module, monkeypatch, cli_path):
+    """Standalone non-version commands must still register the host backend."""
     fake_agent_module.call_llm = MagicMock(return_value={"choices": [{"message": {"content": "ok"}}]})
 
     mod_name = f"_test_standalone_{cli_path.stem}_{hash(str(cli_path)) & 0xFFFFFFFF:x}"
     mod = _load_cli_standalone(cli_path, mod_name)
 
-    # Verify mnemosyne_command exists and is callable
     assert hasattr(mod, "mnemosyne_command"), f"{cli_path} does not define mnemosyne_command"
 
-    # Call mnemosyne_command with args that pass the early-return guard
-    # (mnemosyne_cmd must be set) but exercise a lightweight subcommand.
-    # "version" only needs to import mnemosyne.__version__ — no DB access.
-    # The registration happens before subcommand dispatch, so any valid cmd
-    # triggers it. We capture stdout to suppress the version output.
-    import argparse, io, contextlib
-    args = argparse.Namespace(mnemosyne_cmd="version")
-    with contextlib.redirect_stdout(io.StringIO()):
-        mod.mnemosyne_command(args)
+    from mnemosyne.core import beam as beam_module
 
-    # The backend should be registered — if the import fallback failed
-    # silently, this assertion fails.
+    class FakeBeam:
+        def get_working_stats(self):
+            return {}
+
+        def get_episodic_stats(self):
+            return {}
+
+        def get_memoria_stats(self):
+            return {}
+
+    monkeypatch.setattr(beam_module, "BeamMemory", lambda *_args, **_kwargs: FakeBeam())
+
+    import argparse, contextlib, io
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        mod.mnemosyne_command(argparse.Namespace(mnemosyne_cmd="stats"))
+
     backend = get_host_llm_backend()
-    assert backend is not None, (
-        f"register_hermes_host_llm() was not reached when loading {cli_path} "
-        f"via spec_from_file_location — the relative import likely failed "
-        f"silently and the fallback import was not attempted."
-    )
+    assert backend is not None
     assert backend.name == "hermes"

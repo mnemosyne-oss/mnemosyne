@@ -3,8 +3,10 @@
 Covers all upgrade paths: v2.7 → latest, source installs, PyPI installs,
 and systems with Python's `externally-managed-environment` (PEP 668).
 
-If you're on **v3.10.1** and want the latest (v3.11.0), jump to
-[Upgrading to v3.11.0](#upgrading-to-v3110-automated-sleep-model-refresh).
+If you want the latest (**v4.0.0**), jump to
+[Upgrading to v4.0.0](#upgrading-to-v400-multimodal-memory-and-the-embedding-dimension-guard).
+It is a major release and contains one breaking change; read that section
+before upgrading.
 Already on v3.8.0? See
 [Upgrading to v3.8.0](#upgrading-to-v380-sync-vecworking-and-reindex).
 
@@ -27,22 +29,237 @@ Already on v3.0.0? See [Upgrading to v3.0.0](#upgrading-to-v300-memoria-architec
 
 ---
 
-## Current / Unreleased — Hermes wrapper install safety
+## Upgrading to v4.0.0: Multimodal memory and the embedding-dimension guard
+
+A major release. Most installations can upgrade without doing anything; one
+group must set an environment variable first. Full detail in
+[docs/migration-4.0.md](docs/migration-4.0.md).
+
+This release also changes Hermes wrapper install behavior. See
+[Hermes wrapper install safety](#v400-hermes-wrapper-install-safety) below.
+
+### What changed
+
+- **Multimodal memory.** `BeamMemory.remember_media(ref)` registers a piece of
+  media, describes it through a configured provider, and writes the description
+  back as an ordinary memory that hybrid recall already understands. Text
+  recall is unchanged.
+- **MCP Streamable HTTP transport.** `mnemosyne mcp` gains
+  `--transport streamable-http` (alias `http`). The MCP extras now require
+  `mcp>=2.0.0`; the lockfile previously resolved 1.28.1. If your environment
+  pins the MCP SDK transitively, relax a `mcp<2` constraint or move to 2.0.0
+  or newer before upgrading.
+- **Unknown embedding models now fail loud** instead of silently resolving to
+  384 dimensions. This is the breaking change.
+
+### User action required
+
+Only if **both** of these are true: you point `MNEMOSYNE_EMBEDDING_API_URL` at
+a custom endpoint, **and** your model is not in the built-in model table and you
+have not set `MNEMOSYNE_EMBEDDING_DIM`.
+
+If that is you, startup now exits at import with an actionable error. Set the
+dimension your model actually produces:
+
+```bash
+mnemosyne config set embedding_dim 1024   # your model's real dimension
+```
+
+**If your store was created under the old silent-384 fallback**, setting the
+true dimension will trip the existing dimension-mismatch guard. That guard is
+not a corruption report; your memories are intact and recall falls back to
+keyword search until the index is rebuilt. Either keep the existing vectors by
+running with the dimension already in the database, or re-embed:
+
+```bash
+MNEMOSYNE_EMBEDDING_DIM=<N> mnemosyne reindex   # backs up first
+mnemosyne doctor                                # confirm embeddings_dim
+```
+
+Everyone else: no action. Default model users, anyone already setting
+`MNEMOSYNE_EMBEDDING_DIM`, and embeddings-disabled installs are unaffected.
+
+### New environment variables
+
+All multimodal, all opt-in, all defaulting to off or empty. Nothing dials out
+until `modality_enabled` is true.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MNEMOSYNE_MODALITY_ENABLED` | `false` | Master switch |
+| `MNEMOSYNE_MODALITY_BASE_URL` | *(unset)* | OpenAI-compatible endpoint |
+| `MNEMOSYNE_MODALITY_API_KEY` | *(unset)* | Bearer token |
+| `MNEMOSYNE_MODALITY_VISION_MODEL` | *(unset)* | Images and documents |
+| `MNEMOSYNE_MODALITY_VIDEO_MODEL` | *(unset)* | Video |
+| `MNEMOSYNE_MODALITY_AUDIO_MODEL` | *(unset)* | Audio |
+| `MNEMOSYNE_MODALITY_TIMEOUT` | `60` | Per-call timeout, seconds |
+
+**Setting these as environment variables may not work.** `config.yaml` takes
+precedence over the environment, and presence in the file decides it rather
+than the value. A config seeded on first run already contains these keys, so
+an `export` afterwards is ignored. Use `mnemosyne config set modality_enabled
+true` and the matching `modality_*` keys, or `mnemosyne config migrate` to
+import your current variables.
+
+### Schema changes
+
+Two new tables, `media_assets` and `media_moments`, created `IF NOT EXISTS`
+when a bank is opened. No migration step, no existing table altered, no action
+required. Databases that never use multimodal simply carry two empty tables.
+
+### Rollback to v3.15.1
+
+```bash
+pip install 'mnemosyne-memory==3.15.1'
+```
+
+The new tables are additive and are ignored by older versions, so no schema
+rollback is needed. If you set `MNEMOSYNE_EMBEDDING_DIM` to satisfy the new
+guard, leaving it set is harmless on the older version.
+
+## v4.0.0: Hermes wrapper install safety
 
 ### Updating a Hermes wrapper install
 
-For a persistent wrapper (the Docker/read-only deployment path), keep wrapper
-mode and name the Python environment that contains the selected package:
+A persistent wrapper (the Docker/read-only deployment path) must select a side
+venv with the same Python **major/minor** as the Hermes gateway. Do not use an
+unqualified `python3`: a wrapper whose selected venv has mismatched or
+unreadable version metadata now fails loudly during gateway activation, before
+that venv is added to `sys.path`.
+
+For a launcher-based Hermes installation, derive the gateway interpreter from
+the resolved `hermes` launcher before creating or selecting a side venv. This
+bounded launcher-sibling probe covers only that installation shape: it checks
+the launcher's sibling `python`, then `python3`. It is not a reproduction of
+the installer's broader internal discovery. If it cannot find a sibling,
+**stop** and determine the real gateway interpreter from the deployment; do not
+substitute the current-shell Python or guess another environment.
 
 ```bash
-mnemosyne-hermes install --mode wrapper --python /path/to/venv/bin/python --force
+HERMES_BIN="$(command -v hermes)" || {
+  printf 'Could not find the Hermes launcher on PATH\n' >&2
+  exit 1
+}
+HERMES_BIN="$(readlink -f "$HERMES_BIN")" || {
+  printf 'Could not resolve the Hermes launcher\n' >&2
+  exit 1
+}
+if [ ! -f "$HERMES_BIN" ] || [ ! -x "$HERMES_BIN" ]; then
+  printf 'Resolved Hermes launcher is not a regular executable file: %s\n' "$HERMES_BIN" >&2
+  exit 1
+fi
+HERMES_BIN_DIR="$(dirname "$HERMES_BIN")"
+if [ -f "$HERMES_BIN_DIR/python" ]; then
+  HERMES_PYTHON="$HERMES_BIN_DIR/python"
+elif [ -f "$HERMES_BIN_DIR/python3" ]; then
+  HERMES_PYTHON="$HERMES_BIN_DIR/python3"
+else
+  printf 'Could not find Hermes Python beside %s\n' "$HERMES_BIN" >&2
+  exit 1
+fi
+if [ ! -x "$HERMES_PYTHON" ]; then
+  printf 'Hermes Python is not executable: %s\n' "$HERMES_PYTHON" >&2
+  exit 1
+fi
+"$HERMES_PYTHON" --version || {
+  printf 'Hermes Python failed its version probe: %s\n' "$HERMES_PYTHON" >&2
+  exit 1
+}
 ```
 
-`--force` refreshes a wrapper only after that Python can resolve its
+For a healthy existing side venv, force-refresh the wrapper using its explicit
+interpreter (set `HERMES_HOME` first when the deployment does not use the
+default Hermes home):
+
+```bash
+set -e
+VENV=/path/to/venv
+"$VENV/bin/mnemosyne-hermes" install --mode wrapper --python "$VENV/bin/python" --force
+"$VENV/bin/mnemosyne-hermes" status
+```
+
+`--force` refreshes a wrapper only after the selected Python can resolve its
 site-packages and import `mnemosyne_hermes`; an invalid `--python` leaves the
 existing wrapper and opted-in profile links in place. Editable installs in the
-selected environment are supported. To intentionally replace a wrapper with
-the historical symlink install, acknowledge the mode change:
+selected environment are supported. Use `--force` only after confirming that
+the existing plugin target is the Mnemosyne wrapper or link you intend to
+replace.
+
+### Recovering from a wrapper runtime-Python compatibility error
+
+Do not try to activate the old selected venv. **Before running the recovery
+commands, including in a fresh shell, rerun the launcher-based discovery block
+above in that same shell.** It sets and version-probes `HERMES_PYTHON`; do not
+substitute the current-shell Python. Then create a new, dedicated side venv with
+`"$HERMES_PYTHON" -m venv`, then install `mnemosyne-hermes` and the selected
+wrapper requirement. Before recovery, explicitly set `MNEMOSYNE_PROFILE` to
+the value used by the existing wrapper: `embeddings` for the standard provider
+or `all` when its local-LLM extras are needed. This is a documentation-local
+selector, not a runtime setting the recovery commands can infer. Wrapper mode
+cannot use `core`: `mnemosyne-hermes` itself requires
+`mnemosyne-memory[embeddings]`. The following sequence uses a new path rather
+than overwriting an unconfirmed environment:
+
+```bash
+set -e
+if [ -z "${HERMES_PYTHON:-}" ] || [ ! -f "$HERMES_PYTHON" ] || [ ! -x "$HERMES_PYTHON" ]; then
+  printf 'HERMES_PYTHON is unset or not an executable file; rerun the launcher-based discovery block in this shell before recovery.\n' >&2
+  exit 1
+fi
+# For a non-default deployment/profile, replace both placeholders with its
+# existing paths. At the defaults, omit these two exports.
+export HERMES_HOME="<existing-Hermes-home>"
+export MNEMOSYNE_DATA_DIR="<existing-Mnemosyne-data-directory>"
+VENV=/path/to/new-mnemosyne-compatible-venv
+if [ -e "$VENV" ] || [ -L "$VENV" ]; then
+  printf 'Refusing to create recovery venv at existing path: %s\n' "$VENV" >&2
+  exit 1
+fi
+if [ -z "${MNEMOSYNE_PROFILE:-}" ]; then
+  printf 'MNEMOSYNE_PROFILE is required for recovery. Set it to the existing wrapper profile: embeddings or all.\n' >&2
+  exit 1
+fi
+case "$MNEMOSYNE_PROFILE" in
+  embeddings) MNEMOSYNE_REQUIREMENT="mnemosyne-memory[embeddings]" ;;
+  all) MNEMOSYNE_REQUIREMENT="mnemosyne-memory[all]" ;;
+  core)
+    printf 'MNEMOSYNE_PROFILE=core is unavailable for mnemosyne-hermes wrapper installs: mnemosyne-hermes requires mnemosyne-memory[embeddings]. Use embeddings or all.\n' >&2
+    exit 1
+    ;;
+  *)
+    printf 'Unsupported MNEMOSYNE_PROFILE: %s (expected embeddings or all)\n' "$MNEMOSYNE_PROFILE" >&2
+    exit 1
+    ;;
+esac
+"$HERMES_PYTHON" -m venv "$VENV"
+"$VENV/bin/python" -m pip install --upgrade "$MNEMOSYNE_REQUIREMENT" mnemosyne-hermes
+"$VENV/bin/mnemosyne-hermes" install --mode wrapper --python "$VENV/bin/python" --force
+"$VENV/bin/mnemosyne-hermes" status
+```
+
+Restart and validate on the same deployment/profile scope as the wrapper:
+
+- **Docker or Compose:** use the deployment tooling to restart the actual
+  Hermes container or Compose service. Do not substitute `hermes gateway
+  restart` for this deployment restart. After it is running, execute `hermes
+  memory status` inside that service for the default profile, or `hermes
+  --profile <name> memory status` for a named profile.
+- **Local installed gateway only:** use `hermes gateway restart`, then `hermes
+  memory status` for the default profile. For a named profile, use exactly:
+
+  ```bash
+  hermes --profile <name> gateway restart
+  hermes --profile <name> memory status
+  ```
+
+For a profile-local wrapper, set `HERMES_HOME` to that profile's home for both
+the force-refresh and wrapper `status` commands, then use that same profile
+name for the gateway/service status command above. Do not use the historical
+symlink migration as a compatibility repair; it stops using the wrapper's
+selected Python.
+
+To intentionally replace a wrapper with the historical symlink install,
+acknowledge the mode change:
 
 ```bash
 mnemosyne-hermes install --mode symlink --force --migrate-wrapper-to-symlink
@@ -92,7 +309,7 @@ Not recommended for shared/multi-app systems.
 **Solution 4: Source install with editable mode**
 
 ```bash
-git clone https://github.com/AxDSan/mnemosyne.git
+git clone https://github.com/mnemosyne-oss/mnemosyne.git
 cd mnemosyne
 pip install -e . --break-system-packages
 ```
@@ -728,7 +945,7 @@ hermes memory status
 PyPI does not serve individual files at browsable URLs. The file is
 available at the GitHub repo:
 
-  https://github.com/AxDSan/mnemosyne/blob/main/UPDATING.md
+  https://github.com/mnemosyne-oss/mnemosyne/blob/main/UPDATING.md
 
 ### Option B: Source install (`pip install -e .`)
 
@@ -936,7 +1153,7 @@ hermes mnemosyne import --input ~/backup.json
 PyPI does not serve individual package files at browsable URLs.
 The correct URL for the latest version is:
 
-  https://github.com/AxDSan/mnemosyne/blob/main/UPDATING.md
+  https://github.com/mnemosyne-oss/mnemosyne/blob/main/UPDATING.md
 
 The file IS included in the sdist and wheel — `pip show -f
 mnemosyne-memory` will confirm it ships.

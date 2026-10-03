@@ -12,7 +12,7 @@ Browse, search, and manage Mnemosyne memory directly in VS Code.
 
 ## Requirements
 
-- [Mnemosyne](https://github.com/AxDSan/mnemosyne) installed (`pip install mnemosyne-memory`)
+- [Mnemosyne](https://github.com/mnemosyne-oss/mnemosyne) installed (`pip install mnemosyne-memory`)
 - Python 3.9+ available on PATH
 
 ## Extension Settings
@@ -34,7 +34,7 @@ Browse, search, and manage Mnemosyne memory directly in VS Code.
 ## For Developers
 
 ```bash
-git clone https://github.com/AxDSan/mnemosyne.git
+git clone https://github.com/mnemosyne-oss/mnemosyne.git
 cd integrations/vscode-mnemosyne
 npm install
 npm run compile

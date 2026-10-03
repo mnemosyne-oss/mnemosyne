@@ -25,6 +25,13 @@ class _Provider:
     def handle_tool_call(self, _tool_name, _arguments):
         return '{"status": "ok"}'
 
+    def _handle_persona_tool(self, tool_name, arguments):
+        adapter = persona_adapter.PersonaAdapter(beam_instance=self._beam)
+        return adapter.handle_tool_call(tool_name, arguments)
+
+    def get_tool_schemas(self):
+        return [{"name": "mnemosyne_persona_promote", "description": ""}]
+
 
 class _PersonaAdapter:
     received_beam = None
@@ -51,3 +58,32 @@ def test_persona_tool_uses_plugin_registered_provider_beam(monkeypatch):
     context.tools["mnemosyne_persona_promote"]({"memory_id": "memory-1"})
 
     assert _PersonaAdapter.received_beam is provider._beam
+
+
+def test_plugin_registration_honors_tool_allowlist_before_initialize(tmp_path, monkeypatch):
+    """Standalone PluginManager registration must not advertise excluded tools."""
+    (tmp_path / "config.yaml").write_text(
+        "memory:\n"
+        "  mnemosyne:\n"
+        "    tools:\n"
+        "      - mnemosyne_remember\n"
+        "      - mnemosyne_recall\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(plugin, "_provider", None)
+
+    context = _Context()
+    plugin.register(context)
+
+    assert list(context.tools) == ["mnemosyne_remember", "mnemosyne_recall"]
+
+
+def test_plugin_registration_without_allowlist_exposes_full_surface(monkeypatch):
+    """Standalone PluginManager preserves the complete historical tool surface."""
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setattr(plugin, "_provider", None)
+
+    context = _Context()
+    plugin.register(context)
+
+    assert list(context.tools) == [schema["name"] for schema in plugin.ALL_TOOL_SCHEMAS]

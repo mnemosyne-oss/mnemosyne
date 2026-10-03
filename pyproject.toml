@@ -53,29 +53,75 @@ classifiers = [
 
 [project.optional-dependencies]
 llm = ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20"]
-embeddings = ["fastembed>=0.3.0", "sqlite-vec>=0.1.0"]
-mcp = ["mcp>=2.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'"]
+embeddings = ["fastembed>=0.3.0", "onnxruntime>=1.21.0,<1.29", "sqlite-vec>=0.1.9,<0.1.10"]
+mcp = ["mcp>=2.0.0,!=2.1.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'"]
 openclaw = ["openclaw>=0.1.0; python_version >= '3.10'"]
 sync = ["cryptography>=41.0"]
-test = ["pytest>=7.0"]
-all = ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20", "fastembed>=0.3.0", "sqlite-vec>=0.1.0", "mcp>=2.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'", "cryptography>=41.0"]
-dev = ["pytest>=7.0", "build", "twine", "ruff==0.15.22"]
+# PDF text extraction and scanned-page rendering for remember_media().
+media = ["pypdfium2>=4.30", "pillow>=10"]
+test = ["pytest>=7.0", "pytest-timeout>=2.1", "build", "httpx>=0.27", "tomli>=2.0; python_version < '3.11'"]
+all = ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20", "fastembed>=0.3.0", "onnxruntime>=1.21.0,<1.29", "sqlite-vec>=0.1.9,<0.1.10", "mcp>=2.0.0,!=2.1.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'", "cryptography>=41.0"]
+dev = ["pytest>=7.0", "pytest-timeout>=2.1", "build", "httpx>=0.27", "twine", "ruff==0.15.22"]
 
 [project.urls]
-Homepage = "https://github.com/AxDSan/mnemosyne"
-Repository = "https://github.com/AxDSan/mnemosyne"
-Issues = "https://github.com/AxDSan/mnemosyne/issues"
-Documentation = "https://github.com/AxDSan/mnemosyne/blob/main/docs/README.md"
+Homepage = "https://github.com/mnemosyne-oss/mnemosyne"
+Repository = "https://github.com/mnemosyne-oss/mnemosyne"
+Issues = "https://github.com/mnemosyne-oss/mnemosyne/issues"
+Documentation = "https://github.com/mnemosyne-oss/mnemosyne/blob/main/docs/README.md"
 
 [project.scripts]
-mnemosyne-install = "mnemosyne.install:install"
-mnemosyne-uninstall = "mnemosyne.install:uninstall"
+mnemosyne-install = "mnemosyne.install:main"
+mnemosyne-uninstall = "mnemosyne.install:uninstall_main"
 mnemosyne = "mnemosyne.cli:run_cli"
 mnemosyne-browser = "mnemosyne.integrations.memory_browser:main"
 mnemosyne-auto-save = "mnemosyne.integrations.auto_save_openwebui:main"
 
 [tool.setuptools.packages.find]
-exclude = ["tests*", "benchmark*", "_benchmarks*", "scripts*", "docs*", "assets*"]
+exclude = ["tests*", "benchmark*", "_benchmarks*", "scripts*", "docs*", "assets*", "examples*", "integrations*"]
+
+[tool.setuptools.package-data]
+hermes_memory_provider = ["plugin.yaml"]
 
 [tool.setuptools.dynamic]
 version = {attr = "mnemosyne.__version__"}
+
+# ---------------------------------------------------------------------------
+# Ruff configuration (CI-enforced subset).
+#
+# Only a sliver of ruff's ruleset is enforced in CI today; the gating
+# rubric lives in `.github/workflows/ci.yml` so contributors can see at
+# a glance what blocks merge. This `[tool.ruff.lint]` section exists
+# for two reasons:
+#   (1) documents the rule families the project cares about
+#   (2) lets `ruff check` (run with no `--select`) exercise the F/RUF022
+#       subset locally — but only for files governed by THIS root config.
+#       NOTE: files under integrations/hermes/ are covered by a nested
+#       pyproject.toml with its own broader selection (E,W,F,I,B,C4,UP),
+#       so a bare `ruff check` there will apply that nested config, not
+#       this one. The authoritative CI command is always
+#       `ruff check --select F,RUF022 -- <changed files>` (ci.yml),
+#       which is config-agnostic. CI also adds a separate whole-tree E9
+#       fatal gate (syntax errors) that this config does not select.
+#
+# If you add or remove rules here, mirror the change in ci.yml so the
+# two stay in sync.
+# ---------------------------------------------------------------------------
+[tool.ruff.lint]
+# Pyflakes (F): unused imports, undefined names, dead locals, etc.
+# We deliberately stay on the "F" + "RUF022" subset rather than turning
+# on a broader lint rubric — see `.github/workflows/ci.yml` for the
+# gating rubric and PR history for the discussion (PR #483 followup).
+select = [
+  "F",        # pyflakes (F401 unused imports, F841 dead locals, F541 unparsed f-strings, etc.)
+  "RUF022",   # checks ordering of existing `__all__` definitions (does NOT require them)
+]  # NOTE: F covers F63, F7, F82 but NOT E9 — the E9 fatal gate lives in ci.yml only
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
+# No single test should take five minutes. The cap exists so a deadlock is
+# reported as one named failing test within minutes instead of stalling the
+# job until the workflow timeout, which tells us nothing about where it hung.
+# The signal method fails only the offending test and lets the rest of the
+# suite finish, so a hang still produces a full picture of the run.
+timeout = 300
+timeout_method = "signal"

@@ -19,7 +19,7 @@ expose sensitive information. If you find something, we want to know.
 
 Instead:
 
-- **Open a [GitHub Issue](https://github.com/AxDSan/mnemosyne/issues) marked as sensitive** 
+- **Open a [GitHub Issue](https://github.com/mnemosyne-oss/mnemosyne/issues) marked as sensitive** 
   (GitHub lets you flag an issue as confidential when filing it)
 - Or **DM @AxDSan** directly on GitHub or Discord
 

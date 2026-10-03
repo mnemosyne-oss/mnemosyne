@@ -1,0 +1,60 @@
+name: mnemosyne
+kind: exclusive
+version: 0.7.3
+description: "Native local memory for Hermes - SQLite with vector search, FTS5 hybrid ranking, episodic consolidation, and temporal triples. Zero cloud. Installed from the Hermes plugin catalog; the implementation is the mnemosyne-hermes package declared in pyproject.toml."
+author: Abdias J
+# A floor, not a pin: Hermes refuses to load this plugin when the running version fails this
+# specifier, so the value names the first Hermes release that carries both halves of the catalog
+# path this wrapper depends on: declared Python dependencies installed and re-applied after
+# `hermes update` (hermes-agent#113851, commit 96e8a23222) and automatic catalog install of
+# memory providers that leave core (#114569, commit d177b119). Both landed on Hermes `main`
+# after the 0.21.3 release (tag v2026.9.14, 2026-09-14), and `hermes_cli/plugin_python_deps.py`
+# does not exist at that tag, so 0.21.3 loads this plugin without the install path it needs.
+# Load-blocking below 0.21.4 is the intended fail-closed behaviour, not a defect: do not lower
+# this to a release that predates hermes-agent#113851. Raised at hermes-agent#113581.
+requires_hermes: ">=0.21.4"
+provides_tools:
+  - mnemosyne_apply_pending
+  - mnemosyne_batch
+  - mnemosyne_diagnose
+  - mnemosyne_export
+  - mnemosyne_forget
+  - mnemosyne_forget_canonical
+  - mnemosyne_get
+  - mnemosyne_graph_link
+  - mnemosyne_graph_query
+  - mnemosyne_import
+  - mnemosyne_invalidate
+  - mnemosyne_model_card
+  - mnemosyne_model_refresh
+  - mnemosyne_persona_demote
+  - mnemosyne_persona_list
+  - mnemosyne_persona_promote
+  - mnemosyne_persona_reinforce
+  - mnemosyne_recall
+  - mnemosyne_recall_canonical
+  - mnemosyne_recall_diagnostics
+  - mnemosyne_remember
+  - mnemosyne_remember_canonical
+  - mnemosyne_remember_media
+  - mnemosyne_scratchpad_clear
+  - mnemosyne_scratchpad_read
+  - mnemosyne_scratchpad_write
+  - mnemosyne_shared_forget
+  - mnemosyne_shared_recall
+  - mnemosyne_shared_remember
+  - mnemosyne_shared_stats
+  - mnemosyne_sleep
+  - mnemosyne_stats
+  - mnemosyne_sync_pull
+  - mnemosyne_sync_push
+  - mnemosyne_sync_status
+  - mnemosyne_task_progress
+  - mnemosyne_triple_add
+  - mnemosyne_triple_end
+  - mnemosyne_triple_query
+  - mnemosyne_update
+  - mnemosyne_validate
+provides_hooks: []
+provides_middleware: []
+requires_env: []

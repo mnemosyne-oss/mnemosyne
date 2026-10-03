@@ -69,9 +69,33 @@ def _close_cached_connections():
     except Exception:
         pass
 
+    # Same reasoning for the modality registry, which is also a process-global.
+    # This reset ships in the PR that introduces the registry: a later one is
+    # one bled-through global away from a flaky matrix, and the symptom would be
+    # a privacy test passing for the wrong reason.
+    try:
+        from mnemosyne.core import modality_backends as _modality_mod
+        _modality_mod.clear_modality_backends()
+    except Exception:
+        pass
+
+    # Same reasoning for the content-resolver registry. Note this clears only
+    # explicit registrations: the built-in blob resolver survives, so tests
+    # that read blobs still work after the reset.
+    try:
+        from mnemosyne.core import resolvers as _resolvers_mod
+        _resolvers_mod.clear_content_resolvers()
+    except Exception:
+        pass
+
+
+@pytest.fixture
+def _before_connection_reset():
+    """Overridable hook for setup that must precede connection imports."""
+
 
 @pytest.fixture(autouse=True)
-def _reset_thread_local_connections():
+def _reset_thread_local_connections(_before_connection_reset):
     """
     Auto-use fixture that resets thread-local SQLite connection caches
     before and after every test. This prevents connection leakage between

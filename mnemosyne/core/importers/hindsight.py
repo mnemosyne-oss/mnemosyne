@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
+from mnemosyne.core.beam import _normalize_valid_until
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
 
 logger = logging.getLogger(__name__)
@@ -375,7 +376,7 @@ class HindsightImporter(BaseImporter):
             mem.get("veracity", "imported"),
             mem.get("created_at") or mem.get("timestamp"),
             None,
-            mem.get("valid_until"),
+            _normalize_valid_until(mem.get("valid_until")),
             mem.get("channel_id"),
             mem.get("author_id"),
             mem.get("scope", "global"),
@@ -393,7 +394,14 @@ class HindsightImporter(BaseImporter):
         if not (_embeddings and _embeddings.available()):
             logger.debug("backfill: embeddings unavailable, skipping vector for rowid=%s", rowid)
             return
-        vecs = _embeddings.embed([content])
+        try:
+            vecs = _embeddings.embed([content])
+        except Exception as exc:
+            logger.debug(
+                "backfill: embed() raised for rowid=%s (%s: %s); skipping vector",
+                rowid, type(exc).__name__, exc,
+            )
+            return
         if vecs is None:
             logger.debug("backfill: embed() returned None for rowid=%s, content=%.50r", rowid, content)
             return

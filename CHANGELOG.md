@@ -9,21 +9,237 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Added
 
+- **`mnemosyne_remember_media` tool and `mnemosyne media` CLI command.** Media understanding was SDK-only. It is now a tool over MCP (with a per-call tenant `bank`) and in both Hermes providers, and a CLI command. Because a tool caller can be a remote MCP client or a model steered by what it just read, the tool refuses local paths unless they resolve, after symlinks, inside `MNEMOSYNE_MEDIA_ALLOWED_PATHS`, refuses URLs that resolve to loopback, private or link-local addresses unless `MNEMOSYNE_MEDIA_ALLOW_PRIVATE_URLS` is set, and caps inline `data:` payloads at 25 MB. The CLI and SDK stay unrestricted. The Hermes catalog manifest declares the new tool.
+- **Opt-in persistent recall provenance logging (`MNEMOSYNE_RECALL_PROVENANCE=1`).** `BeamMemory.recall()` can now append one JSONL line per call to `<db>.recall_provenance.jsonl` next to the database, one file per database so two stores in one directory never share an audit trail. Each line records the query (truncated to 200 chars of raw query text), `top_k`, and the first 20 returned memories with their tier, score, importance and timestamp; no content previews are written, so the audit trail answers "which memories shaped this answer?" without duplicating the store. The file is created with `0600` permissions regardless of umask, rotates at 1 MB into a single `.1` generation (retention is the current file plus one rotated generation, capped at roughly 2 MB), and reads examine at most the last 256 KB of the current generation. The new `mnemosyne/core/recall_provenance.py` also exposes `read_recall_provenance()` for newest-first bounded reads (`limit` is a cap, not a guarantee) and `cleanup_orphaned_provenance()` to remove the audit file once its database is gone (call it at init/upgrade time; it is not wired into recall). The flag is read per call (so it can be toggled without rebuilding `BeamMemory`) and defaults to OFF, keeping the zero-config no-surprise-writes contract. The honest cost when enabled is one small locked append per call: bounded record, per-store locks so different databases never serialize against each other, no fsync, and one `os.write` per record on an O_APPEND fd, which keeps records intact across processes on local Linux filesystems (interleaving can only happen between records, never within one); NFS and network filesystems are not supported. Every failure is swallowed and logged at debug level (fail-open), so a provenance problem never breaks recall. `explain=True` calls are intentionally not logged: the explain trace returned to the caller is already the audit surface for that call. Coverage is the linear recall path: provenance is suppressed only when `recall_enhanced()` takes its enhanced branch (`MNEMOSYNE_ENHANCED_RECALL=1`, which calls `recall()` with `_skip_provenance=True`) and on polyphonic delegation, which returns before the hook; with `MNEMOSYNE_ENHANCED_RECALL` unset, `recall_enhanced()` is a plain passthrough into `recall()` and its calls are logged. This complements the in-process recall diagnostics counters, which count signals per measurement window but do not persist query-to-result mappings.
+
+- **`TripleStore.for_bank(bank)`** returns a `TripleStore` backed by the given bank's own `mnemosyne.db`, the same file the `mnemosyne_triple_add`/`mnemosyne_triple_query` MCP tools already read and write for that bank. Bare `TripleStore()` still defaults to its own standalone `triples.db`, unchanged, so existing callers and the existing `triples.db` are unaffected; `for_bank()` is a new way to get a store that lines up with what a bank's own MCP tools see (#548).
+
+- **`mnemosyne doctor` now reports the vector store's write format, and warns when the stored blobs predate it.** Counting rows cannot see the dense-recall defect that a reindex repairs: blobs quantized without normalization are present, well-formed, correctly sized and fully counted, so `vec_working` and `vec_episodes` both read `complete` while every blob's norm is wrong. A wrong norm inflates raw-L2 distance regardless of direction and clamps stored-blob cosine toward zero, so dense episodic recall returns nothing useful while coverage calls the store healthy. `vector_coverage` gains a `vec_store_format` entry (`normalized`, `legacy_unnormalized`, `no_vectors`, `not_configured` or `unknown`) read from the normalized-format marker on the database's `user_version` rather than from a sample of the data, because a probabilistic verdict is not a retrieval guarantee; an unmarked store is routed conservatively, so recall stays correct, but its dense scores remain unusable until the rows are re-embedded. An unmarked store with rows warns (`vectors.legacy_unnormalized_blobs`) and offers a `reindex-vector-store` repair candidate naming `mnemosyne reindex`; a marked store is silent, and an unmarked store with no vec rows reports its format without warning because it holds no blob that could have been mis-encoded (`vec_facts` is excluded on the same grounds — it is recreated empty by a reindex and still has no writer). Read-only throughout, and a `beam` import that fails degrades the entry to `unknown` rather than to a verdict doctor cannot support.
+
+- **A Hermes plugin-catalog directory, `integrations/hermes-catalog/`.** The catalog installs a directory, not a pip package, and a `plugin.yaml` with nothing loadable beside it installs and does nothing (hermes-agent#113851). The new directory is a thin wrapper: `plugin.yaml` (`name: mnemosyne`, `kind: exclusive`, `requires_hermes: ">=0.21.4"` and the tool list), a `pyproject.toml` whose dependencies (`mnemosyne-hermes`, `mnemosyne-memory[embeddings]`) Hermes installs into its venv and re-applies after every update, and an `__init__.py` that re-exports the package's registration hooks. The PyPI project in `integrations/hermes/` is untouched, per #859. Validated with `hermes plugins validate` at hermes-agent a08dee94, the #113851 merge on Hermes `main` rather than a released version. The `requires_hermes` floor names 0.21.4, the first Hermes release that carries both halves of the catalog path: declared Python dependencies installed and re-applied after `hermes update` (`96e8a23222`, hermes-agent#113851) and memory providers that leave core installed from the catalog automatically (hermes-agent#114569). Both landed on Hermes `main` after the 0.21.3 release (tag v2026.9.14) and are not in it, so a 0.21.3 install would load this plugin without the install path. Hermes refuses to load the plugin when the running version fails this specifier, so the gate fails closed below 0.21.4 by design; bump the floor only to a release that contains both behaviours, and only once that release is published.
+- **Multi-token SSE auth with per-agent identity (`MNEMOSYNE_MCP_TOKENS`, issue #761).** The SSE and Streamable HTTP MCP servers accept a JSON object of named bearer tokens; each client authenticates with its own token, and in this opt-in multi-agent mode the matched token's name is the **authoritative** author identity on memories that client creates — a conflicting client-supplied `author_id` is rejected before any write (a matching or omitted `author_id` is fine). Non-string JSON names/secrets fail at startup instead of being coerced. Enables one instance to serve several agents with distinct audit attribution and per-agent token rotation/revocation. The session's identity is bound through the transports' native session ownership: the matched token name is exposed as an authenticated principal, so a request for a session presented with a different valid token is rejected exactly as if the session did not exist (SSE via `SseServerTransport._session_owners`, Streamable HTTP via the stateful session manager's principal check), and the binding is dropped on disconnect. Setting the variable to an empty or whitespace-only value fails at startup on every host (loopback included) instead of silently falling back to the legacy token, as do empty mappings, duplicate names (exact JSON duplicates and names colliding after whitespace normalization), and duplicate secrets; because the variable is evaluated before the loopback bypass, a valid mapping opts into multi-agent mode on every host — bearer auth with per-agent identity is enforced even on loopback. Single-token `MNEMOSYNE_MCP_TOKEN` is unchanged and fully backward compatible: it authenticates requests but binds no session-owning principal and introduces no author identity (explicit `author_id` / `MNEMOSYNE_AUTHOR_ID` keep their prior precedence).
+
+- **The MCP tool surface now declares its per-call `bank` parameter.** `_resolve_bank()` has always read `arguments["bank"]` before falling back to `MNEMOSYNE_MCP_BANK`, so 24 of 29 handlers already routed each call to its own `Mnemosyne(bank=...)` instance rather than the process-global default. Only three schemas said so, which left the capability undiscoverable: a conforming MCP client cannot use a parameter that is not advertised, and a client validating arguments against the published schema may strip it. Every MCP-served tool that routes on it, 25 of the 29 the dispatcher handles, now declares `bank`, so a single MCP server can serve more than one tenant through its documented interface. Nothing about the runtime changed and calls that omit `bank` behave exactly as before.
+
+  The four `mnemosyne_shared_*` tools are deliberately excluded: they operate on the shared surface database, which is one global store, and advertising a tenant bank there would promise an isolation that does not exist. `mnemosyne_validate` keeps its own `bank` parameter, which selects `private` or `surface` rather than a tenant partition; that collision predates this change and is left alone rather than repurposed under a shipped name. The persona, sync and `mnemosyne_triple_end` schemas are Hermes-provider-only and are not served over MCP, so they do not declare a bank either.
+
+- **Hermes runtime-Python discovery (#938).** `mnemosyne-hermes runtime-python --json` reports the validated Python interpreter selected for Hermes, or fails closed when it cannot identify one. `--hermes-home` scopes discovery to that deployment; `--python` explicitly selects an interpreter.
+
+- **`mnemosyne_apply_pending` now replays approved writes by their staged action.** Pending batches stage the complete normalized operation (memory_id, replacement_id, and action-specific fields) and return raw pending IDs (`staged`, forwardable verbatim to `mnemosyne_apply_pending`); action metadata is exposed through the additive `staged_actions` field. On apply, `update` mutates only the supplied fields on the existing row, `forget` deletes, and `invalidate` preserves `replacement_id` chaining — instead of re-running every approved op as a content-based remember. A failed operation never deletes its pending record, so no approved write is silently lost. Both Hermes provider surfaces (`hermes_memory_provider` and `mnemosyne_hermes`).
+
+  Staged records are bound to the Hermes scope they were staged from. Because approval can arrive after `on_session_switch()` has rebound the provider Beam, a record staged in one session could otherwise be committed or applied under whichever session happened to be active at approval time — including `update`/`forget`/`invalidate`, where the mutation is session-scoped SQL. Each pending record now carries the effective Beam `session_id` and `channel_id`; replay restores that scope on the live Beam for the duration of the operation, under the Beam access lock, and reports the switch through `session_redirected_from`/`session_replayed_into` plus a `session_redirected_count`. The redirect is never silent. Records staged by an earlier release (no recorded scope) replay through the active Beam, and a rejected operation still leaves its pending record in place.
+
+  The two provider surfaces now return the same staged response shape, including the `pending_ids`/`count` compatibility aliases the legacy surface has always documented, and replayed `forget`/`invalidate` emit the same audit events as the direct handlers (`source_tool="mnemosyne_apply_pending"`, with `replacement_id` metadata for invalidation). Root-provider tool calls and memory-write callbacks now share that replay lock too, so a concurrent callback cannot write under the replay's temporary staged session/channel; the lock is reentrant so `mnemosyne_apply_pending` can enter scoped replay from normal tool dispatch (#1005).
+
+- **Remote consolidation: a per-endpoint extra request body, and an empty answer is named (#878).** `MNEMOSYNE_LLM_EXTRA_BODY` and `MNEMOSYNE_LLM_FALLBACK_EXTRA_BODY` each take a JSON object that is merged into the chat-completions payload last, one for the primary endpoint and one for the fallback endpoint, so a provider-specific key such as a thinking-mode toggle rides the same request; unset or invalid means nothing is merged, and the reserved keys `messages`, `model` and `stream` are dropped so the escape hatch cannot silently change the request the logs describe. A 2xx reply with no answer text (a thinking model that spends the whole `max_tokens` budget on reasoning returns `finish_reason=length`, `reasoning_content` set, `content` empty) now comes back from `_call_remote_llm_with_model` as an `EmptyAnswer` carrying `finish_reason` and `usage.completion_tokens_details.reasoning_tokens`. `local_llm.last_llm_failure()` keeps the most recent remote failure as `model: reason`, and the `sleep()` WARNING that announces the AAAK fallback carries it as `last_error=`, where before it named no cause.
+- **BEAM initialization status is now available through the additive public Python `BeamInitResult`.** It reports the configured embedding dimension, any dimension mismatch, and immutable stored dimensions for each vector table.
+- **Multimodal memory: images, video, audio and documents become recallable memories (RFCs 0002, 0003, 0004).** `BeamMemory.remember_media(ref)` takes a reference to a piece of media, registers it, understands it, and writes what it found back as ordinary memories that hybrid recall already understands, each located in the source. Nothing about text recall changes.
+
+  | Modality | How it is understood | Needs |
+  |---|---|---|
+  | Image (png, jpg, gif, webp, …) | Vision model via `POST /chat/completions` with an `image_url` part; `caption` and `ocr` moments | `MNEMOSYNE_MODALITY_VISION_MODEL` |
+  | Audio (mp3, wav, m4a, flac, ogg, …) | `POST /audio/transcriptions` with `verbose_json`; timed `transcript` moments, at most `max_moments` contiguous windows | `MNEMOSYNE_MODALITY_AUDIO_MODEL` |
+  | Video (mp4, mov, webm, mkv, …) | ffmpeg samples up to 8 frames sent to the vision model in one call as timed `shot` moments; the soundtrack goes through the audio path | `ffmpeg` on PATH; `MNEMOSYNE_MODALITY_VIDEO_MODEL` (falls back to the vision model) and optionally the audio model |
+  | Document (txt, md, docx, pptx, epub, pdf) | Read locally, no network and no model: text packed into ~1500-character `page` passages with char, slide, chapter or page spans. A PDF page with no text layer is rendered and sent to the image model | Nothing for text formats; the `media` extra for PDF |
+
+  Every path is behind `modality_enabled` and degrades rather than fails: a missing model, a missing ffmpeg or a missing extra registers the asset as `unavailable` with a warning that says which.
+
+  The stack is additive throughout. Two sidecar tables, `media_assets` and `media_moments`, are created `IF NOT EXISTS` by their own store when a bank is opened, so existing databases acquire them with no migration step and no change to any existing table. The only new dependency is optional: `pip install 'mnemosyne-memory[media]'` adds `pypdfium2` and `pillow` for PDFs. Video uses the system `ffmpeg` binary when present.
+
+  It is off unless configured. `modality_enabled` defaults to `false` and every endpoint and model key defaults to empty, so an installation that does not opt in behaves exactly as before. The provider seam is named after the protocol rather than a vendor: `MNEMOSYNE_MODALITY_BASE_URL`, `MNEMOSYNE_MODALITY_API_KEY`, `MNEMOSYNE_MODALITY_VISION_MODEL`, `MNEMOSYNE_MODALITY_VIDEO_MODEL`, `MNEMOSYNE_MODALITY_AUDIO_MODEL` and `MNEMOSYNE_MODALITY_TIMEOUT` point it at any OpenAI-compatible endpoint, and a second backend can be added without inheriting the first one's name.
+
+  `remember_media()` returns a `MediaIngestResult` rather than a bare id, because the ingest path degrades in stages and the caller needs to see which one it landed on: `ok`, `partial`, `unavailable` or `refused`. `unavailable` is a success, not an error. It means the asset was registered and can be described later once a provider is configured.
+
+  Supporting pieces: `ContentResolver` with a `BlobResolver` implementation gives the blob store a reader, so a stored reference can be turned back into bytes; `remember()` accepts an explicit `memory_type` that overrides the content classifier and `dedupe=False` for callers that must write a row per call, both defaulting to current behaviour, with an unrecognized `memory_type` logging a warning and falling back to classification rather than writing a bad value; and `mnemosyne doctor` grows a media orphan check that counts both orphan kinds while treating only one of them as a warning, reporting reference columns only and never user content.
+- **Native MCP Streamable HTTP transport for `mnemosyne mcp`.** `--transport streamable-http` (alias `http`) serves the modern MCP `http` transport on a single configurable endpoint (`--path`, default `/mcp`) that handles GET, POST, and DELETE, so clients POST JSON-RPC directly to it with no `/messages` route to proxy. Responses stream via SSE upgrade by default or are JSON-only with `--json-response`. Auth policy matches SSE: loopback binds need no token; non-loopback binds require `MNEMOSYNE_MCP_TOKEN` bearer auth. A non-loopback `streamable-http` bind exposes the selected local SQLite-backed memory bank to network clients and additionally requires `MNEMOSYNE_MCP_ALLOWED_HOSTS`, with `MNEMOSYNE_MCP_ALLOWED_ORIGINS` optionally restricting browser origins. Tracks #598 (this PR: #749); thanks @ekinnee for filing the issue and for the implementation (PR #599) shipped in the same window.
+
+- **`MNEMOSYNE_JOURNAL_MODE` overrides the SQLite journal mode for store connections.** WAL readback on Linux containers over macOS virtiofs intermittently surfaces as `database disk image is malformed` at every open; deployments on such filesystems can now set `MNEMOSYNE_JOURNAL_MODE=delete` (or any sqlite journal mode) and the sync client (it rides the beam connection) and every connection that sets a journal mode (memory, beam, query cache, veracity consolidator) honors it. Only `wal` persists in the database file; every other mode is per-connection and reverts to SQLite's default (`delete`) on reopen, so each connection re-applies the mode rather than relying on persistence. WAL remains the default; the value is trimmed and lower-cased, unset or blank falls back to `wal`, and non-blank invalid values warn and fall back to `wal`. `memory` and `off` remove disk-backed rollback protection and can corrupt the database after a crash.
+- **Report-only `mnemosyne migrate --dry-run`.** `migrate_311_tables(db_path, dry_run=True)` opens the bank read-only (`mode=ro` + `PRAGMA query_only=ON`), executes no DDL and commits nothing; the returned report carries `would_add` / `tables_would_add` / `indices_would_add` describing the pending DDL (all zero/empty when the bank does not exist). `mnemosyne migrate --dry-run` prints the pending DDL without writing. The read-only behaviour is proven by fingerprint tests: the ordered `sqlite_master` rows, `PRAGMA user_version`, and the on-disk byte size are identical before and after a dry run, including on a WAL-mode bank with a committed seed write. The existing E6 `migrate(dry_run=)` semantics are unchanged.
+- **MCP clients can now retire canonical facts with `mnemosyne_forget_canonical` (#723).** The tool is discoverable and callable by default over MCP; retirement removes the current slot from active recall while preserving it as history.
+- **`MNEMOSYNE_MODEL_CACHE_DIR` relocates the local GGUF cache (#708).** The ~656 MB consolidation model was pinned to `~/.hermes/mnemosyne/models`, so the only way off a small home partition was a symlink. The variable is environment-only and read at import, matching `MNEMOSYNE_LLM_REPO` / `MNEMOSYNE_LLM_FILE`; unset or blank keeps the historical path, `~` is expanded, and the value is used for the cached-file lookup, the directory creation and `hf_hub_download` alike. Existing models are never moved, copied or deleted. An explicitly set path is authoritative: when it cannot be created or written to, the local GGUF attempt fails with an error naming both the variable and the selected path rather than silently falling back to the default, which would reinstate the location the user moved away from. The error is logged as well as raised, because the download path degrades to AAAK on any exception and a raised message alone would never reach the user.
+- **CLI version reporting (#642).** `mnemosyne --version` / `mnemosyne version` and `mnemosyne-hermes --version` / `mnemosyne-hermes version` report installed distribution versions without initializing Mnemosyne data. `hermes mnemosyne version` now reports both core and Hermes-provider versions.
 - **Embedding dimension in doctor diagnostics.** `collect_runtime_diagnostics` (surfaced by `mnemosyne doctor`) now reports the resolved `embeddings_dim` alongside `embeddings_model`, so operators can confirm their `MNEMOSYNE_EMBEDDING_DIM` / model-table resolution without inspecting a traceback. Complements the fail-loud unknown-model resolver (#521); the version bump is deferred to that PR to avoid a duplicate bump.
+- **Success-path coverage for the explicit-dimension contract (follow-up to #521).** The unknown-model-plus-explicit-dimension path (the mxbai-via-custom-endpoint scenario) now has end-to-end coverage proving a clean boot through `init_beam()` with `vec0` tables dimensioned at the explicit value, alongside tighter resolver-level assertions. README, the Hermes guide and the configuration reference now carry a privacy note matching the actual routing: a custom (non-OpenRouter) `MNEMOSYNE_EMBEDDING_API_URL` routes to that endpoint directly, while on the OpenRouter URL or its default only an API-shaped model name (`openai/*`, `text-embedding*`) or `MNEMOSYNE_EMBEDDINGS_VIA_API` routes; either way the service receives both memory text and recall query text, so local-embedding profiles are preferred for privacy-sensitive deployments. Credentialed embedding requests now require an `https://` endpoint and refuse to follow redirects (urllib would forward `Authorization` verbatim to the redirect target), so the credential and the embedded text can never travel over cleartext or to a third-party authority; both refusals fail loud instead of degrading to keyword-only recall.
+
+### Changed
+
+- **Write-policy rejections now have an explicit nullable return contract.** `remember()`, `update()`, and `scratchpad_write()` return `None` when the write-policy gate rejects the requested write; accepted calls keep their existing return values.
+
+- **Episodic vector admission now defaults to a reachable threshold: `MNEMOSYNE_EM_VEC_ADMIT` is 0.62, not 0.80.** The episodic dense block compares each candidate's stored-blob cosine against this constant, so a default above the shipped embedding model's genuine-match band does not filter more strictly, it filters everything: the comparison can never succeed and vector-only episodic candidates are unreachable. On the default model, `BAAI/bge-small-en-v1.5` (384d), real memory text matches at 0.62-0.71 with a best observed 0.7090 while unrelated queries top out at 0.5960, so 0.80 sat above the entire band and session-scope dense recall returned nothing at all; 0.62 admits that band and still excluded every unrelated row measured, 0 of 390 candidates. Set `MNEMOSYNE_EM_VEC_ADMIT` to restore the previous floor; deployments on e5-style stores, whose paraphrase band sits at 0.74-0.80, should raise it. The gateway resolves the constant once at import, so an env change needs a restart.
+
+- **`mnemosyne-install` delegates to the standalone provider instead of creating the legacy plugin symlink (#651).** The core package's `mnemosyne-install` / `mnemosyne-uninstall` entry points no longer link `~/.hermes/plugins/mnemosyne` at `hermes_memory_provider/`. That route is obsolete: the supported provider is the standalone `mnemosyne-hermes` package, whose installer owns the plugin directory, the bundled skill, the per-profile links and wrapper mode. The entry point now detects a legacy link by its *resolved target*, so a link into `mnemosyne_hermes` (including the documented manual fallback) is left alone, warns about a legacy install, removes it as part of an install, and delegates install, uninstall and status to the provider — in-process when it is importable, through the `mnemosyne-hermes` console script when it is on `PATH`, and through Hermes' own venv Python otherwise. Each delegated command drops the working directory from `sys.path` before importing anything, so a source checkout — or a workspace directory holding one — that shadows the package cannot make a healthy provider report `Core library: MISSING`. When none of those is available it fails with the install commands rather than recreating the obsolete link. Real directories are reported and never deleted, and `--dry-run` never promises a deletion the real run would refuse. `mnemosyne-install` now accepts `--status`, `--migrate`, `--force`, `--dry-run` and `--hermes-home`; previously the console script ignored every argument. `--status` exits non-zero unless the provider is importable-or-discoverable, the plugin directory is installed, and `memory.provider` selects mnemosyne.
+
+- **`mnemosyne_validate` selects private or surface with `store`; `bank` now means the tenant bank (#939 follow-up).** The tool shipped with `bank` carrying `private`/`surface`, a store selector, while every other tool uses `bank` for a tenant partition. Over MCP, `store` picks the private memory or the shared surface, and `bank` routes a private-store call to a tenant bank exactly as it does elsewhere, so `validate` can finally reach a non-default bank. The two literal values `bank='private'` and `bank='surface'` are still accepted as an alias for `store` when `store` is absent; the response carries a `deprecated` note, and the alias is removed in 5.0. The Hermes providers, whose bank is fixed per profile, accept `store` and the alias but no tenant bank. Responses now carry `store` alongside `bank`. Done in the beta because a shipped parameter name cannot change after rc1.
+- **The 98.9% LongMemEval figure is withdrawn from the README (#584).** No methodology or run log for the April 2026 run exists in any project repository, so the claim is removed until the benchmark is re-run on the current tree with a published setup. BEAM figures are unchanged and remain labeled with the version they were measured on.
+- **Sponsorship wording now covers paid sponsorships.** The README no longer describes the program as credits-only; cash and credit sponsorships are both accepted, with the same disclosure and editorial-control rules.
+- **Atlas Cloud is no longer a Compute Partner.** The sponsorship ended on 2026-09-08 and the placement was removed from the README, the partners page and the documentation. The Atlas Cloud configuration recipe stays as a plain provider guide, since it is just OpenAI-compatible environment variables. The Compute Partner position is open.
+- **Heuristic-only sleep no longer invalidates memories (#917).** Similarity is not proof of contradiction: the motivating production audit found 142 of 243 items invalidated across consolidation passes, a specific observation rather than a universal failure rate. Both `sleep()` and `sleep_all_sessions()` now report `conflicts_detected_only` alongside `conflicts_resolved`, including no-op runs; every detected pair belongs to exactly one counter. Only a successful LLM-validated invalidation resolves a pair, with at most one successful supersession per older memory per sleep pass. Supersession and validation provenance commit atomically; insert or commit failures roll back the pair and leave it detected-only. Query-cache invalidation is deferred until after that commit, so cache I/O failure cannot undo a validated conflict resolution. Credentialed endpoints require HTTPS and neither transport follows redirects. `MNEMOSYNE_CONFLICT_PAIR_BUDGET` (default 20) and `MNEMOSYNE_CONFLICT_TIME_BUDGET_S` (default 300) bound conflict validation across all source groups in each `sleep()` invocation; empty, invalid, nonpositive or nonfinite values fall back to defaults. Dry runs do not call conflict validation, summarization, backend availability checks or model-refresh inference, and do not write cost or memory records. Fallback warnings no longer initialize or download a model during dry runs. Conflict-failure warnings expose only the exception class, and budget-skip warnings aggregate across source groups.
+
+- **Removed the Hermes Tweet row from the README compatibility table.** The plugin has no Mnemosyne integration; its repository contains no reference to Mnemosyne or to any memory provider, so the July 3 listing was a drive-by placement. The matching 3.14.0 changelog line is removed as well.
+- **Opt-in compression-boundary self-echo release (#918).** Both Hermes providers default to ordinary recall; `MNEMOSYNE_SELF_ECHO_ENABLED=1` enables best-effort suppression only after an actual `on_pre_compress` callback has been observed. Every callback releases **all** existing exclusions, including retained-tail, no-op and failed compression attempts; extra echo is intentional. New suppression requires a successful freshly marked provider-created working row and ordering evidence in the optional sync transcript: an unchanged unique boundary-tail text anchor must precede the uniquely projected source. Multimodal text parts are newline-joined; unknown projections, missing transcripts/anchors and repeated released text abstain. Generations revoke in-flight work and cached proof snapshots; cumulative released-source evidence prevents queued old sync from re-arming. Only exact row IDs with matching capture metadata, actual Beam session, source and stored content are excluded, never equal-content imports, NULL-session/unmarked rows or edited rows. Both recall engines remove supported working contributions before selection/fusion (linear FTS refills by excluded **rows**); episodic vector hits retain their own content, tier and scores. Untyped graph/fact hits conservatively abstain from suppression rather than invent tier ownership. Evidence is bounded (1024 captures and 8192 source hashes per session, 32 sessions per provider, 4 million projected characters / 16384 messages per payload); overflow disables suppression rather than dropping safety evidence. Reset disables affected keys for the current provider lifetime so queued calls cannot exploit forgotten safety evidence; reconstructed providers start without observed-hook capability. There are no timestamps, time windows, turn rings or exact live-context claims. `MNEMOSYNE_SELF_ECHO_HOURS` and `MNEMOSYNE_SELF_ECHO_RING_TURNS` are removed. The previous exclusion arguments are replaced by the internal provider contract `recall(exclude_captures=...)`; ordinary explicit recall is unchanged. Providers do not cache bank prefetch results and retry an in-flight recall whose proof snapshot was revoked; caches owned by the host are outside this plugin contract. This is v1 bookkeeping only, not issue #872 durable checkpoints, a v2 marker, or a Hermes configuration change. Older cores without the optional ledger retain ordinary capture and recall through provider-bundled compatibility adapters. Python 3.10 uses a conservative SQLite parameter budget; invalid session keys abstain, and standalone exclusion readback closes its owned connection on every path. Integration and installation guides document opt-in and lifecycle limits. MEMORIA source-row hydration applies the same working-row exclusions and eligibility filters, so it cannot reintroduce a suppressed raw capture under another tier; independently eligible structured facts remain available.
+- **Entity extraction no longer stores whole quoted spans as entities (#891).** The `"..."` and `'...'` patterns in `_ENTITY_PATTERNS` captured any quoted span of 2-50 characters, so conversational and roleplay text wrote dialogue into the `mentions` vocabulary: `'Okay,'`, `'Talia pauses.'`, `'the light is fading.'`. Punctuation-bearing values also slip past the stop-word filter, which compares exact strings (`'okay,' != 'okay'`). Measured on one production store: 589 of 1,270 distinct `mentions` values (46%) carried punctuation or spaces, and of 9,831 `references` edges written by proactive linking, 127 connected pairs sharing such a fragment, 103 of them on nothing else, so junk vocabulary became graph topology that recall reads back. Both patterns are removed. A real name inside quotes is unaffected because quotes do not block `\b`, so it still extracts from the capitalized single-word and multi-word patterns; the values that disappear are exactly the spans no other pattern can produce, which are the lowercase and punctuation-bearing ones. A quoted lowercase single word was already dropped by the existing lowercase filter. Existing annotation rows are not cleaned retroactively.
+
+- **Unknown embedding models now fail loud at startup instead of silently assuming 384 dimensions (#518, #521).** `_get_embedding_dim` resolves an explicit `MNEMOSYNE_EMBEDDING_DIM` first (must be a positive integer), then the built-in model table, and raises `ValueError` for an unknown model with no explicit dimension rather than falling back to 384 (bge-small's dimension). A vec0 table is dimensioned at creation, so a silent 384 guess baked the wrong dimension into a fresh database and corrupted vector search for anyone using a model absent from the table (e.g. `mxbai-embed-large` via a custom endpoint). Dimension resolution is centralized in `embeddings._get_embedding_dim`; Beam delegates to it, removing a duplicate resolver that could drift. Embeddings-disabled invocations keep the 384 fallback (the dimension is unused there).
+
+  **Breaking:** pointing `MNEMOSYNE_EMBEDDING_API_URL` at a custom endpoint with a model not in the built-in table now requires `MNEMOSYNE_EMBEDDING_DIM=<N>`, otherwise direct core/MCP-provider startup exits at import with an actionable error (the `mnemosyne-hermes` wrapper catches this and reports the provider unavailable instead of exiting). Blank/empty `MNEMOSYNE_EMBEDDING_DIM` and `MNEMOSYNE_EMBEDDING_MODEL` (common in Docker Compose and `.env` files) are normalized to unset/default rather than treated as explicit invalid values.
+
+  **Upgrade note for stores created under the old silent-384 fallback:** setting the model's true dimension can trigger the existing dimension-mismatch guard. Use the documented reindex/recovery path rather than treating the override as a one-step fix.
 
 ### Fixed
+- **SHMR local LLM dispatch (#716).** The harmonization path no longer passes
+  unsupported keyword arguments to the prompt-only local LLM helper, so local
+  inference is reachable and failures remain diagnostically visible.
 
 - **`scope` lost from `metadata_json` on every write path (the two-table trap).** The dedicated `working_memory.scope` column was written on `remember()`, but `metadata_json` only carried caller metadata — so JSON-based readers (`json_extract(metadata_json, '$.scope')`, curator checks, `lr_dump`) saw no scope while column readers saw `'global'`. The dedup-update path updated the scope column without touching `metadata_json`, and the legacy `memories` dual-write (which has no scope column) dropped scope entirely. Scope now mirrors into `metadata_json` on all three paths, tracked authoritatively (assignment, not `setdefault`) so a scope change on dedup-update keeps the mirror consistent with the column.
 
-- **Model-refresh confidence: NaN cleared every gate and legacy text crashed sleep mid-batch.** JSON round-trips NaN and Infinity, and `parse_model_update_proposals` clamped NaN to 1.0 (`min` and `max` keep their first argument when a NaN comparison is False), so a NaN-confidence proposal became a top-importance memory; the auto-apply gate's `confidence < minimum` check is also False for NaN, so the same proposal reached the canonical store regardless of threshold. Separately, `apply_model_refresh_proposal` and sleep()'s proposal-remember call site converted stored confidence with a bare `float()`, so a legacy bank's text value (for example `"high"`) raised ValueError. The sleep call site runs after the claim commit, so that raise stranded the group's `consolidation_claimed_at` and orphaned every later group's claimed rows. Non-numeric and non-finite confidence now degrades per site: skipped at parse, 0.0 at the auto-apply gate, 0.5 at apply and at proposal importance. Finite values outside [0.0, 1.0] clamp to the domain bound on every path, so a persisted 2.0 can no longer clear the auto-apply gate or reach the canonical store unbounded. Hardening split out of #546 per review.
+- **An automatic init retry no longer lets a tool-name validation error escape into the turn (#1091).** `_maybe_retry_init()` called `initialize()` with no exception boundary, so a `memory.mnemosyne.tools` edit landing between the original transient-failure init and the automatic retry could raise straight out of `system_prompt_block()`, `prefetch()`, `sync_turn()` or `handle_tool_call()`. The retry path now catches it and reports it like a direct init failure; an explicit `initialize()` call still raises (#1063).
+
+- **Canonical `forget` and supersede now stamp `valid_until` (and `valid_from`) in UTC, the same clock as `created_at` (#1062).** `CanonicalStore` minted these stamps from naive host-local `datetime.now()` while `created_at` is SQLite `CURRENT_TIMESTAMP` (naive UTC), so on any host away from UTC one row carried two clocks: a host at UTC-4 wrote `created_at = 16:44:03` and `valid_until = 12:58:50` for a retirement seconds later. It is the same class as #525, which fixed `working_memory.valid_until`. The single `_now()` helper now returns naive-UTC `YYYY-MM-DD HH:MM:SS`, the exact shape of `created_at`, so the columns compare directly as text and through `julianday()`; this covers `forget()`, the `valid_until` stamped on the prior row by `remember()`, `valid_from` on insert and the `import_all()` fallbacks, and so both Hermes providers and the MCP `mnemosyne_forget_canonical` tool, which all call `store.forget()`. Rows already minted are not rewritten, because the host offset is not recorded and cannot be recovered reliably from the row; they are recognisable by a `T` separator (`2026-09-26T12:58:50`) where new stamps use a space, and consumers that need a common clock for them should keep counting from `created_at`.
+
+- **The Hermes install docs name the plugin/core channel pairing (#1076).** `mnemosyne-hermes` 0.7.3 requires a prerelease core, so a stable-only `pip install mnemosyne-hermes` cannot resolve it. `docs/hermes-integration.md` now gives the 4.0 beta pair and the last audited stable pair (`mnemosyne-memory` 3.15.1 with `mnemosyne-hermes` 0.7.1), and says not to use 0.7.2, whose declared floor permits a core it cannot run against.
+
+- **`mnemosyne media --help` now prints usage instead of triggering media ingestion (#1043).** The CLI's `cmd_media` accepted any string in the positional slot, so a user checking the available options would instead create a `media_assets` row with `ref_kind=file`, `ref_value=--help`, and `understanding_status=unavailable`. `--help` and `-h` anywhere in the arguments now print the usage string and exit 0 before any database or file write, and any other unrecognized option is rejected instead of being ingested as a file name; running `mnemosyne media` with no arguments produces the same help text. Behavior for valid paths, URLs and `data:` URIs is unchanged.
+
+- **`mnemosyne-hermes` selects Hermes 0.21's staged runtime instead of its macOS TCC anchor venv (#1068).** Hermes 0.21 keeps `$HERMES_HOME/hermes-agent/venv` only as the TCC anchor and executes the provider from `$HERMES_HOME/installs/<key>/environments/<generation>/venv`, but `_find_hermes_python()` returned the anchor, so `install --mode wrapper` built the wrapper against the anchor's Python (3.11 in the report) while Hermes imported it under the staged runtime's (3.14), and the #630 compatibility guard rightly refused it. Discovery now reads the runtime Hermes committed for the checkout, `installs/<key>/facts.json` (`packages.venv.environment`, the record behind Hermes' `pm.environments.selected_venv`), where `<key>` is `sha256` of the resolved checkout path: it is derived, so `installs/` is never scanned and no directory is picked among several. It applies to the `hermes` launcher's checkout and to each known install root, at the priority the checkout's own venv already had, so `install` (including `--dry-run`), `status` and `runtime-python --json`, which share this path, all report the staged interpreter. A checkout with no committed runtime, or no record, keeps the previous venv-based discovery, as Hermes itself does, and an explicit `--python` is still authoritative. **Behavior change:** when a record exists but cannot be used (unreadable, outside that install's `environments/`, or without an executable interpreter), discovery fails closed with a warning naming the record and pointing at `--python`, rather than falling back to the anchor. Because a staged generation is replaceable by a Hermes update, a wrapper installed against it now prints the #1064 PM-generation warning. The guard's error never reaching the user (Hermes only debug-logs it) is not addressed here.
+
+- **The legacy Hermes provider loads again when the gateway's working directory holds a `mnemosyne/` directory (#1056).** Hermes runs a directory plugin's sibling modules before its `__init__`, and `__init__` is what puts the source checkout on `sys.path`. v4 added a module-level `mnemosyne.core` import to `hermes_memory_provider/audit.py`, so with the default data directory `~/.hermes/mnemosyne/` and the gateway running from `~/.hermes`, `mnemosyne` resolved to the data directory, the failure was cached, and Hermes reported "loaded but no provider instance found". The import now happens when the audit table is opened. A subprocess test loads the provider in Hermes' order from a shadowing cwd, and a second test fails if any sibling module imports `mnemosyne` at module level again.
+
+- **Hygiene no longer scores ordinary prose as terminal output (#1074, marker half).** The `terminal_output` marker matched `total ` and `installing ` as bare substrings, so a note such as "# Genova Walking Tour" containing "in total" or "after installing" scored 0.85 and was suggested for `delete`. Those two markers now only count in the shape a terminal prints them: a whole `total 48` or `total 4.0K` line, a line-start `Installing collected packages` (pip) and `==> Installing` (brew). Other markers such as `collecting ` and `downloading ` are still unanchored and are not part of this change.
+
+- **Embedding opt-out aliases now parse Boolean values consistently (#1061).** `MNEMOSYNE_NO_EMBEDDINGS`, `MNEMOSYNE_SKIP_EMBEDDINGS` and `MNEMOSYNE_EMBEDDINGS_OFF` accept trimmed, case-insensitive `1/true/yes/on` and `0/false/no/off`; blank/unset means false. Every alias is validated before combining them, and other nonempty values now raise `ValueError` instead of silently disabling embeddings. Opt-out is checked before local loading, public API embedding dispatch and cached query results, including after the query cache is warmed. Re-enabling preserves normal cache reuse. This change is ENV-only; YAML model/dimension/endpoint resolution remains separate (#818).
+
+- **An unknown `memory.mnemosyne.tools` name now fails at provider `initialize()` instead of the first tool-list or tool-call request (#1063).** The validation in `_configured_tool_schemas()` (#1021) now also runs right after `hermes_home` is bound, in both provider copies, so a config typo surfaces at startup rather than mid-session. A failure on a re-init of an already-active instance also deactivates it and releases its host-LLM backend lease, the same cleanup `shutdown()` performs, so the rejected re-init cannot leave the instance registered active with its beam already gone.
+- **Working-memory top-k follows the reported cosine, not the L2 candidate window (#1069).** `_wm_vec_search_sqlite()` reads candidates in vec0 distance order and truncated them in that order. The blob-scored arms report an exact cosine, and the two orders only agree while every row is unit-normalized, so on a store that still holds pre-normalization rows the returned top-k was the *distance* top-k: with `k=1`, a legacy collinear norm-5 row (cosine 1.0) was dropped in favour of an orthogonal unit row (cosine 0.0) that the distance window ranked first, while the exact compatibility scan ranked the collinear row correctly. Scored candidates are now re-ranked by `sim` before truncation, and when the candidate window is bounded and the store is not in the normalized format - the boundary `_classify_vec_store_regime()` already exists for - the arm abstains so the compatibility scan ranks the candidate set instead of returning a wrong top-k. Both blob-scored arms are covered: `int8` as well as `float32` re-ranks and can abstain this way, so on a store that holds pre-normalization rows and is larger than the window the `int8` arm faces the same routing change. The bounded window stays exact only where the rows are stored unit-length: a normalized-format store guarantees that for `float32`, whereas normalizing before quantization does not equalize the stored byte norms of `int8`, so a bounded `int8` window can still omit a higher-cosine row (a pre-existing gap, not introduced here). The `bit` arm reports a distance-mapped score and is unaffected - its score stays monotone in the distance, so re-ranking leaves it exactly as it was. Regression tests cover the reported `k=1` case, the bounded-window case where the best cosine match is provably outside a 500-row window, and the unchanged fast path on a normalized `float32` store.
+- **The `float32` arm of the working-memory vector search scores from the stored blob instead of guessing a similarity scale (#1069).** `_wm_vec_row_sim()` abstained for `int8` after #982/#987, but the `float32` arm still fell through to `1 - distance / (2 * EMBEDDING_DIM)`. That mapping assumes unit norms and divides by the dimension instead of 2, so on a `float32[1024]` store every candidate collapsed into a ~0.9993-0.9996 band: ordering survived, amplitude did not, and the 20% working-memory dense blend received a near-constant term, which is why the documented recall-first lexical admission opt-in could not be used. The score now comes from the stored blob through the existing `_vec_float32_blob_cosine()` helper, exactly like the int8 arm: `sim` is the true cosine, rows written before normalization was enforced are still exact, and a candidate whose blob is unavailable abstains (`None`) so the caller routes the whole candidate set through the exact compatibility scan rather than reporting a fabricated number (a blob whose length cannot be a vector of the query's shape counts as unavailable, matching the int8 arm's length check). `_wm_vec_search_sqlite()` now fetches the vector column for `float32` as it already did for `int8`; the `bit` arm, the admission gates and the schema are unchanged, and the `int8` arm kept its scoring (its candidate-window routing is covered by the entry above). Measured on a synthetic `float32[768]` store: a row at true cosine 0.3772 reported `dense_score` 0.999273 before and 0.377211 after. Regression tests live in `tests/test_wm_vec_float32_blob_scoring.py` (unit scoring, a real sqlite-vec `vec_working` table, the `_wm_vec_search()` wrapper and `recall()` gold-vs-distractor ranking); `float32` was removed from the `test_row_sim_other_arms_keep_legacy_mapping` parameter list, which asserted the old mapping for that arm.
+- **Doctor and Repair share sqlite-vec capability for `vec0` databases (#1040 D1).** Repair loads the optional extension on planning and bound write connections to match Doctor's schema checks; without the `embeddings` extra, unverifiable schemas remain fail-closed. The separate D2–D4 restrictions remain unresolved.
+- **Malformed Hermes `sync_roles` config now warns while remaining fail-closed (#1033).** Comma-separated strings and native role lists remain supported; explicit empty values still disable autosave. Invalid non-empty values, including stringified lists, no longer fail silently or broaden capture, and role precedence is recomputed on provider reinitialization so stale overrides do not persist.
+
+- **`mnemosyne-uninstall --help` no longer uninstalls (#1048).** The `mnemosyne-uninstall` console script was wired to `uninstall()`, which never reads its arguments, so `--help`, or any argument at all, removed the provider plugin and reset `memory.provider` to `null` in the Hermes config. It now goes through `uninstall_main()`, which parses first: `--help` prints usage, unknown arguments are rejected, and `--hermes-home` is honored. `mnemosyne-install` was already fixed on the 4.0 line by #991. New tests run both scripts, resolved from `pyproject.toml` exactly as packaging does, against a seeded Hermes home and require `--help` and unknown options to leave it untouched, and require every console-script target to import and take only optional parameters.
+- **`mnemosyne reindex` now honors `--db` and `--bank`, and rejects unknown options before opening a store (#1045).** `cmd_reindex` read flags with `"--x" in args` membership tests, never consumed a value for `--db`/`--bank`, and never rejected unrecognized flags; it always opened the default store, no matter which flags were passed. The automatic pre-reindex backup (`create_backup()`) also always targeted the default database, not the store reindex had actually opened. Args are now parsed in a loop, matching `cmd_doctor`: `--db PATH` and `--bank NAME` select the store, the two are rejected together, and any unrecognized flag exits before a store opens. The resolved path is passed to both the reindex operation and its backup. A `--db` file or `--bank` name that does not exist now exits with an error before any database, bank directory or backup is created, and reindex opens its target through `BeamMemory` so importing `mnemosyne.core.memory` no longer initializes the default database during a targeted run.
+- **Legacy `memory_events` databases missing `device_id` now open (#1047).** Initialization and `mnemosyne migrate` add the column before creating its index; migration dry-run reports the pending change. Historical sync-event schema conversion is not included.
+- **Media understanding now works from configuration alone.** The documented setup for describing media is `MNEMOSYNE_MODALITY_ENABLED`, `_BASE_URL`, `_API_KEY` and a model, but nothing ever registered the built-in OpenAI-compatible adapter, so a fully configured install made no request and every `remember_media()` call returned `unavailable`. Only hosts that called `set_modality_backend()` themselves got descriptions. The adapter is now registered on the first describe after the operator opts in, never at import, and never over a backend the host registered. Local files also go out with their real media type (`image/png`, not `application/octet-stream`), which vision endpoints validate and would otherwise reject.
+- **Authorized ID-based forget now reaches episodic memory without crossing tier ownership (#959, #1002).** `BeamMemory.forget_episodic()` and the core/Hermes forget paths delete session-owned or global episodic rows and their tier-specific vectors. Shared `annotations`, `memory_embeddings`, and `gists` rows are deleted only when no parent with the same ID survives in another tier; on a working/episodic ID collision they are retained rather than guessed away. The existing working-memory cascade uses the same symmetric guard. This is a backward-compatible safety boundary for the current untyped child schema; explicit typed child ownership and ambiguous-row migration remain tracked in #1002.
+
+- **`memory.mnemosyne.tools` treats the serialized sentinels `"None"`/`"null"` (any case) and an empty string as unconfigured, not as a literal tool name or an empty allowlist (#1021).** A config/UI layer can round-trip a real `None` into one of those strings instead of YAML `null`; both providers previously raised `Unknown Mnemosyne tool(s)... None` for the quoted string and, for an empty string, silently exposed zero tools. Both now fall back to the documented default (expose every Mnemosyne tool), the same as an omitted key or YAML `null`. `tools: []` is unchanged and still exposes none.
+- **Hermes package compatibility is now enforced at dependency resolution (#1014).** `mnemosyne-hermes 0.7.3` requires `mnemosyne-memory>=4.0.0b3`, the first core release that contains the write-policy, query-sanitization, verbatim-ledger, and upgrade APIs imported by the provider. The catalog wrapper carries the same floor. This prevents the resolver-valid but runtime-broken pair produced by `mnemosyne-hermes 0.7.2` with every then-released core wheel.
+- **Hermes skip-context re-initialization now explains when it intentionally drops a live memory provider (#988).** A primary provider that is re-initialized under `subagent`, `cron`, or another configured skip context must clear its Beam to prevent writes into the wrong session. That safety reset remains unchanged, but it now emits one WARNING, returns additive `reason_code="reset_by_reinit"` in `memory_unavailable` tool payloads, and exposes an `UNAVAILABLE` system-prompt notice until a primary initialization restores memory. A provider that begins in a skip context remains silent and reports `reason_code="skipped_context"`; ordinary initialization failures report `init_failed`.
+
+- **Hermes audit writes now survive provider/tool-call thread handoffs (#997).** Both the legacy and standalone provider surfaces open their audit connection for cross-thread use and serialize each execute/commit pair, while retaining best-effort non-raising behavior. The first write failure per provider instance is logged at warning level; later failures remain debug-level to avoid log flooding. Connection timeout and busy-retry behavior are unchanged.
+
+- **beam**: score working-memory int8 vector candidates from their stored bytes (`_vec_int8_blob_cosine`) instead of the legacy `1 - distance / (2 * EMBEDDING_DIM)` mapping, which compressed every candidate into a 0.92-0.95 band and left the working-memory dense blend with no amplitude to re-rank. A candidate whose blob cannot be read is not scored from its distance: the arm abstains and the exact compatibility scan handles that candidate set, matching the episodic paths from #911. Other arms are unchanged. (#982)
+
+
+- **`forget()` after-commit events now honor SQLite transaction terminators and `executescript()` implicit commits (#963).** Connection- and cursor-level `COMMIT`, `END`, `ROLLBACK TRANSACTION` and scripts now drain or clear queued `MEMORY_INVALIDATED` hooks at the actual transaction boundary, so rollback cannot publish a stale event and a script failure cannot delay an already-committed event until an unrelated later commit.
+
+- **Standalone Hermes setup and status now survive every discovery path (#983).** The `mnemosyne-hermes` package, catalog directory wrapper, and generated persistent wrapper expose the provider CLI contract without declaring a desktop config schema that would write a second config store. `hermes memory status` uses a bounded, terminal-safe, read-only, fail-soft, secret-free view of `memory.mnemosyne`; setup keeps the provider name, existing config keys, data paths, tools, and CLI unchanged.
+- **The standalone `mnemosyne-hermes` package builds again.** A direct push on 2026-09-17 replaced `integrations/hermes/pyproject.toml` with a Hermes catalog wrapper named `mnemosyne-plugin`, so `python -m build` produced a wheel under the wrong name and CI's editable install failed. Reverted; the catalog plugin gets its own directory instead of reusing the PyPI project root.
+
+- **Hermes canonical recall no longer treats individual CJK characters as topical evidence (#971).** Canonical matching now uses overlapping CJK bigrams while leaving ordinary prefetch tokenization unchanged, so unrelated Japanese, Korean and Chinese profile facts cannot enter automatic context or displace ordinary explicit-recall results merely by sharing common characters. Exact one-character CJK queries remain supported, as do short two-character terms and the existing Latin and Cyrillic paths.
+- **Polyphonic dense recall now honors episodic eligibility before its bounded vector result set.** Unmarked float32, int8 and binary stores are scanned over only the eligible episodic join with representation-safe cosine scoring, so another session, channel or filter cannot crowd out a valid vec-only row. Author and channel searches preserve the same cross-session scope rules through final Polyphonic filtering as linear recall. Marked stores retain sqlite-vec KNN and refill only while the finite KNN boundary may still hide an admissible row, falling back to an exact eligible scan when the 4096-candidate boundary cannot exclude one; ordinary low-similarity candidates no longer turn a bounded KNN lookup into a full-store scan. Pure and legacy Polyphonic scoring use the same stored-blob cosine and admission threshold as linear recall. If a blob-bearing KNN projection fails but its distance-only retry succeeds, unscoreable rows now fall through to the existing JSON fallback and set its diagnostic instead of suppressing a valid fallback result. A reindex performed without a usable sqlite-vec backend leaves both the untouched vec table and its existing format marker unchanged instead of falsely certifying legacy blobs as normalized. If the linear recall path cannot read the format marker, it now routes conservatively through the same exact-cosine scan instead of treating the unresolved store as KNN-safe. Existing JSON fallback rows remain available through the pre-existing fallback path when sqlite-vec is absent or unusable; this change does not add JSON-only candidate fusion or rewrite existing records.
+- **Speaker-stamped recall queries now use one shared sanitizer in both Hermes providers (#919).** Stamp-only input skips query-driven prefetch while retaining existing query-independent identity context. Candidate-only normalization preserves unstamped text and retained suffixes. Explicit recall uses the same helper and rejects empty queries. Plugin-loader isolation is separate in #920.
+
+- **Episodic consolidation now preserves its produced embedding when a sqlite-vec write fails (#948).** The summary and matching JSON fallback commit together inside the existing transaction, so a later process without sqlite-vec can still use dense fallback lookup. If both dense writes fail without aborting the transaction, the summary commits FTS-only and a redacted warning reports that outcome. Transaction-aborting SQLite failures instead roll back the summary and propagate, so no ID is returned. Embedding-provider failures retain the existing FTS-only best-effort behavior; successful sqlite-vec writes remain ANN-backed. No historical rows are rewritten.
+- **Episodic degradation now refuses to split dense embedding stores when a persisted sqlite-vec table is unusable (#946).** If `vec_episodes` exists but the active connection cannot use it, the row's existing degradation savepoint rolls back the content, tier, timestamp, JSON/binary vectors, and ANN row together. Databases with no `vec_episodes` table retain the existing JSON/binary fallback behavior; no historical rows are rewritten.
+- **Optional `embeddings` and `all` installs cap `sqlite-vec` below 0.1.10 (#889).** With `sqlite-vec>=0.1.0`, a fresh 4.0.0b1 install resolved the 0.1.10 alphas, whose `vec0` extension is compiled for AVX2 with no runtime dispatch. On any CPU without AVX2 the first `recall()` died with SIGILL, exit code 132, which an external tester hit on a real 86 MB store during the b1 beta (#849). The requirement is now `>=0.1.9,<0.1.10`. 4.0.0b2 exists to get this onto PyPI.
+- **`mnemosyne_diagnose` ignored the requested bank.** `run_diagnostics()` has accepted a `bank` argument all along, but the MCP handler never passed one, so a caller diagnosing one bank was silently given the default bank's report and database path. The handler now forwards the bank and names it in the result. Unspecified stays `None` rather than collapsing to the literal `"default"`, because those select different databases and conflating them would change which database an existing caller inspects.
+
+- **Deleting a memory no longer leaves its gist, annotations or fallback embedding orphaned (#904).** `BeamMemory.forget_working` has cascaded a memory's support rows since #782, but two other delete paths did not go through it. `mnemosyne_validate` with `action="delete"` removed the fallback embedding, the annotations and the vector row but not the gist, and the Hermes provider's own copy of that handler removed only the `working_memory` row, so every delete through the provider stranded all four. Because `remember()` writes a gist of its own, ordinary store/delete cycles accumulated one orphan per deleted memory indefinitely; the reporting database held 1,502 of them. Both handlers now perform the same cascade as `forget_working`, in the same transaction as the parent delete, and the gist step stays guarded on the table existing so databases predating the `gists` table are unaffected. The provider's validation handler also gained the rollback guard the MCP handler already had: it returned `validation_failed` without rolling back, so a failure after the deletes -- the `memory_validations` insert, say -- left them pending on a long-lived connection for a later unrelated commit to make permanent. Existing orphans are not cleaned up retroactively; `mnemosyne doctor --all` continues to report them.
+
+- **Event timestamps and working-memory retention now use chronological UTC instants.** Mixed-offset and whitespace-padded timestamps are compared consistently for TTL and keep-newest limits. Consolidation preserves separately validated event dates, safely degrades invalid stored metadata, and does not strand source claims. Empty embedding results no longer roll back episodic summaries, including the non-sqlite-vec fallback. Existing records are not rewritten.
+
+- Repeated discovery of a successfully loaded canonical plugin path reuses its module and classes across plugin managers. Discovery does not hot-reload changed plugin files.
+
+- Plugin discovery uses lossless canonical-path module keys to avoid standard-library shadowing and cross-directory filename collisions. Failed loads restore only module and registry entries still owned by that load; successful modules remain importable.
+
+- **The CLI no longer crashes on non-Windows-1252 memory content when its output is piped.** When `mnemosyne` is spawned by agent tooling with piped stdout on Windows, Python defaults `sys.stdout` to cp1252, and `recall` (or any command printing memory content) died with `UnicodeEncodeError: 'charmap' codec can't encode character '\u20b1'` the moment a stored memory contained a character outside cp1252, such as the peso sign, an emoji, or CJK text. `run_cli()` now reconfigures `sys.stdout` and `sys.stderr` to UTF-8 with `errors='replace'` at startup, so output stays correct when the environment provides UTF-8 (or supports it) and degrades to replacement characters instead of a traceback when it does not.
+- **CI no longer hangs silently on an `mcp` release (#871).** `mcp` 2.1.0 deadlocks the streamable-http test teardown, so every matrix job burned its full time budget with zero `FAILED` lines and no commit to blame. The dependency now excludes 2.1.0, and the CI pytest invocations run under `pytest-timeout` (900 s per test, thread method) so a future hang surfaces as a named failure instead of a bare red job.
+- **Fact extraction no longer persists truncated or value-free objects (#837).** The rule-based `EpisodicGraph.extract_facts` regexes matched their optional article inside the next word, so `"Alice is already ready"` stored `(Alice, is, lready)`; and nothing guarded the object side, so `"Bob is different"` stored `(Bob, is, different)` and `"Carol uses an extremely reliable editor"` stored `(Carol, uses, extremely)`. Those rows reached `facts`, `graph_edges` and `consolidated_facts` through `remember`, its dedup-update branch, `remember_batch` and `consolidate_to_episodic`, and `fact_recall` surfaced them. Because every such triple shares `(subject, predicate)` with the real facts about that subject, the veracity consolidator also read each one as a contradiction. The article group is now anchored as a whole word, and a new `_is_low_quality_object` rejects a lone lowercase object that is a function word, a transient-state adjective, a filler, or a stance/degree adverb. The guard is a closed word list, not a suffix or shape rule, so names and nouns such as `Sally`, `Italy`, `family` and `developer` cannot be rejected, and a capitalised token (`Rust`, `ComfyUI`) always passes. The patterns capture one object token and still do, so an adjective phrase reaches the guard as its leading modifier and the rule is about that word alone; widening the capture would change every object row and is deliberately not part of this fix. Article-led subjects are rejected when the article opens a common-noun phrase (`"The silence is different"`), and kept when it opens a name (`"The Matrix is a film"`, `"A New Hope has a sequel"`), which the word after the article decides. Existing junk rows are not cleaned retroactively. Restores, in a narrower shape, the fix from #248, whose commits are no longer reachable from `main` (#862); thanks @ekinnee for the independent report.
+- **Optional `embeddings` and `all` installs cap `onnxruntime` below 1.29.** This avoids `blkid` stderr on minimal Linux/aarch64 systems.
+- **CI stopped being able to verify anything, because an unpinned dependency changed ASGI behaviour (#860).** `tests/test_mcp_streamable_http.py` drives the authenticated SSE GET by hand through the TestClient portal, and its `receive()` never delivered the initial `http.request` message. That violates the ASGI contract, but mcp 2.0.0 answered without waiting for it, so the driver passed. mcp 2.1.0 reads the request body to enforce `max_request_body_size` (SDK #3336), so the handler now blocks before `http.response.start`, the test's wait fails, and `TestClient.__exit__` then blocks forever draining a task group that still holds the wedged ASGI task. The job ran to its six-hour ceiling and reported nothing.
+
+  The dependency is declared `mcp>=2.0.0` with no upper bound, so every run resolves the newest release at install time. mcp 2.1.0 was published on 2026-08-24 at 19:04 UTC; every green run predates it and every hung run follows it. This was not intermittent and not a race: 0 hangs in 22 consecutive runs on 2.0.0, then 4 hangs in 4 runs on 2.1.x, and the same boundary reproduces locally on the unmodified test.
+
+  The server itself is unaffected. Driven over a real socket, mcp 2.0.0 and 2.1.1 both answer the session GET with 200 and `text/event-stream` immediately, so no released version of Mnemosyne is affected and the requirement stays unbounded. Only the hand-written scope could omit a message a real server always sends.
+
+  Three changes: `receive()` now delivers `http.request` before blocking; the ASGI call runs as a portal task whose future is cancelled in a `finally`, so a stuck stream or any failing assertion reports instead of wedging teardown; and `pytest-timeout` caps any single test at 300 seconds, roughly a hundred times the slowest test in the suite, so the next surprise of this shape costs five minutes and names itself instead of costing six silent hours.
+- **Native Windows no longer defaults to an install mode that cannot succeed (#857).** `mnemosyne-hermes install` defaulted to `symlink` on every platform, but Windows only permits creating a symbolic link with Developer Mode enabled or an elevated shell. Without one, the install failed with `WinError 1314`, so it worked for some users and not others depending on a privilege nobody thinks to check. On native Windows the default is now persistent wrapper mode, which writes a real plugin directory and needs no privilege; `--mode symlink` still works for anyone who holds it, and nothing changes on Linux, macOS or WSL. An omitted `--mode` resolves to wrapper *before* installation begins rather than switching after a failure, and an explicit `--mode symlink` that hits `WinError 1314` is never switched automatically: it fails with recovery guidance, and the message says so plainly.
+- **CLI failure boundaries now emit stable sanitized error codes.**
+- **The Core wheel no longer ships `examples/` as an installed top-level package.** #729 excluded the repository-only `integrations` tree from root package discovery, but the same greedy finder still swept `examples`, so installing `mnemosyne-memory` placed a top-level `examples` package into `site-packages`, where it can collide with or shadow any other distribution's `examples` module and a user's own `import examples`. `examples*` is now excluded. The wheel regression suite asserts the entire top-level surface rather than individual leaked directories, so the next repository-root directory cannot reach `site-packages` unnoticed.
+- **Portable JSON exports now disclose partial data (#602).** The additive completeness manifest lists populated persisted surfaces omitted entirely and exported sections that omit populated fields; import reports the source artifact's evidence instead of implying a lossless restore. Older export files remain importable with unknown completeness.
+
+- **Hermes plugin tools no longer talk to a second, never-initialized provider.** `register()` constructed one `MnemosyneMemoryProvider` for MemoryManager and a second for PluginManager tool handlers. Desktop/`tool_call` hit the empty instance and returned `Mnemosyne not initialized` while the CLI and `hermes memory status` used the live DB. Both paths now share one instance, and a primary-context tool call lazy-initializes if Hermes never called `initialize()`.
+- **Native Windows Hermes venv discovery now finds `Scripts/python.exe` (#809).** Implicit `mnemosyne-hermes install` discovery now supports validated native Windows virtual-environment layouts through launcher siblings, known Hermes roots, the active prefix, and `VIRTUAL_ENV`; explicit `--python` remains authoritative.
+- **Windows Hermes symlink installs now explain WinError 1314 recovery (#807).** When Windows denies symbolic-link creation because Developer Mode or the symbolic-link privilege is unavailable, the installer fails closed and prints a command-safe persistent wrapper retry using the resolved Hermes Python; it does not switch modes automatically.
+- **CJK-labelled secrets are now detected, flagged and redacted (#806).** A secret introduced by a Chinese/Japanese/Korean label with a fullwidth separator (`数据库密码：s3cr3t_...`) previously bypassed the write classifier, hygiene secret flagging and doctor preview redaction. `detect_secrets` now recognizes a curated set of CJK labels (`密码`/`密钥`/`令牌`/`口令`/`私钥`, `パスワード`/`秘密鍵`/`トークン`, `비밀번호`/`키`) followed by an ASCII or fullwidth separator, with a credential-value predicate that requires a non-CJK, token-like value (8+ chars, at least one ASCII letter or digit) so ordinary Chinese policy prose such as `密码：建议每90天更换一次` is never classified as a secret. The write classifier and hygiene consume this through `detect_secrets`; doctor preview compiles the same canonical patterns for redaction.
+- **Hermes wrapper validation timeout is configurable (#804).** `mnemosyne-hermes install --mode wrapper` now accepts `--import-timeout SECONDS` (default: 60) for both selected-Python validation probes, rejects non-positive/non-finite values, and gives a retry command when validation times out.
+- **Committed memory invalidations no longer report failure when enhanced-recall cache eviction fails (#594).** The mutation remains successful and the cache error is logged for reconciliation.
+- **Hermes providers no longer clear the shared host LLM backend while another primary provider remains active (#551).**
+- **The OpenAI-compatible modality retry test is deterministic under load (#798).** Its localhost stub handles one request at a time and records response statuses, so the 401/no-retry contract is checked against the response actually served.
+- **Raw dialog no longer starves distilled facts out of the dense recall voice (#696).** Conversational capture (`source='conversation'`, and legacy `honcho_*` imports) is topically identical to the queries that retrieve it, so those rows saturated the nearest-N working-memory vector pool and pushed distilled facts beyond it. An affected fact surfaced with `dense_score=0.0` or did not surface at all. Dialog sources are now excluded from the working-memory dense candidate pool while remaining fully reachable through FTS. #608 widened the candidate neighbourhood, which helps a shallow flood; this is what makes that capacity effective against the flood itself.
+- **`hermes mnemosyne export` honors the resolved bank instead of leaking the default (#690).** Explicit and profile-resolved bank selections are now passed to the export-side `Mnemosyne` instance. A selected bank is validated through a read-only SQLite preflight before any Beam, Mnemosyne or output initialization, and a missing, directory-incomplete, table-incomplete or column-incomplete bank is rejected without creating an output artifact or mutating the bank. Validation failures do not expose filesystem paths. Export with no selected bank is unchanged.
+- **An uncached local model download now warns before it starts (#703).** The first use of the local GGUF path could spend a long time fetching roughly 656 MB with nothing said. A single warning now names the model file, the HuggingFace repository and the destination cache path, states the size for the built-in default artifact, and explains both the pre-cache option and the AAAK-only opt-out via `MNEMOSYNE_LLM_ENABLED=false`. Default, cache, download, retry and fallback behavior are unchanged, and nothing is written to CLI or MCP stdout.
+- **Hermes wrapper installs are no longer clobbered by a forced symlink install.** Wrapper mode is the Docker-safe integration path, and a generic forced symlink install could remove its import bootstrap and leave profile links resolving to the package directory. A wrapper-to-symlink downgrade now requires an explicit request, and wrapper refreshes are validated and staged before they replace a working install. Legacy fresh symlink installs, opted-in profile links and the `upgrade` path are unchanged.
+- **API embedding failures no longer vanish as a silent `None` (#735).** `embed()` / `embed_query()` returned a bare `None` whenever the OpenAI-compatible endpoint failed, so callers such as `BeamMemory.remember()` skipped vector storage with zero diagnostics and no log entry (the `except Exception` warning path never fired). The public API now fails loud: when the API path is active but yields no vectors, both functions raise `RuntimeError` naming the redacted endpoint and model (never the input text or credentials), and `_embed_api` logs the previously-silent missing-API-key path for OpenRouter endpoints. Best-effort call sites (`memory.py` legacy dual-write, Hindsight import backfill, SHMR `_embed`) catch the exception and degrade gracefully, so memory writes and imports still succeed without vectors. Endpoint URLs in the credentialed cleartext/redirect policy refusals are now redacted with `_safe_api_endpoint()` before formatting, non-finite API vectors (`NaN`/infinity) are rejected before storage, and `BeamMemory.update_working()` removes the row's previous derived vector from both `memory_embeddings` and `vec_working` when a content change cannot be re-embedded, so dense recall never scores new content with a stale embedding.
+- **Forgetting a working memory now removes its associated gists (#782).** Direct and batch forget paths previously left derived gist rows behind, allowing stale context to survive deletion. Cleanup is atomic and preserves the existing session authorization boundary.
+- **The `mnemosyne-stats.py` test suite now runs against a hermetic pytest-owned database instead of the developer's real one (#783).** `tests/test_mnemosyne_stats.py` shelled out to the stats CLI without an environment override, so on a developer machine it resolved the ambient `MNEMOSYNE_DATA_DIR` / `HERMES_HOME` / `HOME`, read and reported on the real Mnemosyne database, and wrote snapshots into real home directories; `test_rapid_fire` flaked when a live database had concurrent writers, and the tests exposed the developer's stored memories. An autouse module fixture now points the subprocess at a seeded `tmp_path` bank plus tmp home/wiki dirs and re-points the assertion helpers at the same locations, making the tests hermetic and ordering-independent.
+- **Automatic working-memory consolidation no longer calls `sleep_all_sessions()`, and `auto_sleep_enabled: false` is honored (#771).** The Hermes provider's `_maybe_auto_sleep()` previously selected `sleep_all_sessions()` by capability probing, which could sweep unrelated sessions. Its worker now calls `sleep()` on the `BeamMemory` instance bound to the triggering session. The provider also reads the core `auto_sleep_enabled` config key (via the Mnemosyne config bridge, matching the root provider) in addition to the Hermes `auto_sleep` key, so `mnemosyne config set auto_sleep_enabled false` disables automatic consolidation.
+- **The Core wheel no longer ships the repository-only Hermes provider source/test tree (#729).** The root setuptools package finder did not exclude the nested `integrations/` tree, so `mnemosyne-memory` wheels bundled the standalone Hermes provider and its tests even though it is published separately. `integrations*` is now excluded from Core package discovery, while the standalone `mnemosyne-hermes` package remains separate; regression tests build both wheels and assert their contents.
+- **`valid_until` timestamps are now aware UTC everywhere (#525).** `invalidate()` wrote a naive local wall-clock ISO value while SQLite-side surfaces (doctor, repair, MCP validate) compare against UTC `julianday('now')` / `CURRENT_TIMESTAMP`, so expiry checks disagreed by the host's UTC offset and shifted with DST. The write path and every Python-side `valid_until > ?` comparison now use `datetime.now(timezone.utc)`. All read filters compare stored values chronologically (`julianday`) rather than by ISO string ordering, so offset-bearing and space-separated legacy rows are judged by their actual instant; offset-bearing values are canonicalized to UTC at every supported persistence boundary (`remember`, `consolidate_to_episodic`, `import_from_dict`, Hindsight import, sync-apply). Legacy rows written without an offset are interpreted as UTC (the same interpretation SQLite already applies), and only an exact `YYYY-MM-DD` `valid_until` input keeps pass-through semantics (any other parseable form, including lowercase `t` separators, is normalized; unparseable values pass through unchanged).
+- **SHMR clustering no longer crashes with a dimension mismatch (#762).** `harmonize()`'s `_embed()` passed a `str` to `embeddings.embed()`, which expects `List[str]`; the string was iterated per character, so each embedding's dimension scaled with the text length and `_cluster_by_similarity()` failed whenever two candidates had different lengths. `_embed()` now wraps the text in a list, returns a fixed-dimension vector, and degrades to zeros when embeddings are unavailable. The `harmonize()` facts query also drops a filter on a `status` column that the `facts` table does not have, so the candidate step no longer raises `OperationalError`.
+- **MCP `tools/list` no longer advertises tools that cannot be called (#728).** Eight schemas (`mnemosyne_triple_end`, `mnemosyne_sync_push`/`pull`/`status`, `mnemosyne_persona_promote`/`demote`/`list`/`reinforce`) were published over MCP without a dispatch handler, so every `tools/call` for them failed with `Unknown tool`. The advertised surface is now filtered to the handler registry, and a parity test asserts the advertised set matches it exactly.
+- **The Hermes provider's failure diagnostic missed two virtualenvs over one base interpreter (#709).** `register_memory_provider()` compared `_hp.resolve()` against `Path(sys.executable).resolve()`. A venv's `bin/python` is a symlink to the interpreter it was created from, so resolving collapsed two distinct environments onto that one binary and skipped the diagnostic in exactly the case it exists to report; on macOS it also rewrote `/tmp` to `/private/tmp`. It now uses the `_hermes_python_mismatch()` helper added for #736, which compares environment roots, so the provider diagnostic and `mnemosyne-hermes status` answer the question the same way. That helper now normalises both sides with `os.path.normpath` before deriving the root: without it a path spelled `<venv>/bin/../bin/python` yielded `<venv>/bin/..`, which names `<venv>` but does not compare equal to it, so one environment was reported as two. Normalising is lexical and does not follow symlinks, so venv identity is preserved.
+- **Recall no longer silently misses leading-hyphen and symbolic query fragments (#744).** Queries containing leading-hyphen fragments such as ``rm -rf`` or ``--force`` could produce invalid FTS5 queries or no usable FTS terms (a token must start with a word character, and FTS5 treats a leading ``-`` as the NOT / column-exclusion operator), and symbolic code names such as ``C++`` or ``C#`` were dropped by the three-character meaningful-token gate, so recall returned an empty list without an error. Leading-hyphen fragments are now split into their components and matched through the FTS5 and lexical paths (``-v``-style single-character flags are included while stopwords and digits stay excluded); literal flag queries reject bare-component-only candidates regardless of configurable scoring weights. Symbolic code names are admitted as exact lexical tokens on both sides, so ``C++`` recalls memories containing ``C++`` without admitting ``c``-token distractors.
+- **`mnemosyne-hermes status` now reports the real interpreter mismatch (#736).** The warning compared interpreter paths but claimed a Python version mismatch and printed a bare version number instead of a runnable fix; it now compares the Hermes and installer environments and emits a shell-quoted `→ Run: <python> -m pip install -U 'mnemosyne-hermes[all]'` command.
+- **A query embedding whose dimension disagreed with the store's `vec0` tables crashed `recall()` (#753, fixed in #754).** `_vec_search` (the episodic KNN over `vec_episodes`) executed its MATCH without exception handling, so `sqlite3.OperationalError: Dimension mismatch for query vector` propagated straight out of `recall()` and took down the calling process — while the write path (`_wm_vec_upsert`) logged and dropped the mismatched vector, and the working-memory KNN (`_wm_vec_search_sqlite`) already returned `[]`. Most often hit when a process resolves a different `MNEMOSYNE_EMBEDDING_DIM` than the one that dimensioned the store. `_vec_search` now degrades the same way: vector recall is disabled for that call, `recall()` falls back to its other voices, and the log carries actionable guidance: the existing `_dim_mismatch_message()` self-heal steps when the configured dimension disagrees with the store, or a pointer at the embedding endpoint (explicitly not a reindex) when the endpoint serves a differently-dimensioned query vector while store and configuration agree.
+- **MCP SSE authentication rejects malformed non-ASCII bearer tokens with `401` instead of returning a server error (#739).**
+- **Thread-local SQLite connection churn no longer accumulates file descriptors.** Connection creation now periodically runs process-wide cyclic-garbage collection, reclaiming unreachable SQLite handles without closing connections still referenced by live objects. Because collection scans all unreachable cycles, its occasional tail latency depends on process heap size.
+- **API embedding failures now leave a redacted diagnostic trace (#735).** Final HTTP, network, and invalid-response failures still degrade to keyword-only retrieval, but now log the endpoint and safe error class or status without request content, API keys, URL userinfo, query strings, or fragments.
+- **Hermes tool discovery now honors `memory.mnemosyne.tools` (#725).** Tools outside the configured allowlist are no longer advertised through Hermes provider schemas before provider initialization.
+- **Truncated LLM reasoning traces no longer reach memory persistence (#734).** Malformed or unbalanced `<think>` output is rejected before fact extraction, model-refresh parsing, or sleep consolidation; sleep falls back to AAAK rather than persisting a partial LLM summary.
+- **Single-item embedding observability (#718).** `remember()` now warns when
+  an available embedding backend returns no vector or the wrong vector count,
+  while preserving the best-effort memory write.
+- **Episodic degradation preserves atomic vector refreshes (#691).** Refreshing sqlite-vec embeddings no longer commits inside a degradation savepoint, so a failed refresh rolls back its content and vector update together.
+- **Hermes interpreter discovery accepted an unvalidated candidate (follow-up to #618/#620).** #620 taught `_find_hermes_python()` to follow a shell-wrapper launcher through its `exec` target, which fixed the reported case. Two paths still returned the wrong interpreter: a launcher that is neither a symlink nor an `exec` wrapper resolves to itself, so a sibling `python` in a shim directory such as `~/.local/bin` (commonly a Homebrew or system symlink) was still returned as "Hermes' Python"; and the known-install-root branches returned `candidate.resolve()`, which follows a venv's `bin/python` symlink to its base interpreter and discards the venv. An implicitly discovered candidate is now returned only when its directory is a real virtualenv (`pyvenv.cfg`) and its interpreter is executable, from the launcher, the install roots, `sys.prefix` and `VIRTUAL_ENV` alike, and no branch resolves the interpreter symlink. An explicit non-empty `--python` stays authoritative and deliberately bypasses that validation; an empty one is rejected rather than falling through to discovery. `--python` is now authoritative and reaches symlink-mode discovery and `--dry-run`, where it previously affected only wrapper installs. **Behavior change:** a symlink install fails closed when no validated interpreter is found, naming `--python`, where it previously proceeded; `--no-bootstrap` continues without dependency validation, since it already installs nothing into Hermes' environment.
+- **Windows Git Bash/MSYS backup destinations no longer silently land on a drive-relative path (#659).** `mnemosyne backup /c/...` now writes to the intended `C:/...` destination. Ambiguous POSIX-rooted destinations are rejected before backup creation instead of reporting success for a different location; native Windows, UNC, and relative paths remain supported.
+- **The built wheel now ships `hermes_memory_provider/plugin.yaml` (#656).** `pyproject.toml` declared no `package-data` for `hermes_memory_provider`, so a normal `pip install mnemosyne-memory` (unlike an editable install) omitted the manifest Hermes' plugin loader requires, leaving the documented `hermes_memory_provider` symlink install pointed at a directory with no `plugin.yaml`.
+- **Invalidation replacement links now require an accessible memory (#676).** `mnemosyne_invalidate` rejects an unknown or out-of-scope non-empty `replacement_id` before changing the target, so rejected replacements do not create links at invalidation time.
+- **`bge-m3` embedding alias resolves its 1024-dimensional vectors (#666).** The unqualified model name now resolves identically to `BAAI/bge-m3`, avoiding an unknown-model startup error when no explicit dimension override is set.
+- **MCP invalidate now reports scope-safe failure (#660).** `mnemosyne_invalidate` returns `memory_not_found` instead of claiming success when its target is outside the current scope or cannot be mutated, preserving scope isolation.
+- **Recall diagnostics were dead under `MNEMOSYNE_POLYPHONIC_RECALL=1`.** The polyphonic branch of `BeamMemory.recall()` returned before the C4 recording block, so every recall that ran through the polyphonic engine (vector/graph/fact/temporal voices) never incremented `mnemosyne_recall_diagnostics` counters — the tool reported `calls: 0` under the flag that production deployments use. The polyphonic branch now records tier hits and call counts itself, mapping engine voices to the existing diagnostic tiers (`vector`→`wm_vec`, `graph`→`em_vec`, `fact`→`em_fts`). Recording is read-only signal and never alters recall behavior. Documented in `docs/benchmarking.md`.
+- **`fallback_rate` was dead under `MNEMOSYNE_POLYPHONIC_RECALL=1`.** The polyphonic diagnostics block (added in #668) recorded tier hits and call counts but never `record_fallback_used()`, so `mnemosyne_recall_diagnostics` reported `wm_fallback_rate`/`em_fallback_rate` as `0` on every polyphonic recall — including when the vector voice degraded from the sqlite-vec fast path to a numpy full-scan (sqlite-vec absent, failing, or its top-K ANN hits all dropped in the superseded/valid_until JOIN). The engine now exposes a per-call degraded-path flag and the polyphonic block records it as `em_fallback_used`. `wm_fallback_rate` stays `0` by design: the polyphonic engine has no substring-scoring tier for working memory. Recording is read-only signal and never alters recall behavior. Documented in `docs/benchmarking.md`.
+
+- **Persisted Enhanced Recall cache was stale after fresh `remember()` writes (#556).** `BeamMemory.remember()` now uses the established persisted-cache invalidation helper after successful new-memory and dedup-update writes, so a fresh writer evicts results warmed by another instance before the next fresh enhanced-recall request. Live peer in-memory coherence remains tracked separately in #552.
+- **Hermes wrapper runtime compatibility guard (#625).** The legacy provider and newly registered persistent wrappers reject selected Mnemosyne site-packages whose virtualenv targets a different Python major/minor, or has an unreadable version, before activation/import; the error directs operators to recreate the Mnemosyne environment using Hermes' Python. Existing persistent wrapper artifacts must be force-refreshed or re-registered from a compatible Hermes-Python venv to receive this guard.
+- **Vector rebuild failures are now reported explicitly (#603).** Reindexing fails on incomplete embedding batches or derived-vector write failures. `vec_working` repair also fails when its final coverage check remains incomplete. `mnemosyne diagnose --repair-vec-working` returns a non-zero exit code when a requested repair fails.
+- **Persona token-cap truncation (#621).** `render_persona_markdown` now skips oversized topic sections and continues evaluating later sections, so smaller persona sections that still fit within the approximate token cap are retained.
+- **Silent hermes_plugin import failure in legacy provider (#649).** `hermes_memory_provider/__init__.py` `register()` replaced bare `except Exception: pass` with `logger.warning(...)` so that failures to import the legacy `hermes_plugin/` directory are visible in logs. Previously, a missing `__init__.py` (or stale `.pyc` files) silently prevented hook registration (pre_llm_call memory injection, tools) with no diagnostic output.
+- **`degrade_batch` now honors `config.yaml` at the BEAM consumer (#482).** Episodic degradation resolves `degrade_batch` as `config.yaml > MNEMOSYNE_DEGRADE_BATCH > 100` once per complete degradation pass. Reloaded YAML applies to the next pass without changing the candidate limits of a running pass.
+- **BEAM recall weights now honor `config.yaml` at runtime (#482).** `vec_weight`, `fts_weight`, and `importance_weight` now resolve as `config.yaml > MNEMOSYNE_*_WEIGHT > defaults` in direct and Hermes-provider recall paths. Reloaded weights apply to the next request, and enhanced recall cache entries are isolated by the effective weight snapshot.
+- **Packaged Hermes plugin manifests match the released package version (#588).**
+- **Hermes provider discovery and registration work through the provider `register()` bridge (#565).**
+- **Invalidating a nonexistent memory explicitly reports `memory_not_found` (#542).**
+- **sqlite-vec candidate retrieval is widened before working-memory filters (#608).** Matching results are no longer excluded prematurely.
+- **File-import dry run.** File-import `--dry-run` now passes through the core, MCP, both Hermes providers, and CLI surfaces to clone-based validation without changing the active database or audit data. Dry-run responses report `"status": "dry_run"` so clients cannot mistake simulated import statistics for a completed import.
+- **Repaired `hygiene audit --json` → `hygiene clean` workflow (#606).** `hygiene clean` now unwraps the audit envelope produced by `hygiene audit --json` and validates each candidate before cleanup. Raw candidate arrays remain supported, and candidates with persisted `importance` values outside `[0, 1]` are accepted so the audit-to-clean pipeline completes without manual editing.
+- **Model-refresh confidence: NaN cleared every gate and legacy text crashed sleep mid-batch.** JSON round-trips NaN and Infinity, and `parse_model_update_proposals` clamped NaN to 1.0 (`min` and `max` keep their first argument when a NaN comparison is False), so a NaN-confidence proposal became a top-importance memory; the auto-apply gate's `confidence < minimum` check is also False for NaN, so the same proposal reached the canonical store regardless of threshold. Separately, `apply_model_refresh_proposal` and sleep()'s proposal-remember call site converted stored confidence with a bare `float()`, so a legacy bank's text value (for example `"high"`) raised ValueError. The sleep call site runs after the claim commit, so that raise stranded the group's `consolidation_claimed_at` and orphaned every later group's claimed rows. Non-numeric and non-finite confidence now degrades per site: skipped at parse, 0.0 at the auto-apply gate, 0.5 at apply and at proposal importance. Finite values outside [0.0, 1.0] clamp to the domain bound on every path before auto-apply threshold checks and canonical storage, so a persisted 2.0 cannot remain unbounded. Hardening split out of #546 per review.
+- **Russian and Spanish MEMORIA patterns contained literal backslash escapes (#560).** The `ru` instruction pattern was written with `\\\\s+` and `[^.,;!?\\\\n]` inside a raw string, so it required a literal backslash in the text and Russian instruction extraction matched nothing at all. Six `es` patterns (`negation`, `decision`, `entity`, `sequence`, `instruction`, `preference`) carried the same doubled `\\\\n`, which turned the newline exclusion into an exclusion of the letter `n` and truncated every capture at the first `n`. Both are now single-escaped, and the locale guard test in `tests/test_memoria_instruction_boundaries.py` rejects any future doubled escape.
+- **Hermes session switches left Mnemosyne memory bound to the previous session (#601).**
+  The standalone `mnemosyne-hermes` provider now rebinds its `BeamMemory` session when Hermes
+  rotates the agent session through `/new`, `/resume`, `/branch`, undo, or context
+  compression, so subsequent writes, reads, and tools use the active session.
+
+- **After-commit event hooks are now savepoint-aware (#963).** `forget()` defers `MEMORY_INVALIDATED` past a caller-owned transaction so the event fires on commit and is suppressed on rollback, but a `ROLLBACK TO <savepoint>` inside the caller's transaction undid the delete while the queued hook survived, publishing an invalidation for a row that was never deleted. The connection now mirrors savepoint scope for its hook queue through both connection-level `execute()` and a hook-aware cursor: hooks queued inside a savepoint are discarded when it rolls back and kept when it releases, and a bare `ROLLBACK` issued as raw SQL clears them like `rollback()` does. Anything bypassing both paths (e.g. a foreign cursor factory) stays invisible and an untracked name is left alone rather than guessed at. Releasing the outermost savepoint — which implicitly commits — drains the queue at once instead of leaving the event for an unrelated later commit.
 
 ## [3.15.1] - 2026-07-30
 
 ### Fixed
 
+- **`test_stored_offset_bearing_valid_until_chronologically_filtered` failed for two hours every day (#525 follow-up).** The test stores a space-separated naive `valid_until` two hours ahead and asserts a lexical filter drops it, since a space separator sorts before a `T` separator. That only holds while the date components match. Between 22:00 and 00:00 UTC the value rolled into tomorrow, sorted after aware-UTC now, and the sanity assertion failed on an unchanged tree. The naive value is now clamped to the current UTC date, behind a 30-second validity margin so a clamp near midnight cannot leave the row expiring mid-test, so the trap it sets actually holds, verified across all 1440 minutes of the day. Behavior under test is unchanged; this was a defect in the fixture, not in `valid_until` handling.
+- **MEMORIA negation extraction no longer stores embedded-token false positives (#559).** The `negation` patterns for en/de/ru/it/es now start with a word boundary, so text such as `API never ...` cannot be matched as a first-person user negation and written to `memoria_kg`.
 - **MEMORIA instruction extraction inverted "whenever X" into "never X" (#507).** The instruction pattern was not word-boundary anchored, so `never` matched inside `whenever` and the extractor stored the opposite of what the user said — on a production bank, "Good - whenever needed we can use it." was recorded as the instruction "never needed we can use it". All five locale patterns (en/de/ru/it/es) are now anchored with a leading `\b`. Genuine instructions are unaffected, including those preceded by another word or punctuation ("Note: never push to main", "wherever you go, always run the tests"). Reported by @Axmr1 from a 61-row production audit; original diagnosis and fix approach from @Sanjays2402 (#508) and @Souptik96 (#549).
 - **`mnemosyne_recall` crashed on its own schema default (#555).** The tool schema declared `query_time` with `"default": ""`, but `_parse_query_time` mapped only `None` to "now" — a blank string fell through to the ISO parser and raised `Invalid query_time format: ''`. Any MCP harness that sends declared defaults could not call `mnemosyne_recall` at all. Blank and whitespace-only values are now treated as unset, the MCP handler normalizes `""` to `None` (matching the `or None` idiom already used for `valid_until` and `as_of`), and the schema no longer advertises a default that means "omitted". Thanks @dalkommatt for the report and the diagnosis.
-- **Enhanced Recall served invalidated rows until TTL expiry (#550, #554).** `BeamMemory.invalidate()` now clears the query cache after a successful update, including the persisted `query_cache.db` when the instance has no in-memory cache of its own. Missing or unauthorized IDs leave the cache untouched. Remaining gaps are tracked in #552 (live peer coherence), #553 (`forget_working`) and #556 (`remember`/update paths).
+- **Enhanced Recall served invalidated rows until TTL expiry (#550, #554).** `BeamMemory.invalidate()` now clears the query cache after a successful update, including the persisted `query_cache.db` when the instance has no in-memory cache of its own. Missing or unauthorized IDs leave the cache untouched. Remaining gaps are tracked in #552 (live peer coherence) and #553 (`forget_working`).
 - **Catastrophic regex backtracking in version-string extraction (#544).** The pattern used by `extract_and_store_facts` could be driven into exponential backtracking by Title-Case input, hanging every `remember()` and import on attacker- or user-supplied content. The separator is now `\s+`, which makes each whitespace-delimited word consumable exactly one way. Behavioral equivalence was verified across a 200,000-string fuzz with zero differences.
 
 ## [3.15.0] - 2026-07-20
@@ -92,7 +308,50 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   The path now deletes all dependent rows before removing the parent,
   with guarded vec_working handling for sqlite-vec-unavailable environments.
 
-## [3.12.0] — 2026-07-11
+## [3.12.2] - 2026-07-11
+
+### Fixed
+
+- **Config reload now bridges to the Hermes provider.** `mnemosyne config
+  set` and `mnemosyne config reload` previously wrote to the Mnemosyne
+  config.yaml but the Hermes provider only read from the Hermes config.yaml
+  (`memory.mnemosyne.<key>`). The two files never connected, so config
+  changes appeared to do nothing. Now the provider falls back to the
+  Mnemosyne config singleton when the Hermes config has no value, and
+  `MnemosyneConfig.get()` auto-reloads on file mtime changes so `config set`
+  takes effect immediately without an explicit reload.
+
+- **Config.yaml auto-seed on all entry points.** The auto-seed now fires on
+  `Mnemosyne()` and `BeamMemory()` init, not just explicit config imports.
+  Idempotent — checks file existence first.
+
+- **Test isolation for config auto-seed.** Config profile tests now create
+  an empty config.yaml before init so the auto-seed doesn't override test
+  env vars with defaults.
+
+## [3.12.1] - 2026-07-11
+
+### Added
+
+- **Config.yaml auto-seed on first access.** Mnemosyne now creates a
+  `config.yaml` at the standard location with all 106 known keys and their
+  default values. The file is created automatically on first access — no
+  manual setup needed. For each key, if the corresponding env var is set,
+  its value is used instead of the default, ensuring existing env var
+  configurations are never silently overridden. Hot-reload with
+  `mnemosyne config reload`. Precedence unchanged: config.yaml > env vars
+  > hardcoded defaults.
+
+### Fixed
+
+- **Config.yaml auto-seed respects existing env vars.** The initial
+  implementation wrote all defaults blindly, which would silently override
+  any `MNEMOSYNE_*` env vars the user had set (since config.yaml takes
+  precedence over env vars). Now each key checks for an active env var
+  before writing. Type coercion is applied: env var strings are parsed as
+  bool/int/float to match the default type.
+
+## [3.12.0] - 2026-07-11
 
 ### Added
 
@@ -211,7 +470,6 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 - Installation steps revised for Hermes users (#414, @bruvv)
 - Pi agent integration docs added (#c0a7176)
-- Hermes Tweet compatibility table (#e032008, @Burak Bayır)
 - `.coderabbit.yaml` with grouped reviews and architectural rigor (#da4832a)
 
 ### Thanks
@@ -232,50 +490,7 @@ layered memory roadmap
 @PlainWu, @ClaytonChew, @bruvv, @justanotherAIcontributor, @BurakBayır,
 @Iman-Sharif, @webtecnica — bug reports, fixes, and docs improvements
 
-## [3.12.1] — 2026-07-11
-
-### Added
-
-- **Config.yaml auto-seed on first access.** Mnemosyne now creates a
-  `config.yaml` at the standard location with all 106 known keys and their
-  default values. The file is created automatically on first access — no
-  manual setup needed. For each key, if the corresponding env var is set,
-  its value is used instead of the default, ensuring existing env var
-  configurations are never silently overridden. Hot-reload with
-  `mnemosyne config reload`. Precedence unchanged: config.yaml > env vars
-  > hardcoded defaults.
-
-### Fixed
-
-- **Config.yaml auto-seed respects existing env vars.** The initial
-  implementation wrote all defaults blindly, which would silently override
-  any `MNEMOSYNE_*` env vars the user had set (since config.yaml takes
-  precedence over env vars). Now each key checks for an active env var
-  before writing. Type coercion is applied: env var strings are parsed as
-  bool/int/float to match the default type.
-
-## [3.12.2] — 2026-07-11
-
-### Fixed
-
-- **Config reload now bridges to the Hermes provider.** `mnemosyne config
-  set` and `mnemosyne config reload` previously wrote to the Mnemosyne
-  config.yaml but the Hermes provider only read from the Hermes config.yaml
-  (`memory.mnemosyne.<key>`). The two files never connected, so config
-  changes appeared to do nothing. Now the provider falls back to the
-  Mnemosyne config singleton when the Hermes config has no value, and
-  `MnemosyneConfig.get()` auto-reloads on file mtime changes so `config set`
-  takes effect immediately without an explicit reload.
-
-- **Config.yaml auto-seed on all entry points.** The auto-seed now fires on
-  `Mnemosyne()` and `BeamMemory()` init, not just explicit config imports.
-  Idempotent — checks file existence first.
-
-- **Test isolation for config auto-seed.** Config profile tests now create
-  an empty config.yaml before init so the auto-seed doesn't override test
-  env vars with defaults.
-
-## [3.11.0] — 2026-06-30
+## [3.11.0] - 2026-06-30
 
 ### Added
 
@@ -356,12 +571,12 @@ layered memory roadmap
   sleep's model-refresh pass now handles edge cases around session boundaries
   and empty proposal sets.
 
-## [3.10.1] — 2026-06-22
+## [3.10.1] - 2026-06-22
 
 ### Security
 
 - **Fix critical JWT signature verification bypass in sync server
-  ([GHSA-xcw4-53cc-hv32](https://github.com/AxDSan/mnemosyne/security/advisories/GHSA-xcw4-53cc-hv32),
+  ([GHSA-xcw4-53cc-hv32](https://github.com/mnemosyne-oss/mnemosyne/security/advisories/GHSA-xcw4-53cc-hv32),
   CVSS 9.1).** The sync server's authentication check decoded JWT bearer
   tokens but never verified their HMAC-SHA256 signatures, allowing any
   well-formed token (including `alg: none`) to be accepted. An
@@ -393,7 +608,7 @@ endpoint.
   explicit `--bank`) instead of always reading the default bank, which reported empty
   state when the profile bank held the data. (#362, #363)
 
-## [3.10.0] — 2026-06-18
+## [3.10.0] - 2026-06-18
 
 ### Added
 
@@ -423,7 +638,7 @@ endpoint.
 - Default OFF to preserve opt-in upgrade story; turn on with
   `MNEMOSYNE_PERSONA_ENABLED=true` after upgrading.
 
-## [3.9.0] — 2026-06-18
+## [3.9.0] - 2026-06-18
 
 ### Added
 
@@ -515,7 +730,7 @@ endpoint.
   session queries with targeted indexes instead of a broad OR or
   temporary-sort query shape.
 
-## [3.7.0] — 2026-06-13
+## [3.7.0] - 2026-06-13
 
 ### Added
 
@@ -542,7 +757,7 @@ endpoint.
 - **Packaging cleanup:** `openclaw` dependency removed from `[all]` extra.
   Python 3.9 classifier dropped (3.10+ only).
 
-## [3.6.0] — 2026-06-10
+## [3.6.0] - 2026-06-10
 
 ### Added
 
@@ -636,7 +851,7 @@ endpoint.
   Locks in the invariant that importance may boost ordering only after a candidate
   has passed relevance, instead of rescuing unrelated rows.
 
-## [3.4.0] — 2026-06-01
+## [3.4.0] - 2026-06-01
 
 ### Added
 
@@ -651,7 +866,7 @@ endpoint.
   gates now keep diacritics inside tokens, so words like `Stoßlüften`,
   `Bürgeramt`, and `Primärquellen` are no longer split into ASCII fragments.
 
-## [3.3.0] — 2026-06-01
+## [3.3.0] - 2026-06-01
 
 ### Added
 
@@ -788,7 +1003,7 @@ endpoint.
 ### Fixed
 
 - **Irrelevant context injection in recall.** Three root-cause fixes for
-  [#198](https://github.com/AxDSan/mnemosyne/issues/198):
+  [#198](https://github.com/mnemosyne-oss/mnemosyne/issues/198):
   - Strict fact matching is now the default. Set `MNEMOSYNE_LENIENT_FACT_MATCH=1`
     to opt back into permissive matching (which matched any query word against any
     stored fact, dragging in unrelated memories with a false +20% score boost).
@@ -807,13 +1022,13 @@ endpoint.
 - `.githooks/pre-push` hook validates tags match `__version__` and SemVer format.
 - Git hooks path set to `.githooks` (run `git config core.hooksPath .githooks` on clones).
 
-## [3.1.1] — 2026-05-28
+## [3.1.1] - 2026-05-28
 
 ### Added
 
-- **Preferred embedding env vars.** `MNEMOSYNE_EMBEDDING_API_URL` and `MNEMOSYNE_EMBEDDING_API_KEY` are now the preferred names for custom embedding endpoints. The old `OPENROUTER_BASE_URL` and `OPENROUTER_API_KEY` names still work as fallbacks for backward compatibility. Restores the v2.8.x naming convention. ([#193](https://github.com/AxDSan/mnemosyne/issues/193))
+- **Preferred embedding env vars.** `MNEMOSYNE_EMBEDDING_API_URL` and `MNEMOSYNE_EMBEDDING_API_KEY` are now the preferred names for custom embedding endpoints. The old `OPENROUTER_BASE_URL` and `OPENROUTER_API_KEY` names still work as fallbacks for backward compatibility. Restores the v2.8.x naming convention. ([#193](https://github.com/mnemosyne-oss/mnemosyne/issues/193))
 
-## [3.1.0] — 2026-05-26
+## [3.1.0] - 2026-05-26
 
 ### Added
 
@@ -857,7 +1072,7 @@ endpoint.
 - **Local scratch and benchmark artifacts.** Cleaned up development artifacts from the repo. (`7826de9`)
 - **Personal emails from source files.** PII filter-repo scrub with .mailmap and PII pre-commit hook added. (`58507ea`)
 
-## [3.0.0] — 2026-05-18
+## [3.0.0] - 2026-05-18
 
 ### Added
 
@@ -911,7 +1126,7 @@ endpoint.
 - IE: 91.5%, MR: 87.5%, KU: 50%, TR: 75%, ABS: 100%
 - Ingestion: 36s for 188 messages with full MEMORIA extraction
 
-## [2.9.0] — 2026-05-17
+## [2.9.0] - 2026-05-17
 
 ### Fixed
 
@@ -922,7 +1137,7 @@ endpoint.
   Pydantic objects instead of raw dicts, matching the SDK 1.x `list_tools`
   handler signature. Both stdio and SSE transports are patched.
 
-## [2.8.0] — 2026-05-14
+## [2.8.0] - 2026-05-14
 
 ### Added
 
@@ -947,7 +1162,8 @@ endpoint.
 - **CI embedding timeout.** `fastembed` model downloads blocked subprocess tests. Added `MNEMOSYNE_NO_EMBEDDINGS` env guard and lazy-loading in `available()`.
 - **Provider export/import routing.** Fixed handlers to route through the `Mnemosyne` wrapper instead of `BeamMemory` directly.
 - **Stale version references.** Six files across the repo still displayed v2.7 after the initial v2.8.0 build (plugin yamls, docs pages, README badge, codebase surface). All corrected.
-## [2.7.0] — 2026-05-12
+
+## [2.7.0] - 2026-05-12
 
 ### Fixed
 
@@ -983,7 +1199,7 @@ endpoint.
 - `scripts/mnemosyne-stats.py` — new `annotations` section in JSON output alongside the existing `triples` section
 - 30+ new tests covering the new store, the migration script, the auto-migrate hook, and end-to-end production-path regression guards
 
-## [2.5] — 2026-05-10
+## [2.5] - 2026-05-10
 
 ### Added
 
@@ -1017,7 +1233,7 @@ endpoint.
 - Polyphonic recall voice combination: weighted average → position-based RRF
 - `mnemosyne/__init__.py`: version bump to 2.5.0
 
-## [2.4] — 2026-05-07
+## [2.4] - 2026-05-07
 
 ### Added
 
@@ -1052,7 +1268,7 @@ endpoint.
 
 ---
 
-## [2.3.1] — 2026-05-06
+## [2.3.1] - 2026-05-06
 
 ### Fixed
 
@@ -1060,7 +1276,7 @@ endpoint.
 - `MNEMOSYNE_AUTO_SLEEP_ENABLED` env var now controls auto-sleep behavior. Default is `false` (disabled) for interactive safety. Set to `true` to re-enable.
 - Config schema updated to reflect new default.
 
-## [2.3] — 2026-05-05
+## [2.3] - 2026-05-05
 
 ### Added
 
@@ -1089,7 +1305,7 @@ endpoint.
 - SQLite connection conflicts in batch degradation tests
 - Removed hallucinated Phase 2 from roadmap
 
-## [2.2] — 2026-05-02
+## [2.2] - 2026-05-02
 
 ### Added
 
@@ -1117,7 +1333,7 @@ endpoint.
 
 - README: added "Migrate from other memory providers" section with examples
 
-## [2.1] — 2026-05-02
+## [2.1] - 2026-05-02
 
 ### Added
 
@@ -1135,7 +1351,7 @@ endpoint.
 - MCP `_get_instance()` renamed to `_create_instance()` — creates fresh instances per connection
 - Episodic memory SELECTs and recall-tracking UPDATEs use dynamic session/channel scope
 
-## [2.0] — 2026-04-29
+## [2.0] - 2026-04-29
 
 ### Added
 
@@ -1211,7 +1427,7 @@ endpoint.
 
 ---
 
-## [1.13] — 2026-04-28
+## [1.13] - 2026-04-28
 
 ### Added
 
@@ -1229,7 +1445,7 @@ endpoint.
 
 ---
 
-## [1.12] — 2026-04-26
+## [1.12] - 2026-04-26
 
 ### Added
 
@@ -1242,7 +1458,7 @@ endpoint.
 
 ---
 
-## [1.11] — 2026-04-25
+## [1.11] - 2026-04-25
 
 ### Added
 
@@ -1255,7 +1471,7 @@ endpoint.
 
 ---
 
-## [1.10] — 2026-04-24
+## [1.10] - 2026-04-24
 
 ### Added
 
@@ -1271,7 +1487,7 @@ endpoint.
 
 ---
 
-## [1.9] — 2026-04-23
+## [1.9] - 2026-04-23
 
 ### Added
 
@@ -1288,7 +1504,7 @@ endpoint.
 
 ---
 
-## [1.8] — 2026-04-22
+## [1.8] - 2026-04-22
 
 ### Added
 
@@ -1301,7 +1517,7 @@ endpoint.
 
 ---
 
-## [1.7] — 2026-04-22
+## [1.7] - 2026-04-22
 
 ### Added
 
@@ -1314,7 +1530,7 @@ endpoint.
 
 ---
 
-## [1.6] — 2026-04-21
+## [1.6] - 2026-04-21
 
 ### Added
 
@@ -1328,7 +1544,7 @@ endpoint.
 
 ---
 
-## [1.5] — 2026-04-20
+## [1.5] - 2026-04-20
 
 ### Added
 
@@ -1344,7 +1560,7 @@ endpoint.
 
 ---
 
-## [1.4] — 2026-04-19
+## [1.4] - 2026-04-19
 
 ### Added
 
@@ -1361,7 +1577,7 @@ endpoint.
 
 ---
 
-## [1.3] — 2026-04-17
+## [1.3] - 2026-04-17
 
 ### Added
 
@@ -1370,7 +1586,7 @@ endpoint.
 
 ---
 
-## [1.2] — 2026-04-13
+## [1.2] - 2026-04-13
 
 ### Added
 
@@ -1383,7 +1599,7 @@ endpoint.
 
 ---
 
-## [1.1] — 2026-04-10
+## [1.1] - 2026-04-10
 
 ### Added
 
@@ -1399,7 +1615,7 @@ endpoint.
 
 ---
 
-## [1.0] — 2026-04-05
+## [1.0] - 2026-04-05
 
 ### Added
 
@@ -1409,13 +1625,13 @@ endpoint.
 - **Hermes plugin registration** — basic tool integration
 - **AAAK compression** — early context compression for token limits
 
-[3.7.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.7.0
-[3.6.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.6.0
-[3.5.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.5.0
-[3.4.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.4.0
-[3.8.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.8.0
-[3.9.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.9.0
-[3.10.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.10.0
-[3.10.1]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.10.1
-[3.11.1]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.11.1
-[3.11.0]: https://github.com/AxDSan/mnemosyne/releases/tag/v3.11.0
+[3.7.0]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.7.0
+[3.6.0]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.6.0
+[3.5.0]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.5.0
+[3.4.0]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.4.0
+[3.8.0]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.8.0
+[3.9.0]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.9.0
+[3.10.0]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.10.0
+[3.10.1]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.10.1
+[3.11.1]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.11.1
+[3.11.0]: https://github.com/mnemosyne-oss/mnemosyne/releases/tag/v3.11.0

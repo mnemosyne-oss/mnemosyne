@@ -2,8 +2,12 @@
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+import types
+
+from mnemosyne import cli
 
 
 COMMANDS = [
@@ -106,6 +110,114 @@ def test_export_reports_actual_exported_memory_counts(tmp_path):
     assert len(exported["annotations"]) == 2
 
 
+def test_export_manifest_reports_omitted_and_partial_persisted_data(tmp_path):
+    source_dir = tmp_path / "source"
+    target_dir = tmp_path / "target"
+    assert run_cli(["store", "portable source", "cli", "0.7"], source_dir).returncode == 0
+
+    source_db = source_dir / "mnemosyne-data" / "mnemosyne.db"
+    with sqlite3.connect(source_db) as conn:
+        conn.execute(
+            "INSERT INTO facts (fact_id, session_id, subject, predicate, object, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("omitted-fact", "default", "portable", "has", "omitted fact", 1.0),
+        )
+        conn.execute(
+            "UPDATE working_memory SET pinned = 1, author_id = 'export-owner', "
+            "event_date = '2026-04-01', event_date_precision = 'day'"
+        )
+
+    export_path = tmp_path / "partial.json"
+    export_result = run_cli(["export", str(export_path)], source_dir)
+    assert export_result.returncode == 0, export_result.stderr
+    assert "WARNING: portable export is partial" in export_result.stdout
+    assert "facts (1)" in export_result.stdout
+    assert "working_memory missing" in export_result.stdout
+    assert "author_id (1)" in export_result.stdout
+
+    manifest = json.loads(export_path.read_text(encoding="utf-8"))["mnemosyne_export"]["completeness"]
+    assert manifest["complete"] is False
+    assert {surface["table"] for surface in manifest["omitted_surfaces"]} >= {"facts"}
+    partial = {surface["section"]: surface for surface in manifest["partial_surfaces"]}
+    fields = {field["field"]: field for field in partial["working_memory"]["omitted_fields"]}
+    assert fields["author_id"]["affected_rows"] == 1
+    # pinned survives the portable round-trip since the event-date/pinned
+    # export fix; the manifest no longer reports it as omitted.
+    assert "pinned" not in fields
+
+    import_result = run_cli(["import", str(export_path)], target_dir)
+    assert import_result.returncode == 0, import_result.stderr
+    assert "WARNING: imported supported data only" in import_result.stdout
+    target_db = target_dir / "mnemosyne-data" / "mnemosyne.db"
+    with sqlite3.connect(target_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
+        # pinned=1 + event_date survive the portable round-trip
+        # (event-date/pinned export fix); author_id stays omitted.
+        assert conn.execute(
+            "SELECT pinned, author_id, event_date, event_date_precision FROM working_memory"
+        ).fetchone() == (1, None, "2026-04-01", "day")
+
+
+def test_export_warning_omits_invalid_partial_affected_row_counts(monkeypatch, capsys):
+    """Only non-boolean non-negative integer counts belong in CLI output."""
+    monkeypatch.setattr(
+        cli,
+        "_get_memory",
+        lambda: types.SimpleNamespace(
+            export_to_file=lambda *_args, **_kwargs: {
+                "complete": False,
+                "omitted_surfaces": [],
+                "partial_surfaces": [
+                    {
+                        "section": "working_memory",
+                        "omitted_fields": [
+                            {"field": "author_id", "affected_rows": 3},
+                            {"field": "negative", "affected_rows": -1},
+                            {"field": "boolean", "affected_rows": True},
+                            {"field": "malformed", "affected_rows": "3"},
+                        ],
+                    }
+                ],
+            }
+        ),
+    )
+
+    cli.cmd_export(["partial.json"])
+
+    assert (
+        "working_memory missing author_id (3), negative, boolean, malformed"
+        in capsys.readouterr().out
+    )
+
+
+def test_export_manifest_ignores_default_and_null_omitted_fields(tmp_path):
+    assert run_cli(["store", "default-only source", "cli", "0.7"], tmp_path).returncode == 0
+    source_db = tmp_path / "mnemosyne-data" / "mnemosyne.db"
+    with sqlite3.connect(source_db) as conn:
+        conn.execute(
+            "UPDATE working_memory SET memory_type = 'unknown', channel_id = NULL"
+        )
+        conn.execute(
+            'ALTER TABLE working_memory ADD COLUMN quoted_default TEXT DEFAULT "unknown"'
+        )
+        conn.execute(
+            "ALTER TABLE working_memory ADD COLUMN true_default INTEGER DEFAULT TRUE"
+        )
+        conn.execute(
+            "ALTER TABLE working_memory ADD COLUMN false_default INTEGER DEFAULT FALSE"
+        )
+        conn.execute(
+            "ALTER TABLE working_memory ADD COLUMN blob_default BLOB DEFAULT X'00'"
+        )
+    export_path = tmp_path / "default-only.json"
+    result = run_cli(["export", str(export_path)], tmp_path)
+    assert result.returncode == 0, result.stderr
+
+    manifest = json.loads(export_path.read_text(encoding="utf-8"))["mnemosyne_export"]["completeness"]
+    partial = {surface["section"]: surface for surface in manifest["partial_surfaces"]}
+    assert "working_memory" not in partial
+
+
 def test_import_reports_actual_imported_memory_counts(tmp_path):
     source_dir = tmp_path / "source"
     import_dir = tmp_path / "imported"
@@ -126,7 +238,10 @@ def test_import_reports_actual_imported_memory_counts(tmp_path):
     # (e.g. "2 new annotations") instead of the bare count, so the
     # imported_renumbered count from an id-collision import isn't
     # silently dropped from the summary.
-    assert "Imported 1 working, 0 episodic, 1 legacy" in result.stdout
+    # CR-A (round-7): working/episodic summaries flow through
+    # _format_store_stats, so counts carry their bucket label
+    # ("1 new working") and a quarantined count would surface here too.
+    assert "Imported 1 new working, 0 episodic, 1 legacy" in result.stdout
     assert "0 triples" in result.stdout
     assert "2 new annotations" in result.stdout
     assert "Imported 0 memories" not in result.stdout

@@ -69,9 +69,10 @@ def fake_embeddings(monkeypatch):
         emb, "embed",
         lambda texts: np.stack([_content_to_vec(t) for t in texts]),
     )
-    # Force the memory_embeddings fallback path; sqlite-vec presence
-    # varies across test environments and the bug is identical for
-    # both stores.
+    # Force the memory_embeddings fallback path with no persistent vec table.
+    # Merely making _vec_available() false is not enough: an existing but
+    # unusable vec table must abort degradation rather than leave stale ANN data.
+    monkeypatch.setattr(beam_module, "_SQLITE_VEC_AVAILABLE", False)
     monkeypatch.setattr(beam_module, "_vec_available", lambda conn: False)
     return emb
 
@@ -102,7 +103,192 @@ def _read_binary_vector(db_path, memory_id):
         conn.close()
 
 
+def _read_vec_embedding(db_path, rowid):
+    """Read the real sqlite-vec payload using a separately opened connection."""
+    import sqlite_vec
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        row = conn.execute(
+            "SELECT embedding FROM vec_episodes WHERE rowid = ?", (rowid,)
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def sqlite_vec_embeddings(monkeypatch):
+    """Use the installed sqlite-vec extension with deterministic embeddings."""
+    pytest.importorskip("sqlite_vec")
+    from mnemosyne.core import embeddings as emb
+
+    monkeypatch.setattr(emb, "available", lambda: True)
+    monkeypatch.setattr(
+        emb, "embed",
+        lambda texts: np.stack([_content_to_vec(t) for t in texts]),
+    )
+    return emb
+
+
 class TestDegradeEpisodicVectorRefresh:
+
+    def test_existing_unusable_vec_table_rolls_back_entire_degradation(
+        self, temp_db, sqlite_vec_embeddings
+    ):
+        """An inaccessible persisted ANN table must not permit partial updates."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        if not beam_module._vec_available(beam.conn):
+            pytest.skip("sqlite-vec vec_episodes unavailable in this build")
+
+        original = ("ORIGINAL_DETAILED_CONTEXT " * 30).strip()
+        memory_id = beam.consolidate_to_episodic(
+            summary=original, source_wm_ids=["fake-wm"], importance=0.6
+        )
+        rowid = beam.conn.execute(
+            "SELECT rowid FROM episodic_memory WHERE id = ?", (memory_id,)
+        ).fetchone()[0]
+        original_vec = _read_vec_embedding(temp_db, rowid)
+        assert original_vec is not None
+
+        old_json = '[0.25, -0.5]'
+        beam.conn.execute(
+            """
+            INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
+            VALUES (?, ?, ?)
+            """,
+            (memory_id, old_json, "test-model"),
+        )
+        old_ts = (datetime.now() - timedelta(days=beam_module.TIER3_DAYS + 1)).isoformat()
+        beam.conn.execute(
+            "UPDATE episodic_memory SET tier = 2, created_at = ? WHERE id = ?",
+            (old_ts, memory_id),
+        )
+        beam.conn.commit()
+        before = beam.conn.execute(
+            """
+            SELECT content, tier, degraded_at, binary_vector
+            FROM episodic_memory WHERE id = ?
+            """,
+            (memory_id,),
+        ).fetchone()
+
+        # Reopen the active process connection without loading sqlite-vec. The
+        # vec_episodes schema and row persist, but querying the table now raises
+        # "no such module: vec0".
+        beam.conn.close()
+        beam.conn = sqlite3.connect(str(temp_db))
+        beam.conn.row_factory = sqlite3.Row
+        assert not beam_module._vec_available(beam.conn)
+        assert beam.conn.execute(
+            "SELECT 1 FROM sqlite_schema WHERE name = 'vec_episodes'"
+        ).fetchone()
+        with pytest.raises(sqlite3.OperationalError, match="no such module: vec0"):
+            beam.conn.execute("SELECT 1 FROM vec_episodes LIMIT 0")
+
+        result = beam.degrade_episodic(dry_run=False)
+
+        assert result["tier2_to_tier3"] == 0
+        after = beam.conn.execute(
+            """
+            SELECT content, tier, degraded_at, binary_vector
+            FROM episodic_memory WHERE id = ?
+            """,
+            (memory_id,),
+        ).fetchone()
+        assert tuple(after) == tuple(before)
+        assert _read_fallback_embedding(temp_db, memory_id) == old_json
+        assert _read_vec_embedding(temp_db, rowid) == original_vec
+
+    def test_sqlite_vec_refresh_keeps_savepoint_until_outer_commit(
+        self, temp_db, sqlite_vec_embeddings
+    ):
+        """A sqlite-vec refresh must not commit/release degrade_row early."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        if not beam_module._vec_available(beam.conn):
+            pytest.skip("sqlite-vec vec_episodes unavailable in this build")
+
+        original = ("ORIGINAL_DETAILED_CONTEXT " * 30).strip()
+        memory_id = beam.consolidate_to_episodic(
+            summary=original, source_wm_ids=["fake-wm"], importance=0.6
+        )
+        rowid = beam.conn.execute(
+            "SELECT rowid FROM episodic_memory WHERE id = ?", (memory_id,)
+        ).fetchone()[0]
+        original_vec = _read_vec_embedding(temp_db, rowid)
+        assert original_vec is not None
+
+        old_ts = (datetime.now() - timedelta(days=beam_module.TIER3_DAYS + 1)).isoformat()
+        beam.conn.execute(
+            "UPDATE episodic_memory SET tier = 2, created_at = ? WHERE id = ?",
+            (old_ts, memory_id),
+        )
+        beam.conn.commit()
+
+        result = beam.degrade_episodic(dry_run=False)
+        assert result["tier2_to_tier3"] == 1
+
+        # A separate connection can observe both mutations only after
+        # degrade_episodic's outer transaction commits.
+        conn = sqlite3.connect(str(temp_db))
+        try:
+            content, tier = conn.execute(
+                "SELECT content, tier FROM episodic_memory WHERE id = ?", (memory_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert content != original
+        assert tier == 3
+        assert _read_vec_embedding(temp_db, rowid) != original_vec
+
+    def test_sqlite_vec_refresh_failure_rolls_back_row_and_vector(
+        self, temp_db, sqlite_vec_embeddings, monkeypatch
+    ):
+        """A post-insert refresh failure rolls back content, tier, and vec0 data."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        if not beam_module._vec_available(beam.conn):
+            pytest.skip("sqlite-vec vec_episodes unavailable in this build")
+
+        original = ("ORIGINAL_DETAILED_CONTEXT " * 30).strip()
+        memory_id = beam.consolidate_to_episodic(
+            summary=original, source_wm_ids=["fake-wm"], importance=0.6
+        )
+        rowid = beam.conn.execute(
+            "SELECT rowid FROM episodic_memory WHERE id = ?", (memory_id,)
+        ).fetchone()[0]
+        original_vec = _read_vec_embedding(temp_db, rowid)
+        assert original_vec is not None
+
+        old_ts = (datetime.now() - timedelta(days=beam_module.TIER3_DAYS + 1)).isoformat()
+        beam.conn.execute(
+            "UPDATE episodic_memory SET tier = 2, created_at = ? WHERE id = ?",
+            (old_ts, memory_id),
+        )
+        beam.conn.commit()
+
+        real_insert = beam_module._vec_table_insert
+
+        def insert_then_fail(conn, table, vec_rowid, embedding, *, commit=True):
+            real_insert(conn, table, vec_rowid, embedding, commit=commit)
+            raise RuntimeError("simulated failure after sqlite-vec insert")
+
+        monkeypatch.setattr(beam_module, "_vec_table_insert", insert_then_fail)
+
+        result = beam.degrade_episodic(dry_run=False)
+        assert result["tier2_to_tier3"] == 0
+        conn = sqlite3.connect(str(temp_db))
+        try:
+            content, tier = conn.execute(
+                "SELECT content, tier FROM episodic_memory WHERE id = ?", (memory_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert content == original
+        assert tier == 2
+        assert _read_vec_embedding(temp_db, rowid) == original_vec
 
     def test_tier_2_to_tier_3_regenerates_embedding(self, temp_db, fake_embeddings):
         """When tier 2→3 truncation changes content, the embedding stored
@@ -334,9 +520,12 @@ class TestDegradeEpisodicVectorRefresh:
             emb, "embed",
             lambda texts: np.stack([_content_to_vec(t) for t in texts]),
         )
+        # This test covers the genuine no-vec-table fallback contract.
+        monkeypatch.setattr(beam_module, "_SQLITE_VEC_AVAILABLE", False)
         monkeypatch.setattr(beam_module, "_vec_available", lambda conn: False)
 
         beam = BeamMemory(session_id="s1", db_path=temp_db)
+        assert not beam_module._vec_table_exists(beam.conn, "vec_episodes")
         original = ("ORIGINAL_DETAILED_CONTEXT " * 30).strip()
         memory_id = beam.consolidate_to_episodic(
             summary=original,
@@ -357,7 +546,8 @@ class TestDegradeEpisodicVectorRefresh:
         conn.commit()
         conn.close()
 
-        beam.degrade_episodic(dry_run=False)
+        result = beam.degrade_episodic(dry_run=False)
+        assert result["tier2_to_tier3"] == 1
 
         post_embedding = _read_fallback_embedding(temp_db, memory_id)
         assert post_embedding is None, (

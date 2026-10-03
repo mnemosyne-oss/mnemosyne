@@ -21,13 +21,13 @@ Sync your Mnemosyne AI agent memories as markdown notes in your Obsidian vault.
 
 ### Manual
 
-1. Download `main.js`, `manifest.json`, `styles.css` from the [releases page](https://github.com/AxDSan/mnemosyne/releases)
+1. Download `main.js`, `manifest.json`, `styles.css` from the [releases page](https://github.com/mnemosyne-oss/mnemosyne/releases)
 2. Copy to `{vault}/.obsidian/plugins/mnemosyne-sync/`
 3. Enable in Community Plugins settings
 
 ## Requirements
 
-- [Mnemosyne](https://github.com/AxDSan/mnemosyne) installed (`pip install mnemosyne-memory`)
+- [Mnemosyne](https://github.com/mnemosyne-oss/mnemosyne) installed (`pip install mnemosyne-memory`)
 - Python 3.9+ available on PATH
 - Desktop version of Obsidian
 

@@ -1,15 +1,107 @@
 import builtins
+import importlib
+import logging
 import os
 import subprocess
 import sys
-import pytest
+import types
+from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import patch, MagicMock
+
+import pytest
 
 from mnemosyne.core import local_llm
 from mnemosyne.core.llm_backends import (
     CallableLLMBackend,
     set_host_llm_backend,
 )
+
+REAL_LOAD_LLM = local_llm._load_llm
+
+
+class TestLocalModelDownloadNotice:
+    def test_uncached_default_model_logs_notice_before_download(self, monkeypatch, tmp_path, caplog, capsys):
+        """The default GGUF warning is logged before its network fetch, not printed."""
+        cache_dir = tmp_path / "models"
+        events = []
+        download_calls = []
+
+        def fake_download(**kwargs):
+            events.append("download")
+            download_calls.append(kwargs)
+            return str(cache_dir / kwargs["filename"])
+
+        monkeypatch.setattr(local_llm, "MODEL_CACHE_DIR", cache_dir)
+        monkeypatch.setattr(local_llm, "DEFAULT_MODEL_REPO", "openbmb/MiniCPM5-1B-GGUF")
+        monkeypatch.setattr(local_llm, "DEFAULT_MODEL_FILE", "MiniCPM5-1B-Q4_K_M.gguf")
+        monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=fake_download))
+        caplog.set_level(logging.WARNING, logger=local_llm.__name__)
+        original_warning = local_llm.logger.warning
+
+        def record_warning(*args, **kwargs):
+            events.append("warning")
+            return original_warning(*args, **kwargs)
+
+        monkeypatch.setattr(local_llm.logger, "warning", record_warning)
+        local_llm._download_model()
+
+        assert events == ["warning", "download"]
+        assert download_calls == [{
+            "repo_id": "openbmb/MiniCPM5-1B-GGUF",
+            "filename": "MiniCPM5-1B-Q4_K_M.gguf",
+            "local_dir": str(cache_dir),
+            "local_dir_use_symlinks": False,
+        }]
+        assert capsys.readouterr().out == ""
+        message = caplog.records[-1].getMessage()
+        assert "MiniCPM5-1B-Q4_K_M.gguf" in message
+        assert "openbmb/MiniCPM5-1B-GGUF" in message
+        assert str(cache_dir) in message
+        assert "approximately 656 MB" in message
+        assert "current operation will block until the download completes" in message
+        assert "MNEMOSYNE_LLM_ENABLED=false" in message
+        assert "pre-cache" in message
+
+    def test_cached_model_skips_notice_and_download(self, monkeypatch, tmp_path, caplog):
+        """An already cached GGUF does not produce download-related output."""
+        cache_dir = tmp_path / "models"
+        cache_dir.mkdir()
+        model_file = cache_dir / "cached.gguf"
+        model_file.touch()
+        monkeypatch.setattr(local_llm, "MODEL_CACHE_DIR", cache_dir)
+        monkeypatch.setattr(local_llm, "DEFAULT_MODEL_FILE", model_file.name)
+        caplog.set_level(logging.WARNING, logger=local_llm.__name__)
+
+        with patch.dict(sys.modules, {"huggingface_hub": None}):
+            assert local_llm._download_model() == model_file
+
+        assert not caplog.records
+
+    def test_overridden_model_omits_default_size_and_failed_download_falls_back(self, monkeypatch, tmp_path, caplog):
+        """Custom artifacts avoid a misleading size claim and retain AAAK fallback."""
+        cache_dir = tmp_path / "models"
+
+        def failed_download(**kwargs):
+            raise OSError("offline")
+
+        monkeypatch.setattr(local_llm, "MODEL_CACHE_DIR", cache_dir)
+        monkeypatch.setattr(local_llm, "DEFAULT_MODEL_REPO", "example/custom-gguf")
+        monkeypatch.setattr(local_llm, "DEFAULT_MODEL_FILE", "custom.gguf")
+        monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "_llm_instance", None)
+        monkeypatch.setattr(local_llm, "_llm_available", None)
+        monkeypatch.setattr(local_llm, "_load_llm", REAL_LOAD_LLM)
+        monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(hf_hub_download=failed_download))
+        caplog.set_level(logging.WARNING, logger=local_llm.__name__)
+
+        assert local_llm._load_llm() is None
+        assert local_llm._llm_available is False
+        assert len(caplog.records) == 1
+        message = caplog.records[0].getMessage()
+        assert "custom.gguf" in message
+        assert "example/custom-gguf" in message
+        assert "656 MB" not in message
 
 
 class TestRemoteLLM:
@@ -270,7 +362,7 @@ class TestHostLLMBackend:
         monkeypatch.setattr(local_llm, "LLM_BASE_URL", "http://remote/v1")
         set_host_llm_backend(CallableLLMBackend("test", lambda *a, **k: "Host summary."))
         with patch.object(local_llm, "_call_remote_llm", return_value="Remote summary.") as mock_remote, \
-             patch.object(local_llm, "_call_local_llm", return_value=None) as mock_local:
+             patch.object(local_llm, "_call_local_llm", return_value=None):
             # Host gated by LLM_ENABLED → not attempted; remote also gated → not called;
             # local: _call_local_llm internally checks via _load_llm() which itself
             # gates on LLM_ENABLED (preserving prior behavior). End result: None.
@@ -354,15 +446,15 @@ class TestThinkTagStripping:
     """
 
     def test_clean_output_strips_closed_think_tags(self):
-        raw = f"<think>let me reason</think> The answer is 42."
+        raw = "<think>let me reason</think> The answer is 42."
         assert local_llm._clean_output(raw) == "The answer is 42."
 
     def test_clean_output_strips_multiline_closed_think_tags(self):
-        raw = f"<think>step 1\nstep 2</think>\nFinal answer."
+        raw = "<think>step 1\nstep 2</think>\nFinal answer."
         assert local_llm._clean_output(raw) == "Final answer."
 
     def test_clean_output_strips_multiple_think_blocks(self):
-        raw = f"<think>first</think>middle<think>second</think>end"
+        raw = "<think>first</think>middle<think>second</think>end"
         assert local_llm._clean_output(raw) == "middleend"
 
     def test_clean_output_preserves_text_without_think_tags(self):
@@ -370,14 +462,22 @@ class TestThinkTagStripping:
         assert local_llm._clean_output(raw) == "Just a normal summary with no thinking."
 
     def test_clean_output_empty_after_stripping(self):
-        raw = f"<think>only thinking, no output</think>"
+        raw = "<think>only thinking, no output</think>"
         assert local_llm._clean_output(raw) == ""
 
-    def test_clean_output_does_not_strip_unclosed_think_tag(self):
-        """Unclosed think tags are left as-is since we cannot determine
-        where thinking ends and the response begins."""
-        raw = f"middle<think>reasoning that never closes"
-        assert local_llm._clean_output(raw) == raw
+    def test_clean_output_rejects_nested_think_tags(self):
+        assert local_llm._is_invalid_reasoning_output(
+            local_llm._clean_output("<think>outer<think>inner</think>outer</think>")
+        )
+
+    def test_clean_output_rejects_unclosed_think_tag(self):
+        raw = "middle<think>reasoning truncated at the token limit"
+        assert local_llm._is_invalid_reasoning_output(local_llm._clean_output(raw))
+
+    def test_clean_output_rejects_unmatched_closing_think_tag(self):
+        assert local_llm._is_invalid_reasoning_output(
+            local_llm._clean_output("safe prefix</think> malformed ordering")
+        )
 
     def test_try_host_llm_strips_think_tags(self, monkeypatch):
         """Host LLM output with closed think tags should be cleaned."""
@@ -386,25 +486,24 @@ class TestThinkTagStripping:
         monkeypatch.setattr(local_llm, "HOST_LLM_TIMEOUT", 5.0)
         monkeypatch.setattr(local_llm, "HOST_LLM_PROVIDER", None)
         monkeypatch.setattr(local_llm, "HOST_LLM_MODEL", None)
-        set_host_llm_backend(CallableLLMBackend("test", lambda prompt, **kw: f"<think>reasoning</think>Summary of memories."))
+        set_host_llm_backend(CallableLLMBackend("test", lambda prompt, **kw: "<think>reasoning</think>Summary of memories."))
 
         attempted, text = local_llm._try_host_llm("test prompt", max_tokens=128, temperature=0.3)
         assert attempted is True
         assert text == "Summary of memories."
 
-    def test_try_host_llm_does_not_strip_unclosed_think_tag(self, monkeypatch):
-        """Unclosed think tags in host output are left as-is."""
+    def test_try_host_llm_rejects_unclosed_think_tag(self, monkeypatch):
+        """Token-truncated host reasoning must not reach a persistence caller."""
         monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
         monkeypatch.setattr(local_llm, "HOST_LLM_ENABLED", True)
         monkeypatch.setattr(local_llm, "HOST_LLM_TIMEOUT", 5.0)
         monkeypatch.setattr(local_llm, "HOST_LLM_PROVIDER", None)
         monkeypatch.setattr(local_llm, "HOST_LLM_MODEL", None)
-        set_host_llm_backend(CallableLLMBackend("test", lambda prompt, **kw: f"<think>reasoning\nActual output"))
+        set_host_llm_backend(CallableLLMBackend("test", lambda prompt, **kw: "<think>reasoning\nActual output"))
 
         attempted, text = local_llm._try_host_llm("test prompt", max_tokens=128, temperature=0.3)
         assert attempted is True
-        # Unclosed tag is not stripped - we can't tell where thinking ends
-        assert "<think>" in text
+        assert local_llm._is_invalid_reasoning_output(text)
 
 
 class TestRemoteLLMFallback:
@@ -596,3 +695,284 @@ class TestRemoteLLMFallback:
             fb_call = m.call_args_list[1]
             assert fb_call.kwargs["base_url"] == "http://primary/v1"
             assert fb_call.kwargs["api_key"] == "primary-key"
+
+
+
+@pytest.fixture
+def restore_modes():
+    """Undo restrictive chmods so pytest can clean up tmp_path.
+
+    A 0o500 or 0o200 directory cannot be removed by the tmp_path teardown, which
+    leaves garbage behind and emits a cleanup warning on every run.
+    """
+    touched = []
+    yield touched
+    for path in touched:
+        try:
+            path.chmod(0o700)
+        except OSError:  # pragma: no cover - already gone
+            pass
+
+
+@contextmanager
+def _model_cache_env(monkeypatch, value):
+    """Reload local_llm under a patched MNEMOSYNE_MODEL_CACHE_DIR, then restore it.
+
+    The first reload has to happen while the variable is set; the restoring
+    reload has to happen after monkeypatch has unset it. Reloading inside a
+    `finally` instead would run before fixture teardown and leave the module
+    describing an environment that no longer exists.
+    """
+    try:
+        with monkeypatch.context() as patched:
+            if value is None:
+                patched.delenv("MNEMOSYNE_MODEL_CACHE_DIR", raising=False)
+            else:
+                patched.setenv("MNEMOSYNE_MODEL_CACHE_DIR", value)
+            yield importlib.reload(local_llm)
+    finally:
+        # Ordering matters: the inner context exits first, restoring the
+        # environment, and only then is the module reloaded to match it. The
+        # `finally` covers a raising body, which would otherwise skip the
+        # restoring reload and leak the overridden path into later tests.
+        importlib.reload(local_llm)
+
+
+class TestModelCacheDirOverride:
+    """MNEMOSYNE_MODEL_CACHE_DIR relocates the GGUF cache (#708).
+
+    The override is authoritative when set: an unusable directory fails rather
+    than falling back to `~/.hermes/mnemosyne/models`, since silently
+    reinstating the location the user moved away from is the substitution the
+    setting exists to prevent.
+    """
+
+    def _select(self, monkeypatch, path, *, from_env=True):
+        monkeypatch.setattr(local_llm, "MODEL_CACHE_DIR", Path(path))
+        monkeypatch.setattr(local_llm, "MODEL_CACHE_DIR_FROM_ENV", from_env, raising=False)
+
+    _DEFAULT = Path.home() / ".hermes" / "mnemosyne" / "models"
+
+    def test_unset_keeps_the_historical_location(self, monkeypatch):
+        with _model_cache_env(monkeypatch, None) as module:
+            assert module.MODEL_CACHE_DIR == self._DEFAULT
+            assert module.MODEL_CACHE_DIR_FROM_ENV is False
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t"])
+    def test_blank_value_keeps_the_historical_location(self, monkeypatch, blank):
+        """Per spec, unset and empty behave identically."""
+        with _model_cache_env(monkeypatch, blank) as module:
+            assert module.MODEL_CACHE_DIR == self._DEFAULT
+            assert module.MODEL_CACHE_DIR_FROM_ENV is False
+
+    def test_set_value_relocates_and_expands_tilde(self, monkeypatch):
+        with _model_cache_env(monkeypatch, "~/relocated-models") as module:
+            assert module.MODEL_CACHE_DIR == Path.home() / "relocated-models"
+            assert module.MODEL_CACHE_DIR_FROM_ENV is True
+
+    def test_trailing_whitespace_in_the_path_is_preserved(self, monkeypatch):
+        """A directory name may end in a space; stripping would select another."""
+        with _model_cache_env(monkeypatch, "/tmp/models ") as module:
+            assert str(module.MODEL_CACHE_DIR) == "/tmp/models "
+
+    def test_module_state_is_restored_after_the_override_is_unset(self, monkeypatch):
+        """The reload dance must not leak a stale path into later tests.
+
+        Compared against the state captured before the context rather than the
+        built-in default, so the assertion holds when the developer running the
+        suite has MNEMOSYNE_MODEL_CACHE_DIR set in their own environment.
+        """
+        before = (local_llm.MODEL_CACHE_DIR, local_llm.MODEL_CACHE_DIR_FROM_ENV)
+
+        with _model_cache_env(monkeypatch, "/tmp/leak-check") as module:
+            assert module.MODEL_CACHE_DIR == Path("/tmp/leak-check")
+
+        assert (local_llm.MODEL_CACHE_DIR, local_llm.MODEL_CACHE_DIR_FROM_ENV) == before
+
+    def test_module_state_is_restored_when_the_body_raises(self, monkeypatch):
+        """A failing assertion must not leak the overridden path either."""
+        before = (local_llm.MODEL_CACHE_DIR, local_llm.MODEL_CACHE_DIR_FROM_ENV)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            with _model_cache_env(monkeypatch, "/tmp/raises") as module:
+                assert module.MODEL_CACHE_DIR == Path("/tmp/raises")
+                raise RuntimeError("boom")
+
+        assert (local_llm.MODEL_CACHE_DIR, local_llm.MODEL_CACHE_DIR_FROM_ENV) == before
+
+    def test_resolution_is_import_time_not_call_time(self, monkeypatch, tmp_path):
+        """Changing the variable after import must not move the cache.
+
+        Without this, a call-time implementation that re-read os.environ on every
+        access would satisfy every other test here, and the spec is explicit that
+        resolution happens at import.
+        """
+        chosen = tmp_path / "at-import"
+
+        with _model_cache_env(monkeypatch, str(chosen)) as module:
+            assert module.MODEL_CACHE_DIR == chosen
+
+            # Nested so the change is undone before the restoring reload runs.
+            with monkeypatch.context() as later:
+                later.setenv("MNEMOSYNE_MODEL_CACHE_DIR", str(tmp_path / "too-late"))
+                assert module.MODEL_CACHE_DIR == chosen
+                assert module._model_path() is None  # looks under chosen, not too-late
+                chosen.mkdir(parents=True)
+                (chosen / module.DEFAULT_MODEL_FILE).write_bytes(b"gguf")
+                assert module._model_path() == chosen / module.DEFAULT_MODEL_FILE
+
+    def test_lookup_and_download_both_use_the_override(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """One directory for the cached-file check, the mkdir and hf_hub_download."""
+        relocated = tmp_path / "elsewhere"
+        self._select(monkeypatch, relocated)
+        calls = []
+
+        def fake_download(**kwargs):
+            calls.append(kwargs)
+            target = Path(kwargs["local_dir"]) / kwargs["filename"]
+            target.write_bytes(b"gguf")
+            return str(target)
+
+        monkeypatch.setitem(
+            sys.modules, "huggingface_hub", MagicMock(hf_hub_download=fake_download)
+        )
+
+        with caplog.at_level(logging.WARNING, logger=local_llm.__name__):
+            got = local_llm._download_model()
+
+        assert calls[0]["local_dir"] == str(relocated)
+        assert got.parent == relocated
+        assert relocated.is_dir()
+        # The pre-download notice must name where the model is actually going.
+        assert str(relocated) in caplog.records[0].getMessage()
+
+        # The lookup agrees, and a second call short-circuits on the cached file
+        # rather than downloading again. Calling _download_model() rather than
+        # _model_path() is the point: it exercises the existing-file branch.
+        assert local_llm._model_path() == relocated / local_llm.DEFAULT_MODEL_FILE
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=local_llm.__name__):
+            again = local_llm._download_model()
+        assert again == got
+        assert len(calls) == 1
+        assert caplog.records == []
+
+
+    def test_uncreatable_override_fails_naming_the_variable_and_path(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """A file where the directory should be: cannot be created."""
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("i am a file", encoding="utf-8")
+        self._select(monkeypatch, blocker / "models")
+
+        with caplog.at_level("ERROR", logger=local_llm.__name__):
+            with pytest.raises(RuntimeError) as excinfo:
+                local_llm._ensure_model_cache_dir()
+
+        for expected in ("MNEMOSYNE_MODEL_CACHE_DIR", str(blocker / "models")):
+            assert expected in str(excinfo.value)
+        # Logged as well as raised: _load_llm swallows the exception, so the
+        # raise alone would never reach the user. Both facts must survive the
+        # trip through the logger, not just the variable name.
+        logged = caplog.records[0].getMessage()
+        assert "MNEMOSYNE_MODEL_CACHE_DIR" in logged
+        assert str(blocker / "models") in logged
+
+    def test_unwritable_override_fails_naming_the_variable_and_path(
+        self, monkeypatch, tmp_path, restore_modes, caplog
+    ):
+        """Creatable is not the same as usable."""
+        readonly = tmp_path / "readonly"
+        readonly.mkdir()
+        readonly.chmod(0o500)
+        restore_modes.append(readonly)
+        self._select(monkeypatch, readonly)
+
+        if os.access(readonly, os.W_OK):  # pragma: no cover - root ignores the bit
+            pytest.skip("running as root; the unwritable case cannot be modelled")
+
+        with caplog.at_level(logging.ERROR, logger=local_llm.__name__):
+            with pytest.raises(RuntimeError) as excinfo:
+                local_llm._ensure_model_cache_dir()
+
+        for expected in ("MNEMOSYNE_MODEL_CACHE_DIR", str(readonly)):
+            assert expected in str(excinfo.value)
+            # Logged too: _load_llm swallows the exception, so the log is the
+            # only channel that actually reaches the user.
+            assert expected in caplog.records[0].getMessage()
+
+    def test_writable_but_unsearchable_override_is_rejected(
+        self, monkeypatch, tmp_path, restore_modes
+    ):
+        """Mode 0o200 passes W_OK, yet creating anything inside still fails.
+
+        Traversing into a directory needs the execute bit, so W_OK alone would
+        accept a directory the download cannot actually write into, and
+        `_load_llm()` would swallow the resulting PermissionError.
+        """
+        unsearchable = tmp_path / "write-only"
+        unsearchable.mkdir()
+        unsearchable.chmod(0o200)
+        restore_modes.append(unsearchable)
+
+        if os.access(unsearchable, os.X_OK):  # pragma: no cover - root ignores the bit
+            pytest.skip("running as root; the unsearchable case cannot be modelled")
+        assert os.access(unsearchable, os.W_OK), "premise: W_OK alone would accept this"
+
+        self._select(monkeypatch, unsearchable)
+
+        def _must_not_download(**kwargs):
+            raise AssertionError("must not download into an unusable directory")
+
+        monkeypatch.setitem(
+            sys.modules, "huggingface_hub", MagicMock(hf_hub_download=_must_not_download)
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            local_llm._download_model()
+
+        assert "MNEMOSYNE_MODEL_CACHE_DIR" in str(excinfo.value)
+        assert str(unsearchable) in str(excinfo.value)
+
+    def test_failure_never_falls_back_to_the_default_location(
+        self, monkeypatch, tmp_path
+    ):
+        """The whole point: no silent return to ~/.hermes/mnemosyne/models."""
+        blocker = tmp_path / "blocked"
+        blocker.write_text("file", encoding="utf-8")
+        self._select(monkeypatch, blocker / "models")
+        default = Path.home() / ".hermes" / "mnemosyne" / "models"
+
+        def _must_not_download(**kwargs):
+            raise AssertionError("must not download after a cache-dir failure")
+
+        monkeypatch.setitem(
+            sys.modules, "huggingface_hub", MagicMock(hf_hub_download=_must_not_download)
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            local_llm._download_model()
+
+        assert str(default) not in str(excinfo.value)
+
+    def test_unset_default_failure_suggests_the_variable(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """With no override set, the error offers one instead of blaming it."""
+        blocker = tmp_path / "plain"
+        blocker.write_text("file", encoding="utf-8")
+        self._select(monkeypatch, blocker / "models", from_env=False)
+
+        with caplog.at_level(logging.ERROR, logger=local_llm.__name__):
+            with pytest.raises(RuntimeError) as excinfo:
+                local_llm._ensure_model_cache_dir()
+
+        logged = caplog.records[0].getMessage()
+        for message in (str(excinfo.value), logged):
+            assert str(blocker / "models") in message
+            assert "Set MNEMOSYNE_MODEL_CACHE_DIR to relocate it." in message
+            # Must not blame a variable the user never set.
+            assert "is set to" not in message

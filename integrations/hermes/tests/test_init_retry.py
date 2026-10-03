@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 import mnemosyne_hermes
 from mnemosyne_hermes import MnemosyneMemoryProvider
 
@@ -109,3 +111,95 @@ def test_fresh_initialize_supersedes_pending_retry(monkeypatch):
     provider.initialize("sess2")
     assert provider._beam is not None
     assert provider._retry_init_args is None
+
+
+def test_retry_validation_failure_is_reported_not_raised(monkeypatch):
+    """A config edit landing during a pending transient retry must not let
+    _configured_tool_schemas()'s ValueError escape a per-turn surface."""
+    calls = {"n": 0, "fail": 99}
+    monkeypatch.setattr(mnemosyne_hermes, "_get_beam_class", lambda: _locked_beam_class(calls))
+
+    provider = MnemosyneMemoryProvider()
+    provider.initialize("sess")
+    assert provider._beam is None
+    assert provider._retry_init_args is not None
+
+    def _bad_tools_config(self, key):
+        return ["not_a_real_tool"] if key == "tools" else None
+
+    monkeypatch.setattr(MnemosyneMemoryProvider, "_read_config_key", _bad_tools_config)
+    provider._retry_init_at = 0.0
+
+    block = provider.system_prompt_block()
+
+    assert provider._beam is None
+    assert isinstance(provider._init_error, ValueError)
+    assert "Unknown Mnemosyne tool" in str(provider._init_error)
+    # Fail-once: a validation error must not re-arm the retry.
+    assert provider._retry_init_args is None
+    assert "UNAVAILABLE" in block
+    assert "restart Hermes" in block
+
+
+def test_explicit_initialize_still_raises_validation_error(monkeypatch):
+    """The retry path's new except must not swallow #1063 for a direct call."""
+    def _bad_tools_config(self, key):
+        return ["not_a_real_tool"] if key == "tools" else None
+
+    monkeypatch.setattr(MnemosyneMemoryProvider, "_read_config_key", _bad_tools_config)
+
+    provider = MnemosyneMemoryProvider()
+    with pytest.raises(ValueError, match="Unknown Mnemosyne tool"):
+        provider.initialize("sess")
+
+
+def test_unrelated_valueerror_before_reset_propagates(monkeypatch):
+    """dplush's first boundary probe (#1091 comment): a ValueError that has
+    nothing to do with tool validation, raised before _initialize_locked()
+    clears the pending-retry stash, must come out of the per-turn surface
+    as itself, not get relabeled as a validation failure."""
+    calls = {"n": 0, "fail": 99}
+    monkeypatch.setattr(mnemosyne_hermes, "_get_beam_class", lambda: _locked_beam_class(calls))
+
+    provider = MnemosyneMemoryProvider()
+    provider.initialize("sess")
+    assert provider._beam is None
+    assert provider._retry_init_args is not None
+
+    def _boom(self):
+        raise ValueError("boundary probe: unrelated failure before reset")
+
+    monkeypatch.setattr(MnemosyneMemoryProvider, "_invalidate_surface_locked", _boom)
+    provider._retry_init_at = 0.0
+
+    with pytest.raises(ValueError, match="boundary probe: unrelated failure before reset"):
+        provider.system_prompt_block()
+
+    # Not relabeled as a tool-validation failure.
+    assert provider._init_error is None or "boundary probe" not in str(provider._init_error)
+
+
+def test_unrelated_valueerror_after_beam_creation_propagates(monkeypatch):
+    """dplush's second boundary probe (#1091 comment): a ValueError raised
+    after the Beam object already exists must still come out of the
+    per-turn surface as itself, not get relabeled as a validation failure."""
+    calls = {"n": 0, "fail": 1}
+    monkeypatch.setattr(mnemosyne_hermes, "_get_beam_class", lambda: _locked_beam_class(calls))
+
+    provider = MnemosyneMemoryProvider()
+    provider.initialize("sess")
+    assert provider._beam is None
+    assert provider._retry_init_args is not None
+
+    def _boom(self):
+        raise ValueError("boundary probe: unrelated failure after Beam creation")
+
+    monkeypatch.setattr(MnemosyneMemoryProvider, "_init_audit_log", _boom)
+    provider._retry_init_at = 0.0
+
+    with pytest.raises(ValueError, match="boundary probe: unrelated failure after Beam creation"):
+        provider.system_prompt_block()
+
+    # The Beam was already live when the unrelated error hit.
+    assert provider._beam is not None
+    assert provider._init_error is None or "boundary probe" not in str(provider._init_error)

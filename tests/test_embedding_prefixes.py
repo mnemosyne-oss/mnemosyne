@@ -28,6 +28,10 @@ class StubHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def embeddings_mod(monkeypatch):
+    # This loopback stub must exercise enabled API dispatch, not inherit CI's
+    # global opt-out now that public API calls respect the same guard as local.
+    for flag in ("MNEMOSYNE_NO_EMBEDDINGS", "MNEMOSYNE_SKIP_EMBEDDINGS", "MNEMOSYNE_EMBEDDINGS_OFF"):
+        monkeypatch.delenv(flag, raising=False)
     server = HTTPServer(("127.0.0.1", 0), StubHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_port}/v1"
@@ -36,13 +40,29 @@ def embeddings_mod(monkeypatch):
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_DIM", "768")
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_QUERY_PREFIX", QUERY_PREFIX)
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_DOC_PREFIX", DOC_PREFIX)
+    # The fake endpoint is plain http: strip any shell-exported embedding key
+    # BEFORE the reload below, which re-reads it (the client refuses
+    # credentialed non-HTTPS endpoints).
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    # The reload below re-reads _DEFAULT_MODEL from the patched env (model
+    # "embeddinggemma-300m-q4"); restore the original afterward so later
+    # tests in the same session see the true default instead of this
+    # fixture's model.
     RECORDED.clear()
     from mnemosyne.core import embeddings
     # Reload ONLY because upstream reads the API URL/model at module import time.
     # The PREFIXES are read at call time by the patch, so no reload is ever
     # needed for prefix changes (see test_unset_prefixes_unchanged).
+    _orig_default_model = embeddings._DEFAULT_MODEL
+    _orig_api_key = embeddings._OPENAI_API_KEY
     importlib.reload(embeddings)
     yield embeddings
+    # The reload re-reads both module globals from the (patched, key-stripped)
+    # env; restore the originals so later tests in the session see the true
+    # default model and the real credential state, not this fixture's.
+    embeddings._DEFAULT_MODEL = _orig_default_model
+    embeddings._OPENAI_API_KEY = _orig_api_key
     server.shutdown()
 
 def test_query_prefix_byte_exact(embeddings_mod):

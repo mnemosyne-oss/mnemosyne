@@ -22,12 +22,10 @@ RRF-vs-linear-scoring, not dedup-behavior asymmetry.
 """
 from __future__ import annotations
 
-import os
-import sqlite3
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
 import pytest
 
@@ -277,8 +275,15 @@ class _FakeEngine:
         self._results = results
         self.last_top_k = None
 
-    def recall(self, *, query, query_embedding, top_k):
+    def recall(self, *, query, query_embedding, top_k,
+               default_dense_source_filter=True, source=None, topic=None,
+               episodic_where=None, episodic_params=()):
         self.last_top_k = top_k
+        self.last_dense_filter = default_dense_source_filter
+        self.last_source = source
+        self.last_topic = topic
+        self.last_episodic_where = episodic_where
+        self.last_episodic_params = episodic_params
         return self._results
 
 
@@ -468,6 +473,52 @@ class TestReviewHardening:
         monkeypatch.setattr(beam, "_get_polyphonic_engine", lambda: engine)
         beam.recall("anything", top_k=7)
         assert engine.last_top_k == 14  # 7 * 2
+        # Default recall must keep the dense-source exclusion ON and pass
+        # no explicit source/topic predicates.
+        assert engine.last_dense_filter is True
+        assert engine.last_source is None
+        assert engine.last_topic is None
+
+    def test_explicit_source_topic_filters_propagate_to_engine_with_filter_disabled(
+        self, temp_db, monkeypatch
+    ):
+        """Explicit source=/topic= must reach the engine as real predicates
+        AND turn off the default dense-source exclusion, so explicitly
+        requested dialog/honcho rows are not filtered out before top-K
+        selection (#696)."""
+        from mnemosyne.core.polyphonic_recall import PolyphonicResult
+
+        monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+        beam = BeamMemory(db_path=temp_db, session_id="s1")
+        _seed_wm(beam, "wm-1", "anything")
+        engine = _FakeEngine([
+            PolyphonicResult(memory_id="wm-1", combined_score=0.5,
+                             voice_scores={"vector": 0.5}, metadata={}),
+        ])
+        monkeypatch.setattr(beam, "_get_polyphonic_engine", lambda: engine)
+
+        beam.recall("anything", top_k=7, source="conversation")
+        assert engine.last_dense_filter is False, (
+            "explicit source= must disable the default dense-source exclusion"
+        )
+        assert engine.last_source == "conversation"
+        assert engine.last_topic is None
+        assert engine.last_episodic_where is not None
+        assert "source = ?" in engine.last_episodic_where
+        assert "conversation" in engine.last_episodic_params
+
+        engine.last_dense_filter = None
+        engine.last_source = None
+        engine.last_topic = None
+        beam.recall("anything", top_k=7, topic="conversation")
+        assert engine.last_dense_filter is False, (
+            "explicit topic= must disable the default dense-source exclusion"
+        )
+        assert engine.last_source is None
+        assert engine.last_topic == "conversation"
+        assert engine.last_episodic_where is not None
+        assert "source = ?" in engine.last_episodic_where
+        assert "conversation" in engine.last_episodic_params
 
     def test_ep_ep_overlap_not_collapsed_documented_behavior(self, temp_db):
         """Pin behavior: two episodic summaries covering the same wm

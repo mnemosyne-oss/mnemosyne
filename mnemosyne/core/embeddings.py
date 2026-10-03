@@ -6,14 +6,19 @@ Falls back to keyword-only if neither is available.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import ssl
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import List, Optional
 from functools import lru_cache
+
+
+logger = logging.getLogger(__name__)
 
 try:
     import numpy as np
@@ -67,7 +72,13 @@ _OPENAI_API_KEY = os.environ.get("MNEMOSYNE_EMBEDDING_API_KEY", os.environ.get("
 _OPENAI_BASE_URL = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
 
 # --- Model selection ---
-_DEFAULT_MODEL = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+# Normalize a blank (empty or whitespace-only) env var to the default. Such
+# values are routine in Docker Compose (`- MNEMOSYNE_EMBEDDING_MODEL=${X}` with
+# X unset) and .env files; without this, "" would be treated as a model named
+# empty-string, which is unknown and would raise at import under the fail-loud
+# rule even though the user set nothing meaningful. Uses .strip() to mirror the
+# blank handling for MNEMOSYNE_EMBEDDING_DIM in _get_embedding_dim.
+_DEFAULT_MODEL = (os.environ.get("MNEMOSYNE_EMBEDDING_MODEL") or "").strip() or "BAAI/bge-small-en-v1.5"
 _embedding_model = None
 _API_CALL_COUNT = 0
 
@@ -97,17 +108,32 @@ def _get_prefix(kind: str) -> str:
 def _is_disabled() -> bool:
     """True when dense retrieval has been opted out via env var.
 
-    Three flags, in priority order:
+    Three equivalent flags (any true value disables embeddings):
     - MNEMOSYNE_NO_EMBEDDINGS: hard off, used in CI and unit tests that
       exercise non-embedding code paths
     - MNEMOSYNE_SKIP_EMBEDDINGS: same intent, shorter alias
     - MNEMOSYNE_EMBEDDINGS_OFF: same intent, longer alias
+
+    Values are trimmed and case-insensitive: 1/true/yes/on are true;
+    0/false/no/off, blank and unset are false. Validate every alias before
+    combining them, so a true flag cannot hide a malformed one. Other
+    nonempty values raise ValueError. This is ENV-only, not YAML resolution.
     """
-    return bool(
-        os.environ.get("MNEMOSYNE_NO_EMBEDDINGS")
-        or os.environ.get("MNEMOSYNE_SKIP_EMBEDDINGS")
-        or os.environ.get("MNEMOSYNE_EMBEDDINGS_OFF")
-    )
+    disabled = False
+    for name in (
+        "MNEMOSYNE_NO_EMBEDDINGS",
+        "MNEMOSYNE_SKIP_EMBEDDINGS",
+        "MNEMOSYNE_EMBEDDINGS_OFF",
+    ):
+        raw = os.environ.get(name, "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            disabled = True
+        elif raw not in ("", "0", "false", "no", "off"):
+            raise ValueError(
+                f"{name} must be 1/true/yes/on or 0/false/no/off "
+                "(blank or unset also means false)."
+            )
+    return disabled
 
 
 def _is_api_model(model_name: str) -> bool:
@@ -117,7 +143,7 @@ def _is_api_model(model_name: str) -> bool:
     # Custom endpoint: if MNEMOSYNE_EMBEDDING_API_URL is set to a non-OpenRouter URL,
     # assume the user has their own API server and any model name should route there.
     base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
-    if base_url and "openrouter.ai" not in base_url:
+    if base_url and not _is_openrouter_url(base_url):
         return True
     # Explicit opt-in for non-OpenAI embedding models hosted on OpenRouter
     # (qwen/qwen3-embedding-*, baai/bge-*, jina-embeddings-*, nvidia/*-embed-*, etc.).
@@ -135,9 +161,13 @@ def _is_api_model(model_name: str) -> bool:
 def _get_embedding_dim(model_name: str) -> int:
     """Return the embedding dimension for a given model.
 
-    Supports English, Chinese, and multilingual embedding models.
-    Falls back to 384 (bge-small dimension) for unknown models.
-    Override with MNEMOSYNE_EMBEDDING_DIM env var for unsupported models.
+    Resolution order: an explicit MNEMOSYNE_EMBEDDING_DIM wins (and must be a
+    valid integer); otherwise a known model resolves via the table below; an
+    unknown model with no explicit dimension raises ValueError rather than
+    silently assuming 384 -- a vec0 table is dimensioned at creation, so a wrong
+    guess bakes the wrong dimension into a fresh database and corrupts vector
+    search. Embeddings-disabled invocations keep the 384 fallback (the dimension
+    is unused there).
     """
     dims = {
         # --- English BGE ---
@@ -158,6 +188,7 @@ def _get_embedding_dim(model_name: str) -> int:
         "sentence-transformers/paraphrase-multilingual-mpnet-base-v2": 768,
         # --- Multilingual BGE ---
         "BAAI/bge-m3": 1024,            # M3: multilingual (100+ langs), 1024-dim
+        "bge-m3": 1024,                 # Common remote/API alias
         "BAAI/bge-multilingual-gemma2": 3584,
         # --- OpenAI ---
         "openai/text-embedding-3-small": 1536,
@@ -176,14 +207,44 @@ def _get_embedding_dim(model_name: str) -> int:
         "jinaai/jina-embeddings-v2-base-zh": 768,
         "jinaai/jina-embeddings-v2-base-code": 768,
     }
-    # Check env override first
+    # Explicit override wins. An explicit-but-invalid value is a configuration
+    # error -- raise rather than silently fall through to a guess. A set-but-
+    # empty value (routine in Docker Compose / .env / CI matrices) is normalized
+    # to unset so it does not raise for a known model or with embeddings off.
     env_dim = os.environ.get("MNEMOSYNE_EMBEDDING_DIM")
-    if env_dim is not None:
+    if env_dim is not None and env_dim.strip():
         try:
-            return int(env_dim)
-        except (ValueError, TypeError):
-            pass
-    return dims.get(model_name, 384)
+            value = int(env_dim)
+        except ValueError:
+            raise ValueError(
+                f"MNEMOSYNE_EMBEDDING_DIM={env_dim!r} is not a valid integer; "
+                f"set it to the embedding model's output dimension."
+            ) from None
+        if value <= 0:
+            raise ValueError(
+                f"MNEMOSYNE_EMBEDDING_DIM={value} must be a positive integer; "
+                f"vector dimensions are >= 1."
+            )
+        return value
+    if model_name in dims:
+        return dims[model_name]
+    # Unknown model with no explicit dimension. Silently assuming 384 (bge-small's
+    # dimension) bakes the wrong dimension into a fresh vec0 table and corrupts
+    # every insert/recall when the model's true dimension differs -- the root
+    # cause behind the recurring per-model additions to this table. Refuse to
+    # guess and point at the override.
+    if _is_disabled():
+        # Embeddings turned off (CI / opt-out): the dimension is unused, so keep
+        # the 384 fallback rather than failing an unused code path.
+        return 384
+    raise ValueError(
+        f"Unknown embedding model {model_name!r}: not in the built-in dimension "
+        f"table and MNEMOSYNE_EMBEDDING_DIM is unset. A vec0 table is dimensioned "
+        f"at creation, so silently assuming 384 would bake in the wrong dimension "
+        f"and corrupt vector search. Set MNEMOSYNE_EMBEDDING_DIM=<N> to the "
+        f"model's output dimension (e.g. 1024 for mxbai-embed-large), or add the "
+        f"model to the table in _get_embedding_dim()."
+    )
 
 
 def _embedding_threads() -> int:
@@ -260,16 +321,157 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
     return False
 
 
+def _safe_api_endpoint(url: str) -> str:
+    """Return a credential-free API endpoint suitable for logs."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if not parsed.hostname:
+            return "<invalid-url>"
+        host = parsed.hostname
+        if ":" in host:
+            host = f"[{host}]"
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        authority = f"{host}:{port}" if port is not None else host
+        return urllib.parse.urlunsplit((parsed.scheme, authority, parsed.path, "", ""))
+    except ValueError:
+        return "<invalid-url>"
+
+
+class _EmbeddingPolicyError(ValueError):
+    """A configuration/transport-policy refusal (credentialed cleartext
+    endpoint, credentialed redirect). Raised OUTSIDE the retry-and-degrade
+    machinery: unlike transient transport failures these must surface to the
+    caller instead of degrading to keyword-only recall."""
+
+
+class _CredentialedNoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects for key-bearing embedding requests.
+
+    urllib forwards the original request headers, Authorization included,
+    verbatim to the redirect target (verified against a local 302 hop), so a
+    credentialed request must never follow one: the target can be a cleartext
+    http:// URL or an unrelated https:// authority, and either leaks the
+    credential. Fail loud and let the operator point the env var at the final
+    endpoint URL instead."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise _EmbeddingPolicyError(
+            f"Refusing to follow redirect to {_safe_api_endpoint(newurl)} for a credentialed "
+            "embedding request: urllib would forward Authorization to the "
+            "redirect target. Point MNEMOSYNE_EMBEDDING_API_URL at the "
+            "final endpoint URL."
+        )
+
+
+def _is_openrouter_url(base_url: str) -> bool:
+    """Whether the embedding endpoint is OpenRouter proper (hostname-based).
+
+    Substring matching misclassifies custom endpoints whose URL merely
+    contains ``openrouter.ai`` in the path or query, blocking them from the
+    keyless custom-endpoint path. Match the resolved hostname instead.
+    Malformed URLs (e.g. ``http://[``) raise ``ValueError`` from
+    ``urlsplit``; treat those as non-OpenRouter so the request still reaches
+    the API path and fails loud with the redacted ``RuntimeError``.
+    """
+    try:
+        hostname = urllib.parse.urlsplit(base_url).hostname or ""
+    except ValueError:
+        return False
+    return hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai")
+
+
+def _ensure_api_vectors(result: Optional[np.ndarray], base_url: str, expected: int) -> np.ndarray:
+    """Validate that the API embedding result matches the request contract.
+
+    ``embed()`` / ``embed_query()`` must fail loud here: a bare ``None`` is
+    indistinguishable from "embeddings unavailable", so callers (e.g.
+    ``BeamMemory.remember``) would silently skip vector storage without
+    their ``except Exception`` warning ever firing. The result must be a
+    rank-two array with exactly ``expected`` non-empty vectors (one per
+    requested input), so partial, malformed or rank-invalid responses fail
+    here too instead of being silently consumed. The message carries only
+    the redacted endpoint and model name -- never the input text or any
+    credential.
+    """
+    if result is None:
+        if _is_openrouter_url(base_url) and not _OPENAI_API_KEY:
+            hint = (
+                "no API key is configured; set MNEMOSYNE_EMBEDDING_API_KEY "
+                "or OPENAI_API_KEY"
+            )
+        else:
+            hint = (
+                "the endpoint failed or returned no vectors; the warning "
+                "logs above give the HTTP/network reason"
+            )
+        raise RuntimeError(
+            f"Embedding API returned no vectors (endpoint={_safe_api_endpoint(base_url)}, "
+            f"model={_DEFAULT_MODEL}): {hint}."
+        )
+    if result.size == 0:
+        raise RuntimeError(
+            f"Embedding API returned an empty vector result "
+            f"(endpoint={_safe_api_endpoint(base_url)}, model={_DEFAULT_MODEL}); "
+            f"the endpoint may not support embeddings for the given input."
+        )
+    if result.ndim != 2:
+        raise RuntimeError(
+            f"Embedding API returned an unexpected rank-{result.ndim} result "
+            f"(endpoint={_safe_api_endpoint(base_url)}, model={_DEFAULT_MODEL}); "
+            f"expected a rank-2 array with one vector per input."
+        )
+    if len(result) != expected:
+        raise RuntimeError(
+            f"Embedding API returned {len(result)} vector(s) for {expected} input(s) "
+            f"(endpoint={_safe_api_endpoint(base_url)}, model={_DEFAULT_MODEL}); "
+            f"the endpoint may be returning a partial or misaligned response."
+        )
+    if not np.isfinite(result).all():
+        raise RuntimeError(
+            f"Embedding API returned non-finite values (NaN or inf) "
+            f"(endpoint={_safe_api_endpoint(base_url)}, model={_DEFAULT_MODEL}); "
+            "the result is not a valid embedding vector."
+        )
+    return result
+
+
 def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint)."""
     global _API_CALL_COUNT
     # Require API key for OpenRouter; custom endpoints may not need one.
     base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
-    is_custom = "openrouter.ai" not in base_url
+    is_custom = not _is_openrouter_url(base_url)
     if not is_custom and not _OPENAI_API_KEY:
+        logger.warning(
+            "embedding API: no API key set for OpenRouter endpoint %s, returning None vectors",
+            _safe_api_endpoint(base_url),
+        )
         return None
+    if _OPENAI_API_KEY and not base_url.startswith("https://"):
+        # Fail loud before any request: sending Authorization (and the text
+        # being embedded) over cleartext http:// leaks both on the wire.
+        raise _EmbeddingPolicyError(
+            f"Refusing to send embedding credentials over non-HTTPS endpoint "
+            f"{_safe_api_endpoint(base_url)}: point MNEMOSYNE_EMBEDDING_API_URL at an https:// "
+            "URL, or unset MNEMOSYNE_EMBEDDING_API_KEY / OPENAI_API_KEY to "
+            "embed without credentials (for example a local endpoint that "
+            "needs no key)."
+        )
 
-    url = f"{base_url.rstrip('/')}/embeddings"
+    # Append /embeddings to the path, preserving any query string. A naive
+    # string append would push the route into the query value (e.g.
+    # "?upstream=openrouter.ai/embeddings") and silently target the wrong
+    # endpoint. Malformed URLs keep the old behavior: the request still fails
+    # and degrades to None so _ensure_api_vectors raises the redacted error.
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        path = parsed.path.rstrip("/") + "/embeddings"
+        url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
+    except ValueError:
+        url = f"{base_url.rstrip('/')}/embeddings"
     payload = json.dumps({
         "model": _DEFAULT_MODEL,
         "input": texts,
@@ -295,11 +497,26 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
             cert_file = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
             if cert_file:
                 ctx.load_verify_locations(cert_file)
-            with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            if _OPENAI_API_KEY:
+                # Credentialed: refuse redirects (Authorization would be
+                # forwarded to the target); uncredentialed requests keep
+                # the default redirect behavior.
+                opener = urllib.request.build_opener(
+                    _CredentialedNoRedirect,
+                    urllib.request.HTTPSHandler(context=ctx),
+                )
+                resp_ctx = opener.open(req, timeout=30)
+            else:
+                resp_ctx = urllib.request.urlopen(req, timeout=30, context=ctx)
+            with resp_ctx as resp:
                 data = json.loads(resp.read())
             embeddings = [item["embedding"] for item in data["data"]]
             _API_CALL_COUNT += 1
             return np.array(embeddings, dtype=np.float32)
+        except _EmbeddingPolicyError:
+            # Policy refusals (credentialed redirect) propagate; the generic
+            # handler below would otherwise degrade them to keyword-only.
+            raise
         except urllib.error.HTTPError as exc:
             # Retry rate limits and transient server failures, but surface
             # permanent client/authentication failures to callers as the
@@ -308,13 +525,23 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
                 if attempt < 2:
                     time.sleep(retry_delay(attempt))
                     continue
+            logger.warning(
+                "embedding API request failed: endpoint=%s status=%s",
+                _safe_api_endpoint(url),
+                exc.code,
+            )
             return None
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
             # Network failures are transient often enough to warrant the same
             # bounded retry policy as HTTP 5xx responses.
             if attempt < 2:
                 time.sleep(retry_delay(attempt))
                 continue
+            logger.warning(
+                "embedding API request failed: endpoint=%s error=%s",
+                _safe_api_endpoint(url),
+                type(exc).__name__,
+            )
             return None
         except Exception as exc:
             # Preserve compatibility with mocked/custom transports that expose
@@ -325,6 +552,11 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
                 if attempt < 2:
                     time.sleep(retry_delay(attempt))
                     continue
+            logger.warning(
+                "embedding API call failed: endpoint=%s error=%s",
+                _safe_api_endpoint(url),
+                type(exc).__name__,
+            )
             return None
 
     return None
@@ -337,7 +569,7 @@ def available() -> bool:
     if _is_api_model(_DEFAULT_MODEL):
         # Custom endpoints (non-OpenRouter) may not require an API key
         base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
-        if base_url and "openrouter.ai" not in base_url:
+        if base_url and not _is_openrouter_url(base_url):
             return True
         return bool(_OPENAI_API_KEY)
     return _FASTEMBED_AVAILABLE
@@ -353,6 +585,9 @@ def available_api() -> bool:
 #     prevents stale vectors if the prefix env var changes within a process.
 def embed_query(text: str) -> Optional[np.ndarray]:
     """Encode a single query text into a dense vector."""
+    # Check outside the cached function: a warm hit must not bypass opt-out.
+    if _is_disabled():
+        return None
     if not text:
         return None
     return _embed_query_cached(_get_prefix("query") + text)
@@ -362,7 +597,8 @@ def embed_query(text: str) -> Optional[np.ndarray]:
 def _embed_query_cached(prefixed: str) -> Optional[np.ndarray]:
     if _is_api_model(_DEFAULT_MODEL):
         result = _embed_api([prefixed])
-        return result[0] if result is not None else None
+        _ensure_api_vectors(result, os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1"), 1)
+        return result[0]
 
     model = _get_model()
     if model is None or model == "api":
@@ -377,13 +613,16 @@ def _embed_query_cached(prefixed: str) -> Optional[np.ndarray]:
 #     embed_query — that path stamped the query prefix onto stored documents.
 def embed(texts: List[str]) -> Optional[np.ndarray]:
     """Encode texts (documents) into dense vectors."""
+    if _is_disabled():
+        return None
     if not texts:
         return None
     doc_prefix = _get_prefix("doc")
     prefixed = [doc_prefix + t for t in texts]
 
     if _is_api_model(_DEFAULT_MODEL):
-        return _embed_api(prefixed)
+        result = _embed_api(prefixed)
+        return _ensure_api_vectors(result, os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1"), len(prefixed))
 
     model = _get_model()
     if model is None or model == "api":
