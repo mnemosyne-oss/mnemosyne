@@ -368,22 +368,38 @@ class _CredentialedNoRedirect(urllib.request.HTTPRedirectHandler):
         )
 
 
-def _embedding_max_chars() -> int:
-    """Resolve the optional per-input character cap at call time (default:
-    disabled). Set MNEMOSYNE_EMBEDDING_MAX_CHARS for local OpenAI-compatible
-    servers (llama.cpp et al.) whose per-slot context window rejects long
-    inputs with HTTP 400, aborting the whole batch; 0 or negative disables."""
-    raw = os.environ.get("MNEMOSYNE_EMBEDDING_MAX_CHARS", "").strip()
+def _env_cap(name: str) -> int:
+    """An optional integer cap read at call time; unset, blank, 0, negative or
+    invalid (warned) all mean disabled."""
+    raw = os.environ.get(name, "").strip()
     if not raw:
         return 0
     try:
         return int(raw)
     except ValueError:
-        logger.warning(
-            "invalid MNEMOSYNE_EMBEDDING_MAX_CHARS=%r; embedding cap disabled",
-            raw,
-        )
+        logger.warning("invalid %s=%r; embedding cap disabled", name, raw)
         return 0
+
+
+def _embedding_max_chars() -> int:
+    """Resolve the optional per-input character cap at call time (default:
+    disabled). Set MNEMOSYNE_EMBEDDING_MAX_CHARS for local OpenAI-compatible
+    servers (llama.cpp et al.) whose per-slot context window rejects long
+    inputs with HTTP 400, aborting the whole batch; 0 or negative disables."""
+    return _env_cap("MNEMOSYNE_EMBEDDING_MAX_CHARS")
+
+
+def _embedding_max_bytes() -> int:
+    """Optional per-input UTF-8 byte cap (MNEMOSYNE_EMBEDDING_MAX_BYTES,
+    default disabled). Characters are not a token budget: some scripts
+    tokenize to several tokens per character, while UTF-8 bytes bound tokens
+    from above for byte-level BPE tokenizers."""
+    return _env_cap("MNEMOSYNE_EMBEDDING_MAX_BYTES")
+
+
+def _embedding_caps() -> tuple:
+    """Both caps, as one cache key part for embed_query."""
+    return (_embedding_max_chars(), _embedding_max_bytes())
 
 
 def _cap_for_api(texts: List[str]) -> List[str]:
@@ -391,12 +407,12 @@ def _cap_for_api(texts: List[str]) -> List[str]:
     is set. Off by default: characters are not a token budget, and silent
     head-truncation can drop retrieval content on endpoints that accept the
     full text. When enabled, every truncation is logged."""
-    limit = _embedding_max_chars()
-    if limit <= 0:
+    limit, byte_limit = _embedding_max_chars(), _embedding_max_bytes()
+    if limit <= 0 and byte_limit <= 0:
         return texts
     capped: List[str] = []
     for text in texts:
-        if len(text) > limit:
+        if 0 < limit < len(text):
             logger.warning(
                 "embedding input truncated: %d -> %d chars (model=%s, cap=MNEMOSYNE_EMBEDDING_MAX_CHARS)",
                 len(text),
@@ -404,6 +420,17 @@ def _cap_for_api(texts: List[str]) -> List[str]:
                 _DEFAULT_MODEL,
             )
             text = text[:limit]
+        if byte_limit > 0:
+            raw = text.encode("utf-8")
+            if len(raw) > byte_limit:
+                logger.warning(
+                    "embedding input truncated: %d -> %d bytes (model=%s, cap=MNEMOSYNE_EMBEDDING_MAX_BYTES)",
+                    len(raw),
+                    byte_limit,
+                    _DEFAULT_MODEL,
+                )
+                # a cut inside a multi-byte character drops that character, never emits half of it
+                text = raw[:byte_limit].decode("utf-8", "ignore")
         capped.append(text)
     return capped
 
@@ -633,13 +660,13 @@ def embed_query(text: str) -> Optional[np.ndarray]:
         return None
     if not text:
         return None
-    # The effective cap is part of the key: _embed_api reads MNEMOSYNE_EMBEDDING_MAX_CHARS at call time, so a
+    # The effective caps are part of the key: _embed_api reads MNEMOSYNE_EMBEDDING_MAX_CHARS / _BYTES at call time, so a
     # vector embedded under one cap must not be served after the cap changes (review #1052).
-    return _embed_query_cached(_get_prefix("query") + text, _embedding_max_chars())
+    return _embed_query_cached(_get_prefix("query") + text, _embedding_caps())
 
 
 @lru_cache(maxsize=512)
-def _embed_query_cached(prefixed: str, _cap: int = 0) -> Optional[np.ndarray]:
+def _embed_query_cached(prefixed: str, _caps: tuple = (0, 0)) -> Optional[np.ndarray]:
     if _is_api_model(_DEFAULT_MODEL):
         result = _embed_api([prefixed])
         _ensure_api_vectors(result, os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1"), 1)
