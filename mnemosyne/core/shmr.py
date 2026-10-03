@@ -95,7 +95,14 @@ def _init_schema(conn):
 def _embed(text: str) -> np.ndarray:
     """Embed text using Mnemosyne's embedding pipeline (BAAI/bge-small)."""
     np = _require_numpy()
-    emb = _embeddings.embed([text])
+    try:
+        emb = _embeddings.embed([text])
+    except Exception as exc:
+        logger.warning(
+            "SHMR embedding failed, using zero vector (%s): %s",
+            type(exc).__name__, exc,
+        )
+        return np.zeros(EMBEDDING_DIM, dtype=np.float32)
     if emb is None or len(emb) == 0:
         return np.zeros(EMBEDDING_DIM, dtype=np.float32)
     emb = emb[0]
@@ -206,11 +213,17 @@ def _call_llm(prompt: str, system: str = "") -> str:
     # Try local LLM first
     try:
         from mnemosyne.core.local_llm import _call_local_llm
-        result = _call_local_llm(prompt, system=system, temperature=SHMR_TEMPERATURE)
+        # ponytail: _call_local_llm's contract is (prompt) only -- see the
+        # two other call sites in local_llm.py. Fold the system instruction
+        # into the prompt so the local path is not bypassed by a TypeError
+        # that the fallback boundary would swallow. Upgrade path: if/when
+        # _call_local_llm grows native system/temperature kwargs, pass them.
+        local_prompt = f"{system}\n\n{prompt}" if system else prompt
+        result = _call_local_llm(local_prompt)
         if result and len(result.strip()) > 10:
             return result
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("SHMR local LLM failed (%s)", type(exc).__name__)
 
     # Fallback to the cloud extraction client.
     #

@@ -152,6 +152,16 @@ is a real virtual environment. It then checks the known install roots
 `/usr/local/lib/hermes-agent`, `/usr/lib/hermes-agent`), which are held to the
 same bar.
 
+On Hermes 0.21 and later a checkout's own `venv` is only the macOS TCC anchor. The provider runs from a staged
+runtime under `$HERMES_HOME/installs/<key>/environments/<generation>/venv`, which Hermes records in
+`installs/<key>/facts.json`. For the launcher's checkout and for each install root above, discovery reads that
+record (`<key>` is derived from the checkout path, so `installs/` is never scanned) and returns the staged
+interpreter instead of the anchor. A checkout with no committed runtime keeps the venv-based behavior. A record
+that exists but cannot be used (unreadable, outside that install's `environments/`, or without an executable
+interpreter) makes discovery stop with a warning naming it, rather than fall back to the anchor. `--python`
+still overrides all of this. A staged generation is replaceable by a Hermes update, so a wrapper installed
+against it prints the persistence warning described under wrapper mode.
+
 Wrapper resolution is deliberately bounded: it reads a limited prefix of the
 launcher, follows a limited number of hops, and understands a fixed set of forms
 (`exec /path/to/hermes`, a relative or bare target, and `env`/`VAR=val` prefixes).
@@ -196,9 +206,17 @@ that selected interpreter needs longer to resolve its site-packages or import
 `mnemosyne_hermes`. `SECONDS` must be positive and finite: zero, negative,
 `NaN`, and infinite values are rejected.
 
+First create a persistent Mnemosyne side venv outside Hermes' replaceable core/PM
+venv, using a Python with the same major/minor version as Hermes. Install a
+compatible released `mnemosyne-hermes`/core pair into that side venv: the
+integration requires `mnemosyne-memory[embeddings]`; choose
+`mnemosyne-memory[all]` only if its additional local-LLM dependencies are needed.
+Follow the [persistent side-venv wrapper setup](../../docs/hermes-integration.md#persistent-side-venv-wrapper-mode)
+for the package/profile selection and installation steps.
+
 ```bash
-mnemosyne-hermes install --mode wrapper --python /path/to/hermes/venv/bin/python --import-timeout 90
-mnemosyne-hermes install --mode wrapper --python /path/to/hermes/venv/bin/python --no-bootstrap --import-timeout 90
+mnemosyne-hermes install --mode wrapper --python /path/to/persistent/mnemosyne-venv/bin/python --import-timeout 90
+mnemosyne-hermes install --mode wrapper --python /path/to/persistent/mnemosyne-venv/bin/python --no-bootstrap --import-timeout 90
 ```
 
 The second form still validates the selected wrapper interpreter; `--no-bootstrap`
@@ -249,10 +267,11 @@ No required config. Everything defaults to `~/.mnemosyne/`. Optional overrides:
 | `MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT` | `800` | Assistant content truncation in `sync_turn()` (`0` = no limit) |
 | `MNEMOSYNE_FACT_RECALL_ENABLED` | `false` | Merge LLM-extracted facts into standard recall |
 | `MNEMOSYNE_IGNORE_PATTERNS` | _(empty)_ | Newline-separated regular expressions; matching writes are rejected before persistence |
+| `MNEMOSYNE_SYNC_ROLES` | `user` | Comma-separated roles autosaved by `sync_turn()` (`user`, `assistant`; empty disables conversation autosave) |
 | `MNEMOSYNE_WRITE_CLASSIFIER` | `off` | Write admission classifier: `off`, `warn`, or `strict` |
 | `MNEMOSYNE_PREFETCH_CONTENT_CHARS` | `0` | Per-memory prefetch content cap (`0` = full content) |
 | `MNEMOSYNE_PREFETCH_MIN_DISTINCTIVE_TOKENS` | `2` | Shared non-generic terms required for automatic prefetch injection |
-| `MNEMOSYNE_PREFETCH_MIN_QUERY_COVERAGE` | `0.30` | Minimum fraction of non-generic query terms covered by a prefetched memory. Exempt for a canonical slot whose entire body is one CJK bigram that also appears in the query, so a short topical fact is reachable from a contextual sentence; separators around that bigram (`。`, `／`, `｡`, quotes, brackets) are removed before the check, so `部署／` qualifies while `部署／計画` still counts as two units. Automatic prefetch still applies the rarity cap below, and explicit canonical recall needs no coverage fraction at all |
+| `MNEMOSYNE_PREFETCH_MIN_QUERY_COVERAGE` | `0.30` | Minimum fraction of non-generic query terms covered by a prefetched memory. Exempt for a canonical slot whose entire body is one CJK bigram that also appears in the query, so a short topical fact is reachable from a contextual sentence; separators around that bigram (`。`, `／`, `｡`, quotes, brackets) are removed before the check, so `部署／` qualifies while `部署／計画` still counts as two units. Automatic prefetch also runs the same run-local U+3005 iteration-mark predicate as explicit canonical recall before scoring, so a candidate that clears these thresholds can still be excluded when its iteration-mark evidence does not match a CJK run. Automatic prefetch still applies the rarity cap below, and explicit canonical recall needs no coverage fraction at all |
 | `MNEMOSYNE_PREFETCH_CANONICAL_RARE_TOKEN_MAX_FREQUENCY` | `1` | Maximum canonical document frequency that permits a one-token match (`0` disables the exception). A whole-body CJK bigram match counts as a one-token match, so it stays subject to this cap |
 | `MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS` | path-specific built-in canonical set | Complete replacement for the canonical generic-token set used by automatic and explicit canonical lookup; does not affect working/episodic prefetch |
 | `MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS` | _(empty)_ | Extra owner/deployment terms added to automatic canonical prefetch only |
@@ -266,10 +285,21 @@ memory:
   mnemosyne:
     auto_sleep: true
     sleep_threshold: 30
+    sync_roles: [user]  # user | assistant; [] disables conversation autosave
     ignore_patterns:
       - "^\\s*\\$\\s*pip\\s"
     write_classifier: "off"  # off | warn | strict
 ```
+
+`sync_roles` accepts a comma-separated string (for example, `user,assistant`) or
+an `initialize(...)`/YAML list, tuple, or set containing `user` and/or
+`assistant`. A string that looks like a YAML list, such as `"['user',
+'assistant']"`, is not parsed as YAML; it is invalid. Empty strings and empty
+containers silently disable conversation autosave. A non-empty value containing
+no valid roles disables autosave and logs one warning; unknown entries are
+silently dropped when at least one valid role remains. Resolution precedence is
+`initialize(...)` keyword argument > Hermes `memory.mnemosyne.sync_roles` >
+Mnemosyne `sync_roles` config > `MNEMOSYNE_SYNC_ROLES` > default `user`.
 
 For `ignore_patterns` and `write_classifier`, an explicit `initialize(...)`
 keyword argument takes precedence. Without that override, resolution is

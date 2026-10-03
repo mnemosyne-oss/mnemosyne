@@ -146,6 +146,9 @@ ENV_VAR_MAP: Dict[str, str] = {
     "modality_audio_model": "MNEMOSYNE_MODALITY_AUDIO_MODEL",
     "modality_timeout": "MNEMOSYNE_MODALITY_TIMEOUT",
     "modality_max_moments": "MNEMOSYNE_MODALITY_MAX_MOMENTS",
+    # mnemosyne_remember_media tool guards (SDK callers are not restricted).
+    "media_allowed_paths": "MNEMOSYNE_MEDIA_ALLOWED_PATHS",
+    "media_allow_private_urls": "MNEMOSYNE_MEDIA_ALLOW_PRIVATE_URLS",
     # Conflict detection
     "llm_conflict_detection": "MNEMOSYNE_LLM_CONFLICT_DETECTION",
     "conflict_llm_base_url": "MNEMOSYNE_CONFLICT_LLM_BASE_URL",
@@ -288,6 +291,10 @@ DEFAULTS: Dict[str, Any] = {
     "modality_audio_model": "",
     "modality_timeout": 60,
     "modality_max_moments": 12,
+    # Tool calls may read local media only from these directories (os.pathsep
+    # or comma separated). Empty means tool calls cannot name local files.
+    "media_allowed_paths": "",
+    "media_allow_private_urls": False,
     # Conflict detection
     "llm_conflict_detection": False,
     "conflict_llm_base_url": "",
