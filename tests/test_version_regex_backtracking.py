@@ -5,7 +5,7 @@ import sys
 
 import pytest
 
-from mnemosyne.core.beam import BeamMemory
+from mnemosyne.core.beam import BeamMemory, _VERSION_STRING_RE
 
 
 _PATHOLOGICAL_INPUT = ("AAAAAA " * 20) + "v1."
@@ -17,9 +17,13 @@ pattern = re.compile(
 )
 pattern.search(("AAAAAA " * 20) + "v1.")
 '''
+# Send the production pattern and flags to the subprocess. Importing the
+# entire memory stack there would spend the regex deadline on optional
+# dependency initialization instead of matching.
 _CURRENT_REPRODUCER = (
-    "from mnemosyne.core.beam import _VERSION_STRING_RE\n"
-    f"assert _VERSION_STRING_RE.search({_PATHOLOGICAL_INPUT!r}) is None\n"
+    "import re\n"
+    f"pattern = re.compile({_VERSION_STRING_RE.pattern!r}, {_VERSION_STRING_RE.flags!r})\n"
+    f"assert pattern.search({_PATHOLOGICAL_INPUT!r}) is None\n"
 )
 
 

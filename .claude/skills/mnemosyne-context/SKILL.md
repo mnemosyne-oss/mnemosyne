@@ -1,6 +1,6 @@
 ---
 name: mnemosyne-context
-description: Load this when working on the mnemosyne memory system — its repo, sync server, memory databases, CI, or the hermes-vps deployment. Covers architecture, the surface/sync data model, dev workflow (tests/ruff/CI matrix), the Tailscale/systemd devops topology, release policy, contributor norms, and known gotchas that are easy to get wrong. Use for any "mnemosyne" dev or devops task, or when a sync/import/recall behaves unexpectedly.
+description: Load this when working on the mnemosyne memory system — its repo, sync server, memory databases, or CI. Covers architecture, the surface/sync data model, dev workflow (tests/ruff/CI matrix), release policy, and known gotchas that are easy to get wrong. Use for any "mnemosyne" dev or devops task, or when a sync/import/recall behaves unexpectedly.
 ---
 
 # Mnemosyne context
@@ -15,7 +15,6 @@ Mnemosyne is a persistent memory system for AI agents (SQLite-backed, hybrid rec
 - **Architecture-first, and ship DONE work.** Ask "does this need a version bump / is this the right layer?" before implementing. Deliver tested, complete implementations — not partial work.
 - **Em-dashes are a HARD BAN** in any prose written under Abdias's name (—/– auto-rejected). This is a personal quality standard, not a style suggestion. (Terminal/code output is exempt; this is about public-facing text.)
 - **"Draft" means preview, do not send.** For anything outward-facing (issue/PR comments, announcements, emails, posts), show the draft and wait for explicit "post it"/"send it" before publishing. Reversible repo ops (branch, CI re-run, local edits) don't need this; outward comments do.
-- **Contributor review routing**: do NOT ask **dplush (Denis H)** to review other contributors' PRs (avoids contributor-on-contributor drift); AJ reviews. dplush stays focused on shipping core-layer work.
 - **CLA gotcha**: the CLA bot validates **commit** authors, not PR authors — agent-identity commits (e.g. `Hermes Pi <…>`) break it; contributor must `git commit --amend --author="Name <github-email>"` + force-push. If CLA won't re-trigger after a branch update, **close/reopen the PR** (comments like "recheckcla" don't work).
 
 ## Verify before trusting
@@ -37,7 +36,7 @@ Any point-in-time fact here (open issues/PRs, endpoints, versions) may be stale 
 - To actually share existing memories you must put them on the surface (`sync-init --claim-existing` on an all-global DB, or write global memories to the surface). To mirror an entire DB (incl. session memories) use **export/import**, not sync.
 
 ## Dev workflow
-- **Local `mnemosyne` CLI + MCP server run from the pipx install** (`~/.local/share/pipx/venvs/mnemosyne-memory`), **NOT** the repo. Editing the repo does not affect them unless installed editable. (On hermes-vps the install *is* editable at `/root/.hermes/projects/mnemosyne`.)
+- **Local `mnemosyne` CLI + MCP server run from the pipx install** (`~/.local/share/pipx/venvs/mnemosyne-memory`), **NOT** the repo. Editing the repo does not affect them unless installed editable. (Some operator deployments install it editable instead, in which case repo edits do take effect; check before assuming either.)
 - **Tests**: use the repo venv — `.venv/bin/python -m pytest tests/<file> -q`. Running from the repo dir makes `import mnemosyne` resolve to the repo source (shadows pipx). pytest lives in `.venv`, not pipx.
 - Set **`MNEMOSYNE_NO_EMBEDDINGS=1`** for fast test runs; embedding-dependent tests are flaky because Hugging Face rate-limits (`429`) the `BAAI/bge-small-en-v1.5` download. CI defaults to this and caches `~/.hermes/cache/fastembed`.
 - **`tests/test_temporal_recall.py::...::test_performance_overhead` is a flaky wall-clock gate** (<10ms). A single-version red on it is almost always load noise — re-run the job.
@@ -50,16 +49,25 @@ Any point-in-time fact here (open issues/PRs, endpoints, versions) may be stale 
 - **Cadence**: bundle substantial fixes + features into the **next MAJOR**; do **not** drip-feed into incremental MINORs. Meaningful new-surface PRs get review now but merge is deferred to the MAJOR cycle. MINORs ship only when enough additive opt-in features accumulate.
 - Local pipx installs track **PyPI releases** — a merged fix isn't in your local CLI until a release ships (or you reinstall from source). Don't `pipx reinstall` from PyPI expecting an unreleased fix; it silently reverts it.
 
-## DevOps — hermes-vps (Tailscale)
-- Host `vmi3272367.tail9293de.ts.net` (IP `100.88.216.42`); services exposed **tailnet-only** via `tailscale serve` (HTTPS :443, **prefix-stripped**).
-- systemd units: `mnemosyne-sync.service`, `mnemosyne-dashboard.service`, `mnemosyne-bot.service`.
-- **Sync server**: `mnemosyne sync-serve` on `127.0.0.1:8766` (dedicated relay DB `/root/.hermes/mnemosyne/data/sync-relay.db`, `--api-key-file /root/.hermes/mnemosyne/sync-api-key`, `600`). Endpoint: `https://vmi3272367.tail9293de.ts.net/mnemosyne-sync` → routes `/sync/pull|push|status`, `/healthz`.
-- **Dashboard** (`.../mnemosyne` → `:8765`) is a **read-only UI** (`MnemosyneDashboard`), *not* a sync server — every `/sync/*` 404s. Don't point `sync_remote` at it.
-- **tirith gotcha**: the security scanner blocks **raw Tailscale IP URLs** in cron/automation. Use the Tailscale **hostname**, never `100.x.x.x`.
-- SSH: `ssh hermes-vps`. `sqlite3` is available on the box for quick DB inspection.
+## DevOps
+
+The deployment topology (sync server, dashboard, bot, and the host they run on)
+is operator-specific and is **not documented in this public repository**. Hosts,
+addresses, service definitions and credential paths live in the operator's
+private runbook.
+
+What is safe to know here: the sync server is `mnemosyne sync-serve` bound to
+loopback and reverse-proxied; it serves `/sync/pull|push|status` and `/healthz`,
+and it requires a dedicated relay DB rather than a private `mnemosyne.db`. The
+dashboard is a read-only UI on a separate port and is **not** a sync server, so
+pointing `sync_remote` at it 404s on every `/sync/*` route.
 
 ## Contributor norms
-- **dplush (Denis H)** is the highest-velocity core-layer contributor — keep them shipping; **do NOT** ask dplush to review other contributors' PRs (avoids contributor-on-contributor drift). AJ reviews.
+
+Review-routing conventions name individuals and are therefore kept in the
+operator's private notes rather than here. What is safe to state publicly: the
+merge gate is green CI, external review is not required, and the CLA bot
+validates **commit** authors rather than PR authors.
 
 ## Known gotchas / decided designs
 - **Config precedence (#482)**: `config.yaml` > env > default. Runtime reads `MnemosyneConfig.get()` directly — **no** YAML→env bridge / `apply_to_env()`. Many config keys need a **process restart** to take effect.

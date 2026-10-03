@@ -40,14 +40,111 @@ _LOW_QUALITY_SUBJECT_LEADERS = frozenset({
     "my", "your", "his", "their", "our", "its",
 })
 
+# Article-led subjects are the same transient-state noise on narrative
+# traffic ("The silence is different", "A frame has ..."), but the article
+# alone cannot decide it: a proper name may open with one ("The Matrix",
+# "The Netherlands", "A New Hope"). The word after the article settles it,
+# lowercase for the common-noun phrase and capitalised for the name, which
+# is the same proper-noun shape the broader subject rule (#742) will apply
+# to the whole subject; both can coexist.
+_SUBJECT_ARTICLES = frozenset({"the", "a", "an"})
+
 
 def _is_low_quality_subject(subject: str) -> bool:
-    """True if `subject` is a pronoun/demonstrative/possessive-led phrase that
-    should not become a fact triple. See _LOW_QUALITY_SUBJECT_LEADERS."""
+    """True if `subject` is a pronoun/demonstrative/possessive-led phrase, or
+    an article followed by a common noun, and so should not become a fact
+    triple. An article followed by a capitalised word is a name and passes.
+    See _LOW_QUALITY_SUBJECT_LEADERS and _SUBJECT_ARTICLES."""
     if not subject:
         return True
-    first = subject.strip().split(None, 1)[0].strip(".,!?;:'\"").lower()
+    tokens = [t.strip(".,!?;:'\"") for t in subject.strip().split()]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return True
+    first = tokens[0].lower()
+    if first in _SUBJECT_ARTICLES:
+        return not (len(tokens) > 1 and tokens[1][:1].isupper())
     return first in _LOW_QUALITY_SUBJECT_LEADERS
+
+
+# Object-side counterpart to _is_low_quality_subject. The four extraction
+# regexes capture a single object token after "is/has/uses/works at", so on
+# conversational prose the object is frequently a state adjective ("Bob is
+# different"), a stance adverb ("Alice is definitely ..."), a function word
+# ("Carol has it") or a filler ("Dave has nothing"). None of those name a
+# value, and every such triple shares (subject, predicate) with the real
+# facts about that subject, so the veracity consolidator reads each one as a
+# contradiction.
+#
+# Because the capture is one token, an adjective phrase arrives as its
+# leading modifier and nothing else: "an extremely reliable editor" reaches
+# the guard as "extremely". Those modifiers are in the list for the same
+# reason as the rest, they name no value, but note that this is the modifier
+# alone and not a shortened phrase. Widening the capture to keep
+# "extremely reliable editor" would change what every object row holds and
+# is deliberately not part of this fix.
+#
+# This is a closed word list on purpose. A suffix heuristic ("ends in -ly")
+# was tried before and rejected proper nouns and common nouns that happen to
+# end that way ("Sally", "Italy", "family", "assembly"), so the adverb class
+# is enumerated instead. A lone common noun ("developer") is a legitimate
+# object and must pass; the list holds only words that are never one.
+_LOW_QUALITY_OBJECT_WORDS = frozenset({
+    # function words / pronouns / demonstratives
+    "a", "an", "the", "this", "that", "these", "those", "it", "its",
+    "there", "here", "what", "which", "who", "whom", "how", "why", "when",
+    "where", "not", "also", "just", "still", "yet", "now", "then", "too",
+    "very", "so", "all", "some", "any", "none", "more", "most", "less",
+    "much", "many", "such", "same", "other", "another", "each", "every",
+    "either", "neither", "both", "been", "being", "one",
+    # transient state / position
+    "different", "similar", "fine", "okay", "ok", "good", "bad", "great",
+    "ready", "already", "done", "gone", "back", "over", "away", "around",
+    "about", "out", "off", "up", "down", "in", "on", "at", "to", "for",
+    "with", "from", "by", "of", "as", "than", "like", "into", "onto",
+    "through", "because", "if", "but", "and", "or",
+    # fillers
+    "nothing", "something", "anything", "everything", "someone", "anyone",
+    "everyone", "nobody", "somebody", "anybody", "everybody",
+    # stance / degree / frequency adverbs
+    "definitely", "apparently", "probably", "really", "actually",
+    "basically", "usually", "currently", "only", "likely", "certainly",
+    "obviously", "clearly", "totally", "absolutely", "finally", "mostly",
+    "simply", "exactly", "generally", "normally", "typically", "possibly",
+    "presumably", "supposedly", "surely", "honestly", "literally",
+    "essentially", "entirely", "completely", "partly", "partially",
+    "mainly", "largely", "roughly", "nearly", "almost", "always", "never",
+    "often", "sometimes", "rarely", "seldom", "again", "quite", "rather",
+    "pretty", "kind", "sort", "maybe", "perhaps", "however", "therefore",
+    "otherwise", "anyway", "instead", "indeed", "even",
+    "extremely", "incredibly", "highly", "fairly", "somewhat", "slightly",
+    "truly", "deeply", "utterly", "especially", "particularly", "notably",
+    "remarkably", "hardly", "barely", "scarcely", "seriously", "genuinely",
+    "frankly", "arguably", "reportedly", "allegedly", "evidently",
+    "unusually", "increasingly", "occasionally", "frequently", "constantly",
+    "recently", "eventually", "immediately", "originally", "initially",
+    "previously", "formerly", "lately",
+})
+
+
+def _is_low_quality_object(obj: str) -> bool:
+    """True if `obj` carries no nameable value and should not become a fact
+    triple: empty, or a lowercase token in _LOW_QUALITY_OBJECT_WORDS.
+
+    The extraction patterns stop at the first word boundary, so the object
+    this sees is always a single token. It makes no claim about phrases: a
+    capitalised token ("Rust", "ComfyUI") and a lone common noun
+    ("developer") pass, and anything the list does not name passes. The
+    check is a closed list, never a suffix or shape heuristic, so it cannot
+    reject a name."""
+    if not obj:
+        return True
+    o = obj.strip()
+    if not o:
+        return True
+    if o[:1].isupper():
+        return False
+    return o.lower() in _LOW_QUALITY_OBJECT_WORDS
 
 
 @dataclass
@@ -308,11 +405,16 @@ class EpisodicGraph:
             content = content[: self._EXTRACT_FACTS_MAX_CONTENT_LEN]
 
         # Pattern 1: "X is Y"
-        is_pattern = r"\b([A-Z][a-zA-Z\s]+?)\s+is\s+(?:a|an|the)?\s*([a-zA-Z\s]+?)\b"
+        # The optional article must be a whole word (trailing \s+); the old
+        # `(?:a|an|the)?\s*` matched the "a" in "already" and the "the" in
+        # "there", leaving "lready" / "re" as the object.
+        is_pattern = r"\b([A-Z][a-zA-Z\s]+?)\s+is\s+(?:(?:a|an|the)\s+)?([a-zA-Z\s]+?)\b"
         for match in re.finditer(is_pattern, content):
             subject = match.group(1).strip()
             obj = match.group(2).strip()
-            if len(subject) > 2 and len(obj) > 2 and not _is_low_quality_subject(subject):
+            if (len(subject) > 2 and len(obj) > 2
+                    and not _is_low_quality_subject(subject)
+                    and not _is_low_quality_object(obj)):
                 facts.append(Fact(
                     id=f"fact_{memory_id}_{len(facts)}",
                     subject=subject,
@@ -323,11 +425,13 @@ class EpisodicGraph:
                 ))
         
         # Pattern 2: "X has Y"
-        has_pattern = r"\b([A-Z][a-zA-Z\s]+?)\s+has\s+(?:a|an|the)?\s*([a-zA-Z\d\s]+?)\b"
+        has_pattern = r"\b([A-Z][a-zA-Z\s]+?)\s+has\s+(?:(?:a|an|the)\s+)?([a-zA-Z\d\s]+?)\b"
         for match in re.finditer(has_pattern, content):
             subject = match.group(1).strip()
             obj = match.group(2).strip()
-            if len(subject) > 2 and len(obj) > 2 and not _is_low_quality_subject(subject):
+            if (len(subject) > 2 and len(obj) > 2
+                    and not _is_low_quality_subject(subject)
+                    and not _is_low_quality_object(obj)):
                 facts.append(Fact(
                     id=f"fact_{memory_id}_{len(facts)}",
                     subject=subject,
@@ -338,11 +442,13 @@ class EpisodicGraph:
                 ))
         
         # Pattern 3: "X uses Y"
-        uses_pattern = r"\b([A-Z][a-zA-Z\s]+?)\s+(uses?|using|used)\s+(?:a|an|the)?\s*([a-zA-Z\s]+?)\b"
+        uses_pattern = r"\b([A-Z][a-zA-Z\s]+?)\s+(uses?|using|used)\s+(?:(?:a|an|the)\s+)?([a-zA-Z\s]+?)\b"
         for match in re.finditer(uses_pattern, content):
             subject = match.group(1).strip()
             obj = match.group(3).strip()
-            if len(subject) > 2 and len(obj) > 2 and not _is_low_quality_subject(subject):
+            if (len(subject) > 2 and len(obj) > 2
+                    and not _is_low_quality_subject(subject)
+                    and not _is_low_quality_object(obj)):
                 facts.append(Fact(
                     id=f"fact_{memory_id}_{len(facts)}",
                     subject=subject,
@@ -357,7 +463,9 @@ class EpisodicGraph:
         for match in re.finditer(works_pattern, content):
             subject = match.group(1).strip()
             obj = match.group(2).strip()
-            if len(subject) > 2 and len(obj) > 2 and not _is_low_quality_subject(subject):
+            if (len(subject) > 2 and len(obj) > 2
+                    and not _is_low_quality_subject(subject)
+                    and not _is_low_quality_object(obj)):
                 facts.append(Fact(
                     id=f"fact_{memory_id}_{len(facts)}",
                     subject=subject,

@@ -172,8 +172,8 @@ def generate_feature_post(stats: dict, release: Optional[str]) -> str:
 def generate_community_post(stats: dict, release: Optional[str]) -> str:
     """Engagement / CTA."""
     ctas = [
-        "Building an AI agent? Memory is the hardest part.\n\nMnemosyne makes it a `pip install`.\n\n⭐ Star us on GitHub: github.com/AxDSan/mnemosyne\n💬 Join the Discord: discord.gg/Cgzpw9x3R",
-        "We ship fast. v{rel} just dropped with fixes for the Hermes plugin sync path, sqlite-vec compatibility, and smarter recall.\n\nUpgrade: pip install --upgrade mnemosyne-memory\n\nChangelog: github.com/AxDSan/mnemosyne/releases",
+        "Building an AI agent? Memory is the hardest part.\n\nMnemosyne makes it a `pip install`.\n\n⭐ Star us on GitHub: github.com/mnemosyne-oss/mnemosyne\n💬 Join the Discord: discord.gg/Cgzpw9x3R",
+        "We ship fast. v{rel} just dropped with fixes for the Hermes plugin sync path, sqlite-vec compatibility, and smarter recall.\n\nUpgrade: pip install --upgrade mnemosyne-memory\n\nChangelog: github.com/mnemosyne-oss/mnemosyne/releases",
         "What's your agent's memory strategy?\n\nMnemosyne users are building with:\n- BEAM cognitive architecture\n- L3 behavioral rules\n- Multi-device sync with encryption\n- MCP-native tool integration\n\nWe'd love to hear your stack ↓",
     ]
     return random.choice(ctas).format(rel=(release or "latest").lstrip("v"))

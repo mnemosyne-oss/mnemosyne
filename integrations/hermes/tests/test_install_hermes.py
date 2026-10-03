@@ -9,6 +9,7 @@ import venv
 from pathlib import Path
 
 import pytest
+import yaml
 from mnemosyne_hermes import install as install_mod
 from mnemosyne_hermes.install import install_plugin
 
@@ -403,12 +404,18 @@ def test_resolve_hermes_bin_rejects_unsupported_env_option(tmp_path, monkeypatch
 
 def test_default_install_links_single_home(tmp_path):
     _skip_on_windows()
+    source_manifest = _source() / "plugin.yaml"
+    source_manifest_before = source_manifest.read_bytes()
 
     target = install_plugin(hermes_home_path=tmp_path)
 
     assert target == tmp_path / "plugins" / "mnemosyne"
     assert target.is_symlink()
     assert target.resolve() == _source().resolve()
+    assert "python_runtime" not in yaml.safe_load(
+        (target / "plugin.yaml").read_text(encoding="utf-8")
+    )
+    assert source_manifest.read_bytes() == source_manifest_before
     assert install_mod._iter_mnemosyne_profiles(tmp_path) == []
 
 
@@ -1176,6 +1183,12 @@ def test_wrapper_preflight_and_bootstrap_support_real_pep660_editable_install(tm
 
     site_packages = install_mod._site_packages_for_python(python)
     assert not (site_packages / "mnemosyne_hermes").exists()
+    # The wrapper's selected interpreter must contain both the editable Hermes
+    # package and the operational Mnemosyne core. Model the latter with a
+    # second editable-style .pth entry, without downloading dependencies.
+    (site_packages / "mnemosyne-memory.pth").write_text(
+        f"{project.parent.parent}\n", encoding="utf-8"
+    )
     assert install_mod._check_wrapper_import(site_packages, python) == (True, None, False)
 
     wrapper = tmp_path / "hermes-home" / "plugins" / "mnemosyne"

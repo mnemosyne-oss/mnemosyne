@@ -195,8 +195,21 @@ reviews:
   # critical for the contributor "one at a time" issue.
   batch_reviews: true
 
-  # Automatically review new commits as they push
-  auto_incremental_review: true
+  # === AUTO-REVIEW CONTROL ===
+  # https://docs.coderabbit.ai/configuration/auto-review
+  # These keys belong under `auto_review`. `auto_incremental_review` used to sit
+  # directly under `reviews`, where it is not part of the schema and therefore
+  # had no effect; it is documented only under `auto_review`.
+  auto_review:
+    # Automatically review new commits as they push (default: true)
+    auto_incremental_review: true
+
+    # Skip reviews for PRs authored by these accounts (exact match,
+    # case-sensitive, full username — no wildcards or regex). Skipping takes
+    # precedence over every other control, so a listed author is never
+    # auto-reviewed; comment `@coderabbitai review` on the PR to force one.
+    ignore_usernames:
+      - "AxDSan"
 
   # Show the AI prompt for AI agents — Mnemosyne is agent-first
   enable_prompt_for_ai_agents: true

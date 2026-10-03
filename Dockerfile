@@ -12,8 +12,15 @@
 # Run (SSE — for web clients):
 #   docker run -d --rm -p 8080:8080 \
 #     -v mnemosyne-data:/data \
-#     -e MNEMOSYNE_MCP_TOKEN=my-secret \
+#     --env MNEMOSYNE_MCP_TOKEN="${MNEMOSYNE_MCP_TOKEN:?set MNEMOSYNE_MCP_TOKEN}" \
 #     mnemosyne-mcp --transport sse --host 0.0.0.0 --port 8080
+#
+# Run (Streamable HTTP — native MCP http transport, single GET/POST/DELETE /mcp endpoint):
+#   docker run -d --rm -p 8080:8080 \
+#     -v mnemosyne-data:/data \
+#     --env MNEMOSYNE_MCP_TOKEN="${MNEMOSYNE_MCP_TOKEN:?set MNEMOSYNE_MCP_TOKEN}" \
+#     --env MNEMOSYNE_MCP_ALLOWED_HOSTS="${MNEMOSYNE_MCP_ALLOWED_HOSTS:?set MNEMOSYNE_MCP_ALLOWED_HOSTS}" \
+#     mnemosyne-mcp --transport streamable-http --host 0.0.0.0 --port 8080
 #
 # With custom data directory:
 #   docker run -i --rm \
@@ -25,7 +32,7 @@ FROM python:3.11-slim
 
 LABEL org.opencontainers.image.title="Mnemosyne MCP Server"
 LABEL org.opencontainers.image.description="Universal memory layer MCP server for any AI agent"
-LABEL org.opencontainers.image.source="https://github.com/AxDSan/mnemosyne"
+LABEL org.opencontainers.image.source="https://github.com/mnemosyne-oss/mnemosyne"
 LABEL org.opencontainers.image.licenses="MIT"
 
 # Install Mnemosyne with MCP + SSE extras

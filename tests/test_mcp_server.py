@@ -1618,7 +1618,8 @@ run_cli()
             main(["--transport", "sse", "--port", "19090", "--bank", "work"])
 
         run_mcp_server.assert_called_once_with(
-            transport="sse", port=19090, bank="work", host="127.0.0.1"
+            transport="sse", port=19090, bank="work", host="127.0.0.1",
+            path="/mcp", json_response=False,
         )
 
 
