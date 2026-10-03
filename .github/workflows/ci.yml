@@ -107,10 +107,18 @@ jobs:
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
-          # Fetch the base branch explicitly (shallow — we only need
-          # the diff walker) and resolve BASE_REF after the fetch so
-          # `origin/${PR_BASE_REF}` exists locally.
-          git fetch --depth=1 origin "${PR_BASE_REF}"
+          # Fetch the base branch explicitly (full history) and resolve
+          # BASE_REF after the fetch so `origin/${PR_BASE_REF}` exists
+          # locally.
+          #
+          # No `--depth=1`: a depth-limited fetch grafts the fetched tip
+          # as a shallow root, which severs the `BASE_REF...HEAD`
+          # merge-base walk whenever the base branch has advanced since
+          # the merge commit was synthesized (routine, because jobs on
+          # fork PRs can run hours after run creation). The checkout
+          # above is `fetch-depth: 0`, so the full history is already
+          # local and the depth limit buys nothing.
+          git fetch origin "${PR_BASE_REF}"
           BASE_REF="origin/${PR_BASE_REF}"
           # NUL-delimited so paths with spaces / newlines survive.
           # No `|| true` — if the diff walker itself breaks, the step
