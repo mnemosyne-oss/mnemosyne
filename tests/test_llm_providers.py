@@ -26,6 +26,16 @@ class TestPresetRegistry:
     def test_list_providers_includes_minimax(self):
         assert "minimax" in lp.list_providers()
 
+    def test_orcarouter_preset_exists(self):
+        preset = lp.get_provider_preset("orcarouter")
+        assert preset is not None
+        assert preset["name"] == "OrcaRouter"
+        assert preset["default_model"] == "orcarouter/auto"
+        assert preset["default_region"] == "global"
+
+    def test_list_providers_includes_orcarouter(self):
+        assert "orcarouter" in lp.list_providers()
+
 
 class TestRegionsAndEndpoints:
     def test_global_region_openai_and_anthropic_urls(self):
@@ -53,6 +63,18 @@ class TestRegionsAndEndpoints:
     def test_unknown_provider_urls_are_none(self):
         assert lp.get_base_url("nope", "global_en") is None
         assert lp.resolve_region("nope") is None
+
+    def test_orcarouter_global_urls(self):
+        assert lp.get_base_url("orcarouter", "global", api="openai") == "https://api.orcarouter.ai/v1"
+        assert lp.get_base_url("orcarouter", "global", api="anthropic") == "https://api.orcarouter.ai"
+
+    def test_orcarouter_empty_region_falls_back_to_default(self):
+        assert lp.resolve_region("orcarouter", "") == "global"
+        assert lp.get_base_url("orcarouter", "") == "https://api.orcarouter.ai/v1"
+
+    def test_orcarouter_unknown_region_falls_back_to_default(self):
+        assert lp.resolve_region("orcarouter", "mars") == "global"
+        assert lp.get_base_url("orcarouter", "mars") == "https://api.orcarouter.ai/v1"
 
 
 class TestModels:
@@ -89,6 +111,31 @@ class TestModels:
     def test_unknown_model_config_is_none(self):
         assert lp.get_model_config("minimax", "MiniMax-X9") is None
 
+    def test_orcarouter_model_ids(self):
+        assert lp.list_models("orcarouter") == ["orcarouter/auto", "openai/gpt-4o-mini"]
+
+    def test_orcarouter_auto_configuration(self):
+        cfg = lp.get_model_config("orcarouter", "orcarouter/auto")
+        assert cfg["context_window"] is None
+        assert cfg["pricing_usd_per_million_tokens"] == {
+            "input": None,
+            "output": None,
+            "cache_read": None,
+            "cache_write": None,
+        }
+        assert cfg["input_modalities"] == ["text"]
+
+    def test_orcarouter_gpt4o_mini_configuration(self):
+        cfg = lp.get_model_config("orcarouter", "openai/gpt-4o-mini")
+        assert cfg["context_window"] == 128_000
+        assert cfg["input_modalities"] == ["text"]
+
+    def test_orcarouter_default_model(self):
+        assert lp.default_model("orcarouter") == "orcarouter/auto"
+
+    def test_orcarouter_unknown_model_config_is_none(self):
+        assert lp.get_model_config("orcarouter", "does-not-exist") is None
+
 
 class TestResolveProviderDefaults:
     def test_defaults_for_known_provider(self):
@@ -103,6 +150,11 @@ class TestResolveProviderDefaults:
 
     def test_defaults_for_unknown_provider(self):
         assert lp.resolve_provider_defaults("nope") == (None, None)
+
+    def test_orcarouter_defaults_for_known_provider(self):
+        base_url, model = lp.resolve_provider_defaults("orcarouter")
+        assert base_url == "https://api.orcarouter.ai/v1"
+        assert model == "orcarouter/auto"
 
 
 class TestLocalLLMWiring:
@@ -158,3 +210,8 @@ class TestLocalLLMWiring:
         base_url, model = self._import_with_env({})
         assert base_url == ""
         assert model == ""
+
+    def test_orcarouter_provider_fills_base_url_and_model(self):
+        base_url, model = self._import_with_env({"MNEMOSYNE_LLM_PROVIDER": "orcarouter"})
+        assert base_url == "https://api.orcarouter.ai/v1"
+        assert model == "orcarouter/auto"

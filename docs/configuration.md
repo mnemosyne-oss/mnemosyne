@@ -339,8 +339,8 @@ Mnemosyne resolve the OpenAI-compatible base URL and a default model:
 
 | Variable | Default | Description |
 |---|---|---|
-| `MNEMOSYNE_LLM_PROVIDER` | *(none)* | Named provider preset. Currently: `minimax`. |
-| `MNEMOSYNE_LLM_REGION` | *(provider default)* | Region within the preset. For `minimax`: `global_en` (default) or `cn_zh`. |
+| `MNEMOSYNE_LLM_PROVIDER` | *(none)* | Named provider preset. Currently: `minimax`, `orcarouter`. |
+| `MNEMOSYNE_LLM_REGION` | *(provider default)* | Region within the preset. For `minimax`: `global_en` (default) or `cn_zh`. OrcaRouter has a single `global` region. |
 
 Explicit `MNEMOSYNE_LLM_BASE_URL` / `MNEMOSYNE_LLM_MODEL` always take precedence
 over a preset, so existing configurations are unchanged.
@@ -358,6 +358,24 @@ over a preset, so existing configurations are unchanged.
 | `MiniMax-M2.7` | 204,800 | 0.3 / 1.2 | text | always_on |
 
 Set `MNEMOSYNE_LLM_MODEL=MiniMax-M2.7` to select the non-default model.
+
+**OrcaRouter** (`MNEMOSYNE_LLM_PROVIDER=orcarouter`):
+
+| Region | OpenAI-compatible base URL | Anthropic-compatible base URL |
+|---|---|---|
+| `global` | `https://api.orcarouter.ai/v1` | `https://api.orcarouter.ai` |
+
+| Model | Context window | Input / output (USD / 1M tokens) | Input modalities | Thinking |
+|---|---|---|---|---|
+| `orcarouter/auto` (default) | varies by upstream | varies by upstream | text | disabled |
+| `openai/gpt-4o-mini` | 128,000 | varies by upstream | text | disabled |
+
+OrcaRouter is an OpenAI-compatible gateway exposing 150+ models from OpenAI,
+Anthropic, Google, DeepSeek, Qwen and others behind a single endpoint and API
+key. Set `MNEMOSYNE_LLM_API_KEY` to your OrcaRouter key (starts with
+`sk-orca-`). Model ids are namespaced (`openai/...`, `anthropic/...`); the
+default `orcarouter/auto` picks the best upstream per request, and you can pin
+a concrete model with `MNEMOSYNE_LLM_MODEL=openai/gpt-4o-mini`.
 
 ### Host LLM Adapter (Hermes / agent integration)
 

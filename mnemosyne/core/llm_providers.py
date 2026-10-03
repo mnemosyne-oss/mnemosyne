@@ -77,6 +77,48 @@ PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
             },
         },
     },
+    # OrcaRouter is an OpenAI-compatible gateway exposing 150+ models from
+    # OpenAI, Anthropic, Google, DeepSeek, Qwen and others behind a single
+    # endpoint and API key. Model ids are namespaced (openai/...,
+    # anthropic/..., orcarouter/auto). The virtual router ``orcarouter/auto``
+    # picks the best upstream per request, so context window and pricing vary
+    # by upstream and are left unknown rather than stated as fixed figures.
+    "orcarouter": {
+        "name": "OrcaRouter",
+        "default_region": "global",
+        "default_model": "orcarouter/auto",
+        "regions": {
+            "global": {
+                "openai_base_url": "https://api.orcarouter.ai/v1",
+                "anthropic_base_url": "https://api.orcarouter.ai",
+                "docs_root": "https://www.orcarouter.ai",
+            },
+        },
+        "models": {
+            "orcarouter/auto": {
+                "context_window": None,
+                "pricing_usd_per_million_tokens": {
+                    "input": None,
+                    "output": None,
+                    "cache_read": None,
+                    "cache_write": None,
+                },
+                "input_modalities": ["text"],
+                "thinking": ["disabled"],
+            },
+            "openai/gpt-4o-mini": {
+                "context_window": 128_000,
+                "pricing_usd_per_million_tokens": {
+                    "input": None,
+                    "output": None,
+                    "cache_read": None,
+                    "cache_write": None,
+                },
+                "input_modalities": ["text"],
+                "thinking": ["disabled"],
+            },
+        },
+    },
 }
 
 
