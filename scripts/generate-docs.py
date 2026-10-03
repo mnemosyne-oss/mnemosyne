@@ -442,6 +442,19 @@ def _scan_effective_defaults(env_map: dict, defaults: dict,
     for root in roots:
         root = os.path.join(REPO_ROOT, root)
         for path in glob.glob(os.path.join(root, "**", "*.py"), recursive=True):
+            # Build outputs are copies, not sources: `pip install -e` drops
+            # e.g. integrations/hermes/build/lib/... into the tree, and the
+            # test job installs before running the suite. Scanning those
+            # copies would duplicate every source they contain -- and a
+            # stale copy would report a phantom conflict. Same for
+            # distribution and bytecode caches.
+            segments = os.path.relpath(path, REPO_ROOT).split(os.sep)
+            if any(
+                seg in ("build", "dist", "__pycache__")
+                or seg.endswith(".egg-info")
+                for seg in segments
+            ):
+                continue
             try:
                 with open(path, encoding="utf-8") as f:
                     text = f.read()
@@ -454,12 +467,10 @@ def _scan_effective_defaults(env_map: dict, defaults: dict,
                 if key is None or key in RUNTIME_CONFIG_RESOLVED_KEYS:
                     continue
                 rel = os.path.relpath(path, REPO_ROOT)
-                entry = found.setdefault(key, {"by_value": {}, "sources": []})
+                entry = found.setdefault(key, {"by_value": {}})
                 entry["by_value"].setdefault(value, [])
                 if rel not in entry["by_value"][value]:
                     entry["by_value"][value].append(rel)
-                if rel not in entry["sources"]:
-                    entry["sources"].append(rel)
                 # Every distinct value keeps its own source list, so a
                 # cross-root conflict reports where each value was seen
                 # instead of cross-pairing every value with every source.
@@ -484,8 +495,17 @@ def _scan_effective_defaults(env_map: dict, defaults: dict,
     conflicts = {}
     for key, entry in found.items():
         values = [v for v in entry["by_value"] if v.strip() != ""]
-        first_value = next(iter(entry["by_value"]))
-        sources = sorted(entry["sources"])
+        # First *nonempty* fallback: an earlier root can legitimately read
+        # the env var with an empty default ("unset"), in which case the
+        # first real fallback comes from a later root. Using the raw
+        # insertion-first value would let an "" shadow it, and the empty
+        # check below would then drop a real divergence silently.
+        first_value = values[0] if values else next(iter(entry["by_value"]))
+        # Sources for the reported value only: files that read the env var
+        # with an empty fallback ("unset") did not set this value, so they
+        # are not listed here. Per-value lists stay on the entry for the
+        # conflict report below.
+        sources = sorted(entry["by_value"][first_value])
         if len(values) > 1:
             # Same key, different real fallbacks in different files:
             # report each value with the sources that set it. Empty
@@ -701,6 +721,8 @@ def _render_config(env_map, defaults, restart, version: str, effective=None,
             shown = f"`{effective[key][0]}` [^{key}] (declared {declared})"
         else:
             shown = declared
+        if key in conflicts:
+            shown = f"{shown} [^{key}-conflict]"
         lines.append("| `{}` | `{}` | {} | {} | {} |".format(
             key,
             env_map[key],
@@ -709,7 +731,7 @@ def _render_config(env_map, defaults, restart, version: str, effective=None,
             CONFIG_DESCRIPTIONS.get(key, ""),
         ))
 
-    if effective:
+    if effective or conflicts:
         lines += [
             "",
             f"### Keys whose effective default bypasses `config.py` ({len(effective)})",
@@ -724,24 +746,25 @@ def _render_config(env_map, defaults, restart, version: str, effective=None,
             "`DEFAULTS`, so it cannot fall out of date.",
             "",
         ]
-        for key in sorted(effective):
-            value, sources = effective[key]
-            prose = EFFECTIVE_DEFAULT_PROSE.get(key, "")
-            tail = f" {prose}" if prose else ""
-            src_list = ", ".join(f"`{s}`" for s in sources)
-            lines.append(
-                f"[^{key}]: `{key}` -- effective default `{value}`, set in "
-                f"{src_list}, not the `{_fmt_default(defaults.get(key))}` declared in "
-                f"`config.py`.{tail}"
-            )
+        for key in sorted(set(effective) | set(conflicts)):
+            if key in effective:
+                value, sources = effective[key]
+                prose = EFFECTIVE_DEFAULT_PROSE.get(key, "")
+                tail = f" {prose}" if prose else ""
+                src_list = ", ".join(f"`{s}`" for s in sources)
+                lines.append(
+                    f"[^{key}]: `{key}` -- effective default `{value}`, set in "
+                    f"{src_list}, not the `{_fmt_default(defaults.get(key))}` declared in "
+                    f"`config.py`.{tail}"
+                )
             if key in conflicts:
                 each = "; ".join(
                     f"`{v}` in `{s}`" for v, s in sorted(set(conflicts[key]))
                 )
                 lines.append(
                     f"[^{key}-conflict]: `{key}` -- provider roots disagree on the "
-                    f"effective default ({each}). The table shows the first root's "
-                    f"value; the disagreement needs a decision, not silent first-wins."
+                    f"effective default ({each}). The disagreement needs a decision, "
+                    f"not silent first-wins."
                 )
 
     lines += [

@@ -9,6 +9,8 @@ real defaults change.
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parent.parent
 
 
@@ -159,3 +161,134 @@ def test_conflict_footnote_renders(tmp_path, monkeypatch):
                              effective, conflicts)
     assert "[^demo_limit-conflict]" in out
     assert "`10`" in out and "`99`" in out
+    defn = next(
+        l for l in out.splitlines() if l.startswith("[^demo_limit-conflict]:")
+    ).replace("\\", "/")
+    assert "`10` in `pkg_a/mod.py`" in defn
+    assert "`99` in `pkg_b/mod.py`" in defn
+    row = next(l for l in out.splitlines() if l.startswith("| `demo_limit`"))
+    assert "[^demo_limit]" in row and "[^demo_limit-conflict]" in row
+
+
+def test_empty_first_root_does_not_shadow_later_fallback(tmp_path, monkeypatch):
+    """An empty fallback in an earlier root must not hide a later real one."""
+    _write(
+        tmp_path, "pkg_a/mod.py",
+        'import os\nLIMIT = os.environ.get("MNEMOSYNE_DEMO_LIMIT", "")\n',
+    )
+    _write(
+        tmp_path, "pkg_b/mod.py",
+        'import os\nLIMIT = int(os.environ.get("MNEMOSYNE_DEMO_LIMIT", "99"))\n',
+    )
+    gen = _load_gen(tmp_path, monkeypatch)
+    env_map = {"demo_limit": "MNEMOSYNE_DEMO_LIMIT"}
+    effective, conflicts = gen._scan_effective_defaults(
+        env_map, {"demo_limit": 5}, roots=("pkg_a", "pkg_b")
+    )
+    assert effective["demo_limit"][0] == "99"
+    assert conflicts == {}
+
+
+def test_conflict_without_divergence_renders(tmp_path, monkeypatch):
+    """A conflict where the first root matches declared still surfaces."""
+    _write(
+        tmp_path, "pkg_a/mod.py",
+        'import os\nLIMIT = int(os.environ.get("MNEMOSYNE_DEMO_LIMIT", "5"))\n',
+    )
+    _write(
+        tmp_path, "pkg_b/mod.py",
+        'import os\nLIMIT = int(os.environ.get("MNEMOSYNE_DEMO_LIMIT", "99"))\n',
+    )
+    gen = _load_gen(tmp_path, monkeypatch)
+    env_map = {"demo_limit": "MNEMOSYNE_DEMO_LIMIT"}
+    effective, conflicts = gen._scan_effective_defaults(
+        env_map, {"demo_limit": 5}, roots=("pkg_a", "pkg_b")
+    )
+    assert "demo_limit" not in effective
+    assert "demo_limit" in conflicts
+    out = gen._render_config(env_map, {"demo_limit": 5}, set(), "0.0.0",
+                             effective, conflicts)
+    assert "[^demo_limit-conflict]" in out
+    row = next(l for l in out.splitlines() if l.startswith("| `demo_limit`"))
+    assert "[^demo_limit-conflict]" in row
+
+
+def test_build_output_copies_are_not_scanned(tmp_path, monkeypatch):
+    """pip install drops build/ copies into the tree; they are not sources.
+
+    The CI test job installs before running the suite, so a stale or
+    duplicate copy under build/ (or dist/, egg-info, __pycache__) must
+    neither duplicate sources nor report phantom conflicts.
+    """
+    _write(
+        tmp_path, "pkg/mod.py",
+        'import os\nLIMIT = int(os.environ.get("MNEMOSYNE_DEMO_LIMIT", "10"))\n',
+    )
+    _write(
+        tmp_path, "pkg/build/lib/mod.py",
+        'import os\nLIMIT = int(os.environ.get("MNEMOSYNE_DEMO_LIMIT", "99"))\n',
+    )
+    gen = _load_gen(tmp_path, monkeypatch)
+    env_map = {"demo_limit": "MNEMOSYNE_DEMO_LIMIT"}
+    effective, conflicts = gen._scan_effective_defaults(
+        env_map, {"demo_limit": 5}, roots=("pkg",)
+    )
+    assert effective["demo_limit"][0] == "10"
+    assert [s.replace("\\", "/") for s in effective["demo_limit"][1]] == [
+        "pkg/mod.py"
+    ]
+    assert conflicts == {}
+
+
+def test_similarly_named_dirs_are_still_scanned(tmp_path, monkeypatch):
+    """Negative control: exclusion matches whole segments, not substrings.
+
+    A directory merely containing an excluded name (rebuild vs build)
+    must still be scanned.
+    """
+    _write(
+        tmp_path, "pkg/mod.py",
+        'import os\nLIMIT = int(os.environ.get("MNEMOSYNE_DEMO_LIMIT", "10"))\n',
+    )
+    _write(
+        tmp_path, "pkg/rebuild/mod.py",
+        'import os\nLIMIT = int(os.environ.get("MNEMOSYNE_DEMO_LIMIT", "99"))\n',
+    )
+    gen = _load_gen(tmp_path, monkeypatch)
+    env_map = {"demo_limit": "MNEMOSYNE_DEMO_LIMIT"}
+    effective, conflicts = gen._scan_effective_defaults(
+        env_map, {"demo_limit": 5}, roots=("pkg",)
+    )
+    assert effective["demo_limit"][0] == "10"
+    assert "demo_limit" in conflicts
+    assert sorted(v for v, _ in conflicts["demo_limit"]) == ["10", "99"]
+
+@pytest.mark.parametrize(
+    "copy_rel",
+    [
+        "pkg/build/lib/mod.py",
+        "pkg/dist/mod.py",
+        "pkg/__pycache__/mod.py",
+        "pkg/demo.egg-info/mod.py",
+    ],
+)
+def test_generated_copy_dirs_are_not_scanned(tmp_path, monkeypatch, copy_rel):
+    """Every excluded copy dir behaves like build/: invisible to the scan."""
+    _write(
+        tmp_path, "pkg/mod.py",
+        'import os\nLIMIT = int(os.environ.get("MNEMOSYNE_DEMO_LIMIT", "10"))\n',
+    )
+    _write(
+        tmp_path, copy_rel,
+        'import os\nLIMIT = int(os.environ.get("MNEMOSYNE_DEMO_LIMIT", "99"))\n',
+    )
+    gen = _load_gen(tmp_path, monkeypatch)
+    env_map = {"demo_limit": "MNEMOSYNE_DEMO_LIMIT"}
+    effective, conflicts = gen._scan_effective_defaults(
+        env_map, {"demo_limit": 5}, roots=("pkg",)
+    )
+    assert effective["demo_limit"][0] == "10"
+    assert [s.replace("\\", "/") for s in effective["demo_limit"][1]] == [
+        "pkg/mod.py"
+    ]
+    assert conflicts == {}
