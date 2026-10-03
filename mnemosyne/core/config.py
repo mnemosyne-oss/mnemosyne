@@ -55,6 +55,11 @@ REQUIRES_RESTART: Set[str] = {
     "sync_host",
     "sync_port",
     "sync_remote",
+    # Read once at client construction, same reason embedding_model is here.
+    "modality_base_url",
+    "modality_vision_model",
+    "modality_video_model",
+    "modality_audio_model",
 }
 
 # Mapping from config key (snake_case, no MNEMOSYNE_ prefix) to env var name.
@@ -130,6 +135,20 @@ ENV_VAR_MAP: Dict[str, str] = {
     "host_llm_provider": "MNEMOSYNE_HOST_LLM_PROVIDER",
     "host_llm_model": "MNEMOSYNE_HOST_LLM_MODEL",
     "host_llm_n_ctx": "MNEMOSYNE_HOST_LLM_N_CTX",
+    # Modality providers (RFC 0002). Vendor-neutral by design: these name the
+    # OpenAI-compatible protocol, not any provider, so switching endpoints is
+    # an environment change and never a code change.
+    "modality_enabled": "MNEMOSYNE_MODALITY_ENABLED",
+    "modality_base_url": "MNEMOSYNE_MODALITY_BASE_URL",
+    "modality_api_key": "MNEMOSYNE_MODALITY_API_KEY",
+    "modality_vision_model": "MNEMOSYNE_MODALITY_VISION_MODEL",
+    "modality_video_model": "MNEMOSYNE_MODALITY_VIDEO_MODEL",
+    "modality_audio_model": "MNEMOSYNE_MODALITY_AUDIO_MODEL",
+    "modality_timeout": "MNEMOSYNE_MODALITY_TIMEOUT",
+    "modality_max_moments": "MNEMOSYNE_MODALITY_MAX_MOMENTS",
+    # mnemosyne_remember_media tool guards (SDK callers are not restricted).
+    "media_allowed_paths": "MNEMOSYNE_MEDIA_ALLOWED_PATHS",
+    "media_allow_private_urls": "MNEMOSYNE_MEDIA_ALLOW_PRIVATE_URLS",
     # Conflict detection
     "llm_conflict_detection": "MNEMOSYNE_LLM_CONFLICT_DETECTION",
     "conflict_llm_base_url": "MNEMOSYNE_CONFLICT_LLM_BASE_URL",
@@ -260,6 +279,22 @@ DEFAULTS: Dict[str, Any] = {
     "host_llm_provider": "",
     "host_llm_model": "",
     "host_llm_n_ctx": 2048,
+    # Modality providers (RFC 0002). `modality_enabled` defaults to False:
+    # Mnemosyne makes no outbound call to describe media until the operator has
+    # said yes, once, explicitly. The default's Python type drives env coercion,
+    # so the two ints below must stay ints.
+    "modality_enabled": False,
+    "modality_base_url": "",
+    "modality_api_key": "",
+    "modality_vision_model": "",
+    "modality_video_model": "",
+    "modality_audio_model": "",
+    "modality_timeout": 60,
+    "modality_max_moments": 12,
+    # Tool calls may read local media only from these directories (os.pathsep
+    # or comma separated). Empty means tool calls cannot name local files.
+    "media_allowed_paths": "",
+    "media_allow_private_urls": False,
     # Conflict detection
     "llm_conflict_detection": False,
     "conflict_llm_base_url": "",

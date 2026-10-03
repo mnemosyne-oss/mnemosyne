@@ -276,11 +276,14 @@ class _FakeEngine:
         self.last_top_k = None
 
     def recall(self, *, query, query_embedding, top_k,
-               default_dense_source_filter=True, source=None, topic=None):
+               default_dense_source_filter=True, source=None, topic=None,
+               episodic_where=None, episodic_params=()):
         self.last_top_k = top_k
         self.last_dense_filter = default_dense_source_filter
         self.last_source = source
         self.last_topic = topic
+        self.last_episodic_where = episodic_where
+        self.last_episodic_params = episodic_params
         return self._results
 
 
@@ -500,6 +503,9 @@ class TestReviewHardening:
         )
         assert engine.last_source == "conversation"
         assert engine.last_topic is None
+        assert engine.last_episodic_where is not None
+        assert "source = ?" in engine.last_episodic_where
+        assert "conversation" in engine.last_episodic_params
 
         engine.last_dense_filter = None
         engine.last_source = None
@@ -510,6 +516,9 @@ class TestReviewHardening:
         )
         assert engine.last_source is None
         assert engine.last_topic == "conversation"
+        assert engine.last_episodic_where is not None
+        assert "source = ?" in engine.last_episodic_where
+        assert "conversation" in engine.last_episodic_params
 
     def test_ep_ep_overlap_not_collapsed_documented_behavior(self, temp_db):
         """Pin behavior: two episodic summaries covering the same wm

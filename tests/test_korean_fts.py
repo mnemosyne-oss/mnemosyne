@@ -1,0 +1,1083 @@
+# 한국어 조사·2음절 토큰 회귀를 고정하는 FTS 검증 테스트
+"""Korean recall regression suite for the FTS5 query layer.
+
+Frozen benchmark: 60 memories (50 in-domain + 10 unrelated distractors) and
+49 queries tagged ``exact`` / ``josa`` / ``paraphrase``. The ``josa`` bucket
+is the largest because Korean particles are what the query layer used to
+break on.
+
+Vector search is deliberately excluded -- these tests call ``_fts_search``
+directly so a regression in the lexical layer cannot be masked by embeddings.
+
+Baseline before the Korean query fix, for reference:
+
+    variant                       R@1     R@5     MRR    josa   fallback
+    unpatched                    63.3%   71.4%   0.667   12/19   23/49
+    josa prefix only             63.3%   87.8%   0.740   17/19    9/49
+    two-syllable relaxation only 65.3%   77.6%   0.708   14/19   12/49
+    both (this patch)            87.8%  100.0%   0.933   19/19    0/49
+
+The two fixes are not additive -- either one alone leaves the other hole
+open, which is why they ship together.
+
+Every figure above is candidate generation. The public path is measured
+separately at the bottom of this file and lands lower (35/49 episodic,
+38/49 working), because ``BeamMemory.recall()`` applies a lexical
+admission gate on top. Quoting the candidate number as the recall number
+is the mistake this suite exists to prevent.
+"""
+import sqlite3
+
+import pytest
+
+from mnemosyne.core import beam
+from mnemosyne.core.beam import BeamMemory
+
+MEMORIES = [
+    ('m01', 'llama-server 8080 포트는 -c 131072 -np 1 설정으로 고정해서 서빙한다'),
+    ('m02', '8082 포트는 hermes-honcho 별칭으로 Q4_K_XL 양자화 모델을 올린다'),
+    ('m03', '8083 포트는 Qwen3-Embedding-0.6B 임베딩 전용 서버다'),
+    ('m04', 'prompt cache 크기는 --cache-ram 플래그로 조절하며 기본값은 8192 MiB다'),
+    ('m05', 'cram을 24576으로 올렸더니 캐시 축출이 33건에서 2건으로 줄었다'),
+    ('m06', '컨텍스트 체크포인트는 최대 32개까지 저장되고 최소 간격은 256 토큰이다'),
+    ('m07', 'M5 Max의 통합 메모리는 VRAM 110100 MiB와 CPU RAM 131072 MiB를 공유한다'),
+    ('m08', 'ModelForge는 Electron 앱이고 llama-server 프로세스를 감시하며 재기동시킨다'),
+    ('m09', 'ModelForge 실행 프로파일은 홈 디렉터리의 .modelforge.json에 저장된다'),
+    ('m10', 'ModelForge 로그는 lifecycle.log에 ADOPT와 EXIT 이벤트를 남긴다'),
+    ('m11', 'honcho는 Plastic Labs가 만든 에이전트 메모리 인프라 레이어다'),
+    ('m12', 'honcho의 dialectic은 툴 루프를 돌기 때문에 LLM 호출이 여러 번 발생한다'),
+    ('m13', 'dialectic 질의가 22건 모두 120초 타임아웃으로 실패했다'),
+    ('m14', 'honcho의 전문검색이 영어 설정으로 하드코딩되어 한국어 조사를 못 자른다'),
+    ('m15', 'honcho 결론 787건을 오염 때문에 전량 폐기했다'),
+    ('m16', 'honcho 제거는 config.yaml의 provider 값을 비우는 것으로 시작한다'),
+    ('m17', 'honcho 컨테이너는 api, deriver, database, redis 네 개로 구성된다'),
+    ('m18', 'docker compose stop을 쓰면 볼륨이 남아서 롤백이 가능하다'),
+    ('m19', 'hermes 게이트웨이는 기동 시점에만 설정 파일을 읽는다'),
+    ('m20', 'compression과 skills_hub를 포함한 여섯 개 역할이 8082에 물려 있다'),
+    ('m21', '압축 작업이 2분에서 17분까지 걸리며 원인이 아직 규명되지 않았다'),
+    ('m22', '텔레그램 폴링 재연결 실패가 이틀간 44건 발생했다'),
+    ('m23', 'state.db 파일 크기가 385 메가바이트까지 커졌다'),
+    ('m24', '세션 자동 정리를 켜면 2만 건 넘는 행이 삭제되므로 백업이 먼저다'),
+    ('m25', '에이전트 페르소나 이름은 유나로 설정되어 있다'),
+    ('m26', '옵시디언 볼트는 SecB 이름으로 관리한다'),
+    ('m27', '볼트의 AI 도구 스택 폴더에 메모리 프레임워크 비교 노트가 있다'),
+    ('m28', 'Mem0는 사용자 정보와 선호도를 저장하는 데 쓴다'),
+    ('m29', 'Letta는 중요한 사실만 모든 프롬프트에 노출시킨다'),
+    ('m30', 'Graphiti는 시간에 따라 변하는 관계를 표현한다'),
+    ('m31', '그래프 메모리는 일반 프로젝트에는 과도하다는 결론이 났다'),
+    ('m32', '가장 큰 문제는 잘못 저장된 사실이 고쳐지지 않는 것이다'),
+    ('m33', 'Hindsight는 LongMemEval에서 91.4퍼센트 정확도를 기록했다'),
+    ('m34', 'Hindsight는 20B 오픈 모델로도 83.6퍼센트를 냈다'),
+    ('m35', 'Hindsight는 텍스트 검색 백엔드를 다섯 가지 중에 고를 수 있다'),
+    ('m36', 'pgroonga 백엔드는 한중일 문자를 기본으로 지원한다'),
+    ('m37', 'Mnemosyne는 SQLite 하나만 쓰고 외부 서비스가 필요 없다'),
+    ('m38', 'Mnemosyne는 384차원 임베딩을 48바이트로 이진 압축한다'),
+    ('m39', 'InPhase 프로젝트 백업은 매일 새벽 세 시에 돌아간다'),
+    ('m40', '백업 파일은 구글 드라이브에 30일간 보관된다'),
+    ('m41', '구글 워크스페이스 인증 토큰은 7일마다 만료된다'),
+    ('m42', '슈파베이스 프로젝트 소유 계정은 별도 계정으로 분리되어 있다'),
+    ('m43', '커밋은 하나의 논리적 변경이 끝났을 때 바로 남긴다'),
+    ('m44', '새 소스 파일 첫 줄에는 역할을 설명하는 한국어 주석을 넣는다'),
+    ('m45', '테스트를 돌리기 전에는 작업이 끝났다고 말하지 않는다'),
+    ('m46', '에러는 추측하지 말고 실제 로그 줄을 읽고 판단한다'),
+    ('m47', '소스를 고칠 때는 위치와 소스를 먼저 제시하고 승인을 기다린다'),
+    ('m48', '삭제 작업은 항목마다 개별 승인을 받는다'),
+    ('m49', '체크리스트와 컨텍스트 노트를 먼저 만들고 코딩을 시작한다'),
+    ('m50', '간단한 작업에는 판단을 써서 절차를 생략해도 된다'),
+    ('m51', '겨울 등산은 해가 짧아서 하산 시각을 먼저 정해두는 게 안전하다'),
+    ('m52', '김치찌개에는 묵은지를 쓰면 신맛이 깊어진다'),
+    ('m53', '전세 계약 갱신 청구권은 한 번만 행사할 수 있다'),
+    ('m54', '러닝화는 발볼이 넓으면 한 치수 크게 신는 편이 낫다'),
+    ('m55', '커피 원두는 개봉 후 2주 안에 소진하는 것이 향이 좋다'),
+    ('m56', '장마철에는 제습기를 옷장 근처에 두는 게 효과가 크다'),
+    ('m57', '고양이는 사료를 갑자기 바꾸면 설사를 할 수 있다'),
+    ('m58', '자전거 체인은 비 맞은 뒤에 반드시 기름칠을 해야 한다'),
+    ('m59', '여권 갱신은 만료 6개월 전부터 신청할 수 있다'),
+    ('m60', '실내 습도는 40에서 60 퍼센트 사이가 적정하다'),
+]
+
+QUERIES = [
+    ('8080 포트 서빙 설정이 뭐였지', 'm01', 'exact'),
+    ('8080은 컨텍스트를 얼마로 잡았나', 'm01', 'paraphrase'),
+    ('8082에 올린 모델 양자화가 뭐야', 'm02', 'exact'),
+    ('임베딩 서버는 몇 번 포트야', 'm03', 'exact'),
+    ('프롬프트 캐시 기본 크기', 'm04', 'exact'),
+    ('cache-ram 기본값이 얼마지', 'm04', 'josa'),
+    ('cram을 올린 뒤 축출이 어떻게 됐나', 'm05', 'josa'),
+    ('캐시 축출 건수 변화', 'm05', 'paraphrase'),
+    ('체크포인트는 몇 개까지 저장되나', 'm06', 'exact'),
+    ('통합 메모리 용량이 얼마나 되지', 'm07', 'paraphrase'),
+    ('ModelForge가 하는 일이 뭐야', 'm08', 'josa'),
+    ('실행 프로파일은 어디에 저장돼', 'm09', 'exact'),
+    ('lifecycle 로그에 뭐가 남나', 'm10', 'josa'),
+    ('honcho는 누가 만들었어', 'm11', 'exact'),
+    ('dialectic이 왜 느린가', 'm12', 'josa'),
+    ('dialectic 타임아웃 몇 건이었지', 'm13', 'paraphrase'),
+    ('honcho가 한국어 검색을 못 하는 이유', 'm14', 'josa'),
+    ('결론 몇 건을 버렸더라', 'm15', 'paraphrase'),
+    ('honcho를 떼려면 뭐부터 고쳐', 'm16', 'josa'),
+    ('혼초 컨테이너 구성이 어떻게 되지', 'm17', 'paraphrase'),
+    ('볼륨을 남기면서 컨테이너 내리는 법', 'm18', 'paraphrase'),
+    ('설정 파일은 언제 읽히나', 'm19', 'josa'),
+    ('8082에 물려 있는 역할이 몇 개야', 'm20', 'josa'),
+    ('압축이 오래 걸리는 문제', 'm21', 'josa'),
+    ('텔레그램 재연결 실패 건수', 'm22', 'exact'),
+    ('state.db 용량이 얼마나 커졌지', 'm23', 'josa'),
+    ('세션 정리 전에 뭘 해야 해', 'm24', 'paraphrase'),
+    ('에이전트 이름이 뭐지', 'm25', 'paraphrase'),
+    ('옵시디언 볼트 이름', 'm26', 'exact'),
+    ('메모리 프레임워크 비교 노트 위치', 'm27', 'exact'),
+    ('Letta는 어떤 방식이야', 'm29', 'josa'),
+    ('시간에 따른 관계 변화를 다루는 건', 'm30', 'paraphrase'),
+    ('그래프 메모리에 대한 결론', 'm31', 'josa'),
+    ('메모리 시스템의 최대 문제가 뭐였지', 'm32', 'paraphrase'),
+    ('Hindsight 벤치마크 점수', 'm33', 'paraphrase'),
+    ('오픈 모델로 낸 정확도', 'm34', 'josa'),
+    ('한중일 문자를 지원하는 백엔드', 'm36', 'exact'),
+    ('Mnemosyne는 외부 의존성이 있나', 'm37', 'paraphrase'),
+    ('임베딩을 몇 바이트로 줄이지', 'm38', 'josa'),
+    ('백업은 몇 시에 도는가', 'm39', 'paraphrase'),
+    ('백업 보관 기간이 며칠이야', 'm40', 'josa'),
+    ('인증 토큰 만료 주기', 'm41', 'exact'),
+    ('새 파일 첫 줄에 뭘 쓰지', 'm44', 'paraphrase'),
+    ('완료라고 말하기 전에 할 일', 'm45', 'paraphrase'),
+    ('에러가 났을 때 원칙', 'm46', 'josa'),
+    ('소스 수정할 때 절차가 뭐야', 'm47', 'josa'),
+    ('고양이 사료 바꿀 때 주의점', 'm57', 'paraphrase'),
+    ('실내 적정 습도', 'm60', 'exact'),
+    ('여권은 언제부터 갱신 가능해', 'm59', 'josa'),
+]
+
+
+@pytest.fixture
+def corpus(tmp_path):
+    """A throwaway BEAM database holding the 60 benchmark memories.
+
+    Function-scoped on purpose: conftest's autouse
+    ``_reset_thread_local_connections`` closes every cached connection around
+    each test, so a module-scoped connection would already be dead by the
+    second test. 60 rows is cheap to rebuild.
+
+    Returns the open connection and a ``{memory id: rowid}`` map so tests can
+    check where a known document landed in the ranking.
+    """
+    db = tmp_path / "ko.db"
+    beam.init_beam(db)
+    conn = beam._get_connection(db)
+    rowid_of = {}
+    for mid, content in MEMORIES:
+        rowid_of[mid] = conn.execute(
+            "INSERT INTO episodic_memory"
+            " (id, content, source, session_id, importance)"
+            " VALUES (?, ?, 'test', 'default', 0.5)",
+            (mid, content),
+        ).lastrowid
+    conn.commit()
+    return conn, rowid_of
+
+
+def _ranks(conn, rowid_of, k=5):
+    """Run every benchmark query and report where its gold document landed.
+
+    Returns ``(kind, rank)`` per query, rank being 1-based within the top ``k``
+    and 0 when the gold document is absent. Calls ``_fts_search`` directly so a
+    lexical regression cannot be masked by the vector layer.
+    """
+    out = []
+    for query, gold, kind in QUERIES:
+        got = [r["rowid"] for r in beam._fts_search(conn, query, k=k)]
+        target = rowid_of[gold]
+        out.append((kind, got.index(target) + 1 if target in got else 0))
+    return out
+
+
+def test_hangul_query_terms_use_stem_prefix():
+    """조사 is stripped and the stem becomes a quoted prefix term."""
+    assert beam._fts_query_terms("여권은 언제 갱신하지") == ['"여권"*', '"언제"*', '"갱신하지"*']
+
+
+def test_single_syllable_particles_can_over_trim():
+    """Known limitation: 나/야/여 are particles but also verb endings.
+
+    `_strip_ko_josa` is suffix trimming, not morphology, so "갱신하나" is
+    trimmed to "갱신하". Because the result is used as a prefix term the
+    over-trimmed form still matches the intended documents, and the 49-query
+    benchmark shows no recall loss from this. Frozen here so the behaviour is
+    a documented decision rather than an accident.
+    """
+    assert beam._strip_ko_josa("갱신하나") == "갱신하"
+    assert beam._fts_query_terms("여권은 언제 갱신하나") == ['"여권"*', '"언제"*', '"갱신하"*']
+
+
+def test_two_syllable_hangul_tokens_survive():
+    """Two-syllable Korean words are whole words and must not be filtered."""
+    assert "캐시" in beam._recall_tokens("프롬프트 캐시 기본 크기")
+    assert beam._fts_query_terms("백업 주기") == ['"백업"*', '"주기"*']
+
+
+def test_structured_hangul_tokens_are_quoted_before_wildcard(corpus):
+    """A bare ``stem*`` breaks FTS5 when the stem carries punctuation.
+
+    ``/`` raises ``syntax error near "/"``, while ``:`` and ``-`` are read as
+    column filters (``no such column: ...``). ``_fts_search`` has no exception
+    guard, so an unquoted prefix term aborts the entire search before the LIKE
+    fallback can run. Quoting turns all three into ordinary prefix terms.
+    """
+    conn, rowid_of = corpus
+    # Only the structured token itself is asserted. Which *additional*
+    # components a query expands into is the hyphen-splitter's business and
+    # changes as the tokenizer evolves; pinning the whole list here would
+    # make this test fail for reasons unrelated to quoting.
+    #
+    # `bare` is what the term would look like without the quoting fix, and
+    # `gold` is the document the query is actually asking about. Asserting
+    # the term shape and MATCH parseability alone would still pass if the
+    # search returned nothing at all, so each case also has to show that the
+    # intended document comes back (upstream review of #896).
+    cases = [
+        ("한국어/영어 설정", '"한국어/영어"*', "한국어/영어*", "m14"),
+        ("캐시-크기 확인", '"캐시-크기"*', "캐시-크기*", "m04"),
+        ("8080:포트", '"8080:포트"*', "8080:포트*", "m01"),
+    ]
+    for query, structured, bare, gold in cases:
+        terms = beam._fts_query_terms(query)
+        assert structured in terms
+
+        # The failure being fixed. Without quotes FTS5 reads `/` as syntax and
+        # `-`/`:` as column filters, and the raise takes down the whole MATCH.
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute(
+                "SELECT rowid FROM fts_episodes WHERE fts_episodes MATCH ?",
+                (bare,),
+            ).fetchall()
+
+        conn.execute(
+            "SELECT rowid FROM fts_episodes WHERE fts_episodes MATCH ?",
+            (" OR ".join(terms),),
+        ).fetchall()
+
+        got = [row["rowid"] for row in beam._fts_search(conn, query, k=5)]
+        assert rowid_of[gold] in got, f"{query!r} lost {gold}: {got}"
+
+    # `8080:포트` expands to the structured token and nothing else, so its
+    # ranking is attributable to that one term rather than to the components
+    # a splitter happened to add. The other two cases only assert retrieval:
+    # their gold documents share a common word (`설정`, `캐시`) with unrelated
+    # rows, and pinning a rank here would freeze the scorer's tie handling
+    # instead of the quoting behaviour this test is about.
+    assert beam._fts_query_terms("8080:포트") == ['"8080:포트"*']
+    top = [row["rowid"] for row in beam._fts_search(conn, "8080:포트", k=5)]
+    assert top[:1] == [rowid_of["m01"]], f"'8080:포트' -> {top}"
+
+
+def test_non_hangul_queries_are_unchanged():
+    """Every other language keeps the previous quoted-phrase behaviour."""
+    assert beam._fts_query_terms("vault backup policy") == [
+        '"vault"', '"backup"', '"policy"'
+    ]
+
+
+def test_strip_ko_josa_is_suffix_trimming_only():
+    """Particles come off the end; everything else is returned untouched."""
+    assert beam._strip_ko_josa("갱신은") == "갱신"
+    assert beam._strip_ko_josa("회사에서") == "회사"
+    assert beam._strip_ko_josa("백업") == "백업"      # nothing to strip
+    assert beam._strip_ko_josa("나가") == "나가"      # too short to trim
+
+
+def test_korean_recall_at_5(corpus):
+    """Frozen at the exact benchmark result, not a tolerance band.
+
+    49/49 is the number this PR claims. A band would let the claim rot
+    silently, so any movement -- up or down -- is meant to fail and be
+    looked at.
+    """
+    conn, rowid_of = corpus
+    ranks = _ranks(conn, rowid_of)
+    hit = sum(1 for _, r in ranks if r)
+    assert hit == 49, f"R@5 moved to {hit}/{len(ranks)}, benchmark says 49/49"
+
+
+def test_korean_recall_at_1(corpus):
+    """Frozen at the exact benchmark result. See `test_korean_recall_at_5`."""
+    conn, rowid_of = corpus
+    ranks = _ranks(conn, rowid_of)
+    top1 = sum(1 for _, r in ranks if r == 1)
+    assert top1 == 43, f"R@1 moved to {top1}/{len(ranks)}, benchmark says 43/49"
+
+
+def test_particle_inflected_queries_all_recall(corpus):
+    """The bucket the old query layer failed on must be perfect."""
+    conn, rowid_of = corpus
+    josa = [r for kind, r in _ranks(conn, rowid_of) if kind == "josa"]
+    assert all(josa), f"josa recall regressed to {sum(1 for r in josa if r)}/{len(josa)}"
+
+
+def test_like_fallback_is_rarely_needed(corpus):
+    """FTS now answers every benchmark query; LIKE is a safety net, not a path.
+
+    Held at the benchmark's 0/49 rather than a loose cap. The fallback is the
+    path this PR routes around, so a single query falling into it means the
+    query layer regressed even if recall happens to hold.
+    """
+    conn, rowid_of = corpus
+    calls = {"n": 0}
+    original = beam._cjk_like_search
+
+    def counting(*args, **kwargs):
+        """Count each fallback entry, then delegate to the real search."""
+        calls["n"] += 1
+        return original(*args, **kwargs)
+
+    beam._cjk_like_search = counting
+    try:
+        _ranks(conn, rowid_of)
+    finally:
+        beam._cjk_like_search = original
+    assert calls["n"] == 0, f"LIKE fallback used {calls['n']}/{len(QUERIES)} times"
+
+
+def test_search_path_makes_no_network_calls(corpus, monkeypatch):
+    """Structural proof that lexical recall never reaches an LLM."""
+    import socket
+
+    def blocked(*args, **kwargs):
+        """Stand in for ``socket.socket`` and fail if anything opens one."""
+        raise AssertionError("search path opened a socket")
+
+    monkeypatch.setattr(socket, "socket", blocked)
+    conn, rowid_of = corpus
+    ranks = _ranks(conn, rowid_of)
+    assert sum(1 for _, r in ranks if r) > 0
+
+
+# ---------------------------------------------------------------------------
+# Public recall path
+#
+# Everything above measures `_fts_search()`, which is candidate generation
+# only. `BeamMemory.recall()` then applies a lexical admission gate, and a
+# candidate scoring below it is dropped even when it ranked first. The two
+# numbers are therefore different measurements, not the same one taken twice,
+# and the suite states both rather than letting the candidate figure stand in
+# for what a caller actually receives.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def episodic_memory(tmp_path):
+    """A ``BeamMemory`` whose episodic layer holds the 60 benchmark memories.
+
+    Rows are inserted directly, matching the ``corpus`` fixture, so the
+    documents are byte-identical across the candidate and public measurements
+    and any divergence is attributable to the admission gate alone.
+    """
+    db = tmp_path / "public.db"
+    memory = BeamMemory(session_id="default", db_path=db)
+    conn = beam._get_connection(db)
+    for mid, content in MEMORIES:
+        conn.execute(
+            "INSERT INTO episodic_memory"
+            " (id, content, source, session_id, importance)"
+            " VALUES (?, ?, 'test', 'default', 0.5)",
+            (mid, content),
+        )
+    conn.commit()
+    return memory
+
+
+@pytest.fixture
+def working_memory(tmp_path):
+    """A ``BeamMemory`` holding the same 60 memories in the working layer.
+
+    Written through the public ``remember()`` so the working-memory recall
+    branch is exercised end to end. Working rows carry generated ids, so
+    callers match on content.
+    """
+    memory = BeamMemory(session_id="default", db_path=tmp_path / "working.db")
+    for _, content in MEMORIES:
+        memory.remember(content, source="test")
+    return memory
+
+
+def _public_ranks(memory, key, k=5):
+    """Where each benchmark query's gold document lands in ``recall()``.
+
+    ``key`` maps a result row to the value compared against the gold id, which
+    differs by layer: episodic rows keep the benchmark id, working rows get a
+    generated one and are matched on content.
+    """
+    gold_content = dict(MEMORIES)
+    out = []
+    for query, gold, kind in QUERIES:
+        got = [key(row) for row in memory.recall(query, top_k=k)][:k]
+        want = gold if key is _row_id else gold_content[gold]
+        out.append((kind, got.index(want) + 1 if want in got else 0))
+    return out
+
+
+def _row_id(row):
+    """Identity key for episodic rows, which keep their benchmark id."""
+    return row.get("id")
+
+
+def _row_content(row):
+    """Identity key for working rows, whose ids are generated on write."""
+    return row.get("content", "")
+
+
+def test_public_episodic_recall_is_gated_below_candidate_recall(episodic_memory):
+    """Frozen at what a caller receives, which is not the candidate figure.
+
+    35/49 against 49/49 candidates. The 14-query gap is the lexical admission
+    gate, and it is not a normalization defect: in every dropped query only the
+    topic noun is shared, while the rest of the query is an interrogative
+    (누가, 뭐야) or a conjugated predicate whose document counterpart is a
+    synonym (수정할/고칠, 버렸더라/폐기했다). No suffix-trimming scheme
+    recovers those; closing the gap needs morphological analysis, which this
+    change deliberately does not introduce. The number is frozen so the next
+    attempt has a baseline instead of an impression.
+    """
+    ranks = _public_ranks(episodic_memory, _row_id)
+    hit = sum(1 for _, r in ranks if r)
+    assert hit == 35, f"public episodic R@5 moved to {hit}/{len(ranks)}, baseline 35/49"
+
+
+def test_public_episodic_recall_at_1(episodic_memory):
+    """Admitted rows are always rank 1 here, so R@1 tracks R@5 exactly.
+
+    That equality is the point: the gate does not demote, it excludes. A run
+    where R@1 falls below R@5 means something started ranking an admitted row
+    behind a distractor.
+    """
+    ranks = _public_ranks(episodic_memory, _row_id)
+    top1 = sum(1 for _, r in ranks if r == 1)
+    assert top1 == 35, f"public episodic R@1 moved to {top1}/{len(ranks)}, baseline 35/49"
+
+
+def test_public_working_recall(working_memory):
+    """The working layer is a separate recall branch and is measured separately.
+
+    R@5 is frozen exactly, because admission is a score threshold and does not
+    depend on write order. R@1 is a floor rather than an exact figure: the 60
+    rows are written in a burst, so whether two of them share a timestamp
+    varies per run, and the recency tiebreak then orders equally-scored rows
+    differently. Observed 36-37; pinning either value would make this test
+    flaky for a reason that has nothing to do with Korean.
+    """
+    ranks = _public_ranks(working_memory, _row_content)
+    hit = sum(1 for _, r in ranks if r)
+    top1 = sum(1 for _, r in ranks if r == 1)
+    assert hit == 38, f"public working R@5 moved to {hit}/{len(ranks)}, baseline 38/49"
+    assert top1 >= 36, f"public working R@1 fell to {top1}/{len(ranks)}, floor 36/49"
+
+
+@pytest.mark.parametrize(
+    "query, gold",
+    [
+        ('honcho가 한국어 검색을 못 하는 이유', 'm14'),
+        ('백업 보관 기간이 며칠이야', 'm40'),
+        ('임베딩 서버는 몇 번 포트야', 'm03'),
+        ('cram을 올린 뒤 축출이 어떻게 됐나', 'm05'),
+    ],
+)
+def test_inflected_queries_survive_admission(episodic_memory, query, gold):
+    """The reported defect: candidate generation succeeded, admission did not.
+
+    Each query inflects its target's key noun with a particle. Before the
+    normalization contract was unified, ``_fts_search()`` returned the target
+    as its top candidate and ``recall()`` then returned ``[]`` because the gate
+    scored the same row against unnormalized tokens. Asserting rank 1 rather
+    than mere presence keeps the distractors in play.
+    """
+    got = [row.get("id") for row in episodic_memory.recall(query, top_k=5)]
+    assert got[:1] == [gold], f"{query!r} -> {got}"
+
+
+@pytest.mark.parametrize("query", ['AI가 정리된 폴더', 'AI 정리된 폴더'])
+def test_short_latin_stem_survives_josa_stripping(episodic_memory, query):
+    """A Latin stem must not change verdict depending on the particle glued to it.
+
+    ``_is_meaningful_recall_token`` reads its length floor off the surface form,
+    so ``AI가`` clears the two-character Hangul floor -- and then
+    ``_recall_tokens`` strips the very particle that earned the exemption,
+    leaving ``ai``. The same word standing alone in a document is measured
+    against the three-character Latin floor and dropped, so query and content
+    disagreed about ``AI``. ``_fts_query_terms`` emits ``"ai"*`` for both forms
+    and m27 is the top candidate either way; only admission diverged.
+
+    Both spellings are asserted together because the defect is the asymmetry,
+    not either form on its own -- pinning only the inflected one would pass
+    again if the exemption were removed instead of made consistent.
+    """
+    got = [row.get("id") for row in episodic_memory.recall(query, top_k=5)]
+    assert got[:1] == ['m27'], f"{query!r} -> {got}"
+
+
+def test_candidate_and_admission_agree_on_normalization(episodic_memory, corpus):
+    """No query may be a top candidate and then be dropped by the gate.
+
+    This is the invariant the two layers violated. It is asserted directly
+    rather than inferred from the aggregate counts, because a recall number can
+    hold while an individual row silently falls through.
+    """
+    conn, rowid_of = corpus
+    gold_content = dict(MEMORIES)
+    for query, gold, _kind in QUERIES:
+        top = beam._fts_search(conn, query, k=1)
+        if not top or top[0]["rowid"] != rowid_of[gold]:
+            continue
+        admitted = [row.get("id") for row in episodic_memory.recall(query, top_k=5)]
+        if gold in admitted:
+            continue
+        # A drop is permitted only when the query genuinely shares too little
+        # surface form with its target -- never because the two layers
+        # tokenized the same text differently.
+        query_tokens = beam._recall_tokens(query.lower())
+        relevance = beam._lexical_relevance(
+            query_tokens, gold_content[gold], query.lower()
+        )
+        assert relevance < beam._minimum_recall_relevance(query_tokens), (
+            f"{query!r} was the top candidate and scored {relevance:.3f} above "
+            f"the gate, yet recall() dropped it"
+        )
+
+
+def test_strip_ko_josa_is_idempotent():
+    """``f(stem) == f(stem + 조사)`` or the two sides can never meet.
+
+    A query token and the same word inflected inside a document are normalized
+    by separate calls, so a single pass is not enough: ``바나나`` trims to
+    ``바나`` because its final syllable is itself a particle, while ``바나나를``
+    trims only to ``바나나``. Trimming to a fixed point makes both converge.
+    """
+    for stem in ("바나나", "백업", "회사", "갱신", "포트", "캐시"):
+        assert beam._strip_ko_josa(stem) == beam._strip_ko_josa(
+            beam._strip_ko_josa(stem)
+        )
+        for josa in ("를", "은", "이", "에서", "으로", "까지"):
+            assert beam._strip_ko_josa(stem + josa) == beam._strip_ko_josa(stem), (
+                f"{stem}+{josa} normalizes differently from {stem}"
+            )
+
+
+# The stem `바나나` normalizes to `바나` because its final syllable is itself a
+# particle, so a longer compound that merely *starts* with `바나나` is reached
+# through the prefix branch of `_lexical_relevance` rather than the exact one.
+# The two branches used to pay the same weight, which tied the compounds with
+# the word the query actually named.
+#
+# The distractors are written *before* the target on purpose. Equal scores are
+# broken by the recency order the rows were inserted in, so a target written
+# last would come out on top even with the scoring defect present -- the
+# ablation would pass and the test would prove nothing.
+PREFIX_DISTRACTOR_MEMORIES = [
+    ('d01', '바나나우유는 편의점 냉장고에서 판다'),
+    ('d02', '바나나맛 사탕을 한 봉지 샀다'),
+    ('t01', '바나나는 노랗게 익으면 먹는 과일이다'),
+]
+
+
+@pytest.fixture
+def prefix_distractor_memory(tmp_path):
+    """A ``BeamMemory`` holding one target and two longer prefix distractors.
+
+    Kept separate from the 60-row benchmark on purpose: the frozen R@1/R@5
+    figures above are asserted exactly, and adding rows would move them for a
+    reason unrelated to what this test measures.
+    """
+    db = tmp_path / "prefix.db"
+    memory = BeamMemory(session_id="default", db_path=db)
+    conn = beam._get_connection(db)
+    for mid, content in PREFIX_DISTRACTOR_MEMORIES:
+        conn.execute(
+            "INSERT INTO episodic_memory"
+            " (id, content, source, session_id, importance)"
+            " VALUES (?, ?, 'test', 'default', 0.5)",
+            (mid, content),
+        )
+    conn.commit()
+    return memory
+
+
+def test_prefix_match_ranks_below_normalized_exact(prefix_distractor_memory):
+    """The upstream review defect: `바나나우유` outranked `바나나`.
+
+    All three rows clear candidate generation -- `_fts_query_terms` emits
+    ``"바나"*`` and the wildcard grows rightward through every compound, so
+    ranking is decided entirely by `_lexical_relevance`. Two independent terms
+    there paid the compounds as much as the target, and either one alone is
+    enough to reproduce the tie:
+
+    * the Hangul prefix branch credited `_component_unit_weight()` in full,
+      identically to the exact branch the target reaches; and
+    * `full_match` tested raw substring containment, and `바나나` is a
+      substring of `바나나우유` -- worth 1.0 on its own, which saturates the
+      final `min(score, 1.0)` cap and hides any discount applied above it.
+
+    With both scored at 1.0 the order fell to the recency tiebreak. Rank 1 is
+    asserted rather than mere presence, because presence held before the fix
+    too -- the defect was ordering.
+    """
+    got = [row.get("id") for row in prefix_distractor_memory.recall('바나나', top_k=3)]
+    assert got[:1] == ['t01'], f"'바나나' -> {got}"
+
+
+def test_inflected_prefix_query_ranks_below_normalized_exact(prefix_distractor_memory):
+    """Same ordering, with the `full_match` term out of the picture.
+
+    `바나나를` is not a substring of any row, so this query isolates the prefix
+    branch: it fails if the branch is restored to full weight even when the
+    `full_match` fix is left in place. The uninflected case above cannot make
+    that distinction, because either fix alone satisfies it.
+    """
+    got = [row.get("id") for row in prefix_distractor_memory.recall('바나나를', top_k=3)]
+    assert got[:1] == ['t01'], f"'바나나를' -> {got}"
+
+
+def test_prefix_match_still_clears_the_admission_gate(prefix_distractor_memory):
+    """Discounting the prefix branch must not evict the rows it admits.
+
+    The discount exists to break a tie, not to drop compounds: a query naming
+    only `바나나우유` still has to find d01. This is the guard against fixing
+    the ranking by raising the branch out of contention entirely, which would
+    also break `보관` -> `보관한다`, the case the prefix branch was added for.
+    """
+    got = [row.get("id") for row in prefix_distractor_memory.recall('바나나우유', top_k=3)]
+    assert got[:1] == ['d01'], f"'바나나우유' -> {got}"
+
+
+def test_prefix_and_exact_relevance_are_not_tied():
+    """Assert the scores directly, not just the order they produce.
+
+    Ranking tests can pass for the wrong reason -- equal scores fall through to
+    a tiebreak, and a tiebreak can land on the right row by luck. Comparing
+    `_lexical_relevance` output pins the actual contract: a compound that only
+    shares a prefix must score strictly below the word the query named, on both
+    the inflected and uninflected form of the query.
+    """
+    target = dict(PREFIX_DISTRACTOR_MEMORIES)['t01']
+    for query in ('바나나', '바나나를'):
+        query_tokens = beam._recall_tokens(query.lower())
+        gold = beam._lexical_relevance(query_tokens, target, query.lower())
+        floor = beam._minimum_recall_relevance(query_tokens)
+        for did in ('d01', 'd02'):
+            distractor = dict(PREFIX_DISTRACTOR_MEMORIES)[did]
+            score = beam._lexical_relevance(query_tokens, distractor, query.lower())
+            assert score < gold, (
+                f"{query!r}: {did} scored {score:.3f}, not below the target's "
+                f"{gold:.3f}"
+            )
+            # ...but still admitted. The discount breaks the tie; it must not
+            # push a legitimately prefix-matching row below the gate.
+            assert score >= floor, (
+                f"{query!r}: {did} scored {score:.3f}, under the gate {floor}"
+            )
+
+
+# `_fts_query_terms()` widens *every* term of a Hangul-bearing query to a
+# `"stem"*` prefix, including a pure Latin one, because unicode61 glues the
+# particle onto Latin too -- `ModelForge가` is a single index token that no
+# quoted phrase can reach. That widening is candidate generation only, and it
+# used to leak into the ranking: `ModelForgeXYZ` merely starts with the same
+# letters, and the substring branch of `_lexical_relevance` paid it 0.2 against
+# a 0.15 floor, so it surfaced as a public hit the exact-phrase behaviour had
+# never returned (upstream review of #896).
+#
+# The distractor is written first for the same reason as the Hangul fixture
+# above: a target inserted last wins the recency tiebreak on its own.
+LATIN_PREFIX_DISTRACTOR_MEMORIES = [
+    ('d01', 'ModelForgeXYZ 전용 문서는 아직 비어 있다'),
+    ('t01', 'ModelForge가 하는 일은 모델 양자화다'),
+]
+
+
+@pytest.fixture
+def latin_prefix_distractor_memory(tmp_path):
+    """A ``BeamMemory`` holding a mixed-script target and a longer Latin word.
+
+    Both rows start with the same eleven letters, so the widened prefix term
+    retrieves both. Only the ranking can tell them apart.
+    """
+    db = tmp_path / "latin_prefix.db"
+    memory = BeamMemory(session_id="default", db_path=db)
+    conn = beam._get_connection(db)
+    for mid, content in LATIN_PREFIX_DISTRACTOR_MEMORIES:
+        conn.execute(
+            "INSERT INTO episodic_memory"
+            " (id, content, source, session_id, importance)"
+            " VALUES (?, ?, 'test', 'default', 0.5)",
+            (mid, content),
+        )
+    conn.commit()
+    return memory
+
+
+def test_latin_prefix_distractor_is_not_publicly_recalled(
+    latin_prefix_distractor_memory,
+):
+    """A longer Latin word must not be admitted by a mixed-script query.
+
+    This is the public path, gate included -- the regression dplush reported
+    was a result the user could actually see, not a candidate-set artefact.
+    """
+    got = [
+        row.get("id")
+        for row in latin_prefix_distractor_memory.recall('ModelForge가 뭐야', top_k=5)
+    ]
+    assert got[:1] == ['t01'], f"'ModelForge가 뭐야' -> {got}"
+    assert 'd01' not in got, f"ModelForgeXYZ was publicly recalled: {got}"
+
+
+def test_latin_stem_keeps_exact_semantics_after_normalization():
+    """Score the two rows directly, so this cannot pass on a tiebreak.
+
+    `_RECALL_TOKEN_RE` splits on the script boundary, so the target's
+    `ModelForge가` already yields the token `modelforge` and is paid by the
+    exact branch. The distractor has only the substring branch to stand on,
+    and for a pure Latin stem inside a Hangul query that branch is now closed.
+    """
+    query = 'ModelForge가 뭐야'
+    query_tokens = beam._recall_tokens(query.lower())
+    floor = beam._minimum_recall_relevance(query_tokens)
+    rows = dict(LATIN_PREFIX_DISTRACTOR_MEMORIES)
+    gold = beam._lexical_relevance(query_tokens, rows['t01'], query.lower())
+    distractor = beam._lexical_relevance(query_tokens, rows['d01'], query.lower())
+    assert gold >= floor, f"target scored {gold:.3f}, under the gate {floor}"
+    assert distractor < floor, (
+        f"ModelForgeXYZ scored {distractor:.3f}, at or above the gate {floor}"
+    )
+
+
+def test_hangul_prefix_credit_is_unaffected_by_the_latin_guard():
+    """The guard must not disarm the Hangul prefix branch it sits next to.
+
+    `보관` -> `보관한다` is the inflection the branch exists for. The guard is
+    scoped to a Latin token inside a Hangul query, so this must still be paid.
+    """
+    query_tokens = beam._recall_tokens('보관')
+    score = beam._lexical_relevance(query_tokens, '영수증은 3년간 보관한다', '보관')
+    assert score >= beam._minimum_recall_relevance(query_tokens), (
+        f"'보관' -> '보관한다' scored {score:.3f} and would be gated out"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bounded-candidate truncation
+#
+# The two suites above score rows in isolation, where every candidate reaches
+# the gate. `recall()` does not work that way: working-memory candidates are
+# generated by `_fts_search_working(..., k=max(top_k * 3, 50))`, so at
+# `top_k=5` only the first 50 rows by FTS rank are handed to Python. A row cut
+# there is gone before any lexical weighting runs, which is why a ranking
+# assertion cannot catch this and a truncation assertion can.
+# ---------------------------------------------------------------------------
+
+# 60 > the 50-row candidate cap, so the target cannot survive on rank alone --
+# the widened term has to stop matching these rows. Each distractor shares only
+# the `ai` prefix with the query; none contains the token `ai` itself, so an
+# exact term never retrieves them.
+BOUNDED_PREFIX_DISTRACTOR_COUNT = 60
+BOUNDED_PREFIX_TARGET = 'AI가 target meaning'
+
+
+@pytest.fixture
+def bounded_prefix_memory(tmp_path):
+    """Working memory where prefix distractors outnumber the candidate cap.
+
+    Insertion order matters: the distractors are written first so they hold
+    the lower rowids and win the `ORDER BY rank, id` tiebreak, putting the
+    target past the cap. Writing the target first would let it survive the
+    truncation this fixture exists to force.
+    """
+    memory = BeamMemory(session_id="default", db_path=tmp_path / "bounded.db")
+    for i in range(BOUNDED_PREFIX_DISTRACTOR_COUNT):
+        memory.remember(f'air{i:02d} 가 unrelated', source="test")
+    memory.remember(BOUNDED_PREFIX_TARGET, source="test")
+    return memory
+
+
+def test_prefix_distractors_do_not_exhaust_the_candidate_cap(bounded_prefix_memory):
+    """A Hangul query must not widen an unrelated Latin token into a flood.
+
+    `AI가` reaches `_fts_query_terms()` as the pure Latin token `ai`, already
+    stripped of its particle. Widening it to `"ai"*` because the query happens
+    to contain Hangul admits every `air..` row, and 60 of them fill the
+    50-candidate cap before the target is reached.
+    """
+    got = [
+        row.get("content")
+        for row in bounded_prefix_memory.recall(BOUNDED_PREFIX_TARGET, top_k=5)
+    ]
+    assert BOUNDED_PREFIX_TARGET in got, (
+        f"target truncated out of the candidate pool; recall returned {got}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public-path pool-exhaustion regressions (upstream review of #896)
+#
+# The suite above pins the *working*-memory truncation for the `AI가` case.
+# The review asks for the same guarantees on the public paths for both P1
+# defects, on both layers: a query whose exact form is part of the corpus
+# must still retrieve its target even when more than a full candidate pool of
+# prefix distractors precede it in rowid order.
+# ---------------------------------------------------------------------------
+
+# 61 > the 50-row working-memory budget (`max(top_k * 3, 50)`) and also > the
+# 20-row episodic budget (`max(top_k * 3, 20)`), so one count reproduces the
+# exhaustion on both layers at `top_k=5`.
+POOL_EXHAUSTING_DISTRACTOR_COUNT = 61
+BANANA_POOL_TARGET = '바나나는 노란 과일로 아침에 하나씩 먹는다'
+# The uninflected base form on its own, which is the query the review reported.
+# A multi-word query would hide the defect: a second term retrieves the target
+# through a path the flooded one does not, so the pool never runs out. It also
+# has to share a token with the target or the relevance gate drops it before
+# truncation is ever reached, and the failure would look identical.
+BANANA_POOL_QUERY = '바나나'
+BANANA_POOL_DISTRACTOR = '바나{i:02d}는 unrelated'
+# The same flood one syllable wider. `바나NN는` above is only reached by the
+# *stem* `"바나"*`, so a stage keyed on the raw `"바나나"*` clears it without
+# proving anything: a distractor sharing the whole raw query surface is still
+# a prefix hit, and 61 of them exhaust the reserved slice exactly as the stem
+# flood exhausted the whole pool. Only an exact-phrase term separates these --
+# unicode61 indexes `바나나01` as one glued token, which `"바나나"` cannot
+# reach. The target carries `바나나` as a bare token for the same reason: an
+# inflected `바나나는` would be invisible to that term and would test the
+# widened stage over again.
+SAME_PREFIX_POOL_TARGET = '바나나 노란 과일이다'
+SAME_PREFIX_POOL_DISTRACTOR = '바나나{i:02d} unrelated'
+# `가` is part of the distractor, not decoration: the target's only Hangul is
+# the same particle, so a row carrying it used to tie the target through the
+# CJK character-overlap fallback even with no word in common.
+AI_POOL_DISTRACTOR = 'air{i:02d} 가 unrelated'
+
+
+def _pool_exhausting_working_memory(tmp_path, name, target, distractor):
+    """Working memory holding > cap prefix distractors, target written last.
+
+    The distractors are written first so they hold the lower rowids and win
+    the rank tiebreak, putting the target past the candidate cap. Writing the
+    target first would let it survive the truncation these tests exist to
+    force.
+
+    ``distractor`` is a format string taking ``i`` so each P1 supplies the
+    flood that its own query widens into. Hard-coding one shape here made the
+    `AI가` fixtures fill with `바나NN` rows, which their query never reaches --
+    the tests passed without exercising anything.
+    """
+    memory = BeamMemory(session_id="default", db_path=tmp_path / name)
+    for i in range(POOL_EXHAUSTING_DISTRACTOR_COUNT):
+        memory.remember(distractor.format(i=i), source="test")
+    memory.remember(target, source="test")
+    return memory
+
+
+def _pool_exhausting_episodic_memory(tmp_path, name, target, distractor):
+    """Episodic memory holding > cap prefix distractors, target written last.
+
+    The episodic layer is fed through direct row insertion, matching the
+    ``episodic_memory`` fixture, so the same insertion-order argument as the
+    working fixture applies to the episodic budget as well.
+    """
+    db = tmp_path / name
+    beam.init_beam(db)
+    memory = BeamMemory(session_id="default", db_path=db)
+    conn = beam._get_connection(db)
+    for i in range(POOL_EXHAUSTING_DISTRACTOR_COUNT):
+        conn.execute(
+            "INSERT INTO episodic_memory"
+            " (id, content, source, session_id, importance)"
+            " VALUES (?, ?, 'test', 'default', 0.5)",
+            (f'pd{i:02d}', distractor.format(i=i)),
+        )
+    conn.execute(
+        "INSERT INTO episodic_memory"
+        " (id, content, source, session_id, importance)"
+        " VALUES (?, ?, 'test', 'default', 0.5)",
+        ('t01', target),
+    )
+    conn.commit()
+    return memory
+
+
+@pytest.fixture
+def banana_pool_working(tmp_path):
+    """P1 바나나 case on the working layer; the target is inserted last."""
+    return _pool_exhausting_working_memory(
+        tmp_path, "banana_pool_w.db", BANANA_POOL_TARGET, BANANA_POOL_DISTRACTOR
+    )
+
+
+@pytest.fixture
+def banana_pool_episodic(tmp_path):
+    """P1 바나나 case on the episodic layer; the target is inserted last."""
+    return _pool_exhausting_episodic_memory(
+        tmp_path, "banana_pool_e.db", BANANA_POOL_TARGET, BANANA_POOL_DISTRACTOR
+    )
+
+
+def test_banana_pool_exhaustion_public_working(banana_pool_working):
+    """P1-1 (working): an uninflected stem must find itself past the cap.
+
+    `바나나` is part of the corpus as an exact token, but on this branch the
+    query widens to the `바나*` prefix only. The 61 `바나NN` distractors
+    inserted before the target fill the 50-row working candidate pool, so the
+    target never reaches ranking. On base `a943a7d` the exact `바나나` term
+    kept the target alive, which is why this is a regression and not a new
+    requirement. Presence is asserted, not rank: recall itself is broken, so
+    "in the results" is the weaker and correct bar.
+    """
+    got = [
+        row.get("content")
+        for row in banana_pool_working.recall(BANANA_POOL_QUERY, top_k=5)
+    ]
+    assert BANANA_POOL_TARGET in got, (
+        f"'{BANANA_POOL_QUERY}' lost its target to the 61 prefix distractors; "
+        f"recall returned {got}"
+    )
+
+
+def test_banana_pool_exhaustion_public_episodic(banana_pool_episodic):
+    """P1-1 (episodic): same exhaustion against the 20-row episodic budget.
+
+    The episodic budget is `max(top_k * 3, 20)` at `top_k=5`, one quarter of
+    the working one. A fix sized to the working path could pass there while
+    the episodic pool still floods, so the layer is asserted separately.
+    """
+    got = [
+        row.get("id") for row in banana_pool_episodic.recall(BANANA_POOL_QUERY, top_k=5)
+    ]
+    assert 't01' in got, (
+        f"'{BANANA_POOL_QUERY}' lost its target to the 61 prefix distractors; "
+        f"recall returned {got}"
+    )
+
+
+@pytest.fixture
+def same_prefix_pool_working(tmp_path):
+    """Same-surface-prefix flood on the working layer; target inserted last."""
+    return _pool_exhausting_working_memory(
+        tmp_path,
+        "same_prefix_pool_w.db",
+        SAME_PREFIX_POOL_TARGET,
+        SAME_PREFIX_POOL_DISTRACTOR,
+    )
+
+
+@pytest.fixture
+def same_prefix_pool_episodic(tmp_path):
+    """Same-surface-prefix flood on the episodic layer; target inserted last."""
+    return _pool_exhausting_episodic_memory(
+        tmp_path,
+        "same_prefix_pool_e.db",
+        SAME_PREFIX_POOL_TARGET,
+        SAME_PREFIX_POOL_DISTRACTOR,
+    )
+
+
+def test_same_prefix_pool_exhaustion_public_working(same_prefix_pool_working):
+    """A literal token must not be displaced by longer tokens sharing it.
+
+    The `바나NN는` fixtures above are cleared by any stage keyed on the raw
+    query token, because the stem `바나` is what reaches them. These rows
+    share the entire raw surface, so they are admitted by `"바나나"*` too and
+    fill whatever slice that stage reserves. Passing this requires a term no
+    longer token can match at all, which is why the exact phrase runs first.
+    """
+    got = [
+        row.get("content")
+        for row in same_prefix_pool_working.recall(BANANA_POOL_QUERY, top_k=5)
+    ]
+    assert SAME_PREFIX_POOL_TARGET in got, (
+        f"'{BANANA_POOL_QUERY}' lost its literal-token target to the 61 "
+        f"same-prefix distractors; recall returned {got}"
+    )
+
+
+def test_same_prefix_pool_exhaustion_public_episodic(same_prefix_pool_episodic):
+    """Same displacement against the smaller episodic budget.
+
+    The episodic pool is `max(top_k * 3, 20)`, so the exact reservation is a
+    handful of rows there. Asserting the layer separately keeps a fix sized
+    to the 50-row working budget from passing while episodic still floods.
+    """
+    got = [
+        row.get("id")
+        for row in same_prefix_pool_episodic.recall(BANANA_POOL_QUERY, top_k=5)
+    ]
+    assert 't01' in got, (
+        f"'{BANANA_POOL_QUERY}' lost its literal-token target to the 61 "
+        f"same-prefix distractors; recall returned {got}"
+    )
+
+
+@pytest.fixture
+def ai_pool_working(tmp_path):
+    """P1-2 (working): `airNN` distractors fill the pool, target written last."""
+    return _pool_exhausting_working_memory(
+        tmp_path, "ai_pool_w.db", BOUNDED_PREFIX_TARGET, AI_POOL_DISTRACTOR
+    )
+
+
+@pytest.fixture
+def ai_pool_episodic(tmp_path):
+    """P1-2 (episodic): same rows on the episodic layer, target written last."""
+    return _pool_exhausting_episodic_memory(
+        tmp_path, "ai_pool_e.db", BOUNDED_PREFIX_TARGET, AI_POOL_DISTRACTOR
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        BOUNDED_PREFIX_TARGET,   # 'AI가 target meaning'
+        'AI가',                  # the bare mixed-script identifier
+    ],
+)
+def test_ai_pool_exhaustion_public_working(ai_pool_working, query):
+    """P1-2 (working): the `ai` prefix flood must not hide the target.
+
+    Both spellings are asserted because the review requires the exact/symbolic
+    identifier fallback to stay reachable for mixed Hangul queries: the
+    inflected form and the bare identifier must each return the target, not
+    just the one that happens to share more surface form with the distractors.
+    """
+    got = [
+        row.get("content")
+        for row in ai_pool_working.recall(query, top_k=5)
+    ]
+    assert BOUNDED_PREFIX_TARGET in got, (
+        f"'{query}' lost its target to the 61 `airNN` prefix distractors; "
+        f"recall returned {got}"
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        BOUNDED_PREFIX_TARGET,
+        'AI가',
+    ],
+)
+def test_ai_pool_exhaustion_public_episodic(ai_pool_episodic, query):
+    """P1-2 (episodic): the identifier fallback on the 20-row budget."""
+    got = [
+        row.get("id") for row in ai_pool_episodic.recall(query, top_k=5)
+    ]
+    assert 't01' in got, (
+        f"'{query}' lost its target to the 61 `airNN` prefix distractors; "
+        f"recall returned {got}"
+    )
+
+
+def test_benchmark_corpus_is_not_shrunk():
+    """The frozen counts cannot become easier through corpus shrinkage.
+
+    The R@1/R@5 figures in this file are exact against 60 memories and 49
+    queries. Deleting a hard memory or a hard query would make the frozen
+    numbers hold with less work, which reads as a pass and hides the loss.
+    Upstream review of #896 asks for the corpus size to be asserted
+    explicitly so a shrinkage cannot pass silently.
+    """
+    assert len(MEMORIES) == 60
+    assert len(QUERIES) == 49

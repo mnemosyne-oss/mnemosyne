@@ -1,4 +1,6 @@
-# RFC 0002: Modality Providers and the Atlas Cloud Seam
+# RFC 0002: Modality Providers and the Vision Endpoint Seam
+
+> **Retitled 2026-07-30.** This document was "Modality Providers and the Atlas Cloud Seam". The seam is generic — any OpenAI-compatible vision endpoint — and naming it after one provider misrepresented the design as vendor-coupled when it never was. See the correction in §3.2. Atlas Cloud remains the reference deployment and keeps its configuration recipe in §3.5.
 
 **Status:** Draft
 **Author:** abdiisan
@@ -59,7 +61,7 @@ One trap worth documenting in the recipe: `_is_api_model` (`core/embeddings.py:1
 
 ### 1.4 The `vec_facts` cautionary tale
 
-`vec_facts` was declared as a vec0 virtual table at `beam.py:1218` and **never given a writer**. The consequence is permanent: `reindex_vectors` (`beam.py:2392`) must recreate it empty on every reindex, and the comment at `beam.py:2445` explains why, so its declared dimension "can't mismatch a query." It also occupies a slot in three hardcoded table whitelists (`beam.py:552`, `:1544`, `:2150`).
+`vec_facts` was declared as a vec0 virtual table at `beam.py:1220` and **never given a writer**. The consequence is permanent: `reindex_vectors` (`beam.py:2394`) must recreate it empty on every reindex, and the comment at `beam.py:2448` explains why, so its declared dimension "can't mismatch a query." It also occupies a slot in three hardcoded table whitelists (`beam.py:552`, `:1544`, `:2150`).
 
 This yields a rule that governs §2 of this RFC: **do not declare an interface with no writer.** An unused abstraction is not free optionality, it is a maintenance obligation that every future refactor must carry.
 
@@ -69,7 +71,7 @@ This is the single most important constraint on any multimodal design, and it is
 
 - `_existing_vec_dim` (`beam.py:538`) parses the *stored DDL* of the existing vec tables to recover their dimension. The stored schema, not process config, is the source of truth.
 - On mismatch, `init_beam` **refuses to create the vec tables** and logs `_dim_mismatch_message` (`beam.py:566`). See the guard at `beam.py:799-802`.
-- Recovery is an explicit operator action, `mnemosyne reindex`, which re-embeds everything and recreates the tables at the active dimension (`reindex_vectors`, `beam.py:2392`).
+- Recovery is an explicit operator action, `mnemosyne reindex`, which re-embeds everything and recreates the tables at the active dimension (`reindex_vectors`, `beam.py:2394`).
 
 Any design in which swapping a provider can change `EMBEDDING_DIM` is a design that can silently degrade every user's recall to lexical-only. §2 exists to make that impossible.
 
@@ -112,9 +114,17 @@ A structural mirror of `core/llm_backends.py`.
 
 **Request and result shapes.** Three dataclasses:
 
-- `DescribeRequest`: `modality` (`"image" | "video" | "audio" | "document"`), `uri`, `content_hash`, `mime`, `hint`, `max_moments`, `span_hint`, `timeout`, `detail`.
+- `DescribeRequest`: `modality` (`"image" | "video" | "audio" | "document"`), `uri`, `content_hash`, `mime`, `hint`, `max_moments`, `span_hint`, `timeout`, `detail`, **`fetch`**.
 - `MomentDraft`: `kind` (`caption | shot | transcript | style | ocr | page | summary`), `text`, `t_start_ms`, `t_end_ms`, `page_start`, `page_end`, `char_start`, `char_end`, `bbox`, `speaker`, `confidence`, `extra`.
-- `DescribeResult`: `summary`, `moments: List[MomentDraft]`, `provider`, `model`, `warnings`.
+- `DescribeResult`: `summary`, `moments: List[MomentDraft]`, `provider`, `model`, `warnings`, **`refused`**.
+
+> **Correction (2026-07-30): two fields the original draft omitted, one of which is load-bearing.**
+>
+> **`DescribeRequest.fetch: Optional[Callable[[], Optional[bytes]]]`.** As drafted, the request carried `uri`, `mime`, and `content_hash` — and no way to carry bytes or obtain them. An OpenAI-compatible vision call needs a base64 `image_url` data part for anything that is not a publicly fetchable `https://` URL, so the adapter could describe public URLs and **nothing else**: no local file, no `blob://` reference, which is to say none of the media a privacy-first local memory system actually holds. `fetch` closes this. It is lazy and optional — a backend describing a public URL never calls it, and no bytes are read.
+>
+> This makes RFC 0004's `ContentResolver` a **hard prerequisite of this adapter**, not the independent nicety RFC 0004 §11 implies: `fetch` is supplied from the resolver registry. Sequence accordingly.
+>
+> **`DescribeResult.refused: bool`.** RFC 0003 §2.1 declares `understanding_status='refused'` as a valid state and nothing in this RFC produces it. A provider that declines on safety grounds is meaningfully different from one that failed, and the distinction should survive into the asset row.
 
 `MomentDraft` is deliberately the wire shape of a `media_moments` row in RFC 0003 §2.2, minus identity and binding. A provider proposes drafts; the store assigns ids and decides what to keep.
 
@@ -139,15 +149,24 @@ One method. Text-or-None on failure. `hint` carries the caller's prompt, preserv
 
 *Estimated: ~200 lines in a new file, ~150 lines of tests.*
 
-### 3.2 `mnemosyne/core/modality_atlas.py` (new, ~300 lines)
+### 3.2 `mnemosyne/core/modality_openai_compat.py` (new, ~300 lines)
 
-The Atlas Cloud adapter, and the reference implementation of the protocol.
+The OpenAI-compatible vision adapter, and the reference implementation of the protocol.
+
+> **Correction (2026-07-30): this module was named `modality_atlas.py` in the original draft. Renamed, for a reason worth recording.**
+>
+> Naming a core module after one vendor makes that vendor structural. It is not: the module speaks the OpenAI-compatible `chat/completions` shape, which is served by Atlas Cloud, OpenRouter, Together, Groq, vLLM, LM Studio, Ollama, and a local `llama.cpp` server alike. §3.3's ladder already said "Atlas Cloud / **any OpenAI-compatible vision endpoint**" and §3.4's config keys were already vendor-neutral (`MNEMOSYNE_MODALITY_BASE_URL`, not `MNEMOSYNE_ATLAS_URL`), so the design was never actually coupled — only the module name and the framing were.
+>
+> Probing the partner endpoint made the point concrete. `GET https://api.atlascloud.ai/v1/models` returns **123 models, 30 of them accepting image input — and every one is another vendor's** (OpenAI, Anthropic, Google, Qwen, Moonshot, xAI, ByteDance, Z.ai). Atlas is an OpenAI-compatible **aggregator**. There is no "Atlas vision API" distinct from the generic one to write an adapter against.
+>
+> This also matches the project's partnership policy: sponsorship should produce work that benefits the whole ecosystem, not architecture that privileges one provider. **Atlas Cloud is the reference deployment and a documented recipe (§3.5), not a dependency.** The correct test of this correction is that switching endpoints requires changing environment variables only, and that test belongs in the implementing PR.
 
 - OpenAI-compatible `POST {base_url}/chat/completions` with `image_url` content parts.
-- Reuses the retry, backoff, and timeout shape of `_call_remote_llm` (`core/local_llm.py`) and the rate-limit classifier `_is_rate_limit_error` (`core/embeddings.py:247`). Do not invent a third retry policy.
+- Reuses the retry, backoff, and timeout shape of `_call_remote_llm_with_model` (`core/local_llm.py:458`) and the rate-limit classifier `_is_rate_limit_error` (`core/embeddings.py:247`). Do not invent a third retry policy.
 - Requests strict JSON: a `{"summary": ..., "moments": [...]}` envelope. Parsing follows the tolerance ladder already proven in `core/extraction.py`: JSON first, then partial-JSON salvage, then give up and return `None`. Never raise into `remember()`.
 - Prompt overridable by env, the affordance `core/extraction.py` already provides via `MNEMOSYNE_EXTRACTION_PROMPT`.
 - Selected when `MNEMOSYNE_MODALITY_BASE_URL` and `MNEMOSYNE_MODALITY_API_KEY` are both set.
+- **Optional capability preflight.** `GET {base_url}/models` exposes `input_modalities` per model on Atlas and OpenRouter alike — a convention, not a vendor extension. Use it to warn when the configured vision model is text-only. It must stay strictly optional: an endpoint that does not expose it, or exposes a different shape, must still work. Degrade to silence, never to failure.
 
 *Estimated: ~300 lines in a new file, ~200 lines of tests against a stub HTTP server.*
 
@@ -220,13 +239,13 @@ A `docs/integrations/atlas-cloud.md` page covering all three surfaces in one pla
 
 ## 5. Test obligations
 
-**Process-global reset is mandatory.** `tests/conftest.py:63-71` resets `llm_backends._backend` with the comment "The registry is a process-global; a test that forgets to unregister would otherwise bleed into the next." That block exists because this exact bug happened once. `modality_backends._backends` and `._default` must be reset in the same fixture, in the same style.
+**Process-global reset is mandatory.** `tests/conftest.py:64-69` resets `llm_backends._backend` with the comment "The registry is a process-global; a test that forgets to unregister would otherwise bleed into the next." That block exists because this exact bug happened once. `modality_backends._backends` and `._default` must be reset in the same fixture, in the same style.
 
 **Assert silence when disabled.** With `MNEMOSYNE_MODALITY_ENABLED` unset, a test must assert that no socket is opened and no backend method is called. CI runs with `MNEMOSYNE_NO_EMBEDDINGS=1` and no network expectation; a media path that dials out on import or on plain `remember()` would hang the matrix.
 
 **Assert graceful degradation.** With `modality_enabled=true` and no reachable provider, `describe` returns `None` and the caller proceeds. With a backend that raises, `call_modality_describe` returns `None` and the caller proceeds.
 
-Test naming follows the repo's feature convention: `tests/test_modality_backends.py`, `tests/test_modality_atlas.py`. Ruff runs `--select E9,F63,F7,F82` only, so style will not gate; correctness will.
+Test naming follows the repo's feature convention: `tests/test_modality_backends.py`, `tests/test_modality_openai_compat.py`. Ruff runs `--select E9,F63,F7,F82` only, so style will not gate; correctness will.
 
 ---
 
@@ -242,7 +261,7 @@ Test naming follows the repo's feature convention: `tests/test_modality_backends
    │  modality_backends.py   call_modality_describe()   [THIS RFC]      │
    │  ─────────────────────────────────────────────────────────────     │
    │  1. host backend for modality      (set_modality_backend)          │
-   │  2. Atlas / OpenAI-compatible      (modality_atlas.py)             │
+   │  2. Any OpenAI-compatible endpoint  (modality_openai_compat.py)             │
    │  3. (reserved: local captioner)                                    │
    │  4. metadata-only  ->  understanding_status='unavailable'          │
    │     never raises, never blocks remember()                          │
@@ -273,11 +292,11 @@ Test naming follows the repo's feature convention: `tests/test_modality_backends
 | File | Purpose | Lines |
 |---|---|---|
 | `mnemosyne/core/modality_backends.py` | **new.** Protocol, dataclasses, registry | ~200 |
-| `mnemosyne/core/modality_atlas.py` | **new.** Atlas / OpenAI-compatible adapter | ~300 |
+| `mnemosyne/core/modality_openai_compat.py` | **new.** OpenAI-compatible vision adapter (Atlas, OpenRouter, vLLM, LM Studio, …) | ~300 |
 | `mnemosyne/core/llm_backends.py` | the pattern being copied. No change | 124 |
 | `mnemosyne/core/embeddings.py` | no change. Consumed as-is for moment text | 402 |
 | `mnemosyne/core/config.py` | 8 keys into `ENV_VAR_MAP` / `DEFAULTS` / `REQUIRES_RESTART` | +~15 |
-| `tests/conftest.py` | reset the new process-globals beside `:63-71` | +~8 |
+| `tests/conftest.py` | reset the new process-globals beside `:64-69` | +~8 |
 | `docs/integrations/atlas-cloud.md` | **new.** Configuration recipe | ~120 |
 
 ---

@@ -76,31 +76,90 @@ def _close_memory(memory: BeamMemory | None) -> None:
         memory.conn.close()
 
 
-def test_dense_predicate_version_bump_invalidates_old_entries(
-    enhanced, monkeypatch, tmp_path: Path
+def test_unreadable_marker_bypasses_enhanced_cache_without_log_spam(
+    enhanced, monkeypatch, caplog
 ):
-    """#696/#427 regression: the default dense candidate predicate changed
-    (dialog / honcho / consolidated exclusion), so an opaque cache entry
-    created under the pre-change algorithm version (4, upstream literal-flag
-    schema without our dense predicate) must never be reused — it could
-    still contain dialog, honcho or consolidated dense candidates. The
-    version bump (4 -> 5) lives inside the hashed payload; the ``v2:`` key
-    prefix stays fixed."""
     memory, calls = enhanced
-    assert memory._ENHANCED_RECALL_CACHE_VERSION >= 5
+    marker_reads = []
+    cache_calls = []
 
-    # Warm the cache under the OLD algorithm version so it holds a
-    # pre-predicate ranked result, keyed through the real request path.
+    class CacheSpy:
+        def get_opaque(self, key):
+            cache_calls.append(("get", key))
+
+        def put_opaque(self, key, results):
+            cache_calls.append(("put", key, results))
+
+        def close(self):
+            pass
+
+    memory._query_cache = CacheSpy()
+    conn_type = type(memory.conn)
+    real_execute = conn_type.execute
+
+    def execute_without_user_version(conn, sql, parameters=(), *args, **kwargs):
+        normalized = (
+            sql.strip().rstrip(";").casefold() if isinstance(sql, str) else ""
+        )
+        if normalized == "pragma user_version":
+            marker_reads.append(sql)
+            raise RuntimeError("marker header unreadable")
+        return real_execute(conn, sql, parameters, *args, **kwargs)
+
+    monkeypatch.setattr(conn_type, "execute", execute_without_user_version)
+    monkeypatch.setattr(beam_module, "_unknown_marker_warning_emitted", False)
+
+    with caplog.at_level(logging.DEBUG, logger="mnemosyne.core.beam"):
+        first = _call(memory, "unknown marker")
+        second = _call(memory, "unknown marker")
+
+    assert len(marker_reads) == 2
+    assert len(calls) == 2
+    assert first != second
+    assert cache_calls == []
+    marker_warnings = [
+        record for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "vec store format marker unreadable" in record.getMessage()
+    ]
+    assert len(marker_warnings) == 1
+    assert not any(
+        record.levelno == logging.INFO
+        and "full-scan blob scoring this call" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("previous_version", [6, 7])
+def test_cache_version_bump_invalidates_staged_and_admission_entries(
+    enhanced, monkeypatch, tmp_path: Path, previous_version: int
+):
+    """Both prior cache generations miss under the admission algorithm.
+
+    Version 6 predates staged FTS candidate selection; version 7 is current
+    main before #911's admission/ranking change. The ``v2:`` key prefix stays
+    fixed for QueryCache's opaque-key path.
+    """
+    memory, calls = enhanced
+    assert memory._ENHANCED_RECALL_CACHE_VERSION == 8
+
     with monkeypatch.context() as ctx:
-        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 4)
+        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", previous_version)
         stale = _call(memory, "alpha query")
     assert len(calls) == 1
     stale_id = stale[0]["id"]
 
-    # The current-version digest differs from the stale v4 key: cache miss.
+    # The current-version digest differs from either stale key: cache miss.
     fresh = _call(memory, "alpha query")
     assert len(calls) == 2  # base recall ran; the stale entry was not reused
     assert not any(r.get("id") == stale_id for r in fresh)
+    assert memory._query_cache is not None
+    cache_keys = [
+        row[0]
+        for row in memory._query_cache._conn.execute("SELECT normalized FROM query_cache")
+    ]
+    assert len(cache_keys) == 2
+    assert all(key.startswith("v2:") for key in cache_keys)
 
     # The current-version entry is now cached and reused.
     again = _call(memory, "alpha query")
@@ -698,6 +757,158 @@ def test_dedup_remember_write_survives_post_commit_cache_invalidation_failure(
         assert dict(row) == {"source": "updated", "importance": 1.0}
         assert "query-cache invalidation failed after commit" in caplog.text
     finally:
+        _close_memory(memory)
+
+
+@pytest.mark.parametrize("operation", ["invalidate", "forget_working"])
+def test_post_commit_mutations_survive_query_cache_invalidation_failure(
+    monkeypatch, tmp_path: Path, caplog, operation: str
+):
+    """#594: a committed public mutation is never reported as a cache failure."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        memory_id = memory.remember(
+            f"issue 594 {operation} cache invalidation failure sentinel", source="test"
+        )
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+
+        with caplog.at_level(logging.WARNING, logger=beam_module.__name__):
+            if operation == "invalidate":
+                assert memory.invalidate(memory_id) is True
+                row = memory.conn.execute(
+                    "SELECT valid_until FROM working_memory WHERE id = ?", (memory_id,)
+                ).fetchone()
+                assert row is not None
+                assert row["valid_until"] is not None
+            else:
+                assert memory.forget_working(memory_id) is True
+                row = memory.conn.execute(
+                    "SELECT 1 FROM working_memory WHERE id = ?", (memory_id,)
+                ).fetchone()
+                assert row is None
+
+        assert (
+            f"{operation}: query-cache invalidation failed after commit "
+            "(RuntimeError): cache unavailable"
+        ) in caplog.text
+    finally:
+        _close_memory(memory)
+
+
+@pytest.mark.parametrize("operation", ["invalidate", "forget_working"])
+def test_mutations_keep_cache_invalidation_errors_before_caller_commit(
+    monkeypatch, tmp_path: Path, operation: str
+):
+    """#594's warning-only contract starts only after this instance commits."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        memory_id = memory.remember(
+            f"issue 594 {operation} caller transaction sentinel", source="test"
+        )
+        replacement_id = memory.remember(
+            "issue 594 caller transaction replacement sentinel", source="test"
+        )
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+        memory.conn.execute("BEGIN")
+
+        with pytest.raises(RuntimeError, match="cache unavailable"):
+            if operation == "invalidate":
+                memory.invalidate(memory_id, replacement_id=replacement_id)
+            else:
+                memory.forget_working(memory_id)
+
+        assert memory.conn.in_transaction
+        memory.conn.rollback()
+        if operation == "invalidate":
+            row = memory.conn.execute(
+                "SELECT valid_until FROM working_memory WHERE id = ?", (memory_id,)
+            ).fetchone()
+            assert row is not None
+            assert row["valid_until"] is None
+        else:
+            assert memory.get(memory_id) is not None
+    finally:
+        if memory.conn.in_transaction:
+            memory.conn.rollback()
+        _close_memory(memory)
+
+
+@pytest.mark.parametrize("memory_store", ["working", "episodic"])
+def test_invalidate_without_replacement_keeps_cache_failure_in_caller_transaction(
+    monkeypatch, tmp_path: Path, memory_store: str
+):
+    """#594: caller-owned invalidations must remain rollbackable on cache failure."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        if memory_store == "working":
+            memory_id = memory.remember(
+                "issue 594 caller transaction working invalidation sentinel", source="test"
+            )
+            table = "working_memory"
+        else:
+            memory_id = memory.consolidate_to_episodic(
+                "issue 594 caller transaction episodic invalidation sentinel",
+                source_wm_ids=[],
+                source="test",
+            )
+            table = "episodic_memory"
+
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+        memory.conn.execute("BEGIN")
+
+        with pytest.raises(RuntimeError, match="cache unavailable"):
+            memory.invalidate(memory_id)
+
+        assert memory.conn.in_transaction
+        memory.conn.rollback()
+        row = memory.conn.execute(
+            f"SELECT valid_until FROM {table} WHERE id = ?", (memory_id,)
+        ).fetchone()
+        assert row is not None
+        assert row["valid_until"] is None
+    finally:
+        if memory.conn.in_transaction:
+            memory.conn.rollback()
+        _close_memory(memory)
+
+
+def test_invalidate_keeps_cache_invalidation_error_during_deferred_commit(
+    monkeypatch, tmp_path: Path
+):
+    """A deferred batch has not committed when invalidate() returns."""
+    memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+
+    def fail_invalidation():
+        raise RuntimeError("cache unavailable")
+
+    try:
+        memory_id = memory.remember("issue 594 deferred invalidate sentinel", source="test")
+        monkeypatch.setattr(memory, "_invalidate_query_cache", fail_invalidation)
+
+        with pytest.raises(RuntimeError, match="cache unavailable"):
+            with beam_module._deferred_commits(memory.conn):
+                assert memory.invalidate(memory_id) is True
+
+        row = memory.conn.execute(
+            "SELECT valid_until FROM working_memory WHERE id = ?", (memory_id,)
+        ).fetchone()
+        assert row is not None
+        assert row["valid_until"] is None
+    finally:
+        if memory.conn.in_transaction:
+            memory.conn.rollback()
         _close_memory(memory)
 
 

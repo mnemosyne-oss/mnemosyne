@@ -60,6 +60,83 @@ _EXPORT_REQUIRED_TABLES = frozenset(_EXPORT_REQUIRED_COLUMNS)
 _BANK_RESOLUTION_FAILED = object()
 
 
+def _safe_completeness_label(value: object, fallback: str) -> str:
+    """Return a bounded terminal-safe manifest label, never raw import text."""
+    if not isinstance(value, str):
+        return fallback
+    label = "".join(
+        char for char in value if char.isascii() and (char.isalnum() or char in "_.-")
+    )[:80]
+    return label or fallback
+
+
+def _completeness_details(result: object) -> str:
+    """Format bounded, terminal-safe portable-export omission details."""
+    if not isinstance(result, dict):
+        return ""
+    details = []
+    omitted = result.get("omitted_surfaces", [])
+    if isinstance(omitted, list):
+        for surface in omitted[:20]:
+            if not isinstance(surface, dict):
+                continue
+            table = _safe_completeness_label(surface.get("table"), "omitted-surface")
+            row_count = surface.get("row_count")
+            if isinstance(row_count, int) and not isinstance(row_count, bool) and row_count >= 0:
+                details.append(f"{table} ({row_count})")
+            else:
+                details.append(table)
+    partial = result.get("partial_surfaces", [])
+    if isinstance(partial, list):
+        for surface in partial[:20]:
+            if not isinstance(surface, dict):
+                continue
+            section = _safe_completeness_label(surface.get("section"), "partial-surface")
+            fields = surface.get("omitted_fields", [])
+            field_names = []
+            if isinstance(fields, list):
+                for field in fields[:20]:
+                    if isinstance(field, dict):
+                        field_name = _safe_completeness_label(field.get("field"), "field")
+                        affected_rows = field.get("affected_rows")
+                        if (
+                            isinstance(affected_rows, int)
+                            and not isinstance(affected_rows, bool)
+                            and affected_rows >= 0
+                        ):
+                            field_names.append(f"{field_name} ({affected_rows})")
+                        else:
+                            field_names.append(field_name)
+            details.append(
+                f"{section} missing {', '.join(field_names)}" if field_names else section
+            )
+    return "; ".join(details)
+
+
+def _print_completeness_warning(result: object, *, imported: bool) -> None:
+    """Print portable export completeness state without echoing unsafe manifest text."""
+    if not isinstance(result, dict):
+        return
+    complete_key = "restore_complete" if imported else "complete"
+    complete = result.get(complete_key)
+    if complete is False:
+        details = _completeness_details(result)
+        if imported:
+            omitted = result.get("omitted_surfaces", [])
+            partial = result.get("partial_surfaces", [])
+            omitted_count = len(omitted) if isinstance(omitted, list) else 0
+            partial_count = len(partial) if isinstance(partial, list) else 0
+            warning = (
+                "  WARNING: imported supported data only; source export reported "
+                f"{omitted_count} omitted and {partial_count} partial surface(s)"
+            )
+        else:
+            warning = "  WARNING: portable export is partial"
+        print(f"{warning}; {details}" if details else warning)
+    elif imported and complete is None:
+        print("  NOTE: source export predates completeness reporting")
+
+
 def _export_schema_is_complete_read_only(db_path: Path) -> bool:
     """Check selected export tables and read columns without opening it writable."""
     db_uri = f"{db_path.resolve().as_uri()}?mode=ro"
@@ -391,6 +468,7 @@ def mnemosyne_command(args):
             mem = Mnemosyne(session_id="hermes_default", bank=bank)
             result = mem.export_to_file(output_path)
             print(f"Exported {result['working_memory_count']} working, {result['episodic_memory_count']} episodic, {result['legacy_memories_count']} legacy, {result['triples_count']} triples to {output_path}")
+            _print_completeness_warning(result, imported=False)
         except Exception as e:
             print(f"Export failed: {e}")
             return 1
@@ -591,6 +669,7 @@ def mnemosyne_command(args):
             print(f"  Episodic: +{beam_stats.get('episodic_memory', {}).get('inserted', 0)}")
             print(f"  Legacy: +{legacy_stats.get('inserted', 0)}")
             print(f"  Triples: +{triples_stats.get('inserted', 0)}")
+            _print_completeness_warning(stats, imported=True)
             if force:
                 print(
                     "  (force mode: overwrites would be applied)"

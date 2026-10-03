@@ -62,29 +62,49 @@ class ContentResolver(Protocol):
     schemes: frozenset[str]          # {"blob"} | {"archive"} | {"file"} | ...
 
     def head(self, uri: str) -> Optional[ResolvedMeta]:
-        """Cheap existence and metadata probe. None if unresolvable."""
+        """Cheap existence and metadata probe.
+
+        None means "not my scheme, or not a URI I can parse".
+        ResolvedMeta(exists=False) means "mine, and gone".
+        """
 
     def open(self, uri: str) -> Optional[BinaryIO]:
         """Lazy byte stream. None if unavailable."""
 
-    def presign(self, uri: str, ttl_s: int) -> Optional[str]:
+    def presign(self, uri: str, *, ttl_s: int = 300) -> Optional[str]:
         """A short-lived URL a third party can fetch. None if unsupported."""
 ```
 
 `ResolvedMeta` carries `exists`, `byte_size`, `mime`, `content_hash`, `etag`.
 
+> **Correction (2026-07-30), two signature fixes.**
+>
+> **1. `head` must distinguish "not mine" from "gone".** The original docstring said only "None if unresolvable", collapsing two states that §3.2.1 depends on separating: `mnemosyne doctor` validating that a reference is still live needs "the file is missing" to be a *different answer* from "no resolver handles this scheme". `ResolvedMeta.exists` exists precisely to carry that, and returning `None` for both makes it unreachable.
+>
+> **2. `ttl_s` is keyword-only with a default.** As drafted it was positional, contradicting the `llm_backends` convention this section says it is copying — one positional argument, everything else keyword-only (`llm_backends.py:37-47`).
+
 **`presign` is the load-bearing method.** It is how a cloud vision provider (RFC 0002) reaches bytes that Mnemosyne does not want to read, buffer, or proxy. Without it, either the brain streams every megabyte through its own process to hand to a provider, or media understanding only works for local files. With it, "the archive is a separate product" becomes structurally true rather than aspirational: the archive serves bytes directly to whoever needs them, and the brain only ever passes URIs around.
 
 ### 2.3 Ship `BlobResolver` in the same change
 
-A `BlobResolver` over `content_sanitizer._blob_root()`, giving the existing blob store its first reader. Two details from §2.1 constrain `head`:
+A `BlobResolver` over `content_sanitizer._blob_root()`, giving the existing blob store its first reader. Two details constrain `head`:
 
-- `mime` is populated only on the `data:` URI branch (`content_sanitizer.py:128`). For size-cap and entropy blobs, `head` must sniff the bytes or return `mime=None`. It must not guess.
+- **`mime` is sniffed or `None`, on all three branches.** `head` must not guess.
 - `presign` returns `None`. Local files have no presignable URL. Callers must handle `None` by falling back to `open`, or by skipping the provider call.
+
+> **Correction (2026-07-30): the original wording of the first bullet was wrong, in a way that would send an implementer looking for something that does not exist.**
+>
+> It read: "`mime` is populated only on the `data:` URI branch (`content_sanitizer.py:128`). For size-cap and entropy blobs, `head` must sniff the bytes or return `mime=None`." That implies the data-URI branch gives `BlobResolver` a mime it can return. It does not. That mime is written into the **memory row's `metadata_json`** (`beam.py:3251-3256`, `memory.py:358-364`), not into anything addressable by `blob://sha256/<hash>`. The blob store on disk holds bare bytes at a hash path with no sidecar and no filename.
+>
+> So the rule is uniform: **sniff-or-`None` on all three branches.** Sniffing means reading a small prefix and matching magic bytes; it explicitly excludes `mimetypes.guess_type` (there is no filename to guess from — the path *is* the hash) and excludes defaulting to `application/octet-stream`, which is a guess wearing a disguise.
+>
+> A resolver that joined against `working_memory.metadata_json` to recover the declared mime is conceivable but out of scope: it would put a database dependency inside a filesystem resolver, and the two can disagree.
+
+**One thing this section does not say, and must.** Nothing here specifies **who registers `BlobResolver`**. Unaddressed, the forty lines that exist to close the "blobs are unreachable" bug close nothing, because no code path ever constructs one. The registry in §2.4 therefore resolves in two tiers: an explicit registration dict first, then a built-in default map containing `{"blob": BlobResolver}`. This makes byte access work with zero configuration, and it makes `clear_content_resolvers()` restore the built-in rather than *remove* blob access — which matters, because §2.4 mandates calling exactly that in `tests/conftest.py` before every test.
 
 ### 2.4 Registration and absence
 
-Process-global registry keyed by scheme: `set_content_resolver(resolver)`, `get_resolver(scheme)`, `clear_content_resolvers()`. Per RFC 0002 §5, these globals **must** be reset in `tests/conftest.py` beside the existing `llm_backends._backend` reset at `:63-71`.
+Process-global registry keyed by scheme: `set_content_resolver(resolver)`, `get_resolver(scheme)`, `clear_content_resolvers()`. Per RFC 0002 §5, these globals **must** be reset in `tests/conftest.py` beside the existing `llm_backends._backend` reset at `:64-69`.
 
 When no resolver is registered for a scheme, `get_resolver` returns `None` and every caller degrades:
 
@@ -147,7 +167,7 @@ The point of reference hashes and moment spans is to get the utility of media me
 | 2 | **No provider call without explicit opt-in.** | `MNEMOSYNE_MODALITY_ENABLED` defaults false (RFC 0002 §3.4). With it unset, a test asserts zero sockets opened and zero backend invocations |
 | 3 | **The brain never persists media bytes.** | `media_assets` has no BLOB column (RFC 0003 §2.1), and a test asserts the media ingest path never calls `content_sanitizer._store_blob` |
 | 4 | **Recall generates no outbound traffic.** | A test asserts no resolver method is called during `recall()` |
-| 5 | **Deletion is complete and propagates.** | `forget_asset(asset_id, cascade=True)` removes moments, their memory rows, their `memory_embeddings` and `vec_working` entries via `_wm_vec_delete` (`beam.py:2204`), and emits DELETE rows into `memory_events` (`beam.py:745`) so the deletion reaches synced devices |
+| 5 | **Deletion is complete and propagates.** | `forget_asset(asset_id, cascade=True)` removes moments, their memory rows, their `memory_embeddings` and `vec_working` entries via `_wm_vec_delete` (`beam.py:2206`), and emits DELETE rows into `memory_events` (`beam.py:745`) so the deletion reaches synced devices |
 | 6 | **The index is legible.** | Everything stored about an asset is human-readable text plus a reference, per RFC 0002 §2. No opaque media vectors |
 
 Invariant 6 is the substantive difference from tools like Microsoft Recall, and it is worth stating plainly in user-facing docs: what Mnemosyne knows about your media is a list of sentences you can read, search, edit, and delete.
@@ -210,7 +230,7 @@ These are the owner's calls and are deliberately left unresolved here.
 | Registry pattern to copy | ✅ | `core/llm_backends.py:24-123` |
 | Frontmatter parse and vault I/O | ⚠️ export-only | `integrations/obsidian-mnemosyne/main.ts:92` |
 | Source-plugin pattern for the archive to copy | ✅ | `core/importers/base.py:48`, `__init__.py:44` |
-| Deletion propagation through sync | ✅ | `beam.py:745`, `beam.py:2204` |
+| Deletion propagation through sync | ✅ | `beam.py:745`, `beam.py:2206` |
 | A resolver abstraction | ❌ | nowhere |
 | Any way to read a stored blob | ❌ | nowhere |
 | An index-handoff contract | ❌ | nowhere |
@@ -283,7 +303,7 @@ These are the owner's calls and are deliberately left unresolved here.
 | `mnemosyne/core/content_sanitizer.py` | unchanged. Read by `BlobResolver` | 169 |
 | `mnemosyne/core/media.py` | RFC 0003. Stores `archive_locator`, never parses it | ~350 |
 | `mnemosyne/tool_schemas.py`, `mcp_tools.py` | 2 media tools, plus **both** Hermes copies | +~120 |
-| `tests/conftest.py` | reset the resolver registry beside `:63-71` | +~6 |
+| `tests/conftest.py` | reset the resolver registry beside `:64-69` | +~6 |
 | `integrations/obsidian-mnemosyne/main.ts` | export-only today. Candidate prototype for Part 2 | 318 |
 | `mnemosyne/core/importers/base.py` | the plugin pattern the archive should copy | 250 |
 
@@ -297,6 +317,12 @@ Three gaps, in order of value per line of code:
 
 1. **Blobs are unreachable** and always have been. Roughly forty lines of `BlobResolver` fixes a live data-availability hole, and it is worth shipping on its own merits regardless of the rest of this document.
 2. **No seam for byte access**, which would otherwise force local-filesystem-only media support or byte proxying through the brain.
+
+> **Correction (2026-07-30): gap 2 is a blocker, not a nicety, and the sequencing below understates it.**
+>
+> This section recommends that `ContentResolver` plus `BlobResolver` "land with RFC 0003 phase 0, because they close an existing bug" — framing byte access as independently valuable but optional to the provider work. It is not optional. RFC 0002's `DescribeRequest` carries a URI and no bytes, so without a resolver to supply them the OpenAI-compatible adapter can describe **publicly fetchable URLs and nothing else** — no local file, no `blob://` reference. For a local-first memory system, that is close to describing nothing.
+>
+> **`ContentResolver` is therefore a hard prerequisite of the vision adapter**, and the adapter must not be scheduled before it. RFC 0002 §3.1's `DescribeRequest.fetch` field is the seam through which the two connect.
 3. **No index-handoff contract**, which is the gap that determines whether a two-product architecture is real or just a diagram.
 
 Recommended sequencing: `ContentResolver` plus `BlobResolver` land with RFC 0003 phase 0, because they close an existing bug. The MCP handoff tools land with phase 1. Part 2 begins only after the contract has one working implementation, which per §6 should probably be the Obsidian plugin learning to read.

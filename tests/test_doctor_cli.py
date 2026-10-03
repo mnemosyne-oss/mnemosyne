@@ -479,19 +479,17 @@ def test_doctor_cli_single_output_failure_preserves_target_and_cleans_temps(
             return real_replace(source, destination)
 
         monkeypatch.setattr(doctor.os, "replace", fail_replace)
-        error = "simulated CLI single-target replace failure"
     else:
 
         def fail_fsync(_descriptor):
             raise OSError("simulated CLI single-target fsync failure")
 
         monkeypatch.setattr(doctor.os, "fsync", fail_fsync)
-        error = "simulated CLI single-target fsync failure"
 
     with pytest.raises(SystemExit) as raised:
         cli.cmd_doctor(["--db", str(db_path), "--format", output_format, output_flag, str(target)])
 
     assert raised.value.code == 1
-    assert error in capsys.readouterr().err
+    assert capsys.readouterr().err == "Error: doctor_report_failed\n"
     assert target.read_text() == previous
     assert not list(tmp_path.glob(".doctor-*"))

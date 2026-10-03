@@ -48,7 +48,7 @@ Jump into the [tutorial](tutorial.md). It takes 10 minutes: generate a key, star
 
 ## Self-hosting configs
 
-Ready-to-copy deployment files live in [deploy/sync/](https://github.com/AxDSan/mnemosyne/tree/main/deploy/sync):
+Ready-to-copy deployment files live in [deploy/sync/](https://github.com/mnemosyne-oss/mnemosyne/tree/main/deploy/sync):
 
 | File | What it does |
 |------|-------------|

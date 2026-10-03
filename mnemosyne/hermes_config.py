@@ -7,6 +7,59 @@ from pathlib import Path
 from typing import Any
 
 
+_ConfigFingerprint = tuple[int, int, int, int, int]
+_CONFIG_CACHE: dict[Path, tuple[_ConfigFingerprint, dict[str, Any]]] = {}
+
+
+def _fingerprint_from_stat(stat: os.stat_result) -> _ConfigFingerprint:
+    """Return a replacement-sensitive fingerprint from a stat result."""
+    return (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+
+
+def _config_fingerprint(config_path: Path) -> _ConfigFingerprint:
+    """Return a replacement-sensitive fingerprint for a config file."""
+    return _fingerprint_from_stat(config_path.stat())
+
+
+def _load_hermes_config(config_path: Path, yaml: Any) -> dict[str, Any] | None:
+    """Load a safe YAML mapping, reusing it only while its file is unchanged."""
+    try:
+        fingerprint = _config_fingerprint(config_path)
+    except OSError:
+        _CONFIG_CACHE.pop(config_path, None)
+        return None
+
+    cached = _CONFIG_CACHE.get(config_path)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+
+    try:
+        loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+        with config_path.open() as config_file:
+            read_fingerprint = _fingerprint_from_stat(os.fstat(config_file.fileno()))
+            config = yaml.load(config_file, Loader=loader)
+    except Exception:
+        _CONFIG_CACHE.pop(config_path, None)
+        return None
+
+    if config is None:
+        config = {}
+    if not isinstance(config, dict):
+        _CONFIG_CACHE.pop(config_path, None)
+        return {}
+
+    try:
+        parsed_fingerprint = _config_fingerprint(config_path)
+    except OSError:
+        _CONFIG_CACHE.pop(config_path, None)
+        return None
+    if parsed_fingerprint != read_fingerprint:
+        _CONFIG_CACHE.pop(config_path, None)
+        return config
+    _CONFIG_CACHE[config_path] = (read_fingerprint, config)
+    return config
+
+
 def read_hermes_config_key(hermes_home: str | None, key: str) -> Any:
     """Read ``memory.mnemosyne.<key>`` from a Hermes ``config.yaml``.
 
@@ -18,20 +71,21 @@ def read_hermes_config_key(hermes_home: str | None, key: str) -> Any:
     # hermes_home=...). HERMES_HOME is the explicit active-profile authority in
     # that phase; do not fall back to ~/.hermes, which could cross profiles.
     resolved_home = hermes_home or os.environ.get("HERMES_HOME")
-    config_path = os.path.join(resolved_home, "config.yaml") if resolved_home else ""
-    if not config_path or not os.path.exists(config_path):
+    if not resolved_home:
+        return None
+    try:
+        config_path = Path(resolved_home, "config.yaml").resolve()
+    except (OSError, RuntimeError):
         return None
     try:
         import yaml
     except ImportError:
-        return read_config_key_without_yaml(config_path, key)
+        return read_config_key_without_yaml(str(config_path), key)
 
-    try:
-        with open(config_path) as f:
-            config = yaml.safe_load(f) or {}
-    except Exception:
+    config = _load_hermes_config(config_path, yaml)
+    if config is None:
         return None
-    memory = config.get("memory") if isinstance(config, dict) else None
+    memory = config.get("memory")
     memory = memory if isinstance(memory, dict) else {}
     mnemosyne = memory.get("mnemosyne")
     mnemosyne = mnemosyne if isinstance(mnemosyne, dict) else {}

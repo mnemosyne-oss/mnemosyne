@@ -220,7 +220,43 @@ def test_is_installed_stays_false_for_broken_symlink(tmp_path):
     assert install.is_installed(hermes_home_path=tmp_path) is False
 
 
+def test_wrapper_install_accepts_an_11_second_import_with_60_second_timeout(tmp_path, monkeypatch):
+    """A slow but healthy selected runtime must not inherit the old 10s ceiling."""
+    site_packages = tmp_path / "site-packages"
+    site_packages.mkdir()
+    observed_timeouts = []
+
+    def simulated_subprocess(command, **kwargs):
+        timeout = kwargs["timeout"]
+        observed_timeouts.append(timeout)
+        if "-S" in command and timeout < 11:
+            raise subprocess.TimeoutExpired(command, timeout)
+        if "-S" in command:
+            return subprocess.CompletedProcess(command, 0, "0.0-test\n", "")
+        return subprocess.CompletedProcess(command, 0, f"{site_packages}\n", "")
+
+    monkeypatch.setattr(install.subprocess, "run", simulated_subprocess)
+
+    target = install.install_plugin(
+        hermes_home_path=tmp_path,
+        mode="wrapper",
+        python=sys.executable,
+        import_timeout=60.0,
+        link_profiles=False,
+    )
+
+    assert target.is_dir()
+    assert observed_timeouts == [60.0, 60.0]
+
+
 def test_install_plugin_wrapper_creates_persistent_shim(tmp_path):
+    packaged_plugin_path = install._resolve_package_dir() / "plugin.yaml"
+    packaged_plugin_before = packaged_plugin_path.read_bytes()
+    source_plugin_path = Path(__file__).parents[1] / "plugin.yaml"
+    source_plugin_before = source_plugin_path.read_bytes()
+    catalog_plugin_path = Path(__file__).parents[2] / "hermes-catalog" / "plugin.yaml"
+    catalog_plugin_before = catalog_plugin_path.read_bytes()
+
     target = install.install_plugin(
         hermes_home_path=tmp_path,
         force=False,
@@ -247,6 +283,13 @@ def test_install_plugin_wrapper_creates_persistent_shim(tmp_path):
     assert (target / "plugin.yaml").is_file()
     installed_plugin = yaml.safe_load((target / "plugin.yaml").read_text(encoding="utf-8"))
     assert installed_plugin["version"] == mnemosyne_hermes.__version__
+    assert installed_plugin["python_runtime"] == "external"
+    assert "python_runtime" not in yaml.safe_load(packaged_plugin_before)
+    assert "python_runtime" not in yaml.safe_load(source_plugin_before)
+    assert "python_runtime" not in yaml.safe_load(catalog_plugin_before)
+    assert packaged_plugin_path.read_bytes() == packaged_plugin_before
+    assert source_plugin_path.read_bytes() == source_plugin_before
+    assert catalog_plugin_path.read_bytes() == catalog_plugin_before
 
     state = install.plugin_state(hermes_home_path=tmp_path)
     assert state.status == "installed"
@@ -255,6 +298,8 @@ def test_install_plugin_wrapper_creates_persistent_shim(tmp_path):
     assert state.wrapper_python == Path(sys.executable).absolute()
     assert state.wrapper_site_packages is not None
     assert state.wrapper_import_ok is True
+    assert install._is_wrapper_plugin_target(target) is True
+    assert install._provider_init_is_mnemosyne(target / "__init__.py") is True
 
 
 def test_plugin_state_uses_legacy_wrapper_metadata_without_manifest(tmp_path):
@@ -382,6 +427,11 @@ def test_check_wrapper_import_accepts_direct_package_without_dist_metadata(tmp_p
     package = site_packages / "mnemosyne_hermes"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("__version__ = 'test'\n", encoding="utf-8")
+    core = site_packages / "mnemosyne" / "core"
+    core.mkdir(parents=True)
+    (core.parent / "__init__.py").write_text("", encoding="utf-8")
+    (core / "__init__.py").write_text("", encoding="utf-8")
+    (core / "beam.py").write_text("", encoding="utf-8")
 
     ok, error, invalid_runtime = install._check_wrapper_import(site_packages, Path(sys.executable))
 
@@ -395,8 +445,11 @@ def test_plugin_state_classifies_timed_out_wrapper_import_as_stale(tmp_path, mon
     site_packages = install._site_packages_for_python(Path(sys.executable))
     install._write_wrapper_plugin(target, python=Path(sys.executable), site_packages=site_packages)
 
+    observed_timeouts = []
+
     def raise_timeout(*args, **kwargs):
-        raise subprocess.TimeoutExpired(args[0], 10)
+        observed_timeouts.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
 
     monkeypatch.setattr(install.subprocess, "run", raise_timeout)
 
@@ -405,7 +458,14 @@ def test_plugin_state_classifies_timed_out_wrapper_import_as_stale(tmp_path, mon
     assert state.status == "stale_wrapper"
     assert state.installed is False
     assert state.wrapper_import_ok is False
-    assert state.wrapper_import_error == f"wrapper Python import timed out: {Path(sys.executable)}"
+    assert state.wrapper_import_error is not None
+    assert str(Path(sys.executable)) in state.wrapper_import_error
+    assert observed_timeouts == [60.0]
+    assert "fixed default 60-second policy" in state.wrapper_import_error
+    assert "Inspect the selected interpreter and its import performance" in state.wrapper_import_error
+    assert "--import-timeout only affects installer validation" in state.wrapper_import_error
+    assert "--import-timeout 120" not in state.wrapper_import_error
+    assert "Retry with:" not in state.wrapper_import_error
 
 
 def test_plugin_state_reports_stale_wrapper_target(tmp_path):

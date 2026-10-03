@@ -28,10 +28,11 @@ Building on:
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Set
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,19 +42,11 @@ except ImportError:  # numpy is required by other voices too; guard for parity
     np = None
 
 from mnemosyne.core.episodic_graph import EpisodicGraph
+from mnemosyne.core.verbatim_ledger import ExclusionSnapshot, exclusion_sql, resolve_exclusions
 from mnemosyne.core.veracity_consolidation import (
     VeracityConsolidator,
     compute_fact_id,
 )
-
-# Cached embedding dim for vector normalization — resolved once at import time.
-# Avoids a per-row import inside the bit-vec normalization hot path.
-try:
-    from mnemosyne.core.embeddings import EMBEDDING_DIM as _EMB_DIM
-except ImportError:
-    _EMB_DIM = 384
-_EMBEDDING_DIM_BITS = float(_EMB_DIM)
-
 
 def _env_disabled(name: str) -> bool:
     """A/B toggle helper: return True iff env var is set to a falsy
@@ -124,6 +117,16 @@ class PolyphonicRecallEngine:
         self.graph = EpisodicGraph(db_path=self.db_path, conn=conn)
         self.consolidator = VeracityConsolidator(db_path=self.db_path, conn=conn)
 
+        # [C4] Per-call degraded-path signal for recall diagnostics.
+        # The vector voice prefers the sqlite-vec `vec_episodes` fast
+        # path for the EM tier and falls back to a numpy full-scan
+        # over `memory_embeddings` when sqlite-vec is unavailable,
+        # errors, or its ANN hits all get filtered out. That is the
+        # polyphonic analogue of the linear path's em_fallback (the
+        # engine has no substring-scoring tier). reset per recall()
+        # call by the voice; beam.py reads it for record_fallback_used.
+        self.last_call_fallback = {"em": False, "wm": False}
+
         # Voice weights (deterministic, learned from validation)
         self.voice_weights = {
             "vector": 0.35,
@@ -136,7 +139,10 @@ class PolyphonicRecallEngine:
                top_k: int = 10, context_budget: int = 4000,
                *, default_dense_source_filter: bool = True,
                source: Optional[str] = None,
-               topic: Optional[str] = None) -> List[PolyphonicResult]:
+               topic: Optional[str] = None,
+               episodic_where: Optional[str] = None,
+               episodic_params: Sequence[Any] = (),
+               exclude_captures: Optional[ExclusionSnapshot] = None) -> List[PolyphonicResult]:
         """
         Polyphonic recall: all 4 voices in parallel, then combine.
 
@@ -159,25 +165,58 @@ class PolyphonicRecallEngine:
             topic: Same as ``source`` -- topics are stored in the source
                 field for now (pending a dedicated topic column), exactly as
                 beam._wm_search does.
+            episodic_where / episodic_params: Trusted predicate built by
+                BeamMemory for complete episodic eligibility before bounded
+                vector selection. Standalone callers retain the local
+                supersession/expiry/source fallback.
+            exclude_captures: Revocable provider-owned WM capture proofs.
+                Exclude working contributions before ranking/dedup/fusion.
+                Untyped graph/fact hits with dual-tier IDs abstain rather than
+                borrowing a working score for an episodic representation.
 
         Returns:
             List of PolyphonicResult, sorted by combined score
         """
-        # Run all 4 voices
+        excluded = set()
+        if exclude_captures is not None:
+            if self.conn is not None:
+                excluded = resolve_exclusions(self.conn, exclude_captures)
+            else:
+                conn = sqlite3.connect(str(self.db_path))
+                try:
+                    excluded = resolve_exclusions(conn, exclude_captures)
+                finally:
+                    conn.close()
+        graph_results = self._graph_voice(query)
+        fact_results = self._fact_voice(query)
+        if excluded:
+            # These voices carry no producing-tier evidence. An ambiguous
+            # dual-tier hit must fail open, not rescue a WM score as episodic.
+            ambiguous = {r.memory_id for r in graph_results + fact_results} & excluded
+            excluded -= ambiguous
         vector_results = self._vector_voice(
             query_embedding,
             default_dense_source_filter=default_dense_source_filter,
             source=source,
             topic=topic,
+            episodic_where=episodic_where,
+            episodic_params=episodic_params,
+            **({"excluded_wm_ids": excluded} if excluded else {}),
         )
-        graph_results = self._graph_voice(query)
-        fact_results = self._fact_voice(query)
-        temporal_results = self._temporal_voice(query)
-        
-        # Combine results
+        # Preserve the producing tier of surviving episodic vector hits when
+        # their WM twin was excluded BEFORE vector dedup. This is provenance,
+        # not post-fusion twin rescue. Ordinary explicit recall is unchanged.
+        for result in vector_results:
+            if (result.memory_id in excluded
+                    and result.metadata.get("embedding_tier") == "episodic"):
+                result.metadata["_self_echo_tier"] = "episodic"
+        temporal_results = self._temporal_voice(
+            query, **({"excluded_wm_ids": excluded} if excluded else {})
+        )
         combined = self._combine_voices(
             vector_results, graph_results, fact_results, temporal_results
         )
+
         self._hydrate_result_content(combined)
 
         # Diversity re-rank
@@ -187,10 +226,103 @@ class PolyphonicRecallEngine:
         context = self._assemble_context(reranked, context_budget)
         
         return context
-    
-    def _vector_voice(self, query_embedding, default_dense_source_filter: bool = True,
-                      source: Optional[str] = None,
-                      topic: Optional[str] = None) -> List[RecallResult]:
+
+    def _legacy_episodic_vector_voice(
+        self,
+        conn,
+        query_unit,
+        now_iso,
+        source=None,
+        topic=None,
+        episodic_where=None,
+        episodic_params=(),
+    ):
+        """Scan eligible vec rows, retaining only their top-20 hits."""
+        import heapq
+        from mnemosyne.core.beam import (
+            EM_VEC_ADMIT,
+            _vec_bit_blob_cosine,
+            _vec_float32_blob_cosine,
+            _vec_int8_blob_cosine,
+            _vec_table_type_strict,
+        )
+
+        # Read the actual table representation, never infer it from blob length
+        # or the configured model. Unknown types must fall back, not misdecode.
+        vec_type = _vec_table_type_strict(conn)
+        emb_json = json.dumps(query_unit.tolist())
+        query_blob = b""
+        if vec_type == "int8":
+            query_blob = bytes(conn.execute(
+                "SELECT vec_quantize_int8(?, 'unit')", (emb_json,)
+            ).fetchone()[0])
+        elif vec_type == "bit":
+            query_blob = bytes(conn.execute(
+                "SELECT vec_quantize_binary(?)", (emb_json,)
+            ).fetchone()[0])
+        elif vec_type != "float32":
+            raise ValueError("Unknown episodic vector representation")
+
+        if episodic_where is None:
+            clauses = [
+                "em.superseded_by IS NULL",
+                "(em.valid_until IS NULL OR julianday(em.valid_until) > julianday(?))",
+            ]
+            params = [now_iso]
+            source_filter = source or topic
+            if source_filter:
+                clauses.append("em.source = ?")
+                params.append(source_filter)
+            episodic_where = " AND ".join(clauses)
+            episodic_params = params
+        rows = conn.execute(
+            f"""
+            SELECT em.id AS memory_id, v.embedding
+            FROM vec_episodes v JOIN episodic_memory em ON em.rowid = v.rowid
+            WHERE {episodic_where}
+            """,
+            tuple(episodic_params),
+        )
+
+        def candidates():
+            # No KNN or LIMIT: norms and ineligible rows must not hide a later
+            # survivor. nlargest bounds retained memory, not scanned coverage.
+            for row in rows:
+                blob = row["embedding"]
+                if vec_type == "int8":
+                    cosine = _vec_int8_blob_cosine(query_blob, blob)
+                elif vec_type == "bit":
+                    cosine = _vec_bit_blob_cosine(
+                        query_blob, blob, width=len(query_blob) * 8
+                    )
+                else:
+                    cosine = _vec_float32_blob_cosine(query_unit, blob)
+                if cosine < EM_VEC_ADMIT:
+                    continue
+                # Admission uses absolute cosine; keep the voice's existing
+                # numpy score scale for fusion and cross-tier deduplication.
+                sim = (cosine + 1.0) / 2.0
+                yield RecallResult(
+                    memory_id=row["memory_id"], score=sim, voice="vector",
+                    metadata={
+                        "similarity": sim, "cosine_similarity": cosine,
+                        "vec_type": vec_type, "embedding_tier": "episodic",
+                        "backend": "sqlite-vec",
+                    },
+                )
+
+        return heapq.nlargest(20, candidates(), key=lambda result: result.score)
+
+    def _vector_voice(
+        self,
+        query_embedding,
+        default_dense_source_filter: bool = True,
+        source: Optional[str] = None,
+        topic: Optional[str] = None,
+        episodic_where: Optional[str] = None,
+        episodic_params: Sequence[Any] = (),
+        excluded_wm_ids: Optional[Set[str]] = None,
+    ) -> List[RecallResult]:
         """
         Voice 1: Dense semantic similarity over WM + EM.
 
@@ -211,8 +343,11 @@ class PolyphonicRecallEngine:
 
         EM tier prefers sqlite-vec's `vec_episodes` virtual table when
         available (same fast-path the linear scorer uses via
-        `beam._vec_search`); falls through to numpy cosine over
-        `memory_embeddings` on any failure. WM tier uses numpy cosine
+        `beam._vec_search`). Unmarked stores stream representation-safe
+        scores from that same table; failures retain the existing JSON
+        fallback. Combining JSON-only and sqlite-vec candidates is explicitly
+        outside this change (#950).
+        WM tier uses numpy cosine
         (matches the linear path -- no sqlite-vec WM index exists
         today).
 
@@ -228,6 +363,12 @@ class PolyphonicRecallEngine:
         ablation experiments. Returns empty so RRF fusion sees no
         vector contribution.
         """
+        # Reset per-call fallback state before any early-return path:
+        # a prior call may have recorded em=True; if this call exits
+        # early (voice disabled, missing/empty embedding, zero norm)
+        # the engine would otherwise inherit stale degraded state and
+        # beam.py would record a false fallback for this call.
+        self.last_call_fallback = {"em": False, "wm": False}
         if _env_disabled("MNEMOSYNE_VOICE_VECTOR"):
             return []
         if query_embedding is None or np is None:
@@ -259,6 +400,18 @@ class PolyphonicRecallEngine:
             own_conn = True
         try:
             now_iso = datetime.now(timezone.utc).isoformat()
+            if episodic_where is None:
+                clauses = [
+                    "superseded_by IS NULL",
+                    "(valid_until IS NULL OR julianday(valid_until) > julianday(?))",
+                ]
+                params = [now_iso]
+                source_filter = source or topic
+                if source_filter:
+                    clauses.append("source = ?")
+                    params.append(source_filter)
+                episodic_where = " AND ".join(clauses)
+                episodic_params = params
             by_id: Dict[str, RecallResult] = {}
 
             # --- EM tier -- prefer sqlite-vec ANN, fall back to numpy ---
@@ -278,125 +431,225 @@ class PolyphonicRecallEngine:
                 # PolyphonicRecallEngine inside _get_polyphonic_engine).
                 # Both directions are runtime-only.
                 from mnemosyne.core.beam import (
+                    EM_VEC_ADMIT,
+                    _classify_vec_store_regime,
                     _vec_available,
-                    _effective_vec_type,
+                    _vec_bit_blob_cosine,
+                    _vec_float32_blob_cosine,
+                    _vec_int8_blob_cosine,
+                    _vec_search_with_blobs,
+                    _vec_table_type_strict,
                 )
 
                 if _vec_available(conn):
-                    vec_type = _effective_vec_type(conn)
-                    emb_json = json.dumps(
-                        query_embedding.astype(np.float32).tolist()
-                    )
-                    # sqlite-vec's MATCH planner needs LIMIT to be a
-                    # literal at planning time AND enforces a hard max
-                    # of 4096 (raises OperationalError: "k value in knn
-                    # query too large" above that). The fast path is a
-                    # top-K lookup, not a full scan, so we only need
-                    # enough candidates to survive post-fetch filter
-                    # dropouts (~50 buffer above the top-20 the engine
-                    # ultimately returns). vec_limit (which controls
-                    # the numpy fallback's full-scan budget under
-                    # BEAM_MODE) is irrelevant here.
-                    k_inline = 60
-                    if vec_type == "bit":
-                        rank_sql = (
-                            "SELECT rowid, distance FROM vec_episodes "
-                            "WHERE embedding MATCH vec_quantize_binary(?) "
-                            f"AND k={k_inline} ORDER BY distance"
+                    vec_type = _vec_table_type_strict(conn)
+                    try:
+                        _poly_regime = _classify_vec_store_regime(
+                            conn, "vec_episodes"
                         )
-                    elif vec_type == "int8":
-                        rank_sql = (
-                            "SELECT rowid, distance FROM vec_episodes "
-                            "WHERE embedding MATCH vec_quantize_int8(?, 'unit') "
-                            f"AND k={k_inline} ORDER BY distance"
+                    except Exception:
+                        _poly_regime = "unknown"
+                    if _poly_regime != "pure":
+                        legacy_results = self._legacy_episodic_vector_voice(
+                            conn,
+                            query_unit,
+                            now_iso,
+                            source=source,
+                            topic=topic,
+                            episodic_where=episodic_where,
+                            episodic_params=episodic_params,
                         )
+                        by_id.update((r.memory_id, r) for r in legacy_results)
+                        # A successful vec scan is authoritative even when
+                        # every row is below admission. Do not fuse JSON-only
+                        # candidates here; #950 owns that contract.
+                        em_consumed_via_vec_episodes = True
                     else:
-                        rank_sql = (
-                            "SELECT rowid, distance FROM vec_episodes "
-                            f"WHERE embedding MATCH ? AND k={k_inline} "
-                            "ORDER BY distance"
-                        )
-                    vec_rows = conn.execute(rank_sql, (emb_json,)).fetchall()
-                    if vec_rows:
-                        rowid_to_dist = {
-                            r["rowid"]: r["distance"] for r in vec_rows
-                        }
-                        # Map rowid → memory_id and apply WHERE-clause
-                        # parity with the numpy EM fallback. JOIN
-                        # ensures rows orphaned from episodic_memory
-                        # (e.g., deleted post-vec_episodes-insert) drop
-                        # out cleanly.
-                        rowid_list = list(rowid_to_dist.keys())
-                        placeholders = ",".join("?" * len(rowid_list))
-                        em_rows_via_vec = conn.execute(
-                            f"""
-                            SELECT em.rowid AS rowid, em.id AS memory_id
-                            FROM episodic_memory em
-                            WHERE em.rowid IN ({placeholders})
-                              AND em.superseded_by IS NULL
-                              AND (em.valid_until IS NULL OR julianday(em.valid_until) > julianday(?))
-                            """,
-                            (*rowid_list, now_iso),
-                        ).fetchall()
-                        for row in em_rows_via_vec:
-                            mid = row["memory_id"]
-                            dist = rowid_to_dist.get(row["rowid"])
-                            if dist is None:
-                                continue
-                            # Normalize sqlite-vec distances to a
-                            # cosine-similarity-compatible [0, 1] scale
-                            # so cross-tier dedup against the WM tier's
-                            # numpy cosine values is meaningful.
-                            #
-                            # /review (4-source: Codex structured P2,
-                            # Codex adversarial MEDIUM, Claude
-                            # CRITICAL, perf HIGH) caught the pre-fix
-                            # behavior of using `1.0 - distance`
-                            # directly: bit-type Hamming distance is
-                            # an int in [0, EMBEDDING_DIM_BITS], so
-                            # the score went heavily negative
-                            # (~-383). WM cosine is in [-1, 1].
-                            # Dedup at `sim > existing.score` then
-                            # always preferred WM hits over EM
-                            # sqlite-vec hits, silently inverting the
-                            # tier-priority semantics for bit-quantized
-                            # vectors. Normalize per vec_type:
-                            #   bit:    1 - dist/EMBEDDING_DIM_BITS
-                            #   int8:   1 - dist/2  (cosine_dist in
-                            #                       [0, 2] for unit
-                            #                       vectors)
-                            #   raw f32: 1/(1+dist) (L2 → (0, 1])
-                            raw_dist = float(dist)
+                        def candidate_cosine(candidate, query_blob):
+                            row_blob = candidate.get("blob")
+                            if vec_type == "int8":
+                                if query_blob is None or row_blob is None:
+                                    return None
+                                return _vec_int8_blob_cosine(query_blob, row_blob)
                             if vec_type == "bit":
-                                # Resolved from configured model dim
-                                sim = 1.0 - (raw_dist / _EMBEDDING_DIM_BITS)
-                            elif vec_type == "int8":
-                                sim = 1.0 - (raw_dist / 2.0)
-                            else:
-                                sim = 1.0 / (1.0 + raw_dist)
-                            existing = by_id.get(mid)
-                            if existing is None or sim > existing.score:
-                                by_id[mid] = RecallResult(
-                                    memory_id=mid,
-                                    score=sim,
-                                    voice="vector",
-                                    metadata={
-                                        "similarity": sim,
-                                        "raw_distance": raw_dist,
-                                        "vec_type": vec_type,
-                                        "embedding_tier": "episodic",
-                                        "backend": "sqlite-vec",
-                                    },
+                                if query_blob is None or row_blob is None:
+                                    return None
+                                return _vec_bit_blob_cosine(
+                                    query_blob,
+                                    row_blob,
+                                    width=len(query_blob) * 8,
                                 )
-                        # Only mark EM consumed when the fast path
-                        # actually produced results. If all top-60
-                        # ANN hits failed the superseded/valid_until
-                        # filter (or orphaned the JOIN), fall through
-                        # to the numpy path so it can scan up to
-                        # vec_limit and find valid rows beyond the
-                        # truncated ANN candidate set. /review (4-source)
-                        # caught the silent EM-starvation regression.
-                        em_consumed_via_vec_episodes = bool(em_rows_via_vec)
+                            if vec_type == "float32":
+                                if row_blob is None:
+                                    return None
+                                return _vec_float32_blob_cosine(query_unit, row_blob)
+                            return None
+
+                        def knn_excludes_unseen_admitted_rows(
+                            vec_rows, query_blob
+                        ):
+                            """Prove the KNN boundary is past the admission range."""
+                            if not vec_rows:
+                                return False
+                            try:
+                                boundary = max(
+                                    float(row["distance"]) for row in vec_rows
+                                )
+                                if vec_type == "float32":
+                                    max_admitted_distance = (
+                                        math.sqrt(2.0 * (1.0 - EM_VEC_ADMIT))
+                                        + 1e-5
+                                    )
+                                elif vec_type == "bit":
+                                    if query_blob is None:
+                                        return False
+                                    width = len(query_blob) * 8
+                                    max_admitted_distance = (
+                                        math.acos(EM_VEC_ADMIT)
+                                        * width
+                                        / math.pi
+                                    )
+                                elif vec_type == "int8":
+                                    if query_blob is None:
+                                        return False
+                                    quantized_query = memoryview(
+                                        query_blob
+                                    ).cast("b")
+                                    query_norm = math.sqrt(sum(
+                                        value * value
+                                        for value in quantized_query
+                                    ))
+                                    # sqlite-vec 0.1.9 maps a unit component
+                                    # onto int8's 127 scale with less than one
+                                    # byte of quantization error. A normalized
+                                    # row's byte norm is therefore within
+                                    # sqrt(dimension) of 127.
+                                    norm_slack = math.sqrt(
+                                        len(quantized_query)
+                                    )
+                                    row_norms = (
+                                        max(0.0, 127.0 - norm_slack),
+                                        127.0 + norm_slack,
+                                    )
+                                    max_admitted_distance = max(
+                                        math.sqrt(max(
+                                            0.0,
+                                            query_norm * query_norm
+                                            + row_norm * row_norm
+                                            - 2.0 * query_norm * row_norm
+                                            * EM_VEC_ADMIT,
+                                        ))
+                                        for row_norm in row_norms
+                                    )
+                                else:
+                                    return False
+                            except (TypeError, ValueError):
+                                return False
+                            return boundary > max_admitted_distance
+
+                        knn_limit = 60
+                        eligible_scored = []
+                        em_rows_via_vec = []
+                        exact_scan_used = False
+                        while knn_limit:
+                            vec_rows, query_blob = _vec_search_with_blobs(
+                                conn, query_unit.tolist(), k=knn_limit
+                            )
+                            rowid_to_candidate = {
+                                row["rowid"]: row for row in vec_rows
+                            }
+                            em_rows_via_vec = []
+                            if rowid_to_candidate:
+                                rowids = list(rowid_to_candidate)
+                                for offset in range(0, len(rowids), 900):
+                                    chunk = rowids[offset : offset + 900]
+                                    placeholders = ",".join("?" * len(chunk))
+                                    em_rows_via_vec.extend(
+                                        conn.execute(
+                                            f"""
+                                            SELECT rowid, id AS memory_id
+                                            FROM episodic_memory
+                                            WHERE rowid IN ({placeholders})
+                                              AND ({episodic_where})
+                                            """,
+                                            (*chunk, *episodic_params),
+                                        ).fetchall()
+                                    )
+                            eligible_scored = []
+                            scorable_eligible = 0
+                            for row in em_rows_via_vec:
+                                candidate = rowid_to_candidate[row["rowid"]]
+                                cosine = candidate_cosine(candidate, query_blob)
+                                if cosine is not None:
+                                    scorable_eligible += 1
+                                if cosine is not None and cosine >= EM_VEC_ADMIT:
+                                    eligible_scored.append((row, candidate, cosine))
+                            if em_rows_via_vec and scorable_eligible == 0:
+                                raise ValueError("KNN candidates lack scoreable blobs")
+                            admission_range_exhausted = (
+                                bool(em_rows_via_vec)
+                                and knn_excludes_unseen_admitted_rows(
+                                    vec_rows, query_blob
+                                )
+                            )
+                            if (
+                                admission_range_exhausted
+                                or len(vec_rows) < knn_limit
+                            ):
+                                break
+                            if knn_limit >= 4096:
+                                # sqlite-vec caps KNN at 4096. If that finite
+                                # boundary still cannot exclude an unseen row
+                                # meeting admission, scan only the eligible join
+                                # so KNN preselection cannot starve it.
+                                exact_results = self._legacy_episodic_vector_voice(
+                                    conn,
+                                    query_unit,
+                                    now_iso,
+                                    source=source,
+                                    topic=topic,
+                                    episodic_where=episodic_where,
+                                    episodic_params=episodic_params,
+                                )
+                                by_id.update(
+                                    (r.memory_id, r) for r in exact_results
+                                )
+                                em_consumed_via_vec_episodes = True
+                                exact_scan_used = True
+                                break
+                            knn_limit = min(
+                                4096,
+                                max(knn_limit * 2, knn_limit + 60),
+                            )
+
+                        if not exact_scan_used:
+                            for row, candidate, cosine in eligible_scored:
+                                sim = min(
+                                    1.0, max(0.0, (cosine + 1.0) / 2.0)
+                                )
+                                mid = row["memory_id"]
+                                existing = by_id.get(mid)
+                                if existing is None or sim > existing.score:
+                                    by_id[mid] = RecallResult(
+                                        memory_id=mid,
+                                        score=sim,
+                                        voice="vector",
+                                        metadata={
+                                            "similarity": sim,
+                                            "cosine_similarity": cosine,
+                                            "raw_distance": float(
+                                                candidate["distance"]
+                                            ),
+                                            "vec_type": vec_type,
+                                            "embedding_tier": "episodic",
+                                            "backend": "sqlite-vec",
+                                        },
+                                    )
+                            # Preserve existing fallback semantics when the
+                            # usable ANN table has no eligible joined row.
+                            em_consumed_via_vec_episodes = bool(
+                                em_rows_via_vec
+                            )
             except (ImportError, AttributeError,
                     sqlite3.Error, ValueError, TypeError):
                 # Broader catch than the original tuple -- partial
@@ -412,15 +665,14 @@ class PolyphonicRecallEngine:
             if not em_consumed_via_vec_episodes:
                 try:
                     em_rows = conn.execute(
-                        """
+                        f"""
                         SELECT em.id AS memory_id, me.embedding_json
                         FROM memory_embeddings me
                         JOIN episodic_memory em ON me.memory_id = em.id
-                        WHERE em.superseded_by IS NULL
-                          AND (em.valid_until IS NULL OR julianday(em.valid_until) > julianday(?))
+                        WHERE {episodic_where}
                         LIMIT ?
                         """,
-                        (now_iso, vec_limit),
+                        (*episodic_params, vec_limit),
                     ).fetchall()
                 except sqlite3.OperationalError:
                     em_rows = []
@@ -493,6 +745,9 @@ class PolyphonicRecallEngine:
                     " AND wm.source <> 'honcho_message'))"
                     " AND wm.consolidated_at IS NULL"
                 )
+            echo_clause, echo_params = exclusion_sql(excluded_wm_ids, "wm.id")
+            wm_dense_predicate += echo_clause
+            wm_dense_params.extend(echo_params)
             try:
                 wm_rows = conn.execute(
                     f"""
@@ -543,6 +798,12 @@ class PolyphonicRecallEngine:
             results = sorted(
                 by_id.values(), key=lambda r: r.score, reverse=True
             )
+            # [C4] Surface whether the EM tier degraded to the numpy
+            # full-scan (sqlite-vec absent/failed, or its top-K ANN
+            # hits all dropped in the superseded/valid_until JOIN).
+            # WM tier always uses numpy cosine today (no sqlite-vec
+            # WM index exists), so WM is never a degraded path here.
+            self.last_call_fallback["em"] = not em_consumed_via_vec_episodes
             return results[:20]
         finally:
             if own_conn:
@@ -669,7 +930,7 @@ class PolyphonicRecallEngine:
         
         return results
     
-    def _temporal_voice(self, query: str) -> List[RecallResult]:
+    def _temporal_voice(self, query: str, excluded_wm_ids=None) -> List[RecallResult]:
         """
         Voice 4: Time-aware scoring.
 
@@ -711,22 +972,55 @@ class PolyphonicRecallEngine:
             if not cursor.fetchone():
                 return []
 
-            # Get memories from last 7 days
-            week_ago = (datetime.now() - timedelta(days=7)).isoformat()
-            cursor.execute("""
+            # Get memories from last 7 days. working_memory.timestamp is naive UTC
+            # (the beam writers stamp datetime.now(timezone.utc).replace(tzinfo=None)),
+            # so the cutoff has to be naive UTC too — a local `now` compares a UTC string
+            # against a local one and the window shifts by the host offset. #1094.
+            #
+            # julianday() rather than a raw `timestamp > ?`: these are TEXT columns, so a
+            # TEXT comparison orders an offset-bearing row by its written digits rather than
+            # by its instant, which gets both window membership and pre-LIMIT chronology
+            # wrong for mixed-format rows.
+            #
+            # The cost is a full scan: julianday() is not indexable under idx_wm_timestamp,
+            # so the plan degrades from SEARCH USING INDEX to SCAN + temp B-tree. Measured
+            # locally on 50k rows, median of 20 runs: 4.7 ms against 0.013 ms for the raw
+            # form. That is the accepted price — #1094 requires the instant-correct
+            # behaviour, and an expression index on julianday(timestamp) would restore the
+            # SEARCH but is a schema migration, which is not authorised here.
+            # tests/test_temporal_query_plan.py pins this plan and this budget on a synthetic
+            # 50k fixture — a regression guard, not an execution bound. If an expression index
+            # ever lands, the plan assertion flips to SEARCH and that test is the thing to
+            # revisit.
+            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+            week_ago = (now_utc - timedelta(days=7)).isoformat()
+            echo_clause, echo_params = exclusion_sql(excluded_wm_ids)
+            cursor.execute(f"""
                 SELECT id, content, timestamp, importance
                 FROM working_memory
-                WHERE timestamp > ?
-                ORDER BY timestamp DESC
+                WHERE julianday(timestamp) > julianday(?) {echo_clause}
+                ORDER BY julianday(timestamp) DESC
                 LIMIT 20
-            """, (week_ago,))
+            """, (week_ago, *echo_params))
 
             results = []
             for row in cursor.fetchall():
-                # Calculate temporal score
-                age = datetime.now() - datetime.fromisoformat(row["timestamp"])
+                # Calculate temporal score. A naive value is UTC (the storage contract
+                # that #1087 settled for canonical_facts, and what beam.py writes here);
+                # an aware value is normalised to UTC rather than to local. Converting to
+                # local with a bare astimezone() then subtracting local `now` is the same
+                # value on both sides, so it looks right — but a row stamped at UTC reads
+                # as if it were `offset` hours older than it is, and the ranking is off by
+                # exactly the host offset. #1094.
+                try:
+                    row_dt = datetime.fromisoformat(row["timestamp"])
+                except (TypeError, ValueError):
+                    continue
+                if row_dt.tzinfo is not None:
+                    row_dt = row_dt.astimezone(timezone.utc).replace(tzinfo=None)
+                age = datetime.now(timezone.utc).replace(tzinfo=None) - row_dt
                 age_days = age.total_seconds() / 86400
-                temporal_score = np.exp(-age_days / 7)  # 7-day half-life
+                temporal_score = np.exp(-age_days / 7)  # 7-day time constant (unchanged)
 
                 results.append(RecallResult(
                     memory_id=row["id"],
@@ -773,7 +1067,9 @@ class PolyphonicRecallEngine:
                     continue
                 for row in rows:
                     result = results.get(row["id"])
-                    if result is not None and not result.content:
+                    tier = "working" if table == "working_memory" else "episodic"
+                    if (result is not None and not result.content
+                            and result.metadata.get("_self_echo_tier", tier) == tier):
                         result.content = row["content"] or ""
         finally:
             if own_conn:

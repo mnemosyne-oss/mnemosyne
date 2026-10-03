@@ -8,12 +8,18 @@ working. Also checks that --dry-run writes nothing.
 """
 from __future__ import annotations
 
+import os
+import signal
 import sqlite3
+import subprocess
+import sys
 import tempfile
+import zlib
 from pathlib import Path
 
 import pytest
 
+import mnemosyne.core.beam as beam_module
 from mnemosyne.core.beam import BeamMemory, reindex_vectors, _effective_vec_type
 import mnemosyne.core.embeddings as E
 
@@ -178,8 +184,14 @@ def test_reindex_does_not_mask_working_vec_write_failure(tmp_path, monkeypatch):
         reindex_vectors(beam.conn)
 
 
-def test_reindex_real_commits_deferred_working_batches_before_next_embedding(tmp_path, monkeypatch):
-    """Deferred BEAM writes must be committed before the next embedding request."""
+def test_reindex_commits_once_at_the_end_even_when_commits_are_deferred(tmp_path, monkeypatch):
+    """The rebuild is one transaction: every embedding batch runs inside it and a
+    single real commit lands at the end, even when BEAM defers ordinary commits.
+
+    #603 required the rebuild to really commit despite ``_defer_commit``. #1075
+    tightened that to exactly one commit: a commit per batch is what left a
+    half-rebuilt store behind when a run was interrupted.
+    """
     beam = _reindex_fixture_beam(tmp_path, working=2)
     observed_transactions = []
     real_commits = []
@@ -204,8 +216,9 @@ def test_reindex_real_commits_deferred_working_batches_before_next_embedding(tmp
     result = reindex_vectors(beam.conn, batch_size=1)
 
     assert result["working_memory_reindexed"] == 2
-    assert observed_transactions == [False, False]
-    assert real_commits == [True, True]
+    assert observed_transactions == [True, True]
+    assert real_commits == [True]
+    assert beam.conn._defer_commit is True
     assert not beam.conn.in_transaction
 
 
@@ -366,6 +379,222 @@ def test_reindex_rebuilds_all_vector_stores_at_active_dim():
         # recall works (no dimension error) and the model/dim matches the query path.
         results = beam.recall("programming language", top_k=5)
         assert isinstance(results, list)
+
+
+# ---------------------------------------------------------------------------
+# #1075: an interrupted reindex must leave the store exactly as it was.
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _fake_embedder(salt, *, fail_on_call=None):
+    """Deterministic unit vectors per (salt, text); optionally die on call N."""
+    np = pytest.importorskip("numpy")
+    calls = []
+
+    def embed(contents):
+        calls.append(len(contents))
+        if fail_on_call is not None and len(calls) == fail_on_call:
+            raise OSError("simulated interruption")
+        vectors = []
+        for text in contents:
+            rng = np.random.default_rng(zlib.crc32(f"{salt}:{text}".encode()))
+            vector = rng.standard_normal(E.EMBEDDING_DIM)
+            vectors.append((vector / np.linalg.norm(vector)).tolist())
+        return vectors
+
+    return embed
+
+
+def _open_fresh(db_path):
+    """A brand-new connection, as a restarted process would open."""
+    conn = sqlite3.connect(db_path)
+    if beam_module._SQLITE_VEC_AVAILABLE:
+        conn.enable_load_extension(True)
+        beam_module.sqlite_vec.load(conn)
+    return conn
+
+
+def _store_state(db_path):
+    """Everything a reindex writes, read through a fresh connection."""
+    conn = _open_fresh(db_path)
+    try:
+        state = {
+            "user_version": conn.execute("PRAGMA user_version").fetchone()[0],
+            "regime": beam_module._classify_vec_store_regime(conn),
+            "quick_check": conn.execute("PRAGMA quick_check").fetchone()[0],
+            "memory_embeddings": conn.execute(
+                "SELECT memory_id, embedding_json, model FROM memory_embeddings "
+                "ORDER BY memory_id"
+            ).fetchall(),
+            "binary_vector": conn.execute(
+                "SELECT id, binary_vector FROM episodic_memory ORDER BY id"
+            ).fetchall(),
+        }
+        for table in ("vec_episodes", "vec_working", "vec_facts"):
+            ddl = _ddl(conn, table)
+            state[table] = ddl
+            if ddl:
+                state[f"{table} rows"] = conn.execute(
+                    f"SELECT rowid, embedding FROM {table} ORDER BY rowid"
+                ).fetchall()
+        return state
+    finally:
+        conn.close()
+
+
+def _seeded_store(tmp_path, monkeypatch):
+    """3 working + 3 episodic rows, fully reindexed once with 'old' vectors."""
+    beam = _reindex_fixture_beam(tmp_path, working=3, episodic=3)
+    if not beam_module._vec_available(beam.conn) and beam_module._mib is None:
+        pytest.skip("no episodic vector backend in this build")
+    monkeypatch.setattr(E, "available", lambda: True)
+    monkeypatch.setattr(E, "embed", _fake_embedder("old"))
+    reindex_vectors(beam.conn, batch_size=2)
+    return beam
+
+
+@pytest.mark.parametrize("new_dim", [False, True], ids=["same-dim", "new-dim"])
+@pytest.mark.parametrize(
+    "fail_on_call", [1, 2, 4], ids=["first-batch", "second-batch", "last-episodic-batch"]
+)
+def test_interrupted_reindex_leaves_the_store_untouched(
+    tmp_path, monkeypatch, fail_on_call, new_dim
+):
+    """#1075: the destructive rebuild used to commit before the first batch, so
+    an interruption left emptied vec tables and a cleared marker on a store
+    that still passed quick_check. Now nothing lands until the whole run does:
+    a fresh connection must read back the pre-reindex store byte for byte."""
+    beam = _seeded_store(tmp_path, monkeypatch)
+    db_path = str(tmp_path / "m.db")
+    before = _store_state(db_path)
+    if beam_module._vec_available(beam.conn):
+        assert before["regime"] == "pure"
+        assert before["vec_working rows"] and before["vec_episodes rows"]
+    assert before["quick_check"] == "ok"
+    if new_dim:
+        # A model swap: the rebuild would recreate the vec tables at a new dim.
+        monkeypatch.setattr(E, "EMBEDDING_DIM", E.EMBEDDING_DIM + 64)
+    monkeypatch.setattr(E, "embed", _fake_embedder("new", fail_on_call=fail_on_call))
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        reindex_vectors(beam.conn, batch_size=2)
+
+    assert not beam.conn.in_transaction
+    assert _store_state(db_path) == before
+
+
+@pytest.mark.parametrize("new_dim", [False, True], ids=["same-dim", "new-dim"])
+def test_completed_reindex_sets_marker_and_covers_every_row(tmp_path, monkeypatch, new_dim):
+    """The success path still ends committed, marked, and fully covered."""
+    beam = _seeded_store(tmp_path, monkeypatch)
+    db_path = str(tmp_path / "m.db")
+    before = _store_state(db_path)
+    dim = E.EMBEDDING_DIM + 64 if new_dim else E.EMBEDDING_DIM
+    if new_dim:
+        monkeypatch.setattr(E, "EMBEDDING_DIM", dim)
+    monkeypatch.setattr(E, "embed", _fake_embedder("new"))
+    seen = []
+
+    result = reindex_vectors(
+        beam.conn, batch_size=2, progress=lambda store, done, total: seen.append((store, done, total))
+    )
+
+    assert result["status"] == "reindexed"
+    assert (result["working_memory_reindexed"], result["episodic_memory_reindexed"]) == (3, 3)
+    assert seen == [
+        ("working_memory", 2, 3), ("working_memory", 3, 3),
+        ("episodic_memory", 2, 3), ("episodic_memory", 3, 3),
+    ]
+    assert not beam.conn.in_transaction
+    after = _store_state(db_path)
+    assert after["quick_check"] == "ok"
+    assert after["memory_embeddings"] != before["memory_embeddings"]
+    assert len(after["memory_embeddings"]) == 3
+    if beam_module._vec_available(beam.conn):
+        assert after["user_version"] & beam_module._VEC_NORM_BIT
+        assert after["regime"] == "pure"
+        assert len(after["vec_working rows"]) == 3
+        assert len(after["vec_episodes rows"]) == 3
+        for table in ("vec_episodes", "vec_working", "vec_facts"):
+            assert f"[{dim}]" in after[table]
+    if beam_module._mib is not None:
+        assert all(row[1] is not None for row in after["binary_vector"])
+        assert after["binary_vector"] != before["binary_vector"]
+
+
+_KILL_ON_SECOND_BATCH = """
+import os, signal, sys
+import mnemosyne.core.embeddings as E
+from mnemosyne.core.beam import BeamMemory, reindex_vectors
+
+calls = []
+
+def embed(contents):
+    calls.append(1)
+    if len(calls) == 2:
+        os.kill(os.getpid(), signal.SIGKILL)  # mid-rebuild, no cleanup possible
+    return [[0.5] * E.EMBEDDING_DIM for _ in contents]
+
+E.available = lambda: True
+E.embed = embed
+beam = BeamMemory(session_id="reindex-failure", db_path=sys.argv[1])
+reindex_vectors(beam.conn, batch_size=2)
+"""
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGKILL"), reason="needs SIGKILL")
+def test_sigkilled_reindex_leaves_the_store_untouched_and_is_repeatable(tmp_path, monkeypatch):
+    """The report's scenario: the process is killed while embedding. SQLite must
+    discard the uncommitted rebuild on the next open, and a rerun must finish."""
+    beam = _seeded_store(tmp_path, monkeypatch)
+    db_path = str(tmp_path / "m.db")
+    before = _store_state(db_path)
+    beam.conn.close()
+
+    proc = subprocess.run(
+        [sys.executable, "-c", _KILL_ON_SECOND_BATCH, db_path],
+        cwd=_REPO_ROOT,
+        env={**os.environ, "MNEMOSYNE_NO_EMBEDDINGS": "1"},
+        capture_output=True,
+        timeout=300,
+    )
+    assert proc.returncode == -signal.SIGKILL, proc.stderr.decode()
+
+    assert _store_state(db_path) == before
+
+    rerun = BeamMemory(session_id="reindex-failure", db_path=db_path)
+    monkeypatch.setattr(E, "embed", _fake_embedder("new"))
+    result = reindex_vectors(rerun.conn, batch_size=2)
+    assert result["status"] == "reindexed"
+    after = _store_state(db_path)
+    assert after["memory_embeddings"] != before["memory_embeddings"]
+    if beam_module._vec_available(rerun.conn):
+        assert after["regime"] == "pure"
+        assert len(after["vec_working rows"]) == 3
+        assert len(after["vec_episodes rows"]) == 3
+
+
+def test_reindex_reports_a_held_write_lock_before_any_embedding(tmp_path, monkeypatch):
+    """The rebuild takes the write lock up front, so a competing writer fails it
+    immediately and clearly instead of after minutes of embedding."""
+    beam = _reindex_fixture_beam(tmp_path, working=1)
+    embed_calls = []
+    monkeypatch.setattr(E, "available", lambda: True)
+    monkeypatch.setattr(E, "embed", lambda contents: embed_calls.append(contents))
+    holder = sqlite3.connect(str(tmp_path / "m.db"), isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        beam.conn.execute("PRAGMA busy_timeout = 50")
+        with pytest.raises(RuntimeError, match="write lock.*Nothing was changed"):
+            reindex_vectors(beam.conn)
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+    assert embed_calls == []
+    assert not beam.conn.in_transaction
 
 
 if __name__ == "__main__":  # allow direct execution without pytest

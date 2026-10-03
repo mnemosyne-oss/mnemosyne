@@ -35,6 +35,8 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+          # A pre-release tag must not become the repository's "Latest release".
+          prerelease: ${{ contains(github.ref_name, 'a') || contains(github.ref_name, 'b') || contains(github.ref_name, 'rc') }}
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import re
 import subprocess
 from pathlib import Path
 
@@ -74,16 +75,31 @@ def _release_repo(
     return repo
 
 
-def test_standalone_0_6_0_tag_succeeds_against_actual_repo_state():
-    result = _run_hook(ROOT, "v0.6.0")
+def _declared_standalone_version() -> str:
+    """The standalone version this repo would release, from its source of truth."""
+    text = (ROOT / "integrations" / "hermes" / "pyproject.toml").read_text()
+    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    assert match, "integrations/hermes/pyproject.toml declares no [project].version"
+    return match.group(1)
+
+
+def test_standalone_tag_for_the_declared_version_succeeds_against_actual_repo_state():
+    """Read the version rather than pinning it, so a plugin bump does not
+    require renaming this test to keep it honest."""
+    result = _run_hook(ROOT, f"v{_declared_standalone_version()}")
 
     assert result.returncode == 0, result.stderr + result.stdout
     assert "integrations/hermes/pyproject.toml" in result.stdout
 
 
 @pytest.mark.skipif(PYTHON310 is None, reason="python3.10 is unavailable for hook compatibility coverage")
-def test_standalone_0_6_0_tag_succeeds_with_python_3_10(tmp_path):
-    result = _run_hook(ROOT, "v0.6.0", python310=PYTHON310, tmp_path=tmp_path)
+def test_standalone_tag_for_the_declared_version_succeeds_with_python_3_10(tmp_path):
+    result = _run_hook(
+        ROOT,
+        f"v{_declared_standalone_version()}",
+        python310=PYTHON310,
+        tmp_path=tmp_path,
+    )
 
     assert result.returncode == 0, result.stderr + result.stdout
     assert "ModuleNotFoundError" not in result.stderr

@@ -14,6 +14,19 @@ Mnemosyne runs everywhere. Pick your platform:
 | [Zero](zero.md) | Plugin (tools + hooks) | `.zero/plugins/mnemosyne/` |
 | [OpenClaw](openclaw.md) | Native plugin | `pip install mnemosyne-memory[openclaw]` |
 
+## Model providers
+
+Mnemosyne's outbound surfaces all speak the OpenAI-compatible protocol, so any
+provider that implements it works with environment variables alone.
+
+| Provider | Surfaces | Config |
+|----------|----------|--------|
+| [Any OpenAI-compatible vision endpoint](openai-compatible-vision.md) | Vision | `MNEMOSYNE_MODALITY_*` |
+| [Atlas Cloud](atlas-cloud.md) | Chat, embeddings, vision | `MNEMOSYNE_LLM_*`, `MNEMOSYNE_EMBEDDING_*`, `MNEMOSYNE_MODALITY_*` |
+
+Media understanding is **off by default** — `MNEMOSYNE_MODALITY_ENABLED`
+must be set before Mnemosyne makes any outbound call to describe a file.
+
 ## Quick Start (any MCP client)
 
 ```json

@@ -119,11 +119,14 @@ PY
 }
 
 for tag in "${refs[@]}"; do
-    # Validate format: vMAJOR.MINOR.PATCH
-    if ! echo "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-        echo "ERROR: Tag '$tag' must match format vMAJOR.MINOR.PATCH (e.g. v3.1.2)"
+    # Validate format: vMAJOR.MINOR.PATCH, optionally with a PEP 440
+    # pre-release suffix (aN / bN / rcN), so a major can run the beta cycle
+    # RELEASING.md requires.
+    if ! echo "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$'; then
+        echo "ERROR: Tag '$tag' must match vMAJOR.MINOR.PATCH with an optional"
+        echo "       PEP 440 pre-release suffix"
         echo "  Got:      $tag"
-        echo "  Expected: vMAJOR.MINOR.PATCH"
+        echo "  Expected: v3.1.2, or v4.0.0b1 / v4.0.0rc1 for a pre-release"
         exit 1
     fi
 
@@ -150,11 +153,36 @@ for tag in "${refs[@]}"; do
     fi
 
     # Compare only releases in the selected package namespace.
+    #
+    # `sort -V` cannot do this. It orders 4.0.0 BEFORE 4.0.0b1, comparing the
+    # empty suffix against "b1" lexically, so once a beta is tagged the real
+    # release would be rejected as "behind". PEP 440 says the opposite: a
+    # pre-release precedes its final. Compare in Python instead, stdlib only,
+    # so the hook never depends on `packaging` being installed.
     if [ -n "$latest_existing" ]; then
         latest_ver="${latest_existing#v}"
-        if [ "$(printf '%s\n' "$tag_version" "$latest_ver" | sort -V | head -1)" = "$tag_version" ] && [ "$tag_version" != "$latest_ver" ]; then
+        if ! TAG_VER="$tag_version" LATEST_VER="$latest_ver" python3 - <<'PEP440'
+import os, re, sys
+
+def key(v):
+    m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:(a|b|rc)(\d+))?", v)
+    if not m:
+        sys.exit("unparseable version: " + repr(v))
+    major, minor, patch, kind, num = m.groups()
+    # A final release outranks every pre-release of the same X.Y.Z.
+    stage = {None: 3, "a": 0, "b": 1, "rc": 2}[kind]
+    return (int(major), int(minor), int(patch), stage, int(num or 0))
+
+# `git tag --list` includes the tag being pushed, since it exists locally by
+# the time this hook runs, so LATEST_VER is frequently TAG_VER itself.
+# Equality must pass. Only a tag strictly behind the namespace is an error,
+# which is what the previous `sort -V` comparison allowed for.
+sys.exit(0 if key(os.environ["TAG_VER"]) >= key(os.environ["LATEST_VER"]) else 1)
+PEP440
+        then
             echo "ERROR: Tag '$tag_version' is behind existing $tag_namespace tag '$latest_existing'"
-            echo "  New tag must be greater than the latest existing tag in that namespace."
+            echo "  New tag must not be older than the latest existing tag in that namespace."
+            echo "  Pre-release order: 4.0.0a1 < 4.0.0b1 < 4.0.0rc1 < 4.0.0"
             exit 1
         fi
     fi

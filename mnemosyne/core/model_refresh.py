@@ -14,6 +14,8 @@ import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
+from mnemosyne.core.filters import _SYSTEM_DERIVED_WRITE_CAPABILITY
+
 
 DEFAULT_MODEL_CATEGORIES: Set[str] = {
     "model:user",
@@ -398,6 +400,7 @@ def apply_model_refresh_proposal(
         metadata["body"],
         source="sleep_model_refresh",
         confidence=coerce_confidence(metadata.get("confidence"), 0.5),
+        _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
     )
     metadata["status"] = "applied"
     metadata["applied_by"] = validator or "system"

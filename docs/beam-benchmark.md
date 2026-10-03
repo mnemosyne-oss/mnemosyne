@@ -84,7 +84,7 @@ You can reproduce these results with your own LLM. The benchmark is deterministi
 ### Quick Start
 
 ```bash
-git clone https://github.com/AxDSan/mnemosyne.git
+git clone https://github.com/mnemosyne-oss/mnemosyne.git
 cd mnemosyne
 pip install mnemosyne-memory[all]
 pip install datasets numpy  # benchmark deps

@@ -22,6 +22,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Callable, Dict, List, Optional, Type
 
 # Plugin directory under ~/.hermes
@@ -423,6 +424,11 @@ class CompressionPlugin(MnemosynePlugin):
         pass
 
 
+def _plugin_module_key(file_path: Path) -> str:
+    """Return a lossless, private module key for a canonical plugin path."""
+    return f"_mnemosyne_plugin_{os.fsencode(file_path.resolve()).hex()}"
+
+
 class PluginManager:
     """
     Register, load, and manage Mnemosyne plugins.
@@ -584,27 +590,61 @@ class PluginManager:
             if file_path.name.startswith("_"):
                 continue
             try:
-                spec = importlib.util.spec_from_file_location(
-                    file_path.stem, str(file_path)
+                module_key = _plugin_module_key(file_path)
+                missing = object()
+                previous = sys.modules.get(module_key, missing)
+                # Successful discovery is process-local and immutable: reuse
+                # its classes across managers instead of splitting registry
+                # identity from the module's newly executed class objects.
+                candidates = (
+                    previous.__dict__.get("_mnemosyne_discovery_classes")
+                    if isinstance(previous, ModuleType) else None
                 )
-                if spec is None or spec.loader is None:
-                    continue
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[file_path.stem] = module
-                spec.loader.exec_module(module)
-
-                for attr_name in dir(module):
-                    obj = getattr(module, attr_name)
-                    if (
-                        inspect.isclass(obj)
-                        and issubclass(obj, MnemosynePlugin)
-                        and obj is not MnemosynePlugin
-                        and not obj.__name__.startswith("_")
-                    ):
-                        plugin_name = getattr(obj, "name", None) or obj.__name__.lower()
+                reused = candidates is not None
+                if reused:
+                    module = previous
+                else:
+                    spec = importlib.util.spec_from_file_location(module_key, str(file_path))
+                    if spec is None or spec.loader is None:
+                        continue
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules[module_key] = module
+                added = {}
+                try:
+                    if not reused:
+                        spec.loader.exec_module(module)
+                        # Finish inspection before registering any classes:
+                        # __dir__/__getattr__ can fail after a valid class.
+                        candidates = []
+                        for attr_name in dir(module):
+                            obj = getattr(module, attr_name)
+                            if (
+                                inspect.isclass(obj)
+                                and issubclass(obj, MnemosynePlugin)
+                                and obj is not MnemosynePlugin
+                                and not obj.__name__.startswith("_")
+                            ):
+                                plugin_name = getattr(obj, "name", None) or obj.__name__.lower()
+                                candidates.append((plugin_name, obj))
+                    for plugin_name, obj in candidates:
                         if plugin_name not in self._registry:
+                            added[plugin_name] = obj
                             self.register_plugin(plugin_name, obj)
-                            discovered.append(plugin_name)
+                except BaseException:
+                    # Roll back only entries still owned by this load. Keep a
+                    # replacement installed by plugin code or another load.
+                    for plugin_name, obj in added.items():
+                        if self._registry.get(plugin_name) is obj:
+                            self._registry.pop(plugin_name)
+                    if not reused and sys.modules.get(module_key) is module:
+                        if previous is missing:
+                            sys.modules.pop(module_key, None)
+                        else:
+                            sys.modules[module_key] = previous
+                    raise
+                if not reused:
+                    module.__dict__["_mnemosyne_discovery_classes"] = tuple(candidates)
+                discovered.extend(added)
             except Exception as exc:
                 logger.warning("Failed to load plugin from %s: %s", file_path, exc)
 

@@ -19,7 +19,7 @@ For v1 this is deterministic only — no LLM calls.  The ``classify_memory_write
 function returns a structured ``WriteDecision`` that callers inspect before
 persisting.
 
-Config is read from env vars (mirroring the pattern in ``beam.py``):
+Config is resolved through the central runtime config reader:
 
 - ``MNEMOSYNE_IGNORE_PATTERNS`` — newline- or comma-separated regex patterns
 - ``MNEMOSYNE_WRITE_CLASSIFIER`` — ``off`` (default), ``warn``, or ``strict``
@@ -34,10 +34,51 @@ from __future__ import annotations
 import logging
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
+
+from mnemosyne.core.config import get_config
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class WritePolicySnapshot:
+    """Immutable write policy resolved from one config generation."""
+
+    ignore_patterns: Tuple[str, ...]
+    classifier_mode: str
+
+
+class _WritePolicyExemption:
+    """Opaque capability for trusted in-process writers.
+
+    Exemptions are identity-based rather than caller-selected strings. Python
+    callers can still pass the legacy ``_write_kind`` keyword, but values such
+    as ``"restore"`` and ``"system_derived"`` no longer grant privileges.
+    """
+
+
+_RESTORE_WRITE_CAPABILITY = _WritePolicyExemption()
+_SYSTEM_DERIVED_WRITE_CAPABILITY = _WritePolicyExemption()
+_WRITE_POLICY_EXEMPT_CAPABILITIES = (
+    _RESTORE_WRITE_CAPABILITY,
+    _SYSTEM_DERIVED_WRITE_CAPABILITY,
+)
+_active_write_policy: ContextVar[Optional[WritePolicySnapshot]] = ContextVar(
+    "mnemosyne_write_policy", default=None
+)
+
+
+def is_write_policy_exempt(write_kind: object) -> bool:
+    """Return whether ``write_kind`` is a trusted internal capability."""
+
+    return any(
+        write_kind is capability
+        for capability in _WRITE_POLICY_EXEMPT_CAPABILITIES
+    )
 
 # ---------------------------------------------------------------------------
 # Curated default patterns
@@ -91,6 +132,76 @@ SECRET_PATTERNS: List[str] = [
     r"(?i)^\s*(?:DB_PASS|SECRET_KEY|AUTH_TOKEN|API_SECRET)\s*=",
 ]
 
+# CJK character ranges treated as natural prose, not credential values.
+# A value containing CJK characters is almost always ordinary text
+# ("密码：建议每90天更换一次" is a policy note, not a secret), so the
+# credential-value predicate below excludes these ranges.
+_CJK_PROSE_RANGES = (
+    "\u4e00-\u9fff"  # Han ideographs (Chinese, Japanese, Korean hanja)
+    "\u3040-\u30ff"  # Hiragana + Katakana (Japanese)
+    "\uac00-\ud7af"  # Hangul syllables (Korean)
+    "\u3000-\u303f"  # CJK symbols / punctuation
+    "\uff00-\uffef"  # Fullwidth forms
+    "\u3400-\u4dbf"  # CJK Extension A
+    "\uf900-\ufaff"  # CJK Compatibility Ideographs
+    "\U00020000-\U0003347f"  # CJK Extensions B-J (non-BMP Han)
+    "\u1100-\u11ff"  # Hangul Jamo
+    "\u3130-\u318f"  # Hangul Compatibility Jamo
+    "\u31f0-\u31ff"  # Katakana Phonetic Extensions
+    "\u2e80-\u2eff"  # CJK Radicals Supplement
+    "\u2f00-\u2fdf"  # Kangxi Radicals
+)
+
+# CJK prose characters that must not directly follow a credential token:
+# ideographs, kana, hangul, radicals, and word-like fullwidth forms. Excludes
+# CJK/fullwidth punctuation so "，请勿外传" after a token is still detected.
+_CJK_IDEOGRAPHIC = (
+    "\u4e00-\u9fff"  # Han ideographs
+    "\u3040-\u30ff"  # Hiragana + Katakana
+    "\uff66-\uff9f"  # Halfwidth Katakana
+    "\uff10-\uff19"  # Fullwidth digits
+    "\uff21-\uff3a"  # Fullwidth Latin uppercase
+    "\uff41-\uff5a"  # Fullwidth Latin lowercase
+    "\uffa0-\uffbe"  # Halfwidth Hangul filler + letters
+    "\uffbf-\uffc1"  # Reserved allocation gap
+    "\uffc2-\uffc7"  # Halfwidth Hangul letters
+    "\uffc8-\uffc9"  # Reserved allocation gap
+    "\uffca-\uffcf"  # Halfwidth Hangul letters
+    "\uffd0-\uffd1"  # Reserved allocation gap
+    "\uffd2-\uffd7"  # Halfwidth Hangul letters
+    "\uffd8-\uffd9"  # Reserved allocation gap
+    "\uffda-\uffdc"  # Halfwidth Hangul letters
+    "\uac00-\ud7af"  # Hangul syllables
+    "\u1100-\u11ff"  # Hangul Jamo
+    "\u3130-\u318f"  # Hangul Compatibility Jamo
+    "\u31f0-\u31ff"  # Katakana Phonetic Extensions
+    "\u3005-\u3007"  # Ideographic iteration/closing marks and number zero
+    "\u3400-\u4dbf"  # CJK Extension A
+    "\uf900-\ufaff"  # CJK Compatibility Ideographs
+    "\U00020000-\U0003347f"  # CJK Extensions B-J (non-BMP Han)
+    "\u2e80-\u2eff"  # CJK Radicals Supplement
+    "\u2f00-\u2fdf"  # Kangxi Radicals
+)
+
+# Credential-value predicate: 8+ characters, no whitespace / quotes / brackets,
+# no CJK characters, and at least one ASCII letter or digit. The token is the
+# contiguous non-CJK run after the separator, and it must not be directly
+# followed by CJK prose, so mixed prose like "abc12345我的密码" is never treated
+# as a secret while "s3cr3t_pa55word_x1y2z3w4" (even with trailing "，请勿外传")
+# still is.
+_CREDENTIAL_VALUE = (
+    r"(?=(?:(?![" + _CJK_PROSE_RANGES + r"])[^\s'\"<>{}])*(?-i:[A-Za-z0-9]))"
+    r"(?:(?![" + _CJK_PROSE_RANGES + r"])[^\s'\"<>{}]){8,}"
+    r"(?![" + _CJK_IDEOGRAPHIC + r"])"
+)
+
+# Curated CJK secret labels (exact labels only, never generic substrings).
+_CJK_SECRET_LABELS = (
+    "密码|密钥|令牌|口令|私钥|"        # Chinese
+    "パスワード|秘密鍵|トークン|"     # Japanese
+    "비밀번호|키"                     # Korean
+)
+
 # Paired (label, regex) structure — the single source of truth.
 SECRET_LABELED_PATTERNS: List[tuple] = [
     ("api_key_prefix", r"(?:sk|pk|rk)-[a-zA-Z0-9]{20,}"),
@@ -100,7 +211,12 @@ SECRET_LABELED_PATTERNS: List[tuple] = [
     ("google_api_key", r"AIza[0-9A-Za-z_\-]{35}"),
     ("jwt_token", r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
     ("secret_assignment", r"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)"
-                          r"\s*[=:]\s*['\"]?[^\s'\"<>{}]{8,}"),
+                          r"\s*(?:"
+                          r"[=:]\s*['\"]?[^\s'\"<>{}]{8,}|"
+                          r"[：＝]\s*['\"]?" + _CREDENTIAL_VALUE + r"['\"]?)"),
+    ("cjk_secret_assignment",
+     r"(?:" + _CJK_SECRET_LABELS + r")"
+     r"\s*[:=：＝]\s*['\"]?" + _CREDENTIAL_VALUE + r"['\"]?"),
     ("private_key_block", r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"),
     ("connection_string_with_credentials", r"(?:postgres|mysql|mongodb|redis)://[^:]+:[^@]+@"),
     ("env_secret_assignment", r"(?i)^\s*(?:DB_PASS|SECRET_KEY|AUTH_TOKEN|API_SECRET)\s*="),
@@ -199,6 +315,69 @@ def _load_classifier_mode() -> str:
         logger.warning("Unknown MNEMOSYNE_WRITE_CLASSIFIER=%r, defaulting to 'off'", mode)
         return "off"
     return mode
+
+
+def _normalize_classifier_mode(raw: object) -> str:
+    mode = str(raw or "off").strip().lower()
+    if mode not in ("off", "warn", "strict"):
+        logger.warning("Unknown write classifier mode; defaulting to 'off'")
+        return "off"
+    return mode
+
+
+def _coerce_patterns(raw: object) -> Tuple[str, ...]:
+    if isinstance(raw, (list, tuple)):
+        return tuple(str(pattern).strip() for pattern in raw if str(pattern).strip())
+    return tuple(_parse_patterns(str(raw or "")))
+
+
+def resolve_write_policy() -> WritePolicySnapshot:
+    """Resolve ``config.yaml > env > default`` exactly once."""
+    values = get_config().get_many({
+        "ignore_patterns": "",
+        "write_classifier": "off",
+    })
+    return WritePolicySnapshot(
+        ignore_patterns=_coerce_patterns(values["ignore_patterns"]),
+        classifier_mode=_normalize_classifier_mode(values["write_classifier"]),
+    )
+
+
+def make_write_policy(
+    ignore_patterns: object, classifier_mode: object
+) -> WritePolicySnapshot:
+    """Build a normalized immutable snapshot from already-resolved values."""
+    return WritePolicySnapshot(
+        ignore_patterns=_coerce_patterns(ignore_patterns),
+        classifier_mode=_normalize_classifier_mode(classifier_mode),
+    )
+
+
+def current_write_policy() -> WritePolicySnapshot:
+    """Return the enclosing operation snapshot, or resolve a new one."""
+    return _active_write_policy.get() or resolve_write_policy()
+
+
+def active_write_policy() -> Optional[WritePolicySnapshot]:
+    """Return the active operation snapshot without resolving a new policy."""
+    return _active_write_policy.get()
+
+
+@contextmanager
+def write_policy_operation(
+    policy: Optional[WritePolicySnapshot] = None,
+) -> Iterator[WritePolicySnapshot]:
+    """Keep all writes in one public operation on one policy snapshot."""
+    existing = _active_write_policy.get()
+    if existing is not None:
+        yield existing
+        return
+    snapshot = policy or resolve_write_policy()
+    token = _active_write_policy.set(snapshot)
+    try:
+        yield snapshot
+    finally:
+        _active_write_policy.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -369,3 +548,20 @@ def should_remember(
         return True, decision
 
     return True, decision
+
+
+def admit_memory_write(
+    content: str,
+    *,
+    write_kind: object = "public",
+    policy: Optional[WritePolicySnapshot] = None,
+) -> Tuple[bool, WriteDecision]:
+    """Common admission boundary for content-persistence gateways."""
+    if is_write_policy_exempt(write_kind):
+        return True, WriteDecision(action="allow", target="memory")
+    snapshot = policy or current_write_policy()
+    return should_remember(
+        content,
+        ignore_patterns=list(snapshot.ignore_patterns),
+        classifier_mode=snapshot.classifier_mode,
+    )
