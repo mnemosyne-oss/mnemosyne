@@ -4061,8 +4061,18 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     Synchronous and blocking — re-embedding a large DB can take minutes; run it
     offline (with any provider/gateway stopped). Idempotent.
 
+    Atomic: the whole rebuild runs in a single transaction that holds the
+    database write lock until it commits, and the normalized-format marker is
+    set in that same commit. A failed or killed run (SIGKILL included) leaves
+    the store exactly as it was before the call, so the run is safe to repeat;
+    it can never leave emptied vec tables behind a marker that claims health
+    (#1075). The transaction's journal/WAL grows with the rewrite, so leave
+    disk headroom on a large store.
+
     ``dry_run`` returns the plan (model, dim, per-store counts) without writing.
     ``progress`` is an optional ``callable(store, done, total)`` for reporting.
+    It fires after each embedded batch, before the commit, so a count it
+    reports is not durable until the function returns.
     """
     target_dim = int(_embeddings.EMBEDDING_DIM)
     vec_type = _effective_vec_type(conn)
@@ -4072,7 +4082,7 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
         return int(conn.execute(sql).fetchone()[0])
 
     def _commit_reindex_writes() -> None:
-        """Commit a rebuild boundary even when BEAM normally defers commits."""
+        """Really commit, even when BEAM normally defers commits."""
         if isinstance(conn, _BeamConnection):
             conn._real_commit()
         else:
@@ -4157,81 +4167,133 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
             "episodic_memory vector backend unavailable; cannot reindex episodic vectors."
         )
 
-    # 1) Recreate the sqlite-vec tables at the active dimension. vec_facts has no
-    #    writer yet but is recreated so its declared dim can't mismatch a query.
-    #    Clear the normalized-format marker BEFORE the drop: mid-rebuild and
-    #    failed-rebuild readers must route conservatively (the table is
-    #    partial), never on a stale pure verdict. The marker is re-set on
-    #    success below.
-    if vec_ok:
-        try:
-            _uv = conn.execute("PRAGMA user_version").fetchone()[0]
-            if _uv & _VEC_NORM_BIT:
-                conn.execute(f"PRAGMA user_version = {_uv & ~_VEC_NORM_BIT}")
-                _cleared_uv = conn.execute("PRAGMA user_version").fetchone()[0]
-                if _cleared_uv & _VEC_NORM_BIT:
-                    raise RuntimeError("normalized-format marker remained set")
-        except Exception as exc:
-            raise RuntimeError(
-                "Could not clear the normalized-format marker before rebuild; "
-                "aborting before vec tables are changed."
-            ) from exc
-        for table in ("vec_episodes", "vec_working", "vec_facts"):
-            conn.execute(f"DROP TABLE IF EXISTS {table}")
-            conn.execute(
-                f"CREATE VIRTUAL TABLE {table} USING vec0(embedding {vec_type}[{target_dim}])"
-            )
+    # The whole rebuild is ONE transaction (#1075). It drops and recreates the
+    # vec tables, clears the normalized-format marker, and overwrites
+    # memory_embeddings and episodic_memory.binary_vector in place; committing
+    # any of that before the last batch leaves a store that is internally
+    # inconsistent yet passes quick_check (empty vec tables, marker cleared).
+    # Nothing is visible to other connections, and nothing survives a crash
+    # (SIGKILL included), until the single commit at the end: a failed or
+    # killed run leaves the pre-reindex store byte-for-byte intact.
+    # Python's sqlite3 only auto-opens a transaction before DML, so the vec
+    # DDL below needs the explicit BEGIN to share the transaction.
+    if conn.in_transaction:
+        # Flush anything the caller left pending, as the old first commit did.
         _commit_reindex_writes()
-
-    # 2) Working memory -> memory_embeddings (+ vec_working), via the shared write
-    #    helper so the float-JSON and sqlite-vec stores stay consistent.
-    wm_done = 0
-    wm_rows = conn.execute(
-        "SELECT id, content FROM working_memory "
-        "WHERE content IS NOT NULL AND length(content) > 0"
-    ).fetchall()
-    for start in range(0, len(wm_rows), batch_size):
-        chunk = wm_rows[start:start + batch_size]
-        vecs = _embed_chunk("working_memory", chunk)
-        for r, vec in zip(chunk, vecs):
-            _store_working_embedding(
-                conn, r["id"], np.asarray(vec).tolist(), commit_vec=False, strict_vec=True
-            )
-            wm_done += 1
-        _commit_reindex_writes()
-        if progress:
-            progress("working_memory", wm_done, wm_total)
-
-    # 3) Episodic memory -> vec_episodes + binary_vector (mirrors the episodic
-    #    store path).
-    ep_done = 0
-    ep_rows = conn.execute(
-        "SELECT rowid, content FROM episodic_memory "
-        "WHERE content IS NOT NULL AND length(content) > 0"
-    ).fetchall()
-    for start in range(0, len(ep_rows), batch_size):
-        chunk = ep_rows[start:start + batch_size]
-        vecs = _embed_chunk("episodic_memory", chunk)
-        for r, vec in zip(chunk, vecs):
-            arr = np.asarray(vec)
-            rowid = int(r["rowid"])
-            if vec_ok:
-                _vec_table_insert(conn, "vec_episodes", rowid, arr.tolist(), commit=False)
-            if _mib is not None:
-                conn.execute(
-                    "UPDATE episodic_memory SET binary_vector = ? WHERE rowid = ?",
-                    (_mib(arr), rowid),
-                )
-            ep_done += 1
-        _commit_reindex_writes()
-        if progress:
-            progress("episodic_memory", ep_done, ep_total)
-
-    if wm_done != wm_total or ep_done != ep_total:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
         raise RuntimeError(
-            "Reindex incomplete: processed "
-            f"{wm_done}/{wm_total} working and {ep_done}/{ep_total} episodic rows"
-        )
+            "Could not take the database write lock for the vector rebuild "
+            f"({exc}); stop every other process that writes to this database "
+            "and retry. Nothing was changed."
+        ) from exc
+    try:
+        # 1) Recreate the sqlite-vec tables at the active dimension. vec_facts
+        #    has no writer yet but is recreated so its declared dim can't
+        #    mismatch a query. The marker is cleared first and re-set on
+        #    success below; inside the transaction nobody else sees the cleared
+        #    state, but this also proves the header is writable before any
+        #    table is dropped and before minutes of embedding are spent.
+        if vec_ok:
+            try:
+                _uv = conn.execute("PRAGMA user_version").fetchone()[0]
+                if _uv & _VEC_NORM_BIT:
+                    conn.execute(f"PRAGMA user_version = {_uv & ~_VEC_NORM_BIT}")
+                    _cleared_uv = conn.execute("PRAGMA user_version").fetchone()[0]
+                    if _cleared_uv & _VEC_NORM_BIT:
+                        raise RuntimeError("normalized-format marker remained set")
+            except Exception as exc:
+                raise RuntimeError(
+                    "Could not clear the normalized-format marker before rebuild; "
+                    "aborting before vec tables are changed."
+                ) from exc
+            for table in ("vec_episodes", "vec_working", "vec_facts"):
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
+                conn.execute(
+                    f"CREATE VIRTUAL TABLE {table} USING vec0(embedding {vec_type}[{target_dim}])"
+                )
+
+        # 2) Working memory -> memory_embeddings (+ vec_working), via the shared
+        #    write helper so the float-JSON and sqlite-vec stores stay consistent.
+        wm_done = 0
+        wm_rows = conn.execute(
+            "SELECT id, content FROM working_memory "
+            "WHERE content IS NOT NULL AND length(content) > 0"
+        ).fetchall()
+        for start in range(0, len(wm_rows), batch_size):
+            chunk = wm_rows[start:start + batch_size]
+            vecs = _embed_chunk("working_memory", chunk)
+            for r, vec in zip(chunk, vecs):
+                _store_working_embedding(
+                    conn, r["id"], np.asarray(vec).tolist(), commit_vec=False, strict_vec=True
+                )
+                wm_done += 1
+            if progress:
+                progress("working_memory", wm_done, wm_total)
+
+        # 3) Episodic memory -> vec_episodes + binary_vector (mirrors the episodic
+        #    store path).
+        ep_done = 0
+        ep_rows = conn.execute(
+            "SELECT rowid, content FROM episodic_memory "
+            "WHERE content IS NOT NULL AND length(content) > 0"
+        ).fetchall()
+        for start in range(0, len(ep_rows), batch_size):
+            chunk = ep_rows[start:start + batch_size]
+            vecs = _embed_chunk("episodic_memory", chunk)
+            for r, vec in zip(chunk, vecs):
+                arr = np.asarray(vec)
+                rowid = int(r["rowid"])
+                if vec_ok:
+                    _vec_table_insert(conn, "vec_episodes", rowid, arr.tolist(), commit=False)
+                if _mib is not None:
+                    conn.execute(
+                        "UPDATE episodic_memory SET binary_vector = ? WHERE rowid = ?",
+                        (_mib(arr), rowid),
+                    )
+                ep_done += 1
+            if progress:
+                progress("episodic_memory", ep_done, ep_total)
+
+        if wm_done != wm_total or ep_done != ep_total:
+            raise RuntimeError(
+                "Reindex incomplete: processed "
+                f"{wm_done}/{wm_total} working and {ep_done}/{ep_total} episodic rows"
+            )
+
+        # Only a completed sqlite-vec rebuild certifies normalized vec blobs.
+        # JSON/binary-only reindexing leaves the persisted vec table untouched and
+        # must preserve whichever format marker it already had. The marker is
+        # written inside the transaction so it lands atomically with the tables
+        # it certifies.
+        if vec_ok:
+            try:
+                uv = conn.execute("PRAGMA user_version").fetchone()[0]
+                conn.execute(
+                    f"PRAGMA user_version = {(uv & ~0x10000000) | _VEC_NORM_BIT}"
+                )
+            except Exception:
+                logger.warning(
+                    "reindex_vectors: store rebuilt but the normalized-format "
+                    "marker could not be written; episodic vector recall keeps "
+                    "using the conservative full-scan route. Re-run "
+                    "reindex_vectors() when the database is writable.",
+                    exc_info=True,
+                )
+        _commit_reindex_writes()
+    except BaseException:
+        # Includes KeyboardInterrupt: undo the whole rebuild, then re-raise.
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            logger.warning(
+                "reindex_vectors: rollback after a failed rebuild also failed; "
+                "SQLite will discard the uncommitted rebuild when the "
+                "connection closes.",
+                exc_info=True,
+            )
+        raise
 
     plan["status"] = "reindexed"
     plan["working_memory_reindexed"] = wm_done
@@ -4239,25 +4301,9 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     # The rebuild can change the live vec type/dimension and re-quantizes
     # every row: warmed enhanced-recall entries must not survive it
     # (the cache key hashes the process-level VEC_TYPE, which can stay
-    # unchanged while the live table type changes).
+    # unchanged while the live table type changes). Invalidated only after
+    # the commit, so a concurrent reader cannot re-warm from pre-rebuild data.
     _invalidate_query_cache_for_conn(conn, "reindex_vectors")
-    # Only a completed sqlite-vec rebuild certifies normalized vec blobs.
-    # JSON/binary-only reindexing leaves the persisted vec table untouched and
-    # must preserve whichever format marker it already had.
-    if vec_ok:
-        try:
-            uv = conn.execute("PRAGMA user_version").fetchone()[0]
-            conn.execute(
-                f"PRAGMA user_version = {(uv & ~0x10000000) | _VEC_NORM_BIT}"
-            )
-        except Exception:
-            logger.warning(
-                "reindex_vectors: store rebuilt but the normalized-format "
-                "marker could not be written; episodic vector recall keeps "
-                "using the conservative full-scan route. Re-run "
-                "reindex_vectors() when the database is writable.",
-                exc_info=True,
-            )
     return plan
 
 
@@ -11560,9 +11606,9 @@ class BeamMemory:
             SELECT count(*) AS err_count
             FROM consolidation_log
             WHERE created_at > datetime('now', '-7 days')
+              AND items_consolidated = 0
               AND (
-                  items_consolidated = 0
-                  AND summary_preview LIKE '%error%'
+                  summary_preview LIKE '%error%'
                   OR summary_preview LIKE '%fail%'
               )
         """)
