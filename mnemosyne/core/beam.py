@@ -6848,7 +6848,7 @@ class BeamMemory:
             owns_transaction = not self.conn.in_transaction
 
             def validate_and_invalidate() -> bool:
-                now = datetime.now().isoformat()
+                now = datetime.now(timezone.utc).isoformat()
                 # Both the replacement and the target must still be ACTIVE
                 # (not superseded, not expired): a concurrent resolver may have
                 # superseded either between our scan and this write, and we must

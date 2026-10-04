@@ -171,7 +171,7 @@ def test_graph_link_write_admission_provider_parity(
 PROVIDER_TOOL_NAMES = [
     "mnemosyne_remember", "mnemosyne_recall", "mnemosyne_shared_remember",
     "mnemosyne_shared_recall", "mnemosyne_shared_forget", "mnemosyne_shared_stats",
-    "mnemosyne_sleep", "mnemosyne_stats", "mnemosyne_invalidate", "mnemosyne_validate",
+    "mnemosyne_sleep", "mnemosyne_resolve_conflicts", "mnemosyne_stats", "mnemosyne_invalidate", "mnemosyne_validate",
     "mnemosyne_get", "mnemosyne_triple_add", "mnemosyne_triple_query",
     "mnemosyne_triple_end", "mnemosyne_remember_canonical",
     "mnemosyne_recall_canonical", "mnemosyne_forget_canonical",

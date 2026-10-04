@@ -546,6 +546,16 @@ CROSS_SESSION_RESOLVE_SCHEMA = {
                 "description": "If true, report what would be resolved without writing changes.",
                 "default": False,
             },
+            "llm_eval": {
+                "type": "boolean",
+                "description": (
+                    "Only meaningful with dry_run=true: also run LLM verification on "
+                    "flagged pairs (without mutating) so the exact apply-time verdict "
+                    "can be previewed. Default false keeps the dry run deterministic "
+                    "(no LLM calls)."
+                ),
+                "default": False,
+            },
         },
     },
 }
@@ -3167,6 +3177,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         can issue one LLM validation request per flagged pair when
         `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on)."""
         dry_run = bool(args.get("dry_run", False))
+        llm_eval = bool(args.get("llm_eval", False))
         if not hasattr(self._beam, "resolve_cross_session_conflicts"):
             return json.dumps({
                 "status": "unavailable",
@@ -3175,12 +3186,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Apply can issue one LLM validation request per flagged pair when
         # MNEMOSYNE_LLM_CONFLICT_DETECTION is on; reserve the reflection budget
         # like _handle_sleep does for the same class of work. Dry runs are
-        # deterministic and make no LLM calls, so they need no budget.
-        if not dry_run:
+        # deterministic and make no LLM calls unless llm_eval is requested.
+        if not dry_run or llm_eval:
             skip = self._reserve_reflection_budget("tool")
             if skip is not None:
                 return json.dumps(skip)
-        result = self._beam.resolve_cross_session_conflicts(dry_run=dry_run)
+        result = self._beam.resolve_cross_session_conflicts(
+            dry_run=dry_run,
+            llm_eval=llm_eval,
+        )
         if not dry_run and int(result.get("invalidated", 0)):
             try:
                 self._audit_event(

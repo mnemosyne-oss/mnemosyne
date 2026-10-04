@@ -3663,6 +3663,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         can issue one LLM validation request per flagged pair when
         `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on)."""
         dry_run = bool(args.get("dry_run", False))
+        llm_eval = bool(args.get("llm_eval", False))
         if not hasattr(self._beam, "resolve_cross_session_conflicts"):
             return json.dumps({
                 "status": "unavailable",
@@ -3671,14 +3672,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Apply can issue one LLM validation request per flagged pair when
         # MNEMOSYNE_LLM_CONFLICT_DETECTION is on; reserve the reflection budget
         # like _handle_sleep does for the same class of work. Dry runs are
-        # deterministic and make no LLM calls, so they need no budget.
-        if not dry_run:
+        # deterministic and make no LLM calls unless llm_eval is requested.
+        if not dry_run or llm_eval:
             skip = self._reserve_reflection_budget("tool")
             if skip is not None:
                 return json.dumps(skip)
         result = self._beam.resolve_cross_session_conflicts(
             dry_run=dry_run,
-            llm_eval=bool(args.get("llm_eval", False)),
+            llm_eval=llm_eval,
         )
         if not dry_run and int(result.get("invalidated", 0)):
             try:

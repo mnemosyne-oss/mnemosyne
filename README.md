@@ -362,6 +362,27 @@ When used with Hermes Agent, Mnemosyne exposes provider tools for the memory lif
 
 > **For the full Hermes setup guide, see [docs/hermes-integration.md](docs/hermes-integration.md).** That is the canonical, most up-to-date reference.
 
+### Promoted persona prompt context (opt-in)
+
+Set `MNEMOSYNE_PERSONA_ENABLED=true` before starting Hermes to include promoted
+L3 persona facts even when the turn's recall query has no matching keywords.
+The existing `MNEMOSYNE_PERSONA_FILE` / `persona.md` path remains compatible and
+has precedence when nonempty. Otherwise the provider reads `memoria_persona`
+from its active profile-bound Beam connection; it never opens a global fallback
+DB or generates a second copy of the persona store.
+
+The DB path selects at most **20 entries**, ordered by tier (permanent,
+long_term, working), reinforcement count descending, then id ascending. It
+uses a conservative UTF-8 byte budget equal to `MNEMOSYNE_PERSONA_TOKEN_CAP`
+(default **1500 bytes**, including the persona header), not the legacy file
+path's approximate word-count budget. Complete entries that do not fit are
+skipped rather than sliced; this may include fewer facts than a model-specific
+tokenizer would allow. On the DB fallback path, an empty/missing store or a
+nonpositive budget injects nothing. The legacy file path retains its existing
+approximate truncation behavior (including its truncation notice at zero budget).
+Disabling the flag suppresses both file and DB reads. Promotion and
+demotion are reflected when the next system prompt is built.
+
 ### Install profile comparison
 
 | Profile | When to use | RAM | Key tradeoff |

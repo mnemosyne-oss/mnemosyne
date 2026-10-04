@@ -101,7 +101,7 @@ def test_wrapper_pyproject_declares_the_package_and_is_not_a_distribution():
     data = _toml_loads((CATALOG / "pyproject.toml").read_text())
     deps = data["project"]["dependencies"]
     assert "mnemosyne-hermes>=0.7.4,<0.8" in deps, deps
-    assert "mnemosyne-memory[embeddings]>=4.0.0b4" in deps, deps
+    assert "mnemosyne-memory[embeddings]>=4.0.0b5" in deps, deps
     assert "build-system" not in data, "the catalog wrapper must never build as a package"
     assert data["project"]["version"] == _manifest()["version"]
 

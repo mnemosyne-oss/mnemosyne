@@ -1,13 +1,13 @@
 ---
 title: "MCP Tool Schema"
-version: 4.0.0b4
+version: 4.0.0b5
 tool_count: 38
 mcp_tool_count: 30
 plugin_only_tool_count: 8
 generated_at: "auto"
 ---
 
-# MCP Tool Schema (v4.0.0b4)
+# MCP Tool Schema (v4.0.0b5)
 
 > **Generated file. Do not edit by hand.**
 > Source: `mnemosyne/tool_schemas.py` and `mnemosyne/mcp_tools.py`.
@@ -366,7 +366,7 @@ List L3 persona facts, optionally filtered by tier and/or topic. Returns persona
 
 ### 3. `mnemosyne_persona_promote`
 
-Promote a working or episodic memory into the L3 persona store (the memoria_persona table). Tier values: 'permanent', 'long_term' (default), 'working'. Tier is a classification label: it orders mnemosyne_persona_list output (permanent first) and affects nothing else. No automatic eviction or decay is implemented, and a fact leaves the store only by explicit demotion. Persona facts are not read by the system prompt path, which uses the opt-in persona.md file. Returns the new persona id.
+Promote a working or episodic memory into the L3 persona store (the memoria_persona table). Tier values: 'permanent', 'long_term' (default), 'working'. Tier orders persona listing and opt-in DB prompt selection (permanent first). No automatic eviction or decay is implemented; facts leave the store by explicit demotion. With MNEMOSYNE_PERSONA_ENABLED=true, Hermes uses bounded DB prompt context when the compatible persona.md path is absent or empty. Returns the new persona id.
 
 | Parameter | Type | Required | Default |
 |-----------|------|----------|---------|
