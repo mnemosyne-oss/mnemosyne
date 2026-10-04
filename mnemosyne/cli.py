@@ -169,24 +169,56 @@ def cmd_store(args):
     print(f"Stored: {memory_id}")
 
 
+# Cap applied only under `--preview`, for scanning many hits at once.
+_RECALL_PREVIEW_CHARS = 150
+
+
+def _print_recall_results(query, results, *, preview=False):
+    """Render recall results for a human reader.
+
+    Content is printed whole by default. A silent 150-char preview ended records
+    in a bare ``...``, which read as the record itself (#685). The cap now lives
+    behind an explicit ``--preview`` for scanning many hits at once, and when it
+    does apply it states how much was withheld instead of ending in an
+    unexplained ellipsis.
+    """
+    print(f"\nResults for: {query}\n")
+    for r in results:
+        content = r.get("content", "")
+        score = r.get("score", 0)
+        print(f"  ID: {r.get('id', '?')}")
+        if preview and len(content) > _RECALL_PREVIEW_CHARS:
+            print(f"  Content: {content[:_RECALL_PREVIEW_CHARS]}")
+            print(f"  Content truncated: showing {_RECALL_PREVIEW_CHARS} of {len(content)} chars")
+        else:
+            print(f"  Content: {content}")
+        print(f"  Score: {score:.3f}")
+        if r.get("entity_match"):
+            print("  [entity match]")
+        print()
+
+
 def cmd_recall(args):
     """Search memories."""
     if not args:
-        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json]")
+        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json] [--preview]")
 
     explain = False
     json_output = False
+    preview = False
     positionals = []
     for arg in args:
         if arg == "--explain":
             explain = True
         elif arg == "--json":
             json_output = True
+        elif arg == "--preview":
+            preview = True
         else:
             positionals.append(arg)
 
     if not positionals:
-        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json]")
+        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json] [--preview]")
     query = positionals[0]
     top_k = _parse_int(positionals[1], "top_k") if len(positionals) > 1 else 5
 
@@ -204,16 +236,7 @@ def cmd_recall(args):
             print(json.dumps({"query": query, "top_k": top_k, "results": results}, ensure_ascii=False, default=str))
         return
 
-    print(f"\nResults for: {query}\n")
-    for r in results:
-        content = r.get("content", "")
-        score = r.get("score", 0)
-        print(f"  ID: {r.get('id', '?')}")
-        print(f"  Content: {content[:150]}{'...' if len(content) > 150 else ''}")
-        print(f"  Score: {score:.3f}")
-        if r.get("entity_match"):
-            print("  [entity match]")
-        print()
+    _print_recall_results(query, results, preview=preview)
 
 
 def cmd_media(args):

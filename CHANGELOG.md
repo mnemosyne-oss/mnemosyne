@@ -9,6 +9,8 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **`mnemosyne recall` printed a truncated record as if it were complete (#685).** The human-readable output sliced content at 150 characters and appended a literal `...`, so a clipped preview was indistinguishable from the whole record — the reporter saw one and a half of three networks with no signal that anything had been cut. Content now prints whole by default; the 150-char cap moves behind an explicit `--preview` for scanning many hits at once, and when it applies the output reports `showing N of M chars` instead of ending in an unexplained ellipsis. `--json` output is unchanged, and `recall()` itself is untouched.
+
 - **Hermes prefetch now injects raw conversation transcripts under polyphonic recall (#696, #615, #677).** The Hermes prefetch adapter drops a result when it lacks the linear per-signal fields (`keyword_score`/`fts_score`/`dense_score`) and its `score` is below 0.20. Polyphonic engine results carry only `voice_scores` provenance (RRF-ranked) and a small combined `score`, so raw `[USER]` transcript rows were silently filtered out and never surfaced in prefetch under `MNEMOSYNE_POLYPHONIC_RECALL=1`. The adapter now recognises polyphonic results (`voice_scores` with vector/graph/fact/temporal keys), lets them pass their existing lexical gate without applying the linear per-signal signal and 0.20 score floors, and uses the strongest voice contribution for ranking. The core recall pipeline is unchanged.
 
 ### Added
