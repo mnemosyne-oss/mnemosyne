@@ -13,6 +13,10 @@ This directory is the Hermes **directory plugin** that the catalog installs
 - `pyproject.toml` declares the real implementation, the `mnemosyne-hermes`
   package on PyPI, plus `mnemosyne-memory[embeddings]`. Hermes installs both
   into its own venv on install and re-applies them after every `hermes update`.
+  The wrapper pins `mnemosyne-hermes==0.7.4` and
+  `mnemosyne-memory[embeddings]==4.0.0b4`. Its
+  `[tool.uv.exclude-newer-package]` table exempts only those two package names
+  from the release-age cutoff. Keep each exemption paired with an exact pin.
 - `__init__.py` re-exports `register` and `register_memory_provider` from
   the installed package so the directory is loadable.
 
