@@ -49,7 +49,8 @@ def test_cmd_backup_passes_normalized_msys_path_to_backend(monkeypatch, capsys):
         assert value == "/c/Users/alice/backups"
         return "C:/Users/alice/backups"
 
-    def fake_backup(*, backup_dir):
+    def fake_backup(*, db_path, backup_dir):
+        captured["db_path"] = db_path
         captured["backup_dir"] = backup_dir
         return {
             "backup_path": backup_dir / "mnemosyne_backup.db.gz",
@@ -60,19 +61,22 @@ def test_cmd_backup_passes_normalized_msys_path_to_backend(monkeypatch, capsys):
 
     from mnemosyne.dr import recovery
 
+    monkeypatch.delenv("MNEMOSYNE_BANK", raising=False)
     monkeypatch.setattr(cli, "_normalize_backup_output_dir_arg", fake_normalize)
     monkeypatch.setattr(recovery, "create_backup", fake_backup)
 
     cli.cmd_backup(["/c/Users/alice/backups"])
 
     assert captured["backup_dir"] == Path("C:/Users/alice/backups")
+    assert captured["db_path"] is None
     assert "Backup created:" in capsys.readouterr().out
 
 
 def test_production_os_detection_drives_cmd_backup_normalization(monkeypatch, capsys):
     captured = {}
 
-    def fake_backup(*, backup_dir):
+    def fake_backup(*, db_path, backup_dir):
+        captured["db_path"] = db_path
         captured["backup_dir"] = backup_dir
         return {
             "backup_path": backup_dir / "mnemosyne_backup.db.gz",
@@ -83,12 +87,13 @@ def test_production_os_detection_drives_cmd_backup_normalization(monkeypatch, ca
 
     from mnemosyne.dr import recovery
 
-    monkeypatch.setattr(cli, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(cli, "os", SimpleNamespace(name="nt", environ={}))
     monkeypatch.setattr(recovery, "create_backup", fake_backup)
 
     cli.cmd_backup(["/c/Users/alice/backups"])
 
     assert captured["backup_dir"] == Path("C:/Users/alice/backups")
+    assert captured["db_path"] is None
     assert "Backup created:" in capsys.readouterr().out
 
 
