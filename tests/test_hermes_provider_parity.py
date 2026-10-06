@@ -933,9 +933,7 @@ def test_tool_whitelist_unknown_name_on_reinit_releases_active_state(tmp_path, p
             assert provider._beam is not None
             assert provider._is_active_in_module is True
             assert get_host_llm_backend() is not None
-            owns_backend = getattr(provider, "_owns_host_llm_backend", None)
-            if owns_backend is not None:
-                assert owns_backend is True
+            assert provider._owns_host_llm_backend is True
 
             _write_mnemosyne_config(tmp_path, ["mnemosyne_remember", "mnemosyne_not_real"])
             with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
@@ -943,14 +941,7 @@ def test_tool_whitelist_unknown_name_on_reinit_releases_active_state(tmp_path, p
 
             assert provider._beam is None
             assert provider._is_active_in_module is False
-            if owns_backend is not None:
-                assert provider._owns_host_llm_backend is False
-            else:
-                # hermes_memory_provider has no per-instance ownership
-                # refcount: it always (un)registers the shared global on
-                # failure, same as shutdown(), so the global is the
-                # correct signal for that module.
-                assert get_host_llm_backend() is None
+            assert provider._owns_host_llm_backend is False
         finally:
             provider.shutdown()
             set_host_llm_backend(None)

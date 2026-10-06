@@ -74,9 +74,13 @@ def test_initialize_registers_host_llm_when_register_returns_true(monkeypatch):
     monkeypatch.setattr("hermes_memory_provider._get_beam_class", lambda: lambda **kwargs: MagicMock())
     # Stub the registration call so the test does not depend on the real
     # adapter behavior — we only verify the hook is invoked and survives.
+    # A primary init registers before the skip-context check and again when
+    # it takes the ownership lease (#1119), so expect at least one call.
     with patch("hermes_memory_provider.hermes_llm_adapter.register_hermes_host_llm", return_value=True) as mock_reg:
         provider.initialize(session_id="test-session")
-    mock_reg.assert_called_once()
+    mock_reg.assert_called()
+    assert provider._owns_host_llm_backend is True
+    provider.shutdown()
 
 
 def test_initialize_does_not_fail_when_register_raises(monkeypatch):
@@ -121,14 +125,13 @@ def test_initialize_skips_for_non_primary_context(monkeypatch):
 def test_shutdown_clears_host_backend(monkeypatch):
     """After shutdown(), the host LLM backend must be unregistered.
 
-    This test uses the default (primary) agent context, so shutdown()
-    should unregister the backend.
+    This test uses the default (primary) agent context. The provider is the
+    only owner of the backend lease, so shutdown() should unregister it.
     """
-    from hermes_memory_provider import hermes_llm_adapter
-
     provider = MnemosyneMemoryProvider()
-    # Manually register to simulate a live session.
-    hermes_llm_adapter.register_hermes_host_llm()
+    monkeypatch.setattr("hermes_memory_provider._get_beam_class", lambda: lambda **kwargs: MagicMock())
+    provider.initialize(session_id="test-session")
+    assert provider._owns_host_llm_backend is True
     assert get_host_llm_backend() is not None
 
     provider.shutdown()
@@ -319,8 +322,6 @@ def test_shutdown_drains_in_flight_session_end_thread(caplog, monkeypatch):
     """Codex finding 4: shutdown() must briefly wait for an in-flight
     session_end thread before clearing the host backend, otherwise the
     daemon thread's late host call sees backend=None and degrades to remote."""
-    from hermes_memory_provider import hermes_llm_adapter
-
     # Make the session_end thread block for ~0.4s — longer than the
     # session_end timeout (0.1s) but well within the shutdown drain.
     beam = MagicMock()
@@ -360,8 +361,8 @@ def test_shutdown_drains_in_flight_session_end_thread(caplog, monkeypatch):
     assert provider._session_end_thread is not None
     assert provider._session_end_thread.is_alive(), "daemon should still be running"
 
-    # Register the host backend so we can observe it being cleared
-    hermes_llm_adapter.register_hermes_host_llm()
+    # Take the backend lease so we can observe it being cleared
+    provider._acquire_host_llm_backend_ownership()
     assert get_host_llm_backend() is not None
 
     # Shutdown should drain the in-flight thread BEFORE clearing the backend
@@ -376,8 +377,6 @@ def test_shutdown_drains_in_flight_session_end_thread(caplog, monkeypatch):
 def test_shutdown_proceeds_when_drain_times_out(caplog, monkeypatch):
     """If the drain takes longer than SHUTDOWN_DRAIN_TIMEOUT_SECONDS, shutdown
     proceeds (we don't want shutdown to block indefinitely either)."""
-    from hermes_memory_provider import hermes_llm_adapter
-
     beam = MagicMock()
     beam.session_id = "hermes_test123"
     beam.db_path = "/tmp/test.db"
@@ -402,7 +401,7 @@ def test_shutdown_proceeds_when_drain_times_out(caplog, monkeypatch):
     monkeypatch.setattr(provider, "_reserve_reflection_budget", lambda name: None)
 
     provider.on_session_end(messages=[])
-    hermes_llm_adapter.register_hermes_host_llm()
+    provider._acquire_host_llm_backend_ownership()
 
     start = time.monotonic()
     with caplog.at_level("DEBUG", logger="hermes_memory_provider"):
