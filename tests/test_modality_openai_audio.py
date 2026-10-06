@@ -176,6 +176,12 @@ def test_remember_media_stores_timed_transcript_moments_from_configuration(stub,
         assert [(m["kind"], m["span_kind"], m["t_start_ms"]) for m in moments] == [
             ("transcript", "time", 0), ("transcript", "time", 2400), ("transcript", "time", 5100),
         ]
+        asset = beam.media.get_asset(result.asset_id)
+        assert asset["provider_model"] == "whisper-1"
+        assert asset["provider"] is not None
+        assert {(m["provider"], m["provider_model"]) for m in moments} == {
+            (asset["provider"], asset["provider_model"])
+        }
         hits = beam.recall("who ships the parser", top_k=5)
         assert any("Alice ships the parser" in (h.get("content") or "") for h in hits)
     finally:
