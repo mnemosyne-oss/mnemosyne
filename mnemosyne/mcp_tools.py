@@ -1120,10 +1120,15 @@ def _handle_diagnose(arguments: Dict[str, Any]) -> Dict[str, Any]:
     # caller diagnoses, so unspecified stays None.
     bank = arguments.get("bank") or os.environ.get("MNEMOSYNE_MCP_BANK") or None
 
+    from mnemosyne.runtime_diagnostics import MCP_SERVER_SCOPE
+
     result = run_diagnostics(
         repair_vec_working=bool(arguments.get("repair_vec_working", False)),
         dry_run=bool(arguments.get("dry_run", False)),
         bank=bank,
+        # This process is the MCP server serving recall, so its runtime checks
+        # describe that runtime rather than a separate CLI (#813).
+        scope=MCP_SERVER_SCOPE,
     )
     db_path = None
     try:

@@ -4564,6 +4564,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             "repair_vec_working": repair_requested,
             "dry_run": dry_run,
         }
+        # These checks run inside the provider that serves recall, so they are
+        # authoritative for that runtime, not a CLI-side view (#813). This
+        # package installs separately from core; an older core without the
+        # scope contract still gets its unscoped diagnosis.
+        try:
+            from mnemosyne.runtime_diagnostics import PROVIDER_RUNTIME_SCOPE
+        except ImportError:
+            pass
+        else:
+            diagnostic_kwargs["scope"] = PROVIDER_RUNTIME_SCOPE
         if self._profile_isolation_enabled and self._beam is not None:
             diagnostic_kwargs["bank"] = self._resolve_profile_bank()
         if self._beam is None:

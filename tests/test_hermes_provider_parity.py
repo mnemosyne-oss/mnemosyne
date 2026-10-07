@@ -1041,6 +1041,7 @@ def _new_provider(module, *, scope="session", roles=("user", "assistant")):
                 "repair_vec_working": True,
                 "dry_run": True,
                 "bank": "isolated-profile",
+                "scope": "provider_runtime",
             },
         ),
         (
@@ -1051,10 +1052,11 @@ def _new_provider(module, *, scope="session", roles=("user", "assistant")):
                 "repair_vec_working": False,
                 "dry_run": False,
                 "bank": "isolated-profile",
+                "scope": "provider_runtime",
             },
         ),
-        (False, True, {}, {"repair_vec_working": False, "dry_run": False}),
-        (True, False, {}, {"repair_vec_working": False, "dry_run": False}),
+        (False, True, {}, {"repair_vec_working": False, "dry_run": False, "scope": "provider_runtime"}),
+        (True, False, {}, {"repair_vec_working": False, "dry_run": False, "scope": "provider_runtime"}),
     ],
 )
 def test_provider_diagnose_forwards_options_and_routes_only_active_isolated_bank(

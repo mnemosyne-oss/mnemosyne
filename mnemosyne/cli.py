@@ -353,7 +353,13 @@ def cmd_diagnose(args):
 
     try:
         from mnemosyne.diagnose import run_diagnostics, auto_fix
-        result = run_diagnostics(repair_vec_working=repair_vec_working, dry_run=dry_run)
+        from mnemosyne.runtime_diagnostics import CLI_INTERPRETER_SCOPE
+
+        result = run_diagnostics(
+            repair_vec_working=repair_vec_working,
+            dry_run=dry_run,
+            scope=CLI_INTERPRETER_SCOPE,
+        )
         print("\nMnemosyne Diagnostics\n")
         print(f"  Checks passed: {result.get('checks_passed', 0)}/{result.get('checks_total', 0)}")
         if result.get("key_findings"):
@@ -503,6 +509,7 @@ def cmd_doctor(args):
         write_doctor_artifact_atomically,
         write_doctor_artifacts_atomically,
     )
+    from mnemosyne.runtime_diagnostics import CLI_INTERPRETER_SCOPE
 
     try:
         report = build_doctor_report(
@@ -510,6 +517,7 @@ def cmd_doctor(args):
             db_path,
             scan_limit=scan_limit,
             candidate_limit=sample_limit if include_candidates else 0,
+            runtime_scope=CLI_INTERPRETER_SCOPE,
         )
         payload = doctor_report_payload(report, include_candidates=include_candidates)
         json_text = render_doctor_json(payload)

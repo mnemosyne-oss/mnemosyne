@@ -12,20 +12,61 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# Dependency and capability checks run in whichever interpreter called us. Naming
+# that interpreter's role is what keeps a green CLI result from being read as a
+# statement about the runtime serving recall (#813). The caller knows its role;
+# this module does not, so the scope is passed in rather than assumed.
+CALLING_INTERPRETER_SCOPE = "calling_interpreter"  # role not stated by the caller
+CLI_INTERPRETER_SCOPE = "cli_interpreter"  # a standalone ``mnemosyne`` CLI process
+PROVIDER_RUNTIME_SCOPE = "provider_runtime"  # inside the Hermes provider serving recall
+MCP_SERVER_SCOPE = "mcp_server"  # inside the MCP server serving recall
+RUNTIME_SCOPES = frozenset(
+    {
+        CALLING_INTERPRETER_SCOPE,
+        CLI_INTERPRETER_SCOPE,
+        PROVIDER_RUNTIME_SCOPE,
+        MCP_SERVER_SCOPE,
+    }
+)
 
-def collect_runtime_diagnostics() -> dict[str, Any]:
-    """Run pure runtime, dependency, and capability checks without a provider."""
+
+def collect_runtime_diagnostics(*, scope: str = CALLING_INTERPRETER_SCOPE) -> dict[str, Any]:
+    """Run pure runtime, dependency, and capability checks without a provider.
+
+    ``scope`` names the role of the interpreter running the checks and must be
+    one of ``RUNTIME_SCOPES``. Only an in-provider caller may claim
+    ``provider_runtime``; that result is authoritative for the runtime serving
+    recall, while a ``cli_interpreter`` result is not.
+
+    Every dependency check below imports into *this* process. When the CLI lives
+    in a different interpreter from the one serving recall -- the normal outcome
+    of a pipx install beside a Hermes venv -- a green result here says nothing
+    about that runtime, and reporting it unqualified is how a degraded vector
+    stack stayed invisible (#813). So the payload declares the scope it actually
+    measured. Guessing a runtime interpreter from HERMES_HOME would only move the
+    misleading report somewhere else, so nothing here tries.
+    """
+
+    if scope not in RUNTIME_SCOPES:
+        raise ValueError(f"unknown runtime diagnostics scope: {scope!r}")
 
     checks: list[dict[str, str]] = []
 
     def add(category: str, check: str, status: str, detail: str = "") -> None:
-        checks.append({"category": category, "check": check, "status": status, "detail": detail})
+        entry = {"category": category, "check": check, "status": status, "detail": detail}
+        # Every check in this module imports into the calling interpreter, so all
+        # of them carry the scope. Stamping it at the source means a new check
+        # cannot be added without it (#813).
+        entry["scope"] = scope
+        checks.append(entry)
 
     add("env", "python_version", "OK", sys.version.split()[0])
     add("env", "platform", "OK", platform.platform())
     # Report only the executable name: an absolute interpreter path can reveal
     # a user's home directory or virtual-environment layout in diagnostics.
-    add("env", "python_executable", "OK", Path(sys.executable).name)
+    executable = Path(sys.executable).name
+    add("env", "python_executable", "OK", executable)
+    add("env", "checks_scope", "OK", scope)
 
     try:
         import mnemosyne
@@ -96,4 +137,4 @@ def collect_runtime_diagnostics() -> dict[str, Any]:
 
     statuses = {entry["status"] for entry in checks}
     overall = "unavailable" if "ERROR" in statuses else "warning" if statuses & {"MISSING", "NO"} else "ok"
-    return {"status": overall, "checks": checks}
+    return {"status": overall, "checks": checks, "scope": scope, "executable": executable}

@@ -4184,11 +4184,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _handle_diagnose(self, args: Dict[str, Any]) -> str:
         from mnemosyne.diagnose import run_diagnostics
+        from mnemosyne.runtime_diagnostics import PROVIDER_RUNTIME_SCOPE
         repair_requested = bool(args.get("repair_vec_working", False))
         dry_run = bool(args.get("dry_run", False))
         diagnostic_kwargs: Dict[str, Any] = {
             "repair_vec_working": repair_requested,
             "dry_run": dry_run,
+            # These checks run inside the provider that serves recall, so they
+            # are authoritative for that runtime, not a CLI-side view (#813).
+            "scope": PROVIDER_RUNTIME_SCOPE,
         }
         if self._profile_isolation_enabled and self._beam is not None:
             diagnostic_kwargs["bank"] = self._resolve_profile_bank()
