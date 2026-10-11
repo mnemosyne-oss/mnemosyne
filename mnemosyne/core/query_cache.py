@@ -117,21 +117,36 @@ class QueryCache:
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_hits ON query_cache(hit_count DESC)")
         self._conn.commit()
         
-        # Load existing cache entries from SQLite into memory
+        # Load existing cache entries from SQLite into memory.  Each entry
+        # keeps its persisted insert time, so TTL and LRU order hold across
+        # restarts.  ``created_at`` is SQLite's UTC ``CURRENT_TIMESTAMP``.
         try:
             cursor = self._conn.cursor()
-            cursor.execute("SELECT normalized, results_json FROM query_cache")
+            cursor.execute(
+                "SELECT normalized, results_json, "
+                "CAST(strftime('%s', created_at) AS REAL) AS created_epoch "
+                "FROM query_cache ORDER BY created_at, rowid"
+            )
+            undated = []
             for row in cursor.fetchall():
+                key = row["normalized"]
+                if row["created_epoch"] is None:
+                    # No readable insert time: its age cannot be checked.
+                    undated.append(key)
+                    continue
                 try:
                     results = json.loads(row["results_json"])
-                    key = row["normalized"]
                     if _is_opaque_v2_key(key):
                         self._opaque[key] = results
                     else:
                         self._tier1[key] = results
                         self._tier4[key] = results
+                    self._insert_times[key] = row["created_epoch"]
                 except Exception:
                     pass
+            with self._lock:
+                self._delete_persisted(undated)
+                self._evict_if_needed()
         except Exception:
             pass
     
@@ -200,6 +215,7 @@ class QueryCache:
                     self._tier2_3.pop(normalized, None)
                     self._tier4.pop(normalized, None)
                     self._insert_times.pop(normalized, None)
+                    self._delete_persisted([normalized])
                     self.misses += 1
                     return None
             
@@ -269,6 +285,7 @@ class QueryCache:
             if key in self._insert_times and now - self._insert_times[key] > self.ttl_seconds:
                 self._opaque.pop(key, None)
                 self._insert_times.pop(key, None)
+                self._delete_persisted([key])
                 self.misses += 1
                 return None
             if key in self._opaque:
@@ -330,7 +347,11 @@ class QueryCache:
             self._evict_if_needed()
     
     def _evict_if_needed(self):
-        """LRU eviction if cache exceeds max_size. Also cleans TTL-expired entries."""
+        """LRU eviction if cache exceeds max_size. Also cleans TTL-expired entries.
+
+        Every key dropped here also loses its SQLite row, so an evicted
+        entry cannot come back on the next warm start.
+        """
         # First, clean up any TTL-expired entries
         now = time.time()
         expired = [
@@ -345,6 +366,7 @@ class QueryCache:
             self._insert_times.pop(key, None)
         
         # Then evict oldest if still over max_size
+        to_remove = []
         total = len(self._tier1) + len(self._opaque)
         if total > self.max_size:
             sorted_keys = sorted(
@@ -358,6 +380,20 @@ class QueryCache:
                 self._tier4.pop(key, None)
                 self._opaque.pop(key, None)
                 self._insert_times.pop(key, None)
+        self._delete_persisted(expired + to_remove)
+
+    def _delete_persisted(self, keys: List[str]):
+        """Best-effort removal of SQLite rows for keys dropped from memory."""
+        if not self._conn or not keys:
+            return
+        try:
+            self._conn.executemany(
+                "DELETE FROM query_cache WHERE normalized = ?",
+                [(key,) for key in keys],
+            )
+            self._conn.commit()
+        except Exception:
+            pass
     
     def close(self):
         """Close the SQLite connection and release resources."""
