@@ -268,6 +268,82 @@ from mnemosyne.core.prefetch import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+# Fail-loud contract for the silent-degradation defect measured in production
+# (2026-10-13): when fastembed is missing, every embedding write is skipped by
+# the `if available():` guard and nothing logs, so a gateway can run for weeks
+# with dense/semantic recall off; when only sqlite_vec is missing, writes still
+# happen and the limitation is vector search instead. The provider announces
+# the degraded state once per process at startup, attributing the cause to the
+# actual capability that is unavailable. Never raises and never changes recall
+# behaviour.
+_EMBEDDING_ENGINE_UNAVAILABLE_LOGGED = False
+_EMBEDDING_ENGINE_UNAVAILABLE_LOCK = threading.Lock()
+
+
+def _announce_embedding_engine_unavailable() -> None:
+    """Warn once per process when the embedding engine is unavailable."""
+    global _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED
+    with _EMBEDDING_ENGINE_UNAVAILABLE_LOCK:
+        if _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED:
+            return
+        # Reserve before the (slow) capability detection so a concurrent call
+        # can neither re-run it nor emit a second warning. Released again below
+        # if there is nothing to announce.
+        _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED = True
+    try:
+        from mnemosyne.core import beam as _beam
+        from mnemosyne.core import embeddings as _embeddings
+
+        if _embeddings._is_disabled():
+            logger.warning(
+                "Mnemosyne: embedding engine disabled by an opt-out env var "
+                "(MNEMOSYNE_NO_EMBEDDINGS / MNEMOSYNE_SKIP_EMBEDDINGS / "
+                "MNEMOSYNE_EMBEDDINGS_OFF); dense/semantic recall is off and "
+                "recall falls back to keyword-only."
+            )
+            return
+
+        problems = []
+        hints = []
+        if not _embeddings.available():
+            if _embeddings._is_api_model(_embeddings._DEFAULT_MODEL):
+                # available() already returned False, so a keyless custom
+                # endpoint (the other True branch) is ruled out: the API
+                # backend is configured but its credentials are not usable.
+                problems.append(
+                    "the configured embedding API backend has no usable "
+                    "credentials"
+                )
+                hints.append(
+                    "set MNEMOSYNE_EMBEDDING_API_KEY or OPENAI_API_KEY, or "
+                    "point MNEMOSYNE_EMBEDDING_API_URL at a keyless endpoint"
+                )
+            else:
+                problems.append("missing fastembed (no dense vectors)")
+        if not _beam._SQLITE_VEC_AVAILABLE:
+            problems.append("missing sqlite_vec (no vector search)")
+        if not problems:
+            with _EMBEDDING_ENGINE_UNAVAILABLE_LOCK:
+                _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED = False
+            return
+        if any("fastembed" in p or "sqlite_vec" in p for p in problems):
+            hints.append(
+                "make the embeddings extra importable in "
+                "the runtime interpreter that runs this provider"
+            )
+        logger.warning(
+            "Mnemosyne: embedding engine unavailable (%s); "
+            "dense/semantic recall is disabled and recall falls back to "
+            "keyword-only. Hint: %s.",
+            " and ".join(problems),
+            "; ".join(hints),
+        )
+    except Exception:
+        # Announcement only: never block provider startup on diagnostics.
+        with _EMBEDDING_ENGINE_UNAVAILABLE_LOCK:
+            _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED = False
+        return
+
 # ---------------------------------------------------------------------------
 # C13: provider-active flag for memory-context double-injection prevention.
 # ---------------------------------------------------------------------------
@@ -1930,6 +2006,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize Mnemosyne beam for this session."""
+        _announce_embedding_engine_unavailable()
         with self._ensure_beam_access_lock():
             with self._ensure_surface_adapter_lock():
                 self._initialize_locked(session_id, **kwargs)
