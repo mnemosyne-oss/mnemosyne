@@ -319,7 +319,7 @@ If the `hermes_plugin` hook uses a different session ID than the MemoryProvider,
 ### When to use mnemosyne_remember vs the legacy memory tool
 
 - **ALWAYS use `mnemosyne_remember`** for durable facts, preferences, and insights
-- The legacy `memory` tool is deprecated for durable storage
+- The legacy `memory` tool is deprecated for durable storage of bulk facts; small always-injected memory files (binding rules, time-sensitive notes, short pointers) remain a supported complementary tier — this deprecation concerns bulk fact storage, which should go through `mnemosyne_remember`
 - Mnemosyne supports importance scoring (0.0-1.0), global scope, expiry dates, and entity extraction — features the legacy tool doesn't have
 
 ### Memory survives gateway restarts, machine reboots, and Fly.io VM recycles
