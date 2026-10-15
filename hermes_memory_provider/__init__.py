@@ -373,8 +373,9 @@ def _sanitize_prefetch_query(query: str) -> str:
 REMEMBER_SCHEMA = {
     "name": "mnemosyne_remember",
     "description": (
-        "Store a durable memory in Mnemosyne. Use for ANY fact, preference, "
-        "identity, insight, or context that should persist across sessions. Higher importance "
+        "Store a durable memory in Mnemosyne. Use for bulk durable facts, preferences, "
+        "identity, insights, or context that should persist across sessions. Small standing "
+        "rules and context anchors may stay in the always-injected memory tier instead. Higher importance "
         "(0.0-1.0) surfaces the memory more often. Use scope='global' for user-level "
         "facts; scope='session' for conversation-specific context. Use valid_until "
         "(ISO date YYYY-MM-DD) for time-bound facts. Use extract_entities=True to "
@@ -2081,10 +2082,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # (working / init-failed-visible / skip-context-silent).
             base = (
                 "# Mnemosyne Memory\n"
-                "Active (native local memory). Use mnemosyne_remember to store ANY "
-                "durable fact, preference, identity, or insight. Use mnemosyne_recall to search. "
+                "Active (native local memory). Use mnemosyne_remember for bulk durable storage: "
+                "facts, preferences, identity, and insights. Use mnemosyne_recall to search. "
                 "Use mnemosyne_shared_* tools for manual shared surface CRUD. "
-                "The legacy memory tool is deprecated for durable storage — Mnemosyne is primary.\n"
+                "The legacy memory tool is deprecated for bulk durable storage — Mnemosyne is primary. "
+                "Small standing rules and context anchors may stay in the always-injected memory "
+                "tier, a supported complementary tier (bounded, loaded per session); this exception "
+                "takes precedence over general storage guidance.\n"
                 "\n"
                 "When a `## Mnemosyne Context` block is injected into the current turn, "
                 "read it before calling retrieval tools. If it answers the user's question, "
