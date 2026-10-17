@@ -29,6 +29,7 @@ class Response:
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     monkeypatch.delenv("MNEMOSYNE_EMBEDDING_MAX_CHARS", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_MAX_BYTES", raising=False)
     monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "")
@@ -149,3 +150,94 @@ def test_query_cache_follows_cap_changes(monkeypatch):
 
     assert [p["input"] for p in payloads] == [["abcdef"], ["abc"]]
     embeddings._embed_query_cached.cache_clear()
+
+
+def test_byte_cap_cuts_on_a_code_point_boundary(monkeypatch):
+    """MNEMOSYNE_EMBEDDING_MAX_BYTES bounds UTF-8 bytes, which bound tokens from above for byte-level BPE; a cut never
+    leaves half a character."""
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_MAX_BYTES", "5")
+    assert embeddings._cap_for_api(["я" * 10, "abc"]) == ["яя", "abc"]
+    assert embeddings._cap_for_api(["𝔘𝔘"]) == ["𝔘"]  # 4-byte characters
+
+
+def test_byte_cap_is_off_by_default_and_combines_with_the_char_cap(monkeypatch, caplog):
+    text = "ж" * 100
+    assert embeddings._cap_for_api([text]) == [text]
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_MAX_CHARS", "40")
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_MAX_BYTES", "50")
+    with caplog.at_level("WARNING", logger="mnemosyne.core.embeddings"):
+        assert embeddings._cap_for_api([text]) == ["ж" * 25]  # 40 chars = 80 bytes > 50
+    assert any(
+        "embedding input truncated: 80 -> 50 bytes" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_query_cache_follows_byte_cap_changes(monkeypatch):
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "http://127.0.0.1:11435/v1")
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_QUERY_PREFIX", raising=False)
+    for flag in (
+        "MNEMOSYNE_NO_EMBEDDINGS",
+        "MNEMOSYNE_SKIP_EMBEDDINGS",
+        "MNEMOSYNE_EMBEDDINGS_OFF",
+    ):
+        monkeypatch.delenv(flag, raising=False)
+    payloads = _capture_payload(monkeypatch)
+    embeddings._embed_query_cached.cache_clear()
+
+    embeddings.embed_query("щщщщ")
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_MAX_BYTES", "4")
+    embeddings.embed_query("щщщщ")
+
+    assert [p["input"] for p in payloads] == [["щщщщ"], ["щщ"]]
+    embeddings._embed_query_cached.cache_clear()
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "", "   ", "abc", "1.5"])
+def test_byte_cap_disabled_values(monkeypatch, value):
+    text = "x" * 5000 + "\u044f" * 100
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_MAX_BYTES", value)
+
+    assert embeddings._cap_for_api([text]) == [text]
+
+
+@pytest.mark.parametrize("value", ["abc", "1.5"])
+def test_byte_cap_invalid_value_warns(monkeypatch, caplog, value):
+    text = "x" * 5000 + "\u044f" * 100
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_MAX_BYTES", value)
+
+    with caplog.at_level("WARNING", logger="mnemosyne.core.embeddings"):
+        assert embeddings._cap_for_api([text]) == [text]
+
+    assert any(
+        "invalid MNEMOSYNE_EMBEDDING_MAX_BYTES" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_byte_cap_smaller_than_first_char_raises_before_request(monkeypatch):
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_MAX_BYTES", "1")
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "http://127.0.0.1:11435/v1")
+
+    def fail_if_called(*_args, **_kwargs):
+        pytest.fail("embedding request sent despite a cap-to-empty input")
+
+    monkeypatch.setattr(embeddings.urllib.request, "urlopen", fail_if_called)
+
+    with pytest.raises(
+        embeddings._EmbeddingPolicyError, match="MNEMOSYNE_EMBEDDING_MAX_BYTES"
+    ):
+        embeddings._embed_api(["\u044f"])
+
+
+def test_byte_cap_drops_lone_surrogates(monkeypatch):
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_MAX_BYTES", "1")
+    assert embeddings._cap_for_api(["a\udcffb"]) == ["a"]
+
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_MAX_BYTES", "10")
+    assert embeddings._cap_for_api(["a\udcffb"]) == ["a\udcffb"]
+
+
+def test_byte_cap_four_byte_chars_exact_boundary(monkeypatch):
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_MAX_BYTES", "9")
+    assert embeddings._cap_for_api(["\U00020000" * 3]) == ["\U00020000" * 2]
