@@ -8,6 +8,7 @@ for fuzzy matching. No spaCy, no PyTorch, no external NLP libraries.
 Storage: TripleStore triples (subject=memory_id, predicate="mentions", object="entity_name")
 """
 
+import os
 import re
 from typing import List, Set, Tuple
 
@@ -130,6 +131,81 @@ _STOP_WORDS = ENTITY_EXTRACTION_STOP_WORDS
 # REGEX PATTERNS FOR ENTITY EXTRACTION
 # =============================================================================
 
+# Single capitalized word (fallback): Abdias, Python, John.
+# Named so extract_entities_regex can tell this pattern's matches apart:
+# they alone get the position drop below.
+_SINGLE_CAP_WORD = re.compile(r'\b([A-Z][a-zA-Z]{1,20})\b')
+
+# Opt-in position rule, read per call: MNEMOSYNE_ENTITY_POSITION_FILTER=1.
+# In conversation text a single capitalized word is capitalized by where it
+# stands far more often than because it is a name: a sentence opener
+# ("Then", "So", "Okay"), a contraction stem, the first word of a quoted
+# phrase. Off by default because short declarative facts open with their
+# subject ("Jane is an architect."), and the rule would drop that name.
+_POSITION_FILTER_ENV = "MNEMOSYNE_ENTITY_POSITION_FILTER"
+
+# A word is sentence-initial at the start of the text, or when the nearest
+# non-space character before it (closing quotes and brackets are skipped too,
+# and the * closing a markdown emphasis span) ends a sentence, or when it is
+# the first word of a stored turn: a speaker prefix such as `[USER] ` or
+# `[ASSISTANT] `, a bracketed uppercase word opening its line and followed by
+# a space, counts as a sentence start. Only that shape does: a bracket
+# closing mid-sentence is skipped like any closer, and the name after it
+# extracts.
+_SENTENCE_TERMINATORS = frozenset(".!?:;\u2026\n\r")
+_TRAILING_CLOSERS = frozenset("\"')]}*\u2019\u201d")
+_SPEAKER_PREFIX = re.compile(r'\[[A-Z]+\]')
+
+# A contraction stem is not a name: an apostrophe is a word boundary, so
+# "Don't" matched "Don" and "Haven't" matched "Haven". A single word followed
+# by an apostrophe and an unambiguous contraction tail is rejected. The 's
+# tail is ambiguous ("Let's", "Alice's") and goes to the name: a possessive
+# is the one form a name takes in a sentence about the person.
+_CONTRACTION_TAIL = re.compile(r"['\u2019](?:t|ll|re|ve|d|m)\b", re.IGNORECASE)
+
+# The word opening a quoted phrase is capitalized by position, like a
+# sentence opener: the title case of a quoted heading ("Guarded canonical
+# calls"), the first word of quoted speech ('Still us.'). Only the phrase
+# shape is dropped, an opening quote right before the word and a lowercase
+# word right after it. A quoted name standing alone ('Alice'), a quoted
+# possessive ("Alice's notes") and a quoted list (['Alice', 'Maya']) keep
+# their names.
+_OPENING_QUOTES = frozenset("\"'\u201c\u2018")
+_LOWERCASE_FOLLOWER = re.compile(r' [a-z]')
+
+
+def _position_filter_enabled() -> bool:
+    value = os.environ.get(_POSITION_FILTER_ENV, "").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def _is_sentence_initial(text: str, pos: int) -> bool:
+    i = pos - 1
+    while i >= 0 and (text[i] in " \t" or text[i] in _TRAILING_CLOSERS):
+        if text[i] == "]" and text[i + 1] in " \t":
+            line_start = max(text.rfind("\n", 0, i), text.rfind("\r", 0, i)) + 1
+            if _SPEAKER_PREFIX.fullmatch(text, line_start, i + 1):
+                return True
+        i -= 1
+    return i < 0 or text[i] in _SENTENCE_TERMINATORS
+
+
+def _opens_quoted_phrase(text: str, start: int, end: int) -> bool:
+    if start == 0 or text[start - 1] not in _OPENING_QUOTES:
+        return False
+    if start > 1 and text[start - 2].isalnum():
+        return False
+    return _LOWERCASE_FOLLOWER.match(text, end) is not None
+
+
+def _capitalized_by_position(text: str, start: int, end: int) -> bool:
+    return (
+        _is_sentence_initial(text, start)
+        or _CONTRACTION_TAIL.match(text, end) is not None
+        or _opens_quoted_phrase(text, start, end)
+    )
+
+
 _ENTITY_PATTERNS = [
     # @mentions: @username
     re.compile(r'@(\w{2,30})'),
@@ -143,7 +219,7 @@ _ENTITY_PATTERNS = [
     # Capitalized word sequences (2-5 words): New York, Abdias J, San Francisco Bay Area
     re.compile(r'\b([A-Z][a-zA-Z]*(?:\s+[A-Z][a-zA-Z]*){1,4})\b'),
     # Single capitalized word (fallback): Abdias, Python, John
-    re.compile(r'\b([A-Z][a-zA-Z]{1,20})\b'),
+    _SINGLE_CAP_WORD,
 ]
 
 
@@ -225,11 +301,15 @@ def extract_entities_regex(text: str) -> List[str]:
 
     Returns list of unique entity strings. No external dependencies.
     Filters out stop words, single lowercase words, and pure numbers.
+    With MNEMOSYNE_ENTITY_POSITION_FILTER set, also drops a single
+    capitalized word that is capitalized by its position: a sentence opener,
+    a contraction stem, or the first word of a quoted phrase.
     """
     if not text or not isinstance(text, str):
         return []
 
     entities: Set[str] = set()
+    position_filter = _position_filter_enabled()
 
     for pattern in _ENTITY_PATTERNS:
         for match in pattern.finditer(text):
@@ -266,6 +346,16 @@ def extract_entities_regex(text: str) -> List[str]:
                 continue
             # Single-word ALL-CAPS tokens (emphasis/code, not names)
             if len(words) == 1 and entity.isupper():
+                continue
+            # Opt-in: drop a single capitalized word capitalized by position.
+            # A name still extracts from any mid-sentence occurrence, from a
+            # multi-word sequence, or with an @/# prefix (those come from the
+            # other patterns, which skip this).
+            if (
+                position_filter
+                and pattern is _SINGLE_CAP_WORD
+                and _capitalized_by_position(text, match.start(1), match.end(1))
+            ):
                 continue
             # Filter out standalone lowercase words (unless @-mentioned/#-tagged)
             # But allow @mentions and hashtags which are lowercase by nature

@@ -238,6 +238,50 @@ class TestWrapperExtractEntitiesParity:
             f"quoted dialogue reached the mentions vocabulary: {sorted(values)}"
         )
 
+    def test_position_filter_off_keeps_sentence_initial_subjects(
+        self, tmp_path, monkeypatch
+    ):
+        """Default: a fact that opens with its subject keeps the name in
+        the mentions vocabulary."""
+        from mnemosyne.core.annotations import AnnotationStore
+        monkeypatch.delenv("MNEMOSYNE_ENTITY_POSITION_FILTER", raising=False)
+        db_path = tmp_path / "c12c.db"
+        mem = Mnemosyne(session_id="c12c", db_path=db_path)
+        mem.remember(
+            "Jane is an architect. Jane uses AutoCAD daily.",
+            source="user",
+            extract_entities=True,
+        )
+        values = {
+            row["value"]
+            for row in AnnotationStore(db_path=db_path).query_by_kind(
+                "mentions", filter_noise=False
+            )
+        }
+        assert values == {"Jane", "AutoCAD"}
+
+    def test_position_filter_on_drops_sentence_case(self, tmp_path, monkeypatch):
+        """Opt-in: sentence openers, contraction stems and quoted-phrase
+        openers never reach the mentions vocabulary; a mid-sentence name
+        still does."""
+        from mnemosyne.core.annotations import AnnotationStore
+        monkeypatch.setenv("MNEMOSYNE_ENTITY_POSITION_FILTER", "1")
+        db_path = tmp_path / "c12d.db"
+        mem = Mnemosyne(session_id="c12d", db_path=db_path)
+        mem.remember(
+            "[USER] Guess I told Maya. Don't worry, "
+            'read the "Guarded canonical calls" note.',
+            source="user",
+            extract_entities=True,
+        )
+        values = {
+            row["value"]
+            for row in AnnotationStore(db_path=db_path).query_by_kind(
+                "mentions", filter_noise=False
+            )
+        }
+        assert values == {"Maya"}
+
 
 class TestOverlappingCategoriesReachStorageOnce:
     """The cross-category dedupe must survive into both stores.
