@@ -19,6 +19,7 @@ Extraction uses temperature=0.0 (deterministic) so re-ingesting the same
 content does not create near-duplicate facts in the facts table.
 """
 
+import ast
 import logging
 import os
 import re
@@ -32,35 +33,55 @@ logger = logging.getLogger(__name__)
 from mnemosyne.core import local_llm
 
 # --- Config ------------------------------------------------------------------
+# The default template is a WORKED example, not a schema skeleton. A skeleton
+# under-determines the output shape for small local models: Qwen2.5-1.5B asked
+# for a five-key payload returned subject/predicate/object objects inside
+# `facts` and left `kg` empty, because an empty example never shows which
+# container each kind of item belongs in. A filled example pins it (measured on
+# Qwen2.5-1.5B: facts came back as sentences and kg as proper SPO objects).
+DEFAULT_EXTRACTION_PROMPT = """You are an expert structured memory extractor for Mnemosyne v3.0+ MEMORIA tables.
+The user message below may be in English, German, Russian, or another language.
+First detect the language, then extract ONLY high-signal, long-term relevant items.
+Categories to extract (return valid JSON only, no extra text):
+- facts: persistent user metrics, states, knowledge, or personal data, each written
+  as a PLAIN SENTENCE. A fact is never a subject/predicate/object object.
+  (Examples: 'my name is X', 'I work at Y', 'server runs on port 8080')
+  (Russian: 'меня зовут', 'работаю в', 'использую', 'мой пароль', 'живу в')
+- instructions: rules or commands directed at me the agent
+  (Examples: 'always use tabs', 'never delete logs', 'call me boss')
+  (Russian: 'всегда', 'никогда', 'не забудь', 'нужно', 'должен', 'обязательно')
+- preferences: likes, dislikes, and their evolution
+  (Examples: 'I like dark mode', 'I prefer Python over Go')
+  (Russian: 'нравится', 'люблю', 'терпеть не могу', 'предпочитаю', 'я за')
+- timelines: real events with dates/times
+  (Examples: 'release on 2024-12-01', 'meeting next Tuesday')
+  (Russian: 'встреча', 'релиз', 'запланировано на', 'дедлайн', крайний срок)
+- kg: knowledge-graph triples in subject-predicate-object form. EVERY triple goes
+  here, as an object with exactly the keys 'subject', 'predicate' and 'object' —
+  never as a sentence, and never in the facts array.
+  (Examples: 'user prefers vim', 'project uses fastapi')
+
+Rules:
+- Only extract persistent, non-transient content. Ignore weather, one-off chat, system text.
+- Use semantic understanding — do NOT rely on English keywords.
+- Preserve original casing and language.
+- If nothing qualifies, return empty arrays.
+
+Worked example — user message: 'Ada's laptop is called HAL-9000 and it runs NixOS.'
+{"facts": ["Ada's laptop is called HAL-9000.", "Ada's laptop runs NixOS."],
+ "instructions": [], "preferences": [], "timelines": [],
+ "kg": [{"subject": "Ada", "predicate": "has_laptop", "object": "HAL-9000"},
+        {"subject": "HAL-9000", "predicate": "runs", "object": "NixOS"}]}
+
+Return JSON in this exact format:
+{"facts": [], "instructions": [], "preferences": [], "timelines": [], "kg": []}
+
+User message: {text}
+
+Extraction:"""
+
 EXTRACTION_PROMPT_TEMPLATE = os.environ.get(
-    "MNEMOSYNE_EXTRACTION_PROMPT",
-    "You are an expert structured memory extractor for Mnemosyne v3.0+ MEMORIA tables.\n"
-    "The user message below may be in English, German, Russian, or another language.\n"
-    "First detect the language, then extract ONLY high-signal, long-term relevant items.\n"
-    "Categories to extract (return valid JSON only, no extra text):\n"
-    "- facts: persistent user metrics, states, knowledge, or personal data\n"
-    "  (Examples: 'my name is X', 'I work at Y', 'server runs on port 8080')\n"
-    "  (Russian: 'меня зовут', 'работаю в', 'использую', 'мой пароль', 'живу в')\n"
-    "- instructions: rules or commands directed at me the agent\n"
-    "  (Examples: 'always use tabs', 'never delete logs', 'call me boss')\n"
-    "  (Russian: 'всегда', 'никогда', 'не забудь', 'нужно', 'должен', 'обязательно')\n"
-    "- preferences: likes, dislikes, and their evolution\n"
-    "  (Examples: 'I like dark mode', 'I prefer Python over Go')\n"
-    "  (Russian: 'нравится', 'люблю', 'терпеть не могу', 'предпочитаю', 'я за')\n"
-    "- timelines: real events with dates/times\n"
-    "  (Examples: 'release on 2024-12-01', 'meeting next Tuesday')\n"
-    "  (Russian: 'встреча', 'релиз', 'запланировано на', 'дедлайн', крайний срок)\n"
-    "- kg: knowledge-graph triples in subject-predicate-object form\n"
-    "  (Examples: 'user prefers vim', 'project uses fastapi')\n\n"
-    "Rules:\n"
-    "- Only extract persistent, non-transient content. Ignore weather, one-off chat, system text.\n"
-    "- Use semantic understanding — do NOT rely on English keywords.\n"
-    "- Preserve original casing and language.\n"
-    "- If nothing qualifies, return empty arrays.\n\n"
-    "Return JSON in this exact format:\n"
-    '{"facts": [], "instructions": [], "preferences": [], "timelines": [], "kg": []}\n\n'
-    "User message: {text}\n\n"
-    "Extraction:"
+    "MNEMOSYNE_EXTRACTION_PROMPT", DEFAULT_EXTRACTION_PROMPT
 )
 
 
@@ -68,6 +89,54 @@ def _build_extraction_prompt(text: str, detected_lang: str = 'en') -> str:
     """Build the extraction prompt with the user text and language context."""
     prompt = EXTRACTION_PROMPT_TEMPLATE.replace("{text}", text).replace("{lang}", detected_lang)
     return prompt
+
+
+_SPO_KEYS = ("subject", "predicate", "object")
+
+
+def _spo_fields(item):
+    """Return ``(subject, predicate, object)`` for an UNAMBIGUOUS SPO item.
+
+    Returns None when the item is not clearly a triple. Two shapes qualify: a
+    dict carrying all three keys (any casing), and a STRING that is a repr of
+    such a dict — which is what a stray object looks like once something
+    upstream has run ``str()`` over it. The repr is read with ``literal_eval``
+    rather than whitespace-split, so ``"{'subject': 'a', ...}"`` recovers
+    ``('a', ...)`` instead of inventing a triple from its punctuation.
+
+    A 3-element list is deliberately NOT accepted here: ``["a","b","c"]`` inside
+    a flat category is indistinguishable from a list of three short facts, and
+    guessing wrong would both invent a triple and delete facts. A plain sentence
+    never qualifies, because a fabricated SPO split is worse than no triple.
+    """
+    if isinstance(item, dict):
+        fields = {str(key).lower(): value for key, value in item.items()}
+        subject = fields.get("subject")
+        predicate = fields.get("predicate")
+        obj = fields.get("object")
+        if subject and predicate and obj:
+            return (str(subject), str(predicate), str(obj))
+        return None
+    if isinstance(item, str):
+        text = item.strip()
+        if not (
+            text.startswith("{")
+            and "subject" in text
+            and "predicate" in text
+            and "object" in text
+        ):
+            return None
+        try:
+            recovered = ast.literal_eval(text)
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            return None
+        return _spo_fields(recovered) if isinstance(recovered, dict) else None
+    return None
+
+
+def _is_spo_item(item) -> bool:
+    """True when :func:`_spo_fields` can read a triple out of this item."""
+    return _spo_fields(item) is not None
 
 
 def _parse_facts(raw_output: str) -> List[str]:
@@ -110,6 +179,13 @@ def _parse_facts(raw_output: str) -> List[str]:
                     if isinstance(items, list):
                         for item in items:
                             if not item:
+                                continue
+                            # A misfiled triple is not a fact. Stringifying it
+                            # here is what put "{'subject': 'Melissa', ...}"
+                            # rows in the facts table while the real triple was
+                            # lost: drop it, so _parse_kg_triples can recover it
+                            # into the KG instead of storing a repr as knowledge.
+                            if _is_spo_item(item):
                                 continue
                             text = str(item)
                             key = text.strip().casefold()
@@ -193,25 +269,40 @@ def _parse_kg_triples(raw_output: str) -> List[Tuple[str, str, str]]:
         return []
     if not isinstance(parsed, dict):
         return []
+    # The intended category first, preserving every shape it already accepted:
+    # an SPO dict (any key casing), a [s, p, o] list, or a "subject predicate
+    # object" string.
+    parsed_triples: List[Tuple[str, str, str]] = []
     items = parsed.get("kg", [])
-    if not isinstance(items, list):
-        return []
+    if isinstance(items, list):
+        for item in items:
+            fields = _spo_fields(item)
+            if fields:
+                parsed_triples.append(fields)
+            elif (
+                isinstance(item, (list, tuple))
+                and len(item) == 3
+                and not any(field is None for field in item)
+            ):
+                parsed_triples.append((str(item[0]), str(item[1]), str(item[2])))
+            elif isinstance(item, str) and item.strip():
+                parts = item.strip().split(None, 2)
+                if len(parts) == 3:
+                    parsed_triples.append((parts[0], parts[1], parts[2]))
 
-    triples: List[Tuple[str, str, str]] = []
-    for item in items:
-        if isinstance(item, (list, tuple)) and len(item) == 3:
-            if any(f is None for f in item):
-                continue
-            triples.append((str(item[0]), str(item[1]), str(item[2])))
-        elif isinstance(item, dict):
-            s, p, o = item.get("subject"), item.get("predicate"), item.get("object")
-            if s and p and o:
-                triples.append((str(s), str(p), str(o)))
-        elif isinstance(item, str) and item.strip():
-            parts = item.strip().split(None, 2)
-            if len(parts) == 3:
-                triples.append((parts[0], parts[1], parts[2]))
-    return triples
+    # Recovery: small local models sometimes file their SPO dictionaries under a
+    # flat fact category and leave `kg` empty (observed with the bundled
+    # Qwen2.5-1.5B), which silently starved the triples table. Recover the
+    # unambiguous shapes from every other list. Prose and bare three-item lists
+    # are still never split into a triple: a fabricated SPO is worse than none.
+    for category, category_items in parsed.items():
+        if category == "kg" or not isinstance(category_items, list):
+            continue
+        for item in category_items:
+            fields = _spo_fields(item)
+            if fields:
+                parsed_triples.append(fields)
+    return parsed_triples
 
 
 # Validation caps for LLM-proposed KG triples before they reach TripleStore.
@@ -553,7 +644,7 @@ def extract_facts(text: str) -> List[str]:
     half of the payload. Returns 0-5 fact strings; [] when no tier yields
     usable output.
     """
-    facts, _kg_triples = _extract_facts_impl(text)
+    facts, _kg_triples = extract_facts_with_triples(text)
     return facts
 
 
@@ -607,6 +698,10 @@ class _ExtractResultCache:
         self._store.move_to_end(text)
         while len(self._store) > self._maxsize:
             self._store.popitem(last=False)
+
+    def clear(self) -> None:
+        """Clear cached results (also useful for deterministic test isolation)."""
+        self._store.clear()
 
 
 _EXTRACT_CACHE = _ExtractResultCache()

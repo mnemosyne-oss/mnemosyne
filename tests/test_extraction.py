@@ -7,6 +7,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -16,9 +18,18 @@ from mnemosyne.core.extraction import (
     _build_extraction_prompt,
     _call_local_extraction_llm,
     _parse_facts,
+    _EXTRACT_CACHE,
 )
 from mnemosyne.core.triples import init_triples
 from mnemosyne.extraction.diagnostics import get_diagnostics, reset_extraction_stats
+
+
+@pytest.fixture(autouse=True)
+def _clear_extract_cache():
+    """Extraction memo is process-global; isolate tests that reuse content."""
+    _EXTRACT_CACHE.clear()
+    yield
+    _EXTRACT_CACHE.clear()
 
 
 class MockLLM:
@@ -164,6 +175,36 @@ def test_parse_facts_json_unusable_supported_values_yield_no_key_names():
     }))
     assert scalar == [], scalar
     print("PASS: test_parse_facts_json_unusable_supported_values_yield_no_key_names")
+
+
+def test_parse_facts_json_drops_misfiled_spo_objects():
+    """SPO dictionaries belong in the KG, not as Python repr strings in facts."""
+    import json as _json
+    raw = _json.dumps({
+        "facts": [
+            {"subject": "Calypso", "predicate": "has_workstation", "object": "GAME-PC"},
+            "A plain fact sentence about GAME-PC.",
+        ],
+        "instructions": [], "preferences": [], "timelines": [], "kg": [],
+    })
+    assert _parse_facts(raw) == ["A plain fact sentence about GAME-PC."]
+
+
+def test_extract_facts_and_triples_share_one_llm_result(monkeypatch):
+    """The two remember() accessors must reuse one extraction result."""
+    from mnemosyne.core import extraction as extraction_module
+
+    calls = []
+    expected = (["The user uses GAME-PC."], [("Calypso", "uses", "GAME-PC")])
+    monkeypatch.setattr(
+        extraction_module,
+        "_extract_facts_impl",
+        lambda text: (calls.append(text) or expected),
+    )
+    text = "cache-sharing-regression-unique-content"
+    assert extract_facts_safe(text) == expected[0]
+    assert extraction_module.extract_triples_for_beam(text) == expected[1]
+    assert calls == [text]
 
 
 def test_parse_facts_json_without_supported_categories_falls_back():
