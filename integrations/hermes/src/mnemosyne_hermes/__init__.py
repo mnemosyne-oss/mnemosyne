@@ -26,7 +26,7 @@ import threading
 import contextvars
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import uuid
 
@@ -1049,6 +1049,276 @@ def _sync_turn_assistant_limit() -> int:
             raw,
         )
         return 800
+
+
+# Interrupted-note boundary: the note bracket plus its "The interrupted request was:]" cut point
+_HERMES_INTERRUPTED_BOUNDARY = re.compile(r"^\[System\s+note:\s+(?:Your|The)\s+previous\s+turn\s+was\s+interrupted[^\]]*?The\s+interrupted\s+request\s+was:\]\s*", re.IGNORECASE)
+
+# Authentic Hermes machine notice and strippable prefix patterns
+_HERMES_AUTHENTIC_SYSTEM_NOTES: Tuple[re.Pattern, ...] = (
+    re.compile(r"^\[System\s+note:\s+(?:Your|The)\s+previous\s+turn\s+was\s+interrupted[^\]]*\]\s*", re.IGNORECASE),
+    re.compile(r"^\[System\s+note:\s+(?:The\s+)?user\s+switched\s+models[^\]]*\]\s*", re.IGNORECASE),
+    re.compile(r"^\[System\s+note:\s+(?:(?:The\s+)?(?:user's\s+)?(?:previous\s+(?:gateway\s+)?session|session\s+was\s+automatically\s+reset)|(?:The\s+)?previous\s+gateway\s+session|gateway\s+(?:session\s+)?(?:restart|was\s+restarted)|A\s+new\s+message\s+has\s+arrived)[^\]]*\]\s*", re.IGNORECASE),
+    re.compile(r"^\[System\s+note:\s+(?:You\s+are\s+working\s+in\s+an\s+isolated\s+git\s+worktree|The\s+user\s+(?:invoked\s+/browser|has\s+disconnected\s+the\s+browser))[^\]]*\]\s*", re.IGNORECASE),
+    re.compile(r"^\[System\s+note:\s+The\s+following\s+is\s+recalled\s+memory\s+context[^\]]*\]\s*", re.IGNORECASE),
+    re.compile(r"^\[System\s+note:\s+This\s+is\s+the\s+user's\s+very\s+first\s+message\s+ever[^\]]*\]\s*", re.IGNORECASE),
+    re.compile(r"^\[System\s+note:\s+This\s+\w+\s+had\s+an\s+earlier\s+Hermes\s+session[^\]]*\]\s*", re.IGNORECASE),
+)
+
+_HERMES_CRON_HEADER_PATTERN: re.Pattern = re.compile(
+    r"^\[IMPORTANT:\s+You\s+are\s+running\s+as\s+a\s+scheduled\s+cron\s+job\b[^\]]*\]\s*",
+    re.IGNORECASE,
+)
+_HERMES_CRON_REPLY_PATTERN: re.Pattern = re.compile(
+    r"^\[Replying\s+to:\s+\"Cronjob\s+Response:[^\"]*\"\s*\]\s*",
+    re.IGNORECASE,
+)
+_HERMES_MCP_RELOAD_PATTERN: re.Pattern = re.compile(
+    r"^\[IMPORTANT:\s+MCP\s+servers\s+have\s+been\s+reloaded\b[^\]]*\]\s*",
+    re.IGNORECASE,
+)
+_HERMES_WATCH_STATUS_PATTERN: re.Pattern = re.compile(
+    r"^\[IMPORTANT:\s+(?:Watch\s+pattern\s+for\s+process\s+[\w.-]+\s+disabled|Watch-pattern\s+overflow:|Watch-pattern\s+notifications\s+resumed\.)[^\]]*\]\s*",
+    re.IGNORECASE,
+)
+_HERMES_MULTI_PROCESS_PATTERN: re.Pattern = re.compile(
+    r"^\[IMPORTANT:\s+\d+\s+background\s+processes?\s+completed\b.*?\]\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_HERMES_AUTHENTIC_MACHINE_PATTERNS: Tuple[re.Pattern, ...] = (
+    *_HERMES_AUTHENTIC_SYSTEM_NOTES,
+    _HERMES_CRON_HEADER_PATTERN,
+    _HERMES_CRON_REPLY_PATTERN,
+    _HERMES_MCP_RELOAD_PATTERN,
+    _HERMES_WATCH_STATUS_PATTERN,
+    _HERMES_MULTI_PROCESS_PATTERN,
+)
+
+
+
+def _is_conversational_inquiry(text: str) -> bool:
+    """Best-effort check if text has the shape of a conversational inquiry."""
+    t = text.strip()
+    if "?" in t:
+        return True
+    lower = t.lower()
+    if re.search(r"\b(explain|what does|what is|meaning of)\b", lower):
+        return True
+    inquiry_starters = (
+        "what", "why", "how", "when", "where", "who", "which",
+        "can you", "could you", "please", "explain", "tell me",
+        "check", "is this", "is there", "show me", "did you",
+        "do we", "should we", "would you",
+    )
+    for starter in inquiry_starters:
+        if lower.startswith(starter) or f" {starter} " in lower:
+            return True
+    return False
+
+
+def _sanitize_hermes_machine_envelope_core(user_content: str) -> Optional[str]:
+    """Best-effort text-only sanitization of Hermes machine-generated envelopes.
+
+    Filters synthetic execution notices (background processes, cron preambles,
+    delegation completions, compaction handoffs) from autosave in sync_turn().
+    Filtering is explicitly best-effort rather than an origin guarantee;
+    ambiguous input and genuine human questions quoting notice terms are
+    preserved conservatively.
+
+    Returns:
+        - None if user_content is purely a machine-generated notice (autosave should be skipped).
+        - Cleaned human prompt string if user_content contained machine notice envelopes followed
+          by a genuine user prompt (e.g. process notification or interrupted prompt preceding human input).
+        - Unmodified user_content if it is genuine user input or ambiguous mixed input.
+    """
+    text = (user_content or "").strip()
+    if not text:
+        return ""
+
+    # Interrupted prompt: cut only at the note's own boundary, never inside later human text.
+    m = _HERMES_INTERRUPTED_BOUNDARY.match(text)
+    if m:
+        tail = text[m.end():].strip()
+        if tail:
+            return _sanitize_hermes_machine_envelope(tail)
+
+    # 1. Strippable envelope prefixes in mixed turns (cron preamble, cron reply, authentic system notes, MCP reload)
+    changed = True
+    while changed:
+        changed = False
+        m = _HERMES_CRON_HEADER_PATTERN.match(text)
+        if m:
+            text = text[m.end():].strip()
+            changed = True
+            continue
+        m = _HERMES_CRON_REPLY_PATTERN.match(text)
+        if m:
+            text = text[m.end():].strip()
+            changed = True
+            continue
+        m = _HERMES_MCP_RELOAD_PATTERN.match(text)
+        if m:
+            text = text[m.end():].strip()
+            changed = True
+            continue
+        m = _HERMES_WATCH_STATUS_PATTERN.match(text)
+        if m:
+            text = text[m.end():].strip()
+            changed = True
+            continue
+        for pat in _HERMES_AUTHENTIC_SYSTEM_NOTES:
+            m = pat.match(text)
+            if m:
+                text = text[m.end():].strip()
+                changed = True
+                break
+
+    if not text:
+        return None
+
+    # 2. Context compaction & summary handoffs
+    if re.match(r"^\[CONTEXT\s+COMPACTION\b", text, re.IGNORECASE):
+        # A genuine user question inquiring about context compaction
+        if "?" in text and "\n" not in text and "Earlier turns were compacted" not in text:
+            return text
+        for end_marker in (
+            "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---",
+            "--- END OF CONTEXT SUMMARY",
+        ):
+            if end_marker in text:
+                tail = text.split(end_marker, 1)[1].strip()
+                return _sanitize_hermes_machine_envelope(tail) if tail else None
+        return None
+
+    if re.match(r"^\[CONTEXT\s+SUMMARY\]\s*:", text, re.IGNORECASE):
+        after_prefix = text[text.find(":") + 1:].strip()
+        if _is_conversational_inquiry(after_prefix) and "\n\n" not in after_prefix and len(after_prefix) < 200:
+            return text
+        if "\n\n" in after_prefix:
+            tail = after_prefix.split("\n\n", 1)[1].strip()
+            if tail:
+                return _sanitize_hermes_machine_envelope(tail)
+        return None
+
+    if re.match(r"^\[PRIOR\s+CONTEXT\b", text, re.IGNORECASE):
+        if "?" in text and "\n" not in text and "for reference only; not a new message" not in text:
+            return text
+        for end_marker in (
+            "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---",
+            "--- END OF CONTEXT SUMMARY",
+            "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]",
+        ):
+            if end_marker in text:
+                tail = text.split(end_marker, 1)[1].strip()
+                if "--- END OF CONTEXT SUMMARY" in tail:
+                    tail = tail.split("--- END OF CONTEXT SUMMARY", 1)[1].removeprefix(" — respond to the message below, not the summary above ---").strip()
+                return _sanitize_hermes_machine_envelope(tail) if tail else None
+        if "\n\n" in text:
+            tail = text.split("\n\n", 1)[1].strip()
+            if tail:
+                return _sanitize_hermes_machine_envelope(tail)
+        return None
+
+    if re.match(r"^\[Your\s+active\s+task\s+list\s+was\s+preserved\b", text, re.IGNORECASE):
+        if "?" in text and "\n" not in text and "across context compression" not in text:
+            return text
+        if "\n\n" in text:
+            tail = text.split("\n\n", 1)[1].strip()
+            if tail:
+                return _sanitize_hermes_machine_envelope(tail)
+        return None
+
+    if re.match(r"^\[Planning\s+state\s+preserved\b", text, re.IGNORECASE):
+        if "?" in text and "\n" not in text:
+            return text
+        if "\n\n" in text:
+            tail = text.split("\n\n", 1)[1].strip()
+            if tail:
+                return _sanitize_hermes_machine_envelope(tail)
+        return None
+
+    # 3. Async delegation notices
+    is_deleg = (
+        re.match(r"^\[ASYNC\s+(?:DELEGATION\s+)?(?:BATCH\s+)?(?:COMPLETE|TASK\s+FAILED)\b", text, re.IGNORECASE)
+        or re.match(r"^\[IMPORTANT:\s+\d+\s+background\s+subagent\s+delegations\s+completed\b", text, re.IGNORECASE)
+        or re.match(r"^\s*A\s+background\s+(?:fan-out\s+of\s+\d+\s+subagent\(s\)|subagent)\s+you\s+dispatched\s+earlier\s+has\s+finished\.", text, re.IGNORECASE)
+    )
+    if is_deleg:
+        # Check authentic delegation prose notice with prompt
+        m_prose = re.match(r"^\s*A\s+background\s+(?:fan-out\s+of\s+\d+\s+subagent\(s\)|subagent)\s+you\s+dispatched\s+earlier\s+has\s+finished\.(?:\s+You\s+may\s+have\s+moved\s+on\.)?\s*", text, re.IGNORECASE)
+        if m_prose:
+            tail = text[m_prose.end():].strip()
+            if tail:
+                return _sanitize_hermes_machine_envelope(tail)
+            return None
+        if "[System note:" in text:
+            tail = "[System note:" + text.split("[System note:")[-1]
+            return _sanitize_hermes_machine_envelope(tail)
+        # Authentic delegation notice without trailing prompt
+        if ("dispatched earlier has finished" in text or "Dispatched:" in text or "Original goal:" in text or "Role:" in text or "--- RESULT ---" in text or "--- ERROR ---" in text or "Treat these results as one completion batch" in text or text.endswith("]")):
+            return None
+        return text
+
+    # 4. Background process completion / watch notification
+    is_proc = re.match(r"^\[IMPORTANT:\s+Background\s+process\s+[\w.-]+\s+(?:completed|exited|terminated|matched|failed|marked)\b", text, re.IGNORECASE)
+    if is_proc:
+        # Authentic process notice with Command and Output
+        if "Command:" in text and ("Output:" in text or "Matched output:" in text):
+            if text.endswith("]"):
+                return None
+            idx = text.rfind("]\n")
+            if idx != -1:
+                tail = text[idx + 1:].strip()
+                # ponytail: a payload-shaped tail is machine output, never a human prompt
+                if tail and not tail.startswith(("Command:", "Output:", "Matched output:")):
+                    return _sanitize_hermes_machine_envelope(tail)
+            return None
+        # Short mock/test notice, e.g. "[IMPORTANT: Background process job completed]\nPlease summarize..."
+        if "]\n" in text:
+            idx = text.find("]\n")
+            tail = text[idx + 1:].strip()
+            if tail:
+                return _sanitize_hermes_machine_envelope(tail)
+        if text.endswith("]"):
+            if "?" in text:
+                return text
+            return None
+        return text
+
+    if _HERMES_MULTI_PROCESS_PATTERN.match(text):
+        return None
+
+    return text
+
+
+# ponytail: single guard over every `return None` branch: a notice-shaped input the
+# sanitizer would drop is kept when its header/rest is an explicit inquiry and carries no
+# machine payload (Output/Command/RESULT). Narrow by design; ambiguous input stays conservative.
+_HERMES_PAYLOAD_MARKERS = ("Output:", "Matched output:", "Command:", "--- RESULT ---", "--- ERROR ---")
+
+
+def _is_human_inquiry_envelope(text: str) -> bool:
+    m = re.match(r"^\[([^\]]*)\][ \t]*(.*)$", text, re.DOTALL)
+    if not m or any(p in text for p in _HERMES_PAYLOAD_MARKERS):
+        return False
+    # ponytail: text inside a recognized authentic machine notice must never override rejection
+    if any(pat.match(text) for pat in _HERMES_AUTHENTIC_MACHINE_PATTERNS):
+        return False
+    header, rest = m.group(1), m.group(2)
+    return _is_conversational_inquiry(header) or (
+        bool(rest.strip()) and "\n" not in rest and _is_conversational_inquiry(rest.strip())
+    )
+
+
+def _sanitize_hermes_machine_envelope(user_content: str) -> Optional[str]:
+    """Wrapper: keep explicit human inquiries that the core pass would drop."""
+    text = (user_content or "").strip()
+    result = _sanitize_hermes_machine_envelope_core(text)
+    if result is None and text and _is_human_inquiry_envelope(text):
+        return text
+    return result
+
 
 
 # ---------------------------------------------------------------------------
@@ -2819,37 +3089,39 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 ledger_session_id = str(session_id or "").strip()
                 if ledger_session_id and not getattr(self, "_active_session_id", ""):
                     self._active_session_id = ledger_session_id
-                if "user" in self._sync_roles and user_content and len(user_content) > 5:
-                    user_limit = _sync_turn_user_limit()
-                    uc = user_content[:user_limit] if user_limit > 0 else user_content
-                    stored_user = f"[USER] {uc}"
-                    capture = ledger.capture if ledger else None
-                    remember = (lambda **kw: capture(ledger_session_id, ticket, beam, user_content, **kw)) if capture else beam.remember
-                    user_memory_id = remember(
-                        content=stored_user,
-                        source="conversation",
-                        importance=0.5,
-                        scope=self._default_scope,
-                        extract_entities=True,
-                        _write_policy_content=user_content,
-                    )
-                    # Check for identity-significant signals in user content
-                    if user_memory_id is not None:
-                        self._capture_identity_signals(user_content)
-                if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10:
-                    assistant_limit = _sync_turn_assistant_limit()
-                    ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
-                    stored_assistant = f"[ASSISTANT] {ac}"
-                    capture = ledger.capture if ledger else None
-                    remember = (lambda **kw: capture(ledger_session_id, ticket, beam, assistant_content, **kw)) if capture else beam.remember
-                    remember(
-                        content=stored_assistant,
-                        source="conversation",
-                        importance=0.15,
-                        scope=self._default_scope,
-                        extract_entities=True,
-                        _write_policy_content=assistant_content,
-                    )
+                clean_user = _sanitize_hermes_machine_envelope(user_content)
+                if clean_user is not None:
+                    if "user" in self._sync_roles and clean_user and len(clean_user) > 5:
+                        user_limit = _sync_turn_user_limit()
+                        uc = clean_user[:user_limit] if user_limit > 0 else clean_user
+                        stored_user = f"[USER] {uc}"
+                        capture = ledger.capture if ledger else None
+                        remember = (lambda **kw: capture(ledger_session_id, ticket, beam, clean_user, **kw)) if capture else beam.remember
+                        user_memory_id = remember(
+                            content=stored_user,
+                            source="conversation",
+                            importance=0.5,
+                            scope=self._default_scope,
+                            extract_entities=True,
+                            _write_policy_content=clean_user,
+                        )
+                        # Check for identity-significant signals in user content
+                        if user_memory_id is not None:
+                            self._capture_identity_signals(clean_user)
+                    if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10:
+                        assistant_limit = _sync_turn_assistant_limit()
+                        ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
+                        stored_assistant = f"[ASSISTANT] {ac}"
+                        capture = ledger.capture if ledger else None
+                        remember = (lambda **kw: capture(ledger_session_id, ticket, beam, assistant_content, **kw)) if capture else beam.remember
+                        remember(
+                            content=stored_assistant,
+                            source="conversation",
+                            importance=0.15,
+                            scope=self._default_scope,
+                            extract_entities=True,
+                            _write_policy_content=assistant_content,
+                        )
                 if durable_operation:
                     self._turn_count += 1
                     should_auto_sleep = (

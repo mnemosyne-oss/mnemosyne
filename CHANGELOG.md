@@ -8,6 +8,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 ## [Unreleased]
 
 ### Fixed
+- Filter Hermes machine-generated notice envelopes from conversation sync (#1102)
 
 - **Doctor artifact output works on Windows (#1189).** Skip unsupported directory fsync on Windows while retaining staged-file flush/fsync, replacement and rollback. POSIX directory open/fsync errors still propagate; Windows directory durability is not provided.
 

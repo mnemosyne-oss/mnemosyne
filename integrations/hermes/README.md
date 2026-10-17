@@ -100,6 +100,20 @@ shows an `UNAVAILABLE` prompt notice. Re-initialize the provider in a primary
 context to recover. A provider that starts directly in a skip context remains
 silent and returns `reason_code="skipped_context"`.
 
+### Machine notice filtering
+
+`sync_turn()` uses a deterministic, best-effort text filter to detect and drop
+machine-generated execution envelopes injected by Hermes as user-role turns
+(background process completions, cron preambles, MCP reloads, async delegations,
+and context compaction envelopes).
+
+When an envelope is rejected, `sync_turn()` skips autosave for the user turn,
+the paired assistant turn, identity-signal extraction (`_capture_identity_signals`),
+and verbatim ledger capture (`_verbatim_ledger.capture`). Explicit memory-tool
+writes (`remember`, `shared_remember`) and skip-context lifecycle policies remain
+unaffected. The filter handles human inquiries and trailing prompts conservatively;
+it is a best-effort text boundary, not a message-origin guarantee.
+
 Provider lifecycle hooks are fail-soft. Database or disk failures during
 prefetch, turn sync, session-end or automatic consolidation, and wrapper or
 audit cleanup are logged and suppressed so Hermes can continue without a
