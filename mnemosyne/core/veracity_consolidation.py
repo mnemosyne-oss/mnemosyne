@@ -1092,7 +1092,7 @@ class VeracityConsolidator:
         
         return "\n".join(lines)
     
-    def run_consolidation_pass(self):
+    def run_consolidation_pass(self, pair_budget=None, time_budget_s=None):
         """
         Background consolidation pass.
 
@@ -1100,6 +1100,18 @@ class VeracityConsolidator:
         2. Boost confidence
         3. Detect conflicts
         4. Auto-resolve obvious conflicts (higher confidence wins)
+
+        pair_budget / time_budget_s: optional bounds on the
+        read-decide-resolve loop -- at most ``pair_budget`` pairs
+        resolved, and no pair once ``time_budget_s`` wall-clock
+        seconds (monotonic) have elapsed. ``None`` (default) leaves
+        the loop unbounded; the sleep path forwards the same
+        ``MNEMOSYNE_CONFLICT_PAIR_BUDGET`` /
+        ``MNEMOSYNE_CONFLICT_TIME_BUDGET_S`` bounds the LLM conflict
+        validation uses. Hitting either bound stops the loop cleanly;
+        pairs skipped that way are reconsidered by the next pass.
+
+        Returns the number of pairs resolved this pass.
 
         Concurrency: wrapped in ``_serialized_write`` so a concurrent
         write (e.g., `consolidate_fact` or `resolve_conflict`) doesn't
@@ -1114,6 +1126,12 @@ class VeracityConsolidator:
         peer failure delays a conflict row, it does not lose it.
         """
         self.retry_pending_conflicts()
+        deadline = (
+            time.monotonic() + time_budget_s
+            if time_budget_s is not None
+            else None
+        )
+        resolved = 0
         with self._serialized_write():
             cursor = self.conn.cursor()
 
@@ -1132,6 +1150,11 @@ class VeracityConsolidator:
             primary_rows = cursor.fetchall()
 
             for row in primary_rows:
+                if pair_budget is not None and resolved >= pair_budget:
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+
                 subject = row["subject"]
                 predicate = row["predicate"]
 
@@ -1147,23 +1170,40 @@ class VeracityConsolidator:
 
                 conflicts = cursor.fetchall()
                 for conflict in conflicts:
+                    if pair_budget is not None and resolved >= pair_budget:
+                        break
+                    if deadline is not None and time.monotonic() >= deadline:
+                        break
                     # Auto-resolve: higher confidence wins
                     if row["confidence"] > conflict["confidence"]:
                         self.resolve_conflict_by_facts(
                             row["id"], conflict["id"]
                         )
+                        resolved += 1
+        return resolved
 
     def resolve_conflict_by_facts(self, winning_id: str, losing_id: str):
         """Resolve conflict by marking losing fact as superseded.
 
-        Concurrency: this is a single-statement UPDATE so it doesn't
-        have the SELECT-then-write race shape of ``resolve_conflict``.
-        Still wrapped in ``_serialized_write`` for consistency: a
-        concurrent ``resolve_conflict`` on the same losing_id would
-        interleave on the `superseded_by` column, and the wrap makes
-        the override deterministic (later writer wins after the
-        earlier one commits, instead of both racing inside their
-        respective reads).
+        Also stamps the matching ``conflicts`` row(s) resolved, in the
+        same write scope as the supersession: the pair is matched
+        order-normalized via the same 2-arg scalar ``min()``/``max()``
+        expressions the E8 expression index
+        (``idx_conflicts_pair_norm``,
+        ``mnemosyne/migrations/e8_conflict_pair_key.py``) is keyed on,
+        never by orientation; only still-open rows (``resolution IS
+        NULL``) are stamped, first-writer-wins; and the resolution
+        format is the one ``resolve_conflict`` writes, so the operator
+        path and this one agree.
+
+        Concurrency: these are unconditional UPDATEs, so no
+        SELECT-then-write race shape like ``resolve_conflict``. Still
+        wrapped in ``_serialized_write`` for consistency: a concurrent
+        ``resolve_conflict`` on the same losing_id would interleave on
+        the `superseded_by` column, and the wrap makes the override
+        deterministic (later writer wins after the earlier one
+        commits, instead of both racing inside their respective
+        reads). The supersession and the ledger stamp commit together.
         """
         with self._serialized_write():
             now = datetime.now().isoformat()
@@ -1176,6 +1216,23 @@ class VeracityConsolidator:
                 WHERE id = ?
                 """,
                 (winning_id, now, losing_id),
+            )
+
+            # Mark the matching conflict row(s) resolved: same
+            # resolution format `resolve_conflict` writes, matched on
+            # the order-normalized pair (the E8 expression-index key --
+            # the detector does not canonicalize orientation), open
+            # rows only (first-writer-wins).
+            cursor.execute(
+                """
+                UPDATE conflicts
+                SET resolution = ?, resolved_at = ?
+                WHERE resolution IS NULL
+                  AND min(fact_a_id, fact_b_id) = min(?, ?)
+                  AND max(fact_a_id, fact_b_id) = max(?, ?)
+                """,
+                (f"superseded_by_{winning_id}", now,
+                 winning_id, losing_id, winning_id, losing_id),
             )
     
     def get_stats(self) -> Dict:
