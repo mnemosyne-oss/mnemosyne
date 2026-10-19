@@ -1334,6 +1334,48 @@ def _existing_vec_dim(conn: sqlite3.Connection) -> Optional[int]:
     return dimensions.pop() if len(dimensions) == 1 else None
 
 
+def _orphaned_vec_shadow_tiers(conn: sqlite3.Connection) -> Tuple[str, ...]:
+    """Return vector tiers whose virtual table is gone but whose shadows remain.
+
+    sqlite-vec creates a ``vec0`` virtual table plus shadow tables named after
+    it (``vec_episodes_info``, ``vec_episodes_chunks``, ...). A ``.recover``
+    pass or a partial restore can leave the shadows without the virtual table,
+    and ``CREATE VIRTUAL TABLE ... USING vec0`` then fails with "Could not
+    create '_info' shadow table: table ... already exists". Detecting that state
+    before any DDL lets initialization skip the tier instead of aborting or
+    deleting index data it cannot prove is reconstructible (issue #1120).
+    """
+    names = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    orphans = []
+    for table in _VEC_TABLE_NAMES:
+        if table in names:
+            continue
+        prefix = table + "_"
+        if any(name.startswith(prefix) for name in names):
+            orphans.append(table)
+    return tuple(orphans)
+
+
+def _orphaned_vec_shadow_message(tiers: Tuple[str, ...]) -> str:
+    """Build one actionable message for a degraded vector tier."""
+    affected = ", ".join(tiers)
+    return (
+        f"Orphaned sqlite-vec shadow tables found for {affected}: the vector "
+        f"table is missing but its shadow tables remain, so it cannot be "
+        f"recreated in place. Your memories are intact; dense recall for the "
+        f"affected tier is unavailable and falls back to keyword search. No "
+        f"rows or shadow tables were changed. Restore the missing vector table "
+        f"from a backup taken before the store was recovered, or rebuild it "
+        f"with an explicit repair step; automatic cleanup is not performed "
+        f"(issue #1120)."
+    )
+
+
 def _dim_mismatch_message(
     stored_dims: Tuple[Tuple[str, int], ...], configured_dim: int
 ) -> str:
@@ -1375,12 +1417,15 @@ class BeamInitResult:
     fixed-order immutable ``(table, dimension)`` tuple; ``existing_dim`` is set
     only when those stored tables have one uniform dimension. A mismatch remains
     recoverable and does not prevent the non-vector schema from being initialized.
+    ``orphaned_vec_tiers`` names tiers left without a virtual table because only
+    their shadow tables survived; those tiers stay untouched and degraded.
     """
 
     vec_dim_mismatch: bool
     existing_dim: Optional[int]
     configured_dim: int
     stored_dims: Tuple[Tuple[str, int], ...] = ()
+    orphaned_vec_tiers: Tuple[str, ...] = ()
 
 
 _schema_locks = {}
@@ -1596,6 +1641,9 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
     vec_dim_mismatch = any(dim != EMBEDDING_DIM for _, dim in stored_dims)
     if vec_dim_mismatch:
         logger.error(_dim_mismatch_message(stored_dims, EMBEDDING_DIM))
+    orphaned_vec_tiers = _orphaned_vec_shadow_tiers(conn)
+    if orphaned_vec_tiers:
+        logger.error(_orphaned_vec_shadow_message(orphaned_vec_tiers))
     if _SQLITE_VEC_AVAILABLE:
         if not vec_dim_mismatch:
             try:
@@ -1603,17 +1651,19 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
                     "SELECT 1 FROM sqlite_master WHERE type='table' "
                     "AND name='vec_episodes'"
                 ).fetchone() is not None
-                cursor.execute(f"""
-                    CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
-                        embedding {effective_vec_type}[{EMBEDDING_DIM}]
-                    )
-                """)
-                cursor.execute(f"""
-                    CREATE VIRTUAL TABLE IF NOT EXISTS vec_working USING vec0(
-                        embedding {effective_vec_type}[{EMBEDDING_DIM}]
-                    )
-                """)
-                if not _ep_exists_before:
+                if "vec_episodes" not in orphaned_vec_tiers:
+                    cursor.execute(f"""
+                        CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
+                            embedding {effective_vec_type}[{EMBEDDING_DIM}]
+                        )
+                    """)
+                if "vec_working" not in orphaned_vec_tiers:
+                    cursor.execute(f"""
+                        CREATE VIRTUAL TABLE IF NOT EXISTS vec_working USING vec0(
+                            embedding {effective_vec_type}[{EMBEDDING_DIM}]
+                        )
+                    """)
+                if not _ep_exists_before and "vec_episodes" not in orphaned_vec_tiers:
                     # Brand-new table: every row written into it will be
                     # normalized, so it is safe for raw-L2 KNN from row 1.
                     # Pre-existing (upgraded) stores stay unmarked and
@@ -2013,10 +2063,14 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
         END
     """)
 
-    # Vector table for facts (sqlite-vec). Skipped on a dimension mismatch for the
-    # same reason as vec_episodes / vec_working above (see the guard in the
-    # sqlite-vec VIRTUAL TABLES block).
-    if _SQLITE_VEC_AVAILABLE and not vec_dim_mismatch:
+    # Vector table for facts (sqlite-vec). Skipped on a dimension mismatch or a
+    # surviving orphaned shadow for the same reason as vec_episodes /
+    # vec_working above (see the guard in the sqlite-vec VIRTUAL TABLES block).
+    if (
+        _SQLITE_VEC_AVAILABLE
+        and not vec_dim_mismatch
+        and "vec_facts" not in orphaned_vec_tiers
+    ):
         try:
             cursor.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(
@@ -2046,6 +2100,7 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
         existing_dim=existing_dim,
         configured_dim=EMBEDDING_DIM,
         stored_dims=stored_dims,
+        orphaned_vec_tiers=orphaned_vec_tiers,
     )
 
 
