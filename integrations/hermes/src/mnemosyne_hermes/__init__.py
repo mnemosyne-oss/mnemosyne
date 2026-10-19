@@ -805,6 +805,28 @@ def _p1b_current_key() -> Optional[str]:
     return None if home is None else hermes_home_key(home)
 
 
+def _p1b_active_profile() -> Optional[str]:
+    """Active Hermes profile for this turn, or None when the host cannot say.
+
+    Hermes multiplexes several profiles through one provider instance. Under
+    profile isolation those profiles can share a home while using separate
+    banks, so the home key alone cannot identify a binding (#1188).
+    """
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        name = (get_active_profile_name() or "").strip()
+        return name or None
+    except Exception:
+        return None
+
+
+def _p1b_binding_key(home_key: str, profile: Optional[str], isolated: bool) -> str:
+    """Compose a binding key from the home and, when isolating, the profile."""
+    if not isolated or not profile:
+        return home_key
+    return f"{home_key}\x1f{profile}"
+
+
 _EMPTY_BINDING: Dict[str, Any] = {
     "beam": None, "agent_identity": "", "session_id": None,
 }
@@ -1732,7 +1754,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 return
             if time.monotonic() < self._retry_init_at:
                 return
-            turn_key = _p1b_current_key()
+            turn_key = self._current_binding_key()
             if (
                 turn_key is not None
                 and self.__dict__.setdefault("_bindings", {}).get(turn_key) is None
@@ -1775,7 +1797,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return
         if self._init_error is not None:
             return
-        turn_key = _p1b_current_key()
+        turn_key = self._current_binding_key()
         if (
             turn_key is not None
             and self.__dict__.setdefault("_bindings", {}).get(turn_key) is None
@@ -1892,14 +1914,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
         # profile_isolation: separate DB per Hermes profile (bank-based).
         # Default OFF. When enabled, each profile derives its own Mnemosyne bank.
-        profile_isolation = kwargs.get("profile_isolation")
-        if profile_isolation is None:
-            profile_isolation = self._read_config_key("profile_isolation")
-        if profile_isolation is not None:
-            if isinstance(profile_isolation, str):
-                self._profile_isolation_enabled = profile_isolation.lower() in ("true", "1", "yes", "on")
-            else:
-                self._profile_isolation_enabled = bool(profile_isolation)
+        self._profile_isolation_enabled = self._resolve_profile_isolation(kwargs)
 
         shared_surface_path = kwargs.get("shared_surface_path")
         if shared_surface_path is None:
@@ -2333,11 +2348,33 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
         return "default"
 
+    def _resolve_profile_isolation(self, kwargs: Dict[str, Any]) -> bool:
+        """Resolve the isolation flag from kwargs, config, or the last value."""
+        value = kwargs.get("profile_isolation")
+        if value is None:
+            value = self._read_config_key("profile_isolation")
+        if value is None:
+            return bool(getattr(self, "_profile_isolation_enabled", False))
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes", "on")
+        return bool(value)
+
     # ---- P1b call-time binding properties (2026-09-20 multiplex incident) ----
+    def _current_binding_key(self) -> Optional[str]:
+        """Composite binding key for this turn, or None when out of turn."""
+        home_key = _p1b_current_key()
+        if home_key is None:
+            return None
+        return _p1b_binding_key(
+            home_key,
+            _p1b_active_profile(),
+            bool(getattr(self, "_profile_isolation_enabled", False)),
+        )
+
     def _resolve_read_slot(self) -> Dict[str, Any]:
         bindings = self.__dict__.setdefault("_bindings", {})
         ambient = self.__dict__.setdefault("_ambient_key", "default")
-        turn_key = _p1b_current_key()
+        turn_key = self._current_binding_key()
         if turn_key is None:
             # Out-of-turn (cron/teardown/workers): the ambient binding answers.
             return bindings.setdefault(
@@ -2363,10 +2400,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # An active initialize() is authoritative for its own home, turn
             # scope or not; ambient mirroring in _initialize_locked keeps the
             # paired reads on this same slot (review on #1050, point 2).
-            key = _p1b_home_key(init_home)
+            key = _p1b_binding_key(
+                _p1b_home_key(init_home),
+                self.__dict__.get("_init_profile"),
+                bool(getattr(self, "_profile_isolation_enabled", False)),
+            )
         else:
             ambient = self.__dict__.setdefault("_ambient_key", "default")
-            turn_key = _p1b_current_key()
+            turn_key = self._current_binding_key()
             if turn_key is None:
                 key = ambient
             elif turn_key in bindings:
@@ -2438,6 +2479,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     # into B's slot after B finished initializing
                     # (#1050 review point 2, `_init_key` residue probe).
                     self.__dict__["_init_home"] = None
+                    self.__dict__["_init_profile"] = None
 
     def _restore_ambient_if_dead(self, previous_ambient: str) -> None:
         """Give the out-of-turn reads back to the previous ambient home.
@@ -2489,7 +2531,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # per-agent correct even when construction runs outside turn scope).
         init_home = kwargs.get("hermes_home") or None
         self.__dict__["_init_home"] = init_home
-        init_key = _p1b_home_key(init_home)
+        # Resolve isolation before the first slot write: the active profile is
+        # part of the binding key for same-home multiplexing (#1188).
+        self._profile_isolation_enabled = self._resolve_profile_isolation(kwargs)
+        init_profile = _p1b_active_profile() or (kwargs.get("agent_identity") or None)
+        self.__dict__["_init_profile"] = init_profile
+        init_key = _p1b_binding_key(
+            _p1b_home_key(init_home),
+            init_profile,
+            self._profile_isolation_enabled,
+        )
         # Align reads with these writes from the first line: mirror the home
         # under construction into the ambient key so paired getters resolve to
         # the same slot the setters target (instead of inheriting the previous
@@ -2524,7 +2575,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             self._release_host_llm_backend_ownership()
             self._deactivate_in_module()
             raise
-        self._agent_identity = kwargs.get("agent_identity", None) or ""
+        self._agent_identity = (
+            kwargs.get("agent_identity", None) or init_profile or ""
+        )
         self._gateway_session_key = kwargs.get("gateway_session_key") or ""
         self._channel_id_explicit = bool(kwargs.get("channel_id"))
 
