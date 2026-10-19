@@ -129,3 +129,22 @@ def test_same_home_without_isolation_uses_the_last_binding(tmp_path, monkeypatch
     assert provider._beam is beam_b
     _PROFILE.set("agent-a")
     assert provider._beam is beam_b
+
+
+def test_missing_profile_getter_keeps_the_home_key(tmp_path, monkeypatch):
+    import mnemosyne.core.memory as memory_module
+
+    monkeypatch.setattr(memory_module, "Mnemosyne", _Wrapper)
+    monkeypatch.setattr(mnemosyne_hermes, "_p1b_active_profile", lambda: None)
+    provider = MnemosyneMemoryProvider()
+    home = str(tmp_path / "shared-home")
+    _HOME.set(home)
+
+    provider.initialize(
+        "sess", hermes_home=home, profile_isolation=True, agent_identity="profile-b"
+    )
+
+    # Without a call-time profile getter the home is the only key, so init and
+    # call time agree. The explicit identity still selects the bank path.
+    assert provider._beam is not None
+    assert "banks" in provider._beam.db_path

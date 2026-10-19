@@ -2534,7 +2534,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Resolve isolation before the first slot write: the active profile is
         # part of the binding key for same-home multiplexing (#1188).
         self._profile_isolation_enabled = self._resolve_profile_isolation(kwargs)
-        init_profile = _p1b_active_profile() or (kwargs.get("agent_identity") or None)
+        # Only the host's own profile getter can key both init and call time;
+        # an agent_identity hint without that getter would make the keys diverge.
+        init_profile = _p1b_active_profile()
         self.__dict__["_init_profile"] = init_profile
         init_key = _p1b_binding_key(
             _p1b_home_key(init_home),
