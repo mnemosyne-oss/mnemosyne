@@ -2563,6 +2563,13 @@ def _deferred_commits(conn: sqlite3.Connection, *, immediate: bool = False):
 def _generate_id(content: str) -> str:
     return hashlib.sha256(f"{content}{datetime.now().isoformat()}".encode()).hexdigest()[:16]
 
+
+# Generated memory ids are 16 lowercase hex characters. Derived rows can also
+# carry a legacy message index in ``source_msg_id``; only the generated shape
+# is safe to treat as a memory reference when filtering orphans.
+_MEMORY_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+
+
 def _sanitize_utf8(text: str) -> str:
     """Ensure text is valid UTF-8, stripping or replacing invalid bytes.
 
@@ -8909,6 +8916,19 @@ class BeamMemory:
     # ------------------------------------------------------------------
     # MEMORIA: Structured Fact Retrieval (Phase 2)
     # ------------------------------------------------------------------
+    def _derived_source_is_alive(self, source_id: Optional[str]) -> bool:
+        """True when a derived row's source memory still exists.
+
+        Rows extracted before the 4.0 deletion cascade, or preserved by an
+        import, can point at a memory that no longer exists. Derived retrieval
+        must not surface forgotten content. Only the generated id shape is
+        checked: a legacy ``source_msg_id`` can be a message index.
+        """
+        source = str(source_id or "").strip()
+        if not _MEMORY_ID_RE.match(source):
+            return True
+        return self._memory_has_surviving_parent(self.conn, source)
+
     def memoria_retrieve(self, query: str, ability: str = None, top_k: int = 10) -> dict:
         """Route a query to the appropriate MEMORIA specialist table.
         Returns dict with keys: context (str), facts (list), source (str).
@@ -8920,21 +8940,29 @@ class BeamMemory:
             ability = self._classify_ability(query)
 
         if ability in ('IE', 'KU'):
-            return self._memoria_fact_retrieve(query, top_k)
+            result = self._memoria_fact_retrieve(query, top_k)
         elif ability == 'TR':
-            return self._memoria_timeline_retrieve(query, top_k)
+            result = self._memoria_timeline_retrieve(query, top_k)
         elif ability == 'CR':
-            return self._memoria_negation_retrieve(query, top_k)
+            result = self._memoria_negation_retrieve(query, top_k)
         elif ability == 'MR':
-            return self._memoria_entity_retrieve(query, top_k)
+            result = self._memoria_entity_retrieve(query, top_k)
         elif ability == 'EO':
-            return self._memoria_chrono_retrieve(query, top_k)
+            result = self._memoria_chrono_retrieve(query, top_k)
         elif ability == 'IF':
-            return self._memoria_instruction_retrieve(query, top_k)
+            result = self._memoria_instruction_retrieve(query, top_k)
         elif ability == 'PF':
-            return self._memoria_preference_retrieve(query, top_k)
+            result = self._memoria_preference_retrieve(query, top_k)
         else:
             return result
+
+        facts = result.get("facts") or []
+        if facts:
+            result["facts"] = [
+                fact for fact in facts
+                if self._derived_source_is_alive(fact.get("source_memory_id"))
+            ]
+        return result
 
     @staticmethod
     def _classify_ability(query: str) -> str:
@@ -11975,7 +12003,7 @@ class BeamMemory:
             try:
                 cursor.execute(f"""
                     SELECT rowid, fact_id, subject, predicate, object,
-                           timestamp, confidence
+                           timestamp, confidence, source_msg_id
                     FROM facts
                     WHERE rowid IN ({placeholders})
                 """, (*ranked_ids,))
@@ -12005,6 +12033,7 @@ class BeamMemory:
                     "fact_id": row["fact_id"],
                     "subject": subject,
                     "predicate": predicate,
+                    "source_msg_id": row.get("source_msg_id"),
                 })
 
         # --- Source 2: consolidated_facts (sleep-consolidated LLM triples) ---
@@ -12040,6 +12069,10 @@ class BeamMemory:
 
         # Sort by score descending, respect top_k, and apply the same public
         # content boundary as recall() / recall_enhanced().
+        results = [
+            result for result in results
+            if self._derived_source_is_alive(result.get("source_msg_id"))
+        ]
         results.sort(key=lambda x: x["score"], reverse=True)
         return _cap_recall_results(results[:top_k])
 
