@@ -9,11 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 
-import mnemosyne.core.annotations as annotations_module
 import mnemosyne.core.beam as beam_module
 import mnemosyne.core.canonical as canonical_module
 import mnemosyne.core.memory as memory_module
-import mnemosyne.core.triples as triples_module
 from mnemosyne.core.beam import BeamMemory
 from mnemosyne.core.memory import Mnemosyne
 from mnemosyne.core.triples import TripleStore
@@ -228,7 +226,7 @@ def test_core_file_import_dry_run_matches_clone_and_preserves_all_rows(
     _assert_imported_store_rows(after_normal_import)
 
 
-def test_core_file_import_dry_run_closes_clone_store_connections_on_error(
+def test_core_file_import_dry_run_closes_the_clone_on_error(
     tmp_path, monkeypatch
 ):
     export_path = _export_source(tmp_path)
@@ -239,10 +237,8 @@ def test_core_file_import_dry_run_closes_clone_store_connections_on_error(
     active_core_path = memory_module._thread_local.db_path
     active_beam_conn = beam_module._thread_local.conn
     active_beam_path = beam_module._thread_local.db_path
-    closed_connections = []
     clone_cache_connections = []
     clone_query_caches = []
-    init_connections = []
     clone_dirs = _capture_dry_run_clone_dirs(monkeypatch)
 
     original_query_cache = beam_module.QueryCache
@@ -263,9 +259,9 @@ def test_core_file_import_dry_run_closes_clone_store_connections_on_error(
     target.beam._query_cache = caller_query_cache
 
     class CloseSpyConnection:
-        def __init__(self, connection, tracker=closed_connections):
+        def __init__(self, connection, tracker=None):
             self._connection = connection
-            self._tracker = tracker
+            self._tracker = tracker if tracker is not None else []
             self.closed = False
 
         def close(self):
@@ -275,14 +271,6 @@ def test_core_file_import_dry_run_closes_clone_store_connections_on_error(
 
         def __getattr__(self, name):
             return getattr(self._connection, name)
-
-    def tracking_store(store_type):
-        class TrackingStore(store_type):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                self.conn = CloseSpyConnection(self.conn)
-
-        return TrackingStore
 
     original_core_get_connection = memory_module._get_connection
     original_beam_get_connection = beam_module._get_connection
@@ -330,53 +318,22 @@ def test_core_file_import_dry_run_closes_clone_store_connections_on_error(
 
     monkeypatch.setattr(BeamMemory, "import_from_dict", import_with_clone_query_cache)
 
-    monkeypatch.setattr(
-        triples_module, "TripleStore", tracking_store(triples_module.TripleStore)
-    )
-    original_init_triples = triples_module.init_triples
-
-    def tracking_init_triples(*args, **kwargs):
-        original_get_conn = triples_module._get_conn
-
-        def tracking_get_conn(*args, **kwargs):
-            connection = CloseSpyConnection(
-                original_get_conn(*args, **kwargs), init_connections
-            )
-            init_connections.append(connection)
-            return connection
-
-        triples_module._get_conn = tracking_get_conn
-        try:
-            return original_init_triples(*args, **kwargs)
-        finally:
-            triples_module._get_conn = original_get_conn
-
-    monkeypatch.setattr(triples_module, "init_triples", tracking_init_triples)
-    monkeypatch.setattr(
-        annotations_module,
-        "AnnotationStore",
-        tracking_store(annotations_module.AnnotationStore),
-    )
-    tracking_canonical = tracking_store(canonical_module.CanonicalStore)
-
     def raise_after_clone_stores_created(self, *_args, **_kwargs):
         raise RuntimeError("forced clone import failure")
 
     monkeypatch.setattr(
-        tracking_canonical, "import_all", raise_after_clone_stores_created
+        canonical_module.CanonicalStore,
+        "import_all",
+        raise_after_clone_stores_created,
     )
-    monkeypatch.setattr(canonical_module, "CanonicalStore", tracking_canonical)
 
     with pytest.raises(RuntimeError, match="forced clone import failure"):
         target.import_from_file(str(export_path), force=True, dry_run=True)
 
-    assert len(closed_connections) == 3
     assert len(clone_cache_connections) == 2
     assert all(connection.closed for connection in clone_cache_connections)
     assert len(clone_query_caches) == 1
     assert clone_query_caches[0].closed
-    assert init_connections
-    assert all(connection.closed for connection in init_connections)
     assert memory_module._thread_local.conn is active_core_conn
     assert memory_module._thread_local.db_path == active_core_path
     assert beam_module._thread_local.conn is active_beam_conn

@@ -14,6 +14,7 @@ Now upgraded with BEAM architecture:
 import sqlite3
 import json
 import hashlib
+import functools
 import logging
 import threading
 import tempfile
@@ -35,6 +36,46 @@ from mnemosyne.core.beam import (
     _deferred_commits,
 )
 from mnemosyne.core.journal import journal_mode
+
+
+def _atomic_import(method):
+    """Run one JSON import under a single deferred-commit scope.
+
+    The import crosses BEAM, legacy, triple, annotation, canonical and
+    sync-event writes, and each of them commits. Suppressing those commits
+    until the whole import succeeds makes a later failure leave the target
+    unchanged (#727). Dry runs already import into a disposable clone and are
+    not wrapped.
+    """
+
+    @functools.wraps(method)
+    def wrapper(
+        self,
+        input_path,
+        force=False,
+        dry_run=False,
+        _owned_store_connections=None,
+    ):
+        if dry_run:
+            return method(
+                self,
+                input_path,
+                force=force,
+                dry_run=True,
+                _owned_store_connections=_owned_store_connections,
+            )
+        with _deferred_commits(self.conn, immediate=True):
+            return method(
+                self,
+                input_path,
+                force=force,
+                dry_run=False,
+                _owned_store_connections=_owned_store_connections,
+            )
+
+    return wrapper
+
+
 _thread_local = threading.local()
 
 # Default data directory
@@ -1136,6 +1177,7 @@ class Mnemosyne:
             "sync_events_count": len(export.get("sync_events", [])),
         }
 
+    @_atomic_import
     def import_from_file(
         self,
         input_path: str,
@@ -1310,25 +1352,19 @@ class Mnemosyne:
         stats["legacy"] = l_stats
 
         # Triples (current-truth temporal facts)
-        triples = TripleStore(db_path=self.db_path)
-        if _owned_store_connections is not None:
-            _owned_store_connections.append(triples.conn)
+        triples = TripleStore(db_path=self.db_path, conn=self.conn)
         t_stats = triples.import_all(data.get("triples", []), force=force)
         stats["triples"] = t_stats
 
         # Annotations (post-E6 schema 1.1; absent from 1.0 backups)
-        annotations = AnnotationStore(db_path=self.db_path)
-        if _owned_store_connections is not None:
-            _owned_store_connections.append(annotations.conn)
+        annotations = AnnotationStore(db_path=self.db_path, conn=self.conn)
         a_stats = annotations.import_all(data.get("annotations", []), force=force)
         stats["annotations"] = a_stats
 
         # Canonical facts (schema 1.3). Absent from <=1.2 backups -> get([]) is
         # a no-op, so older exports import unchanged. import_all is idempotent
         # and honors force, matching triples/annotations.
-        canonical = CanonicalStore(db_path=self.db_path)
-        if _owned_store_connections is not None:
-            _owned_store_connections.append(canonical.conn)
+        canonical = CanonicalStore(db_path=self.db_path, conn=self.conn)
         c_stats = canonical.import_all(data.get("canonical_facts", []), force=force)
         stats["canonical"] = c_stats
 

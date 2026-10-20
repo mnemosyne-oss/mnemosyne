@@ -539,7 +539,17 @@ class CanonicalStore:
                     )
                 seen_ids.add(row_id)
 
-        cursor.execute("BEGIN IMMEDIATE")
+        owns_transaction = not self.conn.in_transaction
+        savepoint = None
+        if owns_transaction:
+            cursor.execute("BEGIN IMMEDIATE")
+        else:
+            savepoint = (
+                self.conn._next_savepoint_name("import_canonical")
+                if hasattr(self.conn, "_next_savepoint_name")
+                else "mnemosyne_import_canonical"
+            )
+            cursor.execute(f"SAVEPOINT {savepoint}")
         try:
             existing = cursor.execute(
                 "SELECT id, owner_id, category, name, body, source, confidence, "
@@ -641,9 +651,16 @@ class CanonicalStore:
                 except sqlite3.IntegrityError:
                     stats["skipped"] += 1
 
-            self.conn.commit()
+            if owns_transaction:
+                self.conn.commit()
+            else:
+                cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
         except Exception:
-            self.conn.rollback()
+            if owns_transaction:
+                self.conn.rollback()
+            else:
+                cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
         return stats
 

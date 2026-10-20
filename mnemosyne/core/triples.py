@@ -84,30 +84,32 @@ def _get_conn(db_path = None) -> sqlite3.Connection:
     return conn
 
 
+def _ensure_triples_schema(conn: sqlite3.Connection) -> None:
+    """Create the triples schema on an existing connection."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS triples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            object TEXT NOT NULL,
+            valid_from TEXT NOT NULL,
+            valid_until TEXT,
+            source TEXT,
+            confidence REAL DEFAULT 1.0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_predicate ON triples(predicate)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_valid_from ON triples(valid_from)")
+
+
 def init_triples(db_path: Path = None):
     conn = _get_conn(db_path)
     try:
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS triples (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                subject TEXT NOT NULL,
-                predicate TEXT NOT NULL,
-                object TEXT NOT NULL,
-                valid_from TEXT NOT NULL,
-                valid_until TEXT,
-                source TEXT,
-                confidence REAL DEFAULT 1.0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_predicate ON triples(predicate)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_valid_from ON triples(valid_from)")
-
+        _ensure_triples_schema(conn)
         conn.commit()
     finally:
         try:
@@ -161,10 +163,16 @@ class TripleStore:
     get the store instance that matches what a given bank's MCP tools see.
     """
 
-    def __init__(self, db_path: Path = None):
+    def __init__(self, db_path: Path = None, conn: sqlite3.Connection = None):
         self.db_path = Path(db_path) if db_path else _resolve_default_db()
-        init_triples(self.db_path)
-        self.conn = _get_conn(self.db_path)
+        if conn is not None:
+            # Share a caller-owned connection so a multi-store import can run
+            # under one transaction (#727). The caller owns its lifetime.
+            self.conn = conn
+            _ensure_triples_schema(conn)
+        else:
+            init_triples(self.db_path)
+            self.conn = _get_conn(self.db_path)
 
     @classmethod
     def for_bank(cls, bank: str = "default") -> "TripleStore":
@@ -467,7 +475,17 @@ class TripleStore:
         # transaction starts on the first DML, leaving SELECT in
         # autocommit -- another writer could change state between
         # snapshot and insert.
-        cursor.execute("BEGIN IMMEDIATE")
+        owns_transaction = not self.conn.in_transaction
+        savepoint = None
+        if owns_transaction:
+            cursor.execute("BEGIN IMMEDIATE")
+        else:
+            savepoint = (
+                self.conn._next_savepoint_name("import_triples")
+                if hasattr(self.conn, "_next_savepoint_name")
+                else "mnemosyne_import_triples"
+            )
+            cursor.execute(f"SAVEPOINT {savepoint}")
         try:
             cursor.execute(
                 "SELECT id, subject, predicate, object, valid_from, valid_until, "
@@ -552,12 +570,18 @@ class TripleStore:
                 except sqlite3.IntegrityError:
                     stats["skipped"] += 1
 
-            self.conn.commit()
+            if owns_transaction:
+                self.conn.commit()
+            else:
+                cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
         except Exception:
-            # Roll back partial inserts so a mid-stream failure doesn't
-            # leave the connection in a state where a later commit
-            # could accidentally persist orphans (codex review #4).
-            self.conn.rollback()
+            # Roll back only this import's writes: an enclosing import
+            # transaction (#727) must survive to roll back everything.
+            if owns_transaction:
+                self.conn.rollback()
+            else:
+                cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
         return stats
 
