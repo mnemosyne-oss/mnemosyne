@@ -10,8 +10,10 @@ import subprocess
 import sys
 import urllib.request
 
-import httpx
 import pytest
+
+# HTTPX is an optional remote-client dependency; minimal core installs use urllib.
+httpx = pytest.importorskip("httpx")
 
 
 @pytest.fixture
