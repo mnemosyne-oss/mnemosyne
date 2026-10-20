@@ -337,6 +337,11 @@ When client-side encryption is enabled, the remote sync server sees **only metad
 
 Full reference: [docs/configuration.md](docs/configuration.md)
 
+The optional `MNEMOSYNE_LLM_PROVIDER=minimax` preset defaults to
+`MiniMax-M3.1-Flash`, with `MiniMax-M3` also available. Explicit model and endpoint
+settings remain authoritative; see [provider presets](docs/configuration.md#provider-presets)
+for regional endpoints and thinking options.
+
 ### Language Support
 
 Default embeddings are English-optimized (`bge-small-en-v1.5`). For **non-English or multilingual** recall, swap the model:

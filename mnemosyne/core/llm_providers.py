@@ -39,7 +39,7 @@ PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
     "minimax": {
         "name": "MiniMax",
         "default_region": "global_en",
-        "default_model": "MiniMax-M3",
+        "default_model": "MiniMax-M3.1-Flash",
         "regions": {
             "global_en": {
                 "openai_base_url": "https://api.minimax.io/v1",
@@ -53,9 +53,30 @@ PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
             },
         },
         "models": {
+            "MiniMax-M3.1-Flash": {
+                "context_window": 1_000_000,
+                "max_output_tokens": 524_288,
+                "pricing_usd_per_million_tokens": {
+                    "input": 0.15,
+                    "output": 0.6,
+                    "cache_read": 0.015,
+                    "cache_write": None,
+                },
+                "input_modalities": ["text", "image", "video"],
+                "thinking": ["adaptive"],
+                "reasoning_effort": ["low", "medium", "high", "xhigh", "max"],
+                "default_reasoning_effort": "max",
+            },
             "MiniMax-M3": {
                 "context_window": 1_000_000,
+                # Standard tier at <=512k input tokens; priority costs 1.5x.
                 "pricing_usd_per_million_tokens": {
+                    "input": 0.3,
+                    "output": 1.2,
+                    "cache_read": 0.06,
+                    "cache_write": None,
+                },
+                "pricing_usd_per_million_tokens_above_512k": {
                     "input": 0.6,
                     "output": 2.4,
                     "cache_read": 0.12,
@@ -64,6 +85,9 @@ PROVIDER_PRESETS: Dict[str, Dict[str, Any]] = {
                 "input_modalities": ["text", "image", "video"],
                 "thinking": ["adaptive", "disabled"],
             },
+        },
+        # Keep metadata for explicit saved requests, outside ordinary choices.
+        "legacy_models": {
             "MiniMax-M2.7": {
                 "context_window": 204_800,
                 "pricing_usd_per_million_tokens": {
@@ -137,7 +161,7 @@ def default_model(name: str) -> Optional[str]:
 
 
 def list_models(name: str) -> List[str]:
-    """Return the model ids configured for ``name`` (empty list if unknown)."""
+    """Return ordinary model choices in preference order (empty if unknown)."""
     preset = get_provider_preset(name)
     if preset is None:
         return []
@@ -149,7 +173,7 @@ def get_model_config(name: str, model_id: str) -> Optional[Dict[str, Any]]:
     preset = get_provider_preset(name)
     if preset is None:
         return None
-    return preset.get("models", {}).get(model_id)
+    return preset.get("models", {}).get(model_id) or preset.get("legacy_models", {}).get(model_id)
 
 
 def resolve_provider_defaults(
