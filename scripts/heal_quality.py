@@ -20,7 +20,6 @@ import argparse
 import json
 import os
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,12 +32,12 @@ MAX_RETRIES = int(os.environ.get("MNEMOSYNE_HEAL_MAX_RETRIES", "3"))
 MIN_SUMMARY_LEN = int(os.environ.get("MNEMOSYNE_HEAL_MIN_LEN", "300"))
 MEMORY_UNIT_BUDGET = int(os.environ.get("MNEMOSYNE_HEAL_BUDGET", "4000"))
 FORCE_M2_AFTER_RETRIES = int(os.environ.get("MNEMOSYNE_HEAL_ESCALATE_AFTER", "2"))
-JUDGE_MODEL = os.environ.get("MNEMOSYNE_HEAL_JUDGE_MODEL", "MiniMax-M2.7")
+JUDGE_MODEL = os.environ.get("MNEMOSYNE_HEAL_JUDGE_MODEL", "MiniMax-M3.1-Flash")
 
 # --- LLM backends ------------------------------------------------------------
 
 def _call_mmx(prompt: str) -> str | None:
-    """Call MiniMax M2.7 via mmx-cli. Returns text or None on failure."""
+    """Call the configured MiniMax model via mmx-cli; return text or None."""
     import subprocess
 
     mmx_path = Path.home() / ".npm-global" / "bin" / "mmx"
@@ -47,7 +46,7 @@ def _call_mmx(prompt: str) -> str | None:
 
     try:
         result = subprocess.run(
-            [str(mmx_path), "text", "chat", "--message", prompt],
+            [str(mmx_path), "text", "chat", "--model", JUDGE_MODEL, "--message", prompt],
             capture_output=True,
             text=True,
             timeout=60,
@@ -290,7 +289,7 @@ def get_session_path(session_id: str) -> Path | None:
         if path.exists():
             return path
     # Fallback: search
-    for p in sessions_dir.glob(f"session_*.json"):
+    for p in sessions_dir.glob("session_*.json"):
         if session_id.replace("hermes_", "") in p.stem:
             return p
     return None
@@ -378,7 +377,7 @@ def heal_entry(
 
     eid, old_content, session_id, source, meta_json, degraded_at = row
     source = source or f"session:{session_id}"
-    meta = json.loads(meta_json) if meta_json else {}
+    _meta = json.loads(meta_json) if meta_json else {}
 
     # Stage 0: Extract memory units from session file
     session_path = get_session_path(session_id)

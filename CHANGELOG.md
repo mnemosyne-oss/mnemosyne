@@ -7,6 +7,9 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+### Changed
+- Default the opt-in MiniMax text preset to MiniMax-M3.1-Flash, followed by MiniMax-M3 in ordinary choices. Preserve explicit saved/legacy/custom models and legacy metadata. Refresh pricing and thinking metadata, and pass the configured quality-healing model to its CLI backend. Core release metadata advances to 4.0.0b6.
+
 ### Fixed
 - Match existing Hermes identity signal phrases only at Unicode word boundaries, preventing partial-word captures such as "I feel like as …" while preserving complete-phrase matches (PR #1202; partial fix for #1200).
 

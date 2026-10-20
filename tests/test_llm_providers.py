@@ -13,7 +13,7 @@ class TestPresetRegistry:
         preset = lp.get_provider_preset("minimax")
         assert preset is not None
         assert preset["name"] == "MiniMax"
-        assert preset["default_model"] == "MiniMax-M3"
+        assert preset["default_model"] == "MiniMax-M3.1-Flash"
         assert preset["default_region"] == "global_en"
 
     def test_lookup_is_case_insensitive(self):
@@ -57,12 +57,33 @@ class TestRegionsAndEndpoints:
 
 class TestModels:
     def test_model_ids(self):
-        assert lp.list_models("minimax") == ["MiniMax-M3", "MiniMax-M2.7"]
+        assert lp.list_models("minimax") == ["MiniMax-M3.1-Flash", "MiniMax-M3"]
+
+    def test_flash_configuration(self):
+        cfg = lp.get_model_config("minimax", "MiniMax-M3.1-Flash")
+        assert cfg["context_window"] == 1_000_000
+        assert cfg["max_output_tokens"] == 524_288
+        assert cfg["pricing_usd_per_million_tokens"] == {
+            "input": 0.15,
+            "output": 0.6,
+            "cache_read": 0.015,
+            "cache_write": None,
+        }
+        assert cfg["input_modalities"] == ["text", "image", "video"]
+        assert cfg["thinking"] == ["adaptive"]
+        assert cfg["reasoning_effort"] == ["low", "medium", "high", "xhigh", "max"]
+        assert cfg["default_reasoning_effort"] == "max"
 
     def test_m3_configuration(self):
         cfg = lp.get_model_config("minimax", "MiniMax-M3")
         assert cfg["context_window"] == 1_000_000
         assert cfg["pricing_usd_per_million_tokens"] == {
+            "input": 0.3,
+            "output": 1.2,
+            "cache_read": 0.06,
+            "cache_write": None,
+        }
+        assert cfg["pricing_usd_per_million_tokens_above_512k"] == {
             "input": 0.6,
             "output": 2.4,
             "cache_read": 0.12,
@@ -84,7 +105,7 @@ class TestModels:
         assert cfg["thinking"] == ["always_on"]
 
     def test_default_model(self):
-        assert lp.default_model("minimax") == "MiniMax-M3"
+        assert lp.default_model("minimax") == "MiniMax-M3.1-Flash"
 
     def test_unknown_model_config_is_none(self):
         assert lp.get_model_config("minimax", "MiniMax-X9") is None
@@ -94,12 +115,12 @@ class TestResolveProviderDefaults:
     def test_defaults_for_known_provider(self):
         base_url, model = lp.resolve_provider_defaults("minimax")
         assert base_url == "https://api.minimax.io/v1"
-        assert model == "MiniMax-M3"
+        assert model == "MiniMax-M3.1-Flash"
 
     def test_defaults_for_cn_region(self):
         base_url, model = lp.resolve_provider_defaults("minimax", "cn_zh")
         assert base_url == "https://api.minimaxi.com/v1"
-        assert model == "MiniMax-M3"
+        assert model == "MiniMax-M3.1-Flash"
 
     def test_defaults_for_unknown_provider(self):
         assert lp.resolve_provider_defaults("nope") == (None, None)
@@ -134,14 +155,14 @@ class TestLocalLLMWiring:
     def test_provider_fills_base_url_and_model(self):
         base_url, model = self._import_with_env({"MNEMOSYNE_LLM_PROVIDER": "minimax"})
         assert base_url == "https://api.minimax.io/v1"
-        assert model == "MiniMax-M3"
+        assert model == "MiniMax-M3.1-Flash"
 
     def test_provider_region_selects_cn_endpoint(self):
         base_url, model = self._import_with_env(
             {"MNEMOSYNE_LLM_PROVIDER": "minimax", "MNEMOSYNE_LLM_REGION": "cn_zh"}
         )
         assert base_url == "https://api.minimaxi.com/v1"
-        assert model == "MiniMax-M3"
+        assert model == "MiniMax-M3.1-Flash"
 
     def test_explicit_base_url_and_model_win_over_preset(self):
         base_url, model = self._import_with_env(

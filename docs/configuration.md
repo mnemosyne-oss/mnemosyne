@@ -356,10 +356,29 @@ over a preset, so existing configurations are unchanged.
 
 | Model | Context window | Input / output (USD / 1M tokens) | Input modalities | Thinking |
 |---|---|---|---|---|
-| `MiniMax-M3` (default) | 1,000,000 | 0.6 / 2.4 | text, image, video | adaptive, disabled |
-| `MiniMax-M2.7` | 204,800 | 0.3 / 1.2 | text | always_on |
+| `MiniMax-M3.1-Flash` (default) | 1,000,000 | 0.15 / 0.60 | text, image, video | adaptive only |
+| `MiniMax-M3` | 1,000,000 | 0.30 / 1.20 at <=512k input; 0.60 / 2.40 above 512k | text, image, video | adaptive, disabled |
 
-Set `MNEMOSYNE_LLM_MODEL=MiniMax-M2.7` to select the non-default model.
+Set `MNEMOSYNE_LLM_MODEL=MiniMax-M3` to select M3. Explicit saved, legacy,
+and custom model IDs remain accepted, including `MiniMax-M2.7`; they are not
+silently replaced by the preset default. The regional Anthropic URLs are metadata;
+the remote client sends OpenAI-compatible Chat Completions requests.
+
+Flash supports up to 524,288 output tokens (the client's configured
+`MNEMOSYNE_LLM_MAX_TOKENS` budget still applies). Its cache-read price is
+USD 0.015 per million tokens. M3 standard cache-read pricing is USD 0.06 at
+<=512k input and USD 0.12 above 512k; M3 priority pricing is 1.5x standard.
+Cache-write pricing is unspecified.
+
+Flash defaults to adaptive thinking and `max` reasoning effort. To choose another
+supported effort, set `MNEMOSYNE_LLM_EXTRA_BODY='{"reasoning_effort":"high"}'`;
+valid values are `low`, `medium`, `high`, `xhigh`, and `max`. Do not send disabled
+thinking, `reasoning_effort=none`, `service_tier`, or `reasoning_split=false` to
+Flash. Explicit extra bodies are passed through unchanged, so review existing
+thinking overrides when changing models. See the [MiniMax model reference](https://platform.minimax.io/docs/guides/models-intro.md).
+
+The optional `scripts/heal_quality.py` CLI backend also defaults to Flash and
+passes `MNEMOSYNE_HEAL_JUDGE_MODEL` explicitly to `mmx text chat --model`.
 
 ### Host LLM Adapter (Hermes / agent integration)
 
