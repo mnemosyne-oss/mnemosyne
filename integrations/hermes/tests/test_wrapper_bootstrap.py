@@ -253,10 +253,15 @@ def test_generated_bootstrap_rejects_invalid_manifest_python_without_sys_path_mu
 
     code = f"""
 import importlib.util
+import io
+import logging
 import sys
 from pathlib import Path
 
 wrapper = Path({str(wrapper)!r})
+log_stream = io.StringIO()
+logging.getLogger().addHandler(logging.StreamHandler(log_stream))
+logging.getLogger().setLevel(logging.WARNING)
 bootstrap_spec = importlib.util.spec_from_file_location(
     'standalone_mnemosyne_bootstrap', wrapper / '_mnemosyne_bootstrap.py'
 )
@@ -269,6 +274,7 @@ except RuntimeError as exc:
     assert str(exc) == 'Invalid Mnemosyne wrapper Python executable'
 else:
     raise AssertionError('invalid manifest python should fail activation')
+assert log_stream.getvalue() == ''
 assert sys.path == before
 """
     environment = os.environ.copy()
@@ -285,12 +291,13 @@ assert sys.path == before
 
 
 
+@pytest.mark.parametrize("log_level", ["INFO", "WARNING"])
 @pytest.mark.parametrize("entrypoint", ["__init__.py", "cli.py"])
 @pytest.mark.parametrize(
     "config_kind", ["same_major_different_minor", "malformed", "pyvenv_cfg_directory"]
 )
 def test_generated_wrapper_rejects_incompatible_side_venv_before_site_activation(
-    tmp_path, entrypoint, config_kind
+    tmp_path, entrypoint, config_kind, log_level
 ):
     site_packages = tmp_path / "side-venv" / "lib" / "python-current" / "site-packages"
     if config_kind == "same_major_different_minor":
@@ -321,12 +328,19 @@ def test_generated_wrapper_rejects_incompatible_side_venv_before_site_activation
 
     code = f"""
 import importlib.util
+import io
+import logging
 import sys
 import types
 from pathlib import Path
 
 wrapper = Path({str(wrapper)!r})
 site_packages = {str(site_packages.resolve())!r}
+log_stream = io.StringIO()
+handler = logging.StreamHandler(log_stream)
+handler.setFormatter(logging.Formatter('%(levelname)s:%(name)s:%(message)s'))
+logging.getLogger().addHandler(handler)
+logging.getLogger().setLevel(logging.{log_level})
 before = list(sys.path)
 if {entrypoint!r} == '__init__.py':
     parent = types.ModuleType('synthetic_hermes_plugins')
@@ -349,6 +363,9 @@ except RuntimeError as exc:
     assert 'selected Mnemosyne environment Python {selected_version}' in message
 else:
     raise AssertionError('incompatible selected virtualenv should fail activation')
+assert log_stream.getvalue().splitlines() == [
+    'WARNING:' + name + '._mnemosyne_bootstrap:' + message
+]
 assert site_packages not in sys.path
 assert sys.path == before
 assert 'mnemosyne_hermes' not in sys.modules
@@ -391,12 +408,17 @@ def test_generated_wrapper_accepts_matching_side_venv_version_info_for_both_entr
 
     code = f"""
 import importlib.util
+import io
+import logging
 import sys
 import types
 from pathlib import Path
 
 wrapper = Path({str(wrapper)!r})
 site_packages = {str(site_packages.resolve())!r}
+log_stream = io.StringIO()
+logging.getLogger().addHandler(logging.StreamHandler(log_stream))
+logging.getLogger().setLevel(logging.WARNING)
 if {entrypoint!r} == '__init__.py':
     parent = types.ModuleType('synthetic_hermes_plugins')
     parent.__path__ = []
@@ -411,6 +433,7 @@ else:
 module = importlib.util.module_from_spec(spec)
 sys.modules[name] = module
 spec.loader.exec_module(module)
+assert log_stream.getvalue() == ''
 assert site_packages == sys.path[0]
 assert Path(sys.modules['mnemosyne_hermes'].__file__).parent == Path({str(package.resolve())!r})
 """

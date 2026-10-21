@@ -1831,6 +1831,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -1867,13 +1868,15 @@ def _guard_selected_site_packages_python_compatibility(selected_site_packages: P
                 if selected_version is not None
                 else "unknown"
             )
-            raise RuntimeError(
+            message = (
                 "Mnemosyne runtime Python compatibility error: "
                 f"runtime Python {runtime_version[0]}.{runtime_version[1]}; "
                 f"selected Mnemosyne environment Python {selected_text}. "
                 "Recreate the Mnemosyne environment using Hermes' Python, "
                 "then reinstall mnemosyne-hermes."
             )
+            logging.getLogger(__name__).warning("%s", message)
+            raise RuntimeError(message)
         return
 
 

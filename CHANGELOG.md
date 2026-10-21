@@ -8,6 +8,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 ## [Unreleased]
 
 ### Fixed
+- Generated Hermes wrappers emit a WARNING with the existing Python compatibility diagnostic before rejecting a mismatched selected environment (#635). The exception and pre-activation guard are unchanged; gateway log routing is not covered.
 - **Partial legacy Hermes PM adoption work (#1169 remains open).** An opt-in installer path preserves the verified installed core/provider pair and operator-selected extras through Hermes PM admission, refuses external wrappers, and provides a core-free read-only console plan without changing normal installation defaults; this does not close the broader issue.
 
 - Match existing Hermes identity signal phrases only at Unicode word boundaries, preventing partial-word captures such as "I feel like as …" while preserving complete-phrase matches (PR #1202; partial fix for #1200).
