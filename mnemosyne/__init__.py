@@ -25,6 +25,7 @@ _lazy_exports = {
     "get": (".core.memory", "get"),
     "forget": (".core.memory", "forget"),
     "update": (".core.memory", "update"),
+    "close_thread_connection": (".core.connection_release", "close_thread_connection"),
     "reclaim_orphans": (".core.memory", "reclaim_orphans"),
     "SyncEngine": (".core.sync", "SyncEngine"),
     "SyncEvent": (".core.sync", "SyncEvent"),

@@ -263,6 +263,29 @@ logger = logging.getLogger(__name__)
 _provider_active: bool = False
 _active_provider_count: int = 0
 _provider_lock = threading.Lock()
+def _release_thread_connection(db_path=None) -> None:
+    """Release this worker thread's cached SQLite handle (mnemosyne#1163).
+
+    Valid only for a worker that created its own memory instance, finished with
+    it, and will never use it again. The local variable may still reference the
+    instance graph when this runs -- the call sits in ``finally`` -- so the
+    precondition is no further use, not no remaining reference. The provider's
+    per-session beams are retained on purpose and must never be released here.
+    The core helper refuses the main thread.
+    """
+    try:
+        # Import the side-effect-free release module, never
+        # ``mnemosyne.core.memory``: importing that module runs ``init_db()``,
+        # which opens a default-database connection and republishes it into
+        # ``beam``'s thread-local cache, displacing the handle this worker just
+        # used before cleanup can select it. Cores without the module (the
+        # released b5) fail soft here as before.
+        from mnemosyne.core.connection_release import close_thread_connection
+
+        close_thread_connection(db_path)
+    except Exception:  # never let cleanup break a sleep cycle
+        logger.debug("thread connection release failed", exc_info=True)
+
 
 # Host-backend ownership is deliberately separate from _provider_active: only
 # a primary provider whose Beam initialization succeeded owns a contribution.
@@ -3340,6 +3363,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             sleep_beam.sleep()
                     except Exception as inner:
                         logger.debug("Mnemosyne auto-sleep worker failed: %s", inner)
+                    finally:
+                        _release_thread_connection(sleep_args.get("db_path"))
 
                 # P1b: run the worker in the caller's copied context (in-turn spawn)
                 # so out-of-turn ambient fallback never misbinds capture writes.
@@ -5335,6 +5360,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         sleep_beam.sleep()
                 except Exception as inner:
                     logger.debug("Mnemosyne session-end sleep failed: %s", inner)
+                finally:
+                    _release_thread_connection(sleep_args.get("db_path"))
 
             sleep_thread = threading.Thread(
                 target=contextvars.copy_context().run, args=(_sleep_with_logging,), daemon=True)

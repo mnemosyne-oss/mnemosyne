@@ -294,6 +294,25 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
     return _thread_local.conn
 
 
+def close_thread_connection(db_path=None, *, allow_main_thread: bool = False) -> bool:
+    """Close this thread's cached SQLite connection (mnemosyne#1163).
+
+    Thin re-export of
+    :func:`mnemosyne.core.connection_release.close_thread_connection`, which
+    owns the contract, the caches it covers and the close-failure policy.
+
+    The logic lives in that module so the release can be reached without
+    importing this one: importing this module runs the ``init_db()`` below,
+    which opens a connection for the default database and republishes it into
+    ``beam``'s thread-local cache, displacing the handle the caller asked to
+    close. A cold worker that imported this helper therefore left its original
+    handle open.
+    """
+    from mnemosyne.core.connection_release import close_thread_connection as _close
+
+    return _close(db_path, allow_main_thread=allow_main_thread)
+
+
 def _close_dry_run_clone(
     thread_local_states: List[tuple[Any, Dict[str, Any]]],
     clone_store_connections: List[Any],
