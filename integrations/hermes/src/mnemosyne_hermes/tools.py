@@ -21,8 +21,9 @@ from .persona_tools import (
 REMEMBER_SCHEMA = {
     "name": "mnemosyne_remember",
     "description": (
-        "Store a durable memory in Mnemosyne. Use for ANY fact, preference, "
-        "identity, insight, or context that should persist across sessions. Higher importance "
+        "Store a durable memory in Mnemosyne. Use for bulk durable facts, preferences, "
+        "identity, insights, or context that should persist across sessions. Small standing "
+        "rules and context anchors may stay in the always-injected memory tier instead. Higher importance "
         "(0.0-1.0) surfaces the memory more often. Use scope='global' for user-level "
         "facts; scope='session' for conversation-specific context. Use valid_until "
         "(ISO date YYYY-MM-DD) for time-bound facts. Use extract_entities=True to "

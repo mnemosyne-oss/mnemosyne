@@ -357,10 +357,14 @@ only skips automatic package installation. `mnemosyne-hermes status` intentional
 uses its fixed 60-second validation policy, independent of an install-time override.
 
 The installer also deploys the bundled `mnemosyne-memory-override` skill to
-`$HERMES_HOME/skills/memory/mnemosyne-memory-override/SKILL.md`. The skill is a
-behavioral guardrail that nudges agents away from the legacy `memory` tool for
-durable facts. Existing user-edited copies are skipped by default; `install
---force` overwrites the skill only after writing `SKILL.md.bak` next to it.
+`$HERMES_HOME/skills/memory/mnemosyne-memory-override/SKILL.md`, so its
+description appears in Hermes' skills index. The skill is a stricter, optional
+policy that routes all durable storage to Mnemosyne, and it applies only when the
+user consciously selects it: installation, the skill showing up in the index, or
+an ordinary memory task is not that selection. By default, bulk durable facts go
+to Mnemosyne and small standing rules and context anchors may stay in the
+always-injected memory tier. Existing user-edited copies are skipped by default;
+`install --force` overwrites the skill only after writing `SKILL.md.bak` next to it.
 
 ### How it works
 
