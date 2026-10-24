@@ -37,6 +37,7 @@ def _run_fresh(
     *,
     pythonpath: str | None = None,
     timeout: float = 120.0,
+    reset_config: bool = False,
     **env_overrides: str,
 ):
     """Run ``code`` in a fresh interpreter with an isolated data dir.
@@ -46,6 +47,10 @@ def _run_fresh(
     so we can assert no database was written. ``timeout`` bounds the child so
     a hung interpreter fails the test instead of stalling the run.
     """
+    if reset_config:
+        config_path = tmp_path / "data" / "config.yaml"
+        if config_path.exists():
+            config_path.unlink()
     env = os.environ.copy()
     env["MNEMOSYNE_DATA_DIR"] = str(tmp_path / "data")
     env["HOME"] = str(tmp_path / "home")
@@ -385,6 +390,9 @@ def test_second_process_recalls_stored_memory_same_dim(tmp_path):
     reader = _run_fresh(
         _fake_endpoint_recall_only_code(1024),
         tmp_path,  # same MNEMOSYNE_DATA_DIR as the writer
+        # The writer seeded its own ephemeral endpoint URL into config.yaml;
+        # let the reader seed from its own environment.
+        reset_config=True,
         MNEMOSYNE_EMBEDDING_MODEL="mixedbread-ai/mxbai-embed-large-v1",
         MNEMOSYNE_EMBEDDING_DIM="1024",
     )
