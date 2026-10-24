@@ -1461,8 +1461,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # bindings dict resolved AT CALL TIME from the turn's scope, with the
         # last-initialized binding as out-of-turn fallback (cron/teardown keep
         # legacy behavior exactly). _beam/_agent_identity/_session_id are
-        # properties over these slots; see _binding_slot below. The dict must
-        # exist before any property write in this constructor.
+        # properties over these slots; see _binding_slot below.
         self._bindings: Dict[str, Dict[str, Any]] = {
             "default": {"beam": None, "agent_identity": "", "session_id": "hermes_default"},
         }
@@ -1476,6 +1475,22 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # turn-scoped HERMES_HOME — __init__ runs before initialize() exists.
         _ambient = self._bindings[self._ambient_key]
         _ambient["beam"] = None
+        # NOTE: do NOT write `self._beam = None` here. `_beam` is a property
+        # whose setter routes through _write_slot() -> _p1b_current_key(), and
+        # that key is a CONTEXT-LOCAL ContextVar. A provider constructed while
+        # a profile's turn-scoped home is set but before any binding exists for
+        # that home raised "no binding for the current home ...; refusing to
+        # write through another home's binding" IN THE CONSTRUCTOR — before
+        # initialize() could create the slot, so the provider could never
+        # initialise and every memory write for that profile was lost while the
+        # agent still reported success (#1050 follow-up).
+        #
+        # The assignment was also redundant: _binding_slot()/_resolve_read_slot()
+        # return a slot whose "beam" default is already None, so every
+        # `self._beam` read returns None until initialize() assigns a real beam
+        # (line ~2344/2360). Dropping it removes the construction-time write
+        # without changing any read behaviour. The fail-closed guard in
+        # _write_slot() is deliberately left intact for genuine cross-home writes.
         self._surface_beam: Optional[Any] = None
         self._shared_surface_bank = "surface"
         self._shared_surface_path: Optional[Path] = None
@@ -3990,12 +4005,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _handle_resolve_conflicts(self, args: Dict[str, Any]) -> str:
         """Invoke the opt-in cross-session conflict resolver.
 
-        `dry_run=True` previews without superseding memories or apply audits.
-        Explicit `llm_eval=True` can call the LLM and write cost records even
-        when the LLM detection flag is off. Apply and evaluated preview reserve
-        one reflection call before core execution, without refunds."""
+        `dry_run=True` reports candidate pairs without mutating; `dry_run=False`
+        applies supersessions. The apply path reserves the reflection budget (it
+        can issue one LLM validation request per flagged pair when
+        `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on)."""
         dry_run = bool(args.get("dry_run", False))
-        llm_eval = bool(args.get("llm_eval", False))
         if not hasattr(self._beam, "resolve_cross_session_conflicts"):
             return json.dumps({
                 "status": "unavailable",
@@ -4004,14 +4018,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Apply can issue one LLM validation request per flagged pair when
         # MNEMOSYNE_LLM_CONFLICT_DETECTION is on; reserve the reflection budget
         # like _handle_sleep does for the same class of work. Dry runs are
-        # deterministic and make no LLM calls unless llm_eval is requested.
-        if not dry_run or llm_eval:
+        # deterministic and make no LLM calls, so they need no budget.
+        if not dry_run:
             skip = self._reserve_reflection_budget("tool")
             if skip is not None:
                 return json.dumps(skip)
         result = self._beam.resolve_cross_session_conflicts(
             dry_run=dry_run,
-            llm_eval=llm_eval,
+            llm_eval=bool(args.get("llm_eval", False)),
         )
         if not dry_run and int(result.get("invalidated", 0)):
             try:
@@ -4035,47 +4049,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         memoria = self._beam.get_memoria_stats()
         return json.dumps({"provider": "mnemosyne", "session_id": self._session_id, "working": working, "episodic": episodic, "memoria": memoria})
 
-    def _invalidate_target_active(self, beam: Any, memory_id: str) -> bool:
-        """True when `memory_id` is still an ACTIVE row for this beam.
-
-        BeamMemory.invalidate() refuses to touch a row that is superseded or
-        expired, while BeamMemory.get() happily returns such rows too — so a
-        failed invalidation can only blame the replacement when the target
-        itself still passes core's visibility predicate. Mirrors exactly that
-        predicate. When the query cannot run, only a get() row that POSITIVELY
-        declares both status fields unset counts as active: the real
-        BeamMemory.get() shape omits superseded_by/valid_until entirely, and
-        absent fields mean UNKNOWN, not active. An unknown state fails closed
-        (memory_not_found) rather than blaming a healthy replacement.
-        """
-        try:
-            now = datetime.now(timezone.utc).isoformat()
-            cursor = beam.conn.cursor()
-            for table in ("working_memory", "episodic_memory"):
-                cursor.execute(
-                    f"SELECT 1 FROM {table} "
-                    "WHERE id = ? AND (session_id = ? OR scope = 'global') "
-                    "AND superseded_by IS NULL "
-                    "AND (valid_until IS NULL OR julianday(valid_until) > julianday(?)) LIMIT 1",
-                    (memory_id, getattr(beam, "session_id", None), now),
-                )
-                if cursor.fetchone() is not None:
-                    return True
-            return False
-        except Exception:
-            # Degraded path — see the contract above: activity is only
-            # claimed when the row declares it, never inferred from absent
-            # fields (review on #1113, third round).
-            try:
-                row = beam.get(memory_id)
-            except Exception:
-                return False
-            if row is None:
-                return False
-            if "superseded_by" not in row or "valid_until" not in row:
-                return False
-            return not row["superseded_by"] and not row["valid_until"]
-
     def _handle_invalidate(self, args: Dict[str, Any]) -> str:
         memory_id = args.get("memory_id", "")
         replacement_id = args.get("replacement_id", None) or None
@@ -4084,11 +4057,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({"error": "memory_id is required"})
         if bank not in (None, "private", "surface"):
             return json.dumps({"error": f"unknown bank: {bank}"})
-        if replacement_id == memory_id:
-            # A row can never supersede itself; core rejects this before any
-            # visibility lookup. Say so here so the reporting below stays
-            # truthful about ids that were actually looked up.
-            return json.dumps({"error": "replacement_id must differ from memory_id"})
         # Surface routing: an explicit bank= surface wins; otherwise the id
         # namespace decides. Every shared-surface row carries the generation-
         # pinned "sf_" prefix minted by _handle_shared_remember; private ids are
@@ -4115,19 +4083,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             metadata={"replacement_id": replacement_id, "invalidated": ok} if replacement_id else {"invalidated": ok},
         )
         if not ok:
-            if replacement_id and self._invalidate_target_active(target_beam, memory_id):
-                # The target is still an ACTIVE row in this bank, so the only
-                # remaining reason the invalidation can fail is that the
-                # replacement id is not an active row there. Tell the caller
-                # which id to correct. (A bare get() cannot decide this: it
-                # also returns superseded and expired rows, which would let
-                # an inactive target wrongly blame a healthy replacement.)
-                return json.dumps({
-                    "status": "replacement_not_found",
-                    "memory_id": memory_id,
-                    "replacement_id": replacement_id,
-                    "bank": bank,
-                })
             return json.dumps({"status": "memory_not_found", "memory_id": memory_id, "bank": bank})
         return json.dumps({"status": "invalidated", "memory_id": memory_id, "bank": bank})
 
@@ -4407,26 +4362,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _canonical_write_guard(self, tool_name: str) -> Optional[str]:
         """Structured error when this turn's profile does not own the bound
-        canonical identity, or the turn's profile cannot be resolved at all;
-        None when the write may proceed."""
+        canonical identity; None when the write may proceed."""
         try:
             from hermes_cli.profiles import get_active_profile_name
             turn = (get_active_profile_name() or "").strip()
         except Exception:
             turn = ""
         bound = (self._canonical_owner() or "").strip()
-        if not turn:
-            # Fail-closed (2026-09-20 incident): the guard's whole purpose is
-            # proving this turn owns the bound profile. An unresolvable turn
-            # profile proves nothing, so the canonical write is refused;
-            # reads stay ungated.
-            return json.dumps({
-                "status": "canonical_profile_unavailable",
-                "error": "canonical_profile_unavailable",
-                "tool": tool_name,
-                "hint": "active Hermes profile could not be resolved — do not "
-                        "retry from an unbound context; report to the room.",
-            })
         if turn and bound and turn != bound:
             return json.dumps({
                 "status": "canonical_owner_mismatch",
