@@ -7,6 +7,6 @@ version = "0.7.6"
 description = "Mnemosyne memory provider for Hermes Agent, catalog wrapper"
 requires-python = ">=3.11"
 dependencies = [
-    "mnemosyne-hermes>=0.7.6,<0.8",
-    "mnemosyne-memory[embeddings]>=4.0.0b5",
+    "mnemosyne-hermes>=0.7.6,<0.8; sys_platform != 'android' and sys_platform != 'emscripten'",
+    "mnemosyne-memory[embeddings]>=4.0.0b5; sys_platform != 'android' and sys_platform != 'emscripten'",
 ]

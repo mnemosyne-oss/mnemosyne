@@ -102,6 +102,15 @@ transaction or protection against adversarial filesystem races. No runtime,
 hook, autosave, update or release acceptance is implied. This enhancement is
 separate from publication of the already merged #1217 fix.
 
+## Native integration platform support
+
+Android and Emscripten are excluded from the native Hermes integration. Source
+entry points fail closed before provider/core imports or runtime activation;
+static discovery is not an availability guarantee. See [platform boundaries and
+release gates](PLATFORM_SUPPORT.md). A guard-bearing standalone release and a
+catalog floor requiring that actually published version remain shipping gates;
+this source change does not retrofit published `0.7.6` or existing wrappers.
+
 ## How It Works
 
 Mnemosyne runs on three stages:

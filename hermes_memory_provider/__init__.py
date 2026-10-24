@@ -14,12 +14,23 @@ a standalone plugin deployed through the plugin system.
 
 from __future__ import annotations
 
+import sys
+
+# File-loaded entry points cannot rely on a parent package guard.
+if sys.platform in {"android", "emscripten"} or (
+    sys.platform == "linux" and hasattr(sys, "getandroidapilevel")
+):
+    _platform_label = "android" if sys.platform == "linux" else sys.platform
+    raise RuntimeError(
+        f"Mnemosyne native Hermes integration is unsupported on {_platform_label}; "
+        "no provider or tools were activated."
+    )
+
 from contextlib import contextmanager
 import json
 import logging
 import os
 import re
-import sys
 import threading
 import time
 from contextlib import nullcontext

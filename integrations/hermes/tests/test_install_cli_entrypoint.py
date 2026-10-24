@@ -14,6 +14,8 @@ import sys
 import venv
 import zipfile
 
+import pytest
+
 import mnemosyne_hermes
 from mnemosyne_hermes import install
 
@@ -95,6 +97,81 @@ assert "mnemosyne" not in sys.modules
     result = subprocess.run([str(python), "-I", "-B", "-c", code, json.dumps(arguments), loader_hash,
         str(home), str(trap)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.fixture(scope="module")
+def wheel_consumer(tmp_path_factory):
+    """Use an installed wheel, not the editable checkout, for console probes."""
+    root = tmp_path_factory.mktemp("platform-wheel-consumer")
+    source = root / "source"
+    shutil.copytree(Path(__file__).resolve().parents[1], source,
+                    ignore=shutil.ignore_patterns("build", "dist", "*.egg-info", "__pycache__"))
+    built = subprocess.run([sys.executable, "-m", "build", "--wheel",
+        str(source), "--outdir", str(root / "dist")], capture_output=True, text=True,
+        timeout=120)
+    assert built.returncode == 0, built.stdout + built.stderr
+    wheel = next((root / "dist").glob("*.whl"))
+    venv.EnvBuilder(with_pip=True).create(root / "consumer")
+    python = root / "consumer" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    installed = subprocess.run([str(python), "-m", "pip", "install", "--no-deps", "--no-index", str(wheel)],
+                               capture_output=True, text=True, timeout=120)
+    assert installed.returncode == 0, installed.stderr
+    return python
+
+
+@pytest.mark.parametrize(
+    ("platform", "legacy_android"),
+    [
+        pytest.param("android", False, id="android"),
+        pytest.param("emscripten", False, id="emscripten"),
+        pytest.param("linux", True, id="legacy_android"),
+        pytest.param("linux", False, id="ordinary_linux"),
+    ],
+)
+def test_installed_wheel_console_checks_android_before_cached_installer(
+    tmp_path, wheel_consumer, platform, legacy_android,
+):
+    code = f'''
+import importlib.metadata, importlib.util, pathlib, sys, types
+assert importlib.util.find_spec("mnemosyne") is None
+entry = next(e for e in importlib.metadata.distribution("mnemosyne-hermes").entry_points
+             if e.group == "console_scripts" and e.name == "mnemosyne-hermes")
+main = entry.load()
+assert pathlib.Path(sys.modules[main.__module__].__file__).resolve().is_relative_to(
+    pathlib.Path(sys.prefix).resolve())
+calls = []
+cached = types.ModuleType("_mnemosyne_hermes_installer")
+def cached_main(argv):
+    calls.append(argv)
+    return 0
+cached.main = cached_main
+sys.modules[cached.__name__] = cached
+sys.platform = {platform!r}
+if {legacy_android!r}:
+    def android_api_level():
+        raise AssertionError("platform detection must not call Android API")
+    sys.getandroidapilevel = android_api_level
+else:
+    assert not hasattr(sys, "getandroidapilevel")
+status = main(["install"])
+if {legacy_android!r} or {platform!r} in ("android", "emscripten"):
+    assert status != 0, status
+    assert calls == [], calls
+else:
+    assert status == 0, status
+    assert calls == [["install"]], calls
+'''
+    result = subprocess.run([str(wheel_consumer), "-I", "-B", "-c", code],
+                            cwd=tmp_path, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    if legacy_android or platform in ("android", "emscripten"):
+        expected_platform = "android" if legacy_android else platform
+        assert result.stderr == (
+            f"Mnemosyne native Hermes integration is unsupported on {expected_platform}; "
+            "no provider or tools were activated.\n"
+        )
+    else:
+        assert result.stderr == ""
 
 
 def test_package_version_matches_distribution_metadata():

@@ -99,9 +99,19 @@ def _toml_loads(text: str) -> dict:
 def test_wrapper_pyproject_declares_the_package_and_is_not_a_distribution():
     """Require the catalog wrapper to declare packages without becoming one."""
     data = _toml_loads((CATALOG / "pyproject.toml").read_text())
-    deps = data["project"]["dependencies"]
-    assert "mnemosyne-hermes>=0.7.6,<0.8" in deps, deps
-    assert "mnemosyne-memory[embeddings]>=4.0.0b5" in deps, deps
+    from packaging.requirements import Requirement
+
+    deps = {req.name: req for req in map(Requirement, data["project"]["dependencies"])}
+    provider, core = deps["mnemosyne-hermes"], deps["mnemosyne-memory"]
+    assert str(provider.specifier) == "<0.8,>=0.7.6"
+    assert str(core.specifier) == ">=4.0.0b5" and core.extras == {"embeddings"}
+    assert provider.marker is not None and core.marker is not None
+    assert str(provider.marker) == str(core.marker)
+    for platform in ("android", "emscripten", "linux", "darwin", "win32"):
+        for req in (provider, core):
+            assert req.marker.evaluate({"sys_platform": platform}) == (
+                platform not in {"android", "emscripten"}
+            )
     assert "build-system" not in data, "the catalog wrapper must never build as a package"
     assert data["project"]["version"] == _manifest()["version"]
 
