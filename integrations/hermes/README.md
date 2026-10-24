@@ -419,8 +419,8 @@ Both the standalone `mnemosyne_hermes` provider and the bundled
 `hermes_memory_provider` copy expose the same `dry_run`/`llm_eval` resolver
 arguments during migration; this is not a recommendation to install the bundled
 copy. The existing core `BeamMemory.resolve_cross_session_conflicts` signature
-supports both arguments. The declared release pair is core 4.0.0b5 and provider
-0.7.5; no fallback retry against an incompatible core signature is performed.
+supports both arguments. The declared release pair is core 4.0.0b6 and provider
+0.7.6; no fallback retry against an incompatible core signature is performed.
 
 An explicit LLM preview overrides `MNEMOSYNE_LLM_CONFLICT_DETECTION` for that
 preview only, never the default-off cross-session gate. Apply still honors the

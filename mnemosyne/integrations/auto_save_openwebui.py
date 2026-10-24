@@ -43,6 +43,7 @@ import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import quote
 
 from mnemosyne.core.memory import Mnemosyne
 from mnemosyne.core.user_agent import application_user_agent
@@ -107,10 +108,69 @@ async def _api_get_async(url: str, api_key: str = "") -> Any:
 async def _health_check(url: str, api_key: str = "") -> bool:
     """Check if OpenWebUI is reachable."""
     try:
-        await _api_get_async(f"{url}/api/health", api_key)
+        await _api_get_async(f"{url}/health", api_key)
         return True
-    except Exception:
+    except Exception as e:
+        logger.debug("OpenWebUI health check failed at %s/health: %s", url, e)
         return False
+
+
+def _coerce_messages(messages: Any) -> list[Dict[str, Any]]:
+    """Normalize OpenWebUI's legacy lists and current history message maps."""
+    if isinstance(messages, list):
+        return [message for message in messages if isinstance(message, dict)]
+
+    if isinstance(messages, dict):
+        normalized = []
+        for message_id, message in messages.items():
+            if not isinstance(message, dict):
+                continue
+            if not message.get("id") and not message.get("message_id"):
+                message = {**message, "id": message_id}
+            normalized.append(message)
+        return normalized
+
+    return []
+
+
+def _extract_chat_messages(chat_data: Dict[str, Any]) -> list[Dict[str, Any]]:
+    """Read current OpenWebUI chat history and legacy message fields."""
+    if not isinstance(chat_data, dict):
+        return []
+
+    messages = []
+    containers = [chat_data]
+    chat = chat_data.get("chat")
+    if isinstance(chat, dict):
+        containers.append(chat)
+
+    for container in containers:
+        history = container.get("history")
+        if isinstance(history, dict):
+            history_messages = history.get("messages")
+            if history_messages is not None:
+                messages.extend(_coerce_messages(history_messages))
+        else:
+            messages.extend(_coerce_messages(history))
+
+        messages.extend(_coerce_messages(container.get("messages")))
+
+    deduplicated = []
+    seen_ids = set()
+    for message in messages:
+        message_id = message.get("id")
+        if message_id in (None, ""):
+            message_id = message.get("message_id")
+        if message_id in (None, ""):
+            deduplicated.append(message)
+            continue
+
+        message_id = str(message_id)
+        if message_id not in seen_ids:
+            seen_ids.add(message_id)
+            deduplicated.append(message)
+
+    return deduplicated
 
 
 # ── Memory Saver ──────────────────────────────────────────────────────
@@ -233,7 +293,7 @@ class SyncEngine:
         while True:
             try:
                 chats = await _api_get_async(
-                    f"{self.url}/api/chats/list?page={page}",
+                    f"{self.url}/api/v1/chats/?page={page}",
                     self.api_key,
                 )
             except Exception as e:
@@ -251,28 +311,28 @@ class SyncEngine:
 
                 try:
                     chat_data = await _api_get_async(
-                        f"{self.url}/api/chats/{chat_id}",
+                        f"{self.url}/api/v1/chats/{quote(str(chat_id), safe='')}",
                         self.api_key,
                     )
                 except Exception as e:
                     logger.debug("Failed messages for %s: %s", chat_id, e)
                     continue
 
-                # Messages can be in different keys depending on OWUI version
-                messages = (
-                    chat_data.get("messages")
-                    or chat_data.get("history")
-                    or (chat_data.get("chat") or {}).get("messages", [])
+                messages = _extract_chat_messages(chat_data)
+                user_id = (
+                    (chat_data.get("user_id") if isinstance(chat_data, dict) else None)
+                    or (chat.get("user_id") if isinstance(chat, dict) else None)
+                    or ""
                 )
-                if not isinstance(messages, list):
-                    continue
 
                 for msg in messages:
+                    if msg.get("role") == "assistant" and msg.get("done") is False:
+                        continue
                     saved = self.saver.save_message(
                         message=msg,
                         chat_title=chat_title,
                         chat_id=chat_id,
-                        user_id=chat.get("user_id", "") if isinstance(chat, dict) else "",
+                        user_id=user_id,
                     )
                     if saved:
                         total_saved += 1
