@@ -559,6 +559,113 @@ class TestBackupAndStagingRaces:
 import errno as _errno
 
 
+class TestRestoreWritableFsync:
+    """Portable descriptor checks, not a native Windows restore acceptance run."""
+
+    @pytest.fixture
+    def backup_target(self, tmp_path):
+        # Valid legacy SQL isolates handle lifecycle from vec0 serialization (#640).
+        backup = tmp_path / "legacy.db.gz"
+        backup.write_bytes(_gzip.compress(
+            b"CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);"
+            b"INSERT INTO t VALUES (1, 'backup');"
+        ))
+        backup.with_suffix(".gz.json").write_text(json.dumps({
+            "backup_checksum": hashlib.sha256(backup.read_bytes()).hexdigest()[:16],
+        }))
+        target = tmp_path / "target.db"
+        _make_db_simple(target)
+        return backup, target
+
+    def test_helper_writable_nontruncating(self, tmp_path, monkeypatch):
+        path = tmp_path / "existing.db"
+        original = b"existing database bytes\x00\xff"
+        path.write_bytes(original)
+        mode = path.stat().st_mode
+        real_fsync = os.fsync
+        synced = []
+
+        def check(fd):
+            assert os.write(fd, b"") == 0  # real OS rejects read-only fds
+            assert path.read_bytes() == original
+            synced.append(fd)
+            real_fsync(fd)
+
+        monkeypatch.setattr(recovery.os, "fsync", check)
+        recovery._fsync_path(path)
+        assert len(synced) == 1
+        with pytest.raises(OSError) as exc:
+            os.fstat(synced[0])
+        assert exc.value.errno == _errno.EBADF
+        assert path.read_bytes() == original
+        assert path.stat().st_mode == mode
+        with pytest.raises(FileNotFoundError):
+            recovery._fsync_path(tmp_path / "missing.db")
+        assert not (tmp_path / "missing.db").exists()
+
+    @pytest.mark.parametrize("outcome", ["success", "fsync_failure", "rollback"])
+    def test_public_restore_handle_lifecycle(self, backup_target, monkeypatch, outcome):
+        import stat
+
+        backup, target = backup_target
+        original = target.read_bytes()
+        real_fsync, real_replace = os.fsync, os.replace
+        synced, published = [], []
+
+        def assert_closed(fd):
+            with pytest.raises(OSError) as exc:
+                os.fstat(fd)
+            assert exc.value.errno == _errno.EBADF
+
+        def check(fd):
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                return real_fsync(fd)
+            # Let staging pass on base for rollback: RED proves the second caller.
+            if outcome != "rollback" or synced:
+                assert os.write(fd, b"") == 0
+            synced.append((fd, info.st_ino))
+            if outcome == "fsync_failure":
+                raise OSError(_errno.EIO, "injected restore fsync failure")
+            return real_fsync(fd)
+
+        def replace(src, dst):
+            assert len(synced) == 1
+            assert_closed(synced[0][0])
+            assert Path(src).stat().st_ino == synced[0][1]
+            published.append(str(dst))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(recovery.os, "fsync", check)
+        monkeypatch.setattr(recovery.os, "replace", replace)
+        if outcome == "rollback":
+            monkeypatch.setattr(recovery, "verify_integrity", lambda p: False)
+        if outcome == "success":
+            assert recovery.restore_backup(backup, target)["restored"] is True
+            conn = sqlite3.connect(str(target))
+            assert conn.execute("SELECT v FROM t").fetchall() == [("backup",)]
+            conn.close()
+        else:
+            error, message = ((OSError, "injected restore fsync failure")
+                              if outcome == "fsync_failure" else
+                              (RuntimeError, "Post-replace integrity_check failed"))
+            with pytest.raises(error, match=message):
+                recovery.restore_backup(backup, target)
+            assert target.read_bytes() == original
+        assert len(synced) == (2 if outcome == "rollback" else 1)
+        for fd, _ in synced:
+            assert_closed(fd)
+        assert published == ([] if outcome == "fsync_failure" else [str(target)])
+        if outcome == "rollback":
+            assert synced[1][1] == target.stat().st_ino
+            assert target.with_name(target.name + ".restore_preserved").read_bytes() == original
+        assert list(target.parent.glob("*restore_staged*")) == []
+        conn = sqlite3.connect(str(target), timeout=0)
+        conn.execute("BEGIN IMMEDIATE")  # cleanup released the writer lock
+        conn.rollback()
+        conn.close()
+
+
 def _require_write_access_for_fsync(monkeypatch):
     """Make os.fsync refuse descriptors opened without write access, as
     FlushFileBuffers does on Windows. Returns the list of synced inodes."""

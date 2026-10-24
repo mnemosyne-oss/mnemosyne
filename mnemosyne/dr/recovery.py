@@ -383,12 +383,9 @@ def _reacquire_writer_lock(db_path: Path) -> sqlite3.Connection:
 
 
 def _fsync_path(path: Path) -> None:
-    """fsync a file path so the staged bytes reach durable storage."""
-    fd = os.open(str(path), os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    """Sync an existing file through a writable, non-truncating binary handle."""
+    with open(path, "r+b") as handle:
+        _flush_and_fsync(handle)
 
 
 def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
