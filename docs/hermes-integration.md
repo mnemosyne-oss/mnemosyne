@@ -34,7 +34,7 @@ A wrapper's selected side environment is intended to live outside the
 replaceable Hermes runtime. This is a Mnemosyne deployment layout, not a claim
 that Hermes itself enforces or preserves the side environment, plugin
 directory, manifest, preference file, or skill. See
-[Persistent side-venv wrapper mode](#persistent-side-venv-wrapper-mode) for
+[Persistent side-venv wrapper mode](#step-1-install) for
 setup and recovery instructions.
 
 Mnemosyne CI can verify its own path construction, manifest contents, plugin
@@ -81,7 +81,7 @@ symbolic links are privileged operations:
 The three wrapper rows use the same mechanism to keep Mnemosyne independent
 when something outside your control replaces or restricts the Hermes runtime.
 Only the paths differ. See
-[Persistent side-venv wrapper mode](#persistent-side-venv-wrapper-mode) below.
+[Persistent side-venv wrapper mode](#step-1-install) below.
 
 **pip (recommended):**
 
@@ -633,6 +633,94 @@ hermes mnemosyne import --input <backup.json> --dry-run
 ```
 
 This dry run validates the file and reports the import counts using a disposable database clone. It writes neither the active database nor provider audit data. Run the same command without `--dry-run` to perform the side-effecting import.
+
+## Multiple Profiles, Agent Teams, and Group Chats
+
+Mnemosyne is a memory provider. It does not run agents, route messages, or
+decide which agent answers in a chat room. Those are Hermes concerns:
+profiles, the messaging gateway (Telegram, SimpleX, and other platforms), and
+agent dispatch are configured in Hermes. See the
+[Hermes Agent documentation](https://github.com/NousResearch/hermes-agent) for
+profile, gateway, and per-platform setup.
+
+What Mnemosyne controls is where each active provider instance stores and
+looks up memories. These memories live in local SQLite files; Mnemosyne needs
+no external database or network service. Network access happens only for
+configured sync or remote services, and for the one-time download of the local
+embedding model on first use.
+
+| Concern | Owned by | Mnemosyne setting |
+|---|---|---|
+| Hermes profiles, gateway routing, gateway session keys, which agent replies in a room | Hermes | — |
+| Private database path | Mnemosyne | Depends on the provider path; see **Data directory** below |
+| Named bank per profile | Mnemosyne | `memory.mnemosyne.profile_isolation` (default `false`) |
+| Session vs. cross-session visibility inside a bank | Mnemosyne | `memory.mnemosyne.default_scope` (`session` default, or `global`); `cross_session` / `MNEMOSYNE_CROSS_SESSION` (default `false`) removes the session filter on recall |
+| Cross-agent sharing | Mnemosyne | `mnemosyne_shared_*` tools, `shared_surface_path`, `shared_surface_read` |
+
+- **Data directory.** There is no single resolver for every consumer. When
+  Hermes supplies `hermes_home` to the installable provider
+  (`mnemosyne-hermes`), the provider builds an explicit private path under
+  `<hermes_home>/mnemosyne/data/`, so profiles with separate Hermes homes
+  already select separate stores, while profiles that share one home share
+  one store unless `profile_isolation` is enabled and their resolved bank names
+  differ. Without a supplied home, and for the Mnemosyne Core library, CLI, and
+  the root `hermes_memory_provider`, the environment decides:
+  `MNEMOSYNE_DATA_DIR`, else `$HERMES_HOME/mnemosyne/data`, else
+  `~/.hermes/mnemosyne/data`. Run `mnemosyne_diagnose` in each profile to see
+  which database it actually uses.
+- **Bank.** With `profile_isolation: false`, each provider instance uses the
+  `default` bank of its data directory. With `profile_isolation: true`, the
+  provider selects a bank named after the Hermes agent identity or, failing
+  that, the basename of the profile's Hermes home, stored under
+  `data/banks/<name>/mnemosyne.db`. The base home (`~/.hermes`, `hermes`,
+  `default`) still maps to the `default` bank.
+- **Before enabling `profile_isolation`.** Separate profile homes or data
+  directories can already give each profile a separate store, so you may not
+  need it; it matters mainly when several profiles share one Hermes home. Enabling it only selects a different bank: existing memories are
+  **not** migrated from the current bank, so a profile can start with empty
+  memory even though nothing was lost. It is a way to choose a bank, not a
+  general ownership or privacy repair for memories already written.
+- **Session.** When Hermes supplies a gateway session key, the provider uses
+  it as the session; otherwise it uses the Hermes session id. `session`-scoped
+  memories are recalled within that session by default; `global`-scoped
+  memories surface across all sessions of the same bank. This is default
+  recall behavior, not an unconditional boundary: with `cross_session=true`
+  (or `MNEMOSYNE_CROSS_SESSION=1`), recall drops the session filter and can
+  return `session`-scoped memories from other sessions of the same bank, so
+  separate session keys (for example, per participant) do not guarantee
+  isolation under that override.
+- **Shared surface.** A separate database for memories that several profiles
+  are meant to share, written and read through the `mnemosyne_shared_*` tools.
+  `shared_surface_read: true` also merges surface results into
+  `mnemosyne_recall`. The default path differs by provider: the installable
+  provider uses `~/.mnemosyne/data/shared/mnemosyne.db`, while the root
+  `hermes_memory_provider` uses `data/shared/mnemosyne.db` relative to its own
+  code location. Profiles that should share a surface should each set the same
+  absolute `shared_surface_path`.
+
+Two setups are commonly confused:
+
+- **Several people talking to one assistant** (one Hermes profile in a group
+  chat): there is one provider instance and one bank. Gateway session keys
+  come from Hermes: with its default `group_sessions_per_user: true`,
+  non-threaded group chats get a per-participant session key when a
+  participant ID is available, so `session`-scoped memories can be separate
+  per participant within that one bank. Threads, `group_sessions_per_user:
+  false`, or a missing participant ID change the session key. `global`-scoped
+  memories are always shared across the whole bank.
+- **Several profile agents in one room** (an agent team): each agent is its
+  own Hermes profile with its own `memory.provider: mnemosyne` config, and so
+  its own store when the profile homes differ (see **Data directory**). Use
+  `profile_isolation` only if you want named banks, and use the shared surface
+  for what the team should share. Being in the same chat room does not by
+  itself share or separate memory.
+
+Installing or linking one Mnemosyne plugin for several profiles (see
+[Multiple profiles, one side venv](#step-1-install)) shares
+code only. It does not define shared memory; the settings above do. Confirm
+the active provider in each profile with `hermes --profile <name> memory
+status`; the `mnemosyne_diagnose` tool reports that profile's active database
+path and whether profile isolation is enabled.
 
 ## Data Location
 
