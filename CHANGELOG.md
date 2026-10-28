@@ -15,6 +15,9 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 - Clarifies media-hint ownership (#1225), foreign-key diagnostic connection provenance (#1248), and durable-memory guidance (#835).
 - Synchronizes the standalone runtime, package and both manifests at 0.7.7. Core version is unchanged; the catalog pin moves to 0.7.7 after publication.
 
+### Fixed
+- **Hermes prefetch stops injecting operational transcripts, consolidation prompt echoes, and stale canonical task slots, and renders every injected line with its age (#1254).** The provider's row filter is `session_id = ? OR scope = 'global'`, so cron/tick transcripts written by jobs entered every session's context, and consolidation output that merely echoed the model's own instructions was stored and served back as a remembered fact. Prefetch now rejects rows that are themselves log/tick transcripts, rejects prompt-echo boilerplate (meta commentary and instruction echoes), treats canonical `task:progress` slots as historical task state rather than standing facts (bounded freshness, a higher distinctive-token bar, `RECORD` trust tier instead of `CANONICAL`), widens the non-topical function-word set that cannot count as evidence, and renders each injected line with the date it was written. The `## Mnemosyne Context` instruction now states that injected lines are historical records and that a live-system check wins over an injected line; the pinned "read it before calling retrieval tools" and "missing, stale, or insufficient" guidance is preserved unchanged. Multi-token admission is deliberately untouched (open decision in #1137), and the bundled `hermes_memory_provider/` copy is not modified (divergent pipeline, tracked in #655).
+
 ## [4.0.0] - 2026-10-26
 
 ### Fixed

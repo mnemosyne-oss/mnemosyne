@@ -385,8 +385,11 @@ def _build_prompt(memories: List[str], source: str = "") -> str:
         return custom
 
     header = (
-        "Summarize the following memories into 1-3 concise sentences. "
-        "Preserve facts, names, preferences, and decisions. Discard fluff."
+        "Distill the following memories into 1-3 concise sentences of plain fact. "
+        "Preserve names, numbers, dates, decisions, preferences, and outcomes. "
+        "Do not address the reader. Do not describe what you are doing. "
+        "Do not restate these instructions. Do not number the sentences. "
+        "Output only the distilled fact."
     )
     if source:
         header += f" Source: {source}."
@@ -407,8 +410,11 @@ def _build_host_prompt(memories: List[str], source: str = "") -> str:
         return custom
 
     header = (
-        "Summarize the following memories into 1-3 concise sentences. "
-        "Preserve facts, names, preferences, and decisions. Discard fluff."
+        "Distill the following memories into 1-3 concise sentences of plain fact. "
+        "Preserve names, numbers, dates, decisions, preferences, and outcomes. "
+        "Do not address the reader. Do not describe what you are doing. "
+        "Do not restate these instructions. Do not number the sentences. "
+        "Output only the distilled fact."
     )
     if source:
         header += f" Source: {source}."
@@ -531,6 +537,54 @@ def _clean_output(text: str, *, preserve_bullets: bool = False):
     return text.strip()
 
 
+_CONSOLIDATION_META_RE = re.compile(
+    r"^(?:the following (?:memories|text|notes)\b[^\n]*?[.?!:]\s*|the following (?:memories|text|notes)\b|these memories\b|the memories shared\b|"
+    r"memories:\s*|the memorandum\b|memorandum\b|here (?:is|are) (?:a |the )?summary\b|"
+    r"in summary\b|to summarize\b|summary:\s*)",
+    re.IGNORECASE,
+)
+_CONSOLIDATION_ENUM_RE = re.compile(r"^\s*(?:\d{1,2}[.)]|[-*•])\s+")
+
+
+def _sanitize_consolidation_output(text):
+    """Strip prompt echo from consolidation output; None means 'store nothing'.
+
+    Host-model consolidations sometimes open by paraphrasing the instruction
+    ("The following memories are…", "1. Memories: …"). Such preamble must never
+    be persisted as a fact. Bullet lines are preserved: fact extraction relies
+    on them elsewhere, and a bullet that carries a fact is legitimate content.
+    """
+    if not isinstance(text, str):
+        return text
+    cleaned = text.strip()
+    if not cleaned:
+        return ""
+    for _ in range(3):
+        before = cleaned
+        candidate = _CONSOLIDATION_ENUM_RE.sub("", cleaned, count=1)
+        # Strip an enumeration marker only when it introduces prompt echo
+        # ("1. Memories: …"); a bullet/fact line survives untouched.
+        if candidate != cleaned and _CONSOLIDATION_META_RE.match(candidate):
+            cleaned = candidate
+        match = _CONSOLIDATION_META_RE.match(cleaned)
+        if match:
+            remainder = cleaned[match.end():]
+            # Drop only a leading preamble sentence, never a fact that merely
+            # starts with these words and then continues on the same line.
+            if "\n" in remainder or len(remainder.strip()) < 12:
+                cleaned = remainder.lstrip(" :\n\t")
+            elif remainder.strip():
+                cleaned = remainder.strip()
+        cleaned = cleaned.strip()
+        if cleaned == before:
+            break
+    if not cleaned:
+        return ""
+    if _CONSOLIDATION_META_RE.match(cleaned) and len(cleaned) < 40:
+        return ""
+    return cleaned
+
+
 def _estimate_tokens(text: str) -> int:
     """Rough token count: ~4 chars per token for English, with safety margin."""
     return max(1, len(text) // 4)
@@ -568,8 +622,11 @@ def chunk_memories_by_budget(memories: List[str], source: str = "") -> List[List
     current_tokens = 0
 
     header = (
-        "Summarize the following memories into 1-3 concise sentences. "
-        "Preserve facts, names, preferences, and decisions. Discard fluff."
+        "Distill the following memories into 1-3 concise sentences of plain fact. "
+        "Preserve names, numbers, dates, decisions, preferences, and outcomes. "
+        "Do not address the reader. Do not describe what you are doing. "
+        "Do not restate these instructions. Do not number the sentences. "
+        "Output only the distilled fact."
     )
     if source:
         header += f" Source: {source}."
@@ -890,13 +947,13 @@ def _summarize_memories(
             if _is_invalid_reasoning_output(text):
                 return _INVALID_REASONING_OUTPUT
             if text:
-                return text
+                return _sanitize_consolidation_output(text)
             raw = _call_local_llm(prompt)
             if raw:
                 cleaned = _clean_output(raw)
                 if _is_invalid_reasoning_output(cleaned):
                     return _INVALID_REASONING_OUTPUT
-                return cleaned if cleaned else None
+                return cleaned if isinstance(cleaned, str) and cleaned.strip() else None
             return None
 
         # 1. Remote API (skip if MNEMOSYNE_FORCE_LOCAL=1 or remote call fails).
@@ -906,7 +963,9 @@ def _summarize_memories(
                 cleaned = _clean_output(raw, preserve_bullets=True)
                 if _is_invalid_reasoning_output(cleaned):
                     return _INVALID_REASONING_OUTPUT
-                return cleaned if cleaned else None
+                if not isinstance(cleaned, str) or not cleaned.strip():
+                    return None
+                return _sanitize_consolidation_output(cleaned)
 
         # 2. Local LLM (llama-cpp-python or ctransformers fallback).
         raw = _call_local_llm(prompt)
@@ -914,7 +973,9 @@ def _summarize_memories(
             cleaned = _clean_output(raw)
             if _is_invalid_reasoning_output(cleaned):
                 return _INVALID_REASONING_OUTPUT
-            return cleaned if cleaned else None
+            if not isinstance(cleaned, str) or not cleaned.strip():
+                return None
+            return _sanitize_consolidation_output(cleaned)
         return None
 
     # Summarize each chunk individually.

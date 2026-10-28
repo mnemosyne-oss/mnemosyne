@@ -391,6 +391,11 @@ _PREFETCH_FRAGMENT_STOPWORDS = frozenset({
 _PREFETCH_RAW_PREFIXES = ("[USER]", "[ASSISTANT]", "[IDENTITY]")
 _PREFETCH_EXCLUDED_PREFIXES = ("[ASSISTANT]",)
 _PREFETCH_RAW_SOURCES = {"conversation"}
+# [2] Canonical task-progress slots are historical progress reports, not
+# current state. They need fresher dates and stronger lexical evidence than
+# other canonical categories before being silently injected.
+_PREFETCH_CANONICAL_HISTORICAL_CATEGORIES = frozenset({"task:progress"})
+_PREFETCH_CANONICAL_HISTORICAL_MAX_AGE_DAYS = 3
 _PREFETCH_DISTILLED_SOURCES = {
     "preference", "correction", "fact", "identity", "insight", "sleep_consolidation",
 }
@@ -399,6 +404,20 @@ _PREFETCH_DEDUP_STOPWORDS = _PREFETCH_FRAGMENT_STOPWORDS | frozenset({
     "about", "after", "before", "because", "could", "from", "have", "into",
     "like", "more", "need", "needs", "than", "them", "they", "want", "wants",
     "when", "where", "which", "while", "would", "yourself",
+}) | frozenset({
+    "was", "were", "did", "does", "doing", "done", "this", "that", "these",
+    "those", "there", "here", "any", "some", "all", "just", "still", "again",
+    "then", "now", "today", "tonight", "yesterday", "last", "next", "ever",
+    "never", "got", "get", "make", "made", "take", "took", "give", "gave",
+    "said", "says", "tell", "told", "think", "thought", "know", "known",
+    "see", "seen", "look", "looking", "come", "came", "going", "went",
+    "back", "over", "under", "off", "out", "up", "down", "very", "too",
+    "also", "only", "even", "much", "many", "most", "less", "least", "one",
+    "two", "three", "first", "second", "time", "times", "day", "days",
+    "week", "weeks", "month", "months", "year", "years", "thing", "things",
+    "stuff", "way", "lot", "bit", "sure", "please", "thanks", "thank",
+    "can", "should", "shall", "will", "may", "might", "must", "am",
+    "been", "being", "has", "had", "having",
 })
 
 
@@ -470,7 +489,17 @@ _PREFETCH_LEXICAL_GENERIC_TOKENS = {
 # deployments can replace this list with
 # MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS or extend the effective list with
 # MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS.
-_PREFETCH_CANONICAL_GENERIC_TOKEN_DEFAULTS = set(_PREFETCH_LEXICAL_GENERIC_TOKENS)
+# Generic nouns carry no topical evidence on their own. Rarity inside the
+# canonical surface is not evidence either: with a few dozen slots every word
+# looks rare, so "number" once pulled a salary slot into a query about a port.
+_PREFETCH_CANONICAL_GENERIC_NOUNS = {
+    "number", "numbers", "name", "names", "email", "emails", "address", "addresses",
+    "date", "dates", "time", "times", "price", "prices", "size", "sizes", "value",
+    "values", "count", "status", "level", "version", "path", "url", "id", "file",
+    "line", "code", "type", "mode", "info", "details", "data", "setting", "settings",
+    "answer", "question", "thing", "things", "stuff", "lot", "bit", "way", "case",
+}
+_PREFETCH_CANONICAL_GENERIC_TOKEN_DEFAULTS = set(_PREFETCH_LEXICAL_GENERIC_TOKENS) | _PREFETCH_CANONICAL_GENERIC_NOUNS
 
 # Explicit recall keeps the pre-hardening default generic-token contract while
 # continuing to honor the established canonical replacement variable. The new
@@ -499,6 +528,83 @@ def _canonical_recall_generic_tokens() -> Set[str]:
         "MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS",
         _CANONICAL_RECALL_GENERIC_TOKENS,
     )
+
+
+# [4] Operational cron rows write scope='global', so the session filter lets
+# them into automatic injection. These markers identify tick logs and digests
+# that must stay reachable via explicit mnemosyne_recall only.
+_PREFETCH_OPERATIONAL_SUBSTRINGS = (
+    "ibkr challenge",
+    "monitor tick",
+    "monitor run",
+    "[home assistant] [home assistant]",
+    "cronjob response",
+    "[important: you are running as a scheduled cron job",
+)
+_PREFETCH_OPERATIONAL_PREFIXES = (
+    "health feed",
+    "health export",
+    "nightly introspection",
+    "xi/memory",
+    "trump truth social",
+)
+
+
+def _is_operational_log(content: str) -> bool:
+    """True for cron/monitor tick rows that must never be silently injected."""
+    head = " ".join(str(content or "").strip().lower().split())[:200]
+    if not head:
+        return False
+    if head.startswith(_PREFETCH_OPERATIONAL_PREFIXES):
+        return True
+    return any(marker in head for marker in _PREFETCH_OPERATIONAL_SUBSTRINGS)
+
+
+# Consolidation output from the host LLM sometimes persists the model's own
+# prompt echo ("The following memories are…", "1. Memories: …"). 964 such rows
+# exist in the live DB; none of them is a fact. They stay reachable through
+# explicit recall, never through silent injection.
+_PREFETCH_ECHO_PREFIX_RE = re.compile(
+    r"^(?:\d{1,2}[.)]\s*)?(?:"
+    r"the following (?:memories|text|notes|conversations?|memorable)\b|these memories\b|the memories shared\b|"
+    r"memories:\s|the memorandum\b|memorandum\b|here (?:is|are) (?:a |the )?summary\b|"
+    r"summary:\s|a concise summary\b|summari[sz]es? the (?:conversation|memories)\b|"
+    r"in summary\b|to summarize\b|"
+    # Instruction echoes: the model answering the consolidation prompt back.
+    # An imperative directed at the assistant about the conversation/memories
+    # is never a memory of a fact, whatever verb it opens with.
+    r"(?:review|update|memorize|preserve|distill|summari[sz]e|maintain|store|keep|"
+    r"write|record|remember|output|note|track|capture|extract|consolidate|merge|"
+    r"produce|generate|return|respond|reply|answer|list|identify)\b"
+    r".{0,80}\b(?:conversations?|memories|memory|facts?|names?|preferences|decisions?|"
+    r"skill library|summar(?:y|ies)|context|sentences?|transcript|dialogue)\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_prompt_echo(content: str) -> bool:
+    """True for rows that stored the consolidation model's instruction echo."""
+    head = " ".join(str(content or "").strip().split())
+    if not head:
+        return False
+    return bool(_PREFETCH_ECHO_PREFIX_RE.match(head))
+
+
+def _prefetch_age_label(timestamp: str) -> str:
+    """Human age of a memory row: 'today', '3d old', '47d old', or ''."""
+    raw = str(timestamp or "").strip()
+    if not raw:
+        return ""
+    try:
+        when = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    now = datetime.now(when.tzinfo) if when.tzinfo else datetime.now()
+    days = (now - when).days
+    if days <= 0:
+        return "today"
+    return f"{days}d old"
 
 
 def _is_low_quality_prefetch(content: str) -> bool:
@@ -905,8 +1011,34 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
     rare_document_frequency = _prefetch_canonical_rare_token_max_frequency()
     minimum_overlap = _prefetch_min_distinctive_tokens()
     minimum_coverage = _prefetch_min_query_coverage()
+    now = datetime.now(timezone.utc)
     candidates: List[Dict[str, Any]] = []
     for row, body, row_tokens in tokenized_rows:
+        is_historical = str(row.get("category") or "") in _PREFETCH_CANONICAL_HISTORICAL_CATEGORIES
+        if is_historical:
+            # task:progress slots are historical records, not current state.
+            # Expired slots are never injected; unexpired ones must be fresh.
+            expiry_raw = str(row.get("valid_until") or "").strip()
+            if expiry_raw:
+                try:
+                    expiry = datetime.fromisoformat(expiry_raw.replace("Z", "+00:00"))
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=timezone.utc)
+                    if expiry < now:
+                        continue
+                except ValueError:
+                    pass
+            stamp_raw = str(row.get("valid_from") or row.get("created_at") or "").strip()
+            try:
+                stamp = datetime.fromisoformat(stamp_raw.replace("Z", "+00:00"))
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=timezone.utc)
+                if now - stamp > timedelta(days=_PREFETCH_CANONICAL_HISTORICAL_MAX_AGE_DAYS):
+                    continue
+            except ValueError:
+                # No usable date: a historical row without a parseable
+                # timestamp is NOT current, so it is not injected.
+                continue
         overlap = query_tokens & row_tokens
         distinctive_overlap = overlap - generic_tokens
         if not distinctive_overlap:
@@ -925,7 +1057,7 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
         whole_body_unit = _canonical_whole_body_unit(
             body, query_tokens, cjk_ngram_size=cjk_ngram_size
         )
-        if len(distinctive_overlap) == 1:
+        if len(distinctive_overlap) == 1 and not is_historical:
             only_token = next(iter(distinctive_overlap))
             # A whole-body unit answers the query by itself, so the coverage bar
             # does not apply; the rarity guard still does, because this path is
@@ -938,15 +1070,17 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
         elif len(distinctive_overlap) < minimum_overlap:
             continue
         score = min(1.0, 0.72 + coverage * 0.24 + min(len(overlap), 3) * 0.03)
+        historical_importance = 0.55 if is_historical else 0.95
+        historical_trust = "RECORD" if is_historical else "CANONICAL"
         candidates.append({
             "content": body,
             "source": f"canonical:{row.get('category') or 'fact'}",
             "timestamp": row.get("valid_from") or row.get("created_at") or "",
-            "importance": 0.95,
+            "importance": historical_importance,
             "score": score,
             "keyword_score": max(0.35, coverage),
             "fact_match": True,
-            "trust_tier": "CANONICAL",
+            "trust_tier": historical_trust,
             "tier": "canonical",
             "canonical_category": row.get("category"),
             "canonical_name": row.get("name"),
@@ -2813,10 +2947,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "mnemosyne_shared_* only for compact cross-agent stable metadata, never raw conversation.\n"
                 "Prefer compact, declarative, non-imperative memories. Do not save one-off task progress.\n"
                 "\n"
-                "When a `## Mnemosyne Context` block is injected into the current turn, "
-                "read it before calling retrieval tools. If it answers the user's question, "
-                "answer directly. Use session_search only when the injected Mnemosyne "
-                "context is missing, stale, or insufficient."
+                "When a `## Mnemosyne Context` block is injected, read it before "
+                "calling retrieval tools; treat every line "
+                "in it as a historical record stamped with the date it was written, "
+                "not as current state. Quote that date when you use it. For any "
+                "question about the present state of something (open or closed, "
+                "working or broken, done or pending, current price, current config), "
+                "check the live system with a tool and let the tool win; if an "
+                "injected line disagrees with the tool, say the memory is stale. "
+                "When the block is missing, stale, or insufficient, use "
+                "session_search or mnemosyne_recall before asking the user to "
+                "repeat context. Never present an injected line as something "
+                "you verified."
             )
             return self._with_persona_block(base)
         # C27: when init failed (as opposed to a deliberate skip-context),
@@ -2911,6 +3053,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # stronger topical signal than distilled facts/preferences.
             filtered = []
             for r in results:
+                # Operational cron rows and foreign raw transcripts stay
+                # reachable via explicit mnemosyne_recall; they are never
+                # silently injected into the prompt.
+                if _is_operational_log(r.get("content", "")):
+                    continue
+                if _is_prompt_echo(r.get("content", "")):
+                    continue
+                if str(r.get("scope") or "") == "global" and str(r.get("source") or "") in _PREFETCH_RAW_SOURCES:
+                    continue
                 if _is_low_quality_prefetch(r.get("content", "")):
                     continue
                 if _prefetch_source_quality(r) <= 0:
@@ -2953,6 +3104,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 )
                 content = " ".join(content.split())
                 ts = r.get("timestamp", "")[:16] if r.get("timestamp") else ""
+                _age = _prefetch_age_label(r.get("timestamp", ""))
+                _age_suffix = f" · {_age}" if _age else ""
                 imp = r.get("importance", 0.0)
                 trust = r.get("trust_tier", "STATED")
                 trust_tag = f" [{trust}]" if trust != "STATED" else ""
@@ -2965,7 +3118,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     # from — contamination is otherwise undetectable by the victim.
                     _home = str(getattr(self._beam, "db_path", "") or "?")
                     prov = f" [owner={r.get('canonical_owner') or '?'} home={_home}]"
-                lines.append(f"  [{ts}] (importance {imp:.2f}{source_tag}){trust_tag}{prov} {content}")
+                lines.append(f"  [{ts[:10]}{_age_suffix}] (importance {imp:.2f}{source_tag}){trust_tag}{prov} {content}")
             return "\n".join(lines)
         except Exception as e:
             logger.debug("Mnemosyne prefetch failed: %s", e)

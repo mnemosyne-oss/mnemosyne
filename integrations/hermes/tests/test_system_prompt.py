@@ -37,9 +37,13 @@ def test_system_prompt_tells_agent_to_read_mnemosyne_context_first():
 
     assert "## Mnemosyne Context" in block
     assert "read it before calling retrieval tools" in block
-    assert "answer directly" in block
     assert "session_search" in block
     assert "missing, stale, or insufficient" in block
+    # C6 prefetch-relevance hardening: injected lines are historical records,
+    # and live-system checks win over any injected line.
+    assert "historical record" in block
+    assert "let the tool win" in block
+    assert "check the live system with a tool" in block
 
 
 def test_system_prompt_keeps_always_injected_memory_files_as_a_tier():
@@ -83,3 +87,4 @@ def test_bundled_override_skill_requires_conscious_user_selection():
     assert "Only when the user has explicitly selected the strict Mnemosyne-only memory" in frontmatter
     assert "## Activation and precedence" in skill
     assert "Under the default, small standing rules\nand context anchors stay in the always-injected tier" in skill
+
