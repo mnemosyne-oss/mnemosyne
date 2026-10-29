@@ -307,3 +307,59 @@ def test_default_dedup_keeps_existing_containment_behavior(canonical):
     assert _semantic_dedup_prefetch([shorter, longer]) == [shorter]
     if not canonical:
         assert _semantic_dedup_prefetch([shorter, longer], preserve_canonical_extensions=True) == [shorter]
+
+
+@pytest.mark.parametrize(("coverage", "expected_prefix"), [("0.30", "common"), ("0.40", "rare")])
+def test_canonical_priority_is_applied_before_candidate_limit(store, monkeypatch, coverage, expected_prefix):
+    monkeypatch.setenv("MNEMOSYNE_PREFETCH_MIN_QUERY_COVERAGE", coverage)
+    seed(store, [(f"rare{i}", f"Vaultwarden Passwort credential{i}") for i in range(3)])
+    seed(store, [(f"common{i}", f"deployment pipeline worker workload{i}") for i in range(7)])
+    query = "Vaultwarden Passwort deployment pipeline worker recovery archive backup export offline"
+    all_rows = _canonical_prefetch_rows(store, "default", query, limit=10)
+    by_name = {row["canonical_name"]: row for row in all_rows}
+    assert by_name["rare0"]["score"] > by_name["common0"]["score"]
+
+    selected = _canonical_prefetch_rows(store, "default", query)
+
+    assert len(selected) == 3
+    assert all(row["canonical_name"].startswith(expected_prefix) for row in selected)
+
+
+def test_rendered_prefetch_keeps_qualifying_facts_before_candidate_limit(tmp_path):
+    provider = MnemosyneMemoryProvider()
+    provider.initialize("canonical-limit", hermes_home=str(tmp_path), agent_identity="default", profile_isolation=False)
+    try:
+        assert provider._beam is not None
+        canonical = CanonicalStore(db_path=provider._beam.db_path, conn=provider._beam.conn)
+        provider._beam.canonical = canonical
+        seed(canonical, [(f"rare{i}", f"Vaultwarden Passwort credential{i}") for i in range(3)])
+        seed(canonical, [(f"common{i}", f"deployment pipeline worker workload{i}") for i in range(7)])
+
+        block = provider.prefetch("Vaultwarden Passwort deployment pipeline worker recovery archive backup export offline")
+
+        assert "deployment pipeline worker" in block
+        assert "[CANONICAL]" in block
+    finally:
+        provider.shutdown()
+
+
+def test_generic_overlap_cannot_admit_a_weak_single_token_fact(store):
+    seed(store, [("photos", "muss neue Fotos sichern")])
+
+    assert names(store, "muss neue Vaultwarden Passwörter Backup Export sichern") == []
+
+
+def test_rendered_prefetch_omits_single_token_fact_admitted_only_by_generic_overlap(tmp_path):
+    provider = MnemosyneMemoryProvider()
+    provider.initialize("canonical-singleton", hermes_home=str(tmp_path), agent_identity="default", profile_isolation=False)
+    try:
+        assert provider._beam is not None
+        canonical = CanonicalStore(db_path=provider._beam.db_path, conn=provider._beam.conn)
+        provider._beam.canonical = canonical
+        seed(canonical, [("photos", "muss neue Fotos sichern")])
+
+        block = provider.prefetch("muss neue Vaultwarden Passwörter Backup Export sichern")
+
+        assert block == ""
+    finally:
+        provider.shutdown()

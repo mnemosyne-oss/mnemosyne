@@ -887,11 +887,12 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
     requires rarity and query coverage, except for a matching whole-body unit.
     Multi-token admission follows the configured overlap minimum.
 
-    Rank admitted rows by owner-local IDF-weighted query coverage and return at
-    most ``limit`` rows. The private priority flag uses unweighted distinctive
-    coverage: only rows meeting the configured coverage floor precede ordinary
-    memories in provider prefetch. Weaker admitted rows compete by adjusted
-    score. No LLM, embedding lookup, or other owner's corpus is used here.
+    Apply priority before returning at most ``limit`` rows, ranking within
+    each group by owner-local IDF-weighted query coverage. The private priority
+    flag uses unweighted distinctive coverage: only rows meeting the configured
+    coverage floor precede ordinary memories in provider prefetch. Weaker
+    admitted rows compete by adjusted score. No LLM, embedding lookup, or other
+    owner's corpus is used here.
     """
     cjk_ngram_size = _canonical_cjk_ngram_size(query)
     query_tokens = _canonical_match_tokens(query, cjk_ngram_size=cjk_ngram_size)
@@ -951,7 +952,6 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
         # One distinctive token can be enough for canonical slots such as
         # profile URLs; broad queries need a little more coverage. Generic
         # owner/system words do not count toward the minimum overlap.
-        coverage = len(overlap) / max(len(query_tokens), 1)
         distinctive_coverage = len(distinctive_overlap) / max(len(query_tokens - generic_tokens), 1)
         whole_body_unit = _canonical_whole_body_unit(
             body, query_tokens, cjk_ngram_size=cjk_ngram_size
@@ -962,7 +962,7 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
             # does not apply; the rarity guard still does, because this path is
             # injected into every prompt.
             if (
-                max(coverage, distinctive_coverage) < minimum_coverage
+                distinctive_coverage < minimum_coverage
                 and not whole_body_unit
             ) or token_document_frequency.get(only_token, 0) > rare_document_frequency:
                 continue
@@ -994,7 +994,12 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
             r for r in candidates
             if int(r.get("_prefetch_overlap_count") or 0) >= minimum_overlap
         ]
-    candidates.sort(key=lambda r: (float(r.get("score") or 0.0), float(r.get("keyword_score") or 0.0)), reverse=True)
+    # Apply the same priority boundary before limiting as the provider does
+    # before merging; otherwise stronger-priority rows can never reach it.
+    candidates.sort(
+        key=lambda r: (r["_prefetch_canonical_priority"], float(r.get("score") or 0.0), float(r.get("keyword_score") or 0.0)),
+        reverse=True,
+    )
     for candidate in candidates:
         candidate.pop("_prefetch_overlap_count", None)
     return candidates[:limit]
