@@ -213,3 +213,40 @@ def test_rendered_context_omits_function_word_rule(tmp_path):
         assert "Board" not in block
     finally:
         provider.shutdown()
+
+
+@pytest.mark.parametrize("ordinary_body", [
+    "Vaultwarden Passwort sichern deployment pipeline worker backup archive veraltet",
+    "Vaultwarden Passwort sichern export recovery server account device offline",
+])
+def test_rendered_context_prioritizes_canonical_over_high_scoring_preference(tmp_path, monkeypatch, ordinary_body):
+    # Supported scoring configuration makes the real working-memory result
+    # outrank a canonical full match under the old blended sort.
+    monkeypatch.setenv("MNEMOSYNE_VEC_WEIGHT", "0.2")
+    monkeypatch.setenv("MNEMOSYNE_FTS_WEIGHT", "0.2")
+    monkeypatch.setenv("MNEMOSYNE_IMPORTANCE_WEIGHT", "0.6")
+    provider = MnemosyneMemoryProvider()
+    provider.initialize("canonical-priority", hermes_home=str(tmp_path), agent_identity="default", profile_isolation=False)
+    try:
+        assert provider._beam is not None
+        canonical = CanonicalStore(db_path=provider._beam.db_path, conn=provider._beam.conn)
+        provider._beam.canonical = canonical
+        canonical_body = "Vaultwarden Passwort sichern deployment pipeline worker backup archive aktuell"
+        weaker_body = "Vaultwarden sichern lokal verschlüsselt sicher aufbewahren Tresor Zugang"
+        seed(canonical, [("a_weaker", weaker_body), ("z_password", canonical_body)])
+        assert provider._beam.remember(ordinary_body, source="preference", importance=0.95, scope="global")
+
+        block = provider.prefetch("Vaultwarden Passwort sichern")
+
+        assert canonical_body in block
+        assert weaker_body in block
+        assert block.index(canonical_body) < block.index(weaker_body)
+        assert "[CANONICAL]" in block
+        assert "[owner=default home=" in block
+        if "veraltet" in ordinary_body:
+            assert ordinary_body not in block
+        else:
+            assert ordinary_body in block
+            assert block.index(canonical_body) < block.index(ordinary_body)
+    finally:
+        provider.shutdown()

@@ -2951,7 +2951,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
             if canonical_rows:
                 filtered.extend(canonical_rows)
-            filtered.sort(key=_prefetch_adjusted_score, reverse=True)
+            # Preserve canonical provenance when a similar ordinary memory
+            # would otherwise win the blended score and remove it in dedup.
+            filtered.sort(
+                key=lambda row: (row.get("trust_tier") == "CANONICAL", _prefetch_adjusted_score(row)),
+                reverse=True,
+            )
             filtered = _semantic_dedup_prefetch(filtered)[:_PREFETCH_TOP_K]
             if not filtered:
                 return ""
