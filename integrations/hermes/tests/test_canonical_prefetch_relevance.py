@@ -9,6 +9,7 @@ from mnemosyne_hermes import (
     _canonical_prefetch_rows,
     _canonical_recall_rows,
     _prefetch_has_distinctive_lexical_evidence,
+    _semantic_dedup_prefetch,
 )
 
 
@@ -250,3 +251,59 @@ def test_rendered_context_prioritizes_canonical_over_high_scoring_preference(tmp
             assert block.index(canonical_body) < block.index(ordinary_body)
     finally:
         provider.shutdown()
+
+
+@pytest.mark.parametrize(("coverage", "canonical_first"), [("0.30", False), ("0.15", True)])
+def test_prefetch_canonical_priority_requires_configured_query_coverage(tmp_path, monkeypatch, coverage, canonical_first):
+    monkeypatch.setenv("MNEMOSYNE_PREFETCH_MIN_QUERY_COVERAGE", coverage)
+    provider = MnemosyneMemoryProvider()
+    provider.initialize("canonical-coverage", hermes_home=str(tmp_path), agent_identity="default", profile_isolation=False)
+    try:
+        assert provider._beam is not None
+        canonical = CanonicalStore(db_path=provider._beam.db_path, conn=provider._beam.conn)
+        provider._beam.canonical = canonical
+        bodies = ["Vaultwarden Passwort Tresorregel", "deployment pipeline Baustufe", "archive backup Archivregel"]
+        seed(canonical, [(str(i), body) for i, body in enumerate(bodies)])
+        ordinary_body = "Vaultwarden Passwort deployment pipeline worker recovery archive backup export offline"
+        assert provider._beam.remember(ordinary_body, source="preference", importance=0.95, scope="global")
+
+        block = provider.prefetch(ordinary_body)
+
+        assert ordinary_body in block
+        assert all(body in block for body in bodies)
+        if canonical_first:
+            assert all(block.index(body) < block.index(ordinary_body) for body in bodies)
+        else:
+            assert all(block.index(ordinary_body) < block.index(body) for body in bodies)
+    finally:
+        provider.shutdown()
+
+
+def test_prefetch_retains_ordinary_recovery_instructions_containing_canonical_fact(tmp_path):
+    provider = MnemosyneMemoryProvider()
+    provider.initialize("canonical-extension", hermes_home=str(tmp_path), agent_identity="default", profile_isolation=False)
+    try:
+        assert provider._beam is not None
+        canonical = CanonicalStore(db_path=provider._beam.db_path, conn=provider._beam.conn)
+        provider._beam.canonical = canonical
+        seed(canonical, [("password", "Vaultwarden Passwort sichern")])
+        ordinary_body = "Vaultwarden Passwort sichern recovery code offline export encrypted backup restore"
+        assert provider._beam.remember(ordinary_body, source="preference", importance=0.95, scope="global")
+
+        block = provider.prefetch("Vaultwarden Passwort sichern")
+
+        assert "[CANONICAL]" in block
+        assert ordinary_body in block
+        assert block.index("[CANONICAL]") < block.index(ordinary_body)
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize("canonical", [False, True])
+def test_default_dedup_keeps_existing_containment_behavior(canonical):
+    shorter = {"content": "Vaultwarden Passwort sichern", "trust_tier": "CANONICAL" if canonical else "STATED"}
+    longer = {"content": "Vaultwarden Passwort sichern recovery code offline export encrypted backup restore"}
+
+    assert _semantic_dedup_prefetch([shorter, longer]) == [shorter]
+    if not canonical:
+        assert _semantic_dedup_prefetch([shorter, longer], preserve_canonical_extensions=True) == [shorter]

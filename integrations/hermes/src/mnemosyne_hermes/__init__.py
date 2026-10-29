@@ -977,6 +977,7 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
             "canonical_name": row.get("name"),
             "canonical_owner": row.get("owner_id"),
             "_prefetch_overlap_count": len(distinctive_overlap),
+            "_prefetch_canonical_priority": distinctive_coverage >= minimum_coverage,
         })
     # When one fact has materially stronger lexical evidence, do not let
     # weaker one-token candidates ride alongside it merely because their lone
@@ -1075,7 +1076,9 @@ def _sanitize_prefetch_query(query: str) -> str:
     return sanitize_prefetch_query(query)
 
 
-def _semantic_dedup_prefetch(rows: List[Dict[str, Any]], threshold: float = 0.72) -> List[Dict[str, Any]]:
+def _semantic_dedup_prefetch(
+    rows: List[Dict[str, Any]], threshold: float = 0.72, *, preserve_canonical_extensions: bool = False,
+) -> List[Dict[str, Any]]:
     kept: List[Dict[str, Any]] = []
     kept_tokens: List[Set[str]] = []
     for row in rows:
@@ -1083,12 +1086,21 @@ def _semantic_dedup_prefetch(rows: List[Dict[str, Any]], threshold: float = 0.72
         if not tokens:
             continue
         duplicate = False
-        for existing in kept_tokens:
+        for kept_row, existing in zip(kept, kept_tokens):
             overlap = len(tokens & existing)
             if not overlap:
                 continue
             jaccard = overlap / max(len(tokens | existing), 1)
             containment = overlap / max(min(len(tokens), len(existing)), 1)
+            if (
+                preserve_canonical_extensions
+                and kept_row.get("trust_tier") == "CANONICAL"
+                and row.get("trust_tier") != "CANONICAL"
+            ):
+                # A short canonical fact does not make a longer ordinary
+                # instruction redundant. Require coverage of the incoming
+                # row; exact/near duplicates and shorter subsets still drop.
+                containment = overlap / max(len(tokens), 1)
             if jaccard >= threshold or containment >= 0.86:
                 duplicate = True
                 break
@@ -2951,13 +2963,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
             if canonical_rows:
                 filtered.extend(canonical_rows)
-            # Preserve canonical provenance when a similar ordinary memory
-            # would otherwise win the blended score and remove it in dedup.
+            # Prioritize sufficiently covered canonical facts, preserving their
+            # provenance through dedup. Weak admitted facts compete by score.
             filtered.sort(
-                key=lambda row: (row.get("trust_tier") == "CANONICAL", _prefetch_adjusted_score(row)),
+                key=lambda row: (row.get("_prefetch_canonical_priority", False), _prefetch_adjusted_score(row)),
                 reverse=True,
             )
-            filtered = _semantic_dedup_prefetch(filtered)[:_PREFETCH_TOP_K]
+            filtered = _semantic_dedup_prefetch(filtered, preserve_canonical_extensions=True)[:_PREFETCH_TOP_K]
             if not filtered:
                 return ""
             lines = ["## Mnemosyne Context"]
