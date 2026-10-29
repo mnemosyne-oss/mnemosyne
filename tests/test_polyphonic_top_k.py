@@ -1,8 +1,8 @@
 """Polyphonic recall must return min(top_k, eligible) results, never fewer.
 
 Grid: tier (working, episodic) x top_k (at or under the old per-voice cap of
-20, over it, and over the point where the removed metadata-sized context budget
-cut the engine's 2x over-fetch below top_k).
+20, over it, over the point where the removed metadata-sized context budget
+cut the engine's 2x over-fetch below top_k, and over the eligible count).
 """
 import numpy as np
 import pytest
@@ -45,10 +45,11 @@ def _seed_episodic(beam):
 
 @pytest.mark.parametrize("seed,tier", [(_seed_working, "working"), (_seed_episodic, "episodic")],
                          ids=["working", "episodic"])
-@pytest.mark.parametrize("top_k", [10, 20, 50, 80])
+@pytest.mark.parametrize("top_k", [10, 20, 50, 80, 150])
 def test_polyphonic_recall_returns_full_top_k(beam, seed, tier, top_k):
     seed(beam)
     results = beam.recall("unrelated opaque query", top_k=top_k)
-    assert len(results) == top_k
-    assert len({r["id"] for r in results}) == top_k
+    expected = min(top_k, ELIGIBLE)
+    assert len(results) == expected
+    assert len({r["id"] for r in results}) == expected
     assert {r["tier"] for r in results} == {tier}
