@@ -53,3 +53,46 @@ def test_polyphonic_recall_returns_full_top_k(beam, seed, tier, top_k):
     assert len(results) == expected
     assert len({r["id"] for r in results}) == expected
     assert {r["tier"] for r in results} == {tier}
+
+
+def _reference_diversity_rerank(results, top_k):
+    # The pairwise word-Jaccard selection as first written, kept as the oracle
+    # for the precomputed-word-set version.
+    def similarity(a, b):
+        words_a = (a.content or a.metadata.get("content") or "").lower().split()
+        words_b = (b.content or b.metadata.get("content") or "").lower().split()
+        if not words_a or not words_b:
+            return 0.0
+        set_a, set_b = set(words_a), set(words_b)
+        return len(set_a & set_b) / len(set_a | set_b)
+
+    selected = []
+    for result in sorted(results.values(), key=lambda x: x.combined_score, reverse=True):
+        if len(selected) >= top_k:
+            break
+        if all(similarity(result, sel) <= 0.8 for sel in selected):
+            selected.append(result)
+    return selected
+
+
+@pytest.mark.parametrize("seed", range(50))
+def test_diversity_rerank_matches_reference(seed):
+    import random
+
+    from mnemosyne.core.polyphonic_recall import PolyphonicRecallEngine, PolyphonicResult
+
+    rng = random.Random(seed)
+    # A small vocabulary makes near-duplicates (Jaccard > 0.8) common.
+    vocab = [f"w{i}" for i in range(8)]
+    results = {}
+    for i in range(rng.randint(0, 120)):
+        words = rng.sample(vocab, rng.randint(0, 6))
+        content = " ".join(words) if rng.random() < 0.8 else ""
+        meta = {} if content or rng.random() < 0.5 else {"content": " ".join(words).upper()}
+        results[f"m{i}"] = PolyphonicResult(memory_id=f"m{i}", combined_score=rng.random(),
+                                            voice_scores={}, metadata=meta, content=content)
+    top_k = rng.randint(1, 100)
+    engine = PolyphonicRecallEngine.__new__(PolyphonicRecallEngine)
+    got = [r.memory_id for r in engine._diversity_rerank(results, top_k)]
+    want = [r.memory_id for r in _reference_diversity_rerank(results, top_k)]
+    assert got == want

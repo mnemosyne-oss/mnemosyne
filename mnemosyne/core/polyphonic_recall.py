@@ -1134,20 +1134,24 @@ class PolyphonicRecallEngine:
         )
         
         selected = []
+        # Word sets are built once per selected result: rebuilding them for
+        # every pair made this loop dominate recall at large top_k.
+        selected_words = []
         for result in sorted_results:
             if len(selected) >= top_k:
                 break
             
             # Check diversity against selected
+            words = self._content_words(result)
             is_diverse = True
-            for sel in selected:
-                similarity = self._estimate_similarity(result, sel)
-                if similarity > 0.8:  # Too similar
+            for sel_words in selected_words:
+                if self._jaccard(words, sel_words) > 0.8:  # Too similar
                     is_diverse = False
                     break
             
             if is_diverse:
                 selected.append(result)
+                selected_words.append(words)
         
         return selected
     
@@ -1159,18 +1163,17 @@ class PolyphonicRecallEngine:
         dominates the candidate set, causing MMR diversity reranking to
         discard all but one result (#389).
         """
-        content_a = (a.content or a.metadata.get("content") or "").lower().split()
-        content_b = (b.content or b.metadata.get("content") or "").lower().split()
+        return self._jaccard(self._content_words(a), self._content_words(b))
 
-        if not content_a or not content_b:
+    @staticmethod
+    def _content_words(result: PolyphonicResult) -> Set[str]:
+        return set((result.content or result.metadata.get("content") or "").lower().split())
+
+    @staticmethod
+    def _jaccard(set_a: Set[str], set_b: Set[str]) -> float:
+        if not set_a or not set_b:
             return 0.0
-
-        set_a = set(content_a)
-        set_b = set(content_b)
-        intersection = set_a & set_b
-        union = set_a | set_b
-
-        return len(intersection) / len(union) if union else 0.0
+        return len(set_a & set_b) / len(set_a | set_b)
     
     def get_stats(self) -> Dict:
         """Get engine statistics."""
