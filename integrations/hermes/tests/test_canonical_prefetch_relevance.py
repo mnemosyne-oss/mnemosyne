@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import pytest
 
+import mnemosyne_hermes
+
 from mnemosyne.core.canonical import CanonicalStore
 from mnemosyne_hermes import (
     MnemosyneMemoryProvider,
@@ -398,3 +400,49 @@ def test_rendered_prefetch_retains_distinct_fact_behind_duplicate_candidates(tmp
         assert block.index(common) < block.index("Vaultwarden Passwort sichern")
     finally:
         provider.shutdown()
+
+
+@pytest.mark.parametrize("prefix", ["[ASSISTANT]", "[USER]", "[IDENTITY]"])
+def test_canonical_dedup_keeps_body_with_higher_provider_score(store, prefix):
+    seed(store, [("a_prefixed", f"{prefix} Vaultwarden Passwort sichern"), ("z_plain", "Vaultwarden Passwort sichern")])
+
+    rows = _canonical_prefetch_rows(store, "default", "Vaultwarden Passwort sichern")
+
+    assert [row["canonical_name"] for row in rows] == ["z_plain"]
+
+
+@pytest.mark.parametrize("prefix", ["[ASSISTANT]", "[USER]", "[IDENTITY]"])
+def test_rendered_canonical_dedup_keeps_plain_fact_over_lower_quality_prefix(tmp_path, prefix):
+    provider = MnemosyneMemoryProvider()
+    provider.initialize("canonical-quality", hermes_home=str(tmp_path), agent_identity="default", profile_isolation=False)
+    try:
+        assert provider._beam is not None
+        canonical = CanonicalStore(db_path=provider._beam.db_path, conn=provider._beam.conn)
+        provider._beam.canonical = canonical
+        seed(canonical, [("a_prefixed", f"{prefix} Vaultwarden Passwort sichern"), ("z_plain", "Vaultwarden Passwort sichern")])
+
+        block = provider.prefetch("Vaultwarden Passwort sichern")
+
+        assert "[CANONICAL]" in block
+        assert "Vaultwarden Passwort sichern" in block
+        assert prefix not in block
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize("limit", [0, 1, 3])
+def test_canonical_dedup_stops_tokenizing_after_requested_distinct_limit(store, monkeypatch, limit):
+    seed(store, [(f"fact{i:02}", f"Vaultwarden Passwort credential{i}") for i in range(50)])
+    tokenized = []
+    real_tokens = mnemosyne_hermes._prefetch_tokens
+
+    def counted_tokens(content):
+        tokenized.append(content)
+        return real_tokens(content)
+
+    monkeypatch.setattr(mnemosyne_hermes, "_prefetch_tokens", counted_tokens)
+
+    rows = _canonical_prefetch_rows(store, "default", "Vaultwarden Passwort", limit=limit)
+
+    assert [row["canonical_name"] for row in rows] == [f"fact{i:02}" for i in range(limit)]
+    assert len(tokenized) == limit

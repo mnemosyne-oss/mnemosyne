@@ -888,9 +888,9 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
     Multi-token admission follows the configured overlap minimum.
 
     Apply priority and deduplication before returning at most ``limit`` rows,
-    ranking within each group by owner-local IDF-weighted query coverage.
-    The private priority
-    flag uses unweighted distinctive coverage: only rows meeting the configured
+    ranking within each group by the provider's adjusted score, which blends
+    owner-local IDF-weighted query coverage with source quality. The private
+    priority flag uses unweighted distinctive coverage: only rows meeting the configured
     coverage floor precede ordinary memories in provider prefetch. Weaker
     admitted rows compete by adjusted score. No LLM, embedding lookup, or other
     owner's corpus is used here.
@@ -998,14 +998,14 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
     # Apply the same priority boundary before limiting as the provider does
     # before merging; otherwise stronger-priority rows can never reach it.
     candidates.sort(
-        key=lambda r: (r["_prefetch_canonical_priority"], float(r.get("score") or 0.0), float(r.get("keyword_score") or 0.0)),
+        key=lambda r: (r["_prefetch_canonical_priority"], _prefetch_adjusted_score(r)),
         reverse=True,
     )
     for candidate in candidates:
         candidate.pop("_prefetch_overlap_count", None)
     # Near duplicates must not consume the candidate budget before provider
     # dedup can expose a lower-ranked but distinct fact.
-    return _semantic_dedup_prefetch(candidates)[:limit]
+    return _semantic_dedup_prefetch(candidates, limit=limit)
 
 
 def _prefetch_is_polyphonic(row: Dict[str, Any]) -> bool:
@@ -1093,6 +1093,7 @@ def _sanitize_prefetch_query(query: str) -> str:
 
 def _semantic_dedup_prefetch(
     rows: List[Dict[str, Any]], threshold: float = 0.72, *, preserve_canonical_extensions: bool = False,
+    limit: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Keep the first nonduplicate rows in their supplied ranking order.
 
@@ -1104,7 +1105,13 @@ def _semantic_dedup_prefetch(
     instead, so a longer instruction can retain additional content. Jaccard
     still removes near duplicates. The default retains explicit-recall and
     ordinary-to-ordinary containment behavior. Input rows are not modified.
+
+    A positive ``limit`` stops scanning once that many distinct rows are kept;
+    zero returns no rows. ``None`` scans all rows, and negative limits retain
+    the historical slice behavior after a full scan.
     """
+    if limit == 0:
+        return []
     kept: List[Dict[str, Any]] = []
     kept_tokens: List[Set[str]] = []
     for row in rows:
@@ -1134,7 +1141,9 @@ def _semantic_dedup_prefetch(
             continue
         kept.append(row)
         kept_tokens.append(tokens)
-    return kept
+        if limit is not None and limit > 0 and len(kept) >= limit:
+            break
+    return kept if limit is None else kept[:limit]
 
 
 def _sync_turn_user_limit() -> int:
