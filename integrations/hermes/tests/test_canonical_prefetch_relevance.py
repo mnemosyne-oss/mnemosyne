@@ -177,8 +177,10 @@ def test_rendered_context_retains_two_rare_terms_among_three_term_matches(tmp_pa
 
 def test_generic_overlap_does_not_boost_a_canonical_score(store):
     seed(store, [
-        ("a_padded", "muss neue Vaultwarden Passwort sichern"),
-        ("z_plain", "Vaultwarden Passwort sichern"),
+        # Distinct non-query suffixes keep these facts separate during dedup,
+        # so the assertions below isolate scoring rather than duplicate removal.
+        ("a_padded", "muss neue Vaultwarden Passwort sichern Tresor"),
+        ("z_plain", "Vaultwarden Passwort sichern Wiederherstellung"),
     ])
 
     rows = _canonical_prefetch_rows(store, "default", "muss neue Vaultwarden Passwort backup archive")
@@ -361,5 +363,38 @@ def test_rendered_prefetch_omits_single_token_fact_admitted_only_by_generic_over
         block = provider.prefetch("muss neue Vaultwarden Passwörter Backup Export sichern")
 
         assert block == ""
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize("variant", [False, True])
+def test_canonical_candidate_limit_counts_distinct_facts(store, variant):
+    common = "deployment pipeline worker release rollout staging production cluster service"
+    seed(store, [(f"common{i}", common + (f" workload{i}" if variant else "")) for i in range(3)])
+    seed(store, [("vault", "Vaultwarden Passwort sichern")])
+    query = "deployment pipeline worker Vaultwarden Passwort recovery archive backup export offline"
+
+    rows = _canonical_prefetch_rows(store, "default", query)
+
+    assert [row["canonical_name"] for row in rows] == ["common0", "vault"]
+
+
+@pytest.mark.parametrize("variant", [False, True])
+def test_rendered_prefetch_retains_distinct_fact_behind_duplicate_candidates(tmp_path, variant):
+    provider = MnemosyneMemoryProvider()
+    provider.initialize("canonical-dedup-limit", hermes_home=str(tmp_path), agent_identity="default", profile_isolation=False)
+    try:
+        assert provider._beam is not None
+        canonical = CanonicalStore(db_path=provider._beam.db_path, conn=provider._beam.conn)
+        provider._beam.canonical = canonical
+        common = "deployment pipeline worker release rollout staging production cluster service"
+        seed(canonical, [(f"common{i}", common + (f" workload{i}" if variant else "")) for i in range(3)])
+        seed(canonical, [("vault", "Vaultwarden Passwort sichern")])
+
+        block = provider.prefetch("deployment pipeline worker Vaultwarden Passwort recovery archive backup export offline")
+
+        assert "Vaultwarden Passwort sichern" in block
+        assert block.count(common) == 1
+        assert block.index(common) < block.index("Vaultwarden Passwort sichern")
     finally:
         provider.shutdown()

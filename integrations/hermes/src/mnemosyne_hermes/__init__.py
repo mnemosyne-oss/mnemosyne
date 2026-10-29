@@ -887,8 +887,9 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
     requires rarity and query coverage, except for a matching whole-body unit.
     Multi-token admission follows the configured overlap minimum.
 
-    Apply priority before returning at most ``limit`` rows, ranking within
-    each group by owner-local IDF-weighted query coverage. The private priority
+    Apply priority and deduplication before returning at most ``limit`` rows,
+    ranking within each group by owner-local IDF-weighted query coverage.
+    The private priority
     flag uses unweighted distinctive coverage: only rows meeting the configured
     coverage floor precede ordinary memories in provider prefetch. Weaker
     admitted rows compete by adjusted score. No LLM, embedding lookup, or other
@@ -1002,7 +1003,9 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
     )
     for candidate in candidates:
         candidate.pop("_prefetch_overlap_count", None)
-    return candidates[:limit]
+    # Near duplicates must not consume the candidate budget before provider
+    # dedup can expose a lower-ranked but distinct fact.
+    return _semantic_dedup_prefetch(candidates)[:limit]
 
 
 def _prefetch_is_polyphonic(row: Dict[str, Any]) -> bool:
