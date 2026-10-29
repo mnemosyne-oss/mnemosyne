@@ -1145,6 +1145,11 @@ class PolyphonicRecallEngine:
             words = self._content_words(result)
             is_diverse = True
             for sel_words in selected_words:
+                # Jaccard can never exceed min/max of the set sizes, and float
+                # division is monotone, so this skip cannot change a verdict.
+                small, large = sorted((len(words), len(sel_words)))
+                if not small or small / large <= 0.8:
+                    continue
                 if self._jaccard(words, sel_words) > 0.8:  # Too similar
                     is_diverse = False
                     break
@@ -1173,7 +1178,8 @@ class PolyphonicRecallEngine:
     def _jaccard(set_a: Set[str], set_b: Set[str]) -> float:
         if not set_a or not set_b:
             return 0.0
-        return len(set_a & set_b) / len(set_a | set_b)
+        shared = len(set_a & set_b)
+        return shared / (len(set_a) + len(set_b) - shared)
     
     def get_stats(self) -> Dict:
         """Get engine statistics."""
