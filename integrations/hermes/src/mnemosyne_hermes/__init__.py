@@ -882,9 +882,16 @@ _EMPTY_BINDING: Dict[str, Any] = {
 def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: int = 3) -> List[Dict[str, Any]]:
     """Return canonical facts relevant enough for automatic memory-context injection.
 
-    Canonical rows are small, owner-scoped, and single-source-of-truth, so a
-    lightweight lexical pass over current slots is enough and avoids LLM/reranker
-    cost. Importance cannot rescue a row here; it must share query terms.
+    Match current slots for ``owner_id`` using distinctive body tokens,
+    excluding the configured generic terms. Single-token admission additionally
+    requires rarity and query coverage, except for a matching whole-body unit.
+    Multi-token admission follows the configured overlap minimum.
+
+    Rank admitted rows by owner-local IDF-weighted query coverage and return at
+    most ``limit`` rows. The private priority flag uses unweighted distinctive
+    coverage: only rows meeting the configured coverage floor precede ordinary
+    memories in provider prefetch. Weaker admitted rows compete by adjusted
+    score. No LLM, embedding lookup, or other owner's corpus is used here.
     """
     cjk_ngram_size = _canonical_cjk_ngram_size(query)
     query_tokens = _canonical_match_tokens(query, cjk_ngram_size=cjk_ngram_size)
@@ -1079,6 +1086,17 @@ def _sanitize_prefetch_query(query: str) -> str:
 def _semantic_dedup_prefetch(
     rows: List[Dict[str, Any]], threshold: float = 0.72, *, preserve_canonical_extensions: bool = False,
 ) -> List[Dict[str, Any]]:
+    """Keep the first nonduplicate rows in their supplied ranking order.
+
+    Drop empty token sets and rows whose token Jaccard similarity reaches
+    ``threshold`` against an earlier row, or whose smaller token set is at
+    least 86% contained in the larger set. Automatic prefetch opts into
+    ``preserve_canonical_extensions``:
+    after a kept canonical row, containment covers the incoming ordinary row
+    instead, so a longer instruction can retain additional content. Jaccard
+    still removes near duplicates. The default retains explicit-recall and
+    ordinary-to-ordinary containment behavior. Input rows are not modified.
+    """
     kept: List[Dict[str, Any]] = []
     kept_tokens: List[Set[str]] = []
     for row in rows:
@@ -2873,9 +2891,17 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context via Mnemosyne hybrid search with temporal weighting.
 
-        Only includes memories above a relevance threshold to prevent context pollution
-        from low-quality matches. Strictly session-scoped: author identity is never
-        injected into this recall path (see CWE-200 note below)."""
+        Gate ordinary memories by distinctive lexical evidence and signal
+        quality. Merge owner-scoped canonical candidates, prioritizing only
+        those meeting the configured distinctive query-coverage floor, then
+        rank by adjusted score within each priority group. Deduplicate while
+        retaining ordinary extensions of canonical facts and render up to five
+        memories with canonical provenance.
+
+        Ordinary recall retains session scoping: author identity is never
+        injected into that read path (see CWE-200 note below). Return an empty
+        string when no eligible context exists or the lifecycle read fails.
+        """
         self._maybe_retry_init()
         if not self._beam or self._agent_context in self._skip_contexts:
             return ""
