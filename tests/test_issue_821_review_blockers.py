@@ -710,10 +710,17 @@ unsupported_pending = module._stage_pending_write({
     "tool": "mnemosyne_batch", "action": "unsupported",
     "content": "allowed but unsupported",
 })
-approved_update_apply = json.loads(provider.handle_tool_call(
-    "mnemosyne_apply_pending",
-    {"pending_ids": approved_pending_ids + [unsupported_pending]},
-))
+# Explicit approval-OFF compatibility replay for write-policy validation.
+previous_approval = module._write_approval_enabled
+module._write_approval_enabled = lambda: False
+try:
+    approved_update_apply = json.loads(provider.handle_tool_call(
+        "mnemosyne_apply_pending",
+        {"pending_ids": approved_pending_ids + [unsupported_pending]},
+    ))
+finally:
+    module._write_approval_enabled = previous_approval
+
 non_content = json.loads(provider.handle_tool_call("mnemosyne_batch", {"operations": [
     {"action": "update", "memory_id": allowed_id, "importance": 0.9},
     {"action": "forget", "memory_id": allowed_id},
@@ -729,9 +736,16 @@ rejected_pending = module._stage_pending_write({
 allowed_pending = module._stage_pending_write({
     "tool": "mnemosyne_remember", "content": "allowed pending content"
 })
-apply_response = provider.handle_tool_call(
-    "mnemosyne_apply_pending", {"pending_ids": [rejected_pending, allowed_pending]}
-)
+# Explicit approval-OFF compatibility replay for write-policy validation.
+previous_approval = module._write_approval_enabled
+module._write_approval_enabled = lambda: False
+try:
+    apply_response = provider.handle_tool_call(
+        "mnemosyne_apply_pending", {"pending_ids": [rejected_pending, allowed_pending]}
+    )
+finally:
+    module._write_approval_enabled = previous_approval
+
 print(json.dumps({
     "remember": json.loads(remember),
     "batch": json.loads(batch),
@@ -822,7 +836,7 @@ def test_write_approval_rejects_before_pending_persistence(
     )
     assert payload["approved_update_batch"]["staged_count"] == 3
     assert payload["approved_update_batch"]["message"] == (
-        "3 writes staged for approval. Use mnemosyne_apply_pending to commit."
+        "3 writes staged for human review; they have not been committed. Agent-side approval is unavailable."
     )
     assert payload["approved_update_batch"]["pending_ids"] == [
         result["pending_id"] for result in payload["approved_update_batch"]["results"]
@@ -918,9 +932,15 @@ def stage(action, memory_id, **payload):
 
 
 def apply(pending_id):
-    return json.loads(provider.handle_tool_call(
-        "mnemosyne_apply_pending", {"pending_ids": [pending_id]}
-    ))
+    # This tests retry/cleanup under explicitly disabled approval, not authorization.
+    previous_approval = module._write_approval_enabled
+    module._write_approval_enabled = lambda: False
+    try:
+        return json.loads(provider.handle_tool_call(
+            "mnemosyne_apply_pending", {"pending_ids": [pending_id]}
+        ))
+    finally:
+        module._write_approval_enabled = previous_approval
 
 
 def exists(pending_id):

@@ -47,6 +47,7 @@ import sys
 import tempfile
 import threading
 import types
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -263,7 +264,9 @@ def test_apply_pending_update_targets_existing_row(provider_module_name, monkeyp
             assert payload["memory_id"] == seed_id
             assert payload["action"] == "update"
 
-            applied = json.loads(provider._handle_apply_pending({"pending_ids": pids}))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(provider._handle_apply_pending({"pending_ids": pids}))
             assert applied["applied_count"] == 1
             assert applied["failed_count"] == 0
 
@@ -304,7 +307,9 @@ def test_apply_pending_forget_is_content_less(provider_module_name, monkeypatch,
             assert not payload.get("content")
             assert payload["memory_id"] == seed_id
 
-            applied = json.loads(provider._handle_apply_pending({"pending_ids": pids}))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(provider._handle_apply_pending({"pending_ids": pids}))
             # Content-less op must replay successfully, not fail as
             # "empty content".
             assert applied["applied_count"] == 1
@@ -340,7 +345,9 @@ def test_apply_pending_invalidate_is_content_less(provider_module_name, monkeypa
             # (finding 1: absent fields stage as None, not "").
             assert not payload.get("content")
 
-            applied = json.loads(provider._handle_apply_pending({"pending_ids": pids}))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(provider._handle_apply_pending({"pending_ids": pids}))
             assert applied["applied_count"] == 1
             assert applied["failed_count"] == 0
 
@@ -382,7 +389,9 @@ def test_apply_pending_invalidate_replacement_chains(provider_module_name, monke
             assert payload["action"] == "invalidate"
             assert payload["replacement_id"] == repl_id
 
-            applied = json.loads(provider._handle_apply_pending({"pending_ids": pids}))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(provider._handle_apply_pending({"pending_ids": pids}))
             assert applied["applied_count"] == 1
             assert applied["failed_count"] == 0
 
@@ -434,7 +443,9 @@ def test_apply_pending_record_deleted_only_after_success(provider_module_name, m
             assert len(pids) == 1
             rec = pending_dir / f"{pids[0]}.json"
             assert rec.exists()
-            applied = json.loads(provider._handle_apply_pending({"pending_ids": pids}))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(provider._handle_apply_pending({"pending_ids": pids}))
             assert applied["applied_count"] == 1
             assert applied["failed_count"] == 0
             assert not rec.exists()
@@ -451,7 +462,9 @@ def test_apply_pending_record_deleted_only_after_success(provider_module_name, m
                 raise RuntimeError("simulated replay failure")
 
             monkeypatch.setattr(provider._beam, "remember", _boom)
-            applied = json.loads(provider._handle_apply_pending({"pending_ids": pids}))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(provider._handle_apply_pending({"pending_ids": pids}))
             assert applied["applied_count"] == 0
             assert applied["failed_count"] == 1
             # Approved operation must not be silently lost.
@@ -466,7 +479,9 @@ def test_apply_pending_record_deleted_only_after_success(provider_module_name, m
             pids = _staged_ids(resp)
             rec = pending_dir / f"{pids[0]}.json"
             assert rec.exists()
-            applied = json.loads(provider._handle_apply_pending({"pending_ids": pids}))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(provider._handle_apply_pending({"pending_ids": pids}))
             assert applied["applied_count"] == 0
             assert applied["failed_count"] == 1
             assert rec.exists(), "record must survive a failed content-less replay"
@@ -499,9 +514,11 @@ def test_apply_pending_mixed_success_and_failure_is_independent(
                 return real_remember(**kwargs)
 
             monkeypatch.setattr(provider._beam, "remember", fail_second)
-            result = json.loads(provider._handle_apply_pending({
-                "pending_ids": ["good0001", "bad00001"],
-            }))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                result = json.loads(provider._handle_apply_pending({
+                    "pending_ids": ["good0001", "bad00001"],
+                }))
 
             assert result["applied_count"] == 1
             assert result["failed_count"] == 1
@@ -511,9 +528,11 @@ def test_apply_pending_mixed_success_and_failure_is_independent(
 
             # Retrying the failed record must not duplicate the successful one.
             provider._beam.remember = real_remember
-            retry = json.loads(provider._handle_apply_pending({
-                "pending_ids": ["bad00001"],
-            }))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                retry = json.loads(provider._handle_apply_pending({
+                    "pending_ids": ["bad00001"],
+                }))
             assert retry["applied_count"] == 1
             assert retry["failed_count"] == 0
             assert not bad_path.exists()
@@ -556,9 +575,11 @@ def test_apply_pending_concurrent_providers_mutate_once(
 
         def apply(provider):
             start.wait(timeout=1)
-            return json.loads(provider._handle_apply_pending({
-                "pending_ids": ["shared01"],
-            }))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                return json.loads(provider._handle_apply_pending({
+                    "pending_ids": ["shared01"],
+                }))
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             results = list(executor.map(apply, providers))
@@ -621,9 +642,11 @@ def test_apply_pending_cleanup_failure_does_not_make_committed_action_replayable
 
         monkeypatch.setattr(Path, "unlink", fail_first_claim_cleanup)
 
-        first = json.loads(provider._handle_apply_pending({
-            "pending_ids": ["cleanup1"],
-        }))
+        # Compatibility replay is explicitly approval-OFF; this is not human approval.
+        with patch.object(module, "_write_approval_enabled", return_value=False):
+            first = json.loads(provider._handle_apply_pending({
+                "pending_ids": ["cleanup1"],
+            }))
 
         assert first["applied_count"] == 1
         assert first["failed_count"] == 0
@@ -636,9 +659,11 @@ def test_apply_pending_cleanup_failure_does_not_make_committed_action_replayable
         assert not record_path.exists()
         assert len(list(pending_dir.glob("*.claim"))) == 1
 
-        retry = json.loads(provider._handle_apply_pending({
-            "pending_ids": ["cleanup1"],
-        }))
+        # Compatibility replay is explicitly approval-OFF; this is not human approval.
+        with patch.object(module, "_write_approval_enabled", return_value=False):
+            retry = json.loads(provider._handle_apply_pending({
+                "pending_ids": ["cleanup1"],
+            }))
 
         assert retry["applied_count"] == 0
         assert retry["failed_count"] == 1
@@ -667,18 +692,22 @@ def test_apply_pending_failed_claim_is_restored_for_another_provider(
         def fail(**kwargs):
             raise RuntimeError("simulated replay failure")
 
-        failed = json.loads(_stub_replay_provider(
-            module, fail
-        )._handle_apply_pending({"pending_ids": ["retry001"]}))
+        # Compatibility replay is explicitly approval-OFF; this is not human approval.
+        with patch.object(module, "_write_approval_enabled", return_value=False):
+            failed = json.loads(_stub_replay_provider(
+                module, fail
+            )._handle_apply_pending({"pending_ids": ["retry001"]}))
 
         assert failed["applied_count"] == 0
         assert failed["failed_count"] == 1
         assert record_path.exists()
         assert list(pending_dir.glob("*.claim")) == []
 
-        applied = json.loads(_stub_replay_provider(
-            module, lambda **kwargs: "memory-retried"
-        )._handle_apply_pending({"pending_ids": ["retry001"]}))
+        # Compatibility replay is explicitly approval-OFF; this is not human approval.
+        with patch.object(module, "_write_approval_enabled", return_value=False):
+            applied = json.loads(_stub_replay_provider(
+                module, lambda **kwargs: "memory-retried"
+            )._handle_apply_pending({"pending_ids": ["retry001"]}))
 
         assert applied["applied_count"] == 1
         assert applied["failed_count"] == 0
@@ -699,9 +728,11 @@ def test_apply_pending_malformed_record_is_restored(
         record_path = pending_dir / "broken01.json"
         record_path.write_text("{not-json")
 
-        result = json.loads(_stub_replay_provider(
-            module, lambda **kwargs: "must-not-run"
-        )._handle_apply_pending({"pending_ids": ["broken01"]}))
+        # Compatibility replay is explicitly approval-OFF; this is not human approval.
+        with patch.object(module, "_write_approval_enabled", return_value=False):
+            result = json.loads(_stub_replay_provider(
+                module, lambda **kwargs: "must-not-run"
+            )._handle_apply_pending({"pending_ids": ["broken01"]}))
 
         assert result["applied_count"] == 0
         assert result["failed_count"] == 1
@@ -751,9 +782,11 @@ def test_apply_pending_rejects_foreign_provider_record(
                 {"action": "remember", "content": "must not store"},
                 provider="other-provider",
             )
-            result = json.loads(provider._handle_apply_pending({
-                "pending_ids": ["foreign1"],
-            }))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                result = json.loads(provider._handle_apply_pending({
+                    "pending_ids": ["foreign1"],
+                }))
 
             assert result["applied_count"] == 0
             assert result["failed_count"] == 1
@@ -787,9 +820,11 @@ def test_background_review_batch_shape_failure_retains_pending_record(
                 origin="background_review",
             )
 
-            result = json.loads(provider._handle_apply_pending({
-                "pending_ids": ["deadbeef"],
-            }))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                result = json.loads(provider._handle_apply_pending({
+                    "pending_ids": ["deadbeef"],
+                }))
 
             assert result["applied_count"] == 0
             assert result["failed_count"] == 1
@@ -811,9 +846,11 @@ def test_legacy_pending_record_without_action_replays_as_remember(
             record_path = _write_pending_record(
                 pending_dir, "legacy01", {"content": "legacy staged write"}
             )
-            result = json.loads(provider._handle_apply_pending({
-                "pending_ids": ["legacy01"],
-            }))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                result = json.loads(provider._handle_apply_pending({
+                    "pending_ids": ["legacy01"],
+                }))
 
             assert result["applied_count"] == 1
             assert result["failed_count"] == 0
@@ -837,9 +874,11 @@ def test_unknown_pending_action_fails_and_retains_record(
                 "unknown1",
                 {"action": "obliterate", "memory_id": "00000000-dead-beef"},
             )
-            result = json.loads(provider._handle_apply_pending({
-                "pending_ids": ["unknown1"],
-            }))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                result = json.loads(provider._handle_apply_pending({
+                    "pending_ids": ["unknown1"],
+                }))
 
             assert result["applied_count"] == 0
             assert result["failed_count"] == 1
@@ -898,7 +937,9 @@ def _stage_and_replay_update(provider, db_path, seed_id, op_kwargs):
     pids = _staged_ids(resp)
     assert len(pids) == 1
 
-    applied = json.loads(provider._handle_apply_pending({"pending_ids": pids}))
+    # Compatibility replay is explicitly approval-OFF; this is not human approval.
+    with patch.object(sys.modules[type(provider).__module__], "_write_approval_enabled", return_value=False):
+        applied = json.loads(provider._handle_apply_pending({"pending_ids": pids}))
     assert applied["applied_count"] == 1
     assert applied["failed_count"] == 0
 
@@ -1054,7 +1095,9 @@ def test_staged_contains_raw_pending_ids_forwardable(provider_module_name, monke
             # mnemosyne_apply_pending. Before the fix this raised
             # invalid:empty on the standalone surface (dicts) and
             # KeyError on the legacy surface (no 'staged' key).
-            applied = json.loads(provider._handle_apply_pending({"pending_ids": staged}))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(provider._handle_apply_pending({"pending_ids": staged}))
             assert applied["applied_count"] == 2
             assert applied["failed_count"] == 0
             rows = _wm_rows(db_path)

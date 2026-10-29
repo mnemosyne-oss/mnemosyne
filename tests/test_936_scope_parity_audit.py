@@ -36,6 +36,7 @@ import json
 import sqlite3
 import sys
 import types
+from unittest.mock import patch
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -272,9 +273,11 @@ def test_redirected_update_targets_the_staging_session(
         # Approval arrives in session B (a different provider instance on the
         # same store, exactly like a session switch).
         with _provider(module, tmp_path, "sess-b") as prov_b:
-            applied = json.loads(prov_b.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": pids}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov_b.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": pids}
+                ))
             assert applied["applied_count"] == 1, applied
             assert applied["failed_count"] == 0, applied
 
@@ -335,9 +338,11 @@ def test_redirected_replay_failure_restores_live_scope_and_keeps_pending(
                 raise RuntimeError("simulated redirected replay failure")
 
             monkeypatch.setattr(prov_b._beam, "update_working", fail_update)
-            failed = json.loads(prov_b.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": pids}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                failed = json.loads(prov_b.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": pids}
+                ))
             assert failed["applied_count"] == 0, failed
             assert failed["failed_count"] == 1, failed
             assert (pending_dir / f"{pids[0]}.json").exists()
@@ -379,9 +384,11 @@ def test_redirected_forget_targets_the_staging_session(
             finally:
                 conn.close()
 
-            applied = json.loads(prov_b.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": pids}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov_b.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": pids}
+                ))
             assert applied["applied_count"] == 1, applied
             assert applied["failed_count"] == 0, applied
 
@@ -421,9 +428,11 @@ def test_redirected_invalidate_targets_the_staging_session(
             ])
 
         with _provider(module, tmp_path, "sess-b") as prov_b:
-            applied = json.loads(prov_b.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": pids}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov_b.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": pids}
+                ))
             assert applied["applied_count"] == 1, applied
             assert applied["failed_count"] == 0, applied
 
@@ -458,9 +467,11 @@ def test_redirected_remember_reports_scope_metadata(
             ])
 
         with _provider(module, tmp_path, "sess-b") as prov_b:
-            applied = json.loads(prov_b.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": pids}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov_b.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": pids}
+                ))
             assert applied["applied_count"] == 1, applied
             rows = _wm_rows(_db_path(prov_b))
             by_content = {r[1]: r for r in rows}
@@ -490,9 +501,11 @@ def test_explicit_channel_equal_to_session_is_not_rebound(
         with _provider(
             module, tmp_path, "sess-b", channel_id="hermes_sess-b"
         ) as prov_b:
-            applied = json.loads(prov_b.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": [pid]}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov_b.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": [pid]}
+                ))
             assert applied["applied_count"] == 1, applied
             rows = _wm_rows(_db_path(prov_b))
             row = next(r for r in rows if r[1] == "pinned channel")
@@ -512,9 +525,11 @@ def test_same_session_replay_is_not_reported_as_redirected(
             pids = _stage_ops_in_session_a(prov_a, [
                 {"action": "remember", "content": "same session", "scope": "session"},
             ])
-            applied = json.loads(prov_a.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": pids}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov_a.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": pids}
+                ))
             assert applied["applied_count"] == 1, applied
             assert applied["session_redirected_count"] == 0
             assert "session_replayed_into" not in applied["applied"][0]
@@ -546,9 +561,11 @@ def test_channel_binding_is_restored_when_it_differs_under_one_session(
 
             # Same session, different channel at approval time.
             prov._beam.channel_id = "channel-two"
-            applied = json.loads(prov.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": pids}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": pids}
+                ))
             assert applied["applied_count"] == 1, applied
             assert applied["failed_count"] == 0, applied
             # No session redirect happened, so none is reported.
@@ -586,9 +603,11 @@ def test_legacy_record_without_recorded_scope_replays_through_active_beam(
             "summary": "legacy staged", "created_at": 0,
         }))
         with _provider(module, tmp_path, "sess-a") as prov:
-            applied = json.loads(prov.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": ["legacy01"]}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": ["legacy01"]}
+                ))
             assert applied["applied_count"] == 1, applied
             assert applied["failed_count"] == 0, applied
             assert applied["session_redirected_count"] == 0
@@ -696,9 +715,11 @@ def test_direct_and_replayed_update_audit_parity(
                 "memory_id": replay_target,
                 "content": "replayed audited update",
             }])
-            applied = json.loads(prov.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": pids}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": pids}
+                ))
             assert applied["applied_count"] == 1, applied
             events = _audit_events(prov)
 
@@ -733,9 +754,11 @@ def test_replayed_remember_and_update_emit_audit_events(
                 }
             _force_approval_gate(module, monkeypatch)
             pids = _stage_ops_in_session_a(prov, [operation])
-            applied = json.loads(prov.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": pids}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": pids}
+                ))
             assert applied["applied_count"] == 1, applied
             events = _audit_events(prov)
 
@@ -783,9 +806,11 @@ def test_replayed_forget_emits_audit_event(
             pids = _stage_ops_in_session_a(prov, [
                 {"action": "forget", "memory_id": seed_id},
             ])
-            applied = json.loads(prov.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": pids}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": pids}
+                ))
             assert applied["applied_count"] == 1, applied
             events = _audit_events(prov)
 
@@ -816,9 +841,11 @@ def test_replayed_invalidate_emits_audit_event_with_replacement_metadata(
             pids = _stage_ops_in_session_a(prov, [
                 {"action": "invalidate", "memory_id": old_id, "replacement_id": repl_id},
             ])
-            applied = json.loads(prov.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": pids}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": pids}
+                ))
             assert applied["applied_count"] == 1, applied
             events = _audit_events(prov)
 
@@ -866,9 +893,11 @@ def test_replayed_forget_and_invalidate_audit_the_staging_session(
             ])
 
         with _provider(module, tmp_path, "sess-b") as prov_b:
-            applied = json.loads(prov_b.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": pids}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov_b.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": pids}
+                ))
             assert applied["applied_count"] == 2, applied
             assert applied["failed_count"] == 0, applied
             assert applied["session_redirected_count"] == 2, applied
@@ -903,9 +932,11 @@ def test_failed_replay_emits_no_audit_event(
             pids = _stage_ops_in_session_a(prov, [
                 {"action": "forget", "memory_id": "00000000-dead-beef"},
             ])
-            applied = json.loads(prov.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": pids}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": pids}
+                ))
             assert applied["failed_count"] == 1, applied
             events = _audit_events(prov)
 
@@ -936,9 +967,11 @@ def test_replay_restores_the_live_beam_scope(
         with _provider(module, tmp_path, "sess-b") as prov_b:
             before_session = prov_b._beam.session_id
             before_channel = prov_b._beam.channel_id
-            applied = json.loads(prov_b.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": pids}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov_b.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": pids}
+                ))
             assert applied["applied_count"] == 1, applied
             # The temporary swap is restored: later same-session writes keep
             # landing under the approving session.
@@ -977,9 +1010,11 @@ def test_replay_keeps_the_live_beam_identity(
         with _provider(module, tmp_path, "sess-b") as prov_b:
             prov_b._beam.author_id = "bob"
             prov_b._beam.author_type = "human"
-            applied = json.loads(prov_b.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": pids}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov_b.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": pids}
+                ))
             assert applied["applied_count"] == 1, applied
 
             conn = sqlite3.connect(str(_db_path(prov_b)))
@@ -1008,8 +1043,10 @@ def test_invalid_record_still_retains_on_mismatch(
             pids = _stage_ops_in_session_a(prov, [
                 {"action": "update", "memory_id": "00000000-dead-beef", "content": "x"},
             ])
-            applied = json.loads(prov.handle_tool_call(
-                "mnemosyne_apply_pending", {"pending_ids": pids}
-            ))
+            # Compatibility replay is explicitly approval-OFF; this is not human approval.
+            with patch.object(module, "_write_approval_enabled", return_value=False):
+                applied = json.loads(prov.handle_tool_call(
+                    "mnemosyne_apply_pending", {"pending_ids": pids}
+                ))
             assert applied["failed_count"] == 1, applied
             assert (pending_dir / f"{pids[0]}.json").is_file()
