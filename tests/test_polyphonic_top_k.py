@@ -4,10 +4,13 @@ Grid: tier (working, episodic) x top_k (at or under the old per-voice cap of
 20, over it, over the point where the removed metadata-sized context budget
 cut the engine's 2x over-fetch below top_k, and over the eligible count).
 """
+import sqlite3
+
 import numpy as np
 import pytest
 
 import mnemosyne.core.beam as bm
+from mnemosyne.core.polyphonic_recall import PolyphonicRecallEngine, PolyphonicResult
 
 ELIGIBLE = 100
 
@@ -96,3 +99,25 @@ def test_diversity_rerank_matches_reference(seed):
     got = [r.memory_id for r in engine._diversity_rerank(results, top_k)]
     want = [r.memory_id for r in _reference_diversity_rerank(results, top_k)]
     assert got == want
+
+
+@pytest.mark.skipif(not hasattr(sqlite3.Connection, "setlimit"),
+                    reason="sqlite3.Connection.setlimit needs Python 3.11+")
+def test_content_hydration_stays_under_sqlite_variable_limit(beam):
+    # Older SQLite builds allow 999 bound variables, and a large top_k now lets
+    # the vector voice pass more candidates than that. A failed hydration query
+    # leaves rows without content, and the diversity re-rank can't compare them.
+    ids = [f"m{i}" for i in range(1200)]
+    beam.conn.executemany(
+        "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, scope) "
+        "VALUES (?, ?, 'user', datetime('now'), 'top-k-session', 0.5, 'session')",
+        [(mid, _distinct(i)) for i, mid in enumerate(ids)],
+    )
+    beam.conn.commit()
+    beam.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 1000)
+    results = {mid: PolyphonicResult(memory_id=mid, combined_score=0.0, voice_scores={}, metadata={})
+               for mid in ids}
+
+    PolyphonicRecallEngine(db_path=beam.db_path, conn=beam.conn)._hydrate_result_content(results)
+
+    assert all(r.content == _distinct(i) for i, r in enumerate(results.values()))

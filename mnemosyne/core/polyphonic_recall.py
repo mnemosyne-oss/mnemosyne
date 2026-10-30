@@ -1128,21 +1128,24 @@ class PolyphonicRecallEngine:
 
         try:
             memory_ids = tuple(results)
-            placeholders = ", ".join("?" for _ in memory_ids)
             for table in ("working_memory", "episodic_memory"):
-                try:
-                    rows = conn.execute(
-                        f"SELECT id, content FROM {table} WHERE id IN ({placeholders})",
-                        memory_ids,
-                    ).fetchall()
-                except sqlite3.OperationalError:
-                    continue
-                for row in rows:
-                    result = results.get(row["id"])
-                    tier = "working" if table == "working_memory" else "episodic"
-                    if (result is not None and not result.content
-                            and result.metadata.get("_self_echo_tier", tier) == tier):
-                        result.content = row["content"] or ""
+                tier = "working" if table == "working_memory" else "episodic"
+                # Chunked under SQLite's bound-variable limit, as the vec scans do.
+                for offset in range(0, len(memory_ids), 900):
+                    chunk = memory_ids[offset : offset + 900]
+                    placeholders = ", ".join("?" for _ in chunk)
+                    try:
+                        rows = conn.execute(
+                            f"SELECT id, content FROM {table} WHERE id IN ({placeholders})",
+                            chunk,
+                        ).fetchall()
+                    except sqlite3.OperationalError:
+                        break
+                    for row in rows:
+                        result = results.get(row["id"])
+                        if (result is not None and not result.content
+                                and result.metadata.get("_self_echo_tier", tier) == tier):
+                            result.content = row["content"] or ""
         finally:
             if own_conn:
                 conn.close()
