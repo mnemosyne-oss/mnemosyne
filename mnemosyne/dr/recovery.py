@@ -224,7 +224,7 @@ def create_backup(db_path: Optional[Path] = None, backup_dir: Optional[Path] = N
             staged_sqlite = staged_backup_path.with_suffix(".tmp.db")
             sqlite_fd = os.open(str(staged_sqlite), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(sqlite_fd)
-            src = sqlite3.connect(str(db_path))
+            src = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             try:
                 _load_sqlite_vec(src)
                 dst = sqlite3.connect(str(staged_sqlite))
@@ -245,7 +245,7 @@ def create_backup(db_path: Optional[Path] = None, backup_dir: Optional[Path] = N
             staged_sqlite = None
         else:
             # Legacy text SQL dump format via iterdump()
-            src = sqlite3.connect(str(db_path))
+            src = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             try:
                 _load_sqlite_vec(src)
                 dst = sqlite3.connect(":memory:")
@@ -725,7 +725,7 @@ def verify_integrity(db_path: Path = None) -> bool:
         return False
 
     try:
-        with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
             result = conn.execute("PRAGMA integrity_check").fetchone()
             return bool(result) and result[0] == "ok"
     except Exception:
