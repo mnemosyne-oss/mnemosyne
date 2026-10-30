@@ -26,6 +26,28 @@ The SQLite database file (`mnemosyne.db`) is created here on first use. The dire
 
 This path defaults to `~/.hermes/` because Hermes persists that directory across sessions, including on ephemeral VMs (Fly.io, etc.).
 
+## Per-Chat Bank Routing
+
+The Hermes integration can route every turn into a separate database ("bank")
+per conversation partner. Routing is **off** until a map file exists and maps
+somebody.
+
+| Variable | Default | Description |
+|---|---|---|
+| `MNEMOSYNE_BANKS_MAP` | `<data dir>/banks_map.json` | Path to the routing map. Unset means the default location in the data directory; the file's absence means routing is off. |
+
+```json
+{
+  "_default": "vela",
+  "_unknown": "quarantine",
+  "agent:main:telegram:dm:111": "alice"
+}
+```
+
+A map that exists but cannot be parsed routes into the quarantine — it is
+never read as "routing is off", because that would fall back to the private
+profile storage. Full rules, key format and rollback: [`docs/bank-routing.md`](bank-routing.md).
+
 ## Memory Tiers
 
 ### Working Memory
