@@ -10,11 +10,15 @@ import io
 import os
 import json
 import hashlib
+import logging
+import re
 import shutil
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 
 def get_default_paths():
@@ -444,6 +448,74 @@ def _fsync_path(path: Path) -> None:
         os.close(fd)
 
 
+def _virtual_tables_in_dump(dump_text: str) -> Set[str]:
+    return set(
+        m.group(1).lower()
+        for m in re.finditer(
+            r"CREATE\s+VIRTUAL\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\"\`']?(\w+)[\"\`']?\s+USING",
+            dump_text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _create_table_target(stmt: str) -> Optional[str]:
+    m = re.match(
+        r"^\s*CREATE\s+(?:TEMP|TEMPORARY\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\"\`']?(\w+)[\"\`']?",
+        stmt,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    return m.group(1).lower()
+
+
+def _statement_target(stmt: str) -> Optional[str]:
+    """Return the target table name of a DDL/DML statement, or None."""
+    low = stmt.lower().strip()
+    import re as _re
+
+    dq, sq, bq = '"', "'", "`"
+    ident = rf"(?:[{_re.escape(dq)}{_re.escape(sq)}{_re.escape(bq)}]?[A-Za-z_][\w$]*[{_re.escape(dq)}{_re.escape(sq)}{_re.escape(bq)}]?)"
+
+    def _strip_quotes(name: str) -> str:
+        name = name.strip()
+        if len(name) >= 2 and name[0] == name[-1] and name[0] in (dq, sq, bq):
+            return name[1:-1]
+        return name
+
+    patterns = [
+        rf"create\s+(?:or\s+replace\s+)?(?:temp(?:orary)?\s+)?table\s+(?:if\s+not\s+exists\s+)?({ident})",
+        rf"insert\s+(?:or\s+\w+\s+)?into\s+({ident})",
+        rf"delete\s+from\s+({ident})",
+        rf"update\s+({ident})",
+        rf"alter\s+table\s+({ident})",
+        rf"drop\s+table\s+(?:if\s+exists\s+)?({ident})",
+        rf"create\s+(?:unique\s+)?index\s+(?:if\s+not\s+exists\s+)?[\w\"'`]+\s+on\s+({ident})",
+    ]
+    for pat in patterns:
+        m = _re.match(pat, low, _re.IGNORECASE)
+        if m:
+            return _strip_quotes(m.group(1)).lower()
+    return None
+
+
+def _is_shadow_stmt(stmt: str, virtual_tables: Set[str]) -> bool:
+    # Never treat the virtual table's own DDL as a shadow statement.
+    low = stmt.lower().strip()
+    if "create virtual table" in low:
+        return False
+    target = _statement_target(stmt)
+    if target is None:
+        return False
+    # Also handle the virtual table itself being referenced as a shadow base? No.
+    for vt in virtual_tables:
+        for suffix in ("_config", "_content", "_data", "_docsize", "_idx", "_stat"):
+            if target == vt + suffix:
+                return True
+    return False
+
+
 def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
     """Restore database from a compressed backup. Fail-closed.
 
@@ -590,12 +662,58 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
                 )
             )
             try:
-                tmp_db.executescript(dump_bytes.decode("utf-8"))
+                dump_text = dump_bytes.decode("utf-8")
+                virtual_tables = _virtual_tables_in_dump(dump_text)
+                buffer: List[str] = []
+                executed = 0
+
+                def _flush_stmt() -> None:
+                    nonlocal executed
+                    stmt = "\n".join(buffer).strip()
+                    buffer.clear()
+                    if not stmt:
+                        return
+                    # Skip comment-only / whitespace statements; never count them.
+                    if not any(
+                        line.lstrip() and not line.lstrip().startswith("--")
+                        for line in stmt.splitlines()
+                    ):
+                        return
+                    if _is_shadow_stmt(stmt, virtual_tables):
+                        logger.warning(
+                            "Skipping shadow-table DDL in legacy SQL dump: %s",
+                            stmt[:120],
+                        )
+                        return
+                    tmp_db.execute(stmt)
+                    executed += 1
+
+                for line in dump_text.splitlines():
+                    buffer.append(line)
+                    if sqlite3.complete_statement("\n".join(buffer)):
+                        _flush_stmt()
+                if buffer:  # trailing fragment -> incomplete statement raises -> fail closed
+                    _flush_stmt()
+
+                if executed == 0:
+                    raise RuntimeError(
+                        "Refusing to restore: legacy SQL dump replayed zero "
+                        "statements (empty or comments-only payload)."
+                    )
                 integrity = tmp_db.execute("PRAGMA integrity_check").fetchone()[0]
                 if integrity != "ok":
                     raise RuntimeError(
                         f"Staged restore failed integrity_check: {integrity}. "
                         f"Refusing to replace target."
+                    )
+                schema_objects = tmp_db.execute(
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE type IN ('table','index','view','trigger')"
+                ).fetchone()[0]
+                if schema_objects == 0:
+                    raise RuntimeError(
+                        "Refusing to restore: legacy replay created no schema "
+                        "objects (degenerate payload)."
                     )
                 tmp_db.commit()
                 try:
