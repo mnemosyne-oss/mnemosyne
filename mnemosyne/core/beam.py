@@ -1118,6 +1118,61 @@ def _session_scope_params(session_id: str, extra_value=None, *, cross_session: O
     return [session_id]
 
 
+def _recall_scope_where(
+    *,
+    session_id: str,
+    cross_session: bool,
+    author_id: Optional[str] = None,
+    author_type: Optional[str] = None,
+    channel_id: Optional[str] = None,
+) -> Tuple[str, List[Any]]:
+    """Session/channel scope shared by the recall eligibility predicates.
+
+    Author-only searches have no session or channel restriction.
+    """
+    if channel_id:
+        return (
+            _session_scope_filter("channel_id", cross_session=cross_session),
+            _session_scope_params(session_id, channel_id, cross_session=cross_session),
+        )
+    if author_id or author_type:
+        return "(1=1)", []
+    return (
+        _session_scope_filter(cross_session=cross_session),
+        _session_scope_params(session_id, cross_session=cross_session),
+    )
+
+
+def _polyphonic_scope_where(
+    *,
+    session_id: str,
+    cross_session: bool,
+    author_id: Optional[str] = None,
+    author_type: Optional[str] = None,
+    channel_id: Optional[str] = None,
+) -> Tuple[str, List[Any]]:
+    """Scope predicate the polyphonic voices apply before their own limits.
+
+    It must never be stricter than _polyphonic_row_passes_filters, which
+    keeps rows whose session_id is NULL (import writes NULL when an export
+    carries one), so those rows are let through here too. The exact author
+    and channel filters match the post-filter's equality checks.
+    """
+    clause, params = _recall_scope_where(
+        session_id=session_id, cross_session=cross_session,
+        author_id=author_id, author_type=author_type, channel_id=channel_id,
+    )
+    if clause != "(1=1)":
+        clause = f"({clause} OR session_id IS NULL)"
+    clauses = [clause]
+    for column, value in (("author_id", author_id), ("author_type", author_type),
+                          ("channel_id", channel_id)):
+        if value:
+            clauses.append(f"{column} = ?")
+            params.append(value)
+    return " AND ".join(clauses), params
+
+
 def _episodic_recall_where(
     *,
     session_id: str,
@@ -1139,20 +1194,12 @@ def _episodic_recall_where(
         "superseded_by IS NULL",
     ]
     params: List[Any] = [now_iso]
-    if channel_id:
-        clauses.append(_session_scope_filter("channel_id", cross_session=cross_session))
-        params.extend(
-            _session_scope_params(
-                session_id, channel_id, cross_session=cross_session
-            )
-        )
-    elif author_id or author_type:
-        clauses.append("(1=1)")
-    else:
-        clauses.append(_session_scope_filter(cross_session=cross_session))
-        params.extend(
-            _session_scope_params(session_id, cross_session=cross_session)
-        )
+    scope_clause, scope_params = _recall_scope_where(
+        session_id=session_id, cross_session=cross_session,
+        author_id=author_id, author_type=author_type, channel_id=channel_id,
+    )
+    clauses.append(scope_clause)
+    params.extend(scope_params)
     if from_date:
         clauses.append("timestamp >= ?")
         params.append(f"{from_date}T00:00:00")
@@ -10989,7 +11036,7 @@ class BeamMemory:
     # so entries cached under an older digest are not reused. Part of the
     # hashed payload; the opaque key keeps the "v2:" prefix because QueryCache's
     # opaque-path recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 10
+    _ENHANCED_RECALL_CACHE_VERSION = 12
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.
@@ -11645,9 +11692,7 @@ class BeamMemory:
         query_embedding = None
         if _embeddings.available():
             try:
-                vecs = _embeddings.embed([query])
-                if vecs is not None and len(vecs) > 0:
-                    query_embedding = vecs[0]
+                query_embedding = _embeddings.embed_query(query)
             except Exception:
                 query_embedding = None
 
@@ -11666,6 +11711,10 @@ class BeamMemory:
             veracity=veracity,
             memory_type=memory_type,
         )
+        scope_where, scope_params = _polyphonic_scope_where(
+            session_id=self.session_id, cross_session=cross_session,
+            author_id=author_id, author_type=author_type, channel_id=channel_id,
+        )
         try:
             polyphonic_results = engine.recall(
                 query=query,
@@ -11682,6 +11731,8 @@ class BeamMemory:
                 topic=topic,
                 episodic_where=em_where,
                 episodic_params=em_params,
+                scope_where=scope_where,
+                scope_params=scope_params,
                 # Shared revocable ownership contract; the engine removes
                 # proven WM contributions before limits/dedup/fusion.
                 **(
@@ -11780,19 +11831,10 @@ class BeamMemory:
         # in-loop construction this commit removed was reinforcing the
         # gap; rebuilding from `final` post-dedup is the right shape, so
         # add the scope guard here too.
-        if channel_id:
-            rec_scope = _session_scope_filter("channel_id", cross_session=cross_session)
-        elif author_id or author_type:
-            rec_scope = "(1=1)"
-        else:
-            rec_scope = _session_scope_filter(cross_session=cross_session)
-
-        def _rec_scope_params() -> List:
-            if channel_id:
-                return _session_scope_params(self.session_id, channel_id, cross_session=cross_session)
-            if author_id or author_type:
-                return []
-            return _session_scope_params(self.session_id, cross_session=cross_session)
+        rec_scope, rec_scope_params = _recall_scope_where(
+            session_id=self.session_id, cross_session=cross_session,
+            author_id=author_id, author_type=author_type, channel_id=channel_id,
+        )
 
         # Update recall_count / last_recalled for engine results too --
         # the linear path updates them and downstream features (decay
@@ -11800,7 +11842,7 @@ class BeamMemory:
         # /review caught the missing update as a silent telemetry loss.
         if _track_recall and recalled_episodic_ids:
             placeholders = ",".join("?" * len(recalled_episodic_ids))
-            params = [now_iso, *recalled_episodic_ids, *_rec_scope_params()]
+            params = [now_iso, *recalled_episodic_ids, *rec_scope_params]
             self.conn.execute(
                 f"UPDATE episodic_memory SET recall_count = recall_count + 1, "
                 f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
@@ -11808,7 +11850,7 @@ class BeamMemory:
             )
         if _track_recall and recalled_working_ids:
             placeholders = ",".join("?" * len(recalled_working_ids))
-            params = [now_iso, *recalled_working_ids, *_rec_scope_params()]
+            params = [now_iso, *recalled_working_ids, *rec_scope_params]
             self.conn.execute(
                 f"UPDATE working_memory SET recall_count = recall_count + 1, "
                 f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",

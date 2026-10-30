@@ -2566,6 +2566,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # per-agent correct even when construction runs outside turn scope).
         init_home = kwargs.get("hermes_home") or None
         self.__dict__["_init_home"] = init_home
+        self._hermes_home = kwargs.get("hermes_home", "")
         # Resolve isolation before the first slot write: the active profile is
         # part of the binding key for same-home multiplexing (#1188).
         self._profile_isolation_enabled = self._resolve_profile_isolation(kwargs)
@@ -2601,7 +2602,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if _prev_active and _prev_active != self._active_session_id:
             self._verbatim_ledger.reset_session(_prev_active)
         self._platform = kwargs.get("platform", "cli")
-        self._hermes_home = kwargs.get("hermes_home", "")
         # An unknown memory.mnemosyne.tools name must fail init loudly (#1063)
         # instead of waiting for the first tool-list/tool-call request. On
         # failure, release the active registration and backend lease the

@@ -752,6 +752,10 @@ class TestPolyphonicFallbackDiagnostics:
             "mnemosyne.core.embeddings.embed",
             lambda texts: np.ones((len(texts), 384), dtype=np.float32),
         )
+        monkeypatch.setattr(
+            "mnemosyne.core.embeddings.embed_query",
+            lambda text: np.ones(384, dtype=np.float32),
+        )
         beam = BeamMemory(session_id="poly-e2e", db_path=temp_db)
         beam.remember("Alice prefers Vim", source="pref", importance=0.7)
         # Seed an embedding-backed EPISODIC memory so the degraded
@@ -833,6 +837,10 @@ class TestPolyphonicFallbackDiagnostics:
         monkeypatch.setattr(
             "mnemosyne.core.embeddings.embed",
             lambda texts: np.ones((len(texts), 384), dtype=np.float32),
+        )
+        monkeypatch.setattr(
+            "mnemosyne.core.embeddings.embed_query",
+            lambda text: np.ones(384, dtype=np.float32),
         )
         results = beam.recall("Alice", top_k=10)
         snap = get_recall_diagnostics()
