@@ -71,6 +71,15 @@ def test_direct_denial_precedes_pending_argument_and_home_resolution(tmp_path, p
 
 
 @pytest.mark.parametrize("package", ["hermes_memory_provider", "mnemosyne_hermes"])
+def test_public_denial_precedes_home_arguments_and_file_access(tmp_path, package):
+    """Removing the public guard must expose premature processing, even if a later gate rejects."""
+    result = run_worker(tmp_path, package, "public_early")
+    assert result["response"]["status"] == "approval_required", result
+    assert result["response"]["error"] == "agent_pending_replay_disabled", result
+    assert result["accesses"] == {"home": 0, "arguments": 0, "files": 0}, result
+
+
+@pytest.mark.parametrize("package", ["hermes_memory_provider", "mnemosyne_hermes"])
 def test_staging_does_not_instruct_the_agent_to_self_apply(tmp_path, package):
     """Remember and batch responses must not advertise the forbidden replay."""
     result = run_worker(tmp_path, package, "messages")

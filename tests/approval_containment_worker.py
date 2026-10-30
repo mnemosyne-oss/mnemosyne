@@ -1,11 +1,14 @@
 """Subprocess harness; no model, host UI or production memory is accessed."""
 
+import builtins
+from contextlib import ExitStack
 import importlib
 import json
 import os
 from pathlib import Path
 import sys
 import types
+from unittest.mock import patch
 
 
 root, package, mode = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
@@ -117,6 +120,56 @@ elif mode == "early":
         raise AssertionError("blocked replay attempted to resolve a pending home")
     host.get_hermes_home = unavailable_home
     output = json.loads(p._handle_apply_pending(None))
+elif mode == "public_early":
+    p = module.MnemosyneMemoryProvider()
+    accesses = {"home": 0, "arguments": 0, "files": 0}
+    original_home = host.get_hermes_home
+
+    def counted_home():
+        """Observe any home resolution after entering the public boundary."""
+        accesses["home"] += 1
+        return original_home()
+
+    class CountedArgs(dict):
+        """Observe argument inspection without changing ordinary dict results."""
+
+        def get(self, *args):
+            accesses["arguments"] += 1
+            return dict.get(self, *args)
+
+        def __getitem__(self, key):
+            accesses["arguments"] += 1
+            return dict.__getitem__(self, key)
+
+        def __iter__(self):
+            accesses["arguments"] += 1
+            return dict.__iter__(self)
+
+        def __len__(self):
+            accesses["arguments"] += 1
+            return dict.__len__(self)
+
+        def __bool__(self):
+            accesses["arguments"] += 1
+            return dict.__len__(self) != 0
+
+    def counted_file(operation):
+        """Record forbidden filesystem access while preserving its result."""
+        def call(*args, **kwargs):
+            accesses["files"] += 1
+            return operation(*args, **kwargs)
+        return call
+
+    host.get_hermes_home = counted_home
+    args = CountedArgs({"pending_ids": ["not-a-pending-record"]})
+    with ExitStack() as stack:
+        for owner, name in (
+            (builtins, "open"), (os, "open"), (Path, "open"),
+            (Path, "read_text"), (Path, "stat"),
+        ):
+            stack.enter_context(patch.object(owner, name, counted_file(getattr(owner, name))))
+        raw = p.handle_tool_call("mnemosyne_apply_pending", args)
+    output = {"response": json.loads(raw), "accesses": accesses}
 elif mode == "messages":
     p = provider("a")
     remember = json.loads(p.handle_tool_call("mnemosyne_remember", {"content": "quasar cobalt staging"}))
