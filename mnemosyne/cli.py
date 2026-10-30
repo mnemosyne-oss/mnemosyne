@@ -1254,8 +1254,12 @@ def cmd_verify(args):
     try:
         if quick:
             import sqlite3
+            from mnemosyne.dr.recovery import _sqlite_ro_uri
             db = db_path or Path(DATA_DIR) / "mnemosyne.db"
-            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            if not db.is_file():
+                print(f"Error: verify_failed — database not found: {db}")
+                sys.exit(1)
+            conn = sqlite3.connect(_sqlite_ro_uri(db), uri=True)
             cursor = conn.cursor()
             cursor.execute("PRAGMA quick_check")
             result = cursor.fetchone()

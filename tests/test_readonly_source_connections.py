@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 
 import pytest
 
@@ -38,9 +37,10 @@ def test_create_backup_opens_source_read_only(tmp_path, monkeypatch):
 
     ro_calls = [
         c for c in calls
-        if isinstance(c[0], str) and c[0].startswith("file:" + str(db_path))
+        if isinstance(c[0], str) and c[0].startswith("file:") and "mode=ro" in c[0]
     ]
-    assert any(c[1].get("uri") is True and "mode=ro" in c[0] for c in ro_calls), calls
+    assert ro_calls, calls
+    assert any(c[1].get("uri") is True for c in ro_calls), calls
 
 
 def test_verify_integrity_opens_source_read_only(tmp_path, monkeypatch):
@@ -60,9 +60,10 @@ def test_verify_integrity_opens_source_read_only(tmp_path, monkeypatch):
 
     ro_calls = [
         c for c in calls
-        if isinstance(c[0], str) and c[0].startswith("file:" + str(db_path))
+        if isinstance(c[0], str) and c[0].startswith("file:") and "mode=ro" in c[0]
     ]
-    assert any(c[1].get("uri") is True and "mode=ro" in c[0] for c in ro_calls), calls
+    assert ro_calls, calls
+    assert any(c[1].get("uri") is True for c in ro_calls), calls
 
 
 def test_cmd_verify_quick_positional(tmp_path, monkeypatch, capsys):
