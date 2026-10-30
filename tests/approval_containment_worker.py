@@ -13,6 +13,7 @@ options = json.loads(sys.argv[4])
 approval = {"value": True}
 host = types.ModuleType("hermes_constants")
 host.get_hermes_home = lambda: Path(os.environ["HERMES_HOME"])
+host.hermes_home_key = lambda home=None: str(Path(home or host.get_hermes_home()).resolve())
 cli = types.ModuleType("hermes_cli")
 cli.__path__ = []
 config = types.ModuleType("hermes_cli.config")
@@ -53,8 +54,15 @@ def pending_snapshot():
     return {str(p.relative_to(root)): p.read_bytes().hex() for p in root.glob("*/pending/memory/*") if p.is_file()}
 
 
-def contents(p):
-    return [r[0] for r in p._beam.conn.execute("SELECT content FROM working_memory ORDER BY content")]
+def contents(p, name):
+    """Read through the matching home binding, never an ambient fallback."""
+    home = root / name
+    os.environ["HERMES_HOME"] = str(home)
+    os.environ["MNEMOSYNE_DATA_DIR"] = str(home / "data")
+    beam = p._beam
+    assert beam is not None
+    assert Path(beam.db_path).resolve().is_relative_to(home.resolve())
+    return [r[0] for r in beam.conn.execute("SELECT content FROM working_memory ORDER BY content")]
 
 
 def found(p, term):
@@ -81,7 +89,7 @@ if mode == "deny":
     args = {"pending_ids": ",".join(ids) if options["comma_ids"] else ids}
     raw = a._handle_apply_pending(args) if options["direct"] else a.handle_tool_call("mnemosyne_apply_pending", args)
     output = {"response": json.loads(raw), "pending_unchanged": pending_snapshot() == snapshot,
-              "a_contents": contents(a), "b_contents": contents(b)}
+              "a_contents": contents(a, "a"), "b_contents": contents(b, "b")}
 elif mode == "restart":
     a = provider("a")
     a_found = found(a, "quasar cobalt")

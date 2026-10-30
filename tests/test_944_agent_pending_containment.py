@@ -38,7 +38,8 @@ def run_worker(tmp_path, package, mode, **values):
 def test_agent_apply_preserves_both_homes_and_restart(tmp_path, package, direct, comma_ids):
     """Removing the handler/dispatch guard would commit and consume proposals."""
     result = run_worker(tmp_path, package, "deny", direct=direct, comma_ids=comma_ids)
-    assert result["response"].get("error"), result
+    assert result["response"]["status"] == "approval_required", result
+    assert result["response"]["error"] == "agent_pending_replay_disabled", result
     assert result["pending_unchanged"] is True
     assert result["a_contents"] == ["original seed remains unchanged"]
     assert result["b_contents"] == []
@@ -65,7 +66,8 @@ def test_approval_off_replay_still_commits_existing_record(tmp_path, package):
 def test_direct_denial_precedes_pending_argument_and_home_resolution(tmp_path, package):
     """Malformed arguments must not bypass denial or enter file processing."""
     result = run_worker(tmp_path, package, "early")
-    assert result.get("error"), result
+    assert result["status"] == "approval_required", result
+    assert result["error"] == "agent_pending_replay_disabled", result
 
 
 @pytest.mark.parametrize("package", ["hermes_memory_provider", "mnemosyne_hermes"])
