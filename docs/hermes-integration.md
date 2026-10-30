@@ -611,6 +611,16 @@ Only add `--apply` after reviewing the report and dry-run output. Repair require
 
 ## How It Works
 
+### Pending-write approval boundary
+
+When Hermes `memory.write_approval` resolves to enabled, remember/batch proposals
+stay pending. Both providers hide `mnemosyne_apply_pending` and deny even direct
+agent replay before pending files are accessed. This temporary #944 containment
+does not implement trusted human approval or cover every durable mutation tool.
+Disabling approval restores agent writes and compatibility replay; it must not
+be presented as a human approval action. See the integration README's
+[containment limits](../integrations/hermes/README.md#pending-write-containment).
+
 Mnemosyne hooks into the Hermes agent lifecycle:
 
 | Hook | Behavior |

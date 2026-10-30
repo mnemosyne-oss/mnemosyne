@@ -866,10 +866,9 @@ APPLY_PENDING_SCHEMA = {
     "name": "mnemosyne_apply_pending",
     "description": (
         "Commit staged pending memory writes to Mnemosyne. "
-        "When memory.write_approval is enabled, calls to mnemosyne_remember "
-        "and mnemosyne_batch are staged to pending/memory/ instead of "
-        "written directly. This tool replays approved pending records "
-        "through the BEAM write path, committing them to the database."
+        "Available only when memory.write_approval is disabled. "
+        "When approval is enabled, agent-side replay is rejected and pending "
+        "records remain unchanged. This tool is not a trusted human approval path."
     ),
     "parameters": {
         "type": "object",

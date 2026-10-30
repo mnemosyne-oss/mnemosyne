@@ -427,6 +427,21 @@ pipx install -e integrations/hermes   # replaces hook with editable path
 
 ## Configuration
 
+### Pending-write containment
+
+With Hermes `memory.write_approval: true`, `mnemosyne_remember` and
+`mnemosyne_batch` stage proposals. The model cannot apply them: both Hermes
+providers omit `mnemosyne_apply_pending` from tool discovery and reject normal
+or direct replay calls before accessing pending files. Proposals remain pending
+and are not available through ordinary memory recall until committed.
+
+This is temporary containment for #944, not a working human approval UI. No
+authenticated human replay path is supplied here. Do not turn approval off as
+an approval step: doing so re-enables agent writes and compatibility replay.
+Existing configuration-resolution behavior and other durable mutation tools
+are unchanged; this does not guarantee approval of every persistent change.
+
+
 No required config. Everything defaults to `~/.mnemosyne/`. Optional overrides:
 
 | Variable | Default | Description |

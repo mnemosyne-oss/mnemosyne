@@ -59,6 +59,25 @@ def _write_approval_enabled() -> bool:
         return False
 
 
+def _agent_pending_replay_error() -> Optional[str]:
+    """Deny agent replay before touching pending records (#944).
+
+    No host-authenticated human replay capability exists on this tool path.
+    Approval-OFF replay retains its existing compatibility behavior.
+    """
+    if not _write_approval_enabled():
+        return None
+    return json.dumps({
+        "status": "approval_required",
+        "error": "agent_pending_replay_disabled",
+        "message": (
+            "Pending writes require trusted human approval. Agent-side replay "
+            "is disabled while memory.write_approval is enabled; "
+            "pending records are unchanged."
+        ),
+    })
+
+
 def _stage_pending_write(payload: Dict[str, Any],
                          session_scope: Optional[str] = None,
                          channel_scope: Optional[str] = None) -> str:
@@ -1121,10 +1140,9 @@ APPLY_PENDING_SCHEMA = {
     "name": "mnemosyne_apply_pending",
     "description": (
         "Commit staged pending memory writes to Mnemosyne. "
-        "When memory.write_approval is enabled, calls to mnemosyne_remember "
-        "and mnemosyne_batch are staged to pending/memory/ instead of "
-        "written directly. This tool replays approved pending records "
-        "through the BEAM write path, committing them to the database."
+        "Available only when memory.write_approval is disabled. "
+        "When approval is enabled, agent-side replay is rejected and pending "
+        "records remain unchanged. This tool is not a trusted human approval path."
     ),
     "parameters": {
         "type": "object",
@@ -2108,10 +2126,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         strings instead of YAML ``null``.
         """
         configured = self._read_config_key("tools")
-        if configured is None:
-            return list(ALL_TOOL_SCHEMAS)
-        if isinstance(configured, str) and configured.strip().lower() in ("", "none", "null"):
-            return list(ALL_TOOL_SCHEMAS)
+        if configured is None or (
+            isinstance(configured, str) and configured.strip().lower() in ("", "none", "null")
+        ):
+            configured = [schema["name"] for schema in ALL_TOOL_SCHEMAS]
         if isinstance(configured, str):
             configured = [name.strip() for name in configured.replace(",", "\n").split("\n") if name.strip()]
         if not isinstance(configured, list):
@@ -2123,7 +2141,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             known = ", ".join(sorted(available))
             bad = ", ".join(str(name) for name in unknown)
             raise ValueError(f"Unknown Mnemosyne tool(s) in memory.mnemosyne.tools: {bad}. Known tools: {known}")
-        return [available[name] for name in configured]
+        replay_blocked = _agent_pending_replay_error() is not None
+        return [
+            available[name] for name in configured
+            if not (replay_blocked and name == "mnemosyne_apply_pending")
+        ]
 
     def _configured_tool_names(self) -> Set[str]:
         return {schema["name"] for schema in self._configured_tool_schemas()}
@@ -2925,6 +2947,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         return self._configured_tool_schemas()
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        if tool_name == "mnemosyne_apply_pending":
+            denial = _agent_pending_replay_error()
+            if denial is not None:
+                return denial
         # Keep the live Beam stable for the entire operation. In particular,
         # callbacks must not observe the temporary scope used by pending replay.
         with self._ensure_beam_access_lock():
@@ -3144,7 +3170,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "status": "staged",
                 "pending_id": pid,
                 "content_preview": content[:100],
-                "message": "Write staged for approval. Use mnemosyne_apply_pending to commit.",
+                "message": "Write staged for human review; it has not been committed. Agent-side approval is unavailable.",
             })
 
         memory_id = self._beam.remember(
@@ -3219,7 +3245,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     "count": 0,
                     "filtered_count": len(results),
                     "results": results,
-                    "message": "0 writes staged for approval. Use mnemosyne_apply_pending to commit.",
+                    "message": "0 writes staged for human review; they have not been committed. Agent-side approval is unavailable.",
                 })
             staged = []
             staged_actions = []
@@ -3273,7 +3299,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "count": len(staged),
                 "filtered_count": len(results) - len(staged),
                 "results": results,
-                "message": f"{len(staged)} writes staged for approval. Use mnemosyne_apply_pending to commit.",
+                "message": f"{len(staged)} writes staged for human review; they have not been committed. Agent-side approval is unavailable.",
             })
 
         return json.dumps(apply_beam_batch(
@@ -4047,9 +4073,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _handle_apply_pending(self, args: Dict[str, Any]) -> str:
         """Replay staged pending mutations through the BEAM write path.
 
-        Calls Beam methods directly, bypassing the write_approval gate so
-        approved records are committed without re-staging.
+        Agent replay is disabled while write approval is enabled. With
+        approval off, existing records replay without re-staging.
         """
+        denial = _agent_pending_replay_error()
+        if denial is not None:
+            return denial
         from hermes_constants import get_hermes_home
         from mnemosyne.core.veracity_consolidation import clamp_veracity
 

@@ -22,6 +22,7 @@ import json
 import sqlite3
 import sys
 import types
+from unittest.mock import patch
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -174,9 +175,11 @@ def test_replay_restores_the_staging_session_not_the_active_one(monkeypatch, tmp
 
         # Session switch before the approval arrives.
         b = _provider(module, tmp_path, "sess-b")
-        applied = json.loads(b.handle_tool_call(
-            "mnemosyne_apply_pending", {"pending_ids": [pid]}
-        ))
+        # Compatibility replay is explicitly approval-OFF; this is not human approval.
+        with patch.object(module, "_write_approval_enabled", return_value=False):
+            applied = json.loads(b.handle_tool_call(
+                "mnemosyne_apply_pending", {"pending_ids": [pid]}
+            ))
     print("apply result:", applied)
 
     db = tmp_path / "mnemosyne-data" / "private" / "mnemosyne.db"
@@ -265,9 +268,11 @@ def test_redirected_replay_binds_every_action_to_the_staging_session(
 
         # Session switch before the approval arrives.
         b = _provider(module, tmp_path, "sess-b")
-        applied = json.loads(b.handle_tool_call(
-            "mnemosyne_apply_pending", {"pending_ids": pids}
-        ))
+        # Compatibility replay is explicitly approval-OFF; this is not human approval.
+        with patch.object(module, "_write_approval_enabled", return_value=False):
+            applied = json.loads(b.handle_tool_call(
+                "mnemosyne_apply_pending", {"pending_ids": pids}
+            ))
         print(f"{action} apply result:", applied)
 
     assert applied["applied_count"] == 1, applied
