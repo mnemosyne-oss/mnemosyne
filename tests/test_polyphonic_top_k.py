@@ -59,16 +59,18 @@ def test_polyphonic_recall_returns_full_top_k(beam, seed, tier, top_k):
 
 
 @pytest.mark.parametrize("top_k", [1, 50, ELIGIBLE])
-def test_memoria_supplement_stays_within_top_k(beam, monkeypatch, top_k):
+def test_memoria_supplement_does_not_displace_memories(beam, monkeypatch, top_k):
+    # The MEMORIA entry is added on top of the top_k memories. It has no
+    # relevance check yet, so letting it take a slot would drop a real match.
     _seed_working(beam)
     monkeypatch.setattr(beam, "memoria_retrieve",
                         lambda query, top_k: {"source": "facts", "context": "record0 is alpha0"})
     results = beam.recall("unrelated opaque query", top_k=top_k)
-    assert len(results) == top_k
     assert results[0]["tier"] == "memoria"
+    assert [r["tier"] for r in results[1:]] == ["working"] * top_k
     # Only memories that are returned get credited with a recall.
     credited = beam.conn.execute("SELECT COALESCE(SUM(recall_count), 0) FROM working_memory").fetchone()[0]
-    assert credited == top_k - 1
+    assert credited == top_k
 
 
 def _reference_diversity_rerank(results, top_k):
