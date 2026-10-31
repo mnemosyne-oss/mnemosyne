@@ -11844,22 +11844,20 @@ class BeamMemory:
         # the linear path updates them and downstream features (decay
         # scheduling, importance reinforcement) depend on the signal.
         # /review caught the missing update as a silent telemetry loss.
-        if _track_recall and recalled_episodic_ids:
-            placeholders = ",".join("?" * len(recalled_episodic_ids))
-            params = [now_iso, *recalled_episodic_ids, *rec_scope_params]
-            self.conn.execute(
-                f"UPDATE episodic_memory SET recall_count = recall_count + 1, "
-                f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
-                tuple(params),
-            )
-        if _track_recall and recalled_working_ids:
-            placeholders = ",".join("?" * len(recalled_working_ids))
-            params = [now_iso, *recalled_working_ids, *rec_scope_params]
-            self.conn.execute(
-                f"UPDATE working_memory SET recall_count = recall_count + 1, "
-                f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
-                tuple(params),
-            )
+        # Chunked like hydration: a large top_k can pass SQLite's 999-variable
+        # limit, and the timestamp and scope parameters share that budget.
+        id_chunk = 900 - len(rec_scope_params)
+        tracked = ((("episodic_memory", recalled_episodic_ids),
+                    ("working_memory", recalled_working_ids)) if _track_recall else ())
+        for table, ids in tracked:
+            for offset in range(0, len(ids), id_chunk):
+                chunk = ids[offset:offset + id_chunk]
+                placeholders = ",".join("?" * len(chunk))
+                self.conn.execute(
+                    f"UPDATE {table} SET recall_count = recall_count + 1, "
+                    f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
+                    (now_iso, *chunk, *rec_scope_params),
+                )
         if _track_recall and (recalled_episodic_ids or recalled_working_ids):
             self.conn.commit()
 

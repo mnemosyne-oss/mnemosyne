@@ -69,8 +69,9 @@ def test_memoria_supplement_does_not_displace_memories(beam, monkeypatch, top_k)
     assert results[0]["tier"] == "memoria"
     assert [r["tier"] for r in results[1:]] == ["working"] * top_k
     # Only memories that are returned get credited with a recall.
-    credited = beam.conn.execute("SELECT COALESCE(SUM(recall_count), 0) FROM working_memory").fetchone()[0]
-    assert credited == top_k
+    credited = dict(beam.conn.execute(
+        "SELECT id, recall_count FROM working_memory WHERE recall_count > 0").fetchall())
+    assert credited == {r["id"]: 1 for r in results[1:]}
 
 
 def _reference_diversity_rerank(results, top_k):
@@ -135,3 +136,27 @@ def test_content_hydration_stays_under_sqlite_variable_limit(beam):
     PolyphonicRecallEngine(db_path=beam.db_path, conn=beam.conn)._hydrate_result_content(results)
 
     assert all(r.content == _distinct(i) for i, r in enumerate(results.values()))
+
+
+def test_recall_tracking_stays_under_sqlite_variable_limit(beam):
+    # Distinct rows, so all of them survive the re-rank and reach the
+    # recall_count UPDATE; duplicates would be dropped before it.
+    if not hasattr(beam.conn, "setlimit"):  # Python 3.11+
+        pytest.skip("needs Connection.setlimit")
+    count = 1000
+    vec = bm._embeddings.embed_query("unrelated opaque query")
+    beam.conn.executemany(
+        "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, scope) "
+        "VALUES (?, ?, 'user', datetime('now'), 'top-k-session', 0.5, 'session')",
+        [(f"m{i}", _distinct(i)) for i in range(count)],
+    )
+    for i in range(count):
+        bm._store_working_embedding(beam.conn, f"m{i}", vec)
+    beam.conn.commit()
+    beam.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+
+    results = beam.recall("unrelated opaque query", top_k=count)
+
+    assert len(results) == count
+    credited = dict(beam.conn.execute("SELECT id, recall_count FROM working_memory").fetchall())
+    assert credited == {r["id"]: 1 for r in results}
