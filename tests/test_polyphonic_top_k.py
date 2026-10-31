@@ -169,14 +169,31 @@ def test_recall_tracking_stays_under_sqlite_variable_limit(beam):
     assert credited == {r["id"]: 1 for r in results}
 
 
+def _record_id_lookups(monkeypatch):
+    # The rows these lookups return can also arrive on the results, so a
+    # lookup that silently returned nothing would still pass a result check.
+    lookups = []
+    real = bm._select_by_ids
+
+    def record(conn, select, ids):
+        rows = real(conn, select, ids)
+        lookups.append((select, len(ids), len(rows)))
+        return rows
+
+    monkeypatch.setattr(bm, "_select_by_ids", record)
+    return lookups
+
+
 def test_enhanced_recall_weibull_stays_under_sqlite_variable_limit(beam, monkeypatch):
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     _seed_large_working_under_limit(beam)
+    lookups = _record_id_lookups(monkeypatch)
 
     results = beam.recall_enhanced("unrelated opaque query", top_k=LARGE, use_cache=False,
                                    use_mmr=False, use_intent=False, use_synonyms=False)
 
     assert len({r["id"] for r in results}) == LARGE
+    assert ("SELECT id, memory_type FROM working_memory WHERE id IN", LARGE, LARGE) in lookups
 
 
 def test_cross_tier_dedup_stays_under_sqlite_variable_limit(beam):
@@ -198,12 +215,29 @@ def test_cross_tier_dedup_stays_under_sqlite_variable_limit(beam):
     assert [r["id"] for r in kept] == [r["id"] for r in results if r["id"] != "w-covered"]
 
 
-def test_evidence_pack_stays_under_sqlite_variable_limit(beam):
+def test_evidence_pack_stays_under_sqlite_variable_limit(beam, monkeypatch):
     _seed_large_working_under_limit(beam)
+    lookups = _record_id_lookups(monkeypatch)
 
     pack = beam.recall_with_evidence_pack("unrelated opaque query", top_k=10,
                                           candidate_k=LARGE, pack_k=5)
 
     assert len(pack["primary"]) == 10
-    # Session ids come from the per-tier lookup over every candidate.
-    assert {r.get("session_id") for r in pack["primary"]} == {"top-k-session"}
+    # Every candidate is checked for consolidation and given its session.
+    assert ("SELECT id, consolidated_at FROM working_memory WHERE id IN", LARGE, LARGE) in lookups
+    assert ("SELECT id, session_id FROM working_memory WHERE id IN", LARGE, LARGE) in lookups
+
+
+@pytest.mark.parametrize("top_k", [20, 50])
+def test_temporal_voice_supplies_full_top_k_without_embeddings(beam, monkeypatch, top_k):
+    # With no embedding backend the temporal voice is the only source for a
+    # time-worded query, so its own limit decides how many rows come back.
+    monkeypatch.setattr(bm._embeddings, "available", lambda: False)
+    monkeypatch.setenv("MNEMOSYNE_VOICE_VECTOR", "0")
+    monkeypatch.delenv("MNEMOSYNE_VOICE_TEMPORAL", raising=False)
+    _seed_working(beam)
+
+    results = beam.recall("what happened today", top_k=top_k)
+
+    assert len({r["id"] for r in results}) == top_k
+    assert {r["tier"] for r in results} == {"working"}

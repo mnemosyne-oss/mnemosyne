@@ -222,7 +222,7 @@ class PolyphonicRecallEngine:
                     and result.metadata.get("embedding_tier") == "episodic"):
                 result.metadata["_self_echo_tier"] = "episodic"
         temporal_results = self._temporal_voice(
-            query, scope_where=scope_where, scope_params=scope_params,
+            query, scope_where=scope_where, scope_params=scope_params, limit=voice_limit,
             **({"excluded_wm_ids": excluded} if excluded else {})
         )
         combined = self._combine_voices(
@@ -952,7 +952,8 @@ class PolyphonicRecallEngine:
     
     def _temporal_voice(self, query: str, excluded_wm_ids=None,
                         scope_where: Optional[str] = None,
-                        scope_params: Sequence[Any] = ()) -> List[RecallResult]:
+                        scope_params: Sequence[Any] = (),
+                        limit: int = 20) -> List[RecallResult]:
         """
         Voice 4: Time-aware scoring.
 
@@ -1025,8 +1026,8 @@ class PolyphonicRecallEngine:
                 FROM working_memory
                 WHERE julianday(timestamp) > julianday(?) {echo_clause}
                 ORDER BY julianday(timestamp) DESC
-                LIMIT 20
-            """, (week_ago, *echo_params))
+                LIMIT ?
+            """, (week_ago, *echo_params, limit))
 
             results = []
             for row in cursor.fetchall():
