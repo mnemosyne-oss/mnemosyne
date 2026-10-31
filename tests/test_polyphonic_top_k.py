@@ -138,25 +138,72 @@ def test_content_hydration_stays_under_sqlite_variable_limit(beam):
     assert all(r.content == _distinct(i) for i, r in enumerate(results.values()))
 
 
-def test_recall_tracking_stays_under_sqlite_variable_limit(beam):
+LARGE = 1000
+
+
+def _seed_large_working_under_limit(beam):
     # Distinct rows, so all of them survive the re-rank and reach the
-    # recall_count UPDATE; duplicates would be dropped before it.
+    # per-result queries; duplicates would be dropped before them.
     if not hasattr(beam.conn, "setlimit"):  # Python 3.11+
         pytest.skip("needs Connection.setlimit")
-    count = 1000
     vec = bm._embeddings.embed_query("unrelated opaque query")
     beam.conn.executemany(
         "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, scope) "
         "VALUES (?, ?, 'user', datetime('now'), 'top-k-session', 0.5, 'session')",
-        [(f"m{i}", _distinct(i)) for i in range(count)],
+        [(f"m{i}", _distinct(i)) for i in range(LARGE)],
     )
-    for i in range(count):
+    for i in range(LARGE):
         bm._store_working_embedding(beam.conn, f"m{i}", vec)
     beam.conn.commit()
     beam.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+
+
+def test_recall_tracking_stays_under_sqlite_variable_limit(beam):
+    count = LARGE
+    _seed_large_working_under_limit(beam)
 
     results = beam.recall("unrelated opaque query", top_k=count)
 
     assert len(results) == count
     credited = dict(beam.conn.execute("SELECT id, recall_count FROM working_memory").fetchall())
     assert credited == {r["id"]: 1 for r in results}
+
+
+def test_enhanced_recall_weibull_stays_under_sqlite_variable_limit(beam, monkeypatch):
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    _seed_large_working_under_limit(beam)
+
+    results = beam.recall_enhanced("unrelated opaque query", top_k=LARGE, use_cache=False,
+                                   use_mmr=False, use_intent=False, use_synonyms=False)
+
+    assert len({r["id"] for r in results}) == LARGE
+
+
+def test_cross_tier_dedup_stays_under_sqlite_variable_limit(beam):
+    if not hasattr(beam.conn, "setlimit"):  # Python 3.11+
+        pytest.skip("needs Connection.setlimit")
+    summary = "ep-summary"
+    beam.conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, summary_of) "
+        "VALUES (?, 'summary', 'user', datetime('now'), 'top-k-session', 'w-covered')", (summary,))
+    beam.conn.commit()
+    beam.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+    results = ([{"id": summary, "tier": "episodic", "score": 0.9},
+                {"id": "w-covered", "tier": "working", "score": 0.1}]
+               + [{"id": f"e{i}", "tier": "episodic", "score": 0.5} for i in range(LARGE)])
+
+    kept = beam._dedup_cross_tier_summary_links(results)
+
+    # The summary outscores its source, so only the covered working row goes.
+    assert [r["id"] for r in kept] == [r["id"] for r in results if r["id"] != "w-covered"]
+
+
+def test_evidence_pack_stays_under_sqlite_variable_limit(beam):
+    _seed_large_working_under_limit(beam)
+
+    pack = beam.recall_with_evidence_pack("unrelated opaque query", top_k=10,
+                                          candidate_k=LARGE, pack_k=5)
+
+    assert len(pack["primary"]) == 10
+    # Session ids come from the per-tier lookup over every candidate.
+    assert {r.get("session_id") for r in pack["primary"]} == {"top-k-session"}

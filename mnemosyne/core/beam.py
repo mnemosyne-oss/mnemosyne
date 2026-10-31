@@ -2630,6 +2630,18 @@ def _deferred_commits(conn: sqlite3.Connection, *, immediate: bool = False):
         conn._defer_commit = previously_deferred
 
 
+def _select_by_ids(conn: sqlite3.Connection, select: str, ids: Sequence[str]) -> List[sqlite3.Row]:
+    """Run ``select`` (ending in ``WHERE id IN``) over ``ids`` in chunks.
+
+    Older SQLite builds allow 999 bound variables, and polyphonic recall can
+    return more results than that for a large top_k.
+    """
+    rows: List[sqlite3.Row] = []
+    for offset in range(0, len(ids), 900):
+        chunk = list(ids[offset:offset + 900])
+        rows.extend(conn.execute(f"{select} ({','.join('?' * len(chunk))})", chunk).fetchall())
+    return rows
+
 def _generate_id(content: str) -> str:
     return hashlib.sha256(f"{content}{datetime.now().isoformat()}".encode()).hexdigest()[:16]
 
@@ -9516,14 +9528,13 @@ class BeamMemory:
             if row.get("tier") == "working" and row.get("id") is not None
         }
         if working_candidate_ids:
-            placeholders = ",".join("?" * len(working_candidate_ids))
             consolidated_ids = {
                 str(row["id"])
-                for row in self.conn.execute(
-                    f"SELECT id FROM working_memory WHERE id IN ({placeholders}) "
-                    "AND consolidated_at IS NOT NULL",
-                    tuple(working_candidate_ids),
-                ).fetchall()
+                for row in _select_by_ids(
+                    self.conn, "SELECT id, consolidated_at FROM working_memory WHERE id IN",
+                    list(working_candidate_ids),
+                )
+                if row["consolidated_at"] is not None
             }
             candidate_rows = [
                 row
@@ -9536,10 +9547,7 @@ class BeamMemory:
             ids = list({str(row["id"]) for row in all_rows if row.get("tier") == tier and row.get("id") is not None})
             if not ids:
                 continue
-            placeholders = ",".join("?" * len(ids))
-            rows = self.conn.execute(
-                f"SELECT id, session_id FROM {table} WHERE id IN ({placeholders})", ids
-            ).fetchall()
+            rows = _select_by_ids(self.conn, f"SELECT id, session_id FROM {table} WHERE id IN", ids)
             sessions.update(
                 {
                     (tier, str(row["id"])): str(row["session_id"])
@@ -11348,21 +11356,9 @@ class BeamMemory:
                 memory_types = {}
                 wm_ids = [r["id"] for r in results if r.get("tier") == "working"]
                 em_ids = [r["id"] for r in results if r.get("tier") == "episodic"]
-                if wm_ids:
-                    placeholders = ",".join("?" * len(wm_ids))
-                    rows = self.conn.execute(
-                        f"SELECT id, memory_type FROM working_memory WHERE id IN ({placeholders})",
-                        wm_ids
-                    ).fetchall()
-                    for row in rows:
-                        memory_types[row["id"]] = row["memory_type"]
-                if em_ids:
-                    placeholders = ",".join("?" * len(em_ids))
-                    rows = self.conn.execute(
-                        f"SELECT id, memory_type FROM episodic_memory WHERE id IN ({placeholders})",
-                        em_ids
-                    ).fetchall()
-                    for row in rows:
+                for table, ids in (("working_memory", wm_ids), ("episodic_memory", em_ids)):
+                    for row in _select_by_ids(
+                            self.conn, f"SELECT id, memory_type FROM {table} WHERE id IN", ids):
                         memory_types[row["id"]] = row["memory_type"]
 
                 from datetime import datetime as _dt
@@ -11520,13 +11516,8 @@ class BeamMemory:
                 if wm_ids:
                     summary_map[ep_id] = wm_ids
         else:
-            placeholders = ",".join("?" * len(ep_ids))
-            cursor = self.conn.cursor()
-            cursor.execute(
-                f"SELECT id, summary_of FROM episodic_memory WHERE id IN ({placeholders})",
-                tuple(ep_ids),
-            )
-            for row in cursor.fetchall():
+            for row in _select_by_ids(
+                    self.conn, "SELECT id, summary_of FROM episodic_memory WHERE id IN", ep_ids):
                 raw = row["summary_of"] or ""
                 wm_ids = {s.strip() for s in raw.split(",") if s.strip()}
                 if wm_ids:
