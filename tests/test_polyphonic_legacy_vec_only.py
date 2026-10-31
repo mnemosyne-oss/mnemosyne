@@ -655,3 +655,13 @@ def test_no_vec_reindex_preserves_unmarked_store(store, monkeypatch):
     ).fetchone()[0]
     assert blob_after == blob_before
     reopened.conn.close()
+
+
+@pytest.mark.parametrize("limit", [20, 25])
+def test_legacy_scan_returns_requested_limit(store, monkeypatch, limit):
+    beam, query, kind = store
+    mids = {_write(beam, monkeypatch, query, f"legacy limit record {i}")[0] for i in range(30)}
+    results = _voice(beam, query, limit=limit)
+    assert len(results) == limit
+    assert {r.memory_id for r in results} <= mids
+    assert {r.metadata["backend"] for r in results} == {"sqlite-vec"}

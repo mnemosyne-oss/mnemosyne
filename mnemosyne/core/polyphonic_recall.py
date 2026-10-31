@@ -12,7 +12,6 @@ Strategies (4 voices):
 Deterministic re-ranker:
 - Combines 4 scores with learned weights
 - No neural network (rule-based weighting)
-- Budget-aware context assembly
 - Diversity penalty (avoid duplicates)
 
 Building on:
@@ -136,7 +135,7 @@ class PolyphonicRecallEngine:
         }
     
     def recall(self, query: str, query_embedding: np.ndarray = None,
-               top_k: int = 10, context_budget: int = 4000,
+               top_k: int = 10,
                *, default_dense_source_filter: bool = True,
                source: Optional[str] = None,
                topic: Optional[str] = None,
@@ -152,7 +151,6 @@ class PolyphonicRecallEngine:
             query: Text query
             query_embedding: Optional pre-computed embedding
             top_k: Number of results to return
-            context_budget: Max tokens for context assembly
             default_dense_source_filter: When True (default), the vector
                 voice's working-memory tier applies the default dense-source
                 predicate (exclude raw dialog / honcho sources and
@@ -194,6 +192,9 @@ class PolyphonicRecallEngine:
                     excluded = resolve_exclusions(conn, exclude_captures)
                 finally:
                     conn.close()
+        # Each voice must be able to supply a full top_k on its own; a fixed
+        # per-voice cap silently short-changes callers asking for more.
+        voice_limit = max(20, top_k)
         graph_results = self._graph_voice(query)
         fact_results = self._fact_voice(query)
         if excluded:
@@ -208,6 +209,7 @@ class PolyphonicRecallEngine:
             topic=topic,
             episodic_where=episodic_where,
             episodic_params=episodic_params,
+            limit=voice_limit,
             scope_where=scope_where,
             scope_params=scope_params,
             **({"excluded_wm_ids": excluded} if excluded else {}),
@@ -232,12 +234,7 @@ class PolyphonicRecallEngine:
         self._hydrate_result_content(combined)
 
         # Diversity re-rank
-        reranked = self._diversity_rerank(combined, top_k)
-
-        # Assemble context within budget
-        context = self._assemble_context(reranked, context_budget)
-        
-        return context
+        return self._diversity_rerank(combined, top_k)
 
     def _legacy_episodic_vector_voice(
         self,
@@ -248,8 +245,9 @@ class PolyphonicRecallEngine:
         topic=None,
         episodic_where=None,
         episodic_params=(),
+        limit=20,
     ):
-        """Scan eligible vec rows, retaining only their top-20 hits."""
+        """Scan eligible vec rows, retaining only their top-``limit`` hits."""
         import heapq
         from mnemosyne.core.beam import (
             EM_VEC_ADMIT,
@@ -323,7 +321,7 @@ class PolyphonicRecallEngine:
                     },
                 )
 
-        return heapq.nlargest(20, candidates(), key=lambda result: result.score)
+        return heapq.nlargest(limit, candidates(), key=lambda result: result.score)
 
     def _vector_voice(
         self,
@@ -334,6 +332,7 @@ class PolyphonicRecallEngine:
         episodic_where: Optional[str] = None,
         episodic_params: Sequence[Any] = (),
         excluded_wm_ids: Optional[Set[str]] = None,
+        limit: int = 20,
         scope_where: Optional[str] = None,
         scope_params: Sequence[Any] = (),
     ) -> List[RecallResult]:
@@ -371,7 +370,7 @@ class PolyphonicRecallEngine:
         Dedups across WM/EM by `memory_id` keeping the
         higher-similarity occurrence -- without this, a memory that
         exists in both tiers post-E3 would be double-counted in RRF
-        and silently cap unique candidates below `top_k=20`.
+        and silently cap unique candidates below `limit`.
 
         A/B toggle: `MNEMOSYNE_VOICE_VECTOR=0` disables this voice for
         ablation experiments. Returns empty so RRF fusion sees no
@@ -472,6 +471,7 @@ class PolyphonicRecallEngine:
                             topic=topic,
                             episodic_where=episodic_where,
                             episodic_params=episodic_params,
+                            limit=limit,
                         )
                         by_id.update((r.memory_id, r) for r in legacy_results)
                         # A successful vec scan is authoritative even when
@@ -624,6 +624,7 @@ class PolyphonicRecallEngine:
                                     topic=topic,
                                     episodic_where=episodic_where,
                                     episodic_params=episodic_params,
+                                    limit=limit,
                                 )
                                 by_id.update(
                                     (r.memory_id, r) for r in exact_results
@@ -821,7 +822,7 @@ class PolyphonicRecallEngine:
             # WM tier always uses numpy cosine today (no sqlite-vec
             # WM index exists), so WM is never a degraded path here.
             self.last_call_fallback["em"] = not em_consumed_via_vec_episodes
-            return results[:20]
+            return results[:limit]
         finally:
             if own_conn:
                 conn.close()
@@ -1127,21 +1128,24 @@ class PolyphonicRecallEngine:
 
         try:
             memory_ids = tuple(results)
-            placeholders = ", ".join("?" for _ in memory_ids)
             for table in ("working_memory", "episodic_memory"):
-                try:
-                    rows = conn.execute(
-                        f"SELECT id, content FROM {table} WHERE id IN ({placeholders})",
-                        memory_ids,
-                    ).fetchall()
-                except sqlite3.OperationalError:
-                    continue
-                for row in rows:
-                    result = results.get(row["id"])
-                    tier = "working" if table == "working_memory" else "episodic"
-                    if (result is not None and not result.content
-                            and result.metadata.get("_self_echo_tier", tier) == tier):
-                        result.content = row["content"] or ""
+                tier = "working" if table == "working_memory" else "episodic"
+                # Chunked under SQLite's bound-variable limit, as the vec scans do.
+                for offset in range(0, len(memory_ids), 900):
+                    chunk = memory_ids[offset : offset + 900]
+                    placeholders = ", ".join("?" for _ in chunk)
+                    try:
+                        rows = conn.execute(
+                            f"SELECT id, content FROM {table} WHERE id IN ({placeholders})",
+                            chunk,
+                        ).fetchall()
+                    except sqlite3.OperationalError:
+                        break
+                    for row in rows:
+                        result = results.get(row["id"])
+                        if (result is not None and not result.content
+                                and result.metadata.get("_self_echo_tier", tier) == tier):
+                            result.content = row["content"] or ""
         finally:
             if own_conn:
                 conn.close()
@@ -1204,20 +1208,29 @@ class PolyphonicRecallEngine:
         )
         
         selected = []
+        # Word sets are built once per selected result: rebuilding them for
+        # every pair made this loop dominate recall at large top_k.
+        selected_words = []
         for result in sorted_results:
             if len(selected) >= top_k:
                 break
             
             # Check diversity against selected
+            words = self._content_words(result)
             is_diverse = True
-            for sel in selected:
-                similarity = self._estimate_similarity(result, sel)
-                if similarity > 0.8:  # Too similar
+            for sel_words in selected_words:
+                # Jaccard can never exceed min/max of the set sizes, and float
+                # division is monotone, so this skip cannot change a verdict.
+                small, large = sorted((len(words), len(sel_words)))
+                if not small or small / large <= 0.8:
+                    continue
+                if self._jaccard(words, sel_words) > 0.8:  # Too similar
                     is_diverse = False
                     break
             
             if is_diverse:
                 selected.append(result)
+                selected_words.append(words)
         
         return selected
     
@@ -1229,40 +1242,18 @@ class PolyphonicRecallEngine:
         dominates the candidate set, causing MMR diversity reranking to
         discard all but one result (#389).
         """
-        content_a = (a.content or a.metadata.get("content") or "").lower().split()
-        content_b = (b.content or b.metadata.get("content") or "").lower().split()
+        return self._jaccard(self._content_words(a), self._content_words(b))
 
-        if not content_a or not content_b:
+    @staticmethod
+    def _content_words(result: PolyphonicResult) -> Set[str]:
+        return set((result.content or result.metadata.get("content") or "").lower().split())
+
+    @staticmethod
+    def _jaccard(set_a: Set[str], set_b: Set[str]) -> float:
+        if not set_a or not set_b:
             return 0.0
-
-        set_a = set(content_a)
-        set_b = set(content_b)
-        intersection = set_a & set_b
-        union = set_a | set_b
-
-        return len(intersection) / len(union) if union else 0.0
-    
-    def _assemble_context(self, results: List[PolyphonicResult],
-                         budget: int) -> List[PolyphonicResult]:
-        """
-        Assemble context within token budget.
-        
-        Approximate 4 chars per token.
-        """
-        current_chars = 0
-        selected = []
-        
-        for result in results:
-            # Estimate result size
-            result_chars = len(str(result.metadata)) + 100
-            
-            if current_chars + result_chars > budget * 4:
-                break
-            
-            selected.append(result)
-            current_chars += result_chars
-        
-        return selected
+        shared = len(set_a & set_b)
+        return shared / (len(set_a) + len(set_b) - shared)
     
     def get_stats(self) -> Dict:
         """Get engine statistics."""
