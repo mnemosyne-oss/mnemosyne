@@ -164,6 +164,7 @@ mnemosyne store "User likes dark mode"
 mnemosyne recall "preferences"
 mnemosyne stats
 mnemosyne sleep                         # Run consolidation
+mnemosyne diagnose --python /path/to/python  # Check a specific runtime interpreter
 
 # Export / import
 mnemosyne export backup.json

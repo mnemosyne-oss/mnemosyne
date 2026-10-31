@@ -27,13 +27,15 @@ The three flags on `sleep` are parsed but undocumented in the built-in help. `--
 
 | Command | Usage |
 |---|---|
-| `diagnose` | `diagnose [--fix] [--dry-run] [--repair-vec-working]`. PII-safe. `--fix` installs missing dependencies |
+| `diagnose` | `diagnose [--python PATH] [--fix] [--dry-run] [--repair-vec-working]`. PII-safe. `--python` selects the interpreter for runtime checks; `--fix` targets that same interpreter |
 | `doctor` | `doctor [--db PATH \| --bank NAME] [--format json\|markdown\|both]`. Bounded, read-only health report |
 | `repair` | `repair --report REPORT.json --select working_memory:ID [--apply]`. Applies one narrow doctor-gated fix |
 | `verify` | `verify [db_path] [--quick]`. Integrity check |
 | `reindex` | `reindex [--db PATH \| --bank NAME] [--model NAME] [--batch-size N] [--dry-run] [--yes] [--no-backup]`. Re-embeds everything and rebuilds the sqlite-vec tables |
 
 `reindex` is the recovery path for a vector dimension mismatch. It is synchronous, backs up first unless told otherwise, and prompts unless `--yes`. Its `--dry-run` option prints a rebuild plan without writing.
+
+`mnemosyne diagnose --python /path/to/python` runs its runtime, dependency, and capability checks in that exact interpreter. The selected environment must have `mnemosyne-memory` installed; diagnostics use isolated execution, so `PYTHON*` variables and user site-packages do not provide dependencies. Without the option, those checks use the CLI interpreter. Database and integrity checks always use the CLI interpreter. The output includes the runtime-check scope and only the executable basename. If the selected interpreter cannot run Mnemosyne diagnostics, dependency status is unknown and the command does not fall back to the CLI environment. With `--fix`, installations use the selected interpreter's `-m pip`. Each pip installation is limited to 600 seconds; a timeout is reported as a failed repair. A dependency is reported as fixed only after it passes diagnostics again in the selected interpreter.
 
 `--batch-size N` sets the maximum number of source texts embedded per batch for both working and episodic memory (default **64**). For an API endpoint capped at 10 inputs per request, use `mnemosyne reindex --batch-size 8`. Smaller batches do not truncate texts or retry rejected requests. A missing, malformed, zero, or negative value is rejected before target resolution, model setup, database opening, or backup creation, including with `--dry-run`.
 
