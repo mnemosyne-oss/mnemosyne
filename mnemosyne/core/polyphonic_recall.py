@@ -847,13 +847,15 @@ class PolyphonicRecallEngine:
         entities = self._extract_entities(query)
 
         results = []
-        seed_ids = set()
+        # A dict, not a set: seeds are walked in discovery order so the traversal
+        # (and which seed claims a shared neighbour) does not depend on string hashing.
+        seed_ids = {}
         for entity in entities:
             # Find gists mentioning this entity
             gists = self.graph.find_gists_by_participant(entity)
             for gist in gists:
                 gist_mid = gist.id.replace("gist_", "")
-                seed_ids.add(gist_mid)
+                seed_ids[gist_mid] = None
                 results.append(RecallResult(
                     memory_id=gist_mid,
                     score=0.6,  # Base graph score
@@ -865,7 +867,7 @@ class PolyphonicRecallEngine:
             facts = self.graph.find_facts_by_subject(entity)
             for fact in facts:
                 fact_mid = fact.id.split("_")[-1] if "_" in fact.id else fact.id
-                seed_ids.add(fact_mid)
+                seed_ids[fact_mid] = None
                 results.append(RecallResult(
                     memory_id=fact_mid,
                     score=fact.confidence * 0.5,
@@ -1062,7 +1064,7 @@ class PolyphonicRecallEngine:
         import re
         # Simple capitalized word extraction
         entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
-        return list(set(entities))
+        return list(dict.fromkeys(entities))
     
     def _drop_out_of_scope(self, results: Dict[str, PolyphonicResult],
                            scope_where: str, scope_params: Sequence[Any]) -> None:
