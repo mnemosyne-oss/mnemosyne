@@ -11817,6 +11817,28 @@ class BeamMemory:
         # rather than relying on the diversity rerank to handle
         # summary↔source duplicates implicitly.
         final = self._dedup_cross_tier_summary_links(final)
+
+        # --- MEMORIA structured fact supplement (polyphonic path) ---
+        try:
+            _memoria_result = self.memoria_retrieve(query, top_k=3)
+            if _memoria_result and _memoria_result.get("source") != "fallback":
+                _ctx = _memoria_result.get("context", "")
+                if _ctx:
+                    final.insert(0, {
+                        "id": f"memoria_{_memoria_result['source']}",
+                        "content": f"[MEMORIA {_memoria_result['source']}]\n{_ctx}",
+                        "source": f"memoria_{_memoria_result['source']}",
+                        "score": 0.95,
+                        "tier": "memoria",
+                        "fts_score": 0.0,
+                        "dense_score": 0.0,
+                        "importance": 0.9,
+                        "timestamp": "",
+                        "session_id": self.session_id,
+                    })
+        except Exception:
+            logger.info("Regex extraction failed, skipping", exc_info=True)
+
         final = final[:top_k]
         # Rebuild recall_count attribution lists from the deduped final
         # so dropped duplicates aren't credited with a recall.
@@ -11858,27 +11880,6 @@ class BeamMemory:
             )
         if _track_recall and (recalled_episodic_ids or recalled_working_ids):
             self.conn.commit()
-
-        # --- MEMORIA structured fact supplement (polyphonic path) ---
-        try:
-            _memoria_result = self.memoria_retrieve(query, top_k=3)
-            if _memoria_result and _memoria_result.get("source") != "fallback":
-                _ctx = _memoria_result.get("context", "")
-                if _ctx:
-                    final.insert(0, {
-                        "id": f"memoria_{_memoria_result['source']}",
-                        "content": f"[MEMORIA {_memoria_result['source']}]\n{_ctx}",
-                        "source": f"memoria_{_memoria_result['source']}",
-                        "score": 0.95,
-                        "tier": "memoria",
-                        "fts_score": 0.0,
-                        "dense_score": 0.0,
-                        "importance": 0.9,
-                        "timestamp": "",
-                        "session_id": self.session_id,
-                    })
-        except Exception:
-            logger.info("Regex extraction failed, skipping", exc_info=True)
 
         return final
 

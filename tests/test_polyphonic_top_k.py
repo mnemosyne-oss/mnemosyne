@@ -58,6 +58,19 @@ def test_polyphonic_recall_returns_full_top_k(beam, seed, tier, top_k):
     assert {r["tier"] for r in results} == {tier}
 
 
+@pytest.mark.parametrize("top_k", [1, 50, ELIGIBLE])
+def test_memoria_supplement_stays_within_top_k(beam, monkeypatch, top_k):
+    _seed_working(beam)
+    monkeypatch.setattr(beam, "memoria_retrieve",
+                        lambda query, top_k: {"source": "facts", "context": "record0 is alpha0"})
+    results = beam.recall("unrelated opaque query", top_k=top_k)
+    assert len(results) == top_k
+    assert results[0]["tier"] == "memoria"
+    # Only memories that are returned get credited with a recall.
+    credited = beam.conn.execute("SELECT COALESCE(SUM(recall_count), 0) FROM working_memory").fetchone()[0]
+    assert credited == top_k - 1
+
+
 def _reference_diversity_rerank(results, top_k):
     # The pairwise word-Jaccard selection as first written, kept as the oracle
     # for the precomputed-word-set version.
@@ -101,8 +114,6 @@ def test_diversity_rerank_matches_reference(seed):
     assert got == want
 
 
-@pytest.mark.skipif(not hasattr(sqlite3.Connection, "setlimit"),
-                    reason="sqlite3.Connection.setlimit needs Python 3.11+")
 def test_content_hydration_stays_under_sqlite_variable_limit(beam):
     # Older SQLite builds allow 999 bound variables, and a large top_k now lets
     # the vector voice pass more candidates than that. A failed hydration query
@@ -114,7 +125,8 @@ def test_content_hydration_stays_under_sqlite_variable_limit(beam):
         [(mid, _distinct(i)) for i, mid in enumerate(ids)],
     )
     beam.conn.commit()
-    beam.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 1000)
+    if hasattr(beam.conn, "setlimit"):  # Python 3.11+
+        beam.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 1000)
     results = {mid: PolyphonicResult(memory_id=mid, combined_score=0.0, voice_scores={}, metadata={})
                for mid in ids}
 
