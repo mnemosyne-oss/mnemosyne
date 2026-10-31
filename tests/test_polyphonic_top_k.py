@@ -255,3 +255,20 @@ def test_select_by_ids_returns_every_row_across_chunks(beam, count):
     rows = bm._select_by_ids(beam.conn, "SELECT id FROM working_memory WHERE id IN", ids)
 
     assert sorted(r["id"] for r in rows) == sorted(ids)
+
+
+@pytest.mark.parametrize("call", [
+    lambda engine, q, vec: engine.recall(q, vec, 50, 4000),
+    lambda engine, q, vec: engine.recall(q, vec, top_k=50, context_budget=10),
+], ids=["positional", "keyword"])
+def test_context_budget_is_accepted_and_ignored(beam, call):
+    # Older callers still pass it; it no longer trims the results.
+    _seed_working(beam)
+    engine = PolyphonicRecallEngine(db_path=beam.db_path, conn=beam.conn)
+    vec = bm._embeddings.embed_query("unrelated opaque query")
+
+    got = call(engine, "unrelated opaque query", vec)
+    want = engine.recall("unrelated opaque query", vec, top_k=50)
+
+    assert [r.memory_id for r in got] == [r.memory_id for r in want]
+    assert len(got) == 50

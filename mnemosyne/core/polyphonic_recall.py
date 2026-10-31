@@ -135,7 +135,7 @@ class PolyphonicRecallEngine:
         }
     
     def recall(self, query: str, query_embedding: np.ndarray = None,
-               top_k: int = 10,
+               top_k: int = 10, context_budget: int = 4000,
                *, default_dense_source_filter: bool = True,
                source: Optional[str] = None,
                topic: Optional[str] = None,
@@ -151,6 +151,9 @@ class PolyphonicRecallEngine:
             query: Text query
             query_embedding: Optional pre-computed embedding
             top_k: Number of results to return
+            context_budget: Ignored. It used to trim results by metadata
+                size, which could leave fewer than top_k. It stays in the
+                signature so existing callers keep working.
             default_dense_source_filter: When True (default), the vector
                 voice's working-memory tier applies the default dense-source
                 predicate (exclude raw dialog / honcho sources and
