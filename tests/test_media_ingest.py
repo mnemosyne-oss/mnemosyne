@@ -421,6 +421,72 @@ def test_a_backend_that_does_not_serve_the_modality_is_not_called(beam, tmp_path
     assert result.status == "unavailable"
 
 
+def _asset_provenance(beam, asset_id):
+    row = beam.media.get_asset(asset_id)
+    return row["understanding_status"], row["provider"], row["provider_model"]
+
+
+def test_a_successful_ingest_records_provenance_on_the_asset(beam, tmp_path, enabled):
+    _provider(_CAPTION)
+    result = remember_media(beam, ref=str(_png_file(tmp_path)))
+
+    assert _asset_provenance(beam, result.asset_id) == ("ok", "stub", "stub/model")
+    moments = beam.media.get_moments(result.asset_id)
+    assert {(m["provider"], m["provider_model"]) for m in moments} == {
+        ("stub", "stub/model")
+    }
+
+
+def test_a_partial_ingest_records_provenance_on_the_asset(beam, tmp_path, enabled):
+    _provider(DescribeResult(provider="stub", model="stub/model", moments=[
+        DescribedMoment(kind="caption", text="good"),
+        DescribedMoment(kind="caption", text=""),
+    ]))
+    result = remember_media(beam, ref=str(_png_file(tmp_path)))
+
+    assert _asset_provenance(beam, result.asset_id) == ("partial", "stub", "stub/model")
+
+
+@pytest.mark.parametrize("second,status", [
+    (DescribeResult(provider="stub", model="stub/model", refused=True), "refused"),
+    (DescribeResult(provider="stub", model="stub/model"), "unavailable"),
+    (None, "unavailable"),
+])
+def test_an_unsuccessful_ingest_leaves_no_provenance_on_the_asset(
+    beam, tmp_path, enabled, second, status,
+):
+    ref = str(_png_file(tmp_path))
+    _provider(_CAPTION)
+    first = remember_media(beam, ref=ref)
+    assert _asset_provenance(beam, first.asset_id) == ("ok", "stub", "stub/model")
+
+    _provider(second)
+    again = remember_media(beam, ref=ref)
+
+    assert again.asset_id == first.asset_id
+    assert _asset_provenance(beam, again.asset_id) == (status, None, None)
+
+
+def test_no_provider_leaves_no_provenance_on_the_asset(beam, tmp_path):
+    result = remember_media(beam, ref=str(_png_file(tmp_path)))
+    assert _asset_provenance(beam, result.asset_id) == ("unavailable", None, None)
+
+
+def test_a_failed_ingest_leaves_no_provenance_on_the_asset(beam, tmp_path, enabled, monkeypatch):
+    _provider(_CAPTION)
+    monkeypatch.setattr(
+        media, "_bind_moment_memories",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("constraint error")),
+    )
+    with pytest.raises(RuntimeError):
+        remember_media(beam, ref=str(_png_file(tmp_path)))
+
+    rows = beam.conn.execute(
+        "SELECT understanding_status, provider, provider_model FROM media_assets"
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [("unavailable", None, None)]
+
+
 def test_status_is_never_left_pending(beam, tmp_path, enabled, monkeypatch):
     """The `finally` exists because nothing retries a stranded `pending`, and
     doctor would not flag it either."""
@@ -580,6 +646,14 @@ def test_ingest_through_the_real_openai_compat_adapter(beam, tmp_path, monkeypat
 
         assert result.status == "ok"
         assert len(result.memory_ids) == 1
+
+        asset = beam.media.get_asset(result.asset_id)
+        moments = beam.media.get_moments(result.asset_id)
+        assert asset["provider_model"] == "some/vision-model"
+        assert asset["provider"] is not None
+        assert {(m["provider"], m["provider_model"]) for m in moments} == {
+            (asset["provider"], asset["provider_model"])
+        }
 
         # The bytes went out as a data part, since a local path is not fetchable
         # by the provider -- this is the DescribeRequest.fetch path, live.
