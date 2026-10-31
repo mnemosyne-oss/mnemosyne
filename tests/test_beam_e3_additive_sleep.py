@@ -27,6 +27,13 @@ import pytest
 from mnemosyne.core.beam import BeamMemory
 
 
+def _naive_utc_now():
+    """Naive-UTC "now", the shape reclaim_orphans() and the working-memory
+    TTL trim build their cutoffs in. Fixtures compared against those
+    cutoffs must use it; datetime.now() shifts them by the host offset."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 @pytest.fixture
 def temp_db():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -377,7 +384,7 @@ class TestE3AdditiveSleep:
 
         # Backdate the row past the trim cutoff (= WORKING_MEMORY_TTL_HOURS).
         very_old = (
-            datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS + 5)
+            _naive_utc_now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS + 5)
         ).isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.execute(
@@ -452,7 +459,7 @@ class TestE3AdditiveSleep:
     def test_reclaim_orphans_clears_stale_claim_without_summary(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         _seed_old_wm(temp_db, "s1", n=1)
-        stale_claim = (datetime.now() - timedelta(hours=2)).isoformat()
+        stale_claim = (_naive_utc_now() - timedelta(hours=2)).isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.execute(
             "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? WHERE id = ?",
@@ -471,7 +478,7 @@ class TestE3AdditiveSleep:
     def test_reclaim_orphans_preserves_referenced_claims_and_avoids_partial_matches(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
-        stale_claim = (datetime.now() - timedelta(hours=2)).isoformat()
+        stale_claim = (_naive_utc_now() - timedelta(hours=2)).isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.executemany(
             """
@@ -503,8 +510,8 @@ class TestE3AdditiveSleep:
     def test_reclaim_orphans_respects_stale_threshold(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
-        stale_claim = (datetime.now() - timedelta(hours=2)).isoformat()
-        fresh_claim = datetime.now().isoformat()
+        stale_claim = (_naive_utc_now() - timedelta(hours=2)).isoformat()
+        fresh_claim = _naive_utc_now().isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.executemany(
             """
@@ -529,7 +536,7 @@ class TestE3AdditiveSleep:
     def test_reclaim_orphans_dry_run_writes_nothing(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         _seed_old_wm(temp_db, "s1", n=1)
-        stale_claim = (datetime.now() - timedelta(hours=2)).isoformat()
+        stale_claim = (_naive_utc_now() - timedelta(hours=2)).isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.execute(
             "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? WHERE id = ?",
@@ -606,7 +613,7 @@ class TestE3AdditiveSleep:
         )
         beam = BeamMemory(session_id="maintenance", db_path=temp_db)
         _seed_old_wm(temp_db, "s1", n=1)
-        stale_claim = (datetime.now() - timedelta(hours=2)).isoformat()
+        stale_claim = (_naive_utc_now() - timedelta(hours=2)).isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.execute(
             "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? WHERE id = ?",
