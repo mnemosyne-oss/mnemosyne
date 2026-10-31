@@ -641,6 +641,19 @@ mnemosyne doctor --bank default --format both
 mnemosyne repair --report mnemosyne-doctor.json --select working_memory:<ID> --dry-run
 ```
 
+JSON import restores working-memory rows without generating new embeddings or
+rebuilding `vec_working`. When the export contains `legacy_embeddings`, their
+`memory_embeddings` vectors are restored and can serve working-memory vector
+recall through the JSON fallback when the dedicated index yields no candidates.
+Rows without exported vectors need embedding/index generation before dense
+retrieval; linear recall still applies its normal lexical admission rules.
+Episodic embeddings are restored from `episodic_embeddings` when present and
+supported by `sqlite-vec`. Use `mnemosyne store` for new memories. To rebuild
+vectors for existing rows, follow the [`mnemosyne reindex` workflow](cli-reference.md#health-and-repair):
+it re-embeds memories with non-empty content and rebuilds the vector tables. Preview with
+`--dry-run`; run it in the intended embedding runtime with the provider/gateway
+stopped. It backs up by default unless `--no-backup` is specified.
+
 For a database containing sqlite-vec `vec0` tables, install the optional
 `embeddings` extra (or compatible `sqlite-vec`) in the **same runtime** for
 Doctor and repair, then generate a fresh report on the offline copy. Without
