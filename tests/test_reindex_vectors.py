@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 import mnemosyne.core.beam as beam_module
-from mnemosyne.core.beam import BeamMemory, reindex_vectors, _effective_vec_type
+from mnemosyne.core.beam import BeamMemory, reindex_vectors, _effective_vec_type, _mib
 import mnemosyne.core.embeddings as E
 
 
@@ -595,6 +595,74 @@ def test_reindex_reports_a_held_write_lock_before_any_embedding(tmp_path, monkey
 
     assert embed_calls == []
     assert not beam.conn.in_transaction
+
+@pytest.mark.skipif(_mib is None, reason="binary episodic writer unavailable")
+def test_reindex_works_with_a_bare_sqlite3_connect_row_factory_unset(
+    tmp_path, monkeypatch
+):
+    """Reproduces the live incident (2026-10-30, twice): a standalone caller runs
+    ``sqlite3.connect(path)`` (default ``row_factory=None`` → plain tuples) into
+    ``reindex_vectors``, which indexes rows by column name. Before the fix the
+    first ``working_memory`` embedding batch crashed with
+    ``TypeError: tuple indices must be integers or slices, not str`` AFTER the
+    vec tables had already been dropped and recreated empty — leaving the DB in
+    a half-rebuilt state. reindex_vectors now adopts sqlite3.Row indexing itself
+    when the caller left the factory unset.
+    """
+    import mnemosyne.core.beam as beam_module
+
+    db_path = tmp_path / "m.db"
+    beam = BeamMemory(session_id="bare-conn", db_path=db_path)
+    beam.conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, importance) "
+        "VALUES ('ep1', 'episodic source harbor signal', 'test', "
+        "'2026-01-01T00:00:00', 'bare-conn', 0.5)"
+    )
+    beam.conn.commit()
+    if not beam_module._vec_available(beam.conn):
+        pytest.skip("sqlite-vec vec tables unavailable in this build")
+    beam.conn.close()  # release the BeamMemory connection before the bare one opens
+
+    bare = sqlite3.connect(str(db_path))  # row_factory left at None, like the live heredoc
+    # Load sqlite-vec exactly like BeamMemory.__init__ does: without the
+    # vec0 module the bare connection can neither rebuild nor even SELECT
+    # from the vec0 virtual tables.
+    import sqlite_vec
+    bare.enable_load_extension(True)
+    sqlite_vec.load(bare)
+    monkeypatch.setattr(E, "available", lambda: True)
+    dim = int(E.EMBEDDING_DIM)
+    seen_calls = []
+
+    def _spy_embed(contents):
+        seen_calls.append(contents)
+        return [[0.1] * dim]
+
+    monkeypatch.setattr(E, "embed", _spy_embed)
+
+    plan = reindex_vectors(bare)  # must not raise the tuple-index TypeError
+    assert plan["status"] == "reindexed"
+    assert plan["episodic_memory_reindexed"] == 1
+    assert bare.execute("SELECT COUNT(*) FROM vec_episodes").fetchone()[0] == 1
+
+    # embedder received the SOURCE text (not a repr or a row object)
+    assert seen_calls, "embedder was never invoked"
+    assert seen_calls == [["episodic source harbor signal"]]
+    # the vec row landed on the SOURCE episodic rowid
+    src_rowid = bare.execute(
+        "SELECT rowid FROM episodic_memory WHERE id = 'ep1'").fetchone()[0]
+    assert bare.execute("SELECT rowid FROM vec_episodes").fetchone()[0] == src_rowid
+
+    # a caller with their OWN compatible factory keeps it after the rebuild
+    bare.row_factory = lambda cur, row: dict(zip(
+        [d[0] for d in cur.description], row))
+    plan2 = reindex_vectors(bare)
+    assert plan2["status"] == "reindexed"
+    assert isinstance(bare.execute("SELECT id FROM episodic_memory LIMIT 1").fetchone(), dict)
+    bare.close()
+
+
+
 
 
 if __name__ == "__main__":  # allow direct execution without pytest
