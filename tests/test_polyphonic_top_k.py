@@ -241,3 +241,17 @@ def test_temporal_voice_supplies_full_top_k_without_embeddings(beam, monkeypatch
 
     assert len({r["id"] for r in results}) == top_k
     assert {r["tier"] for r in results} == {"working"}
+
+
+@pytest.mark.parametrize("count", [0, 1, 900, 901, 1800])
+def test_select_by_ids_returns_every_row_across_chunks(beam, count):
+    ids = [f"s{i}" for i in range(count)]
+    beam.conn.executemany(
+        "INSERT INTO working_memory (id, content, source, timestamp, session_id, scope) "
+        "VALUES (?, ?, 'user', datetime('now'), 'top-k-session', 'session')",
+        [(mid, _distinct(i)) for i, mid in enumerate(ids)],
+    )
+
+    rows = bm._select_by_ids(beam.conn, "SELECT id FROM working_memory WHERE id IN", ids)
+
+    assert sorted(r["id"] for r in rows) == sorted(ids)
