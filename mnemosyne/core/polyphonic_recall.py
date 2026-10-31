@@ -877,18 +877,21 @@ class PolyphonicRecallEngine:
         # Graph traversal: from seed memory IDs, walk edges to
         # discover indirectly related memories (ctx edges only,
         # moderate weight threshold to avoid noise).
-        traversed_ids = set()
+        traversed = {}
         for seed_id in seed_ids:
             related = self.graph.find_related_memories(
                 seed_id, depth=2, edge_type="ctx", min_weight=0.3
             )
             for rel in related:
                 mid = rel["memory_id"]
-                if mid not in traversed_ids and mid not in seed_ids:
-                    traversed_ids.add(mid)
-                    results.append(RecallResult(
+                if mid in seed_ids:
+                    continue
+                score = 0.4 / rel["depth"]  # Score decays with hop distance
+                previous = traversed.get(mid)
+                if previous is None or score > previous.score:
+                    traversed[mid] = RecallResult(
                         memory_id=mid,
-                        score=0.4 / rel["depth"],  # Score decays with hop distance
+                        score=score,
                         voice="graph_traversal",
                         metadata={
                             "seed": seed_id,
@@ -896,8 +899,9 @@ class PolyphonicRecallEngine:
                             "depth": rel["depth"],
                             "weight": rel["weight"],
                         }
-                    ))
+                    )
 
+        results.extend(traversed.values())
         return results
     
     def _fact_voice(self, query: str) -> List[RecallResult]:
