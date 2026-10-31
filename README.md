@@ -390,16 +390,7 @@ for gates, conservative reservation and cost-logging limits.
 
 > **Privacy note on remote embedding endpoints.** Embeddings go to a remote API whenever `MNEMOSYNE_EMBEDDING_API_URL` points at a custom (non-OpenRouter) endpoint, the model name is API-shaped (`openai/*`, `text-embedding*`), or `MNEMOSYNE_EMBEDDINGS_VIA_API` is truthy; on the OpenRouter default (or an OpenRouter URL) the last two are what route, and with no URL set the OpenRouter default is used. That service receives the text of your memories and of your recall queries (working-memory content, summaries, annotations, and search queries) for vectorization. For privacy-sensitive or local-first deployments prefer a local-embedding profile (`[embeddings]` or `[all]`); use a remote endpoint only when you accept that the embedding provider sees your content.
 
-**Install (Hermes users):**
-```bash
-source ~/.hermes/hermes-agent/venv/bin/activate
-python -m ensurepip --upgrade
-python -m pip install --upgrade pip
-python -m pip install mnemosyne-hermes
-mkdir -p ~/.hermes/plugins/mnemosyne
-ln -sfn "$(~/.hermes/hermes-agent/venv/bin/python -c 'import pathlib, mnemosyne_hermes; print(pathlib.Path(mnemosyne_hermes.__file__).resolve().parent)')"/* ~/.hermes/plugins/mnemosyne/
-hermes config set memory.provider mnemosyne
-```
+**Install (Hermes users):** Select the active Hermes home and runtime interpreter using the [Hermes integration guide](docs/hermes-integration.md). Install `mnemosyne-hermes` into that interpreter and run `mnemosyne-hermes install` for the selected home. POSIX symlink mode links the package directory; native Windows and persistent wrappers use the modes in the guide. Do not link individual package files. Set `memory.provider` to `mnemosyne`, then check `mnemosyne-hermes status` and `hermes memory status` for the same home. Existing per-file plugin directories require the [ownership-checked recovery](docs/hermes-integration.md#recover-a-legacy-per-file-plugin-directory) before installation.
 
 After installing, verify the provider in the active Hermes profile and start a new session or restart the gateway:
 
