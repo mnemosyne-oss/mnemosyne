@@ -259,13 +259,24 @@ def test_memoria_source_fanout_is_not_silently_lost(make_store, monkeypatch):
 @pytest.mark.parametrize('tier', ['working', 'episodic'])
 def test_enhanced_weibull_large_pool(make_store, tier):
     memory = make_store(tier)
-    options = dict(top_k=600, use_weibull=True, use_mmr=False, use_intent=False,
+    expected_types = {
+        f'm{i:04}': 'preference' if i % 2 else 'fact' for i in range(1200)
+    }
+    memory.conn.executemany(
+        f'UPDATE {tier}_memory SET memory_type=? WHERE id=?',
+        [(memory_type, mid) for mid, memory_type in expected_types.items()],
+    )
+    memory.conn.commit()
+    options = dict(top_k=1200, use_weibull=True, use_mmr=False, use_intent=False,
                    use_synonyms=False, use_associative=False, use_cache=False, _track_recall=False, **FILTERS)
     options.pop('_cross_session')  # Enhanced recall resolves this internally.
     baseline = memory.recall_enhanced('launch', **options)
-    assert len(baseline) == 600
+    assert len(baseline) == 1200
+    assert {row['id']: row['memory_type'] for row in baseline} == expected_types
     limit(memory, 999)
-    assert signature(memory.recall_enhanced('launch', **options)) == signature(baseline)
+    actual = memory.recall_enhanced('launch', **options)
+    assert signature(actual) == signature(baseline)
+    assert {row['id']: row['memory_type'] for row in actual} == expected_types
 
 
 def test_summary_link_hydration_large_pool(make_store):
