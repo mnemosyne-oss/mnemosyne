@@ -42,7 +42,8 @@ logger = logging.getLogger(__name__)
 
 DELETE_OVERRIDE_ERROR = (
     "Explicit delete override includes candidates not suggested for deletion; "
-    "review the audit and use --force (MCP/core: force=true) to override deliberately."
+    "review the audit and use --force (CLI), force=True (Python core), "
+    "or force=true (MCP) to override deliberately."
 )
 
 # ---------------------------------------------------------------------------

@@ -37,6 +37,8 @@ def test_mixed_delete_refused_before_any_write(mixed, dry_run, non_delete):
     before = path.read_bytes()
     result = clean_noise(path, candidates, action='delete', confirm=True, dry_run=dry_run)
     assert result.errors
+    for syntax in ('--force (CLI)', 'force=True (Python core)', 'force=true (MCP)'):
+        assert syntax in result.errors[0]
     assert result.deleted == result.log_entries == 0
     assert ids(path) == ['note', 'trash']
     assert path.read_bytes() == before
