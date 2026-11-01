@@ -4583,6 +4583,24 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     if batch_size <= 0:
         raise ValueError("batch_size must be a positive integer")
 
+
+    # Standalone callers may pass a bare sqlite3.connect() connection whose
+    # default row_factory yields plain tuples; the row reads below index by
+    # column name, so the rebuild runs on a sqlite3.Row connection and the
+    # caller's own factory is restored on every exit path afterwards.
+    _caller_row_factory = getattr(conn, "row_factory", None)
+    conn.row_factory = sqlite3.Row
+    try:
+        return _reindex_vectors_impl(conn, batch_size=batch_size, dry_run=dry_run,
+                                     progress=progress)
+    finally:
+        try:
+            conn.row_factory = _caller_row_factory
+        except (AttributeError, sqlite3.ProgrammingError):
+            pass
+
+
+def _reindex_vectors_impl(conn, *, batch_size, dry_run, progress):
     target_dim = int(_embeddings.EMBEDDING_DIM)
     vec_type = _effective_vec_type(conn)
     vec_ok = _vec_available(conn)
