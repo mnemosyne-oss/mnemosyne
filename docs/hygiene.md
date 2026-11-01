@@ -112,7 +112,9 @@ Archive first, delete later. Archiving is reversible and gets the noise out of r
 
 **`mnemosyne_hygiene_clean`** requires `candidates_json`. Also takes `action` (`delete` / `archive` / `flag` / `keep`, default `keep`), `confirm` (false), `force` (false), and `bank`. Only the JSON boolean `true` enables the mixed-candidate delete override; strings and numbers are rejected.
 
-The confirm gate is `dry_run = not confirm`. There is no independent `dry_run` parameter over MCP, so `confirm=false` is always a dry run and `confirm=true` always applies. The underlying function double-gates: it returns before touching the database on a dry run, and refuses to proceed if it somehow receives a non-dry-run without confirmation.
+Both `confirm` and `force` must be JSON booleans. Strings (including `"false"`), numbers, null, arrays and objects are rejected before bank initialization. Omitting `confirm` retains the default preview.
+
+The confirm gate is `dry_run = not confirm`. There is no independent `dry_run` parameter over MCP, so `confirm=false` is always a dry run and `confirm=true` permits applying the selected action after validation. The underlying function double-gates: it returns before touching the database on a dry run, and refuses to proceed if it somehow receives a non-dry-run without confirmation.
 
 Candidates are validated strictly. Note that **`scratchpad` can be audited but not cleaned**: only `working_memory`, `memories`, and `episodic_memory` are accepted as clean targets.
 

@@ -1259,6 +1259,9 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
     force = arguments.get("force", False)
     if type(force) is not bool:
         return {"error": "force must be a boolean"}
+    confirm = arguments.get("confirm", False)
+    if type(confirm) is not bool:
+        return {"error": "confirm must be a boolean"}
 
     candidates_json = arguments.get("candidates_json", "[]")
     try:
@@ -1299,7 +1302,6 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
     bank = _resolve_bank(arguments)
     mem = _create_instance(bank=bank)
     db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
-    confirm = arguments.get("confirm", False)
     dry_run = not confirm
 
     result = clean_noise(

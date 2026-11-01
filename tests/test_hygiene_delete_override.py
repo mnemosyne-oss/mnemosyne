@@ -136,6 +136,7 @@ def test_false_force_is_valid_for_all_delete_recommendations(mixed):
         ('refused', {}, False, True, None, None, ['note', 'trash']),
         ('cleanup_failed', {}, True, True, 'failed', 0, ['note', 'trash']),
         ('dry_run', {}, False, False, 'dry_run', 1, ['note', 'trash']),
+        ('omitted_confirm', {}, False, False, 'dry_run', 1, ['note', 'trash']),
         ('applied', {}, True, False, 'applied', 1, ['note']),
         ('archive', {}, True, False, 'applied', 0, ['note', 'trash']),
         ('flag', {}, True, False, 'applied', 0, ['note', 'trash']),
@@ -147,7 +148,8 @@ def test_false_force_is_valid_for_all_delete_recommendations(mixed):
         ('forced', {'force': 'true'}, False, True, None, None, ['note', 'trash']),
     ],
     ids=['refused', 'unforced-delete-preview', 'cleanup-failed',
-         'per-candidate-preview', 'per-candidate-applied', 'archive-override', 'flag-override',
+         'per-candidate-preview', 'omitted-confirm-preview', 'per-candidate-applied',
+         'archive-override', 'flag-override',
          'force-true-confirmed', 'force-true-preview', 'force-int-confirmed',
          'force-int-preview', 'force-string-confirmed', 'force-string-preview'],
 )
@@ -173,6 +175,8 @@ def test_mcp_wire_reports_hygiene_failure_and_success(
     arguments = {'candidates_json': json.dumps([c.to_dict() for c in candidates]),
                  'action': action,
                  'confirm': confirm, **force_args}
+    if case == 'omitted_confirm':
+        arguments.pop('confirm')
 
     async def exercise():
         server = _build_mcp_server()
@@ -214,3 +218,47 @@ def test_mcp_wire_reports_hygiene_failure_and_success(
             else:
                 assert importance == 0.5
                 assert metadata['_hygiene_flagged'] is True
+
+
+@pytest.mark.parametrize(
+    'confirm', ['false', 'true', 1, 0, None, [], {}, ['false']],
+    ids=['string-false', 'string-true', 'integer-one', 'integer-zero',
+         'null', 'empty-list', 'empty-object', 'nonempty-list'],
+)
+def test_mcp_wire_rejects_nonboolean_confirmation_before_bank_open(mixed, monkeypatch, confirm):
+    """A JSON value with truthiness must never substitute for confirmation."""
+    import asyncio
+    import contextlib
+    from mcp import ClientSession
+    from mcp.shared.memory import create_client_server_memory_streams
+    from mnemosyne.mcp_server import _build_mcp_server
+
+    path, candidates = mixed
+    opened = []
+    def create_instance(**kwargs):
+        opened.append(kwargs)
+        return SimpleNamespace(beam=SimpleNamespace(db_path=path))
+    monkeypatch.setattr('mnemosyne.mcp_tools._create_instance', create_instance)
+    # One genuine delete recommendation; the override guard cannot mask confirm.
+    arguments = {'candidates_json': json.dumps([candidates[0].to_dict()]),
+                 'action': 'delete', 'confirm': confirm}
+
+    async def exercise():
+        server = _build_mcp_server()
+        async with create_client_server_memory_streams() as (cs, ss):
+            task = asyncio.create_task(server.run(*ss, server.create_initialization_options()))
+            try:
+                async with ClientSession(*cs) as client:
+                    await client.initialize()
+                    return await client.call_tool('mnemosyne_hygiene_clean', arguments)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+    response = asyncio.run(exercise())
+    payload = json.loads(response.content[0].text)
+    after = ids(path)
+    assert after == ['note', 'trash'], {'response': payload, 'remaining': after}
+    assert response.is_error is True
+    assert 'confirm' in payload['error'] and 'boolean' in payload['error']
+    assert opened == []
