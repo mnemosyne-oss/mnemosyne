@@ -84,9 +84,16 @@ def test_cli_refusal_explains_force_and_force_applies(mixed, monkeypatch, capsys
     assert ids(path) == []
 
 
+@pytest.mark.parametrize('suggestions,expected_scope', [
+    (('keep', 'keep'), '0/2'),
+    (('delete', 'keep'), '1/2'),
+    (('delete', 'delete'), '2/2'),
+])
 @pytest.mark.parametrize('confirm', [False, True], ids=['preview', 'applied'])
-def test_cli_forced_delete_reports_override_scope(mixed, monkeypatch, capsys, confirm):
+def test_cli_forced_delete_reports_override_scope(mixed, monkeypatch, capsys, confirm, suggestions, expected_scope):
     path, candidates = mixed
+    for candidate, suggestion in zip(candidates, suggestions):
+        candidate.suggested_action = suggestion
     monkeypatch.setattr('mnemosyne.cli.DATA_DIR', path.parent)
     report = path.parent / 'audit.json'
     report.write_text(json.dumps([c.to_dict() for c in candidates]))
@@ -96,13 +103,19 @@ def test_cli_forced_delete_reports_override_scope(mixed, monkeypatch, capsys, co
     cmd_hygiene(args)
     mode = 'APPLIED' if confirm else 'DRY RUN'
     output = capsys.readouterr().out
-    assert f'[{mode}] override=delete scope=all candidates (1/2 recommended delete)' in output
+    assert f'[{mode}] override=delete scope=all candidates ({expected_scope} recommended delete)' in output
     assert f'[{mode}] deleted=2 archived=0 flagged=0 kept=0' in output
     assert ids(path) == ([] if confirm else ['note', 'trash'])
 
 
-@pytest.mark.parametrize('action,force', [('keep', False), ('keep', True), ('archive', True), ('delete', False)])
-def test_cli_other_clean_modes_do_not_report_forced_scope(mixed, monkeypatch, capsys, action, force):
+@pytest.mark.parametrize('action,force,expected_counts', [
+    ('keep', False, 'deleted=1 archived=0 flagged=0 kept=1'),
+    ('keep', True, 'deleted=1 archived=0 flagged=0 kept=1'),
+    ('archive', True, 'deleted=0 archived=2 flagged=0 kept=0'),
+    ('flag', True, 'deleted=0 archived=0 flagged=2 kept=0'),
+    ('delete', False, 'deleted=1 archived=0 flagged=0 kept=0'),
+])
+def test_cli_other_clean_modes_do_not_report_forced_scope(mixed, monkeypatch, capsys, action, force, expected_counts):
     path, candidates = mixed
     if action == 'delete':
         candidates = candidates[:1]  # Valid unforced deletion: every candidate recommends delete.
@@ -114,7 +127,7 @@ def test_cli_other_clean_modes_do_not_report_forced_scope(mixed, monkeypatch, ca
         args.append('--force')
     cmd_hygiene(args)
     output = capsys.readouterr().out
-    assert '[DRY RUN] deleted=' in output
+    assert f'[DRY RUN] {expected_counts}' in output
     assert 'override=' not in output
     assert ids(path) == ['note', 'trash']
 
