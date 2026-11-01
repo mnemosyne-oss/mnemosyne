@@ -685,9 +685,8 @@ def _env_cap(name: str) -> int:
 
 def _embedding_max_chars() -> int:
     """Resolve the optional per-input character cap at call time (default:
-    disabled). Set MNEMOSYNE_EMBEDDING_MAX_CHARS for local OpenAI-compatible
-    servers (llama.cpp et al.) whose per-slot context window rejects long
-    inputs with HTTP 400, aborting the whole batch; 0 or negative disables."""
+    disabled). Applies to both API and local embedding inputs; 0 or negative
+    disables the cap."""
     return _env_cap("MNEMOSYNE_EMBEDDING_MAX_CHARS")
 
 
@@ -704,13 +703,13 @@ def _embedding_caps() -> tuple:
     return (_embedding_max_chars(), _embedding_max_bytes())
 
 
-def _cap_for_api(texts: List[str]) -> List[str]:
-    """Cap each text before the API call when MNEMOSYNE_EMBEDDING_MAX_CHARS
+def _cap_for_api(texts: List[str], caps: Optional[tuple] = None) -> List[str]:
+    """Cap each text before an API or local embedding call when MNEMOSYNE_EMBEDDING_MAX_CHARS
     and/or MNEMOSYNE_EMBEDDING_MAX_BYTES is set. Off by default: characters
     are not a token budget, and silent head-truncation can drop retrieval
     content on endpoints that accept the full text. When enabled, every
     truncation is logged."""
-    limit, byte_limit = _embedding_max_chars(), _embedding_max_bytes()
+    limit, byte_limit = _embedding_caps() if caps is None else caps
     if limit <= 0 and byte_limit <= 0:
         return texts
     capped: List[str] = []
@@ -986,7 +985,7 @@ def embed_query(text: str) -> Optional[np.ndarray]:
         return None
     if not text:
         return None
-    # The effective caps are part of the key: _embed_api reads MNEMOSYNE_EMBEDDING_MAX_CHARS / _BYTES at call time, so a
+    # The effective caps are part of the key: embedding calls read MNEMOSYNE_EMBEDDING_MAX_CHARS / _BYTES at call time, so a
     # vector embedded under one cap must not be served after the cap changes (review #1052).
     # The backend is part of the key too: embeddings_via_api or the API URL can change at runtime,
     # and a cached local vector must not be compared against API document vectors.
@@ -1029,7 +1028,7 @@ def _embed_query_cached(
         raise _ConfigChangedDuringQuery
     if model is None:
         return None
-    vectors = list(model.embed([prefixed]))
+    vectors = list(model.embed(_cap_for_api([prefixed], _caps)))
     if not vectors:
         return None
     return vectors[0].astype(np.float32)
@@ -1053,7 +1052,7 @@ def embed(texts: List[str]) -> Optional[np.ndarray]:
     model = _get_model()
     if model is None or model == "api":
         return None
-    vectors = list(model.embed(prefixed))
+    vectors = list(model.embed(_cap_for_api(prefixed)))
     return np.stack(vectors).astype(np.float32)
 
 
