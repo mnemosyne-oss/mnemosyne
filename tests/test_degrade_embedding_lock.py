@@ -122,6 +122,15 @@ def test_embedding_failure_warns_without_private_details_and_invalidates_stale_v
     memory, monkeypatch, caplog, tier,
 ):
     original = seed(memory, tier, 'target')
+    memory.conn.execute(
+        "UPDATE episodic_memory SET binary_vector=? WHERE id='target'", (b'\x80',),
+    )
+    memory.conn.commit()
+
+    def unexpected_binary_encoding(_vector):
+        pytest.fail('a failed embedding must invalidate, not encode a vector')
+
+    monkeypatch.setattr(bm, '_mib', unexpected_binary_encoding)
 
     def fail_embedding(texts):
         raise RuntimeError('private provider credential; input=' + texts[0])
