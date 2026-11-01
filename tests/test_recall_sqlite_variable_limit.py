@@ -202,3 +202,24 @@ def test_equal_score_top_k_is_independent_of_bind_budget(make_store, order):
     assert [r['id'] for r in baseline] == [f'm{i:04}' for i in range(40)]
     limit(memory, 31)
     assert signature(memory.recall('launch', **options)) == signature(baseline)
+
+
+@pytest.mark.parametrize('bind_limit', [31, 999])
+@pytest.mark.parametrize('tier', ['working', 'episodic'])
+def test_hangul_staged_rank_hydration_preserves_full_pool(make_store, tier, bind_limit):
+    memory = make_store(tier)
+    ids = [r['id'] for r in memory.conn.execute(f'SELECT id FROM {tier}_memory ORDER BY id')]
+    memory.conn.executemany(
+        f'UPDATE {tier}_memory SET content=? WHERE id=?',
+        [('바나나 ' * (1 + i % 7) + '노란 과일 ' * (1 + i % 11), mid) for i, mid in enumerate(ids)],
+    )
+    memory.conn.commit()
+    search = bm._fts_search_working if tier == 'working' else bm._fts_search
+    baseline_ranks = search(memory.conn, '바나나', k=1200)
+    assert len(baseline_ranks) == 1200  # MATCH plus these IDs exceeds the old 999 budget.
+    assert len({r['rank'] for r in baseline_ranks}) > 1
+    baseline = memory.recall('바나나', top_k=400, _track_recall=False, **FILTERS)
+    assert len(baseline) == 400
+    limit(memory, bind_limit)
+    assert search(memory.conn, '바나나', k=1200) == baseline_ranks
+    assert signature(memory.recall('바나나', top_k=400, _track_recall=False, **FILTERS)) == signature(baseline)

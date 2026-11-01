@@ -5674,12 +5674,12 @@ def _fts_staged_rows(
     if not ordered_ids:
         return []
 
-    placeholders = ",".join("?" * len(ordered_ids))
-    rank_rows = conn.execute(
+    rank_rows = _select_recall_rows_by_ids(
+        conn,
         f"SELECT {id_col}, rank FROM {table}"
-        f" WHERE {table} MATCH ? AND {id_col} IN ({placeholders})",
-        (" OR ".join(expansion_terms), *ordered_ids),
-    ).fetchall()
+        f" WHERE {id_col} IN ({{placeholders}}) AND {table} MATCH ?",
+        ordered_ids, (" OR ".join(expansion_terms),), key=id_col,
+    )
     ranks = {r[id_col]: r["rank"] for r in rank_rows}
     # An exact hit the expansion terms cannot reach keeps the pool slot but
     # scores last, so it never displaces a row the ranking actually measured.
