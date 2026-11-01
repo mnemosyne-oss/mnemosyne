@@ -19,7 +19,7 @@ experiment.
 
 import sqlite3
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -295,7 +295,13 @@ class TestE3AdditiveSleep:
         beam.sleep(dry_run=False)
 
         rows = _consolidated_rows(temp_db, "s1")
-        now = datetime.now()
+        # The writers stamp UTC with the tzinfo stripped
+        # (datetime.now(timezone.utc).replace(tzinfo=None).isoformat()), so the
+        # comparison has to be UTC too. datetime.now() is local wall clock: on any
+        # host that is not UTC the two differ by exactly the offset, and the
+        # assertion reads that as a corrupt marker rather than a clock mismatch.
+        # This is the test half of #1094; the polyphonic reader was the production half.
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         for row_id, consolidated_at in rows:
             parsed = datetime.fromisoformat(consolidated_at)
             # Within 60s of NOW (generous for CI clock skew).

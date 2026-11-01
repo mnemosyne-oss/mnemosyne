@@ -348,6 +348,144 @@ def test_canonical_write_guard_fails_closed_on_unresolvable_profile(tmp_path, mo
     assert err["tool"] == "mnemosyne_forget_canonical"
 
 
+def test_task_progress_mutations_fail_closed_on_mismatch(tmp_path, monkeypatch):
+    """Mutating task_progress (set/clear) must fail closed when the turn profile
+    does not match the bound owner (#1177). Reads (get/list) remain ungated."""
+    profiles = _install_fake_hermes_modules(monkeypatch, tmp_path, "alice")
+    p = _provider(tmp_path, monkeypatch)
+    p._agent_identity = "alice"
+
+    # Alice sets her task progress normally.
+    init_res = json.loads(p.handle_tool_call(
+        "mnemosyne_task_progress",
+        {"action": "set", "task": "deploy", "state": "staging"},
+    ))
+    assert init_res["status"] == "set"
+
+    # Seed a Bob task-progress row before switching active profile to Bob.
+    profiles.get_active_profile_name = lambda: "bob"
+    p._agent_identity = "bob"
+    bob_init = json.loads(p.handle_tool_call(
+        "mnemosyne_task_progress",
+        {"action": "set", "task": "deploy", "state": "idle"},
+    ))
+    assert bob_init["status"] == "set"
+
+    # Switch provider back to Alice; turn profile switches to Bob.
+    p._agent_identity = "alice"
+    profiles.get_active_profile_name = lambda: "bob"
+
+    set_err = json.loads(p.handle_tool_call(
+        "mnemosyne_task_progress",
+        {"action": "set", "task": "deploy", "state": "production"},
+    ))
+    assert set_err["status"] == "canonical_owner_mismatch"
+    assert set_err["error"] == "canonical_owner_mismatch"
+    assert set_err["tool"] == "mnemosyne_task_progress"
+    assert set_err["bound_owner"] == "alice"
+    assert set_err["active_profile"] == "bob"
+
+    # Alice's task progress and Bob's pre-seeded task progress are untouched.
+    row = p._beam.canonical.recall("alice", "task:progress", "deploy")
+    assert row is not None
+    assert row["body"] == "staging"
+    bob_row = p._beam.canonical.recall("bob", "task:progress", "deploy")
+    assert bob_row is not None
+    assert bob_row["body"] == "idle"
+
+    clear_err = json.loads(p.handle_tool_call(
+        "mnemosyne_task_progress",
+        {"action": "clear", "task": "deploy"},
+    ))
+    assert clear_err["status"] == "canonical_owner_mismatch"
+    assert clear_err["tool"] == "mnemosyne_task_progress"
+
+    # Tasks were not cleared — both Alice's and Bob's rows remain unchanged.
+    row = p._beam.canonical.recall("alice", "task:progress", "deploy")
+    assert row is not None
+    assert row["body"] == "staging"
+    bob_row = p._beam.canonical.recall("bob", "task:progress", "deploy")
+    assert bob_row is not None
+    assert bob_row["body"] == "idle"
+
+    # Reads (get/list) remain accessible.
+    get_res = json.loads(p.handle_tool_call(
+        "mnemosyne_task_progress",
+        {"action": "get", "task": "deploy"},
+    ))
+    assert get_res["status"] == "found"
+    assert get_res["state"] == "staging"
+
+    list_res = json.loads(p.handle_tool_call(
+        "mnemosyne_task_progress",
+        {"action": "list"},
+    ))
+    assert list_res["count"] == 1
+
+
+def test_task_progress_mutations_fail_closed_on_unresolvable_profile(tmp_path, monkeypatch):
+    """Mutating task_progress fails closed when active profile cannot be resolved (#1177)."""
+    profiles = _install_fake_hermes_modules(monkeypatch, tmp_path, "alice")
+    p = _provider(tmp_path, monkeypatch)
+    p._agent_identity = "alice"
+
+    # Seed an Alice task-progress row before disabling profile resolution.
+    init_res = json.loads(p.handle_tool_call(
+        "mnemosyne_task_progress",
+        {"action": "set", "task": "build", "state": "queued"},
+    ))
+    assert init_res["status"] == "set"
+
+    profiles.get_active_profile_name = lambda: ""
+    err_set = json.loads(p.handle_tool_call(
+        "mnemosyne_task_progress",
+        {"action": "set", "task": "build", "state": "in_progress"},
+    ))
+    assert err_set["status"] == "canonical_profile_unavailable"
+    assert err_set["error"] == "canonical_profile_unavailable"
+    assert err_set["tool"] == "mnemosyne_task_progress"
+
+    # Alice's seeded row remains present and unchanged after refused set.
+    row = p._beam.canonical.recall("alice", "task:progress", "build")
+    assert row is not None
+    assert row["body"] == "queued"
+
+    def _boom():
+        raise RuntimeError("profiles lookup failed")
+
+    profiles.get_active_profile_name = _boom
+    err_clear = json.loads(p.handle_tool_call(
+        "mnemosyne_task_progress",
+        {"action": "clear", "task": "build"},
+    ))
+    assert err_clear["status"] == "canonical_profile_unavailable"
+    assert err_clear["tool"] == "mnemosyne_task_progress"
+
+    # Alice's seeded row remains present and unchanged after refused clear.
+    row = p._beam.canonical.recall("alice", "task:progress", "build")
+    assert row is not None
+    assert row["body"] == "queued"
+
+    # Direct handler call also fails closed on unresolvable profile
+    direct_err = json.loads(p._handle_task_progress(
+        {"action": "set", "task": "build", "state": "in_progress"}
+    ))
+    assert direct_err["status"] == "canonical_profile_unavailable"
+
+    # Seeded row is still present and unchanged after direct handler refusal.
+    row = p._beam.canonical.recall("alice", "task:progress", "build")
+    assert row is not None
+    assert row["body"] == "queued"
+
+    # Reads remain ungated even with unresolvable profile
+    get_res = json.loads(p.handle_tool_call(
+        "mnemosyne_task_progress",
+        {"action": "get", "task": "build"},
+    ))
+    assert get_res["status"] == "found"
+    assert get_res["state"] == "queued"
+
+
 # --------------------------------------------------------------------------
 # Invalidate bank routing (surface branch)
 # --------------------------------------------------------------------------

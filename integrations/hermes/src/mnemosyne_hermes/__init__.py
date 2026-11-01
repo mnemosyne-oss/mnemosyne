@@ -2566,6 +2566,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # per-agent correct even when construction runs outside turn scope).
         init_home = kwargs.get("hermes_home") or None
         self.__dict__["_init_home"] = init_home
+        self._hermes_home = kwargs.get("hermes_home", "")
         # Resolve isolation before the first slot write: the active profile is
         # part of the binding key for same-home multiplexing (#1188).
         self._profile_isolation_enabled = self._resolve_profile_isolation(kwargs)
@@ -2601,7 +2602,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if _prev_active and _prev_active != self._active_session_id:
             self._verbatim_ledger.reset_session(_prev_active)
         self._platform = kwargs.get("platform", "cli")
-        self._hermes_home = kwargs.get("hermes_home", "")
         # An unknown memory.mnemosyne.tools name must fail init loudly (#1063)
         # instead of waiting for the first tool-list/tool-call request. On
         # failure, release the active registration and backend lease the
@@ -2621,23 +2621,22 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Apply provider-specific config from kwargs (Hermes-passed) or config.yaml fallback
         self._apply_provider_config(kwargs)
 
-        # Register the Hermes auxiliary LLM backend BEFORE the skip-context
-        # early return. The backend is process-global and needed by
-        # mnemosyne_sleep / extract_facts regardless of whether this session
-        # gets memory injection. Without this, cron-context sessions that
-        # still call mnemosyne_sleep as a tool silently fall back to AAAK
-        # because register_hermes_host_llm() was after the early return.
-        # Idempotent: set_host_llm_backend() just overwrites the global.
-        host_llm_registered = False
-        try:
-            from .hermes_llm_adapter import register_hermes_host_llm
-            host_llm_registered = register_hermes_host_llm()
-            if host_llm_registered:
-                logger.info("Mnemosyne registered Hermes auxiliary LLM backend for memory operations")
-        except Exception as exc:
-            logger.debug("Mnemosyne could not register Hermes auxiliary LLM backend: %s", exc)
+        # Release a former primary lease before the skip context registers its
+        # backend. Releasing the final lease afterwards would clear that backend.
+        if self._agent_context in self._skip_contexts:
+            self._release_host_llm_backend_ownership()
 
         if self._agent_context in self._skip_contexts:
+            # Skip contexts retain their existing process-global registration.
+            # A primary registers only when its successful init acquires a lease,
+            # so a failed new primary cannot replace or clear this backend.
+            with _provider_lock:
+                try:
+                    from .hermes_llm_adapter import register_hermes_host_llm
+                    if register_hermes_host_llm():
+                        logger.info("Mnemosyne registered Hermes auxiliary LLM backend for memory operations")
+                except Exception as exc:
+                    logger.debug("Mnemosyne could not register Hermes auxiliary LLM backend: %s", exc)
             if had_beam:
                 self._unavailable_reason_code = "reset_by_reinit"
                 self._unavailable_reason = (
@@ -2665,9 +2664,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # skip-context check of its own). Preserving legacy behavior
             # for the plugin in skip contexts is the smaller blast radius
             # vs. silently dropping memory injection for those sessions.
-            # Skip contexts never own the backend. A primary -> skip re-init
-            # therefore drops any lease this instance previously held.
-            self._release_host_llm_backend_ownership()
             self._deactivate_in_module()
             return
 
@@ -2741,20 +2737,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             self._init_error = e
             self._unavailable_reason_code = "init_failed"
             self._unavailable_reason = ""
-            # A failed re-initialization no longer supplies a live primary
-            # backend owner, even though _provider_active retains its existing
-            # fallback semantics. A first failed primary init registered the
-            # process-global backend above but never acquired a lease, so clear
-            # that unowned registration when no peer owns it.
+            # A failed re-init releases only its own former primary lease.
+            # New failed primaries never registered a backend, so they must not
+            # clear an existing skip-context or peer registration.
             self._release_host_llm_backend_ownership()
-            if host_llm_registered:
-                with _provider_lock:
-                    if _host_llm_owner_count == 0:
-                        try:
-                            from .hermes_llm_adapter import unregister_hermes_host_llm
-                            unregister_hermes_host_llm()
-                        except Exception as exc:
-                            logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
             # A transient SQLite failure (writer holding the lock at the exact
             # moment this session initialized) must not disable memory for the
             # session's whole lifetime. Stash the init args so the per-turn
@@ -3427,12 +3413,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         else nullcontext()
                     )
                 with policy_context:
-                    # Fail-closed canonical WRITE guard (2026-09-20 incident): a
+                    # Fail-closed canonical WRITE guard (2026-09-20 incident, #1177): a
                     # session may restamp self-facts only through an instance
                     # bound to its own profile. Reads are intentionally not
                     # gated; mismatch here means a keying regression and must
                     # surface as a loud error, never a silent reroute.
-                    if tool_name in ("mnemosyne_remember_canonical", "mnemosyne_forget_canonical"):
+                    if (
+                        tool_name in ("mnemosyne_remember_canonical", "mnemosyne_forget_canonical")
+                        or (
+                            tool_name == "mnemosyne_task_progress"
+                            and str((args or {}).get("action") or "get").strip().lower() in ("set", "clear")
+                        )
+                    ):
                         _guard_err = self._canonical_write_guard(tool_name)
                         if _guard_err is not None:
                             return _guard_err
@@ -5112,6 +5104,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         task = args.get("task", "").strip()
         state = args.get("state", "").strip()
         metadata = args.get("metadata", {}) or {}
+
+        if action in ("set", "clear"):
+            _guard_err = self._canonical_write_guard("mnemosyne_task_progress")
+            if _guard_err is not None:
+                return _guard_err
 
         owner_id = self._canonical_owner()
         store = getattr(self._beam, "canonical", None)

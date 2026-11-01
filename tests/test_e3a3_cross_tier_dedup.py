@@ -277,7 +277,8 @@ class _FakeEngine:
 
     def recall(self, *, query, query_embedding, top_k,
                default_dense_source_filter=True, source=None, topic=None,
-               episodic_where=None, episodic_params=()):
+               episodic_where=None, episodic_params=(),
+               scope_where=None, scope_params=()):
         self.last_top_k = top_k
         self.last_dense_filter = default_dense_source_filter
         self.last_source = source

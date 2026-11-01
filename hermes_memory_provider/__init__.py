@@ -311,6 +311,14 @@ logger = logging.getLogger(__name__)
 _provider_active: bool = False
 _active_provider_count: int = 0
 
+# Host-backend ownership is deliberately separate from _provider_active: only
+# a primary provider whose Beam initialization succeeded owns a contribution.
+# Skip contexts still register the backend for mnemosyne_sleep, but neither
+# acquire nor release this ownership lease. _host_llm_lock serializes every
+# lease transition with the register/unregister call it guards.
+_host_llm_owner_count: int = 0
+_host_llm_lock = threading.Lock()
+
 # ---------------------------------------------------------------------------
 # Lazy imports — fail gracefully if mnemosyne core is missing
 # ---------------------------------------------------------------------------
@@ -1724,6 +1732,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # negative count when shutdown is called on a never-activated
         # instance.
         self._is_active_in_module: bool = False
+        # A host-backend owner is a successfully initialized primary provider.
+        # It is intentionally not inferred from _is_active_in_module because
+        # that counter governs legacy prefetch deferral, not backend lifetime.
+        self._owns_host_llm_backend: bool = False
 
     def _activate_in_module(self) -> None:
         """Bump the module-level active-provider count exactly once per
@@ -1745,6 +1757,37 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             self._is_active_in_module = False
             _active_provider_count = max(0, _active_provider_count - 1)
             _provider_active = (_active_provider_count > 0)
+
+    def _acquire_host_llm_backend_ownership(self) -> None:
+        """Register and record this initialized primary provider's lease once."""
+        global _host_llm_owner_count
+        with _host_llm_lock:
+            if self._owns_host_llm_backend:
+                return
+            try:
+                from hermes_memory_provider.hermes_llm_adapter import register_hermes_host_llm
+                if not register_hermes_host_llm():
+                    return
+            except Exception as exc:
+                logger.debug("Mnemosyne could not register Hermes auxiliary LLM backend: %s", exc)
+                return
+            self._owns_host_llm_backend = True
+            _host_llm_owner_count += 1
+
+    def _release_host_llm_backend_ownership(self) -> None:
+        """Release this provider's lease and clear only after the final owner."""
+        global _host_llm_owner_count
+        with _host_llm_lock:
+            if not self._owns_host_llm_backend:
+                return
+            self._owns_host_llm_backend = False
+            _host_llm_owner_count = max(0, _host_llm_owner_count - 1)
+            if _host_llm_owner_count == 0:
+                try:
+                    from hermes_memory_provider.hermes_llm_adapter import unregister_hermes_host_llm
+                    unregister_hermes_host_llm()
+                except Exception as exc:
+                    logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
 
     def _init_audit_log(self) -> None:
         """Initialize audit log co-located with the active provider DB."""
@@ -2245,18 +2288,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._hermes_home = kwargs.get("hermes_home", "")
         # An unknown memory.mnemosyne.tools name must fail init loudly (#1063)
         # instead of waiting for the first tool-list/tool-call request. On
-        # failure, run the same deactivation/release path shutdown() uses so
-        # a rejected re-init can't leave the instance active with no beam.
+        # failure, release the active registration and backend lease the
+        # same way shutdown() does, then re-raise the original error.
         try:
             self._configured_tool_schemas()
         except Exception:
+            self._release_host_llm_backend_ownership()
             self._deactivate_in_module()
-            if self._agent_context not in self._skip_contexts:
-                try:
-                    from hermes_memory_provider.hermes_llm_adapter import unregister_hermes_host_llm
-                    unregister_hermes_host_llm()
-                except Exception as exc:
-                    logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
             raise
         self._agent_identity = kwargs.get("agent_identity", None) or ""
         self._gateway_session_key = kwargs.get("gateway_session_key") or ""
@@ -2271,17 +2309,22 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Apply provider-specific config from kwargs (Hermes-passed) or config.yaml fallback
         self._apply_provider_config(kwargs)
 
-        # C25: Register the Hermes auxiliary LLM backend BEFORE the skip-context
-        # early return. The backend is process-global and needed by sleep even in
-        # skip-context sessions (subagent/cron/flush can still run memory tools).
-        try:
-            from hermes_memory_provider.hermes_llm_adapter import register_hermes_host_llm
-            if register_hermes_host_llm():
-                logger.info("Mnemosyne registered Hermes auxiliary LLM backend for memory operations")
-        except Exception as exc:
-            logger.debug("Mnemosyne could not register Hermes auxiliary LLM backend: %s", exc)
+        # Release a former primary lease before the skip context registers its
+        # backend. Releasing the final lease afterwards would clear that backend.
+        if self._agent_context in self._skip_contexts:
+            self._release_host_llm_backend_ownership()
 
         if self._agent_context in self._skip_contexts:
+            # Skip contexts retain their existing process-global registration.
+            # A primary registers only when its successful init acquires a lease,
+            # so a failed new primary cannot replace or clear this backend.
+            with _host_llm_lock:
+                try:
+                    from hermes_memory_provider.hermes_llm_adapter import register_hermes_host_llm
+                    if register_hermes_host_llm():
+                        logger.info("Mnemosyne registered Hermes auxiliary LLM backend for memory operations")
+                except Exception as exc:
+                    logger.debug("Mnemosyne could not register Hermes auxiliary LLM backend: %s", exc)
             logger.debug("Mnemosyne skipped: non-primary context=%s", self._agent_context)
             # C13: a skip-context re-init must DEACTIVATE the instance if
             # it was previously active in this process. Without this, a
@@ -2335,6 +2378,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             logger.warning("Mnemosyne init failed: %s", e)
             self._beam = None
             self._init_error = e
+            # A failed re-init releases only its own former primary lease.
+            # New failed primaries never registered a backend, so they must not
+            # clear an existing skip-context or peer registration.
+            self._release_host_llm_backend_ownership()
 
         # C13: activate AFTER the BeamMemory init result is known. If
         # init succeeded (_beam is set) the provider is the live memory
@@ -2355,6 +2402,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             self._beam.canonical_owner_id = self._canonical_owner()
             self._beam.agent_context = self._agent_context
             self._activate_in_module()
+            self._acquire_host_llm_backend_ownership()
             self._init_audit_log()
 
 
@@ -4770,17 +4818,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         drain_timed_out = thread is not None and thread.is_alive()
         self._session_end_thread = None
 
-        # Symmetric with initialize(): clear the Hermes host LLM backend so a
-        # process that later uses Mnemosyne outside Hermes does not retain a
-        # stale reference into agent.auxiliary_client.
-        # Skip-context sessions must NOT unregister — the backend is process-global
-        # and owned by the primary session.
-        if self._agent_context not in self._skip_contexts:
-            try:
-                from hermes_memory_provider.hermes_llm_adapter import unregister_hermes_host_llm
-                unregister_hermes_host_llm()
-            except Exception as exc:
-                logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
+        # Only a successfully initialized primary provider owns a backend lease.
+        # Releasing a non-owner (skip context or failed initialization) is a no-op;
+        # the final owner clears the global backend.
+        self._release_host_llm_backend_ownership()
         # The consolidation worker owns this lock while sleeping. After the
         # bounded drain expires, reacquiring it here would turn the timeout into
         # an unbounded shutdown wait. The worker uses its own Beam/connection, so

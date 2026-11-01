@@ -61,6 +61,32 @@ validation in the corresponding Hermes distribution and release.
 
 ## Setup
 
+### Recall query bodies and channel envelopes
+
+Both Hermes providers sanitize prefetch and explicit `mnemosyne_recall` queries
+without changing captured text or stored memories. They recognize one serialized
+recent-channel envelope only when the query starts exactly with
+`[Recent channel messages]\n`, followed by nonempty history and a
+`\n\n[New message]\n` separator. Backfill is removed only when there is
+**exactly one** such separator. The remaining suffix then receives the usual
+leading speaker-stamp removal.
+
+Multiple separators make the boundary ambiguous: relay history can contain
+literal markers, and the current body can contain the same markers or nested
+envelopes. Choosing the first can retain old messages; choosing the last can
+truncate the current message. Both providers therefore retain the entire query
+in this case, including history. This avoids deleting current-message text but
+does **not** guarantee history-free recall. Even a single complete envelope can
+be ordinary quoted text; the header is a caller convention, not proof of origin.
+Callers needing reliable separation must pass the current body separately from
+channel history, or agree on an escaped or length-delimited upstream format.
+
+A marker or sender stamp alone does not identify an envelope. Unwrapped bodies,
+incomplete envelopes, and other channel-context formats retain their text,
+apart from the existing leading-stamp handling. This is a narrow text format
+contract, not sender authentication: callers must pass an ordinary body unless
+they intend the exact leading format above to be interpreted as an envelope.
+
 ### Step 1: Install
 
 **Choose an install mode first.** The default writes a symbolic link into the

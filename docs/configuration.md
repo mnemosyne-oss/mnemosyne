@@ -308,14 +308,20 @@ See [Health and repair](cli-reference.md#health-and-repair) for the `reindex` co
 | `MNEMOSYNE_LLM_N_CTX` | `2048` | Context window size for the local model |
 | `MNEMOSYNE_LLM_MAX_TOKENS` | `2048` | Maximum output tokens per summary |
 | `MNEMOSYNE_LLM_N_THREADS` | `4` | CPU threads for local inference |
-| `MNEMOSYNE_LLM_REPO` | `openbmb/MiniCPM5-1B-GGUF` | HuggingFace repo for GGUF model |
-| `MNEMOSYNE_LLM_FILE` | `MiniCPM5-1B-Q4_K_M.gguf` | GGUF filename |
+| `MNEMOSYNE_LLM_REPO` | `openbmb/MiniCPM5-1B-GGUF` | HuggingFace repo the local GGUF is fetched from. Selects the source only, and works alone by pairing with the default filename. |
+| `MNEMOSYNE_LLM_FILE` | `MiniCPM5-1B-Q4_K_M.gguf` | GGUF filename to load. Selects the artifact only, and works alone by fetching from the default repo. |
 | `MNEMOSYNE_MODEL_CACHE_DIR` | `~/.hermes/mnemosyne/models` | Directory the GGUF model is cached in |
 | `MNEMOSYNE_SLEEP_PROMPT` | *(built-in)* | Optional sleep/consolidation prompt override. Supports `{source}`, `{memories}`, and `{memory_count}` placeholders for language-specific summaries. |
 
 `MNEMOSYNE_LLM_ENABLED=false` disables all LLM-backed consolidation, including Hermes host routing and configured remote endpoints; Mnemosyne then uses its AAAK/no-LLM fallback. The generated [configuration reference](api/configuration.mdx) records the current distinction between this environment gate and the separately declared `config.yaml` key.
 
 When the gate is enabled and neither a usable host backend nor a configured remote endpoint succeeds, Mnemosyne falls back to the local GGUF model. The default `MiniCPM5-1B-Q4_K_M.gguf` model is approximately 656 MB and is cached in `~/.hermes/mnemosyne/models`, or in `MNEMOSYNE_MODEL_CACHE_DIR` when that is set. `sleep()` is synchronous, so the first uncached local fallback can block while it downloads the model from Hugging Face. To avoid a download, set `MNEMOSYNE_LLM_ENABLED=false` for AAAK-only consolidation or pre-cache the GGUF model; a cached local fallback does not require network access.
+
+`MNEMOSYNE_LLM_FILE` and `MNEMOSYNE_LLM_REPO` are resolved as a pair on every call rather than when the module is imported, so a value set later in the process still applies. Each variable works alone: FILE names the artifact, REPO names where to fetch it. If the selected file is already in the cache it is used without any network access; a miss is fetched from REPO when that is set, and from the default repo otherwise. Setting REPO alone downloads the default filename. A blank value counts as unset. Per-call resolution never replaces a model that has already been loaded, and a failed download logs a warning naming the resolved repo, the resolved filename, and the variable to change.
+
+Cache entries are keyed by the pair, not by the filename alone, because two repositories can ship the same filename. The shipped repository keeps the historical flat location, `<cache dir>/<file>`, so existing caches keep working untouched; any other repository is stored under `<cache dir>/.repositories/<sha256 of the repo id>/<file>`. A file cached for one repository therefore cannot satisfy a selection pointing at a different one, and switching repository downloads that repository's artifact once.
+
+A filename containing a parent-directory component is rejected, with an error naming the variable, because it would escape the cache root and could reach another repository's cached artifact. An absolute filename is used exactly as given: it names one specific file, the cache root does not apply to it, and REPO is not consulted. Because an absolute path cannot be fetched by name, a missing one is rejected rather than downloaded.
 
 ### Remote LLM (OpenAI-compatible)
 

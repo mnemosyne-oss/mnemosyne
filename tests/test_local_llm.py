@@ -20,6 +20,17 @@ from mnemosyne.core.llm_backends import (
 REAL_LOAD_LLM = local_llm._load_llm
 
 
+@pytest.fixture(autouse=True)
+def _isolate_model_selection(monkeypatch):
+    """Keep the operator's own MNEMOSYNE_LLM_REPO/FILE out of these tests.
+
+    Selection is read from the environment on each call, so a developer who has
+    the variables exported would otherwise resolve different model names than CI.
+    """
+    monkeypatch.delenv("MNEMOSYNE_LLM_REPO", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_LLM_FILE", raising=False)
+
+
 class TestLocalModelDownloadNotice:
     def test_uncached_default_model_logs_notice_before_download(self, monkeypatch, tmp_path, caplog, capsys):
         """The default GGUF warning is logged before its network fetch, not printed."""
@@ -97,11 +108,20 @@ class TestLocalModelDownloadNotice:
 
         assert local_llm._load_llm() is None
         assert local_llm._llm_available is False
-        assert len(caplog.records) == 1
+        assert len(caplog.records) == 2
         message = caplog.records[0].getMessage()
         assert "custom.gguf" in message
         assert "example/custom-gguf" in message
         assert "656 MB" not in message
+
+        # The failure has to be visible in the log: _load_llm() returns None and
+        # degrades to AAAK, which makes a silent miss look like a working install.
+        failure = caplog.records[1].getMessage()
+        assert "custom.gguf" in failure
+        assert "example/custom-gguf" in failure
+        assert "MNEMOSYNE_LLM_REPO" in failure
+        assert "MNEMOSYNE_LLM_FILE" in failure
+        assert "offline" in failure
 
 
 class TestRemoteLLM:
@@ -1013,3 +1033,359 @@ class TestModelCacheDirOverride:
             assert "Set MNEMOSYNE_MODEL_CACHE_DIR to relocate it." in message
             # Must not blame a variable the user never set.
             assert "is set to" not in message
+
+
+class TestModelSelectionEnv:
+    """MNEMOSYNE_LLM_REPO and MNEMOSYNE_LLM_FILE select independently (#1242).
+
+    FILE names the artifact and REPO names the download source, and either one
+    works alone. The pair is resolved on every call, so a variable set after
+    import still applies, and a cached file must never reach the network.
+    """
+
+    def _cache(self, monkeypatch, tmp_path):
+        cache_dir = tmp_path / "models"
+        monkeypatch.setattr(local_llm, "MODEL_CACHE_DIR", cache_dir)
+        return cache_dir
+
+    def _fake_hub(self, monkeypatch, calls=None, raises=None):
+        def fake_download(**kwargs):
+            if calls is not None:
+                calls.append(kwargs)
+            if raises is not None:
+                raise raises
+            target = Path(kwargs["local_dir"]) / kwargs["filename"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"gguf")
+            return str(target)
+
+        monkeypatch.setitem(
+            sys.modules,
+            "huggingface_hub",
+            types.SimpleNamespace(hf_hub_download=fake_download),
+        )
+
+    def test_file_only_uses_a_cached_file_without_network(self, monkeypatch, tmp_path):
+        cache_dir = self._cache(monkeypatch, tmp_path)
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", "cached.gguf")
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "cached.gguf").write_bytes(b"gguf")
+        calls = []
+        self._fake_hub(monkeypatch, calls=calls)
+
+        assert local_llm._model_path() == cache_dir / "cached.gguf"
+        assert local_llm._download_model() == cache_dir / "cached.gguf"
+        assert calls == []
+
+    def test_file_only_downloads_from_the_default_repo(self, monkeypatch, tmp_path):
+        cache_dir = self._cache(monkeypatch, tmp_path)
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", "extra.gguf")
+        calls = []
+        self._fake_hub(monkeypatch, calls=calls)
+
+        local_llm._download_model()
+
+        assert calls == [
+            {
+                "repo_id": "openbmb/MiniCPM5-1B-GGUF",
+                "filename": "extra.gguf",
+                "local_dir": str(cache_dir),
+                "local_dir_use_symlinks": False,
+            }
+        ]
+
+    def test_repo_only_downloads_the_default_filename(self, monkeypatch, tmp_path):
+        cache_dir = self._cache(monkeypatch, tmp_path)
+        monkeypatch.setenv("MNEMOSYNE_LLM_REPO", "someone/other-gguf")
+        calls = []
+        self._fake_hub(monkeypatch, calls=calls)
+
+        local_llm._download_model()
+
+        assert calls[0]["repo_id"] == "someone/other-gguf"
+        assert calls[0]["filename"] == "MiniCPM5-1B-Q4_K_M.gguf"
+        # A non-default repo is namespaced, so its download cannot land on the
+        # flat path shared with the shipped artifact.
+        download_root = Path(calls[0]["local_dir"])
+        assert download_root != cache_dir
+        assert download_root.name != ".repositories"
+        assert download_root.parent.parent == cache_dir
+        assert download_root.parent.name == ".repositories"
+        assert (download_root / "MiniCPM5-1B-Q4_K_M.gguf").is_file()
+
+    def test_default_repo_keeps_the_historical_flat_cache_path(
+        self, monkeypatch, tmp_path
+    ):
+        """Existing caches must keep working: the shipped repo stays flat."""
+        cache_dir = self._cache(monkeypatch, tmp_path)
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "MiniCPM5-1B-Q4_K_M.gguf").write_bytes(b"gguf")
+        calls = []
+        self._fake_hub(monkeypatch, calls=calls)
+
+        assert local_llm._model_path() == cache_dir / "MiniCPM5-1B-Q4_K_M.gguf"
+        assert local_llm._download_model() == cache_dir / "MiniCPM5-1B-Q4_K_M.gguf"
+        assert calls == []
+
+    def test_cached_default_does_not_satisfy_a_different_repo(
+        self, monkeypatch, tmp_path
+    ):
+        """A cached file is not the selected artifact when the repo differs."""
+        cache_dir = self._cache(monkeypatch, tmp_path)
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "MiniCPM5-1B-Q4_K_M.gguf").write_bytes(b"gguf")
+        monkeypatch.setenv("MNEMOSYNE_LLM_REPO", "someone/other-gguf")
+        calls = []
+        self._fake_hub(monkeypatch, calls=calls)
+
+        # The flat file belongs to the shipped repo, so it cannot answer for
+        # another one even though the filename matches.
+        assert local_llm._model_path() is None
+        local_llm._download_model()
+        assert calls[0]["repo_id"] == "someone/other-gguf"
+
+    def test_same_filename_in_two_repos_resolves_separately(self, monkeypatch, tmp_path):
+        cache_dir = self._cache(monkeypatch, tmp_path)
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "shared.gguf").write_bytes(b"shipped")
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", "shared.gguf")
+        monkeypatch.setenv("MNEMOSYNE_LLM_REPO", "someone/other-gguf")
+
+        assert local_llm._model_path() is None
+        other = local_llm._model_cache_path("someone/other-gguf", "shared.gguf")
+        assert other != cache_dir / "shared.gguf"
+
+    def test_cached_same_filename_in_two_repos_hits_its_own_cache(
+        self, monkeypatch, tmp_path
+    ):
+        """Each repo keeps its own copy, and a second lookup downloads nothing."""
+        cache_dir = self._cache(monkeypatch, tmp_path)
+        calls = []
+        self._fake_hub(monkeypatch, calls=calls)
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", "shared.gguf")
+
+        shipped = local_llm._download_model()
+        monkeypatch.setenv("MNEMOSYNE_LLM_REPO", "someone/other-gguf")
+        other = local_llm._download_model()
+
+        assert shipped == cache_dir / "shared.gguf"
+        assert other != shipped
+        assert shipped.exists() and other.exists()
+        assert len(calls) == 2
+
+        # Both are now cached, so neither selection may reach the network again.
+        assert local_llm._model_path() == other
+        monkeypatch.delenv("MNEMOSYNE_LLM_REPO", raising=False)
+        assert local_llm._model_path() == shipped
+        assert len(calls) == 2
+
+    def test_nested_filename_lands_where_the_lookup_expects(self, monkeypatch, tmp_path):
+        """A filename with a separator must not be nested twice on download."""
+        cache_dir = self._cache(monkeypatch, tmp_path)
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", "quant/model.gguf")
+        calls = []
+        self._fake_hub(monkeypatch, calls=calls)
+
+        assert local_llm._model_path() is None
+        downloaded = local_llm._download_model()
+
+        # hf_hub_download joins local_dir with the filename, so local_dir has to
+        # be the cache root; handing it the file's parent doubled the subdir.
+        assert calls[0]["local_dir"] == str(cache_dir)
+        assert downloaded == cache_dir / "quant" / "model.gguf"
+        assert local_llm._model_path() == downloaded
+
+    def test_cache_directory_failure_names_the_selection(self, monkeypatch, tmp_path, caplog):
+        cache_dir = self._cache(monkeypatch, tmp_path)
+        cache_dir.mkdir(parents=True)
+        # A file where the namespace directory must go makes mkdir raise.
+        (cache_dir / ".repositories").write_bytes(b"not a directory")
+        monkeypatch.setenv("MNEMOSYNE_LLM_REPO", "someone/other-gguf")
+        self._fake_hub(monkeypatch)
+
+        with caplog.at_level(logging.WARNING, logger=local_llm.__name__):
+            with pytest.raises(OSError):
+                local_llm._download_model()
+
+        warning = caplog.records[-1].getMessage()
+        assert "someone/other-gguf" in warning
+        assert "MiniCPM5-1B-Q4_K_M.gguf" in warning
+        assert ".repositories" in warning
+
+    def test_absolute_filename_is_used_as_given(self, monkeypatch, tmp_path):
+        """An absolute selection names one file; the cache root does not apply."""
+        self._cache(monkeypatch, tmp_path)
+        outside = tmp_path / "elsewhere.gguf"
+        outside.write_bytes(b"gguf")
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", str(outside))
+        calls = []
+        self._fake_hub(monkeypatch, calls=calls)
+
+        assert local_llm._model_path() == outside
+        assert local_llm._download_model() == outside
+        assert calls == []
+
+    def test_absolute_filename_that_is_missing_is_rejected(self, monkeypatch, tmp_path):
+        """An absolute name cannot be fetched, so a miss must fail loudly."""
+        self._cache(monkeypatch, tmp_path)
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", str(tmp_path / "absent.gguf"))
+        calls = []
+        self._fake_hub(monkeypatch, calls=calls)
+
+        assert local_llm._model_path() is None
+        with pytest.raises(ValueError, match="absolute path"):
+            local_llm._download_model()
+        assert calls == []
+
+    def test_missing_absolute_selection_logs_through_load_llm(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """_load_llm() swallows the failure, so the log record is the only signal."""
+        self._cache(monkeypatch, tmp_path)
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", str(tmp_path / "absent.gguf"))
+        self._fake_hub(monkeypatch, calls=[])
+        monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "_llm_instance", None)
+        monkeypatch.setattr(local_llm, "_llm_available", None)
+        monkeypatch.setattr(local_llm, "_load_llm", REAL_LOAD_LLM)
+        caplog.set_level(logging.WARNING, logger=local_llm.__name__)
+
+        assert local_llm._load_llm() is None
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "MNEMOSYNE_LLM_FILE" in message and "absent.gguf" in message
+            for message in messages
+        ), messages
+
+    def _stub_backends(self, monkeypatch, model_path, loader_calls):
+        """Stand in for the real backends so _load_llm can run without a model."""
+        monkeypatch.setattr(local_llm, "LLM_ENABLED", True)
+        monkeypatch.setattr(local_llm, "_llm_instance", None)
+        monkeypatch.setattr(local_llm, "_llm_backend", None)
+        monkeypatch.setattr(local_llm, "_llm_available", None)
+        monkeypatch.setattr(local_llm, "_load_llm", REAL_LOAD_LLM)
+
+        def fake_llamacpp(selected):
+            loader_calls.append(selected)
+            return model_path
+
+        monkeypatch.setattr(local_llm, "_load_llm_llamacpp", fake_llamacpp)
+        monkeypatch.setattr(
+            local_llm, "_load_llm_ctransformers", lambda selected: None
+        )
+
+    def test_load_llm_hands_the_cached_selection_to_the_backend(
+        self, monkeypatch, tmp_path
+    ):
+        """The seam from selection to loading: a cache hit hands over its own path."""
+        cache_dir = self._cache(monkeypatch, tmp_path)
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "cached.gguf").write_bytes(b"gguf")
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", "cached.gguf")
+        calls = []
+        self._fake_hub(monkeypatch, calls=calls)
+        sentinel = object()
+        loader_calls = []
+        self._stub_backends(monkeypatch, sentinel, loader_calls)
+
+        assert local_llm._load_llm() is sentinel
+        assert loader_calls == [cache_dir / "cached.gguf"]
+        assert calls == []
+        assert local_llm._llm_backend == "llamacpp"
+
+    def test_load_llm_hands_the_downloaded_selection_to_the_backend(
+        self, monkeypatch, tmp_path
+    ):
+        """A miss downloads first, and the backend receives that same path."""
+        self._cache(monkeypatch, tmp_path)
+        monkeypatch.setenv("MNEMOSYNE_LLM_REPO", "someone/other-gguf")
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", "fetched.gguf")
+        downloads = []
+        self._fake_hub(monkeypatch, calls=downloads)
+        sentinel = object()
+        loader_calls = []
+        self._stub_backends(monkeypatch, sentinel, loader_calls)
+
+        assert local_llm._load_llm() is sentinel
+        expected = local_llm._model_cache_path("someone/other-gguf", "fetched.gguf")
+        assert loader_calls == [expected]
+        assert expected.exists()
+        assert len(downloads) == 1
+
+    def test_parent_directory_filename_is_rejected(self, monkeypatch, tmp_path):
+        self._cache(monkeypatch, tmp_path)
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", "../other-repo/model.gguf")
+
+        assert local_llm._model_path() is None
+        with pytest.raises(ValueError, match="parent-directory"):
+            local_llm._download_model()
+
+    def test_both_set_select_the_pair_together(self, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_LLM_REPO", "someone/other-gguf")
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", "other.gguf")
+
+        assert local_llm._resolve_model_selection() == (
+            "someone/other-gguf",
+            "other.gguf",
+        )
+
+    def test_neither_set_keeps_the_shipped_defaults(self):
+        assert local_llm._resolve_model_selection() == local_llm._SHIPPED_MODEL
+
+    def test_blank_values_count_as_unset(self, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_LLM_REPO", "   ")
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", "")
+
+        assert local_llm._resolve_model_selection() == local_llm._SHIPPED_MODEL
+
+    def test_blank_repo_keeps_the_shipped_repo_with_a_custom_file(self, monkeypatch):
+        """A blank value is unset, so the other half of the pair still applies."""
+        shipped_repo, _ = local_llm._SHIPPED_MODEL
+        monkeypatch.setenv("MNEMOSYNE_LLM_REPO", "   ")
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", "custom.gguf")
+
+        assert local_llm._resolve_model_selection() == (shipped_repo, "custom.gguf")
+
+    def test_blank_file_keeps_the_shipped_file_with_a_custom_repo(self, monkeypatch):
+        _, shipped_file = local_llm._SHIPPED_MODEL
+        monkeypatch.setenv("MNEMOSYNE_LLM_REPO", "someone/other-gguf")
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", "  ")
+
+        assert local_llm._resolve_model_selection() == ("someone/other-gguf", shipped_file)
+
+    def test_variable_set_after_import_is_honoured(self, monkeypatch, tmp_path):
+        cache_dir = self._cache(monkeypatch, tmp_path)
+        before = local_llm._resolve_model_selection()
+
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", "late.gguf")
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "late.gguf").write_bytes(b"gguf")
+
+        assert local_llm._resolve_model_selection() != before
+        assert local_llm._model_path() == cache_dir / "late.gguf"
+
+    def test_loaded_model_is_not_replaced_when_the_selection_changes(self, monkeypatch):
+        existing = object()
+        monkeypatch.setattr(local_llm, "_llm_instance", existing)
+        monkeypatch.setattr(local_llm, "_load_llm", REAL_LOAD_LLM)
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", "late.gguf")
+
+        assert local_llm._load_llm() is existing
+
+    def test_download_failure_names_the_resolved_pair_and_variables(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        self._cache(monkeypatch, tmp_path)
+        monkeypatch.setenv("MNEMOSYNE_LLM_FILE", "missing.gguf")
+        self._fake_hub(monkeypatch, raises=OSError("offline"))
+
+        with caplog.at_level(logging.WARNING, logger=local_llm.__name__):
+            with pytest.raises(OSError):
+                local_llm._download_model()
+
+        failure = caplog.records[-1].getMessage()
+        assert "missing.gguf" in failure
+        assert "openbmb/MiniCPM5-1B-GGUF" in failure
+        assert "MNEMOSYNE_LLM_REPO" in failure
+        assert "MNEMOSYNE_LLM_FILE" in failure

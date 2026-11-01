@@ -130,19 +130,22 @@ def test_unreadable_marker_bypasses_enhanced_cache_without_log_spam(
     )
 
 
-@pytest.mark.parametrize("previous_version", [6, 7, 8])
+@pytest.mark.parametrize("previous_version", [6, 7, 8, 9, 10, 11, 12, 13])
 def test_cache_version_bump_invalidates_prior_candidate_and_cap_entries(
     enhanced, monkeypatch, tmp_path: Path, previous_version: int
 ):
     """Every prior cache generation misses under the content-cap contract.
 
     Version 6 predates staged FTS candidate selection, version 7 predates
-    vector admission/ranking, and version 8 is current main before the cap
-    becomes cache material. The ``v2:`` key prefix stays fixed for
-    QueryCache's opaque-key path.
+    vector admission/ranking, version 8 predates the cap as cache material,
+    version 9 predates the polyphonic query prefix, version 10 predates
+    polyphonic session scope before voice limits, and version 11 predates
+    hash-independent polyphonic order. Version 12 predates veracity and
+    memory_type filters before voice limits. Version 13 predates hydration of
+    the first eligible tier. The ``v2:`` key prefix stays fixed
+    for QueryCache's opaque-key path.
     """
     memory, calls = enhanced
-    assert memory._ENHANCED_RECALL_CACHE_VERSION == 9
 
     with monkeypatch.context() as ctx:
         ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", previous_version)
