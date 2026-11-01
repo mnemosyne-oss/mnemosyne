@@ -67,8 +67,8 @@ def test_concurrent_content_change_is_not_overwritten(memory, monkeypatch, tier)
         return np.ones((1, 384), dtype=np.float32)
     monkeypatch.setattr(bm._embeddings, 'embed', embed)
     result = memory.degrade_episodic()
-    row = memory.conn.execute("SELECT content, tier FROM episodic_memory WHERE id='target'").fetchone()
-    assert tuple(row) == ('peer replacement', tier)
+    row = memory.conn.execute("SELECT content, tier, degraded_at FROM episodic_memory WHERE id='target'").fetchone()
+    assert tuple(row) == ('peer replacement', tier, None)
     assert result[f'tier{tier}_to_tier{tier+1}'] == 0
     assert memory.conn.execute("SELECT embedding_json FROM memory_embeddings WHERE memory_id='target'").fetchone()[0] == '[9.0]'
 
@@ -89,3 +89,29 @@ def test_interrupted_vector_write_rolls_back_and_releases_lock(memory, monkeypat
     with sqlite3.connect(memory.db_path, timeout=0) as peer:
         peer.execute('BEGIN IMMEDIATE')
         peer.rollback()
+
+
+def test_sqlite_rollback_trigger_preserves_original_error(memory, monkeypatch):
+    """RAISE(ROLLBACK) removes the savepoint; cleanup must not replace its error."""
+    original = seed(memory, 2, 'target')
+    monkeypatch.setattr(bm._embeddings, 'embed', lambda texts: np.ones((1, 384), dtype=np.float32))
+    memory.conn.execute("CREATE TRIGGER abort_degradation BEFORE UPDATE OF tier ON episodic_memory BEGIN SELECT RAISE(ROLLBACK, 'original degradation failure'); END")
+    memory.conn.commit()
+    row = memory.conn.execute("SELECT id, rowid, content, tier, created_at FROM episodic_memory WHERE id='target'").fetchone()
+    with pytest.raises(sqlite3.IntegrityError, match='original degradation failure'):
+        memory._apply_episodic_degradation(row, 'compressed content', 2, datetime.now(timezone.utc))
+    assert not memory.conn.in_transaction
+    assert tuple(memory.conn.execute("SELECT content, tier, degraded_at FROM episodic_memory WHERE id='target'").fetchone()) == (original, 2, None)
+
+
+def test_lost_savepoint_does_not_replace_keyboard_interrupt(memory, monkeypatch):
+    original = seed(memory, 2, 'target')
+    monkeypatch.setattr(bm._embeddings, 'embed', lambda texts: np.ones((1, 384), dtype=np.float32))
+    def interrupt_after_rollback(*args, **kwargs):
+        memory.conn.rollback()
+        raise KeyboardInterrupt('original interrupt')
+    monkeypatch.setattr(memory, '_refresh_episodic_embedding', interrupt_after_rollback)
+    with pytest.raises(KeyboardInterrupt, match='original interrupt'):
+        memory.degrade_episodic()
+    assert not memory.conn.in_transaction
+    assert tuple(memory.conn.execute("SELECT content, tier FROM episodic_memory WHERE id='target'").fetchone()) == (original, 2)

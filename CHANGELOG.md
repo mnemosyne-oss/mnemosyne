@@ -7,12 +7,11 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
-- Precompute episodic degradation embeddings before row write savepoints, skip concurrently changed rows and preserve atomic vector rollback (#695).
-
 ### Added
 - **Advisory offline linear BEAM throughput benchmark (#901).** A fixed synthetic workload on a temporary database reports warm per-call latency, sequential throughput, raw samples and environment/revision metadata as JSON, with compatible same-machine baseline comparisons and a documented retention/interpretation policy. No runtime recall changes or CI timing threshold.
 
 ### Fixed
+- Precompute episodic degradation embeddings before row write savepoints, skip concurrently changed rows and preserve atomic vector rollback (#695).
 - **A query embedded while the embedding config changed is no longer stuck at `None` (#1296).** `embed_query()` chose its cache key before the model loaded. If the config moved to an API backend or to opt-out in between, the call returned `None` and that `None` was cached under the local key, so the query kept getting no vector after the config moved back. That one call still returns `None`, but nothing is cached, and the next call embeds normally.
 - **Dense recall self-heals after `mnemosyne.core.embeddings` is first imported while numpy/fastembed are unreachable.** It used to report dense recall unavailable for the whole process lifetime, silently; now `available()` and `_get_model()` re-attempt the dense-stack import via the new thread-safe `_ensure_fastembed()`, which binds the stack on success, remembers the result, and logs exactly one WARNING naming the failing module (numpy or fastembed) on failure instead of degrading silently; the API-model branch of `available()` is unchanged.
 - **Polyphonic recall no longer loses the caller's working memory to another session's episodic row with the same id (#1279).** Graph and fact hits don't say which tier they came from, so hydration tried the episodic table first and kept whatever row it found. If that row belonged to another session, the filter dropped it and the caller's own working row was never checked. Hydration now takes the first tier whose row passes the filters, still episodic first. Typed hits still read only their own tier. The enhanced-recall cache version moves to 14 so cached results from before the fix aren't reused.

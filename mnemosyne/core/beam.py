@@ -12448,8 +12448,13 @@ class BeamMemory:
             cursor.execute("RELEASE degrade_row")
             return applied
         except BaseException:
-            cursor.execute("ROLLBACK TO degrade_row")
-            cursor.execute("RELEASE degrade_row")
+            try:
+                cursor.execute("ROLLBACK TO degrade_row")
+                cursor.execute("RELEASE degrade_row")
+            except sqlite3.Error:
+                # SQLite may already have rolled back the transaction and
+                # removed the savepoint. Preserve the original failure.
+                pass
             raise
 
     def degrade_episodic(self, dry_run: bool = False) -> Dict:
