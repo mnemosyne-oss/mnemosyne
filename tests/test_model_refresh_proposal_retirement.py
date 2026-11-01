@@ -23,7 +23,10 @@ from mnemosyne.core.beam import (
     BeamMemory,
     _cjk_like_search,
     _cyrillic_like_search,
+    _fts_precise_terms,
+    _fts_query_terms,
     _fts_search_working,
+    _fts_staged_rows,
 )
 from mnemosyne.core import model_refresh
 
@@ -192,6 +195,45 @@ class TestResolvedProposalRetirement:
 
         assert survivor in ids
         assert not (ids & set(retired))
+
+    def test_retired_rows_do_not_consume_the_hangul_fts_budget(self, tmp_path):
+        """Hangul: eligibility must hold in the exact, precise and expanded stages.
+
+        A Korean query yields three different term lists (literal phrase,
+        widened phrase, shortened prefix) and each stage has its own LIMIT.
+        A filter that only covers one stage leaves the other two open, which
+        the Latin budget test cannot see because it never reaches those
+        stages.
+        """
+        beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+        retired = [
+            _store_proposal(beam, f"hangul{i}", body=f"시스템의 포트 설정 {i}번 항목")
+            for i in range(30)
+        ]
+        for proposal_id in retired:
+            model_refresh.reject_model_refresh_proposal(beam, proposal_id, reason="bulk")
+        survivor = _store_proposal(beam, "hangul_survivor", body="시스템의 포트 설정 보관")
+
+        query = "시스템의"
+        exact = _fts_precise_terms(query, widen=False)
+        precise = _fts_precise_terms(query)
+        expanded = _fts_query_terms(query)
+        assert len({tuple(exact), tuple(precise), tuple(expanded)}) == 3
+
+        ids = {row["id"] for row in _fts_search_working(beam.conn, query, k=5)}
+
+        assert survivor in ids
+        assert not (ids & set(retired))
+
+        # Negative control: without the predicate the same query fills the
+        # pool with retired rows, so the assertions above are not vacuous.
+        unfiltered = {
+            row["id"]
+            for row in _fts_staged_rows(
+                beam.conn, "fts_working", "id", query, 10, expanded
+            )
+        }
+        assert unfiltered & set(retired)
 
     def test_resolved_proposal_keeps_its_outcome(self, tmp_path):
         """Re-resolving must not rewrite metadata or flip the marker."""

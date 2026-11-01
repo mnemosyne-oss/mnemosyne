@@ -5575,15 +5575,26 @@ def _fts_staged_rows(
     query: str,
     k: int,
     expansion_terms: List[str],
-    eligibility_sql: str = "",
+    eligibility_predicate: str = "",
 ) -> List[Dict]:
     """Fill the bounded candidate budget with exact hits before expansions.
 
-    ``eligibility_sql`` optionally supplies an ``id IN (SELECT ...)``
-    subquery that is applied inside every stage, before that stage's LIMIT.
-    Callers that filter rows out afterwards must pass it here instead: with
-    a bounded pool, ineligible rows would otherwise consume the budget and
-    push eligible rows out of the candidate set entirely.
+    ``eligibility_predicate`` optionally supplies a **correlated** predicate
+    over the FTS row, applied inside every stage before that stage's LIMIT.
+    ``{id}`` in the predicate is replaced with the table's id column, so the
+    caller passes a subquery the planner can turn into an index lookup::
+
+        EXISTS (SELECT 1 FROM working_memory wm
+                WHERE wm.id = {id} AND wm.superseded_by IS NULL)
+
+    Do not pass ``{id} IN (SELECT ...)`` instead: SQLite materializes the
+    whole eligible id set before the FTS rows are ranked, which scans every
+    row of the outer table on each stage. On 100,000 working rows with three
+    matches that measured 32 ms versus 0.05 ms for the correlated form
+    (SQLite 3.53.1), and the cost grows with the table, not with the hits.
+    Callers that filter rows out afterwards must pass a predicate here
+    instead: with a bounded pool, ineligible rows would otherwise consume the
+    budget and push eligible rows out of the candidate set entirely.
 
     The pool handed to Python is capped (``LIMIT k``), so a single MATCH over
     ``exact OR prefix`` lets the prefix branch spend the whole budget on rows
@@ -5622,7 +5633,11 @@ def _fts_staged_rows(
     literal hits without enlarging the pool. Thirds and halves need no
     per-corpus constant.
     """
-    extra_sql = f" AND {id_col} IN ({eligibility_sql})" if eligibility_sql else ""
+    extra_sql = (
+        f" AND ({eligibility_predicate.format(id=f'{table}.{id_col}')})"
+        if eligibility_predicate
+        else ""
+    )
     match_sql = (
         f"SELECT {id_col}, rank FROM {table} WHERE {table} MATCH ?{extra_sql}"
         f" ORDER BY rank, {id_col} LIMIT ?"
@@ -5715,7 +5730,14 @@ def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> Li
         terms,
         # Retired rows stay in fts_working (the row is kept for audit), so
         # they must leave the candidate pool before its LIMIT, not after it.
-        eligibility_sql="SELECT id FROM working_memory WHERE superseded_by IS NULL",
+        # Correlated EXISTS, not ``id IN (SELECT ...)``: the IN form makes
+        # SQLite materialize every eligible id before ranking (32 ms vs
+        # 0.05 ms on 100k rows) and the cost scales with the bank, not the
+        # number of hits.
+        eligibility_predicate=(
+            "EXISTS (SELECT 1 FROM working_memory wm"
+            " WHERE wm.id = {id} AND wm.superseded_by IS NULL)"
+        ),
     )
     if not rows and _has_cjk(query):
         return _cjk_like_search(conn, query, k=k, working=True)
