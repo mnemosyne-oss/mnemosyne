@@ -29,9 +29,11 @@ def ids(path):
         return [r[0] for r in conn.execute('SELECT id FROM working_memory ORDER BY id')]
 
 
+@pytest.mark.parametrize('non_delete', ['keep', 'archive', 'flag'])
 @pytest.mark.parametrize('dry_run', [True, False])
-def test_mixed_delete_refused_before_any_write(mixed, dry_run):
+def test_mixed_delete_refused_before_any_write(mixed, dry_run, non_delete):
     path, candidates = mixed
+    candidates[1].suggested_action = non_delete
     before = path.read_bytes()
     result = clean_noise(path, candidates, action='delete', confirm=True, dry_run=dry_run)
     assert result.errors
@@ -87,6 +89,8 @@ def test_cli_refusal_explains_force_and_force_applies(mixed, monkeypatch, capsys
 @pytest.mark.parametrize('suggestions,expected_scope', [
     (('keep', 'keep'), '0/2'),
     (('delete', 'keep'), '1/2'),
+    (('delete', 'archive'), '1/2'),
+    (('delete', 'flag'), '1/2'),
     (('delete', 'delete'), '2/2'),
 ])
 @pytest.mark.parametrize('confirm', [False, True], ids=['preview', 'applied'])
