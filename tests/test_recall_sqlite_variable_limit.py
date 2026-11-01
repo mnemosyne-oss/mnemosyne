@@ -204,9 +204,10 @@ def test_equal_score_top_k_is_independent_of_bind_budget(make_store, order):
     assert signature(memory.recall('launch', **options)) == signature(baseline)
 
 
+@pytest.mark.parametrize('candidate_k', [40, 1200])
 @pytest.mark.parametrize('bind_limit', [31, 999])
 @pytest.mark.parametrize('tier', ['working', 'episodic'])
-def test_hangul_staged_rank_hydration_preserves_full_pool(make_store, tier, bind_limit):
+def test_hangul_staged_rank_hydration_preserves_full_pool(make_store, tier, bind_limit, candidate_k):
     memory = make_store(tier)
     ids = [r['id'] for r in memory.conn.execute(f'SELECT id FROM {tier}_memory ORDER BY id')]
     memory.conn.executemany(
@@ -215,8 +216,8 @@ def test_hangul_staged_rank_hydration_preserves_full_pool(make_store, tier, bind
     )
     memory.conn.commit()
     search = bm._fts_search_working if tier == 'working' else bm._fts_search
-    baseline_ranks = search(memory.conn, '바나나', k=1200)
-    assert len(baseline_ranks) == 1200  # MATCH plus these IDs exceeds the old 999 budget.
+    baseline_ranks = search(memory.conn, '바나나', k=candidate_k)
+    assert len(baseline_ranks) == candidate_k  # 40 crosses the 31/999 branch boundary; 1200 exceeds both.
     assert len({r['rank'] for r in baseline_ranks}) > 1
     table, id_col = ('fts_working', 'id') if tier == 'working' else ('fts_episodes', 'rowid')
     # Independent oracle: the expansion MATCH itself, without the staged selector.
@@ -231,5 +232,5 @@ def test_hangul_staged_rank_hydration_preserves_full_pool(make_store, tier, bind
     baseline = memory.recall('바나나', top_k=400, _track_recall=False, **FILTERS)
     assert len(baseline) == 400
     limit(memory, bind_limit)
-    assert search(memory.conn, '바나나', k=1200) == expected_ranks
+    assert search(memory.conn, '바나나', k=candidate_k) == expected_ranks
     assert signature(memory.recall('바나나', top_k=400, _track_recall=False, **FILTERS)) == signature(baseline)
