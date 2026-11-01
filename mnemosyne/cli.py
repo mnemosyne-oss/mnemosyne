@@ -1248,13 +1248,18 @@ def cmd_restore(args):
 def cmd_verify(args):
     """Verify database integrity."""
     from mnemosyne.dr.recovery import verify_integrity
-    db_path = Path(args[0]) if args else None
+    db_args = [a for a in args if a != "--quick"]
+    db_path = Path(db_args[0]) if db_args else None
     quick = "--quick" in args
     try:
         if quick:
             import sqlite3
+            from mnemosyne.dr.recovery import _sqlite_ro_uri
             db = db_path or Path(DATA_DIR) / "mnemosyne.db"
-            conn = sqlite3.connect(str(db))
+            if not db.is_file():
+                print(f"Error: verify_failed — database not found: {db}")
+                sys.exit(1)
+            conn = sqlite3.connect(_sqlite_ro_uri(db), uri=True)
             cursor = conn.cursor()
             cursor.execute("PRAGMA quick_check")
             result = cursor.fetchone()
