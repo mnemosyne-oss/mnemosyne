@@ -7,6 +7,8 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+- Precompute episodic degradation embeddings before row write savepoints, skip concurrently changed rows and preserve atomic vector rollback (#695).
+
 ### Added
 - **Advisory offline linear BEAM throughput benchmark (#901).** A fixed synthetic workload on a temporary database reports warm per-call latency, sequential throughput, raw samples and environment/revision metadata as JSON, with compatible same-machine baseline comparisons and a documented retention/interpretation policy. No runtime recall changes or CI timing threshold.
 

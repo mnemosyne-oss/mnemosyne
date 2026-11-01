@@ -35,6 +35,8 @@ from mnemosyne.core.recall_provenance import append_recall_provenance
 from mnemosyne.core.sqlite_config import configure_busy_timeout
 
 logger = logging.getLogger(__name__)
+
+_EPISODIC_EMBEDDING_UNSET = object()
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Any, Set, Union, Tuple, Callable, Sequence, FrozenSet
 from pathlib import Path
@@ -12338,7 +12340,19 @@ class BeamMemory:
             compressed += " [...]"
         return compressed
 
-    def _refresh_episodic_embedding(self, memory_id: str, rowid: int, new_content: str):
+    def _prepare_episodic_embedding(self, content: str):
+        """Compute external embedding work before opening a degradation savepoint."""
+        if _embeddings.available():
+            try:
+                return _embeddings.embed([content])
+            except Exception:
+                pass
+        return None
+
+    def _refresh_episodic_embedding(
+        self, memory_id: str, rowid: int, new_content: str,
+        *, prepared_embedding=_EPISODIC_EMBEDDING_UNSET,
+    ):
         """Refresh dense-recall embedding stores for an episodic row whose
         content has been mutated (degraded). Without this the
         vec_episodes / memory_embeddings / binary_vector entries continue
@@ -12367,36 +12381,34 @@ class BeamMemory:
                 "embedding refresh"
             )
 
-        if _embeddings.available():
-            try:
-                vec = _embeddings.embed([new_content])
-            except Exception:
-                vec = None
-            if vec is not None:
-                # vec_episodes is a sqlite-vec virtual table; vec0 doesn't
-                # support UPDATE on the embedding column reliably, so we
-                # DELETE+INSERT to refresh.
-                if vec_available_now:
-                    cursor.execute("DELETE FROM vec_episodes WHERE rowid = ?", (rowid,))
-                    _vec_insert(
-                        self.conn, rowid, np.asarray(vec[0]).tolist(), commit=False
-                    )
-                else:
-                    cursor.execute("""
-                        INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
-                        VALUES (?, ?, ?)
-                    """, (memory_id, _embeddings.serialize(np.asarray(vec[0])), _embeddings._DEFAULT_MODEL))
+        vec = (self._prepare_episodic_embedding(new_content)
+               if prepared_embedding is _EPISODIC_EMBEDDING_UNSET
+               else prepared_embedding)
+        if vec is not None:
+            # vec_episodes is a sqlite-vec virtual table; vec0 doesn't
+            # support UPDATE on the embedding column reliably, so we
+            # DELETE+INSERT to refresh.
+            if vec_available_now:
+                cursor.execute("DELETE FROM vec_episodes WHERE rowid = ?", (rowid,))
+                _vec_insert(
+                    self.conn, rowid, np.asarray(vec[0]).tolist(), commit=False
+                )
+            else:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
+                    VALUES (?, ?, ?)
+                """, (memory_id, _embeddings.serialize(np.asarray(vec[0])), _embeddings._DEFAULT_MODEL))
 
-                if _mib is not None:
-                    try:
-                        bv = _mib(vec[0])
-                        cursor.execute(
-                            "UPDATE episodic_memory SET binary_vector = ? WHERE id = ?",
-                            (bv, memory_id),
-                        )
-                    except Exception:
-                        logger.info("Regex extraction failed, skipping", exc_info=True)
-                return
+            if _mib is not None:
+                try:
+                    bv = _mib(vec[0])
+                    cursor.execute(
+                        "UPDATE episodic_memory SET binary_vector = ? WHERE id = ?",
+                        (bv, memory_id),
+                    )
+                except Exception:
+                    logger.info("Regex extraction failed, skipping", exc_info=True)
+            return
 
         # Provider unavailable (or embed() returned None). Invalidate the
         # stale entries so dense recall doesn't lie. The row keeps its
@@ -12413,6 +12425,32 @@ class BeamMemory:
                 "UPDATE episodic_memory SET binary_vector = NULL WHERE id = ?",
                 (memory_id,),
             )
+
+    def _apply_episodic_degradation(self, row, content, old_tier, now):
+        """Apply a prepared row transition only while its source snapshot still matches."""
+        content = _sanitize_utf8(content)
+        changed = content != row["content"]
+        prepared = self._prepare_episodic_embedding(content) if changed else None
+        cursor = self.conn.cursor()
+        cursor.execute("SAVEPOINT degrade_row")
+        try:
+            cursor.execute(
+                "UPDATE episodic_memory SET content = ?, tier = ?, degraded_at = ? "
+                "WHERE id = ? AND rowid = ? AND tier = ? AND content = ? AND created_at = ?",
+                (content, old_tier + 1, now.isoformat(), row["id"], row["rowid"],
+                 old_tier, row["content"], row["created_at"]),
+            )
+            applied = cursor.rowcount == 1
+            if applied and changed:
+                self._refresh_episodic_embedding(
+                    row["id"], row["rowid"], content, prepared_embedding=prepared,
+                )
+            cursor.execute("RELEASE degrade_row")
+            return applied
+        except BaseException:
+            cursor.execute("ROLLBACK TO degrade_row")
+            cursor.execute("RELEASE degrade_row")
+            raise
 
     def degrade_episodic(self, dry_run: bool = False) -> Dict:
         """Degrade old episodic memories through tier 1→2→3 compression.
@@ -12451,7 +12489,7 @@ class BeamMemory:
         # rowid is selected so the embedding refresh can address vec_episodes.
         try:
             cursor.execute("""
-                SELECT id, rowid, content, importance FROM episodic_memory
+                SELECT id, rowid, content, importance, created_at FROM episodic_memory
                 WHERE tier = 1 AND created_at < ?
                 ORDER BY created_at ASC LIMIT ?
             """, (tier2_cutoff, degrade_batch_size))
@@ -12467,7 +12505,7 @@ class BeamMemory:
         # Tier 2 → Tier 3: very old, at tier 2
         try:
             cursor.execute("""
-                SELECT id, rowid, content FROM episodic_memory
+                SELECT id, rowid, content, created_at FROM episodic_memory
                 WHERE tier = 2 AND created_at < ?
                 ORDER BY created_at ASC LIMIT ?
             """, (tier3_cutoff, degrade_batch_size // 2))
@@ -12485,46 +12523,23 @@ class BeamMemory:
             results["tier2_to_tier3"] = len(tier2_rows)
             return results
 
-        # --- Degrade tier 1 → tier 2: LLM summarization ---
-        # Each row's UPDATE + embedding refresh runs inside a SAVEPOINT so
-        # a refresh failure rolls back the content mutation too. Without
-        # this the broad except below would swallow the refresh exception
-        # while leaving the UPDATE staged in the implicit transaction,
-        # which then commits at the end of degrade_episodic -- producing
-        # the very content/embedding drift this fix exists to prevent
-        # (caught by /review for C18.b).
+        # Compute external work before taking this row's write lock. Each
+        # UPDATE and vector refresh stays atomic inside the row savepoint.
+        # A caller-owned outer transaction can still hold its own write lock.
         from mnemosyne.core import local_llm
         for row in tier1_rows:
-            cursor.execute("SAVEPOINT degrade_row")
             try:
                 compressed = row["content"]
                 if local_llm.llm_available() and len(row["content"]) > 300:
                     summary = local_llm.summarize_memories([row["content"]])
                     if summary:
                         compressed = summary[:400]
-                final_content = compressed[:800]
-                cursor.execute(
-                    "UPDATE episodic_memory SET content = ?, tier = 2, degraded_at = ? WHERE id = ?",
-                    (_sanitize_utf8(final_content), now.isoformat(), row["id"])
-                )
-                # Only refresh the embedding when content actually changed.
-                # If LLM was unavailable and content is unchanged the
-                # existing embedding is already correct and an embed()
-                # call would be wasted.
-                if final_content != row["content"]:
-                    self._refresh_episodic_embedding(row["id"], row["rowid"], final_content)
-                cursor.execute("RELEASE degrade_row")
-                results["tier1_to_tier2"] += 1
+                if self._apply_episodic_degradation(row, compressed[:800], 1, now):
+                    results["tier1_to_tier2"] += 1
             except Exception:
-                try:
-                    cursor.execute("ROLLBACK TO degrade_row")
-                    cursor.execute("RELEASE degrade_row")
-                except Exception:
-                    logger.info("degrade_episodic: rollback failed", exc_info=True)
+                logger.info("degrade_episodic: row skipped", exc_info=True)
 
-        # --- Degrade tier 2 → tier 3: smart extraction (keep key entities) ---
         for row in tier2_rows:
-            cursor.execute("SAVEPOINT degrade_row")
             try:
                 content = row["content"]
                 if SMART_COMPRESS and len(content) > TIER3_MAX_CHARS:
@@ -12533,20 +12548,10 @@ class BeamMemory:
                     compressed = content[:TIER3_MAX_CHARS]
                     if len(content) > TIER3_MAX_CHARS:
                         compressed += " [...]"
-                cursor.execute(
-                    "UPDATE episodic_memory SET content = ?, tier = 3, degraded_at = ? WHERE id = ?",
-                    (_sanitize_utf8(compressed), now.isoformat(), row["id"])
-                )
-                if compressed != row["content"]:
-                    self._refresh_episodic_embedding(row["id"], row["rowid"], compressed)
-                cursor.execute("RELEASE degrade_row")
-                results["tier2_to_tier3"] += 1
+                if self._apply_episodic_degradation(row, compressed, 2, now):
+                    results["tier2_to_tier3"] += 1
             except Exception:
-                try:
-                    cursor.execute("ROLLBACK TO degrade_row")
-                    cursor.execute("RELEASE degrade_row")
-                except Exception:
-                    logger.info("degrade_episodic: rollback failed", exc_info=True)
+                logger.info("degrade_episodic: row skipped", exc_info=True)
 
         self.conn.commit()
         # Tier demotion changes episodic content + embeddings; drop warmed
