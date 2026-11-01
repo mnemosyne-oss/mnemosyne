@@ -83,11 +83,6 @@ def test_real_recall_excludes_foreign_and_orphan_seeds_before_traversal(
         session_id="a", cross_session=False
     )
     try:
-        graph_target = next(r for r in engine._graph_voice(
-            query, scope_where=scope_where, scope_params=scope_params
-        ) if r.memory_id == "target")
-        assert graph_target.score == 0.2
-        assert graph_target.metadata["seed"] == "Alice"
         # A real engine call combines voices, prunes scope, hydrates content,
         # reranks, and assembles context; a foreign seed must not set metadata.
         scoped = engine.recall(
@@ -103,8 +98,13 @@ def test_real_recall_excludes_foreign_and_orphan_seeds_before_traversal(
         assert target.combined_score == pytest.approx(1 / 63)
         assert not {"Bob", "Ghost"} & {r.memory_id for r in scoped}
 
-        # An unscoped caller still selects the stronger Bob path. Ghost has
-        # no backing row and cannot appear in the final fused result.
+        graph_target = next(r for r in engine._graph_voice(
+            query, scope_where=scope_where, scope_params=scope_params
+        ) if r.memory_id == "target")
+        assert graph_target.score == 0.2
+        assert graph_target.metadata["seed"] == "Alice"
+
+        # An unscoped caller still selects the stronger Bob path.
         unscoped = engine.recall(query)
         target = next(r for r in unscoped if r.memory_id == "target")
         assert target.metadata["seed"] == "Bob"
