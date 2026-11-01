@@ -115,7 +115,19 @@ def test_api_numpy_broken_install_backs_off_and_recovers(recovery_api, monkeypat
     assert embeddings.available() is False
     assert embeddings.available() is False
     assert len(attempts) == 1
+    for call in (
+        lambda: embeddings.embed_query("private query"),
+        lambda: embeddings.embed(["private document"]),
+    ):
+        with pytest.raises(RuntimeError, match="NumPy") as error:
+            call()
+        assert "endpoint failed" not in str(error.value)
+        assert "private native-library path" not in str(error.value)
+    assert recovery_api["requests"] == []
+    assert len(attempts) == 1
     assert "private native-library path" not in caplog.text
+    assert "private query" not in caplog.text
+    assert "private document" not in caplog.text
     recovery_api["numpy_missing"] = False
     clock[0] = 101.0
     assert embeddings.available() is True
