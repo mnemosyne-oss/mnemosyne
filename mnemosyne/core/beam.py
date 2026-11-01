@@ -5589,9 +5589,11 @@ def _fts_staged_rows(
 
     Do not pass ``{id} IN (SELECT ...)`` instead: SQLite materializes the
     whole eligible id set before the FTS rows are ranked, which scans every
-    row of the outer table on each stage. On 100,000 working rows with three
-    matches that measured 32 ms versus 0.05 ms for the correlated form
-    (SQLite 3.53.1), and the cost grows with the table, not with the hits.
+    row of the outer table on each stage. Measured through
+    ``_fts_search_working`` on this schema -- 100,000 working rows, three
+    matches, SQLite 3.53.1, median of 10 statement runs -- that form took
+    61.7 ms against 0.36 ms for the correlated form, and the cost grows with
+    the table, not with the hits.
     Callers that filter rows out afterwards must pass a predicate here
     instead: with a bounded pool, ineligible rows would otherwise consume the
     budget and push eligible rows out of the candidate set entirely.
@@ -5731,8 +5733,8 @@ def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> Li
         # Retired rows stay in fts_working (the row is kept for audit), so
         # they must leave the candidate pool before its LIMIT, not after it.
         # Correlated EXISTS, not ``id IN (SELECT ...)``: the IN form makes
-        # SQLite materialize every eligible id before ranking (32 ms vs
-        # 0.05 ms on 100k rows) and the cost scales with the bank, not the
+        # SQLite materialize every eligible id before ranking (61.7 ms vs
+        # 0.36 ms on 100k rows) and the cost scales with the bank, not the
         # number of hits.
         eligibility_predicate=(
             "EXISTS (SELECT 1 FROM working_memory wm"
