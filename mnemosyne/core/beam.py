@@ -42,6 +42,41 @@ from typing import List, Dict, Optional, Any, Set, Union, Tuple, Callable, Seque
 from pathlib import Path
 
 
+def _recall_id_batches(conn, ids, reserved=0):
+    """Yield distinct IDs within the live bind limit, reserving fixed parameters.
+
+    Python 3.10 lacks Connection.getlimit; 999 is its conservative fallback.
+    Keep updates disjoint so a repeated candidate earns recall credit once.
+    """
+    distinct = list(dict.fromkeys(ids))
+    if not distinct:
+        return
+    getlimit = getattr(conn, "getlimit", None)
+    limit = getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) if callable(getlimit) else 999
+    size = min(900, limit - reserved)
+    if size < 1:
+        raise sqlite3.OperationalError("recall filters exhaust SQLite's variable limit")
+    for start in range(0, len(distinct), size):
+        yield distinct[start:start + size]
+
+
+def _select_recall_rows_by_ids(conn, sql, ids, params=(), *, key="id"):
+    """Load an IN lookup without dropping filters or truncating its candidates.
+
+    SQL is internal and contains one {placeholders} slot. IDs precede the fixed
+    filter parameters. Merge chunked results by the indexed identity so chunk
+    boundaries do not introduce an arbitrary ordering for equal-score rows.
+    Apply this order to single batches too: filter indexes may otherwise return
+    insertion order, changing tie membership when the bind budget changes.
+    """
+    rows = []
+    for chunk in _recall_id_batches(conn, ids, len(params)):
+        placeholders = ",".join("?" * len(chunk))
+        rows.extend(conn.execute(sql.format(placeholders=placeholders), (*chunk, *params)).fetchall())
+    rows.sort(key=lambda row: row[key])
+    return rows
+
+
 class MemoryTransactionStateError(RuntimeError):
     """An event-emitting write cannot be ordered after its caller's commit."""
 
@@ -2631,18 +2666,6 @@ def _deferred_commits(conn: sqlite3.Connection, *, immediate: bool = False):
         # Preserve an enclosing deferral scope if this context was nested.
         conn._defer_commit = previously_deferred
 
-
-def _select_by_ids(conn: sqlite3.Connection, select: str, ids: Sequence[str]) -> List[sqlite3.Row]:
-    """Run ``select`` (ending in ``WHERE id IN``) over ``ids`` in chunks.
-
-    Older SQLite builds allow 999 bound variables, and polyphonic recall can
-    return more results than that for a large top_k.
-    """
-    rows: List[sqlite3.Row] = []
-    for offset in range(0, len(ids), 900):
-        chunk = list(ids[offset:offset + 900])
-        rows.extend(conn.execute(f"{select} ({','.join('?' * len(chunk))})", chunk).fetchall())
-    return rows
 
 def _generate_id(content: str) -> str:
     return hashlib.sha256(f"{content}{datetime.now().isoformat()}".encode()).hexdigest()[:16]
@@ -5653,12 +5676,24 @@ def _fts_staged_rows(
     if not ordered_ids:
         return []
 
-    placeholders = ",".join("?" * len(ordered_ids))
-    rank_rows = conn.execute(
-        f"SELECT {id_col}, rank FROM {table}"
-        f" WHERE {table} MATCH ? AND {id_col} IN ({placeholders})",
-        (" OR ".join(expansion_terms), *ordered_ids),
-    ).fetchall()
+    match = " OR ".join(expansion_terms)
+    first_batch = next(_recall_id_batches(conn, ordered_ids, reserved=1))
+    if len(first_batch) == len(ordered_ids):
+        # Small pools keep the filtered, single-statement lookup.
+        rank_rows = _select_recall_rows_by_ids(
+            conn,
+            f"SELECT {id_col}, rank FROM {table}"
+            f" WHERE {id_col} IN ({{placeholders}}) AND {table} MATCH ?",
+            ordered_ids, (match,), key=id_col,
+        )
+    else:
+        # FTS working IDs are UNINDEXED: batching repeats the whole MATCH
+        # scan. Stream it once, retaining at most the selected pool in ranks.
+        rank_rows = (
+            r for r in conn.execute(
+                f"SELECT {id_col}, rank FROM {table} WHERE {table} MATCH ?", (match,)
+            ) if r[id_col] in seen_ids
+        )
     ranks = {r[id_col]: r["rank"] for r in rank_rows}
     # An exact hit the expansion terms cannot reach keeps the pool slot but
     # scores last, so it never displaces a row the ranking actually measured.
@@ -9532,8 +9567,8 @@ class BeamMemory:
         if working_candidate_ids:
             consolidated_ids = {
                 str(row["id"])
-                for row in _select_by_ids(
-                    self.conn, "SELECT id, consolidated_at FROM working_memory WHERE id IN",
+                for row in _select_recall_rows_by_ids(
+                    self.conn, "SELECT id, consolidated_at FROM working_memory WHERE id IN ({placeholders})",
                     list(working_candidate_ids),
                 )
                 if row["consolidated_at"] is not None
@@ -9549,7 +9584,8 @@ class BeamMemory:
             ids = list({str(row["id"]) for row in all_rows if row.get("tier") == tier and row.get("id") is not None})
             if not ids:
                 continue
-            rows = _select_by_ids(self.conn, f"SELECT id, session_id FROM {table} WHERE id IN", ids)
+            rows = _select_recall_rows_by_ids(
+                self.conn, f"SELECT id, session_id FROM {table} WHERE id IN ({{placeholders}})", ids)
             sessions.update(
                 {
                     (tier, str(row["id"])): str(row["session_id"])
@@ -9953,15 +9989,14 @@ class BeamMemory:
                 _recall_diag.record_fallback_used(wm=True)
 
         if wm_ids:
-            placeholders = ",".join("?" * len(wm_ids))
-            cursor = self.conn.cursor()
-            cursor.execute(f"""
+            rows = _select_recall_rows_by_ids(
+                self.conn, f"""
                 SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, veracity, memory_type
                 FROM working_memory
-                WHERE id IN ({placeholders})
+                WHERE id IN ({{placeholders}})
                   AND {wm_where}
-            """, (*tuple(wm_ids), *wm_params))
-            rows = cursor.fetchall()
+            """, wm_ids, wm_params
+            )
         else:
             # Fallback: fetch recent items and score in Python (old path)
             cursor = self.conn.cursor()
@@ -10105,15 +10140,14 @@ class BeamMemory:
         entity_memory_ids = _find_memories_by_entity(self, query)
         if entity_memory_ids:
             # Fetch entity-matched memories and boost their scores
-            placeholders = ",".join("?" * len(entity_memory_ids))
-            cursor = self.conn.cursor()
-            cursor.execute(f"""
+            entity_rows = _select_recall_rows_by_ids(
+                self.conn, f"""
                 SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, veracity, memory_type
                 FROM working_memory
-                WHERE id IN ({placeholders})
+                WHERE id IN ({{placeholders}})
                   AND {wm_where}
-            """, (*tuple(entity_memory_ids), *wm_params))
-            entity_rows = cursor.fetchall()
+            """, entity_memory_ids, wm_params
+            )
             
             # Entity matches can strengthen an existing query candidate, but
             # must not introduce annotation-only rows with no query evidence.
@@ -10129,40 +10163,38 @@ class BeamMemory:
 
             
             # Also check episodic memory for entity matches
-            em_placeholders = ",".join("?" * len(entity_memory_ids))
             if channel_id:
                 em_entity_scope = _session_scope_filter("channel_id", cross_session=cross_session)
-                em_entity_params = [*tuple(entity_memory_ids), *_session_scope_params(self.session_id, channel_id, cross_session=cross_session)]
+                em_entity_params = [*_session_scope_params(self.session_id, channel_id, cross_session=cross_session)]
             elif author_id or author_type:
                 em_entity_scope = "(1=1)"
-                em_entity_params = [*tuple(entity_memory_ids)]
+                em_entity_params = []
             else:
                 em_entity_scope = _session_scope_filter(cross_session=cross_session)
-                em_entity_params = [*tuple(entity_memory_ids), *_session_scope_params(self.session_id, cross_session=cross_session)]
+                em_entity_params = [*_session_scope_params(self.session_id, cross_session=cross_session)]
             em_entity_params.extend([datetime.now(timezone.utc).isoformat()])
-            cursor.execute(f"""
+            em_entity_rows = _select_recall_rows_by_ids(
+                self.conn, f"""
                 SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, veracity, memory_type
                 FROM episodic_memory
-                WHERE id IN ({em_placeholders})
+                WHERE id IN ({{placeholders}})
                   AND {em_entity_scope}
                   AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))
                   AND superseded_by IS NULL
-            """, (*em_entity_params,))
-            em_entity_rows = cursor.fetchall()
+            """, entity_memory_ids, em_entity_params
+            )
             
         # ---- Fact-aware recall ----
         fact_memory_ids = _find_memories_by_fact(self, query)
         if fact_memory_ids:
-            placeholders = ",".join("?" * len(fact_memory_ids))
-            cursor = self.conn.cursor()
-            # Check working_memory for fact matches
-            cursor.execute(f"""
+            fact_rows = _select_recall_rows_by_ids(
+                self.conn, f"""
                 SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, veracity, memory_type
                 FROM working_memory
-                WHERE id IN ({placeholders})
+                WHERE id IN ({{placeholders}})
                   AND {wm_where}
-            """, (*tuple(fact_memory_ids), *wm_params))
-            fact_rows = cursor.fetchall()
+            """, fact_memory_ids, wm_params
+            )
             
             existing_ids = {r["id"] for r in results}
             for row in fact_rows:
@@ -10208,23 +10240,24 @@ class BeamMemory:
             # Also check episodic memory for fact matches
             if channel_id:
                 fact_em_scope = _session_scope_filter("channel_id", cross_session=cross_session)
-                fact_em_params = [*tuple(fact_memory_ids), *_session_scope_params(self.session_id, channel_id, cross_session=cross_session)]
+                fact_em_params = [*_session_scope_params(self.session_id, channel_id, cross_session=cross_session)]
             elif author_id or author_type:
                 fact_em_scope = "(1=1)"
-                fact_em_params = [*tuple(fact_memory_ids)]
+                fact_em_params = []
             else:
                 fact_em_scope = _session_scope_filter(cross_session=cross_session)
-                fact_em_params = [*tuple(fact_memory_ids), *_session_scope_params(self.session_id, cross_session=cross_session)]
+                fact_em_params = [*_session_scope_params(self.session_id, cross_session=cross_session)]
             fact_em_params.extend([datetime.now(timezone.utc).isoformat()])
-            cursor.execute(f"""
+            em_fact_rows = _select_recall_rows_by_ids(
+                self.conn, f"""
                 SELECT id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, veracity, memory_type
                 FROM episodic_memory
-                WHERE id IN ({placeholders})
+                WHERE id IN ({{placeholders}})
                   AND {fact_em_scope}
                   AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))
                   AND superseded_by IS NULL
-            """, (*fact_em_params,))
-            em_fact_rows = cursor.fetchall()
+            """, fact_memory_ids, fact_em_params
+            )
             
             em_existing_ids = {r["id"] for r in results}
             for row in em_fact_rows:
@@ -10491,15 +10524,14 @@ class BeamMemory:
         # (session/channel/date) inflated the counter.
         
         if episodic_rowids:
-            placeholders = ",".join("?" * len(episodic_rowids))
-            cursor = self.conn.cursor()
-            cursor.execute(f"""
+            _em_candidate_rows = _select_recall_rows_by_ids(
+                self.conn, f"""
                 SELECT rowid, id, content, source, timestamp, importance, recall_count, last_recalled, valid_until, superseded_by, scope, author_id, author_type, channel_id, memory_type, binary_vector
                 FROM episodic_memory
-                WHERE rowid IN ({placeholders})
+                WHERE rowid IN ({{placeholders}})
                   AND {em_where}
-            """, (*tuple(episodic_rowids), *em_params))
-            _em_candidate_rows = cursor.fetchall()
+            """, episodic_rowids, em_params, key="rowid"
+            )
         else:
             _em_candidate_rows = []
         for row in _em_candidate_rows:
@@ -10756,11 +10788,10 @@ class BeamMemory:
         # SELECT for the same ep ids.
         ep_summary_of_map: Dict[str, str] = {}
         if em_ids_for_tier:
-            placeholders = ",".join("?" * len(em_ids_for_tier))
-            tier_rows = cursor.execute(
-                f"SELECT id, tier, veracity, summary_of FROM episodic_memory WHERE id IN ({placeholders})",
+            tier_rows = _select_recall_rows_by_ids(
+                self.conn, "SELECT id, tier, veracity, summary_of FROM episodic_memory WHERE id IN ({placeholders})",
                 em_ids_for_tier
-            ).fetchall()
+            )
             tier_lookup = {r["id"]: (r["tier"] or 1) for r in tier_rows}
             veracity_lookup = {r["id"]: (r["veracity"] or "unknown") for r in tier_rows}
             ep_summary_of_map = {r["id"]: (r["summary_of"] or "") for r in tier_rows}
@@ -10849,12 +10880,11 @@ class BeamMemory:
                         if sid
                     ]
                     if _source_ids:
-                        _ph = ",".join("?" * len(_source_ids))
-                        _src_rows = self.conn.execute(
-                            f"SELECT id, content, source, timestamp, importance, scope, veracity "
-                            f"FROM working_memory WHERE id IN ({_ph}) AND {wm_where}",
-                            (*_source_ids, *wm_params),
-                        ).fetchall()
+                        _src_rows = _select_recall_rows_by_ids(
+                            self.conn, "SELECT id, content, source, timestamp, importance, scope, veracity "
+                            "FROM working_memory WHERE id IN ({placeholders}) AND " + wm_where,
+                            _source_ids, wm_params,
+                        )
                         for _row in _src_rows:
                             memoria_source_id = f"memoria_source_{_row['id']}"
                             _track_literal_content(
@@ -10932,30 +10962,45 @@ class BeamMemory:
             rec_scope = "(1=1)"
         else:
             rec_scope = _session_scope_filter(cross_session=cross_session)
-        if _track_recall and wm_ids:
-            placeholders = ",".join("?" * len(wm_ids))
-            rec_params = [now_iso, *tuple(wm_ids)]
-            if channel_id:
-                rec_params.extend(_session_scope_params(self.session_id, channel_id, cross_session=cross_session))
-            elif not (author_id or author_type):
-                rec_params.extend(_session_scope_params(self.session_id, cross_session=cross_session))
-            cursor.execute(f"""
-                UPDATE working_memory
-                SET recall_count = recall_count + 1, last_recalled = ?
-                WHERE id IN ({placeholders}) AND {rec_scope}
-            """, (*rec_params,))
-        if _track_recall and em_ids:
-            placeholders = ",".join("?" * len(em_ids))
-            rec_params = [now_iso, *tuple(em_ids)]
-            if channel_id:
-                rec_params.extend(_session_scope_params(self.session_id, channel_id, cross_session=cross_session))
-            elif not (author_id or author_type):
-                rec_params.extend(_session_scope_params(self.session_id, cross_session=cross_session))
-            cursor.execute(f"""
-                UPDATE episodic_memory
-                SET recall_count = recall_count + 1, last_recalled = ?
-                WHERE id IN ({placeholders}) AND {rec_scope}
-            """, (*rec_params,))
+        rec_scope_params = []
+        if channel_id:
+            rec_scope_params = _session_scope_params(self.session_id, channel_id, cross_session=cross_session)
+        elif not (author_id or author_type):
+            rec_scope_params = _session_scope_params(self.session_id, cross_session=cross_session)
+        if _track_recall and (wm_ids or em_ids):
+            conn = self.conn
+            owns_transaction = not conn.in_transaction
+            savepoint = (conn._next_savepoint_name("recall_credit")
+                         if isinstance(conn, _BeamConnection)
+                         else f"mnemosyne_recall_credit_{next(_plain_savepoint_counter)}")
+            try:
+                # Keep all batches atomic without undoing caller-owned writes.
+                # BEGIN prevents RELEASE from committing ahead of the existing
+                # commit below, including when that commit is deferred.
+                if owns_transaction:
+                    conn.execute("BEGIN")
+                conn.execute(f"SAVEPOINT {savepoint}")
+                for table, ids in (("working_memory", wm_ids), ("episodic_memory", em_ids)):
+                    for chunk in _recall_id_batches(conn, ids, 1 + len(rec_scope_params)):
+                        placeholders = ",".join("?" * len(chunk))
+                        cursor.execute(f"""
+                            UPDATE {table}
+                            SET recall_count = recall_count + 1, last_recalled = ?
+                            WHERE id IN ({placeholders}) AND {rec_scope}
+                        """, (now_iso, *chunk, *rec_scope_params))
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except BaseException:
+                try:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                except sqlite3.Error:
+                    pass  # A trigger may already have rolled back the transaction.
+                try:
+                    if owns_transaction or not conn.in_transaction:
+                        conn.rollback()
+                except sqlite3.Error:
+                    pass  # A closed connection's state query can also fail.
+                raise
         self.conn.commit()
 
         if _track_recall:
@@ -11051,7 +11096,7 @@ class BeamMemory:
     # so entries cached under an older digest are not reused. Part of the
     # hashed payload; the opaque key keeps the "v2:" prefix because QueryCache's
     # opaque-path recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 15
+    _ENHANCED_RECALL_CACHE_VERSION = 16
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.
@@ -11358,9 +11403,19 @@ class BeamMemory:
                 memory_types = {}
                 wm_ids = [r["id"] for r in results if r.get("tier") == "working"]
                 em_ids = [r["id"] for r in results if r.get("tier") == "episodic"]
-                for table, ids in (("working_memory", wm_ids), ("episodic_memory", em_ids)):
-                    for row in _select_by_ids(
-                            self.conn, f"SELECT id, memory_type FROM {table} WHERE id IN", ids):
+                if wm_ids:
+                    rows = _select_recall_rows_by_ids(
+                        self.conn, "SELECT id, memory_type FROM working_memory WHERE id IN ({placeholders})",
+                        wm_ids
+                    )
+                    for row in rows:
+                        memory_types[row["id"]] = row["memory_type"]
+                if em_ids:
+                    rows = _select_recall_rows_by_ids(
+                        self.conn, "SELECT id, memory_type FROM episodic_memory WHERE id IN ({placeholders})",
+                        em_ids
+                    )
+                    for row in rows:
                         memory_types[row["id"]] = row["memory_type"]
 
                 from datetime import datetime as _dt
@@ -11518,8 +11573,11 @@ class BeamMemory:
                 if wm_ids:
                     summary_map[ep_id] = wm_ids
         else:
-            for row in _select_by_ids(
-                    self.conn, "SELECT id, summary_of FROM episodic_memory WHERE id IN", ep_ids):
+            rows = _select_recall_rows_by_ids(
+                self.conn, "SELECT id, summary_of FROM episodic_memory WHERE id IN ({placeholders})",
+                ep_ids,
+            )
+            for row in rows:
                 raw = row["summary_of"] or ""
                 wm_ids = {s.strip() for s in raw.split(",") if s.strip()}
                 if wm_ids:
@@ -11837,9 +11895,8 @@ class BeamMemory:
         # the linear path updates them and downstream features (decay
         # scheduling, importance reinforcement) depend on the signal.
         # /review caught the missing update as a silent telemetry loss.
-        # Chunked like hydration: a large top_k can pass SQLite's 999-variable
+        # Batched: a large top_k can pass SQLite's 999-variable
         # limit, and the timestamp and scope parameters share that budget.
-        id_chunk = 900 - len(rec_scope_params)
         if _track_recall and (recalled_episodic_ids or recalled_working_ids):
             # A failure between chunks, interrupts included, rolls back every
             # chunk: inside a caller's transaction only to a savepoint, so the
@@ -11847,8 +11904,7 @@ class BeamMemory:
             with _guarded_transaction(self.conn):
                 for table, ids in (("episodic_memory", recalled_episodic_ids),
                                    ("working_memory", recalled_working_ids)):
-                    for offset in range(0, len(ids), id_chunk):
-                        chunk = ids[offset:offset + id_chunk]
+                    for chunk in _recall_id_batches(self.conn, ids, 1 + len(rec_scope_params)):
                         placeholders = ",".join("?" * len(chunk))
                         self.conn.execute(
                             f"UPDATE {table} SET recall_count = recall_count + 1, "

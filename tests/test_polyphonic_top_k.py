@@ -251,14 +251,14 @@ def _record_id_lookups(monkeypatch):
     # The rows these lookups return can also arrive on the results, so a
     # lookup that silently returned nothing would still pass a result check.
     lookups = []
-    real = bm._select_by_ids
+    real = bm._select_recall_rows_by_ids
 
-    def record(conn, select, ids):
-        rows = real(conn, select, ids)
+    def record(conn, select, ids, *args, **kwargs):
+        rows = real(conn, select, ids, *args, **kwargs)
         lookups.append((select, len(ids), len(rows)))
         return rows
 
-    monkeypatch.setattr(bm, "_select_by_ids", record)
+    monkeypatch.setattr(bm, "_select_recall_rows_by_ids", record)
     return lookups
 
 
@@ -271,7 +271,7 @@ def test_enhanced_recall_weibull_stays_under_sqlite_variable_limit(beam, monkeyp
                                    use_mmr=False, use_intent=False, use_synonyms=False)
 
     assert len({r["id"] for r in results}) == LARGE
-    assert ("SELECT id, memory_type FROM working_memory WHERE id IN", LARGE, LARGE) in lookups
+    assert ("SELECT id, memory_type FROM working_memory WHERE id IN ({placeholders})", LARGE, LARGE) in lookups
 
 
 def test_cross_tier_dedup_stays_under_sqlite_variable_limit(beam):
@@ -302,8 +302,8 @@ def test_evidence_pack_stays_under_sqlite_variable_limit(beam, monkeypatch):
 
     assert len(pack["primary"]) == 10
     # Every candidate is checked for consolidation and given its session.
-    assert ("SELECT id, consolidated_at FROM working_memory WHERE id IN", LARGE, LARGE) in lookups
-    assert ("SELECT id, session_id FROM working_memory WHERE id IN", LARGE, LARGE) in lookups
+    assert ("SELECT id, consolidated_at FROM working_memory WHERE id IN ({placeholders})", LARGE, LARGE) in lookups
+    assert ("SELECT id, session_id FROM working_memory WHERE id IN ({placeholders})", LARGE, LARGE) in lookups
 
 
 @pytest.mark.parametrize("top_k", [20, 50])
@@ -319,20 +319,6 @@ def test_temporal_voice_supplies_full_top_k_without_embeddings(beam, monkeypatch
 
     assert len({r["id"] for r in results}) == top_k
     assert {r["tier"] for r in results} == {"working"}
-
-
-@pytest.mark.parametrize("count", [0, 1, 900, 901, 1800])
-def test_select_by_ids_returns_every_row_across_chunks(beam, count):
-    ids = [f"s{i}" for i in range(count)]
-    beam.conn.executemany(
-        "INSERT INTO working_memory (id, content, source, timestamp, session_id, scope) "
-        "VALUES (?, ?, 'user', datetime('now'), 'top-k-session', 'session')",
-        [(mid, _distinct(i)) for i, mid in enumerate(ids)],
-    )
-
-    rows = bm._select_by_ids(beam.conn, "SELECT id FROM working_memory WHERE id IN", ids)
-
-    assert sorted(r["id"] for r in rows) == sorted(ids)
 
 
 @pytest.mark.parametrize("call", [
