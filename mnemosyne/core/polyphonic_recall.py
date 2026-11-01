@@ -194,7 +194,10 @@ class PolyphonicRecallEngine:
                     excluded = resolve_exclusions(conn, exclude_captures)
                 finally:
                     conn.close()
-        graph_results = self._graph_voice(query)
+        graph_results = (
+            self._graph_voice(query) if scope_where is None else
+            self._graph_voice(query, scope_where=scope_where, scope_params=scope_params)
+        )
         fact_results = self._fact_voice(query)
         if excluded:
             # These voices carry no producing-tier evidence. An ambiguous
@@ -826,7 +829,8 @@ class PolyphonicRecallEngine:
             if own_conn:
                 conn.close()
     
-    def _graph_voice(self, query: str) -> List[RecallResult]:
+    def _graph_voice(self, query: str, scope_where: Optional[str] = None,
+                     scope_params: Sequence[Any] = ()) -> List[RecallResult]:
         """
         Voice 2: Episodic graph traversal.
 
@@ -874,21 +878,35 @@ class PolyphonicRecallEngine:
                     metadata={"entity": entity, "fact": f"{fact.subject} {fact.predicate} {fact.object}"}
                 ))
 
+        if scope_where is not None and seed_ids:
+            # Gists/facts have no shared scope column. Resolve their derived
+            # memory IDs against both backing tiers before they can influence
+            # traversal or fusion. Use the same any-tier eligibility check as
+            # the final fused prune, including its missing-tier handling and
+            # SQL error propagation. Unscoped standalone calls are unchanged.
+            eligible = {mid: PolyphonicResult(mid, 0.0, {}, {}) for mid in seed_ids}
+            self._drop_out_of_scope(eligible, scope_where, scope_params)
+            seed_ids = {mid: None for mid in seed_ids if mid in eligible}
+            results = [result for result in results if result.memory_id in seed_ids]
+
         # Graph traversal: from seed memory IDs, walk edges to
         # discover indirectly related memories (ctx edges only,
         # moderate weight threshold to avoid noise).
-        traversed_ids = set()
+        traversed = {}
         for seed_id in seed_ids:
             related = self.graph.find_related_memories(
                 seed_id, depth=2, edge_type="ctx", min_weight=0.3
             )
             for rel in related:
                 mid = rel["memory_id"]
-                if mid not in traversed_ids and mid not in seed_ids:
-                    traversed_ids.add(mid)
-                    results.append(RecallResult(
+                if mid in seed_ids:
+                    continue
+                score = 0.4 / rel["depth"]  # Score decays with hop distance
+                previous = traversed.get(mid)
+                if previous is None or score > previous.score:
+                    traversed[mid] = RecallResult(
                         memory_id=mid,
-                        score=0.4 / rel["depth"],  # Score decays with hop distance
+                        score=score,
                         voice="graph_traversal",
                         metadata={
                             "seed": seed_id,
@@ -896,8 +914,9 @@ class PolyphonicRecallEngine:
                             "depth": rel["depth"],
                             "weight": rel["weight"],
                         }
-                    ))
+                    )
 
+        results.extend(traversed.values())
         return results
     
     def _fact_voice(self, query: str) -> List[RecallResult]:
