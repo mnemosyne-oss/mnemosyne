@@ -174,17 +174,7 @@ def test_failed_tracking_chunk_leaves_no_partial_credit(beam, monkeypatch, error
     # A failure between tracking chunks must not leave the earlier chunks'
     # increments in an open transaction that holds the write lock.
     _seed_large_working_under_limit(beam)
-    real_execute = beam.conn.execute
-    updates = []
-
-    def fail_on_second_chunk(sql, *args, **kwargs):
-        if isinstance(sql, str) and sql.startswith("UPDATE working_memory SET recall_count"):
-            updates.append(sql)
-            if len(updates) == 2:
-                raise error("stopped between tracking chunks")
-        return real_execute(sql, *args, **kwargs)
-
-    monkeypatch.setattr(beam.conn, "execute", fail_on_second_chunk)
+    updates = _fail_on_second_tracking_chunk(beam, monkeypatch, error)
 
     with pytest.raises(error):
         beam.recall("unrelated opaque query", top_k=LARGE)
@@ -200,6 +190,61 @@ def test_failed_tracking_chunk_leaves_no_partial_credit(beam, monkeypatch, error
         other.rollback()
     finally:
         other.close()
+
+
+def _fail_on_second_tracking_chunk(beam, monkeypatch, error):
+    real_execute = beam.conn.execute
+    updates = []
+
+    def execute(sql, *args, **kwargs):
+        if isinstance(sql, str) and sql.startswith("UPDATE working_memory SET recall_count"):
+            updates.append(sql)
+            if len(updates) == 2:
+                raise error("stopped between tracking chunks")
+        return real_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(beam.conn, "execute", execute)
+    return updates
+
+
+@pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt], ids=["exception", "interrupt"])
+def test_failed_tracking_chunk_keeps_the_caller_transaction(beam, monkeypatch, error):
+    # Inside a caller's transaction only the tracking writes roll back; the
+    # caller's own row and open transaction survive, and committing later
+    # credits nothing for the failed recall.
+    _seed_large_working_under_limit(beam)
+    # The first recall builds the engine, whose table setup commits.
+    beam.recall("unrelated opaque query", top_k=1, _track_recall=False)
+    beam.conn.execute("BEGIN")
+    beam.conn.execute(
+        "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
+        "VALUES ('caller-marker', 'caller row', 'user', datetime('now'), 'top-k-session')")
+    updates = _fail_on_second_tracking_chunk(beam, monkeypatch, error)
+
+    with pytest.raises(error):
+        beam.recall("unrelated opaque query", top_k=LARGE)
+
+    monkeypatch.undo()
+    assert len(updates) == 2
+    assert beam.conn.in_transaction
+    beam.conn.commit()
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = 'caller-marker'").fetchone()[0] == 1
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE recall_count > 0").fetchone()[0] == 0
+
+
+def test_failed_rollback_keeps_the_tracking_error(beam, monkeypatch):
+    _seed_large_working_under_limit(beam)
+    _fail_on_second_tracking_chunk(beam, monkeypatch, RuntimeError)
+
+    def broken_rollback():
+        raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+
+    monkeypatch.setattr(beam.conn, "rollback", broken_rollback)
+
+    with pytest.raises(RuntimeError, match="stopped between tracking chunks"):
+        beam.recall("unrelated opaque query", top_k=LARGE)
 
 
 def _record_id_lookups(monkeypatch):

@@ -2466,7 +2466,7 @@ def _guarded_transaction(conn: sqlite3.Connection):
             conn.commit()
         else:
             conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-    except Exception:
+    except BaseException:
         try:
             if savepoint is None:
                 conn.rollback()
@@ -11840,27 +11840,21 @@ class BeamMemory:
         # Chunked like hydration: a large top_k can pass SQLite's 999-variable
         # limit, and the timestamp and scope parameters share that budget.
         id_chunk = 900 - len(rec_scope_params)
-        tracked = ((("episodic_memory", recalled_episodic_ids),
-                    ("working_memory", recalled_working_ids)) if _track_recall else ())
-        # A failure between chunks, interrupts included, must not leave the
-        # earlier chunks' credit in an open transaction holding the write lock.
-        owns_transaction = not self.conn.in_transaction
-        try:
-            for table, ids in tracked:
-                for offset in range(0, len(ids), id_chunk):
-                    chunk = ids[offset:offset + id_chunk]
-                    placeholders = ",".join("?" * len(chunk))
-                    self.conn.execute(
-                        f"UPDATE {table} SET recall_count = recall_count + 1, "
-                        f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
-                        (now_iso, *chunk, *rec_scope_params),
-                    )
-        except BaseException:
-            if owns_transaction and self.conn.in_transaction:
-                self.conn.rollback()
-            raise
         if _track_recall and (recalled_episodic_ids or recalled_working_ids):
-            self.conn.commit()
+            # A failure between chunks, interrupts included, rolls back every
+            # chunk: inside a caller's transaction only to a savepoint, so the
+            # failed recall credits nothing even if the caller commits later.
+            with _guarded_transaction(self.conn):
+                for table, ids in (("episodic_memory", recalled_episodic_ids),
+                                   ("working_memory", recalled_working_ids)):
+                    for offset in range(0, len(ids), id_chunk):
+                        chunk = ids[offset:offset + id_chunk]
+                        placeholders = ",".join("?" * len(chunk))
+                        self.conn.execute(
+                            f"UPDATE {table} SET recall_count = recall_count + 1, "
+                            f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
+                            (now_iso, *chunk, *rec_scope_params),
+                        )
 
         # --- MEMORIA structured fact supplement (polyphonic path) ---
         try:
