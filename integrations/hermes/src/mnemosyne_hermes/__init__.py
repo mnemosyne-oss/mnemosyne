@@ -299,6 +299,56 @@ def _release_thread_connection(db_path=None) -> None:
         logger.debug("thread connection release failed", exc_info=True)
 
 
+# --- connection ownership -------------------------------------------------
+#
+# A SQLite connection belongs to the THREAD that opened it: the core caches
+# one handle per (thread, database path) in ``memory._thread_local`` and
+# ``beam._thread_local``. Two consequences shape the release rules here:
+#
+#   * A handle opened in a worker thread is reachable only through the
+#     instance that holds it. The core's ``close_thread_connection`` looks at
+#     the CALLING thread's cache and would not see it.
+#   * Two instances that open the same path in the same thread SHARE one
+#     handle. Closing it on behalf of one of them breaks the other -- the
+#     "cannot operate on a closed database" error.
+#
+# The registry below counts the live owners per HANDLE OBJECT, so a handle is
+# closed exactly when its last owner lets go of it.
+#
+# The key is deliberately the handle object and NOT (thread, path). The core
+# keeps only ONE connection per THREAD: opening a second path in the same
+# thread REPLACES the cached connection, and opening the first path again
+# then creates a NEW connection object for it. (thread, path) therefore
+# identifies a path, not a connection -- two instances that use the same
+# path can hold two different connection objects, and a counter per
+# (thread, path) would either close a handle a sibling still uses or leave
+# one open forever (review round 3).
+#
+# The handle is the identity of the resource. It is not weak-referenceable
+# (sqlite3.Connection), so the registry keeps it alive on purpose: the entry
+# is removed when the last owner lets go, which is exactly when the handle
+# is closed.
+_CONNECTION_CLAIMS: Dict[Any, int] = {}
+_CONNECTION_CLAIMS_LOCK = threading.Lock()
+
+
+def _claim_connection(handle: Any) -> None:
+    """Record one more live owner of a connection handle."""
+    with _CONNECTION_CLAIMS_LOCK:
+        _CONNECTION_CLAIMS[handle] = _CONNECTION_CLAIMS.get(handle, 0) + 1
+
+
+def _release_connection(handle: Any) -> bool:
+    """Drop one owner of THIS handle; return True when the last one let go."""
+    with _CONNECTION_CLAIMS_LOCK:
+        count = _CONNECTION_CLAIMS.get(handle, 0) - 1
+        if count > 0:
+            _CONNECTION_CLAIMS[handle] = count
+            return False
+        _CONNECTION_CLAIMS.pop(handle, None)
+        return True
+
+
 # Host-backend ownership is deliberately separate from _provider_active: only
 # a primary provider whose Beam initialization succeeded owns a contribution.
 # Skip contexts still register the backend for mnemosyne_sleep, but neither
@@ -2555,6 +2605,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 self._memory.close()
             except Exception:
                 logger.debug("Mnemosyne: could not close prior wrapper", exc_info=True)
+        # The claim on the prior profile handle must be given back: the
+        # re-initialization claims a new one, and a claim that is never
+        # released would keep the handle alive forever (review round 2, R3).
+        #
+        # Both owners are covered: with profile isolation the claim sits on
+        # ``_memory`` (one handle, one claim), without it the claim sits on
+        # ``_beam`` alone and ``_memory`` is None. The handle is NOT closed
+        # here -- the new instance reuses it.
+        if self._memory is not None:
+            self._release_bank_connection(self._memory)
+        elif self._beam is not None:
+            self._release_bank_connection(self._beam)
         if self._audit is not None:
             try:
                 self._audit.close()
@@ -2703,6 +2765,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 )
                 self._memory = mem
                 self._beam = mem.beam
+                self._claim_bank_connection(mem)
                 self._ambient_key = init_key
                 logger.info(
                     "Mnemosyne initialized (profile isolation ON): session=%s, bank=%s, db=%s",
@@ -2719,6 +2782,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 if kwargs.get("channel_id"):
                     beam_kwargs["channel_id"] = kwargs["channel_id"]
                 self._beam = BeamMemory(**beam_kwargs)
+                self._claim_bank_connection(self._beam)
                 self._ambient_key = init_key
                 logger.info(
                     "Mnemosyne initialized: session=%s, db=%s",
@@ -3083,7 +3147,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         return previous_session_id, provider_session_id
 
     @contextmanager
-    def _beam_session_scope(self, session_id: str):
+    def _beam_session_scope_raw(self, session_id: str):
         """Scope one Beam operation without replacing durable switch state."""
         requested_session_id = str(session_id or "").strip()
         with self._ensure_beam_access_lock():
@@ -3117,6 +3181,267 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     else:
                         del beam.channel_id
 
+
+    # --- Vela-Bank-Routing (Port aus dem 0.7.3-Fork, 29.10.2026) ----------
+    # Eine Vela, getrennte Erinnerungsbanken je Gespraechspartner. Die Zuordnung
+    # kommt aus der Chat-Identitaet des Turns, nie aus dem Inhalt. Fail-closed:
+    # unbekannte Identitaet -> quarantine, interner Kontext -> _default.
+    def _route_session_key(self, requested_session_id: str) -> str:
+        def _normalise(candidate: str) -> str:
+            if candidate.startswith("hermes_agent:"):
+                return "agent:" + candidate[len("hermes_agent:"):]
+            return candidate
+        explicit = _normalise(str(getattr(self, "_gateway_session_key", "") or "").strip())
+        requested = _normalise(str(requested_session_id or "").strip())
+        for candidate in (explicit, requested):
+            if candidate.startswith("agent:"):
+                return candidate
+        return explicit or requested
+
+    def _claim_bank_connection(self, mem) -> None:
+        """Register this provider as an owner of a bank's connection handle.
+
+        The handle belongs to the thread that opened it, and the thread that
+        opened it may be a worker. The claim is keyed by the HANDLE OBJECT
+        itself, so a second instance that shares the handle is counted as a
+        second owner (review round 2, R3).
+
+        The key is the handle, not (thread, path): the core keeps one
+        connection per thread and replaces it when another path is opened,
+        so the same (thread, path) can be served by two different
+        connection objects (review round 3).
+
+        Every attribute is read defensively: a provider may exist without a
+        full initialization (the parity tests build one with ``__new__``).
+        """
+        handle = getattr(mem, "conn", None)
+        if handle is None:
+            return
+        _claim_connection(handle)
+
+    def _release_bank_connection(self, mem) -> bool:
+        """Drop this provider's claim on a bank's handle.
+
+        Returns True when the last owner of THIS handle let go, i.e. when
+        the handle may be closed. A shared handle stays open for the
+        instance that still uses it (review round 2, R3).
+        """
+        handle = getattr(mem, "conn", None)
+        if handle is None:
+            return False
+        return _release_connection(handle)
+
+    def _close_bank_handle(self, mem) -> None:
+        """Close one bank's connection handle (only its last owner may)."""
+        handle = getattr(mem, "conn", None)
+        if handle is None:
+            return
+        try:
+            handle.close()
+        except Exception:
+            logger.debug("Mnemosyne: could not close cached bank connection", exc_info=True)
+
+    def _close_owned_profile_handle(self, memory=None, beam=None) -> None:
+        """Close the profile handle once its last owner let go.
+
+        The profile storage is a database of its own, so it never collides
+        with a bank. It is still shared between two providers that open the
+        same profile path in the same thread, so the last-owner rule applies
+        here as well (review round 2, R3).
+
+        The owners are passed in because the shutdown clears
+        ``self._memory``/``self._beam`` before the release runs: reading them
+        from the instance at that point would find nothing and leave the
+        handle open.
+        """
+        if memory is None:
+            memory = getattr(self, "_memory", None)
+        if beam is None:
+            beam = getattr(self, "_beam", None)
+        seen_handles = set()
+        for owner in (memory, beam):
+            if owner is None:
+                continue
+            handle = getattr(owner, "conn", None)
+            if handle is None or id(handle) in seen_handles:
+                continue
+            seen_handles.add(id(handle))
+            if not _release_connection(handle):
+                continue
+            try:
+                handle.close()
+            except Exception:
+                logger.debug("Mnemosyne: could not close profile connection", exc_info=True)
+
+    def _beam_for_bank(self, bank: str, reason: str = ""):
+        """Beam + Mnemosyne-Instanz einer Bank (gecacht nach Speicher-Identitaet).
+
+        Der Cache-Schluessel ist der aufgeloeste Datenbankpfad, nicht der
+        Bankname: zwei Homes mit gleichnamiger Bank sind zwei Datenbanken, und
+        ein Cache nach Namen liefert dem zweiten Home die Instanz des ersten
+        (Review P1-4).
+        """
+        from . import bank_router
+        cache = getattr(self, "_bank_cache", None)
+        if cache is None:
+            cache = {}
+            self._bank_cache = cache
+        home = getattr(self, "_hermes_home", None)
+        key = bank_router.cache_key(bank, home)
+        if key in cache:
+            entry = cache[key]
+            self._rebind_cached_session(entry)
+            return entry
+        from mnemosyne.core.memory import Mnemosyne
+        db_path = bank_router.bank_db_path(bank, home)
+        mem = Mnemosyne(
+            session_id=getattr(self, "_session_id", "default"),
+            db_path=str(db_path),
+            bank=bank,
+            channel_id=getattr(getattr(self, "_beam", None), "channel_id", "") or "",
+        )
+        # A routed Beam is a first-class Beam: it carries the same canonical
+        # owner and agent context as the profile Beam. Without them the
+        # lifecycle work fell back to the default owner, and model-refresh
+        # writes landed in the wrong namespace (review round 2, R7).
+        mem.beam.canonical_owner_id = self._canonical_owner()
+        mem.beam.agent_context = getattr(self, "_agent_context", "primary")
+        entry = (mem.beam, mem)
+        self._claim_bank_connection(mem)
+        cache[key] = entry
+        try:
+            self._audit_event("bank_bound", bank=bank, reason=reason, db_path=str(db_path))
+        except Exception:
+            pass
+        logger.info("Mnemosyne bank bound: bank=%s reason=%s db=%s", bank, reason, db_path)
+        return entry
+
+    def _rebind_cached_session(self, entry) -> None:
+        """A cached bank must not keep the session id of its first visit.
+
+        The instance is cached per storage identity, so after a session
+        switch a session-scoped write would still be attributed to the
+        previous session (review follow-up F4). An explicitly configured
+        channel is preserved, an implicit one follows the session.
+
+        Whether the channel is explicit is read from the provider's own
+        flag, not inferred from the channel's *value*: an explicit channel
+        that happens to equal the session id is still an explicit channel,
+        and the value-based inference rewrote it on the next switch
+        (review round 2, R4).
+        """
+        beam, mem = entry
+        session_id = str(getattr(self, "_session_id", "") or "default")
+        old_session = getattr(beam, "session_id", None)
+        # The canonical owner and the agent context belong to the provider,
+        # not to the bank instance. A re-initialization can change them, and
+        # the cached bank outlives it — so they are refreshed here, not only
+        # at creation (review round 2, R7).
+        beam.canonical_owner_id = self._canonical_owner()
+        beam.agent_context = getattr(self, "_agent_context", "primary")
+        if old_session == session_id:
+            return
+        implicit_channel = not getattr(self, "_channel_id_explicit", False)
+        beam.session_id = session_id
+        if implicit_channel:
+            beam.channel_id = session_id
+        if getattr(mem, "session_id", None) != session_id:
+            mem.session_id = session_id
+            if implicit_channel:
+                mem.channel_id = session_id
+
+    def _current_bank(self) -> str:
+        return str(getattr(self, "_active_bank", "") or "")
+
+    def _session_storage_beam_locked(self):
+        """The Beam that holds the memories written for this session.
+
+        Derived from the session's own route, not remembered from the last
+        routed write. A remembered pointer outlives the decision that set it:
+        after the documented rollback (the map was removed, the writes went
+        back to the profile) it still names the old bank, and when a second
+        chat writes in between it names *that* chat's bank for this
+        session's end (review round 2, R5).
+
+        The route is resolved from the CURRENT session key. A lifecycle
+        operation belongs to the session that triggered it: after a switch
+        back, it must name that session's bank and not the bank of the chat
+        that wrote last (review round 2, R8).
+
+        Falls back to the profile Beam when the route names no bank that this
+        provider has actually bound — there is nothing to consolidate there.
+        """
+        from . import bank_router
+        home = getattr(self, "_hermes_home", None)
+        try:
+            key = self._route_session_key(self._session_id)
+            bank, _reason = bank_router.resolve_bank(key, home)
+        except Exception:
+            logger.debug("Mnemosyne: could not resolve the session route", exc_info=True)
+            bank = ""
+        if bank:
+            cache = getattr(self, "_bank_cache", None) or {}
+            entry = cache.get(bank_router.cache_key(bank, home))
+            if entry is not None:
+                return entry[0]
+        return self._beam
+
+    @contextmanager
+    def _beam_session_scope(self, session_id: str):
+        """Bank des Turns binden, dann den Upstream-Scope ausfuehren.
+
+        Bindung **und** Wiederherstellung passieren innerhalb derselben Sperre,
+        die der Upstream-Scope haelt. Ein Austausch von ``self._beam`` vor dem
+        Lock-Erwerb haette einem parallelen Turn die fremde Bank gezeigt
+        (Review P1-3).
+
+        Die Route wird **unter** dieser Sperre aufgeloest. Ihr Key stammt aus
+        ``_gateway_session_key``, das ein Session-Wechsel unter derselben
+        Sperre umschreibt: ein Routing vor dem Lock haette die Bank der einen
+        Sitzung mit der Session-ID der anderen binden koennen (Review-Runde 2,
+        R2).
+
+        ``bank == ""`` heisst: Routing ist aus. Dann wird nichts umgebunden und
+        nichts angelegt — der Adapter verhaelt sich wie vor dem Feature
+        (Review P1-2).
+        """
+        from . import bank_router
+        lock = self._ensure_beam_access_lock()
+        with lock:
+            key = self._route_session_key(session_id)
+            bank, reason = bank_router.resolve_bank(
+                key, getattr(self, "_hermes_home", None)
+            )
+            if not bank:
+                with self._beam_session_scope_raw(session_id) as scoped:
+                    yield scoped
+                return
+            if getattr(self, "_beam", None) is None:
+                # A provider without its own Beam is unavailable: a skipped
+                # context (subagent, cron, background) or a failed init.
+                # Routing must not create a bank for it — that would revive a
+                # context the runtime deliberately skipped and report a
+                # successful write where main reports memory_unavailable
+                # (review follow-up F3).
+                with self._beam_session_scope_raw(session_id) as scoped:
+                    yield scoped
+                return
+            previous_bank = getattr(self, "_active_bank", None)
+            previous_beam = getattr(self, "_beam", None)
+            if bank == previous_bank and previous_beam is not None:
+                with self._beam_session_scope_raw(session_id) as scoped:
+                    yield scoped
+                return
+            # A failure here leaves the provider untouched; nothing to restore.
+            beam, _mem = self._beam_for_bank(bank, reason)
+            self._active_bank = bank
+            self._beam = beam
+            try:
+                with self._beam_session_scope_raw(session_id) as scoped:
+                    yield scoped
+            finally:
+                self._beam = previous_beam
+                self._active_bank = previous_bank
     def _sync_turn_diagnostics(self) -> Dict[str, Any]:
         """Return a PII-safe snapshot of sync_turn telemetry."""
         self._ensure_sync_turn_telemetry()
@@ -3281,7 +3606,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _auto_sleep_snapshot_locked(self, expected_session_id: str = ""):
         """Return one immutable auto-sleep snapshot while Beam is locked."""
-        beam_ref = self._beam
+        # The routed Beam is resolved from *this* session's route, not from a
+        # remembered "last routed" pointer: that pointer names whichever chat
+        # wrote last, not the chat whose turn triggered the sleep
+        # (review round 2, R5).
+        beam_ref = self._session_storage_beam_locked()
         if beam_ref is None:
             return None
         if expected_session_id and beam_ref.session_id != expected_session_id:
@@ -3568,6 +3897,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _handle_persona_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
         try:
             adapter = getattr(self, "_provider_persona_adapter", None)
+            if adapter is not None and getattr(adapter, "_beam", None) is not self._beam:
+                # The adapter holds the Beam it was built with. After a
+                # session switch it would read the previous chat's bank
+                # (review follow-up F2). Rebuild it for the active Beam.
+                shutdown = getattr(adapter, "shutdown", None)
+                if callable(shutdown):
+                    try:
+                        shutdown()
+                    except Exception:
+                        pass
+                adapter = None
+                self._provider_persona_adapter = None
             if adapter is None:
                 from mnemosyne_hermes.persona_adapter import PersonaAdapter
                 adapter = PersonaAdapter(self._beam, {})
@@ -5343,7 +5684,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 if skip is not None:
                     logger.info("Mnemosyne session-end sleep skipped: %s", json.dumps(skip))
                     return
-                beam = self._beam
+                # The routed bank is the storage this session wrote into;
+                # the original Beam was restored when the scope ended
+                # (review F5). It is resolved from this session's route, not
+                # from a remembered pointer: after the documented rollback the
+                # writes went back to the profile, and the consolidation must
+                # follow them there (review round 2, R5).
+                beam = self._session_storage_beam_locked()
                 if beam is None:
                     return
                 sleep_args = {
@@ -5453,6 +5800,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         with beam_context:
             with self._ensure_surface_adapter_lock():
                 self._invalidate_surface_locked()
+            # Captured before the references are cleared below: the release
+            # needs the owner objects, and after the clear the instance
+            # holds nothing to release (review round 2, R3).
+            profile_memory = getattr(self, "_memory", None)
+            profile_beam = getattr(self, "_beam", None)
             if self._memory is not None:
                 try:
                     self._memory.close()
@@ -5466,6 +5818,35 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     logger.debug("Mnemosyne: could not close audit log", exc_info=True)
             self._audit = None
             self._beam = None
+            # The cached bank instances hold their own database connections.
+            # They must not survive the shutdown of the provider (review
+            # follow-up: cleanup was not addressed).
+            #
+            # ``Mnemosyne`` has no ``close()``: the connection is the handle
+            # the instance holds (``mem.conn``). Clearing the cache dictionary
+            # released nothing -- both handles kept answering SQL after the
+            # provider was gone (review round 2, R3).
+            #
+            # A handle is shared by every instance that opened the same path
+            # in the same thread. Closing it while another provider still uses
+            # it breaks that provider ("cannot operate on a closed database"),
+            # so the handle is closed only when its last owner lets go
+            # (review round 2, R3).
+            bank_cache = getattr(self, "_bank_cache", None)
+            if bank_cache:
+                for _cached in list(bank_cache.values()):
+                    _beam_ref, _mem = _cached
+                    if self._release_bank_connection(_mem):
+                        self._close_bank_handle(_mem)
+                bank_cache.clear()
+            # The profile storage holds a handle as well. It is not shared
+            # with a bank (a different database), so it never collides with a
+            # bank claim -- but the same last-owner rule applies: a second
+            # provider on the same profile path owns it too.
+            #
+            # The owners are captured BEFORE the references above are
+            # cleared: after the clear the instance holds nothing to release.
+            self._close_owned_profile_handle(profile_memory, profile_beam)
 
         # C13: decrement this instance's contribution to the module-level
         # active-provider count. ``_provider_active`` stays True if other
