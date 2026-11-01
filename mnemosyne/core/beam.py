@@ -10998,11 +10998,11 @@ class BeamMemory:
                     conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                 except sqlite3.Error:
                     pass  # A trigger may already have rolled back the transaction.
-                if owns_transaction or not conn.in_transaction:
-                    try:
+                try:
+                    if owns_transaction or not conn.in_transaction:
                         conn.rollback()
-                    except sqlite3.Error:
-                        pass  # Cleanup must not replace the original failure.
+                except sqlite3.Error:
+                    pass  # A closed connection's state query can also fail.
                 raise
         self.conn.commit()
 

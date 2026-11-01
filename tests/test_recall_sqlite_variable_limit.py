@@ -224,6 +224,29 @@ def test_recall_credit_savepoint_setup_failure_releases_owned_transaction(make_s
         peer.rollback()
 
 
+@pytest.mark.parametrize('outer_transaction', [False, True])
+def test_closed_connection_during_recall_preserves_original_interrupt(
+    make_store, monkeypatch, outer_transaction,
+):
+    memory = make_store('working')
+    if outer_transaction:
+        memory.conn.execute("UPDATE working_memory SET importance=importance WHERE id='m0000'")
+    original_execute = bm._BeamCursor.execute
+
+    def execute(cursor, sql, *args, **kwargs):
+        if sql.lstrip().startswith('UPDATE working_memory') and 'recall_count = recall_count + 1' in sql:
+            cursor.connection.close()
+            raise KeyboardInterrupt('original recall interrupt')
+        return original_execute(cursor, sql, *args, **kwargs)
+
+    monkeypatch.setattr(bm._BeamCursor, 'execute', execute)
+    with pytest.raises(KeyboardInterrupt, match='original recall interrupt'):
+        memory.recall('launch', top_k=5, **FILTERS)
+    with sqlite3.connect(memory.db_path, timeout=0) as peer:
+        peer.execute('BEGIN IMMEDIATE')
+        peer.rollback()
+
+
 def test_dense_candidate_fetch_with_small_top_k(make_store, monkeypatch):
     memory = make_store('working')
     vector = np.zeros(bm.EMBEDDING_DIM, dtype=np.float32)
