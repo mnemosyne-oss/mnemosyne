@@ -133,6 +133,33 @@ class TestParseKgTriples:
         fenced = "```json\n" + _kg_payload(["a b c"]) + "\n```"
         assert validate_kg_triples(_parse_kg_triples(fenced)) == [("a", "b", "c")]
 
+    def test_recovers_spo_dicts_misfiled_under_facts(self):
+        # Observed with the bundled Qwen2.5-1.5B: it emitted SPO dicts under
+        # `facts` and left `kg` empty. Recover the structured data, while the
+        # companion _parse_facts test ensures it is not stringified as a fact.
+        raw = json.dumps({
+            "facts": [
+                {"subject": "Calypso", "predicate": "has_workstation", "object": "GAME-PC"},
+                "The workstation is GAME-PC.",
+            ],
+            "instructions": [], "preferences": [], "timelines": [], "kg": [],
+        })
+        assert _parse_kg_triples(raw) == [("Calypso", "has_workstation", "GAME-PC")]
+
+    def test_recovers_case_insensitive_spo_keys(self):
+        raw = json.dumps({
+            "facts": [{"Subject": "Calypso", "PREDICATE": "owns", "Object": "GAME-PC"}],
+            "kg": [],
+        })
+        assert _parse_kg_triples(raw) == [("Calypso", "owns", "GAME-PC")]
+
+    def test_does_not_guess_from_flat_fact_sentences(self):
+        raw = json.dumps({
+            "facts": ["The user prefers vim"],
+            "instructions": [], "preferences": [], "timelines": [], "kg": [],
+        })
+        assert _parse_kg_triples(raw) == []
+
     def test_null_fields_rejected_before_str_conversion(self):
         # JSON null must never become the literal string "None".
         assert _parse_kg_triples(_kg_payload([[None, "uses", "sqlite"]])) == []
