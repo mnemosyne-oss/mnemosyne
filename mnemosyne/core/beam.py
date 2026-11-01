@@ -11911,6 +11911,7 @@ class BeamMemory:
                             f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
                             (now_iso, *chunk, *rec_scope_params),
                         )
+            self.conn.commit()
 
         # --- MEMORIA structured fact supplement (polyphonic path) ---
         try:
