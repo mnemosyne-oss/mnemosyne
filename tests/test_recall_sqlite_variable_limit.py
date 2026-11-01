@@ -152,7 +152,7 @@ def test_failed_recall_credit_batches_do_not_survive_later_commit(
 
 
 @pytest.mark.parametrize('ownership', ['owned', 'caller', 'deferred'])
-def test_episodic_credit_failure_rolls_back_working_credits_too(make_store, ownership):
+def test_episodic_credit_failure_rolls_back_working_credits_too(make_store, monkeypatch, ownership):
     memory = make_store('working')
     memory.conn.execute(
         "INSERT INTO episodic_memory (id,content,source,timestamp,importance,session_id,channel_id,author_id,author_type) "
@@ -166,12 +166,24 @@ def test_episodic_credit_failure_rolls_back_working_credits_too(make_store, owne
         "BEGIN SELECT RAISE(ABORT, 'episodic credit failure'); END"
     )
     memory.conn.commit()
+    working_updates = []
+    original_execute = bm._BeamCursor.execute
+
+    def execute(cursor, sql, *args, **kwargs):
+        result = original_execute(cursor, sql, *args, **kwargs)
+        if sql.lstrip().startswith('UPDATE working_memory') and 'recall_count = recall_count + 1' in sql:
+            working_updates.append(cursor.rowcount)
+        return result
+
+    monkeypatch.setattr(bm._BeamCursor, 'execute', execute)
     scope = bm._deferred_commits(memory.conn) if ownership == 'deferred' else nullcontext()
     with scope:
         if ownership != 'owned':
             memory.conn.execute('UPDATE recall_marker SET value=1')
         with pytest.raises(sqlite3.IntegrityError, match='episodic credit failure'):
             memory.recall('launch', top_k=2400, **FILTERS)
+        assert len(working_updates) == 2
+        assert sum(working_updates) == 1200
         for table in ('working_memory', 'episodic_memory'):
             assert memory.conn.execute(
                 f'SELECT COUNT(*) FROM {table} WHERE recall_count != 0 OR last_recalled IS NOT NULL'
