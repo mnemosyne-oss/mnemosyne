@@ -2633,7 +2633,9 @@ def _deferred_commits(conn: sqlite3.Connection, *, immediate: bool = False):
     conn._defer_commit = True
     try:
         yield
-    except Exception:
+    except BaseException:
+        # BaseException: an interrupt must not leave the write lock held or
+        # a queued after-commit hook behind for the next unrelated commit.
         conn._defer_commit = previously_deferred
         try:
             if owns_transaction:
@@ -2666,6 +2668,18 @@ def _deferred_commits(conn: sqlite3.Connection, *, immediate: bool = False):
         # Preserve an enclosing deferral scope if this context was nested.
         conn._defer_commit = previously_deferred
 
+
+def _enrichment_transaction(conn: sqlite3.Connection):
+    """One BEAM-owned transaction for remember()'s local enrichment writes.
+
+    IMMEDIATE takes the write lock up front, so trim's read-then-delete stays
+    safe under contention. A caller-owned transaction keeps its old behavior:
+    the helpers' own commits close it, so the LLM fact step after the block
+    still runs outside any write transaction.
+    """
+    if conn.in_transaction:
+        return contextlib.nullcontext()
+    return _deferred_commits(conn, immediate=True)
 
 def _generate_id(content: str) -> str:
     return hashlib.sha256(f"{content}{datetime.now().isoformat()}".encode()).hexdigest()[:16]
@@ -6461,22 +6475,26 @@ class BeamMemory:
                 # facts tables. Without this the dedup early-return silently
                 # skips everything `extract=True` advertises, breaking the
                 # contract on duplicate-content writes (see C12.a /review note).
-                if extract_entities:
-                    _extract_and_store_entities(self, existing_id, content)
+                # The local enrichment writes share one transaction: each helper
+                # commits on its own, and every commit is an fsync.
+                with _enrichment_transaction(self.conn):
+                    if extract_entities:
+                        _extract_and_store_entities(self, existing_id, content)
+                    # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
+                    # Populates memoria_facts, memoria_timelines, memoria_kg for the
+                    # structured retrieval router. Runs silently on every remember()
+                    # so the MEMORIA tables stay current regardless of extract=True.
+                    try:
+                        self.extract_and_store_facts(content, message_idx=0, source_memory_id=existing_id)
+                    except Exception:
+                        pass  # regex extraction failures must not block memory storage
+                    # Phase 3-4: Extract graph and consolidate veracity for dedup update
+                    self._ingest_graph_and_veracity(existing_id, content, source, veracity)
+                # Outside the transaction: the LLM call must not hold the write lock.
                 if extract:
                     _extract_and_store_facts(
                         self, existing_id, content, source, write_policy
                     )
-                # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
-                # Populates memoria_facts, memoria_timelines, memoria_kg for the
-                # structured retrieval router. Runs silently on every remember()
-                # so the MEMORIA tables stay current regardless of extract=True.
-                try:
-                    self.extract_and_store_facts(content, message_idx=0, source_memory_id=existing_id)
-                except Exception:
-                    pass  # regex extraction failures must not block memory storage
-                # Phase 3-4: Extract graph and consolidate veracity for dedup update
-                self._ingest_graph_and_veracity(existing_id, content, source, veracity)
                 self._emit_event("MEMORY_UPDATED", existing_id, content=content,
                                  source=source, importance=importance, metadata=metadata)
 
@@ -6485,11 +6503,8 @@ class BeamMemory:
                 # Enrichment can refill enhanced recall after the early post-commit eviction.
                 self._invalidate_query_cache_after_remember_commit()
 
-        try:
-            self._trim_working_memory()
-        finally:
-            # Cache failures must not turn a committed new-memory write into a retry.
-            self._invalidate_query_cache_after_remember_commit()
+        # Cache failures must not turn a committed new-memory write into a retry.
+        self._invalidate_query_cache_after_remember_commit()
 
         try:
             # --- Embedding storage for vector recall ---
@@ -6498,6 +6513,9 @@ class BeamMemory:
             # never populated memory_embeddings. This left _detect_conflicts
             # with zero embeddings to compare, making Phase 1 conflict
             # detection a no-op despite 3762+ working memories.
+            # Computed before the enrichment transaction so the model call
+            # does not hold the write lock.
+            vec = None
             if _embeddings.available():
                 try:
                     vec = _embeddings.embed([content])
@@ -6517,57 +6535,72 @@ class BeamMemory:
                             "partial-alignment errors",
                             len(vec),
                         )
-                    else:
-                        _store_working_embedding(self.conn, memory_id, vec[0])
+                        vec = None
                 except Exception as exc:
+                    vec = None
                     logger.warning(
                         "remember: embedding storage failed for '%s' (%s): %s",
                         memory_id, type(exc).__name__, exc,
                     )
 
-            # Auto-generate temporal triple
-            self._add_temporal_triple(
-                memory_id, timestamp, source, content,
-                _write_kind=_write_kind, _write_policy=write_policy,
-            )
+            # The local enrichment writes share one transaction: each helper
+            # commits on its own, and every commit is an fsync.
+            with _enrichment_transaction(self.conn):
+                self._trim_working_memory()
 
-            # --- Temporal extraction ---
-            if extract_temporal is not None:
-                try:
-                    temporal_info = extract_temporal(content)
-                    if temporal_info and temporal_info.get("event_date"):
-                        import json as _json_tmp
-                        cursor.execute(
-                            "UPDATE working_memory SET event_date=?, event_date_precision=?, temporal_tags=? WHERE id=?",
-                            (temporal_info["event_date"],
-                             temporal_info["event_date_precision"],
-                             _json_tmp.dumps(temporal_info["temporal_tags"]),
-                             memory_id)
+                if vec is not None:
+                    try:
+                        _store_working_embedding(self.conn, memory_id, vec[0])
+                    except Exception as exc:
+                        logger.warning(
+                            "remember: embedding storage failed for '%s' (%s): %s",
+                            memory_id, type(exc).__name__, exc,
                         )
-                        self.conn.commit()
-                except Exception:
-                    pass  # Temporal extraction is best-effort
 
-            # --- Entity extraction ---
-            if extract_entities:
-                _extract_and_store_entities(self, memory_id, content)
+                # Auto-generate temporal triple
+                self._add_temporal_triple(
+                    memory_id, timestamp, source, content,
+                    _write_kind=_write_kind, _write_policy=write_policy,
+                )
+
+                # --- Temporal extraction ---
+                if extract_temporal is not None:
+                    try:
+                        temporal_info = extract_temporal(content)
+                        if temporal_info and temporal_info.get("event_date"):
+                            import json as _json_tmp
+                            cursor.execute(
+                                "UPDATE working_memory SET event_date=?, event_date_precision=?, temporal_tags=? WHERE id=?",
+                                (temporal_info["event_date"],
+                                 temporal_info["event_date_precision"],
+                                 _json_tmp.dumps(temporal_info["temporal_tags"]),
+                                 memory_id)
+                            )
+                            self.conn.commit()
+                    except Exception:
+                        pass  # Temporal extraction is best-effort
+
+                # --- Entity extraction ---
+                if extract_entities:
+                    _extract_and_store_entities(self, memory_id, content)
+
+                # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
+                # Populates memoria_facts, memoria_timelines, memoria_kg for the
+                # structured retrieval router. Runs on every remember() call.
+                try:
+                    self.extract_and_store_facts(content, message_idx=0, source_memory_id=memory_id)
+                except Exception:
+                    pass  # regex extraction failures must not block memory storage
+
+                # Phase 3-4: Extract graph and consolidate veracity for new memory
+                self._ingest_graph_and_veracity(memory_id, content, source, veracity)
 
             # --- Structured fact extraction ---
+            # Outside the transaction: the LLM call must not hold the write lock.
             if extract:
                 _extract_and_store_facts(
                     self, memory_id, content, source, write_policy
                 )
-
-            # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
-            # Populates memoria_facts, memoria_timelines, memoria_kg for the
-            # structured retrieval router. Runs on every remember() call.
-            try:
-                self.extract_and_store_facts(content, message_idx=0, source_memory_id=memory_id)
-            except Exception:
-                pass  # regex extraction failures must not block memory storage
-
-            # Phase 3-4: Extract graph and consolidate veracity for new memory
-            self._ingest_graph_and_veracity(memory_id, content, source, veracity)
 
             self._emit_event("MEMORY_ADDED", memory_id, content=content,
                              source=source, importance=importance, metadata=metadata)
