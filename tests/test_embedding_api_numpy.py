@@ -46,7 +46,12 @@ def api(monkeypatch):
 @pytest.fixture
 def recovery_api(request):
     """Positive vector checks need real NumPy; missing-dependency checks do not."""
-    pytest.importorskip("numpy")
+    try:
+        __import__("numpy")
+    except ModuleNotFoundError as exc:
+        if exc.name != "numpy":
+            raise
+        pytest.skip("NumPy is not installed")
     return request.getfixturevalue("api")
 
 
