@@ -125,15 +125,23 @@ def test_broken_numpy_direct_api_failures_are_private_and_back_off(broken_api, c
     ]
     if not query_first:
         calls.reverse()
-    for call in calls:
-        with pytest.raises(RuntimeError, match="NumPy") as error:
-            call()
-        assert "endpoint failed" not in str(error.value)
-        for private in ("private native-library path", "private query", "private document"):
-            assert private not in str(error.value) + caplog.text
-        assert broken_api["requests"] == []
-        assert len(broken_api["attempts"]) == 1
-        assert embeddings._embed_query_cached.cache_info().currsize == 0
+    for now, expected_attempts in (
+        (100.0, 1), (100.999, 1), (101.0, 2), (101.999, 2), (102.0, 3),
+    ):
+        broken_api["clock"][0] = now
+        for call in calls:
+            with pytest.raises(RuntimeError, match="NumPy") as error:
+                call()
+            assert "endpoint failed" not in str(error.value)
+            for private in ("private native-library path", "private query", "private document"):
+                assert private not in str(error.value) + caplog.text
+            assert broken_api["requests"] == []
+            assert len(broken_api["attempts"]) == expected_attempts
+            assert embeddings._embed_query_cached.cache_info().currsize == 0
+            assert sum(
+                "API embeddings require NumPy" in record.getMessage()
+                for record in caplog.records
+            ) == 1
 
 
 def test_api_numpy_broken_install_backs_off_and_recovers(recovery_api, broken_api, caplog):
