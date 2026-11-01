@@ -11840,15 +11840,23 @@ class BeamMemory:
         id_chunk = 900 - len(rec_scope_params)
         tracked = ((("episodic_memory", recalled_episodic_ids),
                     ("working_memory", recalled_working_ids)) if _track_recall else ())
-        for table, ids in tracked:
-            for offset in range(0, len(ids), id_chunk):
-                chunk = ids[offset:offset + id_chunk]
-                placeholders = ",".join("?" * len(chunk))
-                self.conn.execute(
-                    f"UPDATE {table} SET recall_count = recall_count + 1, "
-                    f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
-                    (now_iso, *chunk, *rec_scope_params),
-                )
+        # A failure between chunks, interrupts included, must not leave the
+        # earlier chunks' credit in an open transaction holding the write lock.
+        owns_transaction = not self.conn.in_transaction
+        try:
+            for table, ids in tracked:
+                for offset in range(0, len(ids), id_chunk):
+                    chunk = ids[offset:offset + id_chunk]
+                    placeholders = ",".join("?" * len(chunk))
+                    self.conn.execute(
+                        f"UPDATE {table} SET recall_count = recall_count + 1, "
+                        f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
+                        (now_iso, *chunk, *rec_scope_params),
+                    )
+        except BaseException:
+            if owns_transaction and self.conn.in_transaction:
+                self.conn.rollback()
+            raise
         if _track_recall and (recalled_episodic_ids or recalled_working_ids):
             self.conn.commit()
 

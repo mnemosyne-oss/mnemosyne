@@ -169,6 +169,39 @@ def test_recall_tracking_stays_under_sqlite_variable_limit(beam):
     assert credited == {r["id"]: 1 for r in results}
 
 
+@pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt], ids=["exception", "interrupt"])
+def test_failed_tracking_chunk_leaves_no_partial_credit(beam, monkeypatch, error):
+    # A failure between tracking chunks must not leave the earlier chunks'
+    # increments in an open transaction that holds the write lock.
+    _seed_large_working_under_limit(beam)
+    real_execute = beam.conn.execute
+    updates = []
+
+    def fail_on_second_chunk(sql, *args, **kwargs):
+        if isinstance(sql, str) and sql.startswith("UPDATE working_memory SET recall_count"):
+            updates.append(sql)
+            if len(updates) == 2:
+                raise error("stopped between tracking chunks")
+        return real_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(beam.conn, "execute", fail_on_second_chunk)
+
+    with pytest.raises(error):
+        beam.recall("unrelated opaque query", top_k=LARGE)
+
+    monkeypatch.undo()
+    assert len(updates) == 2
+    assert not beam.conn.in_transaction
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE recall_count > 0").fetchone()[0] == 0
+    other = sqlite3.connect(beam.db_path, timeout=0)
+    try:
+        other.execute("BEGIN IMMEDIATE")
+        other.rollback()
+    finally:
+        other.close()
+
+
 def _record_id_lookups(monkeypatch):
     # The rows these lookups return can also arrive on the results, so a
     # lookup that silently returned nothing would still pass a result check.
