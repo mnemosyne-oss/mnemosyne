@@ -129,8 +129,28 @@ def test_false_force_is_valid_for_all_delete_recommendations(mixed):
     assert ids(path) == []
 
 
-@pytest.mark.parametrize('case', ['refused', 'cleanup_failed', 'dry_run', 'applied'])
-def test_mcp_wire_reports_hygiene_failure_and_success(mixed, monkeypatch, case):
+@pytest.mark.parametrize(
+    'case,force_args,confirm,expected_error,expected_status,deleted,remaining',
+    [
+        ('refused', {}, True, True, None, None, ['note', 'trash']),
+        ('cleanup_failed', {}, True, True, 'failed', 0, ['note', 'trash']),
+        ('dry_run', {}, False, False, 'dry_run', 1, ['note', 'trash']),
+        ('applied', {}, True, False, 'applied', 1, ['note']),
+        ('forced', {'force': True}, True, False, 'applied', 2, []),
+        ('forced', {'force': True}, False, False, 'dry_run', 2, ['note', 'trash']),
+        ('forced', {'force': 1}, True, True, None, None, ['note', 'trash']),
+        ('forced', {'force': 1}, False, True, None, None, ['note', 'trash']),
+        ('forced', {'force': 'true'}, True, True, None, None, ['note', 'trash']),
+        ('forced', {'force': 'true'}, False, True, None, None, ['note', 'trash']),
+    ],
+    ids=['refused', 'cleanup-failed', 'per-candidate-preview', 'per-candidate-applied',
+         'force-true-confirmed', 'force-true-preview', 'force-int-confirmed',
+         'force-int-preview', 'force-string-confirmed', 'force-string-preview'],
+)
+def test_mcp_wire_reports_hygiene_failure_and_success(
+    mixed, monkeypatch, case, force_args, confirm, expected_error,
+    expected_status, deleted, remaining,
+):
     """Returned handler failures must set the real MCP CallToolResult flag."""
     import asyncio
     import contextlib
@@ -145,8 +165,8 @@ def test_mcp_wire_reports_hygiene_failure_and_success(mixed, monkeypatch, case):
         with sqlite3.connect(path) as conn:
             conn.execute("CREATE TRIGGER prevent_cleanup BEFORE DELETE ON working_memory BEGIN SELECT RAISE(ABORT, 'cleanup blocked'); END")
     arguments = {'candidates_json': json.dumps([c.to_dict() for c in candidates]),
-                 'action': 'delete' if case in ('refused', 'cleanup_failed') else 'keep',
-                 'confirm': case != 'dry_run'}
+                 'action': 'delete' if case in ('refused', 'cleanup_failed', 'forced') else 'keep',
+                 'confirm': confirm, **force_args}
 
     async def exercise():
         server = _build_mcp_server()
@@ -157,19 +177,17 @@ def test_mcp_wire_reports_hygiene_failure_and_success(mixed, monkeypatch, case):
                     await client.initialize()
                     response = await client.call_tool('mnemosyne_hygiene_clean', arguments)
                     payload = json.loads(response.content[0].text)
-                    assert response.is_error is (case in ('refused', 'cleanup_failed'))
-                    if case == 'refused':
-                        assert '--force' in payload['error']
-                    elif case == 'cleanup_failed':
-                        assert payload['status'] == 'failed'
-                        assert payload['result']['errors']
+                    assert response.is_error is expected_error
+                    if expected_status is None:
+                        reason = '--force' if case == 'refused' else 'boolean'
+                        assert reason in payload['error']
                     else:
-                        assert payload['status'] == case
-                        assert payload['result']['errors'] == []
-                        assert payload['result']['deleted'] == 1
+                        assert payload['status'] == expected_status
+                        assert bool(payload['result']['errors']) is expected_error
+                        assert payload['result']['deleted'] == deleted
             finally:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
     asyncio.run(exercise())
-    assert ids(path) == (['note'] if case == 'applied' else ['note', 'trash'])
+    assert ids(path) == remaining
