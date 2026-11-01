@@ -106,3 +106,70 @@ def test_mcp_refusal_does_not_open_bank(mixed, monkeypatch):
     monkeypatch.setattr('mnemosyne.mcp_tools._create_instance', forbidden)
     result = _handle_hygiene_clean({'candidates_json': [c.to_dict() for c in candidates], 'action': 'delete'})
     assert result['error']
+
+
+@pytest.mark.parametrize('force', [None, 0, []])
+@pytest.mark.parametrize('action', ['delete', 'archive', 'flag'])
+def test_force_type_is_checked_without_mixed_delete_guard(mixed, force, action):
+    path, candidates = mixed
+    for candidate in candidates:
+        candidate.suggested_action = 'delete'
+    result = clean_noise(path, candidates, action=action, confirm=True, dry_run=False, force=force)
+    assert result.errors and 'boolean' in result.errors[0]
+    assert ids(path) == ['note', 'trash']
+
+
+def test_false_force_is_valid_for_all_delete_recommendations(mixed):
+    path, candidates = mixed
+    for candidate in candidates:
+        candidate.suggested_action = 'delete'
+    result = clean_noise(path, candidates, action='delete', force=False, confirm=True, dry_run=False)
+    assert result.errors == []
+    assert result.deleted == 2
+    assert ids(path) == []
+
+
+@pytest.mark.parametrize('case', ['refused', 'cleanup_failed', 'dry_run', 'applied'])
+def test_mcp_wire_reports_hygiene_failure_and_success(mixed, monkeypatch, case):
+    """Returned handler failures must set the real MCP CallToolResult flag."""
+    import asyncio
+    import contextlib
+    from mcp import ClientSession
+    from mcp.shared.memory import create_client_server_memory_streams
+    from mnemosyne.mcp_server import _build_mcp_server
+
+    path, candidates = mixed
+    monkeypatch.setattr('mnemosyne.mcp_tools._create_instance', lambda **kw: SimpleNamespace(beam=SimpleNamespace(db_path=path)))
+    if case == 'cleanup_failed':
+        candidates = candidates[:1]
+        with sqlite3.connect(path) as conn:
+            conn.execute("CREATE TRIGGER prevent_cleanup BEFORE DELETE ON working_memory BEGIN SELECT RAISE(ABORT, 'cleanup blocked'); END")
+    arguments = {'candidates_json': json.dumps([c.to_dict() for c in candidates]),
+                 'action': 'delete' if case in ('refused', 'cleanup_failed') else 'keep',
+                 'confirm': case != 'dry_run'}
+
+    async def exercise():
+        server = _build_mcp_server()
+        async with create_client_server_memory_streams() as (cs, ss):
+            task = asyncio.create_task(server.run(*ss, server.create_initialization_options()))
+            try:
+                async with ClientSession(*cs) as client:
+                    await client.initialize()
+                    response = await client.call_tool('mnemosyne_hygiene_clean', arguments)
+                    payload = json.loads(response.content[0].text)
+                    assert response.is_error is (case in ('refused', 'cleanup_failed'))
+                    if case == 'refused':
+                        assert '--force' in payload['error']
+                    elif case == 'cleanup_failed':
+                        assert payload['status'] == 'failed'
+                        assert payload['result']['errors']
+                    else:
+                        assert payload['status'] == case
+                        assert payload['result']['errors'] == []
+                        assert payload['result']['deleted'] == 1
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+    asyncio.run(exercise())
+    assert ids(path) == (['note'] if case == 'applied' else ['note', 'trash'])
