@@ -10970,15 +10970,40 @@ class BeamMemory:
             rec_scope_params = _session_scope_params(self.session_id, channel_id, cross_session=cross_session)
         elif not (author_id or author_type):
             rec_scope_params = _session_scope_params(self.session_id, cross_session=cross_session)
-        if _track_recall:
-            for table, ids in (("working_memory", wm_ids), ("episodic_memory", em_ids)):
-                for chunk in _recall_id_batches(self.conn, ids, 1 + len(rec_scope_params)):
-                    placeholders = ",".join("?" * len(chunk))
-                    cursor.execute(f"""
-                        UPDATE {table}
-                        SET recall_count = recall_count + 1, last_recalled = ?
-                        WHERE id IN ({placeholders}) AND {rec_scope}
-                    """, (now_iso, *chunk, *rec_scope_params))
+        if _track_recall and (wm_ids or em_ids):
+            conn = self.conn
+            owns_transaction = not conn.in_transaction
+            savepoint = (conn._next_savepoint_name("recall_credit")
+                         if isinstance(conn, _BeamConnection)
+                         else f"mnemosyne_recall_credit_{next(_plain_savepoint_counter)}")
+            try:
+                # Keep all batches atomic without undoing caller-owned writes.
+                # BEGIN prevents RELEASE from committing ahead of the existing
+                # commit below, including when that commit is deferred.
+                if owns_transaction:
+                    conn.execute("BEGIN")
+                conn.execute(f"SAVEPOINT {savepoint}")
+                for table, ids in (("working_memory", wm_ids), ("episodic_memory", em_ids)):
+                    for chunk in _recall_id_batches(conn, ids, 1 + len(rec_scope_params)):
+                        placeholders = ",".join("?" * len(chunk))
+                        cursor.execute(f"""
+                            UPDATE {table}
+                            SET recall_count = recall_count + 1, last_recalled = ?
+                            WHERE id IN ({placeholders}) AND {rec_scope}
+                        """, (now_iso, *chunk, *rec_scope_params))
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except BaseException:
+                try:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                except sqlite3.Error:
+                    pass  # A trigger may already have rolled back the transaction.
+                if owns_transaction or not conn.in_transaction:
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass  # Cleanup must not replace the original failure.
+                raise
         self.conn.commit()
 
         if _track_recall:

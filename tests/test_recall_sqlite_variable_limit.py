@@ -1,6 +1,7 @@
 """Linear recall must preserve its results on SQLite's legacy bind budget (#1307)."""
 import random
 import sqlite3
+from contextlib import nullcontext
 
 import numpy as np
 import pytest
@@ -88,6 +89,139 @@ def test_large_candidate_pool_and_tracking_preserve_results(make_store, tier):
     counts = dict(memory.conn.execute(f'SELECT id,recall_count FROM {tier}_memory'))
     assert all(counts[f'm{i:04}'] == 1 for i in range(1200))
     assert counts['foreign'] == counts['expired'] == 0
+
+
+@pytest.mark.parametrize('tier', ['working', 'episodic'])
+@pytest.mark.parametrize('ownership', ['owned', 'caller', 'deferred'])
+@pytest.mark.parametrize('failure', ['ABORT', 'FAIL', 'ROLLBACK', 'interrupt'])
+def test_failed_recall_credit_batches_do_not_survive_later_commit(
+    make_store, monkeypatch, tier, ownership, failure,
+):
+    memory = make_store(tier)
+    table = f'{tier}_memory'
+    baseline = memory.recall('launch', top_k=1200, _track_recall=False, **FILTERS)
+    assert len(baseline) == 1200
+    memory.conn.execute('CREATE TABLE recall_marker (value INTEGER)')
+    memory.conn.execute('INSERT INTO recall_marker VALUES (0)')
+    if failure != 'interrupt':
+        # The last ranked result belongs to the second, real UPDATE batch.
+        late_id = baseline[-1]['id']
+        memory.conn.execute(
+            f"CREATE TRIGGER reject_late_credit BEFORE UPDATE OF recall_count ON {table} "
+            f"WHEN NEW.id='{late_id}' BEGIN SELECT RAISE({failure}, 'late recall credit failure'); END"
+        )
+    memory.conn.commit()
+    updates = []
+    original_execute = bm._BeamCursor.execute
+
+    def execute(cursor, sql, *args, **kwargs):
+        result = original_execute(cursor, sql, *args, **kwargs)
+        if sql.lstrip().startswith(f'UPDATE {table}') and 'recall_count = recall_count + 1' in sql:
+            updates.append(sql)
+            if failure == 'interrupt' and len(updates) == 2:
+                raise KeyboardInterrupt('late recall credit interrupt')
+        return result
+
+    monkeypatch.setattr(bm._BeamCursor, 'execute', execute)
+    scope = bm._deferred_commits(memory.conn) if ownership == 'deferred' else nullcontext()
+    with scope:
+        if ownership != 'owned':
+            memory.conn.execute('UPDATE recall_marker SET value=1')
+        expected_exception = KeyboardInterrupt if failure == 'interrupt' else sqlite3.IntegrityError
+        with pytest.raises(expected_exception, match='late recall credit'):
+            memory.recall('launch', top_k=1200, **FILTERS)
+        assert updates  # At least the first UPDATE completed before the failure.
+        assert memory.conn.execute(
+            f'SELECT COUNT(*) FROM {table} WHERE recall_count != 0 OR last_recalled IS NOT NULL'
+        ).fetchone()[0] == 0
+        marker = 1 if ownership != 'owned' and failure != 'ROLLBACK' else 0
+        assert memory.conn.execute('SELECT value FROM recall_marker').fetchone()[0] == marker
+        assert memory.conn.in_transaction is (ownership != 'owned' and failure != 'ROLLBACK')
+        assert memory.conn._savepoint_hook_marks == []
+        memory.conn.execute('UPDATE recall_marker SET value=value+10')
+        memory.conn.commit()
+        if ownership == 'deferred':
+            with sqlite3.connect(memory.db_path) as observer:
+                assert observer.execute('SELECT value FROM recall_marker').fetchone()[0] == 0
+    with sqlite3.connect(memory.db_path) as observer:
+        assert observer.execute('SELECT value FROM recall_marker').fetchone()[0] == marker + 10
+        assert observer.execute(
+            f'SELECT COUNT(*) FROM {table} WHERE recall_count != 0 OR last_recalled IS NOT NULL'
+        ).fetchone()[0] == 0
+    assert not memory.conn.in_transaction
+
+
+@pytest.mark.parametrize('ownership', ['owned', 'caller', 'deferred'])
+def test_episodic_credit_failure_rolls_back_working_credits_too(make_store, ownership):
+    memory = make_store('working')
+    memory.conn.execute(
+        "INSERT INTO episodic_memory (id,content,source,timestamp,importance,session_id,channel_id,author_id,author_type) "
+        "SELECT 'ep_' || id,content,source,timestamp,importance,session_id,channel_id,author_id,author_type "
+        "FROM working_memory WHERE id LIKE 'm%'"
+    )
+    memory.conn.execute('CREATE TABLE recall_marker (value INTEGER)')
+    memory.conn.execute('INSERT INTO recall_marker VALUES (0)')
+    memory.conn.execute(
+        "CREATE TRIGGER reject_episodic_credit BEFORE UPDATE OF recall_count ON episodic_memory "
+        "BEGIN SELECT RAISE(ABORT, 'episodic credit failure'); END"
+    )
+    memory.conn.commit()
+    scope = bm._deferred_commits(memory.conn) if ownership == 'deferred' else nullcontext()
+    with scope:
+        if ownership != 'owned':
+            memory.conn.execute('UPDATE recall_marker SET value=1')
+        with pytest.raises(sqlite3.IntegrityError, match='episodic credit failure'):
+            memory.recall('launch', top_k=2400, **FILTERS)
+        for table in ('working_memory', 'episodic_memory'):
+            assert memory.conn.execute(
+                f'SELECT COUNT(*) FROM {table} WHERE recall_count != 0 OR last_recalled IS NOT NULL'
+            ).fetchone()[0] == 0
+        memory.conn.execute('UPDATE recall_marker SET value=value+10')
+        memory.conn.commit()
+    with sqlite3.connect(memory.db_path) as observer:
+        assert observer.execute('SELECT value FROM recall_marker').fetchone()[0] == (
+            10 if ownership == 'owned' else 11
+        )
+
+
+@pytest.mark.parametrize('tier', ['working', 'episodic'])
+def test_successful_credit_batches_respect_deferred_commit_without_outer_transaction(
+    make_store, monkeypatch, tier,
+):
+    memory = make_store(tier)
+    monkeypatch.setattr(memory.conn, '_defer_commit', True)
+    assert not memory.conn.in_transaction
+    rows = memory.recall('launch', top_k=1200, **FILTERS)
+    assert len(rows) == 1200
+    assert memory.conn.in_transaction
+    with sqlite3.connect(memory.db_path) as observer:
+        assert observer.execute(
+            f'SELECT SUM(recall_count) FROM {tier}_memory'
+        ).fetchone()[0] == 0
+    memory.conn._real_commit()
+    with sqlite3.connect(memory.db_path) as observer:
+        assert observer.execute(
+            f'SELECT COUNT(*) FROM {tier}_memory WHERE recall_count=1 AND last_recalled IS NOT NULL'
+        ).fetchone()[0] == 1200
+
+
+def test_recall_credit_savepoint_setup_failure_releases_owned_transaction(make_store, monkeypatch):
+    memory = make_store('working')
+    original_execute = bm._BeamConnection.execute
+
+    def execute(conn, sql, *args, **kwargs):
+        if sql.startswith('SAVEPOINT mnemosyne_recall_credit_'):
+            raise sqlite3.OperationalError('credit savepoint setup failure')
+        return original_execute(conn, sql, *args, **kwargs)
+
+    monkeypatch.setattr(bm._BeamConnection, 'execute', execute)
+    with pytest.raises(sqlite3.OperationalError, match='credit savepoint setup failure'):
+        memory.recall('launch', top_k=5, **FILTERS)
+    assert not memory.conn.in_transaction
+    assert memory.conn._savepoint_hook_marks == []
+    with sqlite3.connect(memory.db_path, timeout=0) as peer:
+        peer.execute('BEGIN IMMEDIATE')
+        peer.rollback()
 
 
 def test_dense_candidate_fetch_with_small_top_k(make_store, monkeypatch):
