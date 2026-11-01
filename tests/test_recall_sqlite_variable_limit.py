@@ -218,8 +218,18 @@ def test_hangul_staged_rank_hydration_preserves_full_pool(make_store, tier, bind
     baseline_ranks = search(memory.conn, '바나나', k=1200)
     assert len(baseline_ranks) == 1200  # MATCH plus these IDs exceeds the old 999 budget.
     assert len({r['rank'] for r in baseline_ranks}) > 1
+    table, id_col = ('fts_working', 'id') if tier == 'working' else ('fts_episodes', 'rowid')
+    # Independent oracle: the expansion MATCH itself, without the staged selector.
+    direct_ranks = {r[id_col]: r['rank'] for r in memory.conn.execute(
+        f'SELECT {id_col}, rank FROM {table} WHERE {table} MATCH ?', ('"바나"*',),
+    )}
+    expected_ranks = sorted(
+        [{id_col: r[id_col], 'rank': direct_ranks[r[id_col]]} for r in baseline_ranks],
+        key=lambda r: (r['rank'], r[id_col]),
+    )
+    assert baseline_ranks == expected_ranks
     baseline = memory.recall('바나나', top_k=400, _track_recall=False, **FILTERS)
     assert len(baseline) == 400
     limit(memory, bind_limit)
-    assert search(memory.conn, '바나나', k=1200) == baseline_ranks
+    assert search(memory.conn, '바나나', k=1200) == expected_ranks
     assert signature(memory.recall('바나나', top_k=400, _track_recall=False, **FILTERS)) == signature(baseline)

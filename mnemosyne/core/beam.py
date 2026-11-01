@@ -5674,12 +5674,24 @@ def _fts_staged_rows(
     if not ordered_ids:
         return []
 
-    rank_rows = _select_recall_rows_by_ids(
-        conn,
-        f"SELECT {id_col}, rank FROM {table}"
-        f" WHERE {id_col} IN ({{placeholders}}) AND {table} MATCH ?",
-        ordered_ids, (" OR ".join(expansion_terms),), key=id_col,
-    )
+    match = " OR ".join(expansion_terms)
+    first_batch = next(_recall_id_batches(conn, ordered_ids, reserved=1))
+    if len(first_batch) == len(ordered_ids):
+        # Small pools keep the filtered, single-statement lookup.
+        rank_rows = _select_recall_rows_by_ids(
+            conn,
+            f"SELECT {id_col}, rank FROM {table}"
+            f" WHERE {id_col} IN ({{placeholders}}) AND {table} MATCH ?",
+            ordered_ids, (match,), key=id_col,
+        )
+    else:
+        # FTS working IDs are UNINDEXED: batching repeats the whole MATCH
+        # scan. Stream it once, retaining at most the selected pool in ranks.
+        rank_rows = (
+            r for r in conn.execute(
+                f"SELECT {id_col}, rank FROM {table} WHERE {table} MATCH ?", (match,)
+            ) if r[id_col] in seen_ids
+        )
     ranks = {r[id_col]: r["rank"] for r in rank_rows}
     # An exact hit the expansion terms cannot reach keeps the pool slot but
     # scores last, so it never displaces a row the ranking actually measured.
