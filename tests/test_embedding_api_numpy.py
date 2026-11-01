@@ -43,6 +43,13 @@ def api(monkeypatch):
     embeddings._embed_query_cached.cache_clear()
 
 
+@pytest.fixture
+def recovery_api(request):
+    """Positive vector checks need real NumPy; missing-dependency checks do not."""
+    pytest.importorskip("numpy")
+    return request.getfixturevalue("api")
+
+
 @pytest.mark.parametrize("call", [
     lambda: embeddings.embed_query("private query"),
     lambda: embeddings.embed(["private document"]),
@@ -57,24 +64,24 @@ def test_missing_numpy_fails_before_sending_api_input(api, call, caplog):
     assert "private document" not in caplog.text
 
 
-def test_api_availability_recovers_numpy_without_fastembed(api, caplog):
+def test_api_availability_recovers_numpy_without_fastembed(recovery_api, caplog):
     assert embeddings.available() is False
     assert embeddings.available() is False
     assert "NumPy" in caplog.text
-    api["numpy_missing"] = False
+    recovery_api["numpy_missing"] = False
     assert embeddings.available() is True
     assert embeddings.embed_query("recovered query").tolist() == [0.25, 0.75]
-    assert api["local_imports"] == []
-    assert len(api["requests"]) == 1
+    assert recovery_api["local_imports"] == []
+    assert len(recovery_api["requests"]) == 1
 
 
-def test_direct_api_query_recovers_after_missing_numpy(api):
+def test_direct_api_query_recovers_after_missing_numpy(recovery_api):
     with pytest.raises(RuntimeError, match="NumPy"):
         embeddings.embed_query("same query")
     assert embeddings._embed_query_cached.cache_info().currsize == 0
-    api["numpy_missing"] = False
+    recovery_api["numpy_missing"] = False
     assert embeddings.embed_query("same query").tolist() == [0.25, 0.75]
-    assert api["local_imports"] == []
+    assert recovery_api["local_imports"] == []
 
 
 def test_runtime_diagnostics_report_api_dependency_unavailable(api):
@@ -86,7 +93,7 @@ def test_runtime_diagnostics_report_api_dependency_unavailable(api):
     assert api["requests"] == []
 
 
-def test_api_numpy_broken_install_backs_off_and_recovers(api, monkeypatch, caplog):
+def test_api_numpy_broken_install_backs_off_and_recovers(recovery_api, monkeypatch, caplog):
     original_import = builtins.__import__
     clock = [100.0]
     attempts = []
@@ -94,7 +101,7 @@ def test_api_numpy_broken_install_backs_off_and_recovers(api, monkeypatch, caplo
     def broken_numpy(name, *args, **kwargs):
         if name == "numpy":
             attempts.append(name)
-            if api["numpy_missing"]:
+            if recovery_api["numpy_missing"]:
                 raise ImportError("private native-library path")
         return original_import(name, *args, **kwargs)
 
@@ -104,7 +111,7 @@ def test_api_numpy_broken_install_backs_off_and_recovers(api, monkeypatch, caplo
     assert embeddings.available() is False
     assert len(attempts) == 1
     assert "private native-library path" not in caplog.text
-    api["numpy_missing"] = False
+    recovery_api["numpy_missing"] = False
     clock[0] = 101.0
     assert embeddings.available() is True
     assert len(attempts) == 2
