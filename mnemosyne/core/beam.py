@@ -12345,8 +12345,13 @@ class BeamMemory:
         if _embeddings.available():
             try:
                 return _embeddings.embed([content])
-            except Exception:
-                pass
+            except Exception as exc:
+                # Provider exception text can contain credentials or input.
+                logger.warning(
+                    "degrade_episodic: embedding failed (%s); "
+                    "stale vectors will be invalidated if the row is applied",
+                    type(exc).__name__,
+                )
         return None
 
     def _refresh_episodic_embedding(

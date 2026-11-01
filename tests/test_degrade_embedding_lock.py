@@ -115,3 +115,37 @@ def test_lost_savepoint_does_not_replace_keyboard_interrupt(memory, monkeypatch)
         memory.degrade_episodic()
     assert not memory.conn.in_transaction
     assert tuple(memory.conn.execute("SELECT content, tier FROM episodic_memory WHERE id='target'").fetchone()) == (original, 2)
+
+
+@pytest.mark.parametrize('tier', [1, 2])
+def test_embedding_failure_warns_without_private_details_and_invalidates_stale_vector(
+    memory, monkeypatch, caplog, tier,
+):
+    original = seed(memory, tier, 'target')
+
+    def fail_embedding(texts):
+        raise RuntimeError('private provider credential; input=' + texts[0])
+
+    monkeypatch.setattr(bm._embeddings, 'embed', fail_embedding)
+    result = memory.degrade_episodic()
+    assert result[f'tier{tier}_to_tier{tier+1}'] == 1
+    row = memory.conn.execute(
+        "SELECT content, tier, binary_vector FROM episodic_memory WHERE id='target'"
+    ).fetchone()
+    assert row['content'] != original
+    assert row['tier'] == tier + 1
+    assert row['binary_vector'] is None
+    assert memory.conn.execute(
+        "SELECT 1 FROM memory_embeddings WHERE memory_id='target'"
+    ).fetchone() is None
+    warnings = [record for record in caplog.records if 'embedding failed' in record.getMessage()]
+    assert len(warnings) == 1
+    assert warnings[0].levelname == 'WARNING'
+    assert 'RuntimeError' in warnings[0].getMessage()
+    assert warnings[0].exc_info is None
+    assert 'private provider credential' not in caplog.text
+    assert 'original detailed context' not in caplog.text
+    assert not memory.conn.in_transaction
+    with sqlite3.connect(memory.db_path, timeout=0) as peer:
+        peer.execute('BEGIN IMMEDIATE')
+        peer.rollback()
