@@ -74,13 +74,19 @@ mnemosyne hygiene audit [--limit N] [--offset N] [--all [--batch-size N]]
 mnemosyne hygiene status [--limit N] [--json]
 
 # Act on candidates. Dry run unless --confirm.
-mnemosyne hygiene clean --action delete|archive|flag [--confirm] [--dry-run] <candidates.json>
+mnemosyne hygiene clean --action delete|archive|flag [--force] [--confirm] [--dry-run] <candidates.json>
 
 # Undo archives
 mnemosyne hygiene restore [--limit N]
 ```
 
 Defaults: `audit` uses `--limit 200` and `--min-score 0.3`, and prints the top 20 candidates in human mode. `clean` is a **dry run by default**; `--confirm` both confirms and disables the dry run.
+
+An explicit `--action delete` is refused before any cleanup if even one candidate
+is not suggested for deletion, including during a dry run. Review the audit first;
+`--force` deliberately overrides that guard and still requires `--confirm` to apply.
+Omitting `--action` (or using `--action keep`) applies each candidate's suggestion.
+Archive and flag overrides retain their existing behavior.
 
 Two sharp edges worth knowing:
 
@@ -104,7 +110,7 @@ Archive first, delete later. Archiving is reversible and gets the noise out of r
 
 **`mnemosyne_hygiene_audit`** is read-only. Parameters: `limit` (200), `offset` (0), `scan_all` (false), `batch_size` (1000), `min_score` (0.3), `tables`, `bank` (`default`). Nothing is required. Opens the database read-only, so it cannot modify anything.
 
-**`mnemosyne_hygiene_clean`** requires `candidates_json`. Also takes `action` (`delete` / `archive` / `flag` / `keep`, default `keep`), `confirm` (false), and `bank`.
+**`mnemosyne_hygiene_clean`** requires `candidates_json`. Also takes `action` (`delete` / `archive` / `flag` / `keep`, default `keep`), `confirm` (false), `force` (false), and `bank`. Only the JSON boolean `true` enables the mixed-candidate delete override; strings and numbers are rejected.
 
 The confirm gate is `dry_run = not confirm`. There is no independent `dry_run` parameter over MCP, so `confirm=false` is always a dry run and `confirm=true` always applies. The underlying function double-gates: it returns before touching the database on a dry run, and refuses to proceed if it somehow receives a non-dry-run without confirmation.
 

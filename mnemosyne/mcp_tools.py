@@ -1254,7 +1254,11 @@ def _handle_hygiene_audit(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_hygiene_clean tool call."""
-    from mnemosyne.core.hygiene import NoiseCandidate, clean_noise, validate_hygiene_candidate
+    from mnemosyne.core.hygiene import NoiseCandidate, clean_noise, validate_delete_override, validate_hygiene_candidate
+
+    force = arguments.get("force", False)
+    if type(force) is not bool:
+        return {"error": "force must be a boolean"}
 
     candidates_json = arguments.get("candidates_json", "[]")
     try:
@@ -1287,11 +1291,14 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
             )
         )
 
+    action = arguments.get("action", "keep")
+    override_error = validate_delete_override(candidates, action, force)
+    if override_error:
+        return {"error": override_error}
+
     bank = _resolve_bank(arguments)
     mem = _create_instance(bank=bank)
     db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
-
-    action = arguments.get("action", "keep")
     confirm = arguments.get("confirm", False)
     dry_run = not confirm
 
@@ -1301,9 +1308,10 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
         action=action,
         confirm=confirm,
         dry_run=dry_run,
+        force=force,
     )
     return {
-        "status": "dry_run" if dry_run else "applied",
+        "status": "failed" if result.errors else ("dry_run" if dry_run else "applied"),
         "result": result.to_dict(),
         "bank": bank,
     }

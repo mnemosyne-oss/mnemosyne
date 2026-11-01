@@ -1495,7 +1495,7 @@ def cmd_hygiene(args):
         print("  audit [--limit N] [--offset N] [--all [--batch-size N]] [--min-score F] [--json]")
         print("                                          Scan for noise (dry-run; --batch-size only affects --all)")
         print("  status [--limit N] [--json]             Show PII-safe hygiene status")
-        print("  clean --action delete|archive|flag [--confirm] [--dry-run] <candidates.json>")
+        print("  clean --action delete|archive|flag [--force] [--confirm] [--dry-run] <candidates.json>")
         print("  restore [--limit N]                     Restore archived memories")
         return
 
@@ -1612,6 +1612,7 @@ def cmd_hygiene(args):
 
     elif sub == "clean":
         action = "keep"
+        force = False
         confirm = False
         dry_run = True
         candidates_file = None
@@ -1624,6 +1625,9 @@ def cmd_hygiene(args):
             elif rest[i] == "--confirm":
                 confirm = True
                 dry_run = False
+                i += 1
+            elif rest[i] == "--force":
+                force = True
                 i += 1
             elif rest[i] == "--dry-run":
                 dry_run = True
@@ -1685,11 +1689,15 @@ def cmd_hygiene(args):
                 action=action,
                 confirm=confirm,
                 dry_run=dry_run,
+                force=force,
             )
         except Exception:
             _fail("hygiene_clean_failed", exit_code=1)
 
         if result.errors:
+            from mnemosyne.core.hygiene import DELETE_OVERRIDE_ERROR
+            if DELETE_OVERRIDE_ERROR in result.errors:
+                _fail(DELETE_OVERRIDE_ERROR, exit_code=1)
             _fail("hygiene_clean_failed", exit_code=1)
 
         mode = "DRY RUN" if dry_run else "APPLIED"
