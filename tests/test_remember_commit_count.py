@@ -207,6 +207,15 @@ def test_failure_after_each_enrichment_step(beam, monkeypatch, tmp_path, path, p
     if escaped:
         for table, count in before.items():
             assert beam.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == count, table
+    else:
+        # The swallowed failure must not stop the steps after it: the graph
+        # step runs last, so its gist and the queued conflict prove they ran.
+        memory_id = beam.conn.execute(
+            "SELECT id FROM working_memory WHERE content = ?", (text,)).fetchone()[0]
+        assert beam.conn.execute(
+            "SELECT COUNT(*) FROM gists WHERE memory_id = ?", (memory_id,)).fetchone()[0] == 1
+        assert beam.conn.execute(
+            "SELECT COUNT(*) FROM consolidated_facts WHERE object = 'Initech'").fetchone()[0] == 1
 
 
 def _seed_expired_row(beam):
