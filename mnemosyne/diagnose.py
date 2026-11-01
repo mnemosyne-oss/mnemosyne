@@ -17,7 +17,11 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from mnemosyne.runtime_diagnostics import collect_runtime_diagnostics
+from mnemosyne.runtime_diagnostics import (
+    CALLING_INTERPRETER_SCOPE,
+    CLI_INTERPRETER_SCOPE,
+    collect_runtime_diagnostics,
+)
 
 def _default_log_dir() -> Path:
     """Resolve diagnostics beside the active Hermes home."""
@@ -151,7 +155,13 @@ def _sqlite_integrity_diagnostics(conn) -> dict[str, str]:
     return {"quick_check": result, "detail": ""}
 
 
-def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, bank: str | None = None) -> dict:
+def run_diagnostics(
+    *,
+    repair_vec_working: bool = False,
+    dry_run: bool = False,
+    bank: str | None = None,
+    scope: str = CALLING_INTERPRETER_SCOPE,
+) -> dict:
     """
     Run full diagnostic scan and write PII-safe log.
     Returns summary dict for display.
@@ -164,13 +174,17 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, 
         bank: Optional named bank to diagnose. When provided, diagnostics run
             against the bank's own SQLite DB (data/banks/<bank>/mnemosyne.db).
             When None, the default/profile-root DB is used.
+        scope: Role of the interpreter running the runtime checks, one of
+            ``mnemosyne.runtime_diagnostics.RUNTIME_SCOPES``. Callers inside
+            the provider pass ``provider_runtime``; standalone CLI entry points
+            pass ``cli_interpreter`` (#813).
     """
     log_path = _log_path()
     entries: list[dict] = []
     resolved_bank: str | None = None
     resolved_db: str | None = None
 
-    def log(category: str, check: str, status: str, detail: str = ""):
+    def log(category: str, check: str, status: str, detail: str = "", scope: str | None = None):
         entry = {
             "ts": datetime.now().isoformat(),
             "category": category,
@@ -178,12 +192,24 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, 
             "status": status,
             "detail": detail
         }
+        if scope is not None:
+            entry["scope"] = scope
         entries.append(entry)
         return entry
 
     # --- Pure runtime/dependency/capability checks (no provider construction) ---
-    for check in collect_runtime_diagnostics()["checks"]:
-        log(check["category"], check["check"], check["status"], check["detail"])
+    # Keep each check's scope: dropping it here would leave the summary and the
+    # JSONL log as unqualified as before #813.
+    runtime = collect_runtime_diagnostics(scope=scope)
+    runtime_scope = runtime.get("scope", scope)
+    for check in runtime["checks"]:
+        log(
+            check["category"],
+            check["check"],
+            check["status"],
+            check["detail"],
+            scope=check.get("scope", runtime_scope),
+        )
 
     # --- Database state ---
     try:
@@ -310,6 +336,8 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, 
         "entries": entries,
         "resolved_bank": resolved_bank,
         "resolved_db": resolved_db,
+        "scope": runtime_scope,
+        "executable": runtime.get("executable"),
     }
 
     # Auto-detect common problems
@@ -447,7 +475,12 @@ if __name__ == "__main__":
     parser.add_argument("--bank", type=str, default=None, help="Mnemosyme bank to diagnose (default: profile-root DB)")
     args = parser.parse_args()
 
-    result = run_diagnostics(repair_vec_working=args.repair_vec_working, dry_run=args.dry_run, bank=args.bank)
+    result = run_diagnostics(
+        repair_vec_working=args.repair_vec_working,
+        dry_run=args.dry_run,
+        bank=args.bank,
+        scope=CLI_INTERPRETER_SCOPE,
+    )
     print(json.dumps(result, indent=2))
 
     if args.fix or (args.dry_run and not args.repair_vec_working):
