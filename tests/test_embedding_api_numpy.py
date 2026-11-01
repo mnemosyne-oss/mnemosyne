@@ -98,7 +98,8 @@ def test_runtime_diagnostics_report_api_dependency_unavailable(api):
     assert api["requests"] == []
 
 
-def test_api_numpy_broken_install_backs_off_and_recovers(recovery_api, monkeypatch, caplog):
+@pytest.fixture
+def broken_api(api, monkeypatch):
     original_import = builtins.__import__
     clock = [100.0]
     attempts = []
@@ -106,30 +107,42 @@ def test_api_numpy_broken_install_backs_off_and_recovers(recovery_api, monkeypat
     def broken_numpy(name, *args, **kwargs):
         if name == "numpy":
             attempts.append(name)
-            if recovery_api["numpy_missing"]:
+            if api["numpy_missing"]:
                 raise ImportError("private native-library path")
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", broken_numpy)
     monkeypatch.setattr(embeddings, "time", SimpleNamespace(monotonic=lambda: clock[0]))
-    assert embeddings.available() is False
-    assert embeddings.available() is False
-    assert len(attempts) == 1
-    for call in (
+    api.update(clock=clock, attempts=attempts)
+    return api
+
+
+@pytest.mark.parametrize("query_first", [True, False])
+def test_broken_numpy_direct_api_failures_are_private_and_back_off(broken_api, caplog, query_first):
+    calls = [
         lambda: embeddings.embed_query("private query"),
         lambda: embeddings.embed(["private document"]),
-    ):
+    ]
+    if not query_first:
+        calls.reverse()
+    for call in calls:
         with pytest.raises(RuntimeError, match="NumPy") as error:
             call()
         assert "endpoint failed" not in str(error.value)
-        assert "private native-library path" not in str(error.value)
-    assert recovery_api["requests"] == []
-    assert len(attempts) == 1
+        for private in ("private native-library path", "private query", "private document"):
+            assert private not in str(error.value) + caplog.text
+        assert broken_api["requests"] == []
+        assert len(broken_api["attempts"]) == 1
+        assert embeddings._embed_query_cached.cache_info().currsize == 0
+
+
+def test_api_numpy_broken_install_backs_off_and_recovers(recovery_api, broken_api, caplog):
+    assert embeddings.available() is False
+    assert embeddings.available() is False
+    assert len(broken_api["attempts"]) == 1
     assert "private native-library path" not in caplog.text
-    assert "private query" not in caplog.text
-    assert "private document" not in caplog.text
     recovery_api["numpy_missing"] = False
-    clock[0] = 101.0
+    broken_api["clock"][0] = 101.0
     assert embeddings.available() is True
-    assert len(attempts) == 2
+    assert len(broken_api["attempts"]) == 2
     assert embeddings.embed_query("repaired query").tolist() == [0.25, 0.75]
