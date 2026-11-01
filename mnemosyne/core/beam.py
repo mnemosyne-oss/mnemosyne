@@ -12854,6 +12854,15 @@ class BeamMemory:
         bound. ``_fleet_census=False`` is a private opt-out for
         sleep_all_sessions, which runs this method once per session and
         therefore takes the census once for the whole pass instead of N times.
+
+        Conflict-ledger drain (additive): a non-dry-run sleep also runs the
+        veracity consolidator's documented conflict pass once
+        (``run_consolidation_pass``), bounded by the same
+        MNEMOSYNE_CONFLICT_PAIR_BUDGET / MNEMOSYNE_CONFLICT_TIME_BUDGET_S
+        limits as LLM conflict validation and recorded under
+        ``veracity_conflict_pass`` in the result. Best-effort: a pass
+        failure is logged and never fails the sleep; dry runs skip it
+        (the pass writes).
         """
         from mnemosyne.core.aaak import encode as aaak_encode
         from mnemosyne.core import local_llm
@@ -13439,6 +13448,28 @@ class BeamMemory:
                 " skipped this sleep", pairs_skipped_budget,
             )
 
+        # Conflict-ledger drain (the documented sleep retry hook, PR
+        # #1082 review): run the veracity consolidator's conflict pass
+        # once so pairs left queued by a refused probe are re-probed and
+        # obvious conflicts among consolidated facts resolve here.
+        # Bounded by the same pair/time budgets as LLM conflict
+        # validation; best-effort -- a resolution failure must never
+        # fail the sleep. Dry runs skip it: the pass writes.
+        veracity_conflict_pass = None
+        if not dry_run and self.veracity_consolidator is not None:
+            try:
+                resolutions = self.veracity_consolidator.run_consolidation_pass(
+                    pair_budget=_CONFLICT_PAIR_BUDGET,
+                    time_budget_s=_CONFLICT_TIME_BUDGET_S,
+                )
+                veracity_conflict_pass = {"resolutions": resolutions}
+            except Exception as exc:
+                logger.warning(
+                    "veracity conflict pass failed (%s); sleep result unaffected",
+                    type(exc).__name__,
+                )
+                veracity_conflict_pass = {"error": type(exc).__name__}
+
         # Run tiered degradation after consolidation
         degrade_result = self.degrade_episodic(dry_run=dry_run)
         if not dry_run:
@@ -13461,6 +13492,7 @@ class BeamMemory:
             "method": method,
             "consolidated_ids": consolidated_ids,
             "degradation": degrade_result,
+            "veracity_conflict_pass": veracity_conflict_pass,
             "model_refresh": {
                 "proposals": model_refresh_proposals,
                 "applied": model_refresh_applied,
