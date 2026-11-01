@@ -133,9 +133,12 @@ def test_false_force_is_valid_for_all_delete_recommendations(mixed):
     'case,force_args,confirm,expected_error,expected_status,deleted,remaining',
     [
         ('refused', {}, True, True, None, None, ['note', 'trash']),
+        ('refused', {}, False, True, None, None, ['note', 'trash']),
         ('cleanup_failed', {}, True, True, 'failed', 0, ['note', 'trash']),
         ('dry_run', {}, False, False, 'dry_run', 1, ['note', 'trash']),
         ('applied', {}, True, False, 'applied', 1, ['note']),
+        ('archive', {}, True, False, 'applied', 0, ['note', 'trash']),
+        ('flag', {}, True, False, 'applied', 0, ['note', 'trash']),
         ('forced', {'force': True}, True, False, 'applied', 2, []),
         ('forced', {'force': True}, False, False, 'dry_run', 2, ['note', 'trash']),
         ('forced', {'force': 1}, True, True, None, None, ['note', 'trash']),
@@ -143,7 +146,8 @@ def test_false_force_is_valid_for_all_delete_recommendations(mixed):
         ('forced', {'force': 'true'}, True, True, None, None, ['note', 'trash']),
         ('forced', {'force': 'true'}, False, True, None, None, ['note', 'trash']),
     ],
-    ids=['refused', 'cleanup-failed', 'per-candidate-preview', 'per-candidate-applied',
+    ids=['refused', 'unforced-delete-preview', 'cleanup-failed',
+         'per-candidate-preview', 'per-candidate-applied', 'archive-override', 'flag-override',
          'force-true-confirmed', 'force-true-preview', 'force-int-confirmed',
          'force-int-preview', 'force-string-confirmed', 'force-string-preview'],
 )
@@ -164,8 +168,10 @@ def test_mcp_wire_reports_hygiene_failure_and_success(
         candidates = candidates[:1]
         with sqlite3.connect(path) as conn:
             conn.execute("CREATE TRIGGER prevent_cleanup BEFORE DELETE ON working_memory BEGIN SELECT RAISE(ABORT, 'cleanup blocked'); END")
+    action = (case if case in ('archive', 'flag') else
+              'delete' if case in ('refused', 'cleanup_failed', 'forced') else 'keep')
     arguments = {'candidates_json': json.dumps([c.to_dict() for c in candidates]),
-                 'action': 'delete' if case in ('refused', 'cleanup_failed', 'forced') else 'keep',
+                 'action': action,
                  'confirm': confirm, **force_args}
 
     async def exercise():
@@ -185,9 +191,26 @@ def test_mcp_wire_reports_hygiene_failure_and_success(
                         assert payload['status'] == expected_status
                         assert bool(payload['result']['errors']) is expected_error
                         assert payload['result']['deleted'] == deleted
+                        assert payload['result']['archived'] == (2 if case == 'archive' else 0)
+                        assert payload['result']['flagged'] == (2 if case == 'flag' else 0)
             finally:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
     asyncio.run(exercise())
     assert ids(path) == remaining
+    if case in ('archive', 'flag'):
+        with sqlite3.connect(path) as conn:
+            rows = conn.execute(
+                'SELECT id, content, importance, metadata_json FROM working_memory ORDER BY id'
+            ).fetchall()
+        assert [(r[0], r[1]) for r in rows] == [('note', 'note'), ('trash', 'trash')]
+        for _mid, _content, importance, raw_metadata in rows:
+            metadata = json.loads(raw_metadata)
+            if case == 'archive':
+                assert importance == 0
+                assert metadata['_archived'] is True
+                assert metadata['_original_importance'] == 0.5
+            else:
+                assert importance == 0.5
+                assert metadata['_hygiene_flagged'] is True
