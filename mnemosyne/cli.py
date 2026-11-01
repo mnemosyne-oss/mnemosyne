@@ -1701,6 +1701,10 @@ def cmd_hygiene(args):
             _fail("hygiene_clean_failed", exit_code=1)
 
         mode = "DRY RUN" if dry_run else "APPLIED"
+        if force and action == "delete":
+            recommended = sum(c.suggested_action == "delete" for c in candidates)
+            print(f"[{mode}] override=delete scope=all candidates "
+                  f"({recommended}/{len(candidates)} recommended delete)")
         print(f"[{mode}] deleted={result.deleted} archived={result.archived} "
               f"flagged={result.flagged} kept={result.kept}")
 

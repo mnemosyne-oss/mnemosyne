@@ -84,6 +84,41 @@ def test_cli_refusal_explains_force_and_force_applies(mixed, monkeypatch, capsys
     assert ids(path) == []
 
 
+@pytest.mark.parametrize('confirm', [False, True], ids=['preview', 'applied'])
+def test_cli_forced_delete_reports_override_scope(mixed, monkeypatch, capsys, confirm):
+    path, candidates = mixed
+    monkeypatch.setattr('mnemosyne.cli.DATA_DIR', path.parent)
+    report = path.parent / 'audit.json'
+    report.write_text(json.dumps([c.to_dict() for c in candidates]))
+    args = ['clean', str(report), '--action', 'delete', '--force']
+    if confirm:
+        args.append('--confirm')
+    cmd_hygiene(args)
+    mode = 'APPLIED' if confirm else 'DRY RUN'
+    output = capsys.readouterr().out
+    assert f'[{mode}] override=delete scope=all candidates (1/2 recommended delete)' in output
+    assert f'[{mode}] deleted=2 archived=0 flagged=0 kept=0' in output
+    assert ids(path) == ([] if confirm else ['note', 'trash'])
+
+
+@pytest.mark.parametrize('action,force', [('keep', False), ('keep', True), ('archive', True), ('delete', False)])
+def test_cli_other_clean_modes_do_not_report_forced_scope(mixed, monkeypatch, capsys, action, force):
+    path, candidates = mixed
+    if action == 'delete':
+        candidates = candidates[:1]  # Valid unforced deletion: every candidate recommends delete.
+    monkeypatch.setattr('mnemosyne.cli.DATA_DIR', path.parent)
+    report = path.parent / 'audit.json'
+    report.write_text(json.dumps([c.to_dict() for c in candidates]))
+    args = ['clean', str(report), '--action', action]
+    if force:
+        args.append('--force')
+    cmd_hygiene(args)
+    output = capsys.readouterr().out
+    assert '[DRY RUN] deleted=' in output
+    assert 'override=' not in output
+    assert ids(path) == ['note', 'trash']
+
+
 @pytest.mark.parametrize('force', [False, 1, 'true', None, True])
 def test_mcp_force_contract(mixed, monkeypatch, force):
     path, candidates = mixed
