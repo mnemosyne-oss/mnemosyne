@@ -6,15 +6,111 @@ capabilities without importing the mutable ``mnemosyne.diagnose`` command.
 """
 
 import importlib.metadata
+import json
+import os
 import platform
+import shutil
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 
-def collect_runtime_diagnostics() -> dict[str, Any]:
-    """Run pure runtime, dependency, and capability checks without a provider."""
+def resolve_python_executable(python_executable: str) -> str:
+    """Resolve PATH names as subprocesses do while preserving explicit paths."""
+    expanded = os.path.expanduser(python_executable)
+    if os.path.dirname(expanded):
+        return os.path.abspath(expanded)
+    return shutil.which(expanded) or expanded
+
+
+def _collect_target_runtime_diagnostics(python_executable: str) -> dict[str, Any]:
+    """Collect a selected interpreter's checks in an isolated subprocess.
+
+    Validate the JSON response before exposing it to diagnostic consumers.
+    A failed launch, timeout, or invalid response reports an unavailable target
+    without falling back to the caller's interpreter or revealing its path.
+    """
+    executable = resolve_python_executable(python_executable)
+    display_name = Path(executable).name or "python"
+    script = (
+        "import json; "
+        "from mnemosyne.runtime_diagnostics import collect_runtime_diagnostics; "
+        "print('MNEMOSYNE_DIAGNOSTICS=' + json.dumps(collect_runtime_diagnostics()))"
+    )
+    try:
+        result = subprocess.run(
+            [executable, "-I", "-c", script],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+
+    payload = None
+    if result is not None and result.returncode == 0:
+        for line in reversed(result.stdout.splitlines()):
+            if line.startswith("MNEMOSYNE_DIAGNOSTICS="):
+                try:
+                    payload = json.loads(line.partition("=")[2])
+                except json.JSONDecodeError:
+                    pass
+                break
+
+    required_keys = {"category", "check", "status", "detail"}
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("checks"), list)
+        or not all(
+            isinstance(check, dict) and required_keys <= check.keys()
+            for check in payload["checks"]
+        )
+    ):
+        return {
+            "status": "unavailable",
+            "checks": [
+                {
+                    "category": "runtime",
+                    "check": "target_interpreter",
+                    "status": "ERROR",
+                    "detail": "selected interpreter could not run Mnemosyne diagnostics",
+                }
+            ],
+            "scope": "target_interpreter",
+            "executable": display_name,
+            "unavailable": True,
+        }
+
+    executable_check = next(
+        (
+            check
+            for check in payload["checks"]
+            if isinstance(check, dict) and check.get("check") == "python_executable"
+        ),
+        {},
+    )
+    executable_name = str(executable_check.get("detail") or display_name)
+    executable_name = executable_name.replace("\\", "/").rsplit("/", 1)[-1]
+    payload["scope"] = "target_interpreter"
+    payload["executable"] = executable_name
+    return payload
+
+
+def collect_runtime_diagnostics(python_executable: str | None = None) -> dict[str, Any]:
+    """Run pure runtime, dependency, and capability checks without a provider.
+
+    By default, inspect the current interpreter. When ``python_executable`` is
+    supplied, resolve PATH names or explicit paths and run checks there with
+    Python's isolated mode. An unavailable target never falls back to the
+    current interpreter.
+    """
+
+    if python_executable is not None:
+        return _collect_target_runtime_diagnostics(python_executable)
 
     checks: list[dict[str, str]] = []
 

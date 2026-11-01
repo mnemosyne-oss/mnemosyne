@@ -371,15 +371,37 @@ def cmd_sleep(args):
 
 
 def cmd_diagnose(args):
-    """Run PII-safe diagnostics. Use --fix to auto-install missing dependencies."""
+    """Run PII-safe diagnostics. Use --python to select the runtime interpreter."""
     fix_mode = "--fix" in args
     dry_run = "--dry-run" in args
     repair_vec_working = "--repair-vec-working" in args
+    python_executable = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--python" or args[i].startswith("--python="):
+            if args[i].startswith("--python="):
+                value = args[i].partition("=")[2]
+                if not value:
+                    _fail("--python requires a value")
+                python_executable = value
+                i += 1
+                continue
+            python_executable, i = _require_value(args, i, "--python", lambda value, _name: value)
+        else:
+            i += 1
 
     try:
         from mnemosyne.diagnose import run_diagnostics, auto_fix
-        result = run_diagnostics(repair_vec_working=repair_vec_working, dry_run=dry_run)
+        diagnose_args = {"repair_vec_working": repair_vec_working, "dry_run": dry_run}
+        if python_executable is not None:
+            diagnose_args["python_executable"] = python_executable
+        result = run_diagnostics(**diagnose_args)
         print("\nMnemosyne Diagnostics\n")
+        print(
+            "  Runtime checks: "
+            f"{result.get('runtime_scope', 'cli_interpreter')} "
+            f"({result.get('runtime_executable', 'unknown')})"
+        )
         print(f"  Checks passed: {result.get('checks_passed', 0)}/{result.get('checks_total', 0)}")
         if result.get("key_findings"):
             print("\n  Key findings:")
@@ -403,7 +425,10 @@ def cmd_diagnose(args):
 
         if fix_mode or (dry_run and not repair_vec_working):
             print("\n--- Auto-fix ---")
-            fix_result = auto_fix(result.get("entries", []), dry_run=dry_run)
+            fix_args = {"dry_run": dry_run}
+            if python_executable is not None:
+                fix_args["python_executable"] = python_executable
+            fix_result = auto_fix(result.get("entries", []), **fix_args)
             if fix_result["fixed"]:
                 for item in fix_result["fixed"]:
                     if dry_run:
@@ -2066,7 +2091,10 @@ def run_cli():
         print("  delete <id>                            Delete a memory")
         print("  stats                                  Show statistics")
         print("  sleep                                  Run consolidation")
-        print("  diagnose [--fix] [--dry-run] [--repair-vec-working]  Run diagnostics / optional repairs")
+        print(
+            "  diagnose [--python PATH] [--fix] [--dry-run] [--repair-vec-working]  "
+            "Run diagnostics / optional repairs"
+        )
         print("  doctor [--db PATH|--bank NAME] [--format json|markdown|both]  Read-only report")
         print("  repair --report REPORT.json --select working_memory:ID [--apply]  Narrow doctor-gated repair")
         print("  export [--include-sync-events] [file.json]    Export memories")
