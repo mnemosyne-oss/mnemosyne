@@ -14,6 +14,7 @@ extract_entities=False write paths, the LLM fact step and a failing
 enrichment step on each path.
 """
 import itertools
+import sqlite3
 
 import numpy as np
 import pytest
@@ -126,29 +127,86 @@ def test_llm_fact_step_runs_outside_a_write_transaction(beam, monkeypatch, path,
     assert seen == [False]
 
 
-@pytest.mark.parametrize("path", ["new", "dedup"])
-def test_failing_enrichment_keeps_the_row(beam, monkeypatch, path):
-    monkeypatch.setattr(bm._embeddings, "available", lambda: True)
-    if path == "dedup":
-        beam.remember("unrelated earlier row", source="user")
-        beam.remember(TEXT, source="user")
-    before = {t: beam.conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-              for t in ("annotations", "memory_embeddings", "memoria_facts", "memoria_timelines")}
+ENRICHMENT_TABLES = ("annotations", "memory_embeddings", "memoria_facts",
+                     "memoria_timelines", "gists", "consolidated_facts")
 
-    def fail(*args, **kwargs):
-        raise RuntimeError("graph store down")
+# Every enrichment step remember() runs inside its BEAM-owned transaction, as
+# (owner, name). Steps the dedup path never runs are listed in DEDUP_SKIPS.
+INJECTION_POINTS = [
+    ("beam", "_trim_working_memory"),
+    ("module", "_store_working_embedding"),
+    ("beam", "_add_temporal_triple"),
+    ("module", "extract_temporal"),
+    ("module", "_extract_and_store_entities"),
+    ("beam", "extract_and_store_facts"),
+    ("beam", "_ingest_graph_and_veracity"),
+]
+DEDUP_SKIPS = {"_trim_working_memory", "_store_working_embedding",
+               "_add_temporal_triple", "extract_temporal"}
+INJECTION_CELLS = [
+    (path, point, error)
+    for path in ("new", "dedup")
+    for point in INJECTION_POINTS
+    for error in (RuntimeError, KeyboardInterrupt)
+    if not (path == "dedup" and point[1] in DEDUP_SKIPS)
+]
 
-    monkeypatch.setattr(beam, "_ingest_graph_and_veracity", fail)
 
-    with pytest.raises(RuntimeError):
-        beam.remember(TEXT, source="user", extract_entities=True)
-
+def _assert_no_transaction_left_behind(beam, db_path):
     assert not beam.conn.in_transaction
+    assert not beam.conn._defer_commit
+    assert beam.conn._after_commit_hooks == []
+    other = sqlite3.connect(db_path, timeout=0)
+    try:
+        other.execute("BEGIN IMMEDIATE")
+        other.rollback()
+    finally:
+        other.close()
+
+
+@pytest.mark.parametrize("path,point,error", INJECTION_CELLS,
+                         ids=[f"{p}-{n}-{e.__name__}" for p, (_, n), e in INJECTION_CELLS])
+def test_failure_after_each_enrichment_step(beam, monkeypatch, tmp_path, path, point, error):
+    # Each step runs for real, then fails. Steps whose ordinary errors
+    # remember() deliberately swallows still have to leave no transaction
+    # behind; a failure that escapes rolls back all of this call's enrichment
+    # and keeps the row.
+    monkeypatch.setattr(bm._embeddings, "available", lambda: True)
+    text = "Alice works at Initech. " + TEXT
+    beam.remember("Alice works at Acme.", source="user")
+    if path == "dedup":
+        beam.remember(text, source="user")
+        beam.conn.execute("DELETE FROM consolidated_facts WHERE object = 'Initech'")
+        beam.conn.commit()
+    before = {t: beam.conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+              for t in ENRICHMENT_TABLES}
+    owner, name = point
+    target = beam if owner == "beam" else bm
+    real = getattr(target, name)
+    reached = []
+
+    def run_then_fail(*args, **kwargs):
+        real(*args, **kwargs)
+        reached.append(name)
+        raise error(f"stopped after {name}")
+
+    monkeypatch.setattr(target, name, run_then_fail)
+
+    try:
+        beam.remember(text, source="user", extract_entities=True)
+        escaped = False
+    except error:
+        escaped = True
+
+    assert reached == [name]
+    _assert_no_transaction_left_behind(beam, tmp_path / "memory.db")
     assert beam.conn.execute(
-        "SELECT COUNT(*) FROM working_memory WHERE content = ?", (TEXT,)).fetchone()[0] == 1
-    # The graph step runs last, so the earlier enrichment rolled back with it.
-    for table, count in before.items():
-        assert beam.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == count
+        "SELECT COUNT(*) FROM working_memory WHERE content = ?", (text,)).fetchone()[0] == 1
+    if error is KeyboardInterrupt:
+        assert escaped
+    if escaped:
+        for table, count in before.items():
+            assert beam.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == count, table
 
 
 def _seed_expired_row(beam):
@@ -232,3 +290,70 @@ def test_conflict_probe_runs_after_the_enrichment_commit(beam, monkeypatch, path
 
     assert seen == [False]
     assert beam.conn.execute("SELECT COUNT(*) FROM conflict_probe_pending").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt], ids=["exception", "interrupt"])
+@pytest.mark.parametrize("path", ["new", "dedup"])
+def test_failure_after_a_queued_conflict_rolls_it_back(beam, monkeypatch, tmp_path, path, error):
+    # Fails after the graph step has queued a conflict pair and its probe
+    # hook, but before the enrichment commits.
+    conflicting = "Alice works at Initech."
+    if path == "dedup":
+        beam.remember(conflicting, source="user")
+        beam.conn.execute("DELETE FROM consolidated_facts")
+        beam.conn.commit()
+    beam.remember("Alice works at Acme.", source="user")
+    consolidator = beam.veracity_consolidator
+    retries = []
+    monkeypatch.setattr(consolidator, "retry_pending_conflicts", lambda: retries.append(1))
+    real_ingest = beam._ingest_graph_and_veracity
+    queued = []
+
+    def ingest_then_fail(*args, **kwargs):
+        real_ingest(*args, **kwargs)
+        queued.append(len(beam.conn._after_commit_hooks))
+        raise error("stopped after graph ingestion")
+
+    monkeypatch.setattr(beam, "_ingest_graph_and_veracity", ingest_then_fail)
+
+    with pytest.raises(error):
+        beam.remember(conflicting, source="user")
+
+    assert queued == [1]
+    assert not beam.conn.in_transaction
+    assert beam.conn._after_commit_hooks == []
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM consolidated_facts WHERE object = 'Initech'").fetchone()[0] == 0
+    # The queue table is created lazily, so the rollback can remove it too.
+    if beam.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'conflict_probe_pending'").fetchone():
+        assert beam.conn.execute("SELECT COUNT(*) FROM conflict_probe_pending").fetchone()[0] == 0
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE content = ?", (conflicting,)).fetchone()[0] == 1
+    other = sqlite3.connect(tmp_path / "memory.db", timeout=0)
+    try:
+        other.execute("BEGIN IMMEDIATE")
+        other.rollback()
+    finally:
+        other.close()
+    beam.conn.execute("UPDATE working_memory SET importance = importance WHERE 0")
+    beam.conn.commit()
+    assert retries == []
+
+
+def test_interrupt_inside_a_caller_transaction_rolls_back_only_the_savepoint(beam):
+    _open_caller_transaction(beam)
+
+    with pytest.raises(KeyboardInterrupt):
+        with bm._deferred_commits(beam.conn, immediate=True):
+            beam.conn.execute(
+                "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
+                "VALUES ('scoped', 'scoped row', 'user', datetime('now'), 'commit-count')")
+            raise KeyboardInterrupt
+
+    assert beam.conn.in_transaction
+    assert not beam.conn._defer_commit
+    ids = {r[0] for r in beam.conn.execute(
+        "SELECT id FROM working_memory WHERE id IN ('caller-marker', 'scoped')")}
+    assert ids == {"caller-marker"}
+    beam.conn.rollback()

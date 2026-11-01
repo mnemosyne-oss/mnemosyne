@@ -2596,7 +2596,9 @@ def _deferred_commits(conn: sqlite3.Connection, *, immediate: bool = False):
     conn._defer_commit = True
     try:
         yield
-    except Exception:
+    except BaseException:
+        # BaseException: an interrupt must not leave the write lock held or
+        # a queued after-commit hook behind for the next unrelated commit.
         conn._defer_commit = previously_deferred
         try:
             if owns_transaction:
