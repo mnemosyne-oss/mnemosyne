@@ -417,6 +417,22 @@ def test_busy_lock_skips_enrichment_on_a_dedup_hit(beam, monkeypatch, caplog):
     assert "enrichment skipped" in caplog.text
 
 
+def test_busy_lock_on_a_dedup_hit_skips_the_llm_step(beam, monkeypatch):
+    # The LLM call would only wait on the same lock after spending model time.
+    existing = beam.remember(TEXT, source="user")
+    calls = []
+    monkeypatch.setattr(bm, "_extract_and_store_facts", lambda *args: calls.append(args))
+    monkeypatch.setattr(bm.time, "sleep", lambda seconds: None)
+    other = _hold_lock_after_row_commit(beam, monkeypatch)
+    try:
+        assert beam.remember(TEXT, source="user", extract=True) == existing
+    finally:
+        other.rollback()
+        other.close()
+
+    assert calls == []
+
+
 def test_busy_lock_still_raises_on_a_new_row(beam, monkeypatch):
     monkeypatch.setattr(bm.time, "sleep", lambda seconds: None)
     other = _hold_lock_after_row_commit(beam, monkeypatch)

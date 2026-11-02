@@ -6503,6 +6503,7 @@ class BeamMemory:
                 # contract on duplicate-content writes (see C12.a /review note).
                 # The local enrichment writes share one transaction: each helper
                 # commits on its own, and every commit is an fsync.
+                enrichment_skipped = False
                 try:
                     with _enrichment_transaction(self.conn):
                         if extract_entities:
@@ -6524,8 +6525,9 @@ class BeamMemory:
                         "remember: enrichment skipped for duplicate '%s', write lock busy: %s",
                         existing_id, exc,
                     )
+                    enrichment_skipped = True
                 # Outside the transaction: the LLM call must not hold the write lock.
-                if extract:
+                if extract and not enrichment_skipped:
                     _extract_and_store_facts(
                         self, existing_id, content, source, write_policy
                     )
