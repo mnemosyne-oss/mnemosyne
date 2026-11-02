@@ -505,6 +505,81 @@ def test_busy_error_without_an_error_code_counts_as_busy():
     assert not bm._is_busy_error(sqlite3.OperationalError("no such table: x"))
 
 
+def _sqlite_error(code):
+    error = sqlite3.OperationalError("injected sqlite failure")
+    error.sqlite_errorcode = code
+    return error
+
+
+BUSY_RECOVERY, BUSY_TIMEOUT, LOCKED, LOCKED_SHAREDCACHE = 261, 773, 6, 262
+
+
+@pytest.mark.parametrize("code,busy", [(sqlite3.SQLITE_BUSY, True), (BUSY_RECOVERY, True), (BUSY_TIMEOUT, True),
+                                       (LOCKED, False), (LOCKED_SHAREDCACHE, False)])
+def test_busy_classification_uses_the_primary_result_code(code, busy):
+    assert bm._is_busy_error(_sqlite_error(code)) is busy
+
+
+def _fail_enrichment_entry(beam, monkeypatch, code):
+    # remember()'s row write takes the first BEGIN IMMEDIATE; enrichment takes the next.
+    real_execute = beam.conn.execute
+    begins = []
+
+    def execute(sql, *args, **kwargs):
+        if sql == "BEGIN IMMEDIATE":
+            begins.append(sql)
+            if len(begins) > 1:
+                raise _sqlite_error(code)
+        return real_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(beam.conn, "execute", execute)
+    return begins
+
+
+@pytest.mark.parametrize("code", [BUSY_RECOVERY, BUSY_TIMEOUT])
+def test_extended_busy_at_enrichment_entry_retries_then_skips(beam, monkeypatch, code):
+    existing = beam.remember(TEXT, source="user")
+    sleeps = []
+    monkeypatch.setattr(bm.time, "sleep", sleeps.append)
+    begins = _fail_enrichment_entry(beam, monkeypatch, code)
+
+    assert beam.remember(TEXT, source="user") == existing
+
+    assert len(begins) == 4
+    assert len(sleeps) == 2
+    assert not beam.conn.in_transaction
+
+
+def test_non_busy_error_at_enrichment_entry_is_not_retried(beam, monkeypatch):
+    beam.remember(TEXT, source="user")
+    sleeps = []
+    monkeypatch.setattr(bm.time, "sleep", sleeps.append)
+    begins = _fail_enrichment_entry(beam, monkeypatch, LOCKED)
+
+    with pytest.raises(sqlite3.OperationalError, match="injected"):
+        beam.remember(TEXT, source="user")
+
+    assert len(begins) == 2
+    assert sleeps == []
+
+
+def test_extended_busy_inside_the_block_is_not_retried(beam, monkeypatch):
+    beam.remember(TEXT, source="user")
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(1)
+        raise _sqlite_error(BUSY_TIMEOUT)
+
+    monkeypatch.setattr(beam, "_ingest_graph_and_veracity", fail)
+
+    with pytest.raises(sqlite3.OperationalError, match="injected"):
+        beam.remember(TEXT, source="user")
+
+    assert calls == [1]
+    assert not beam.conn.in_transaction
+
+
 def test_busy_error_inside_the_block_is_not_retried_or_skipped(beam, monkeypatch):
     # Only failing to enter is a busy lock; a failure inside still rolls back and raises.
     beam.remember(TEXT, source="user")

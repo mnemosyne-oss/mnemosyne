@@ -2521,7 +2521,8 @@ def _is_busy_error(exc: sqlite3.OperationalError) -> bool:
     if code is None:
         # Python 3.10 has no error codes on sqlite3 exceptions.
         return "database is locked" in str(exc)
-    return code == sqlite3.SQLITE_BUSY
+    # The low byte is the primary code; extended ones such as BUSY_RECOVERY add to it.
+    return (code & 0xFF) == sqlite3.SQLITE_BUSY
 
 
 _plain_savepoint_counter = itertools.count(1)
