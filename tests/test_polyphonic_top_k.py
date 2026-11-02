@@ -302,6 +302,73 @@ def test_closed_connection_keeps_the_tracking_interrupt(beam, monkeypatch):
         beam.recall("unrelated opaque query", top_k=LARGE)
 
 
+@pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt], ids=["exception", "interrupt"])
+@pytest.mark.parametrize("ownership", ["owned", "deferred"])
+def test_failed_working_update_rolls_back_episodic_credit(beam, monkeypatch, ownership, error):
+    # Episodic rows are credited first, so a working-tier failure has to undo
+    # a tier that already finished, not just earlier chunks of its own.
+    pytest.importorskip("sqlite_vec")
+    # Different text per tier, or the re-rank keeps only one of each pair.
+    for i in range(10):
+        beam.remember(_distinct(i), source="user", dedupe=False)
+        beam.consolidate_to_episodic(_distinct(i + 1000), [], source="user")
+    real_execute = beam.conn.execute
+    credited_tiers = []
+
+    def fail_on_working_update(sql, *args, **kwargs):
+        if isinstance(sql, str) and "SET recall_count" in sql:
+            credited_tiers.append(sql.split()[1])
+            if sql.startswith("UPDATE working_memory"):
+                raise error("stopped before the working update")
+        return real_execute(sql, *args, **kwargs)
+
+    def recall_and_fail():
+        with monkeypatch.context() as patch:
+            patch.setattr(beam.conn, "execute", fail_on_working_update)
+            with pytest.raises(error):
+                beam.recall("unrelated opaque query", top_k=20)
+
+    if ownership == "deferred":
+        with bm._deferred_commits(beam.conn):
+            recall_and_fail()
+            beam.conn.commit()
+    else:
+        recall_and_fail()
+
+    assert credited_tiers == ["episodic_memory", "working_memory"]
+    assert not beam.conn.in_transaction
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM episodic_memory WHERE recall_count > 0").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("failure", ["ABORT", "FAIL", "ROLLBACK"])
+@pytest.mark.parametrize("ownership", ["owned", "deferred"])
+def test_sqlite_failure_in_working_update_credits_nothing(beam, ownership, failure):
+    # A real SQLite failure, including ROLLBACK, which ends the transaction
+    # and removes the savepoint before the cleanup runs.
+    pytest.importorskip("sqlite_vec")
+    for i in range(10):
+        beam.remember(_distinct(i), source="user", dedupe=False)
+        beam.consolidate_to_episodic(_distinct(i + 1000), [], source="user")
+    beam.conn.execute(
+        "CREATE TRIGGER fail_credit BEFORE UPDATE OF recall_count ON working_memory "
+        f"BEGIN SELECT RAISE({failure}, 'credit failed'); END")
+    beam.conn.commit()
+
+    if ownership == "deferred":
+        with bm._deferred_commits(beam.conn):
+            with pytest.raises(sqlite3.IntegrityError, match="credit failed"):
+                beam.recall("unrelated opaque query", top_k=20)
+    else:
+        with pytest.raises(sqlite3.IntegrityError, match="credit failed"):
+            beam.recall("unrelated opaque query", top_k=20)
+
+    assert not beam.conn.in_transaction
+    for table in ("episodic_memory", "working_memory"):
+        assert beam.conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE recall_count > 0").fetchone()[0] == 0
+
+
 def _record_id_lookups(monkeypatch):
     # The rows these lookups return can also arrive on the results, so a
     # lookup that silently returned nothing would still pass a result check.

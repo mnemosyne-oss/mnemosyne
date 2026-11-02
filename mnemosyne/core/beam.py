@@ -9669,10 +9669,9 @@ class BeamMemory:
             When the env flag is set to "1", recall delegates to
             PolyphonicRecallEngine (mnemosyne/core/polyphonic_recall.py).
             The engine runs 4 voices in parallel -- vector / graph /
-            fact / temporal -- fuses them via RRF (k=60), diversity-
-            reranks the combined results, and assembles within a
-            context budget. Each result dict carries `voice_scores`
-            for per-signal provenance.
+            fact / temporal -- fuses them via RRF (k=60) and diversity-
+            reranks the combined results. Each result dict carries
+            `voice_scores` for per-signal provenance.
 
             Flag unset or "0" (default): the existing linear scorer
             below runs unchanged. Zero behavior change for production.
@@ -11719,8 +11718,8 @@ class BeamMemory:
 
         Delegates to PolyphonicRecallEngine when MNEMOSYNE_POLYPHONIC_RECALL=1.
         Engine runs vector + graph + fact + temporal voices, fuses via RRF,
-        diversity-reranks, assembles within a context budget. Maps
-        PolyphonicResult objects back to recall()'s dict shape.
+        and diversity-reranks. Maps PolyphonicResult objects back to
+        recall()'s dict shape.
 
         Each result carries `voice_scores` for per-signal provenance.
         Engine's RRF combined_score lands in the `score` field; the
