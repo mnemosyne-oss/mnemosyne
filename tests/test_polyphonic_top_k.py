@@ -354,17 +354,29 @@ def test_failure_between_tiers_is_contained(beam, monkeypatch, ownership, error)
 
 @pytest.mark.parametrize("failure", ["ABORT", "FAIL", "ROLLBACK"])
 @pytest.mark.parametrize("ownership", OWNERSHIP)
-def test_sqlite_failure_in_tracking_is_contained(beam, ownership, failure):
+def test_sqlite_failure_in_tracking_is_contained(beam, monkeypatch, ownership, failure):
     _seed_both_tiers(beam)
     beam.conn.execute(
         "CREATE TRIGGER fail_credit BEFORE UPDATE OF recall_count ON working_memory "
         f"BEGIN SELECT RAISE({failure}, 'credit failed'); END")
     beam.conn.commit()
 
-    with _transaction_scope(beam, ownership):
-        with pytest.raises(sqlite3.IntegrityError, match="credit failed"):
-            beam.recall("unrelated opaque query", top_k=20)
+    real_execute = beam.conn.execute
+    credited_tiers = []
 
+    def record_credit(sql, *args, **kwargs):
+        if isinstance(sql, str) and "SET recall_count" in sql:
+            credited_tiers.append(sql.split()[1])
+        return real_execute(sql, *args, **kwargs)
+
+    with _transaction_scope(beam, ownership):
+        with monkeypatch.context() as patch:
+            patch.setattr(beam.conn, "execute", record_credit)
+            with pytest.raises(sqlite3.IntegrityError, match="credit failed"):
+                beam.recall("unrelated opaque query", top_k=20)
+
+    # The episodic tier finished first, so the rollback had real credit to undo.
+    assert credited_tiers == ["episodic_memory", "working_memory"]
     # ROLLBACK ends the whole transaction, so the caller's write goes with it.
     keeps_marker = ownership != "owned" and failure != "ROLLBACK"
     _assert_failure_contained(beam, kept=(MARKER,) if keeps_marker else ())
