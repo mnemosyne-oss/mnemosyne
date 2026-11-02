@@ -13546,6 +13546,17 @@ class BeamMemory:
         When force=True, skips the age cutoff and consolidates all
         non-consolidated working memories across all sessions immediately.
         """
+        # Release claims a crashed sleep() left behind (consolidated_at set,
+        # no episodic summary) so this pass can summarize those rows instead
+        # of skipping them forever. reclaim_orphans() only touches claims
+        # older than its stale window, so an in-flight sleep() is unaffected.
+        reclaimed_orphans = 0
+        if not dry_run:
+            try:
+                reclaimed_orphans = int(self.reclaim_orphans().get("reclaimed") or 0)
+            except Exception:
+                logger.warning("sleep_all_sessions: reclaim_orphans failed", exc_info=True)
+
         cursor = self.conn.cursor()
         _cutoff_raw = (
             datetime.now(timezone.utc)
@@ -13574,6 +13585,7 @@ class BeamMemory:
                 "conflicts_resolved": 0,
                 "conflicts_detected_only": 0,
                 "sessions_scanned": 0,
+                "reclaimed_orphans": reclaimed_orphans,
                 "sessions_consolidated": 0,
                 "items_consolidated": 0,
                 "summaries_created": 0,
@@ -13650,6 +13662,7 @@ class BeamMemory:
         result = {
             "status": "dry_run" if dry_run else ("consolidated" if items_consolidated else "no_op"),
             "sessions_scanned": len(session_rows),
+            "reclaimed_orphans": reclaimed_orphans,
             "sessions_consolidated": sessions_consolidated,
             "items_consolidated": items_consolidated,
             "summaries_created": summaries_created,
