@@ -49,6 +49,72 @@ def _assert_writer_available(peer):
     peer.rollback()
 
 
+@pytest.mark.parametrize("helper", ["write_locked", "serialized"])
+@pytest.mark.parametrize("connection_factory", [sqlite3.Connection, _BeamConnection],
+                         ids=["plain", "beam"])
+@pytest.mark.parametrize("mode", ["before", "after", "closed"])
+def test_begin_interruption_releases_owned_writer(
+    tmp_path, failure, helper, connection_factory, mode
+):
+    begins = []
+    rollbacks = []
+
+    def interrupt_begin(execute, sql, *args, **kwargs):
+        if sql == "BEGIN IMMEDIATE":
+            begins.append(sql)
+            if mode != "before":
+                execute(sql, *args, **kwargs)
+                assert conn.in_transaction
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    peer.execute("BEGIN IMMEDIATE")
+            if mode == "closed":
+                conn.close()
+            raise failure
+        return execute(sql, *args, **kwargs)
+
+    class InterruptedCursor(sqlite3.Cursor):
+        def execute(self, sql, *args, **kwargs):
+            return interrupt_begin(super().execute, sql, *args, **kwargs)
+
+    class InterruptedBeginConnection(connection_factory):
+        def execute(self, sql, *args, **kwargs):
+            if helper == "write_locked":
+                return interrupt_begin(super().execute, sql, *args, **kwargs)
+            return super().execute(sql, *args, **kwargs)
+
+        def cursor(self, *args, **kwargs):
+            # Python 3.10's Connection.execute also calls this override.
+            if helper == "serialized":
+                return super().cursor(factory=InterruptedCursor)
+            return super().cursor(*args, **kwargs)
+
+        def rollback(self):
+            rollbacks.append("rollback")
+            return super().rollback()
+
+    path = tmp_path / "begin_interrupt.db"
+    conn = sqlite3.connect(path, factory=InterruptedBeginConnection)
+    peer = sqlite3.connect(path, timeout=0)
+    conn.execute("CREATE TABLE markers (value TEXT)")
+    scope = _scope(helper, conn)
+    try:
+        with pytest.raises(type(failure)) as caught:
+            with scope:
+                pytest.fail("interrupted acquisition must not enter the body")
+        assert caught.value is failure
+        assert begins == ["BEGIN IMMEDIATE"]
+        if mode != "closed":
+            assert not conn.in_transaction
+            assert _markers(conn) == []
+        if mode == "after":
+            assert rollbacks == ["rollback"]
+        assert _markers(peer) == []
+        _assert_writer_available(peer)
+    finally:
+        conn.close()
+        peer.close()
+
+
 @pytest.mark.parametrize("helper", ["write_locked", "guarded", "serialized"])
 def test_owned_failure_rolls_back_and_releases_writer(connections, failure, helper):
     conn, peer = connections
@@ -184,6 +250,7 @@ def test_closed_connection_cleanup_preserves_original_exception(
     pytest.param("write_locked", False, id="write_locked-owned"),
     pytest.param("write_locked", True, id="write_locked-caller"),
     pytest.param("guarded", False, id="guarded-owned"),
+    pytest.param("serialized", False, id="serialized-owned"),
 ])
 def test_commit_failure_or_successful_caller_release(
     tmp_path, connection_factory, error_type, helper, caller_owned
@@ -191,8 +258,12 @@ def test_commit_failure_or_successful_caller_release(
     failure = error_type("commit interrupted")
 
     class InterruptedCommitConnection(connection_factory):
+        interrupt_commit = False
+
         def commit(self):
-            raise failure
+            if self.interrupt_commit:
+                raise failure
+            return super().commit()
 
     path = tmp_path / "commit_interrupt.db"
     conn = sqlite3.connect(path, factory=InterruptedCommitConnection)
@@ -200,11 +271,14 @@ def test_commit_failure_or_successful_caller_release(
     events = []
     conn.execute("CREATE TABLE markers (value TEXT)")
     try:
+        # The consolidator constructor also commits; interrupt only the scope.
+        scope = _scope(helper, conn)
+        conn.interrupt_commit = True
         if caller_owned:
             # Successful control: caller participation must never call commit().
             # Interrupted caller finalization is exercised at RELEASE below.
             conn.execute("INSERT INTO markers VALUES ('caller')")
-            with _scope(helper, conn):
+            with scope:
                 conn.execute("INSERT INTO markers VALUES ('body')")
             assert conn.in_transaction
             assert _markers(conn) == ["caller", "body"]
@@ -213,7 +287,7 @@ def test_commit_failure_or_successful_caller_release(
                 peer.execute("BEGIN IMMEDIATE")
         else:
             with pytest.raises(error_type) as caught:
-                with _scope(helper, conn):
+                with scope:
                     conn.execute("INSERT INTO markers VALUES ('body')")
                     if isinstance(conn, _BeamConnection):
                         conn._after_commit_hooks.append(lambda: events.append("body"))

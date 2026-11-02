@@ -2579,6 +2579,14 @@ def _write_locked_transaction(
                     time.sleep(0.05 * (2 ** attempt))
                     continue
                 raise
+            except BaseException:
+                # BEGIN may have succeeded before execute returned to us.
+                try:
+                    if conn.in_transaction:
+                        conn.rollback()
+                except sqlite3.Error:
+                    pass  # a closed connection must not mask the interruption
+                raise
 
     try:
         yield
