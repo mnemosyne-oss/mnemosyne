@@ -77,6 +77,12 @@ def _seed_old_wm(db_path, session_id, n, ts_offset_hours=200):
     return [r[0] for r in rows]
 
 
+
+def _utc_naive_iso(hours_ago: float) -> str:
+    """Claim timestamp in the same clock sleep() writes (naive UTC), so the
+    staleness check is independent of the machine's local timezone."""
+    return (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours_ago)).isoformat()
+
 class TestE3AdditiveSleep:
 
     def test_sleep_preserves_working_memory_rows(self, temp_db):
@@ -448,6 +454,51 @@ class TestE3AdditiveSleep:
             f"concurrent sleeps produced {ep_count} summaries; the atomic "
             f"claim failed. result_a={result_a}, result_b={result_b}"
         )
+
+    def test_sleep_all_sessions_reclaims_stale_orphan_claims_first(self, temp_db):
+        """A crash between sleep()'s claim and its episodic insert leaves rows
+        with consolidated_at set and no summary. The maintenance pass must
+        reclaim them so they are summarized instead of skipped forever."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        _seed_old_wm(temp_db, "s1", n=2)
+        stale_claim = _utc_naive_iso(hours_ago=2)
+        conn = sqlite3.connect(str(temp_db))
+        conn.execute(
+            "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ?",
+            (stale_claim, stale_claim),
+        )
+        conn.commit()
+        conn.close()
+
+        result = beam.sleep_all_sessions(dry_run=False)
+
+        assert result["reclaimed_orphans"] == 2
+        assert result["items_consolidated"] == 2
+        conn = sqlite3.connect(str(temp_db))
+        try:
+            summary_of = conn.execute(
+                "SELECT summary_of FROM episodic_memory"
+            ).fetchall()
+        finally:
+            conn.close()
+        covered = {i for (s,) in summary_of for i in (s or "").split(",") if i}
+        assert {"e3-s1-0", "e3-s1-1"} <= covered
+
+    def test_sleep_all_sessions_dry_run_does_not_reclaim(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        _seed_old_wm(temp_db, "s1", n=1)
+        stale_claim = _utc_naive_iso(hours_ago=2)
+        conn = sqlite3.connect(str(temp_db))
+        conn.execute(
+            "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ?",
+            (stale_claim, stale_claim),
+        )
+        conn.commit()
+        conn.close()
+
+        beam.sleep_all_sessions(dry_run=True)
+
+        assert _consolidated_rows(temp_db, "s1")[0][1] == stale_claim
 
     def test_reclaim_orphans_clears_stale_claim_without_summary(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
