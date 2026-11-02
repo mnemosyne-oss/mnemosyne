@@ -330,8 +330,13 @@ def test_failed_working_update_rolls_back_episodic_credit(beam, monkeypatch, own
 
     if ownership == "deferred":
         with bm._deferred_commits(beam.conn):
+            beam.conn.execute(
+                "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
+                "VALUES ('caller-marker', 'caller row', 'user', datetime('now'), 'top-k-session')")
             recall_and_fail()
             beam.conn.commit()
+        assert beam.conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE id = 'caller-marker'").fetchone()[0] == 1
     else:
         recall_and_fail()
 
