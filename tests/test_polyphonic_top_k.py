@@ -145,8 +145,6 @@ LARGE = 1000
 def _seed_large_working_under_limit(beam):
     # Distinct rows, so all of them survive the re-rank and reach the
     # per-result queries; duplicates would be dropped before them.
-    if not hasattr(beam.conn, "setlimit"):  # Python 3.11+
-        pytest.skip("needs Connection.setlimit")
     vec = bm._embeddings.embed_query("unrelated opaque query")
     beam.conn.executemany(
         "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, scope) "
@@ -156,10 +154,17 @@ def _seed_large_working_under_limit(beam):
     for i in range(LARGE):
         bm._store_working_embedding(beam.conn, f"m{i}", vec)
     beam.conn.commit()
-    beam.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+    if hasattr(beam.conn, "setlimit"):  # Python 3.11+
+        beam.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+
+
+def _require_setlimit(beam):
+    if not hasattr(beam.conn, "setlimit"):  # Python 3.11+
+        pytest.skip("needs Connection.setlimit to prove the limit is respected")
 
 
 def test_recall_tracking_stays_under_sqlite_variable_limit(beam):
+    _require_setlimit(beam)
     count = LARGE
     _seed_large_working_under_limit(beam)
 
@@ -402,6 +407,7 @@ def _record_id_lookups(monkeypatch):
 
 
 def test_enhanced_recall_weibull_stays_under_sqlite_variable_limit(beam, monkeypatch):
+    _require_setlimit(beam)
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     _seed_large_working_under_limit(beam)
     lookups = _record_id_lookups(monkeypatch)
@@ -433,6 +439,7 @@ def test_cross_tier_dedup_stays_under_sqlite_variable_limit(beam):
 
 
 def test_evidence_pack_stays_under_sqlite_variable_limit(beam, monkeypatch):
+    _require_setlimit(beam)
     _seed_large_working_under_limit(beam)
     lookups = _record_id_lookups(monkeypatch)
 
