@@ -357,8 +357,15 @@ def test_sqlite_failure_in_working_update_credits_nothing(beam, ownership, failu
 
     if ownership == "deferred":
         with bm._deferred_commits(beam.conn):
+            beam.conn.execute(
+                "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
+                "VALUES ('caller-marker', 'caller row', 'user', datetime('now'), 'top-k-session')")
             with pytest.raises(sqlite3.IntegrityError, match="credit failed"):
                 beam.recall("unrelated opaque query", top_k=20)
+        # ROLLBACK ends the whole transaction, so only the others can keep it.
+        assert beam.conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE id = 'caller-marker'"
+        ).fetchone()[0] == (0 if failure == "ROLLBACK" else 1)
     else:
         with pytest.raises(sqlite3.IntegrityError, match="credit failed"):
             beam.recall("unrelated opaque query", top_k=20)
