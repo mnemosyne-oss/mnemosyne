@@ -322,6 +322,7 @@ def test_failure_between_tracking_chunks_is_contained(beam, monkeypatch, ownersh
             with pytest.raises(error):
                 beam.recall("unrelated opaque query", top_k=LARGE)
         assert len(updates) == 2
+        assert beam.conn.in_transaction == (ownership != "owned")
 
     _assert_failure_contained(beam, kept=() if ownership == "owned" else (MARKER,))
 
@@ -347,6 +348,7 @@ def test_failure_between_tiers_is_contained(beam, monkeypatch, ownership, error)
             patch.setattr(beam.conn, "execute", fail_on_working_update)
             with pytest.raises(error):
                 beam.recall("unrelated opaque query", top_k=20)
+        assert beam.conn.in_transaction == (ownership != "owned")
 
     assert credited_tiers == ["episodic_memory", "working_memory"]
     _assert_failure_contained(beam, kept=() if ownership == "owned" else (MARKER,))
@@ -374,6 +376,8 @@ def test_sqlite_failure_in_tracking_is_contained(beam, monkeypatch, ownership, f
             patch.setattr(beam.conn, "execute", record_credit)
             with pytest.raises(sqlite3.IntegrityError, match="credit failed"):
                 beam.recall("unrelated opaque query", top_k=20)
+        # ROLLBACK ends the whole transaction; the others leave the caller's open.
+        assert beam.conn.in_transaction == (ownership != "owned" and failure != "ROLLBACK")
 
     # The episodic tier finished first, so the rollback had real credit to undo.
     assert credited_tiers == ["episodic_memory", "working_memory"]
