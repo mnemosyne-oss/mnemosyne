@@ -458,6 +458,12 @@ def test_lock_released_during_backoff_runs_enrichment(beam, monkeypatch, path):
     assert _gist_count(beam, memory_id) == 1
 
 
+def test_busy_error_without_an_error_code_counts_as_busy():
+    # What Python 3.10 raises: its sqlite3 exceptions carry no error code.
+    assert bm._is_busy_error(sqlite3.OperationalError("database is locked"))
+    assert not bm._is_busy_error(sqlite3.OperationalError("no such table: x"))
+
+
 def test_busy_error_inside_the_block_is_not_retried_or_skipped(beam, monkeypatch):
     # Only failing to enter is a busy lock; a failure inside still rolls back and raises.
     beam.remember(TEXT, source="user")
