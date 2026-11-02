@@ -2501,7 +2501,7 @@ def _guarded_transaction(conn: sqlite3.Connection):
             conn.commit()
         else:
             conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-    except Exception:
+    except BaseException:
         try:
             if savepoint is None:
                 conn.rollback()
@@ -9565,14 +9565,13 @@ class BeamMemory:
             if row.get("tier") == "working" and row.get("id") is not None
         }
         if working_candidate_ids:
-            placeholders = ",".join("?" * len(working_candidate_ids))
             consolidated_ids = {
                 str(row["id"])
-                for row in self.conn.execute(
-                    f"SELECT id FROM working_memory WHERE id IN ({placeholders}) "
-                    "AND consolidated_at IS NOT NULL",
-                    tuple(working_candidate_ids),
-                ).fetchall()
+                for row in _select_recall_rows_by_ids(
+                    self.conn, "SELECT id, consolidated_at FROM working_memory WHERE id IN ({placeholders})",
+                    list(working_candidate_ids),
+                )
+                if row["consolidated_at"] is not None
             }
             candidate_rows = [
                 row
@@ -9585,10 +9584,8 @@ class BeamMemory:
             ids = list({str(row["id"]) for row in all_rows if row.get("tier") == tier and row.get("id") is not None})
             if not ids:
                 continue
-            placeholders = ",".join("?" * len(ids))
-            rows = self.conn.execute(
-                f"SELECT id, session_id FROM {table} WHERE id IN ({placeholders})", ids
-            ).fetchall()
+            rows = _select_recall_rows_by_ids(
+                self.conn, f"SELECT id, session_id FROM {table} WHERE id IN ({{placeholders}})", ids)
             sessions.update(
                 {
                     (tier, str(row["id"])): str(row["session_id"])
@@ -9672,10 +9669,9 @@ class BeamMemory:
             When the env flag is set to "1", recall delegates to
             PolyphonicRecallEngine (mnemosyne/core/polyphonic_recall.py).
             The engine runs 4 voices in parallel -- vector / graph /
-            fact / temporal -- fuses them via RRF (k=60), diversity-
-            reranks the combined results, and assembles within a
-            context budget. Each result dict carries `voice_scores`
-            for per-signal provenance.
+            fact / temporal -- fuses them via RRF (k=60) and diversity-
+            reranks the combined results. Each result dict carries
+            `voice_scores` for per-signal provenance.
 
             Flag unset or "0" (default): the existing linear scorer
             below runs unchanged. Zero behavior change for production.
@@ -11099,7 +11095,7 @@ class BeamMemory:
     # so entries cached under an older digest are not reused. Part of the
     # hashed payload; the opaque key keeps the "v2:" prefix because QueryCache's
     # opaque-path recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 15
+    _ENHANCED_RECALL_CACHE_VERSION = 16
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.
@@ -11722,8 +11718,8 @@ class BeamMemory:
 
         Delegates to PolyphonicRecallEngine when MNEMOSYNE_POLYPHONIC_RECALL=1.
         Engine runs vector + graph + fact + temporal voices, fuses via RRF,
-        diversity-reranks, assembles within a context budget. Maps
-        PolyphonicResult objects back to recall()'s dict shape.
+        and diversity-reranks. Maps PolyphonicResult objects back to
+        recall()'s dict shape.
 
         Each result carries `voice_scores` for per-signal provenance.
         Engine's RRF combined_score lands in the `score` field; the
@@ -11898,23 +11894,22 @@ class BeamMemory:
         # the linear path updates them and downstream features (decay
         # scheduling, importance reinforcement) depend on the signal.
         # /review caught the missing update as a silent telemetry loss.
-        if _track_recall and recalled_episodic_ids:
-            placeholders = ",".join("?" * len(recalled_episodic_ids))
-            params = [now_iso, *recalled_episodic_ids, *rec_scope_params]
-            self.conn.execute(
-                f"UPDATE episodic_memory SET recall_count = recall_count + 1, "
-                f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
-                tuple(params),
-            )
-        if _track_recall and recalled_working_ids:
-            placeholders = ",".join("?" * len(recalled_working_ids))
-            params = [now_iso, *recalled_working_ids, *rec_scope_params]
-            self.conn.execute(
-                f"UPDATE working_memory SET recall_count = recall_count + 1, "
-                f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
-                tuple(params),
-            )
+        # Batched: a large top_k can pass SQLite's 999-variable
+        # limit, and the timestamp and scope parameters share that budget.
         if _track_recall and (recalled_episodic_ids or recalled_working_ids):
+            # A failure between chunks, interrupts included, rolls back every
+            # chunk: inside a caller's transaction only to a savepoint, so the
+            # failed recall credits nothing even if the caller commits later.
+            with _guarded_transaction(self.conn):
+                for table, ids in (("episodic_memory", recalled_episodic_ids),
+                                   ("working_memory", recalled_working_ids)):
+                    for chunk in _recall_id_batches(self.conn, ids, 1 + len(rec_scope_params)):
+                        placeholders = ",".join("?" * len(chunk))
+                        self.conn.execute(
+                            f"UPDATE {table} SET recall_count = recall_count + 1, "
+                            f"last_recalled = ? WHERE id IN ({placeholders}) AND {rec_scope}",
+                            (now_iso, *chunk, *rec_scope_params),
+                        )
             self.conn.commit()
 
         # --- MEMORIA structured fact supplement (polyphonic path) ---
