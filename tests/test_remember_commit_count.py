@@ -474,6 +474,31 @@ def test_lock_released_during_backoff_runs_enrichment(beam, monkeypatch, path):
     assert _gist_count(beam, memory_id) == 1
 
 
+def test_lock_released_during_backoff_still_runs_the_llm_step(beam, monkeypatch):
+    existing = beam.remember(TEXT, source="user")
+    in_transaction = []
+    monkeypatch.setattr(bm, "_extract_and_store_facts",
+                        lambda b, *args: in_transaction.append(b.conn.in_transaction))
+    with monkeypatch.context() as patch:
+        other = _hold_lock_after_row_commit(beam, patch)
+        sleeps = []
+
+        def release(seconds):
+            sleeps.append(seconds)
+            other.rollback()
+            # Stop the commit hook from taking the lock again.
+            patch.undo()
+
+        monkeypatch.setattr(bm.time, "sleep", release)
+        try:
+            assert beam.remember(TEXT, source="user", extract=True) == existing
+        finally:
+            other.close()
+
+    assert len(sleeps) == 1
+    assert in_transaction == [False]
+
+
 def test_busy_error_without_an_error_code_counts_as_busy():
     # What Python 3.10 raises: its sqlite3 exceptions carry no error code.
     assert bm._is_busy_error(sqlite3.OperationalError("database is locked"))
