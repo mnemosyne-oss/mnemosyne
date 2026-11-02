@@ -277,6 +277,21 @@ def _assert_failure_contained(beam, *, kept):
         other.close()
 
 
+def test_guarded_transaction_commits_what_it_owns(beam):
+    # Read from another connection: this one sees its own uncommitted rows.
+    with bm._guarded_transaction(beam.conn):
+        beam.conn.execute(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
+            "VALUES ('owned-row', 'row', 'user', datetime('now'), 'top-k-session')")
+
+    other = sqlite3.connect(beam.db_path)
+    try:
+        assert other.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE id = 'owned-row'").fetchone()[0] == 1
+    finally:
+        other.close()
+
+
 def _seed_both_tiers(beam):
     pytest.importorskip("sqlite_vec")
     # Different text per tier, or the re-rank keeps only one of each pair.
