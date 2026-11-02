@@ -180,9 +180,13 @@ def test_closed_connection_cleanup_preserves_original_exception(
 @pytest.mark.parametrize("connection_factory", [sqlite3.Connection, _BeamConnection],
                          ids=["plain", "beam"])
 @pytest.mark.parametrize("error_type", [sqlite3.OperationalError, KeyboardInterrupt, SystemExit])
-@pytest.mark.parametrize("caller_owned", [False, True], ids=["owned", "caller"])
-def test_write_locked_commit_failure_or_successful_caller_release(
-    tmp_path, connection_factory, error_type, caller_owned
+@pytest.mark.parametrize("helper,caller_owned", [
+    pytest.param("write_locked", False, id="write_locked-owned"),
+    pytest.param("write_locked", True, id="write_locked-caller"),
+    pytest.param("guarded", False, id="guarded-owned"),
+])
+def test_commit_failure_or_successful_caller_release(
+    tmp_path, connection_factory, error_type, helper, caller_owned
 ):
     failure = error_type("commit interrupted")
 
@@ -200,7 +204,7 @@ def test_write_locked_commit_failure_or_successful_caller_release(
             # Successful control: caller participation must never call commit().
             # Interrupted caller finalization is exercised at RELEASE below.
             conn.execute("INSERT INTO markers VALUES ('caller')")
-            with _write_locked_transaction(conn):
+            with _scope(helper, conn):
                 conn.execute("INSERT INTO markers VALUES ('body')")
             assert conn.in_transaction
             assert _markers(conn) == ["caller", "body"]
@@ -209,7 +213,7 @@ def test_write_locked_commit_failure_or_successful_caller_release(
                 peer.execute("BEGIN IMMEDIATE")
         else:
             with pytest.raises(error_type) as caught:
-                with _write_locked_transaction(conn):
+                with _scope(helper, conn):
                     conn.execute("INSERT INTO markers VALUES ('body')")
                     if isinstance(conn, _BeamConnection):
                         conn._after_commit_hooks.append(lambda: events.append("body"))
@@ -227,14 +231,18 @@ def test_write_locked_commit_failure_or_successful_caller_release(
         peer.close()
 
 
-@pytest.mark.parametrize("connection_factory", [sqlite3.Connection, _BeamConnection],
-                         ids=["plain", "beam"])
+@pytest.mark.parametrize("helper,connection_factory", [
+    pytest.param("write_locked", sqlite3.Connection, id="write_locked-plain"),
+    pytest.param("write_locked", _BeamConnection, id="write_locked-beam"),
+    # Only Beam guarded transactions preserve caller ownership via a savepoint.
+    pytest.param("guarded", _BeamConnection, id="guarded-beam"),
+])
 @pytest.mark.parametrize("error_type", [
     sqlite3.OperationalError, RuntimeError, KeyboardInterrupt, SystemExit,
 ])
 @pytest.mark.parametrize("mode", ["before", "deny_rollback", "deny_release", "after"])
-def test_write_locked_release_failure_rolls_back_only_helper_savepoint(
-    tmp_path, connection_factory, error_type, mode
+def test_release_failure_rolls_back_only_helper_savepoint(
+    tmp_path, helper, connection_factory, error_type, mode
 ):
     failure = error_type("release interrupted")
     releases = []
@@ -269,7 +277,7 @@ def test_write_locked_release_failure_rolls_back_only_helper_savepoint(
         if isinstance(conn, _BeamConnection):
             conn._after_commit_hooks.append(lambda: events.append("caller"))
         with pytest.raises(error_type) as caught:
-            with _write_locked_transaction(conn):
+            with _scope(helper, conn):
                 conn.execute("INSERT INTO markers VALUES ('body')")
                 if isinstance(conn, _BeamConnection):
                     conn._after_commit_hooks.append(lambda: events.append("body"))
@@ -281,7 +289,8 @@ def test_write_locked_release_failure_rolls_back_only_helper_savepoint(
         assert denied == ({"deny_rollback": ["ROLLBACK"],
                            "deny_release": ["RELEASE"]}.get(mode, []))
         if mode in ("before", "deny_release"):
-            assert releases == [releases[0], releases[0]]
+            assert len(releases) == 2
+            assert releases[0] == releases[1]
         else:
             assert len(releases) == 1
         conn.set_authorizer(lambda *args: sqlite3.SQLITE_OK)
