@@ -4,6 +4,7 @@ Grid: tier (working, episodic) x top_k (at or under the old per-voice cap of
 20, over it, over the point where the removed metadata-sized context budget
 cut the engine's 2x over-fetch below top_k, and over the eligible count).
 """
+import contextlib
 import sqlite3
 
 import numpy as np
@@ -169,29 +170,6 @@ def test_recall_tracking_stays_under_sqlite_variable_limit(beam):
     assert credited == {r["id"]: 1 for r in results}
 
 
-@pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt], ids=["exception", "interrupt"])
-def test_failed_tracking_chunk_leaves_no_partial_credit(beam, monkeypatch, error):
-    # A failure between tracking chunks must not leave the earlier chunks'
-    # increments in an open transaction that holds the write lock.
-    _seed_large_working_under_limit(beam)
-    updates = _fail_on_second_tracking_chunk(beam, monkeypatch, error)
-
-    with pytest.raises(error):
-        beam.recall("unrelated opaque query", top_k=LARGE)
-
-    monkeypatch.undo()
-    assert len(updates) == 2
-    assert not beam.conn.in_transaction
-    assert beam.conn.execute(
-        "SELECT COUNT(*) FROM working_memory WHERE recall_count > 0").fetchone()[0] == 0
-    other = sqlite3.connect(beam.db_path, timeout=0)
-    try:
-        other.execute("BEGIN IMMEDIATE")
-        other.rollback()
-    finally:
-        other.close()
-
-
 def _fail_on_second_tracking_chunk(beam, monkeypatch, error):
     real_execute = beam.conn.execute
     updates = []
@@ -205,55 +183,6 @@ def _fail_on_second_tracking_chunk(beam, monkeypatch, error):
 
     monkeypatch.setattr(beam.conn, "execute", execute)
     return updates
-
-
-@pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt], ids=["exception", "interrupt"])
-def test_failed_tracking_chunk_keeps_the_caller_transaction(beam, monkeypatch, error):
-    # Inside a caller's transaction only the tracking writes roll back; the
-    # caller's own row and open transaction survive, and committing later
-    # credits nothing for the failed recall.
-    _seed_large_working_under_limit(beam)
-    # The first recall builds the engine, whose table setup commits.
-    beam.recall("unrelated opaque query", top_k=1, _track_recall=False)
-    beam.conn.execute("BEGIN")
-    beam.conn.execute(
-        "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
-        "VALUES ('caller-marker', 'caller row', 'user', datetime('now'), 'top-k-session')")
-    updates = _fail_on_second_tracking_chunk(beam, monkeypatch, error)
-
-    with pytest.raises(error):
-        beam.recall("unrelated opaque query", top_k=LARGE)
-
-    monkeypatch.undo()
-    assert len(updates) == 2
-    assert beam.conn.in_transaction
-    beam.conn.commit()
-    assert beam.conn.execute(
-        "SELECT COUNT(*) FROM working_memory WHERE id = 'caller-marker'").fetchone()[0] == 1
-    assert beam.conn.execute(
-        "SELECT COUNT(*) FROM working_memory WHERE recall_count > 0").fetchone()[0] == 0
-
-
-@pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt], ids=["exception", "interrupt"])
-def test_failed_tracking_chunk_inside_a_deferred_scope_credits_nothing(beam, monkeypatch, error):
-    # Commits are no-ops in this scope, so partial credit would survive a later
-    # commit and the scope's own commit unless a savepoint removed it.
-    _seed_large_working_under_limit(beam)
-    with bm._deferred_commits(beam.conn):
-        beam.conn.execute(
-            "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
-            "VALUES ('caller-marker', 'caller row', 'user', datetime('now'), 'top-k-session')")
-        with monkeypatch.context() as patch:
-            updates = _fail_on_second_tracking_chunk(beam, patch, error)
-            with pytest.raises(error):
-                beam.recall("unrelated opaque query", top_k=LARGE)
-        assert len(updates) == 2
-        beam.conn.commit()
-
-    assert beam.conn.execute(
-        "SELECT COUNT(*) FROM working_memory WHERE id = 'caller-marker'").fetchone()[0] == 1
-    assert beam.conn.execute(
-        "SELECT COUNT(*) FROM working_memory WHERE recall_count > 0").fetchone()[0] == 0
 
 
 def test_successful_tracking_still_commits_a_caller_transaction(beam):
@@ -302,16 +231,80 @@ def test_closed_connection_keeps_the_tracking_interrupt(beam, monkeypatch):
         beam.recall("unrelated opaque query", top_k=LARGE)
 
 
-@pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt], ids=["exception", "interrupt"])
-@pytest.mark.parametrize("ownership", ["owned", "deferred"])
-def test_failed_working_update_rolls_back_episodic_credit(beam, monkeypatch, ownership, error):
-    # Episodic rows are credited first, so a working-tier failure has to undo
-    # a tier that already finished, not just earlier chunks of its own.
+MARKER = "caller-marker"
+OWNERSHIP = ["owned", "caller", "deferred"]
+ERRORS = pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt], ids=["exception", "interrupt"])
+
+
+@contextlib.contextmanager
+def _transaction_scope(beam, ownership):
+    """Run a failing recall as the transaction's owner, or under a caller with a pending write."""
+    # The first recall builds the engine, whose table setup commits.
+    beam.recall("unrelated opaque query", top_k=1, _track_recall=False)
+
+    def write_marker():
+        beam.conn.execute(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
+            f"VALUES ('{MARKER}', 'caller row', 'user', datetime('now'), 'top-k-session')")
+
+    if ownership == "owned":
+        yield
+    elif ownership == "caller":
+        beam.conn.execute("BEGIN")
+        write_marker()
+        yield
+        beam.conn.commit()
+    else:
+        with bm._deferred_commits(beam.conn):
+            write_marker()
+            yield
+            beam.conn.commit()
+
+
+def _assert_failure_contained(beam, *, kept):
+    """A failed recall credits nothing, keeps `kept`, and leaves the write lock free."""
+    assert not beam.conn.in_transaction
+    for table in ("episodic_memory", "working_memory"):
+        assert beam.conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE recall_count > 0").fetchone()[0] == 0
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (MARKER,)).fetchone()[0] == len(kept)
+    other = sqlite3.connect(beam.db_path, timeout=0)
+    try:
+        other.execute("BEGIN IMMEDIATE")
+        other.rollback()
+    finally:
+        other.close()
+
+
+def _seed_both_tiers(beam):
     pytest.importorskip("sqlite_vec")
     # Different text per tier, or the re-rank keeps only one of each pair.
     for i in range(10):
         beam.remember(_distinct(i), source="user", dedupe=False)
         beam.consolidate_to_episodic(_distinct(i + 1000), [], source="user")
+
+
+@ERRORS
+@pytest.mark.parametrize("ownership", OWNERSHIP)
+def test_failure_between_tracking_chunks_is_contained(beam, monkeypatch, ownership, error):
+    _seed_large_working_under_limit(beam)
+    with _transaction_scope(beam, ownership):
+        with monkeypatch.context() as patch:
+            updates = _fail_on_second_tracking_chunk(beam, patch, error)
+            with pytest.raises(error):
+                beam.recall("unrelated opaque query", top_k=LARGE)
+        assert len(updates) == 2
+
+    _assert_failure_contained(beam, kept=() if ownership == "owned" else (MARKER,))
+
+
+@ERRORS
+@pytest.mark.parametrize("ownership", OWNERSHIP)
+def test_failure_between_tiers_is_contained(beam, monkeypatch, ownership, error):
+    # Episodic rows are credited first, so a working-tier failure has to undo
+    # a tier that already finished, not just earlier chunks of its own.
+    _seed_both_tiers(beam)
     real_execute = beam.conn.execute
     credited_tiers = []
 
@@ -322,63 +315,32 @@ def test_failed_working_update_rolls_back_episodic_credit(beam, monkeypatch, own
                 raise error("stopped before the working update")
         return real_execute(sql, *args, **kwargs)
 
-    def recall_and_fail():
+    with _transaction_scope(beam, ownership):
         with monkeypatch.context() as patch:
             patch.setattr(beam.conn, "execute", fail_on_working_update)
             with pytest.raises(error):
                 beam.recall("unrelated opaque query", top_k=20)
 
-    if ownership == "deferred":
-        with bm._deferred_commits(beam.conn):
-            beam.conn.execute(
-                "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
-                "VALUES ('caller-marker', 'caller row', 'user', datetime('now'), 'top-k-session')")
-            recall_and_fail()
-            beam.conn.commit()
-        assert beam.conn.execute(
-            "SELECT COUNT(*) FROM working_memory WHERE id = 'caller-marker'").fetchone()[0] == 1
-    else:
-        recall_and_fail()
-
     assert credited_tiers == ["episodic_memory", "working_memory"]
-    assert not beam.conn.in_transaction
-    assert beam.conn.execute(
-        "SELECT COUNT(*) FROM episodic_memory WHERE recall_count > 0").fetchone()[0] == 0
+    _assert_failure_contained(beam, kept=() if ownership == "owned" else (MARKER,))
 
 
 @pytest.mark.parametrize("failure", ["ABORT", "FAIL", "ROLLBACK"])
-@pytest.mark.parametrize("ownership", ["owned", "deferred"])
-def test_sqlite_failure_in_working_update_credits_nothing(beam, ownership, failure):
-    # A real SQLite failure, including ROLLBACK, which ends the transaction
-    # and removes the savepoint before the cleanup runs.
-    pytest.importorskip("sqlite_vec")
-    for i in range(10):
-        beam.remember(_distinct(i), source="user", dedupe=False)
-        beam.consolidate_to_episodic(_distinct(i + 1000), [], source="user")
+@pytest.mark.parametrize("ownership", OWNERSHIP)
+def test_sqlite_failure_in_tracking_is_contained(beam, ownership, failure):
+    _seed_both_tiers(beam)
     beam.conn.execute(
         "CREATE TRIGGER fail_credit BEFORE UPDATE OF recall_count ON working_memory "
         f"BEGIN SELECT RAISE({failure}, 'credit failed'); END")
     beam.conn.commit()
 
-    if ownership == "deferred":
-        with bm._deferred_commits(beam.conn):
-            beam.conn.execute(
-                "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
-                "VALUES ('caller-marker', 'caller row', 'user', datetime('now'), 'top-k-session')")
-            with pytest.raises(sqlite3.IntegrityError, match="credit failed"):
-                beam.recall("unrelated opaque query", top_k=20)
-        # ROLLBACK ends the whole transaction, so only the others can keep it.
-        assert beam.conn.execute(
-            "SELECT COUNT(*) FROM working_memory WHERE id = 'caller-marker'"
-        ).fetchone()[0] == (0 if failure == "ROLLBACK" else 1)
-    else:
+    with _transaction_scope(beam, ownership):
         with pytest.raises(sqlite3.IntegrityError, match="credit failed"):
             beam.recall("unrelated opaque query", top_k=20)
 
-    assert not beam.conn.in_transaction
-    for table in ("episodic_memory", "working_memory"):
-        assert beam.conn.execute(
-            f"SELECT COUNT(*) FROM {table} WHERE recall_count > 0").fetchone()[0] == 0
+    # ROLLBACK ends the whole transaction, so the caller's write goes with it.
+    keeps_marker = ownership != "owned" and failure != "ROLLBACK"
+    _assert_failure_contained(beam, kept=(MARKER,) if keeps_marker else ())
 
 
 def _record_id_lookups(monkeypatch):
