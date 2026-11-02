@@ -153,7 +153,8 @@ def test_cleanup_sqlite_failure_preserves_original_exception(
         # _serialized_write intentionally attempts no cleanup for a caller tx.
         assert bool(denied) is not (caller_owned and helper == "serialized")
     finally:
-        conn.set_authorizer(None)
+        # Passing None only disables the authorizer on Python 3.11+.
+        conn.set_authorizer(lambda *args: sqlite3.SQLITE_OK)
         conn.rollback()
 
 
@@ -174,6 +175,54 @@ def test_closed_connection_cleanup_preserves_original_exception(
     assert caught.value is failure
     assert _markers(peer) == []
     _assert_writer_available(peer)
+
+
+@pytest.mark.parametrize("connection_factory", [sqlite3.Connection, _BeamConnection],
+                         ids=["plain", "beam"])
+@pytest.mark.parametrize("error_type", [sqlite3.OperationalError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("caller_owned", [False, True], ids=["owned", "caller"])
+def test_write_locked_commit_failure_respects_transaction_ownership(
+    tmp_path, connection_factory, error_type, caller_owned
+):
+    failure = error_type("commit interrupted")
+
+    class InterruptedCommitConnection(connection_factory):
+        def commit(self):
+            raise failure
+
+    path = tmp_path / "commit_interrupt.db"
+    conn = sqlite3.connect(path, factory=InterruptedCommitConnection)
+    peer = sqlite3.connect(path, timeout=0)
+    events = []
+    conn.execute("CREATE TABLE markers (value TEXT)")
+    try:
+        if caller_owned:
+            conn.execute("INSERT INTO markers VALUES ('caller')")
+            with _write_locked_transaction(conn):
+                conn.execute("INSERT INTO markers VALUES ('body')")
+            assert conn.in_transaction
+            assert _markers(conn) == ["caller", "body"]
+            assert _markers(peer) == []
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                peer.execute("BEGIN IMMEDIATE")
+        else:
+            with pytest.raises(error_type) as caught:
+                with _write_locked_transaction(conn):
+                    conn.execute("INSERT INTO markers VALUES ('body')")
+                    if isinstance(conn, _BeamConnection):
+                        conn._after_commit_hooks.append(lambda: events.append("body"))
+            assert caught.value is failure
+            assert not conn.in_transaction
+            assert _markers(conn) == []
+            assert _markers(peer) == []
+            _assert_writer_available(peer)
+            if isinstance(conn, _BeamConnection):
+                assert conn._after_commit_hooks == []
+            assert events == []
+    finally:
+        conn.rollback()
+        conn.close()
+        peer.close()
 
 
 @pytest.mark.parametrize("helper", ["write_locked", "guarded"])

@@ -2598,7 +2598,7 @@ def _write_locked_transaction(
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             elif started_tx:
                 conn.commit()
-        except sqlite3.Error:
+        except BaseException:
             # If finalization fails, roll back any transaction we opened.
             try:
                 if started_tx:
