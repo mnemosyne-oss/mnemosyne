@@ -2513,6 +2513,9 @@ def _guarded_transaction(conn: sqlite3.Connection):
         raise
 
 
+_SQLITE_BUSY = 5
+
+
 def _is_busy_error(exc: sqlite3.OperationalError) -> bool:
     """True when SQLite raised SQLITE_BUSY (database is locked)."""
     if getattr(exc, "sqlite_errorname", None) == "SQLITE_BUSY":
@@ -2522,7 +2525,8 @@ def _is_busy_error(exc: sqlite3.OperationalError) -> bool:
         # Python 3.10 has no error codes on sqlite3 exceptions.
         return "database is locked" in str(exc)
     # The low byte is the primary code; extended ones such as BUSY_RECOVERY add to it.
-    return (code & 0xFF) == sqlite3.SQLITE_BUSY
+    # A literal, because the sqlite3 module only names it from Python 3.11.
+    return (code & 0xFF) == _SQLITE_BUSY
 
 
 _plain_savepoint_counter = itertools.count(1)

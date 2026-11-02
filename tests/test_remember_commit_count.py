@@ -511,10 +511,10 @@ def _sqlite_error(code):
     return error
 
 
-BUSY_RECOVERY, BUSY_TIMEOUT, LOCKED, LOCKED_SHAREDCACHE = 261, 773, 6, 262
+BUSY, BUSY_RECOVERY, BUSY_TIMEOUT, LOCKED, LOCKED_SHAREDCACHE = 5, 261, 773, 6, 262
 
 
-@pytest.mark.parametrize("code,busy", [(sqlite3.SQLITE_BUSY, True), (BUSY_RECOVERY, True), (BUSY_TIMEOUT, True),
+@pytest.mark.parametrize("code,busy", [(BUSY, True), (BUSY_RECOVERY, True), (BUSY_TIMEOUT, True),
                                        (LOCKED, False), (LOCKED_SHAREDCACHE, False)])
 def test_busy_classification_uses_the_primary_result_code(code, busy):
     assert bm._is_busy_error(_sqlite_error(code)) is busy
