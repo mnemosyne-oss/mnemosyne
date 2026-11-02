@@ -277,6 +277,18 @@ def _assert_failure_contained(beam, *, kept):
         other.close()
 
 
+def test_recall_with_no_results_leaves_a_caller_transaction_open(beam):
+    # Nothing was credited, so there is nothing for the tracking step to commit.
+    # The first recall builds the engine, whose table setup commits.
+    beam.recall("unrelated opaque query", top_k=1, _track_recall=False)
+    beam.conn.execute("BEGIN")
+
+    assert beam.recall("unrelated opaque query", top_k=1) == []
+
+    assert beam.conn.in_transaction
+    beam.conn.rollback()
+
+
 def test_guarded_transaction_commits_what_it_owns(beam):
     # Read from another connection: this one sees its own uncommitted rows.
     with bm._guarded_transaction(beam.conn):
