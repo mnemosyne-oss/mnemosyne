@@ -2599,9 +2599,12 @@ def _write_locked_transaction(
             elif started_tx:
                 conn.commit()
         except BaseException:
-            # If finalization fails, roll back any transaction we opened.
+            # Clean up only the transaction or savepoint owned by this helper.
             try:
-                if started_tx:
+                if owns_savepoint:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                elif started_tx:
                     conn.rollback()
             except sqlite3.Error:
                 pass

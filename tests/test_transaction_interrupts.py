@@ -181,7 +181,7 @@ def test_closed_connection_cleanup_preserves_original_exception(
                          ids=["plain", "beam"])
 @pytest.mark.parametrize("error_type", [sqlite3.OperationalError, KeyboardInterrupt, SystemExit])
 @pytest.mark.parametrize("caller_owned", [False, True], ids=["owned", "caller"])
-def test_write_locked_commit_failure_respects_transaction_ownership(
+def test_write_locked_commit_failure_or_successful_caller_release(
     tmp_path, connection_factory, error_type, caller_owned
 ):
     failure = error_type("commit interrupted")
@@ -197,6 +197,8 @@ def test_write_locked_commit_failure_respects_transaction_ownership(
     conn.execute("CREATE TABLE markers (value TEXT)")
     try:
         if caller_owned:
+            # Successful control: caller participation must never call commit().
+            # Interrupted caller finalization is exercised at RELEASE below.
             conn.execute("INSERT INTO markers VALUES ('caller')")
             with _write_locked_transaction(conn):
                 conn.execute("INSERT INTO markers VALUES ('body')")
@@ -220,6 +222,87 @@ def test_write_locked_commit_failure_respects_transaction_ownership(
                 assert conn._after_commit_hooks == []
             assert events == []
     finally:
+        conn.rollback()
+        conn.close()
+        peer.close()
+
+
+@pytest.mark.parametrize("connection_factory", [sqlite3.Connection, _BeamConnection],
+                         ids=["plain", "beam"])
+@pytest.mark.parametrize("error_type", [
+    sqlite3.OperationalError, RuntimeError, KeyboardInterrupt, SystemExit,
+])
+@pytest.mark.parametrize("mode", ["before", "deny_rollback", "deny_release", "after"])
+def test_write_locked_release_failure_rolls_back_only_helper_savepoint(
+    tmp_path, connection_factory, error_type, mode
+):
+    failure = error_type("release interrupted")
+    releases = []
+    denied = []
+
+    def deny_cleanup(action, operation, name, database, trigger):
+        target = {"deny_rollback": "ROLLBACK", "deny_release": "RELEASE"}.get(mode)
+        if action == sqlite3.SQLITE_SAVEPOINT and operation == target:
+            denied.append(operation)
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    class InterruptedReleaseConnection(connection_factory):
+        def execute(self, sql, *args, **kwargs):
+            if sql.startswith("RELEASE SAVEPOINT"):
+                releases.append(sql)
+                if len(releases) == 1:
+                    if mode == "after":
+                        # Completed release cannot be undone through this savepoint.
+                        super().execute(sql, *args, **kwargs)
+                    self.set_authorizer(deny_cleanup)
+                    raise failure
+            return super().execute(sql, *args, **kwargs)
+
+    path = tmp_path / "release_interrupt.db"
+    conn = sqlite3.connect(path, factory=InterruptedReleaseConnection)
+    peer = sqlite3.connect(path, timeout=0)
+    events = []
+    conn.execute("CREATE TABLE markers (value TEXT)")
+    try:
+        conn.execute("INSERT INTO markers VALUES ('caller')")
+        if isinstance(conn, _BeamConnection):
+            conn._after_commit_hooks.append(lambda: events.append("caller"))
+        with pytest.raises(error_type) as caught:
+            with _write_locked_transaction(conn):
+                conn.execute("INSERT INTO markers VALUES ('body')")
+                if isinstance(conn, _BeamConnection):
+                    conn._after_commit_hooks.append(lambda: events.append("body"))
+        assert caught.value is failure
+        assert conn.in_transaction
+        expected = ["caller", "body"] if mode in ("deny_rollback", "after") else ["caller"]
+        assert _markers(conn) == expected
+        assert _markers(peer) == []
+        assert denied == ({"deny_rollback": ["ROLLBACK"],
+                           "deny_release": ["RELEASE"]}.get(mode, []))
+        if mode in ("before", "deny_release"):
+            assert releases == [releases[0], releases[0]]
+        else:
+            assert len(releases) == 1
+        conn.set_authorizer(lambda *args: sqlite3.SQLITE_OK)
+        if mode in ("before", "after"):
+            # Successful cleanup removes the helper savepoint. A completed
+            # initial release also removes it, but leaves body writes pending.
+            savepoint = releases[0].split()[-1]
+            with pytest.raises(sqlite3.OperationalError, match="no such savepoint"):
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            peer.execute("BEGIN IMMEDIATE")
+        assert events == []
+        if isinstance(conn, _BeamConnection) and mode in ("before", "after"):
+            assert conn._savepoint_hook_marks == []
+        conn.execute("INSERT INTO markers VALUES ('after')")
+        conn.commit()
+        assert _markers(peer) == expected + ["after"]
+        assert events == (expected if isinstance(conn, _BeamConnection) else [])
+        _assert_writer_available(peer)
+    finally:
+        conn.set_authorizer(lambda *args: sqlite3.SQLITE_OK)
         conn.rollback()
         conn.close()
         peer.close()
