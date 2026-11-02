@@ -105,9 +105,17 @@ def test_other_write_paths_commit_twice(beam, monkeypatch, kwargs):
         beam.remember(TEXT, source="user")
     call = {"extract_entities": True, **kwargs}
 
-    _, commits = _count_commits(beam, lambda: beam.remember(TEXT, source="user", **call))
+    memory_id, commits = _count_commits(beam, lambda: beam.remember(TEXT, source="user", **call))
 
     assert commits == 2
+    # The one enrichment commit has to carry the writes, not land empty.
+    assert _gist_count(beam, memory_id) == 1
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM memoria_facts WHERE source_memory_id = ?", (memory_id,)).fetchone()[0] > 0
+    mentions = beam.conn.execute(
+        "SELECT COUNT(*) FROM annotations WHERE memory_id = ? AND kind = 'mentions'",
+        (memory_id,)).fetchone()[0]
+    assert (mentions > 0) == (kwargs != {"extract_entities": False})
 
 
 @pytest.mark.parametrize("path,caller_txn", list(itertools.product(("new", "dedup"), (False, True))),
@@ -366,3 +374,103 @@ def test_interrupt_inside_a_caller_transaction_rolls_back_only_the_savepoint(bea
         "SELECT id FROM working_memory WHERE id IN ('caller-marker', 'scoped')")}
     assert ids == {"caller-marker"}
     beam.conn.rollback()
+
+
+def _hold_lock_after_row_commit(beam, monkeypatch):
+    # Another writer takes the lock as soon as remember()'s row commit lands.
+    beam.conn.execute("PRAGMA busy_timeout=1")
+    other = sqlite3.connect(beam.db_path, timeout=0, isolation_level=None)
+    real_commit = bm._BeamConnection.commit
+
+    def commit(self):
+        had_transaction = self.in_transaction
+        real_commit(self)
+        if had_transaction and not other.in_transaction:
+            other.execute("BEGIN IMMEDIATE")
+
+    monkeypatch.setattr(bm._BeamConnection, "commit", commit)
+    return other
+
+
+def _gist_count(beam, memory_id):
+    return beam.conn.execute(
+        "SELECT COUNT(*) FROM gists WHERE memory_id = ?", (memory_id,)).fetchone()[0]
+
+
+def test_busy_lock_skips_enrichment_on_a_dedup_hit(beam, monkeypatch, caplog):
+    # The row update already committed, so a duplicate write must not report failure.
+    existing = beam.remember(TEXT, source="user")
+    beam.conn.execute("DELETE FROM gists WHERE memory_id = ?", (existing,))
+    beam.conn.commit()
+    sleeps = []
+    monkeypatch.setattr(bm.time, "sleep", sleeps.append)
+    other = _hold_lock_after_row_commit(beam, monkeypatch)
+    try:
+        assert beam.remember(TEXT, source="user") == existing
+    finally:
+        other.rollback()
+        other.close()
+
+    assert len(sleeps) == 2
+    assert not beam.conn.in_transaction
+    assert _gist_count(beam, existing) == 0
+    assert "enrichment skipped" in caplog.text
+
+
+def test_busy_lock_still_raises_on_a_new_row(beam, monkeypatch):
+    monkeypatch.setattr(bm.time, "sleep", lambda seconds: None)
+    other = _hold_lock_after_row_commit(beam, monkeypatch)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            beam.remember(TEXT, source="user")
+    finally:
+        other.rollback()
+        other.close()
+
+    assert not beam.conn.in_transaction
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE content = ?", (TEXT,)).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("path", ["new", "dedup"])
+def test_lock_released_during_backoff_runs_enrichment(beam, monkeypatch, path):
+    existing = beam.remember(TEXT, source="user") if path == "dedup" else None
+    if existing:
+        beam.conn.execute("DELETE FROM gists WHERE memory_id = ?", (existing,))
+        beam.conn.commit()
+    other = _hold_lock_after_row_commit(beam, monkeypatch)
+    sleeps = []
+
+    def release(seconds):
+        sleeps.append(seconds)
+        other.rollback()
+        # Stop the commit hook from taking the lock again.
+        monkeypatch.undo()
+        monkeypatch.setattr(bm.time, "sleep", lambda seconds: None)
+
+    monkeypatch.setattr(bm.time, "sleep", release)
+    try:
+        memory_id = beam.remember(TEXT, source="user")
+    finally:
+        other.close()
+
+    assert len(sleeps) == 1
+    assert _gist_count(beam, memory_id) == 1
+
+
+def test_busy_error_inside_the_block_is_not_retried_or_skipped(beam, monkeypatch):
+    # Only failing to enter is a busy lock; a failure inside still rolls back and raises.
+    beam.remember(TEXT, source="user")
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(1)
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(beam, "_ingest_graph_and_veracity", fail)
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        beam.remember(TEXT, source="user")
+
+    assert calls == [1]
+    assert not beam.conn.in_transaction
