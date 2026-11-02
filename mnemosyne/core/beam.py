@@ -2501,7 +2501,7 @@ def _guarded_transaction(conn: sqlite3.Connection):
             conn.commit()
         else:
             conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-    except Exception:
+    except BaseException:
         try:
             if savepoint is None:
                 conn.rollback()
@@ -2582,7 +2582,7 @@ def _write_locked_transaction(
 
     try:
         yield
-    except Exception:
+    except BaseException:
         try:
             if owns_savepoint:
                 conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")

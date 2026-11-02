@@ -455,7 +455,7 @@ class VeracityConsolidator:
                 yield
                 if started_tx:
                     conn.commit()
-            except Exception:
+            except BaseException:
                 if started_tx:
                     try:
                         conn.rollback()
