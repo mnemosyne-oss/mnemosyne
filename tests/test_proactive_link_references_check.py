@@ -19,7 +19,7 @@ def _references(beam):
         "SELECT source, target FROM graph_edges WHERE edge_type = 'references' ORDER BY id")]
 
 
-def test_duplicate_check_uses_the_endpoint_indexes(beam):
+def test_duplicate_check_searches_the_new_memorys_edges(beam):
     beam.remember("Alice met Bob in Paris.", source="user", extract_entities=True)
     statements = []
     beam.conn.set_trace_callback(statements.append)
@@ -29,7 +29,9 @@ def test_duplicate_check_uses_the_endpoint_indexes(beam):
     checks = [s for s in statements if "FROM graph_edges" in s and "references" in s]
     assert checks
     plan = " ".join(row[3] for row in beam.conn.execute("EXPLAIN QUERY PLAN " + checks[0]))
-    assert "idx_edges_type" not in plan
+    # The target can be a hub, since many memories link to the same few. The
+    # source is the new memory, which has only the edges this call is adding.
+    assert "USING INDEX idx_edges_source" in plan
 
 
 def test_check_still_finds_an_existing_references_edge(beam):
