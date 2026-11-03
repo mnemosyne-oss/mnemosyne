@@ -589,9 +589,13 @@ class EpisodicGraph:
             for mem in current_level:
                 cursor = self.conn.cursor()
                 if edge_type:
+                    # Unary + keeps the planner off idx_edges_type: nearly every edge
+                    # shares one type, so that index reads the whole table. rowid keeps
+                    # insertion order, which decides who claims a shared neighbour.
                     cursor.execute("""
                         SELECT source, target, edge_type, weight FROM graph_edges
-                        WHERE (source = ? OR target = ?) AND edge_type = ? AND weight >= ?
+                        WHERE (source = ? OR target = ?) AND +edge_type = ? AND weight >= ?
+                        ORDER BY rowid
                     """, (mem, mem, edge_type, min_weight))
                 else:
                     cursor.execute("""
