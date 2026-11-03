@@ -470,7 +470,19 @@ _PREFETCH_LEXICAL_GENERIC_TOKENS = {
 # deployments can replace this list with
 # MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS or extend the effective list with
 # MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS.
-_PREFETCH_CANONICAL_GENERIC_TOKEN_DEFAULTS = set(_PREFETCH_LEXICAL_GENERIC_TOKENS)
+# German function words are not topical evidence for automatic canonical
+# injection (#1263). Keep this bounded vocabulary separate from tokenization
+# and explicit recall. Frequency alone cannot identify function words: common
+# domain terms such as "Vaultwarden Passwort" must remain useful in small banks.
+_PREFETCH_CANONICAL_GENERIC_TOKEN_DEFAULTS = _PREFETCH_LEXICAL_GENERIC_TOKENS | {
+    "aber", "alle", "als", "auch", "auf", "aus", "bei", "dass", "das",
+    "dem", "den", "der", "des", "die", "dies", "diese", "diesem", "diesen",
+    "dieser", "dieses", "doch", "ein", "eine", "einem", "einen", "einer",
+    "eines", "für", "fuer", "ich", "ist", "kein", "keine", "kann", "mit",
+    "mich", "muss", "müssen", "nach", "neue", "neuem", "neuen", "neuer",
+    "neues", "nicht", "noch", "nur", "oder", "sich", "sind", "soll", "und",
+    "vom", "von", "vor", "was", "wenn", "werden", "wie", "wird", "zum", "zur",
+}
 
 # Explicit recall keeps the pre-hardening default generic-token contract while
 # continuing to honor the established canonical replacement variable. The new
@@ -870,9 +882,18 @@ _EMPTY_BINDING: Dict[str, Any] = {
 def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: int = 3) -> List[Dict[str, Any]]:
     """Return canonical facts relevant enough for automatic memory-context injection.
 
-    Canonical rows are small, owner-scoped, and single-source-of-truth, so a
-    lightweight lexical pass over current slots is enough and avoids LLM/reranker
-    cost. Importance cannot rescue a row here; it must share query terms.
+    Match current slots for ``owner_id`` using distinctive body tokens,
+    excluding the configured generic terms. Single-token admission additionally
+    requires rarity and query coverage, except for a matching whole-body unit.
+    Multi-token admission follows the configured overlap minimum.
+
+    Apply priority and deduplication before returning at most ``limit`` rows,
+    ranking within each group by the provider's adjusted score, which blends
+    owner-local IDF-weighted query coverage with source quality. The private
+    priority flag uses unweighted distinctive coverage: only rows meeting the configured
+    coverage floor precede ordinary memories in provider prefetch. Weaker
+    admitted rows compete by adjusted score. No LLM, embedding lookup, or other
+    owner's corpus is used here.
     """
     cjk_ngram_size = _canonical_cjk_ngram_size(query)
     query_tokens = _canonical_match_tokens(query, cjk_ngram_size=cjk_ngram_size)
@@ -883,6 +904,9 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
     except Exception:
         return []
     generic_tokens = _prefetch_canonical_generic_tokens()
+    query_distinctive = query_tokens - generic_tokens
+    if not query_distinctive:
+        return []
     tokenized_rows: List[tuple[Dict[str, Any], str, Set[str]]] = []
     token_document_frequency: Dict[str, int] = {}
     for row in rows:
@@ -897,6 +921,15 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
         tokenized_rows.append((row, body, row_tokens))
         for token in row_tokens - generic_tokens:
             token_document_frequency[token] = token_document_frequency.get(token, 0) + 1
+
+    # Rank by distinctive evidence, not a count of shared function words.
+    # IDF downweights repeated domain vocabulary without making it ineligible;
+    # a frequency blacklist would erase useful terms in focused small banks.
+    query_weights = {
+        token: math.log((len(tokenized_rows) + 1) / (token_document_frequency.get(token, 0) + 1)) + 1.0
+        for token in query_distinctive
+    }
+    query_weight = math.fsum(query_weights.values())
 
     # A single lexical overlap is useful only when the token is genuinely rare
     # across the owner's canonical surface. Otherwise broad words such as
@@ -920,7 +953,6 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
         # One distinctive token can be enough for canonical slots such as
         # profile URLs; broad queries need a little more coverage. Generic
         # owner/system words do not count toward the minimum overlap.
-        coverage = len(overlap) / max(len(query_tokens), 1)
         distinctive_coverage = len(distinctive_overlap) / max(len(query_tokens - generic_tokens), 1)
         whole_body_unit = _canonical_whole_body_unit(
             body, query_tokens, cjk_ngram_size=cjk_ngram_size
@@ -931,20 +963,21 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
             # does not apply; the rarity guard still does, because this path is
             # injected into every prompt.
             if (
-                max(coverage, distinctive_coverage) < minimum_coverage
+                distinctive_coverage < minimum_coverage
                 and not whole_body_unit
             ) or token_document_frequency.get(only_token, 0) > rare_document_frequency:
                 continue
         elif len(distinctive_overlap) < minimum_overlap:
             continue
-        score = min(1.0, 0.72 + coverage * 0.24 + min(len(overlap), 3) * 0.03)
+        evidence_coverage = math.fsum(query_weights[token] for token in distinctive_overlap) / query_weight
+        score = min(1.0, 0.72 + evidence_coverage * 0.24)
         candidates.append({
             "content": body,
             "source": f"canonical:{row.get('category') or 'fact'}",
             "timestamp": row.get("valid_from") or row.get("created_at") or "",
             "importance": 0.95,
             "score": score,
-            "keyword_score": max(0.35, coverage),
+            "keyword_score": max(0.35, evidence_coverage),
             "fact_match": True,
             "trust_tier": "CANONICAL",
             "tier": "canonical",
@@ -952,6 +985,7 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
             "canonical_name": row.get("name"),
             "canonical_owner": row.get("owner_id"),
             "_prefetch_overlap_count": len(distinctive_overlap),
+            "_prefetch_canonical_priority": distinctive_coverage >= minimum_coverage,
         })
     # When one fact has materially stronger lexical evidence, do not let
     # weaker one-token candidates ride alongside it merely because their lone
@@ -961,10 +995,17 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
             r for r in candidates
             if int(r.get("_prefetch_overlap_count") or 0) >= minimum_overlap
         ]
-    candidates.sort(key=lambda r: (float(r.get("score") or 0.0), float(r.get("keyword_score") or 0.0)), reverse=True)
+    # Apply the same priority boundary before limiting as the provider does
+    # before merging; otherwise stronger-priority rows can never reach it.
+    candidates.sort(
+        key=lambda r: (r["_prefetch_canonical_priority"], _prefetch_adjusted_score(r)),
+        reverse=True,
+    )
     for candidate in candidates:
         candidate.pop("_prefetch_overlap_count", None)
-    return candidates[:limit]
+    # Near duplicates must not consume the candidate budget before provider
+    # dedup can expose a lower-ranked but distinct fact.
+    return _semantic_dedup_prefetch(candidates, limit=limit)
 
 
 def _prefetch_is_polyphonic(row: Dict[str, Any]) -> bool:
@@ -1050,7 +1091,27 @@ def _sanitize_prefetch_query(query: str) -> str:
     return sanitize_prefetch_query(query)
 
 
-def _semantic_dedup_prefetch(rows: List[Dict[str, Any]], threshold: float = 0.72) -> List[Dict[str, Any]]:
+def _semantic_dedup_prefetch(
+    rows: List[Dict[str, Any]], threshold: float = 0.72, *, preserve_canonical_extensions: bool = False,
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Keep the first nonduplicate rows in their supplied ranking order.
+
+    Drop empty token sets and rows whose token Jaccard similarity reaches
+    ``threshold`` against an earlier row, or whose smaller token set is at
+    least 86% contained in the larger set. Automatic prefetch opts into
+    ``preserve_canonical_extensions``:
+    after a kept canonical row, containment covers the incoming ordinary row
+    instead, so a longer instruction can retain additional content. Jaccard
+    still removes near duplicates. The default retains explicit-recall and
+    ordinary-to-ordinary containment behavior. Input rows are not modified.
+
+    A positive ``limit`` stops scanning once that many distinct rows are kept;
+    zero returns no rows. ``None`` scans all rows, and negative limits retain
+    the historical slice behavior after a full scan.
+    """
+    if limit == 0:
+        return []
     kept: List[Dict[str, Any]] = []
     kept_tokens: List[Set[str]] = []
     for row in rows:
@@ -1058,12 +1119,21 @@ def _semantic_dedup_prefetch(rows: List[Dict[str, Any]], threshold: float = 0.72
         if not tokens:
             continue
         duplicate = False
-        for existing in kept_tokens:
+        for kept_row, existing in zip(kept, kept_tokens):
             overlap = len(tokens & existing)
             if not overlap:
                 continue
             jaccard = overlap / max(len(tokens | existing), 1)
             containment = overlap / max(min(len(tokens), len(existing)), 1)
+            if (
+                preserve_canonical_extensions
+                and kept_row.get("trust_tier") == "CANONICAL"
+                and row.get("trust_tier") != "CANONICAL"
+            ):
+                # A short canonical fact does not make a longer ordinary
+                # instruction redundant. Require coverage of the incoming
+                # row; exact/near duplicates and shorter subsets still drop.
+                containment = overlap / max(len(tokens), 1)
             if jaccard >= threshold or containment >= 0.86:
                 duplicate = True
                 break
@@ -1071,7 +1141,9 @@ def _semantic_dedup_prefetch(rows: List[Dict[str, Any]], threshold: float = 0.72
             continue
         kept.append(row)
         kept_tokens.append(tokens)
-    return kept
+        if limit is not None and limit > 0 and len(kept) >= limit:
+            break
+    return kept if limit is None else kept[:limit]
 
 
 def _sync_turn_user_limit() -> int:
@@ -2836,9 +2908,17 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context via Mnemosyne hybrid search with temporal weighting.
 
-        Only includes memories above a relevance threshold to prevent context pollution
-        from low-quality matches. Strictly session-scoped: author identity is never
-        injected into this recall path (see CWE-200 note below)."""
+        Gate ordinary memories by distinctive lexical evidence and signal
+        quality. Merge owner-scoped canonical candidates, prioritizing only
+        those meeting the configured distinctive query-coverage floor, then
+        rank by adjusted score within each priority group. Deduplicate while
+        retaining ordinary extensions of canonical facts and render up to five
+        memories with canonical provenance.
+
+        Ordinary recall retains session scoping: author identity is never
+        injected into that read path (see CWE-200 note below). Return an empty
+        string when no eligible context exists or the lifecycle read fails.
+        """
         self._maybe_retry_init()
         if not self._beam or self._agent_context in self._skip_contexts:
             return ""
@@ -2926,8 +3006,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
             if canonical_rows:
                 filtered.extend(canonical_rows)
-            filtered.sort(key=_prefetch_adjusted_score, reverse=True)
-            filtered = _semantic_dedup_prefetch(filtered)[:_PREFETCH_TOP_K]
+            # Prioritize sufficiently covered canonical facts, preserving their
+            # provenance through dedup. Weak admitted facts compete by score.
+            filtered.sort(
+                key=lambda row: (row.get("_prefetch_canonical_priority", False), _prefetch_adjusted_score(row)),
+                reverse=True,
+            )
+            filtered = _semantic_dedup_prefetch(filtered, preserve_canonical_extensions=True)[:_PREFETCH_TOP_K]
             if not filtered:
                 return ""
             lines = ["## Mnemosyne Context"]
