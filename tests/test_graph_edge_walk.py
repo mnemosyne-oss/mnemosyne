@@ -59,44 +59,48 @@ def test_typed_walk_uses_the_endpoint_indexes(graph):
     assert "idx_edges_type" not in plan
 
 
-def _vm_steps_for_a_walk(graph, node):
-    steps = [0]
-
-    def count():
-        steps[0] += 1
-        return 0
-
-    graph.conn.set_progress_handler(count, 10)
-    graph.find_related_memories(node, depth=2, edge_type="ctx", min_weight=0.3)
-    graph.conn.set_progress_handler(None, 10)
-    return steps[0]
-
-
 def test_typed_walk_cost_ignores_unrelated_edges(graph):
+    _add(graph, [("a", "b", "ctx", 0.9), ("b", "c", "ctx", 0.9)])
+
     def add_unrelated(start, stop):
         _add(graph, ((f"gist_{i}", f"fact_{i}_0", "ctx", 1.0) for i in range(start, stop)))
 
+    def vm_steps_for_a_walk():
+        steps = [0]
+
+        def count():
+            steps[0] += 1
+            return 0
+
+        graph.conn.set_progress_handler(count, 10)
+        related = graph.find_related_memories("a", depth=2, edge_type="ctx", min_weight=0.3)
+        graph.conn.set_progress_handler(None, 10)
+        assert [r["memory_id"] for r in related] == ["b", "c"]
+        return steps[0]
+
     add_unrelated(0, 1000)
-    at_1k = _vm_steps_for_a_walk(graph, "unrelated-node")
+    at_1k = vm_steps_for_a_walk()
     add_unrelated(1000, 10000)
-    at_10k = _vm_steps_for_a_walk(graph, "unrelated-node")
+    at_10k = vm_steps_for_a_walk()
 
-    assert at_10k <= at_1k + 5
+    # Ten times the edges; a little index depth is fine, a scan is ten times the work.
+    assert at_10k <= at_1k * 2
 
 
-@pytest.mark.parametrize("seed", range(25))
-def test_typed_walk_matches_a_scan_in_insertion_order(graph, seed):
-    rng = random.Random(seed)
+def test_typed_walk_matches_a_scan_in_insertion_order(graph):
     nodes = [f"n{i}" for i in range(12)]
-    edges = [(rng.choice(nodes), rng.choice(nodes), rng.choice(["ctx", "ctx", "ctx", "rel", "CTX"]),
-              rng.choice([0.1, 0.3, 0.5, 0.9])) for _ in range(40)]
-    edges = [e for e in edges if e[0] != e[1]]
-    _add(graph, edges)
-    start, depth, min_weight = rng.choice(nodes), rng.choice([1, 2, 3]), rng.choice([0.0, 0.3, 0.6])
+    for seed in range(25):
+        rng = random.Random(seed)
+        edges = [(rng.choice(nodes), rng.choice(nodes), rng.choice(["ctx", "ctx", "ctx", "rel", "CTX"]),
+                  rng.choice([0.1, 0.3, 0.5, 0.9])) for _ in range(40)]
+        edges = [e for e in edges if e[0] != e[1]]
+        graph.conn.execute("DELETE FROM graph_edges")
+        _add(graph, edges)
+        start, depth, min_weight = rng.choice(nodes), rng.choice([1, 2, 3]), rng.choice([0.0, 0.3, 0.6])
 
-    got = graph.find_related_memories(start, depth=depth, edge_type="ctx", min_weight=min_weight)
+        got = graph.find_related_memories(start, depth=depth, edge_type="ctx", min_weight=min_weight)
 
-    assert got == _reference_walk(edges, start, depth, "ctx", min_weight)
+        assert got == _reference_walk(edges, start, depth, "ctx", min_weight), f"seed {seed}"
 
 
 def test_non_string_edge_type_still_matches(graph):
