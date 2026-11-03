@@ -2501,7 +2501,7 @@ def _guarded_transaction(conn: sqlite3.Connection):
             conn.commit()
         else:
             conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-    except Exception:
+    except BaseException:
         try:
             if savepoint is None:
                 conn.rollback()
@@ -2579,10 +2579,18 @@ def _write_locked_transaction(
                     time.sleep(0.05 * (2 ** attempt))
                     continue
                 raise
+            except BaseException:
+                # BEGIN may have succeeded before execute returned to us.
+                try:
+                    if conn.in_transaction:
+                        conn.rollback()
+                except sqlite3.Error:
+                    pass  # a closed connection must not mask the interruption
+                raise
 
     try:
         yield
-    except Exception:
+    except BaseException:
         try:
             if owns_savepoint:
                 conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
@@ -2598,10 +2606,13 @@ def _write_locked_transaction(
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             elif started_tx:
                 conn.commit()
-        except sqlite3.Error:
-            # If finalization fails, roll back any transaction we opened.
+        except BaseException:
+            # Clean up only the transaction or savepoint owned by this helper.
             try:
-                if started_tx:
+                if owns_savepoint:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                elif started_tx:
                     conn.rollback()
             except sqlite3.Error:
                 pass
