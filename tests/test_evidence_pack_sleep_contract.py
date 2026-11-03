@@ -201,6 +201,32 @@ def test_authorized_colleague_context_can_enter_pack(
     assert pack[0]["content"] == COLLEAGUE
 
 
+@pytest.mark.parametrize("backend", ["sqlite", "json"])
+def test_candidates_from_both_primary_sessions_are_excluded(
+    slept_memory, backend, monkeypatch
+):
+    """Exclude both represented sessions while retaining a third-session row."""
+    _remember(
+        slept_memory, "candidate-a", "Orion gateway access first-session detail.",
+        session_id="primary-a",
+    )
+    _remember(
+        slept_memory, "candidate-b", "Orion gateway access second-session detail.",
+        session_id="primary-b",
+    )
+    _remember(
+        slept_memory, "candidate-third", "Orion gateway access third-session detail.",
+        session_id="third-session",
+    )
+    # Align real graph-recency and vector ranking on the intended primary pair.
+    _remember(slept_memory, "secondary", SECONDARY, session_id="primary-b", importance=0.9)
+    _remember(slept_memory, "primary", CURRENT, session_id="primary-a", importance=0.99)
+    candidates, pack = _pack(slept_memory, backend, monkeypatch)
+    assert {"candidate-a", "candidate-b", "candidate-third"}.issubset(candidates)
+    assert _ids(pack) == ["candidate-third"]
+    assert pack[0]["session_id"] == "third-session"
+
+
 def test_optional_hermes_lexical_gate_does_not_resolve_subject(monkeypatch):
     """Helper-only companion check, not pack-to-provider integration."""
     plugin = pytest.importorskip("mnemosyne_hermes")

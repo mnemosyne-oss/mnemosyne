@@ -42,9 +42,9 @@ python -m pytest -q tests/test_evidence_pack_sleep_contract.py
 ```
 
 Expected with NumPy, a loadable sqlite-vec extension, and the bundled Hermes
-package: **13 passed**. No environment variable or separate fixture archive is
+package: **17 passed**. No environment variable or separate fixture archive is
 required. Without the Hermes package, only its helper companion test skips;
-the 12 Core cases still run. Without a loadable sqlite-vec extension, the native
+the 16 Core cases still run. Without a loadable sqlite-vec extension, the native
 WM arms skip. Without NumPy, the module skips. A run with skips is not evidence
 that the complete matrix passed; inspect the skip reasons with `-rs`.
 
@@ -57,7 +57,7 @@ PYTHONPATH=.:integrations/hermes/src python -m pytest -q tests/test_evidence_pac
 
 ## What the cases establish
 
-All 12 Core cases first use real `remember()` and successful `sleep()`. They
+All 16 Core cases first use real `remember()` and successful `sleep()`. They
 check retained original text, the consolidation marker, completed claim and
 `summary_of`. Summary text and embeddings are deliberately fixed: the original
 has cosine 0.8 to the query, the first primary has cosine 1, the second primary
@@ -74,6 +74,10 @@ and native-WM-index/JSON-WM configurations:
   candidates but is not added as a supplemental group.
 - An authorized current fact about a colleague from another session can enter
   the pack even though the question is about the user's own configuration.
+- With primary rows from two different sessions, candidates from both sessions
+  reach wider recall but are excluded from the pack. A candidate from a third
+  authorized session remains in the pack. In this fixture, the primary rows are
+  written last so the real graph-recency and vector ordering agree on the pair.
 
 `cross_session: true` is explicitly configured only for the synthetic store;
 all stored rows have `scope='global'`. This is not an unauthorized-session
@@ -85,7 +89,7 @@ It checks actual WM recall-count changes: both primary rows are credited once,
 and supplemental candidate reads do not credit the other rows. The recall wrapper
 observes real calls and does not replace their results.
 
-The thirteenth test checks only Hermes's distinctive-lexical-evidence helper
+The optional Hermes test checks only Hermes's distinctive-lexical-evidence helper
 with the colleague text. It does not wire packs into `prefetch()`, run the full
 provider, or measure an answering model's error.
 
