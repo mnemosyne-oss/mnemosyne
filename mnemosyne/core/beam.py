@@ -2513,11 +2513,20 @@ def _guarded_transaction(conn: sqlite3.Connection):
         raise
 
 
+_SQLITE_BUSY = 5
+
+
 def _is_busy_error(exc: sqlite3.OperationalError) -> bool:
     """True when SQLite raised SQLITE_BUSY (database is locked)."""
     if getattr(exc, "sqlite_errorname", None) == "SQLITE_BUSY":
         return True
-    return getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_BUSY
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is None:
+        # Python 3.10 has no error codes on sqlite3 exceptions.
+        return "database is locked" in str(exc)
+    # The low byte is the primary code; extended ones such as BUSY_RECOVERY add to it.
+    # A literal, because the sqlite3 module only names it from Python 3.11.
+    return (code & 0xFF) == _SQLITE_BUSY
 
 
 _plain_savepoint_counter = itertools.count(1)
@@ -2680,17 +2689,39 @@ def _deferred_commits(conn: sqlite3.Connection, *, immediate: bool = False):
         conn._defer_commit = previously_deferred
 
 
-def _enrichment_transaction(conn: sqlite3.Connection):
+class _EnrichmentLockBusy(sqlite3.OperationalError):
+    """The enrichment transaction could not take the write lock."""
+
+
+@contextlib.contextmanager
+def _enrichment_transaction(conn: sqlite3.Connection, *, max_attempts: int = 3):
     """One BEAM-owned transaction for remember()'s local enrichment writes.
 
     IMMEDIATE takes the write lock up front, so trim's read-then-delete stays
     safe under contention. A caller-owned transaction keeps its old behavior:
     the helpers' own commits close it, so the LLM fact step after the block
     still runs outside any write transaction.
+
+    Taking the lock retries like _write_locked_transaction. Only a failure to
+    enter raises _EnrichmentLockBusy; errors from the block are never retried.
     """
     if conn.in_transaction:
-        return contextlib.nullcontext()
-    return _deferred_commits(conn, immediate=True)
+        yield
+        return
+    for attempt in range(max_attempts):
+        entered = False
+        try:
+            with _deferred_commits(conn, immediate=True):
+                entered = True
+                yield
+            return
+        except sqlite3.OperationalError as exc:
+            if entered or not _is_busy_error(exc):
+                raise
+            if attempt + 1 == max_attempts:
+                raise _EnrichmentLockBusy(str(exc)) from exc
+            time.sleep(0.05 * (2 ** attempt))
+
 
 def _generate_id(content: str) -> str:
     return hashlib.sha256(f"{content}{datetime.now().isoformat()}".encode()).hexdigest()[:16]
@@ -6488,21 +6519,31 @@ class BeamMemory:
                 # contract on duplicate-content writes (see C12.a /review note).
                 # The local enrichment writes share one transaction: each helper
                 # commits on its own, and every commit is an fsync.
-                with _enrichment_transaction(self.conn):
-                    if extract_entities:
-                        _extract_and_store_entities(self, existing_id, content)
-                    # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
-                    # Populates memoria_facts, memoria_timelines, memoria_kg for the
-                    # structured retrieval router. Runs silently on every remember()
-                    # so the MEMORIA tables stay current regardless of extract=True.
-                    try:
-                        self.extract_and_store_facts(content, message_idx=0, source_memory_id=existing_id)
-                    except Exception:
-                        pass  # regex extraction failures must not block memory storage
-                    # Phase 3-4: Extract graph and consolidate veracity for dedup update
-                    self._ingest_graph_and_veracity(existing_id, content, source, veracity)
+                enrichment_skipped = False
+                try:
+                    with _enrichment_transaction(self.conn):
+                        if extract_entities:
+                            _extract_and_store_entities(self, existing_id, content)
+                        # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
+                        # Populates memoria_facts, memoria_timelines, memoria_kg for the
+                        # structured retrieval router. Runs silently on every remember()
+                        # so the MEMORIA tables stay current regardless of extract=True.
+                        try:
+                            self.extract_and_store_facts(content, message_idx=0, source_memory_id=existing_id)
+                        except Exception:
+                            pass  # regex extraction failures must not block memory storage
+                        # Phase 3-4: Extract graph and consolidate veracity for dedup update
+                        self._ingest_graph_and_veracity(existing_id, content, source, veracity)
+                except _EnrichmentLockBusy as exc:
+                    # The row update already committed, and the duplicate's
+                    # enrichment can be redone by the next write of this content.
+                    logger.warning(
+                        "remember: enrichment skipped for duplicate '%s', write lock busy: %s",
+                        existing_id, exc,
+                    )
+                    enrichment_skipped = True
                 # Outside the transaction: the LLM call must not hold the write lock.
-                if extract:
+                if extract and not enrichment_skipped:
                     _extract_and_store_facts(
                         self, existing_id, content, source, write_policy
                     )
