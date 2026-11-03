@@ -7055,8 +7055,10 @@ class BeamMemory:
                     ).fetchall()
                     for match in related:
                         rid = match["memory_id"]
+                        # Unary + keeps the planner off idx_edges_type: this type can
+                        # dominate the table, and the endpoints are already known.
                         existing = self.episodic_graph.conn.execute(
-                            "SELECT 1 FROM graph_edges WHERE source = ? AND target = ? AND edge_type = 'references'",
+                            "SELECT 1 FROM graph_edges WHERE source = ? AND target = ? AND +edge_type = 'references'",
                             (memory_id, rid)
                         ).fetchone()
                         if existing:
