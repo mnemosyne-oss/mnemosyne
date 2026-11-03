@@ -947,6 +947,8 @@ class TestToolHandlers:
                 db_path = "test.db"
 
         class _Result:
+            errors = []
+
             def to_dict(self):
                 return {"cleaned": 1}
 
