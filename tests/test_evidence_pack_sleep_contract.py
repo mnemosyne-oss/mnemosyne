@@ -17,6 +17,7 @@ from mnemosyne.core.config import MnemosyneConfig
 QUERY = "Orion gateway access"
 ORIGINAL = "Orion gateway access uses cobaltcommand."
 CURRENT = "Orion gateway access uses jadecommand."
+SECONDARY = "Orion gateway access standby uses tincommand."
 SUMMARY = "A maintenance event was recorded."
 COLLEAGUE_QUERY = "my opal gateway access"
 COLLEAGUE = (
@@ -24,6 +25,7 @@ COLLEAGUE = (
     "This is about my colleague, not my own configuration."
 )
 UNKNOWN = "opal gateway access status remains unknown."
+SECONDARY_UNKNOWN = "opal gateway access standby status remains pending."
 
 
 def _ids(rows):
@@ -66,13 +68,15 @@ def slept_memory(request, tmp_path, monkeypatch):
     orthogonal[1] = 1
 
     def embed(texts):
-        """Give the summary, primary and other facts distinct fixed directions."""
+        """Give the summary, both primary rows and other facts fixed directions."""
         vectors = []
         for text in texts:
             if text == SUMMARY:
                 vector = orthogonal
             elif text in {CURRENT, UNKNOWN}:
                 vector = query_vector
+            elif text in {SECONDARY, SECONDARY_UNKNOWN}:
+                vector = 0.95 * query_vector + np.sqrt(1 - 0.95 ** 2) * orthogonal
             else:
                 vector = 0.8 * query_vector + 0.6 * orthogonal
             vectors.append(vector)
@@ -135,24 +139,25 @@ def _pack(beam, backend, monkeypatch, *, query=QUERY):
             context.setattr(bm, "_wm_vec_available", lambda conn: False)
         elif not bm._wm_vec_available(beam.conn):
             pytest.skip("sqlite-vec extension required for the native WM arm")
-        plain = recall(query, source="fact", top_k=1, _track_recall=False)
+        plain = recall(query, source="fact", top_k=2, _track_recall=False)
         usage_before = dict(beam.conn.execute(
             "SELECT id, COALESCE(recall_count, 0) FROM working_memory"
         ).fetchall())
         context.setattr(beam, "recall", observe)
         packed = beam.recall_with_evidence_pack(
-            query, source="fact", top_k=1, candidate_k=8, pack_k=5
+            query, source="fact", top_k=2, candidate_k=8, pack_k=5
         )
         usage_after = dict(beam.conn.execute(
             "SELECT id, COALESCE(recall_count, 0) FROM working_memory"
         ).fetchall())
 
-    assert _ids(plain) == _ids(packed["primary"]) == ["primary"]
-    assert [(call["top_k"], call["track"]) for call in calls] == [(1, True), (8, False)]
+    assert _ids(plain) == _ids(packed["primary"]) == ["primary", "secondary"]
+    assert [(call["top_k"], call["track"]) for call in calls] == [(2, True), (8, False)]
     # Check actual storage effects, not just the spy's _track_recall flag.
     assert usage_after["primary"] == usage_before["primary"] + 1
+    assert usage_after["secondary"] == usage_before["secondary"] + 1
     for memory_id in usage_before:
-        if memory_id != "primary":
+        if memory_id not in {"primary", "secondary"}:
             assert usage_after[memory_id] == usage_before[memory_id]
     return calls[1]["ids"], packed["evidence_pack"]
 
@@ -161,6 +166,7 @@ def _pack(beam, backend, monkeypatch, *, query=QUERY):
 def test_sleep_original_reaches_candidates_but_is_excluded_from_pack(
     slept_memory, backend, monkeypatch
 ):
+    _remember(slept_memory, "secondary", SECONDARY, importance=0.9)
     _remember(slept_memory, "primary", CURRENT, importance=0.99)
     candidates, pack = _pack(slept_memory, backend, monkeypatch)
     assert "archived" in candidates
@@ -172,6 +178,7 @@ def test_current_detail_from_primary_session_is_not_a_supplement(
     slept_memory, backend, monkeypatch
 ):
     _remember(slept_memory, "sibling", "Orion gateway access secondary detail uses amberkey.")
+    _remember(slept_memory, "secondary", SECONDARY, importance=0.9)
     _remember(slept_memory, "primary", CURRENT, importance=0.99)
     candidates, pack = _pack(slept_memory, backend, monkeypatch)
     assert "sibling" in candidates
@@ -183,6 +190,7 @@ def test_authorized_colleague_context_can_enter_pack(
     slept_memory, backend, monkeypatch
 ):
     _remember(slept_memory, "colleague", COLLEAGUE, session_id="colleague-writer")
+    _remember(slept_memory, "secondary", SECONDARY_UNKNOWN, importance=0.9)
     _remember(slept_memory, "primary", UNKNOWN, importance=0.99)
     candidates, pack = _pack(
         slept_memory, backend, monkeypatch, query=COLLEAGUE_QUERY

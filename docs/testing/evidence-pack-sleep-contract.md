@@ -19,14 +19,18 @@ write result files, or require the earlier local investigation artifacts.
 
 Use Python 3.10 or later in a disposable checkout that contains the tests.
 From a clone of `https://github.com/mnemosyne-oss/mnemosyne.git`, these commands
-select the immutable original reproduction revision:
+select the current PR test matrix, including its two-primary ordering checks:
 
 ```sh
-git fetch origin ac3229013ea72d7e0edda0d3685eaf3c8db7ed49
-git switch --detach ac3229013ea72d7e0edda0d3685eaf3c8db7ed49
+git fetch origin refs/pull/1327/head
+git switch --detach FETCH_HEAD
+git rev-parse HEAD
 ```
 
-The current PR checkout also contains the tests. In a virtual environment,
+Record the printed commit when sharing results. For the immutable original
+13-case reproduction, fetch and check out
+`ac3229013ea72d7e0edda0d3685eaf3c8db7ed49` instead; that historical revision
+does not include the strengthened two-primary checks. In a virtual environment,
 install the small test/runtime dependencies and the two local packages.
 Installation may require network access; the reproduction itself uses controlled
 inference and does not download models or call an inference service.
@@ -56,8 +60,9 @@ PYTHONPATH=.:integrations/hermes/src python -m pytest -q tests/test_evidence_pac
 All 12 Core cases first use real `remember()` and successful `sleep()`. They
 check retained original text, the consolidation marker, completed claim and
 `summary_of`. Summary text and embeddings are deliberately fixed: the original
-has cosine 0.8 to the query, the current primary has cosine 1, and the summary
-is orthogonal. These values isolate contract boundaries, not model quality.
+has cosine 0.8 to the query, the first primary has cosine 1, the second primary
+has cosine 0.95, and the summary is orthogonal. These values isolate contract
+boundaries, not model quality.
 Entity extraction is disabled during storage.
 
 The tests then establish three outcomes, each under linear/polyphonic recall
@@ -74,10 +79,11 @@ and native-WM-index/JSON-WM configurations:
 all stored rows have `scope='global'`. This is not an unauthorized-session
 exclusion test and does not promote existing rows to global scope.
 
-Every case compares primary IDs/order against ordinary recall and checks the
-actual WM recall-count changes: the primary is credited once and supplemental
-candidate reads do not credit the other rows. The recall wrapper observes real
-calls and does not replace their results.
+Every case retrieves two primary rows with `top_k=2` and compares the exact
+ordered IDs `["primary", "secondary"]` against ordinary recall and the pack.
+It checks actual WM recall-count changes: both primary rows are credited once,
+and supplemental candidate reads do not credit the other rows. The recall wrapper
+observes real calls and does not replace their results.
 
 The thirteenth test checks only Hermes's distinctive-lexical-evidence helper
 with the colleague text. It does not wire packs into `prefetch()`, run the full
