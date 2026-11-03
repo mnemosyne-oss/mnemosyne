@@ -31,7 +31,7 @@ def test_duplicate_check_searches_the_new_memorys_edges(beam):
     plan = " ".join(row[3] for row in beam.conn.execute("EXPLAIN QUERY PLAN " + checks[0]))
     # The target can be a hub, since many memories link to the same few. The
     # source is the new memory, which has only the edges this call is adding.
-    assert "USING INDEX idx_edges_source" in plan
+    assert "SEARCH graph_edges USING INDEX idx_edges_source (source=?)" in plan
 
 
 def test_check_still_finds_an_existing_references_edge(beam):
