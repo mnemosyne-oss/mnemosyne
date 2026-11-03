@@ -8,17 +8,28 @@ This is an executable characterization of the existing contract discussed in
 It does not implement archive recovery or select a new admission policy.
 Intentional contract changes should update these expectations with their decision.
 
-The reproduction was checked against Core commit
-`e1f34fb696f72d57f2a98a17714e6c8e7b81c886` and its bundled Hermes **0.7.7**
-source. The tests do not pin a machine path, read private memories, write result
-files, or require the earlier local investigation artifacts.
+The runtime baseline is Core commit
+`e1f34fb696f72d57f2a98a17714e6c8e7b81c886` with its bundled Hermes **0.7.7**
+source. The original reproduction tests were added in
+`ac3229013ea72d7e0edda0d3685eaf3c8db7ed49`; the baseline commit alone does not
+contain the test file. The tests do not pin a machine path, read private memories,
+write result files, or require the earlier local investigation artifacts.
 
 ## Setup and run
 
-Use Python 3.10 or later in a disposable checkout at that commit. In a virtual
-environment, install the small test/runtime dependencies and the two local
-packages. Installation may require network access; the reproduction itself
-uses controlled inference and does not download models or call an inference service.
+Use Python 3.10 or later in a disposable checkout that contains the tests.
+From a clone of `https://github.com/mnemosyne-oss/mnemosyne.git`, these commands
+select the immutable original reproduction revision:
+
+```sh
+git fetch origin ac3229013ea72d7e0edda0d3685eaf3c8db7ed49
+git switch --detach ac3229013ea72d7e0edda0d3685eaf3c8db7ed49
+```
+
+The current PR checkout also contains the tests. In a virtual environment,
+install the small test/runtime dependencies and the two local packages.
+Installation may require network access; the reproduction itself uses controlled
+inference and does not download models or call an inference service.
 
 ```sh
 python -m pip install "pytest>=7" "pytest-timeout>=2.1" numpy "PyYAML>=6" "sqlite-vec==0.1.9"

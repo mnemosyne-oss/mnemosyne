@@ -27,10 +27,12 @@ UNKNOWN = "opal gateway access status remains unknown."
 
 
 def _ids(rows):
+    """Return row IDs in the order produced by real recall or pack assembly."""
     return [row["id"] for row in rows]
 
 
 def _remember(beam, memory_id, content, *, session_id="reader", importance=0.6):
+    """Store one global synthetic fact and restore the caller's session binding."""
     previous = beam.session_id, beam.channel_id
     beam.session_id = beam.channel_id = session_id
     try:
@@ -46,6 +48,7 @@ def _remember(beam, memory_id, content, *, session_id="reader", importance=0.6):
 
 @pytest.fixture(params=["linear", "polyphonic"])
 def slept_memory(request, tmp_path, monkeypatch):
+    """Yield an isolated store after real Sleep with controlled inference."""
     config = tmp_path / "data"
     config.mkdir()
     (config / "config.yaml").write_text("cross_session: true\n", encoding="utf-8")
@@ -63,6 +66,7 @@ def slept_memory(request, tmp_path, monkeypatch):
     orthogonal[1] = 1
 
     def embed(texts):
+        """Give the summary, primary and other facts distinct fixed directions."""
         vectors = []
         for text in texts:
             if text == SUMMARY:
@@ -110,10 +114,12 @@ def slept_memory(request, tmp_path, monkeypatch):
 
 
 def _pack(beam, backend, monkeypatch, *, query=QUERY):
+    """Run real pack retrieval and check primary order and WM recall credits."""
     calls = []
     recall = beam.recall
 
     def observe(*args, **kwargs):
+        """Record recall boundaries while preserving its results and side effects."""
         rows = recall(*args, **kwargs)
         calls.append({
             "top_k": kwargs.get("top_k"),
