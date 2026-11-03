@@ -105,7 +105,7 @@ def test_typed_walk_matches_a_scan_in_insertion_order(graph):
 
 def test_non_string_edge_type_still_matches(graph):
     # The tool handler passes edge_type through uncoerced.
-    _add(graph, [("a", "b", "5", 1.0)])
+    _add(graph, [("a", "b", "5", 1.0), ("a", "near-miss", "05", 1.0)])
 
     assert [r["memory_id"] for r in graph.find_related_memories("a", depth=1, edge_type=5)] == ["b"]
 
