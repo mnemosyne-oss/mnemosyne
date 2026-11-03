@@ -59,3 +59,19 @@ def test_check_ignores_other_edge_types_between_the_same_memories(beam):
     beam._proactively_link(second, "Alice called Bob from Paris.")
 
     assert (second, first) in _references(beam)
+
+
+def test_edge_to_one_target_does_not_stop_a_link_to_another(beam):
+    # The check must compare the target too, not only look for any edge from the source.
+    first = beam.remember("Alice met Bob in Paris.", source="user", extract_entities=True)
+    second = beam.remember("Alice saw Bob in Paris.", source="user", extract_entities=True)
+    third = beam.remember("Alice called Bob from Paris.", source="user", extract_entities=True)
+    assert {(third, first), (third, second)} <= set(_references(beam))
+    beam.conn.execute("DELETE FROM graph_edges WHERE source = ? AND target = ?", (third, second))
+    beam.conn.commit()
+
+    beam._proactively_link(third, "Alice called Bob from Paris.")
+
+    edges = _references(beam)
+    assert edges.count((third, second)) == 1
+    assert edges.count((third, first)) == 1
