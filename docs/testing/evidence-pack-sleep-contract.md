@@ -41,12 +41,18 @@ python -m pip install --no-deps -e . -e integrations/hermes
 python -m pytest -q tests/test_evidence_pack_sleep_contract.py
 ```
 
-Expected with NumPy, a loadable sqlite-vec extension, and the bundled Hermes
-package: **17 passed**. No environment variable or separate fixture archive is
-required. Without the Hermes package, only its helper companion test skips;
-the 16 Core cases still run. Without a loadable sqlite-vec extension, the native
-WM arms skip. Without NumPy, the module skips. A run with skips is not evidence
-that the complete matrix passed; inspect the skip reasons with `-rs`.
+Expected results depend on the checked-out revision. With NumPy, a loadable
+sqlite-vec extension, and the bundled Hermes package:
+
+| Revision | Complete result | Without the Hermes package |
+| --- | --- | --- |
+| Current PR matrix | **17 passed** (16 Core cases + 1 Hermes helper) | 16 passed, 1 skipped |
+| Historical `ac3229013ea72d7e0edda0d3685eaf3c8db7ed49` | **13 passed** (12 Core cases + 1 Hermes helper) | 12 passed, 1 skipped |
+
+No environment variable or separate fixture archive is required. Without a
+loadable sqlite-vec extension, the native WM arms skip. Without NumPy, the
+module skips. A run with skips is not evidence that the complete matrix passed;
+inspect the skip reasons with `-rs`.
 
 For a source-tree run without editable installation of the Hermes package,
 on a POSIX shell use the relative import path:
