@@ -88,7 +88,7 @@ def test_typed_walk_cost_ignores_unrelated_edges(graph):
 def test_typed_walk_matches_a_scan_in_insertion_order(graph, seed):
     rng = random.Random(seed)
     nodes = [f"n{i}" for i in range(12)]
-    edges = [(rng.choice(nodes), rng.choice(nodes), rng.choice(["ctx", "ctx", "ctx", "rel"]),
+    edges = [(rng.choice(nodes), rng.choice(nodes), rng.choice(["ctx", "ctx", "ctx", "rel", "CTX"]),
               rng.choice([0.1, 0.3, 0.5, 0.9])) for _ in range(40)]
     edges = [e for e in edges if e[0] != e[1]]
     _add(graph, edges)
@@ -97,6 +97,13 @@ def test_typed_walk_matches_a_scan_in_insertion_order(graph, seed):
     got = graph.find_related_memories(start, depth=depth, edge_type="ctx", min_weight=min_weight)
 
     assert got == _reference_walk(edges, start, depth, "ctx", min_weight)
+
+
+def test_non_string_edge_type_still_matches(graph):
+    # The tool handler passes edge_type through uncoerced.
+    _add(graph, [("a", "b", "5", 1.0)])
+
+    assert [r["memory_id"] for r in graph.find_related_memories("a", depth=1, edge_type=5)] == ["b"]
 
 
 def test_shared_neighbour_is_claimed_by_the_earliest_edge(graph):
