@@ -71,7 +71,7 @@ has cosine 0.95, and the summary is orthogonal. These values isolate contract
 boundaries, not model quality.
 Entity extraction is disabled during storage.
 
-The tests then establish three outcomes, each under linear/polyphonic recall
+The tests then establish four outcomes, each under linear/polyphonic recall
 and native-WM-index/JSON-WM configurations:
 
 - The original reaches a wider candidate call through explicit `source='fact'`,
