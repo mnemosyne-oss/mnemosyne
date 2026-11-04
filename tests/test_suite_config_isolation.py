@@ -125,6 +125,22 @@ def test_next_test_gets_clean_defaults():
 @pytest.mark.parametrize("suite", ["tests", "integrations/hermes/tests", "both"])
 def test_checkout_named_mnemosyne_does_not_load_plugin_as_core(tmp_path, suite):
     """CI's checkout basename must not let root plugin packaging shadow Core."""
+    result = _run_checkout_probe(tmp_path, suite)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("suite", ["tests", "integrations/hermes/tests", "both"])
+def test_collection_rejects_precached_ambient_singleton(tmp_path, suite):
+    """A preload before pytest.main must be detected during collection."""
+    result = _run_checkout_probe(tmp_path, suite, preload_config=True)
+    output = result.stdout + result.stderr
+    assert result.returncode == 2, output
+    assert "AssertionError: cached collection config escaped isolation" in output
+    assert "during collection" in output
+
+
+def _run_checkout_probe(tmp_path, suite, *, preload_config=False):
+    """Run real suite setup with a synthetic ambient profile in a fresh child."""
     project = tmp_path / "checkouts" / "mnemosyne"
     project.mkdir(parents=True)
     (project / "integrations").mkdir()
@@ -191,9 +207,19 @@ def test_checkout_named_mnemosyne_does_not_load_plugin_as_core(tmp_path, suite):
         environment.pop("USERPROFILE")
         drive, tail = os.path.splitdrive(str(ambient))
         environment.update(HOMEDRIVE=drive, HOMEPATH=tail)
+    preload = (
+        "from pathlib import Path\n"
+        "from mnemosyne.core.config import get_config\n"
+        "cached = get_config()\n"
+        "assert cached.config_path == Path(os.environ['MNEMOSYNE_DATA_DIR']) / 'config.yaml'\n"
+        "assert cached.get_bool('cross_session') is True\n"
+        "assert cached.get('default_scope') == 'global'\n"
+        if preload_config else ""
+    )
     code = (
         "import os, pytest, sys\n"
-        "keys = ('HOME', 'USERPROFILE', 'HERMES_HOME', 'MNEMOSYNE_DATA_DIR', 'HOMEDRIVE', 'HOMEPATH')\n"
+        + preload
+        + "keys = ('HOME', 'USERPROFILE', 'HERMES_HOME', 'MNEMOSYNE_DATA_DIR', 'HOMEDRIVE', 'HOMEPATH')\n"
         "previous = {key: os.environ.get(key) for key in keys}\n"
         f"result = pytest.main({['-q', *suites]!r})\n"
         "assert {key: os.environ.get(key) for key in keys} == previous\n"
@@ -203,4 +229,4 @@ def test_checkout_named_mnemosyne_does_not_load_plugin_as_core(tmp_path, suite):
         [sys.executable, "-c", code],
         cwd=project, env=environment, text=True, capture_output=True, timeout=60,
     )
-    assert result.returncode == 0, result.stdout + result.stderr
+    return result
