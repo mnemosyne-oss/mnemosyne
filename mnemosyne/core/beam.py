@@ -3079,7 +3079,18 @@ def _recency_decay(timestamp_str: str, halflife_hours: float = RECENCY_HALFLIFE_
     try:
         ts = _parse_iso_datetime_utc(timestamp_str)
         age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
-        return math.exp(-age_hours / halflife_hours)
+        # A stored timestamp can never be in the future, so the age cannot be negative and the
+        # factor cannot exceed 1.0. It can nonetheless *compute* above 1.0: pre-round-4 producers
+        # stamped naive LOCAL wall time (see the producer-contract note above
+        # ``_parse_iso_datetime_utc``), and those rows are read as UTC, which places them
+        # `utcoffset` hours in the future — measured 1.055 at UTC+9. decay feeds the score as a
+        # multiplier, so >1.0 silently *rewards* a row for being misdated.
+        #
+        # Clamp the AGE, not the result: `math.exp` overflows to OverflowError once the exponent
+        # passes ~709, and a far-future timestamp would then fall into the handler below and
+        # report the neutral 0.5 instead of 1.0. max(age, 0) saturates exactly at 1.0 and cannot
+        # overflow, for any halflife.
+        return math.exp(-max(age_hours, 0.0) / halflife_hours)
     except Exception:
         return 0.5
 
