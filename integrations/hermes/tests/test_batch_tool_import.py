@@ -29,3 +29,13 @@ def test_importing_hermes_plugin_does_not_import_batch_tool():
         return
     imported = [name for name in absent if name in sys.modules]
     assert not imported, imported
+
+
+def test_package_getattr_still_imports_cli_submodule():
+    sys.path.insert(0, str(SRC))
+    sys.modules.pop("mnemosyne_hermes.cli", None)
+    provider = importlib.import_module("mnemosyne_hermes")
+    provider.__dict__.pop("cli", None)
+    module = provider.cli
+    assert module.__name__ == "mnemosyne_hermes.cli"
+    assert "mnemosyne.batch_tool" not in sys.modules

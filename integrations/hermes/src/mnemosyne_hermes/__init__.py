@@ -29,6 +29,7 @@ if sys.platform in {"android", "emscripten"} or (
     )
 
 from contextlib import contextmanager, nullcontext
+import importlib
 import json
 import logging
 import math
@@ -279,9 +280,18 @@ def _load_batch_tool():
 
 
 def __getattr__(name):
-    if name not in _BATCH_EXPORTS:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    return dict(zip(_BATCH_EXPORTS, _load_batch_tool()))[name]
+    if name in _BATCH_EXPORTS:
+        return dict(zip(_BATCH_EXPORTS, _load_batch_tool()))[name]
+    # A package __getattr__ runs before implicit submodule import. Delegate
+    # so mnemosyne_hermes.cli still loads; only a missing submodule is an
+    # attribute error.
+    fullname = f"{__name__}.{name}"
+    try:
+        return importlib.import_module(fullname)
+    except ModuleNotFoundError as exc:
+        if exc.name != fullname:
+            raise
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
 
 try:
     from mnemosyne.hermes_config import read_hermes_config_key
