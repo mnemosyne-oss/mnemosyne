@@ -76,6 +76,37 @@ class _NoConflictRedirects(HTTPRedirectHandler):
         return None
 
 
+def _conflict_request_options() -> dict:
+    """Use explicit provider options, retaining the conflict-check default."""
+    raw_tokens = os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "").strip()
+    max_tokens = 512
+    if raw_tokens:
+        try:
+            max_tokens = int(raw_tokens)
+            if max_tokens <= 0:
+                raise ValueError
+        except ValueError:
+            logger.warning("Conflict detection: invalid MNEMOSYNE_LLM_MAX_TOKENS; using 512.")
+            max_tokens = 512
+    options = {"max_tokens": max_tokens}
+    raw_body = os.environ.get("MNEMOSYNE_LLM_EXTRA_BODY", "").strip()
+    if not raw_body:
+        return options
+    try:
+        extra = json.loads(raw_body)
+    except ValueError:
+        logger.warning("Conflict detection: invalid MNEMOSYNE_LLM_EXTRA_BODY; ignoring it.")
+        return options
+    if not isinstance(extra, dict):
+        logger.warning("Conflict detection: MNEMOSYNE_LLM_EXTRA_BODY must be an object; ignoring it.")
+        return options
+    reserved = {"messages", "model", "stream"}
+    if reserved.intersection(extra):
+        logger.warning("Conflict detection: reserved fields in MNEMOSYNE_LLM_EXTRA_BODY were ignored.")
+    options.update({key: value for key, value in extra.items() if key not in reserved})
+    return options
+
+
 def _call_conflict_llm_with_retry(
     prompt: str, *, deadline: Optional[float] = None,
 ) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
@@ -110,6 +141,8 @@ def _call_conflict_llm_with_retry(
         "temperature": 0.0,
         "response_format": {"type": "json_object"} if "gemini" in CONFLICT_LLM_MODEL.lower() or "gpt" in CONFLICT_LLM_MODEL.lower() else None
     }
+
+    payload.update(_conflict_request_options())
 
     max_retries = 2
     backoff_factor = 2.0
