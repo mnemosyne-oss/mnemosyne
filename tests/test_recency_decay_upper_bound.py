@@ -13,8 +13,11 @@ explicitly rather than by manipulating TZ.
 """
 from datetime import datetime, timedelta, timezone
 
+import math
+
 import pytest
 
+from mnemosyne.core import beam as beam_module
 from mnemosyne.core.beam import _recency_decay
 
 
@@ -83,3 +86,52 @@ def test_ordinary_curve_unchanged():
 def test_unknown_timestamp_is_still_neutral():
     assert _recency_decay("") == 0.5
     assert _recency_decay("not-a-timestamp") == 0.5
+
+
+FROZEN_NOW = datetime(2026, 3, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+class _FrozenDateTime(datetime):
+    """A ``datetime`` whose ``now()`` is pinned, so expected values can be exact."""
+
+    @classmethod
+    def now(cls, tz=None):
+        if tz is None:
+            return FROZEN_NOW.replace(tzinfo=None)
+        return FROZEN_NOW.astimezone(tz)
+
+
+@pytest.fixture
+def frozen_clock(monkeypatch):
+    monkeypatch.setattr(beam_module, "datetime", _FrozenDateTime)
+    return FROZEN_NOW
+
+
+@pytest.mark.parametrize("age_minutes", [0, 5, 30, 60, 360, 720])
+def test_short_positive_ages_match_the_exponential_curve(frozen_clock, age_minutes):
+    """Pin the near-1.0 band, where a "collapse present/past to 0.5" regression hides.
+
+    A mutation that caps only present and past values at the neutral 0.5 fallback, leaving
+    future timestamps at 1.0 and the old tail curve intact, still passes every other test in
+    this file: the bound is satisfied, the sweep stays monotone, and the one-halflife tail
+    assertion (0.36-0.38) is untouched. Exact frozen values in the 0.93-1.0 band do not.
+    """
+    stamp = FROZEN_NOW - timedelta(minutes=age_minutes)
+    expected = math.exp(-(age_minutes / 60.0) / 168.0)
+    got = _recency_decay(_naive_utc(stamp))
+    assert got == pytest.approx(expected, rel=1e-9), (got, expected)
+    assert got > 0.9, (
+        f"a row {age_minutes} minutes old must sit near 1.0; got {got:.6f} "
+        "(0.5 is the unknown-age fallback, not a decay value)"
+    )
+
+
+def test_zero_age_is_exactly_one(frozen_clock):
+    assert _recency_decay(_naive_utc(FROZEN_NOW)) == 1.0
+
+
+def test_future_row_is_exactly_one(frozen_clock):
+    """The legacy local-naive case with the clock pinned, so saturation is exact."""
+    for offset_hours in (1, 9, 14):
+        stamp = FROZEN_NOW + timedelta(hours=offset_hours)
+        assert _recency_decay(_naive_utc(stamp)) == 1.0
