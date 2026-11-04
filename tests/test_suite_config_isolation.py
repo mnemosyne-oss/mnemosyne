@@ -12,8 +12,14 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize("inherited_overrides", [False, True], ids=["plain-env", "scope-overrides"])
 @pytest.mark.parametrize("ambient_source", ["home", "hermes_home", "data_dir", "windows_home"])
-def test_ambient_quality_profile_cannot_change_collection_or_test_defaults(tmp_path, ambient_source):
+def test_ambient_quality_profile_cannot_change_collection_or_test_defaults(
+    tmp_path, monkeypatch, ambient_source, inherited_overrides,
+):
+    if inherited_overrides:
+        monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION", "true")
+        monkeypatch.setenv("MNEMOSYNE_DEFAULT_SCOPE", "global")
     developer = tmp_path / "developer"
     hermes = developer / ".hermes"
     data = tmp_path / "external-data"
@@ -100,6 +106,8 @@ def test_next_test_gets_clean_defaults():
     environment.update(HOME=str(developer), USERPROFILE=str(developer), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     environment.pop("MNEMOSYNE_DATA_DIR", None)
     environment.pop("HERMES_HOME", None)
+    environment.pop("MNEMOSYNE_CROSS_SESSION", None)
+    environment.pop("MNEMOSYNE_DEFAULT_SCOPE", None)
     if ambient_source == "hermes_home":
         environment["HERMES_HOME"] = str(hermes)
     elif ambient_source == "data_dir":
@@ -135,8 +143,19 @@ def test_checkout_named_mnemosyne_does_not_load_plugin_as_core(tmp_path, suite):
         if source.exists():
             shutil.copyfile(source, directory / "conftest.py")
         filename = "test_core_imports.py" if name == "tests" else "test_hermes_imports.py"
+        # An absent incoming USERPROFILE must not let the drive fallback
+        # escape the collection-time isolation before function fixtures run.
+        collection_probe = (
+            "from pathlib import Path\n"
+            "import os\n"
+            "import ntpath\n"
+            "Path.home = classmethod(lambda cls: cls(ntpath.expanduser('~')))\n"
+            "assert Path.home() == Path(os.environ['HOME']), 'collection home escaped isolation'\n"
+            if suite == "tests" else ""
+        )
         (directory / filename).write_text(
-            "from mnemosyne.integrations import hermes_persona_prompt, auto_save_openwebui\n"
+            collection_probe
+            + "from mnemosyne.integrations import hermes_persona_prompt, auto_save_openwebui\n"
             "def test_core_integrations_are_importable():\n"
             "    assert hermes_persona_prompt.HermesPersonaPromptMixin\n"
             "    assert callable(auto_save_openwebui.main)\n",
@@ -151,7 +170,7 @@ def test_checkout_named_mnemosyne_does_not_load_plugin_as_core(tmp_path, suite):
         environment.update(HOMEDRIVE=drive, HOMEPATH=tail)
     code = (
         "import os, pytest, sys\n"
-        "keys = ('HOME', 'USERPROFILE', 'HERMES_HOME', 'MNEMOSYNE_DATA_DIR')\n"
+        "keys = ('HOME', 'USERPROFILE', 'HERMES_HOME', 'MNEMOSYNE_DATA_DIR', 'HOMEDRIVE', 'HOMEPATH')\n"
         "previous = {key: os.environ.get(key) for key in keys}\n"
         f"result = pytest.main({['-q', *suites]!r})\n"
         "assert {key: os.environ.get(key) for key in keys} == previous\n"
