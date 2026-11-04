@@ -18,6 +18,13 @@ def test_cap_change_recomputes_real_ranking_including_persisted_cache(tmp_path, 
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_URL", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDINGS_VIA_API", raising=False)
+
+    def unexpected_api(*args, **kwargs):
+        pytest.fail("local ranking test dispatched to the API")
+
+    monkeypatch.setattr(embeddings, "_embed_api", unexpected_api)
     for name in ("MNEMOSYNE_EMBEDDING_MAX_CHARS", "MNEMOSYNE_EMBEDDING_MAX_BYTES"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_QUERY_PREFIX", "")
