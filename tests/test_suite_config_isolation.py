@@ -135,6 +135,12 @@ def test_checkout_named_mnemosyne_does_not_load_plugin_as_core(tmp_path, suite):
     if helper.exists():
         (project / "tests").mkdir(exist_ok=True)
         shutil.copyfile(helper, project / "tests" / "_config_isolation.py")
+    ambient = tmp_path / "ambient-profile"
+    for config_dir in (ambient / ".hermes" / "mnemosyne", ambient / "data"):
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.yaml").write_text(
+            "cross_session: true\ndefault_scope: global\n", encoding="utf-8",
+        )
     suites = ["tests", "integrations/hermes/tests"] if suite == "both" else [suite]
     for name in suites:
         directory = project / name
@@ -143,15 +149,25 @@ def test_checkout_named_mnemosyne_does_not_load_plugin_as_core(tmp_path, suite):
         if source.exists():
             shutil.copyfile(source, directory / "conftest.py")
         filename = "test_core_imports.py" if name == "tests" else "test_hermes_imports.py"
-        # An absent incoming USERPROFILE must not let the drive fallback
-        # escape the collection-time isolation before function fixtures run.
+        # Probe before function fixtures can hide a missing suite configure hook.
+        # The ntpath rule also covers an absent incoming USERPROFILE on POSIX.
         collection_probe = (
             "from pathlib import Path\n"
             "import os\n"
             "import ntpath\n"
+            "from mnemosyne.core.config import get_config, MnemosyneConfig\n"
             "Path.home = classmethod(lambda cls: cls(ntpath.expanduser('~')))\n"
-            "assert Path.home() == Path(os.environ['HOME']), 'collection home escaped isolation'\n"
-            if suite == "tests" else ""
+            "home = Path(os.environ['HOME'])\n"
+            f"assert home != Path({str(ambient)!r}), 'collection home escaped isolation'\n"
+            "assert Path.home() == home\n"
+            "assert Path(os.environ['USERPROFILE']) == home\n"
+            "assert Path(os.environ['HERMES_HOME']) == home / '.hermes'\n"
+            "data = Path(os.environ['MNEMOSYNE_DATA_DIR'])\n"
+            "assert data == home / 'data'\n"
+            "MnemosyneConfig.reset_instance()\n"
+            "assert get_config().config_path == data / 'config.yaml'\n"
+            "assert get_config().get_bool('cross_session') is False\n"
+            "assert get_config().get('default_scope', 'session') == 'session'\n"
         )
         (directory / filename).write_text(
             collection_probe
@@ -163,10 +179,15 @@ def test_checkout_named_mnemosyne_does_not_load_plugin_as_core(tmp_path, suite):
         )
     environment = os.environ.copy()
     environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
-    environment["USERPROFILE"] = str(tmp_path / "ambient-profile")
+    environment.update(
+        HOME=str(ambient), USERPROFILE=str(ambient),
+        HERMES_HOME=str(ambient / ".hermes"), MNEMOSYNE_DATA_DIR=str(ambient / "data"),
+    )
+    environment.pop("MNEMOSYNE_CROSS_SESSION", None)
+    environment.pop("MNEMOSYNE_DEFAULT_SCOPE", None)
     if suite == "tests":
         environment.pop("USERPROFILE")
-        drive, tail = os.path.splitdrive(str(tmp_path / "ambient-profile"))
+        drive, tail = os.path.splitdrive(str(ambient))
         environment.update(HOMEDRIVE=drive, HOMEPATH=tail)
     code = (
         "import os, pytest, sys\n"
