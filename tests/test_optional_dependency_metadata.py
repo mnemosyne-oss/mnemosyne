@@ -20,8 +20,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 # The unconditional cap everywhere except macOS x86_64, and the narrow one that platform gets.
-ONNXRUNTIME_DEFAULT = "onnxruntime>=1.21.0,<1.29; sys_platform != 'darwin' or platform_machine != 'x86_64'"
-ONNXRUNTIME_MACOS_INTEL = "onnxruntime>=1.21.0,<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'"
+_WHEEL_SYSTEMS = "(platform_system == 'Linux' or platform_system == 'Darwin' or platform_system == 'Windows')"
+ONNXRUNTIME_DEFAULT = (
+    "onnxruntime>=1.21.0,<1.29; (sys_platform != 'darwin' or platform_machine != 'x86_64') and "
+    + _WHEEL_SYSTEMS
+)
+ONNXRUNTIME_MACOS_INTEL = (
+    "onnxruntime>=1.21.0,<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64' and "
+    + _WHEEL_SYSTEMS
+)
 ONNXRUNTIME_REQUIREMENTS = (ONNXRUNTIME_DEFAULT, ONNXRUNTIME_MACOS_INTEL)
 EXPECTED_EXTRAS = {"embeddings", "all"}
 
@@ -105,18 +112,18 @@ def test_the_two_markers_partition_every_platform():
     macos_intel = Marker(ONNXRUNTIME_MACOS_INTEL.split(";", 1)[1])
 
     platforms = [
-        {"sys_platform": "darwin", "platform_machine": "x86_64"},
-        {"sys_platform": "darwin", "platform_machine": "arm64"},
-        {"sys_platform": "linux", "platform_machine": "x86_64"},
-        {"sys_platform": "linux", "platform_machine": "aarch64"},
-        {"sys_platform": "win32", "platform_machine": "AMD64"},
+        {"sys_platform": "darwin", "platform_machine": "x86_64", "platform_system": "Darwin"},
+        {"sys_platform": "darwin", "platform_machine": "arm64", "platform_system": "Darwin"},
+        {"sys_platform": "linux", "platform_machine": "x86_64", "platform_system": "Linux"},
+        {"sys_platform": "linux", "platform_machine": "aarch64", "platform_system": "Linux"},
+        {"sys_platform": "win32", "platform_machine": "AMD64", "platform_system": "Windows"},
     ]
     for environment in platforms:
         assert universal.evaluate(environment) != macos_intel.evaluate(environment), environment
 
     # The narrower bound is only ever active on the platform that needs it.
     assert macos_intel.evaluate(
-        {"sys_platform": "darwin", "platform_machine": "x86_64"}
+        {"sys_platform": "darwin", "platform_machine": "x86_64", "platform_system": "Darwin"}
     )
     for environment in platforms[1:]:
         assert not macos_intel.evaluate(environment), environment
@@ -166,7 +173,7 @@ def test_swapped_bounds_would_still_break_an_intel_mac():
     from packaging.version import Version
 
     versions_without_an_x86_wheel = ("1.24.0", "1.25.0", "1.26.0", "1.27.0", "1.28.0")
-    env = {"sys_platform": "darwin", "platform_machine": "x86_64"}
+    env = {"sys_platform": "darwin", "platform_machine": "x86_64", "platform_system": "Darwin"}
     swapped_applies = "onnxruntime>=1.21.0,<1.29; sys_platform == 'darwin' and platform_machine == 'x86_64'"
 
     def admits_uninstallable(requirement: str) -> list[str]:
@@ -196,8 +203,8 @@ def test_nothing_applicable_on_macos_intel_lacks_a_wheel():
     from packaging.version import Version
 
     UNWHEELED = ("1.24.0", "1.25.0", "1.26.0", "1.27.0", "1.28.0")
-    MACOS_INTEL = {"sys_platform": "darwin", "platform_machine": "x86_64"}
-    LINUX = {"sys_platform": "linux", "platform_machine": "x86_64"}
+    MACOS_INTEL = {"sys_platform": "darwin", "platform_machine": "x86_64", "platform_system": "Darwin"}
+    LINUX = {"sys_platform": "linux", "platform_machine": "x86_64", "platform_system": "Linux"}
 
     def admits_unwheeled(environment):
         parsed = [Requirement(r) for r in _shipped_onnxruntime_requirements()]
@@ -225,7 +232,7 @@ def test_swapping_the_bounds_would_reintroduce_the_defect():
     from packaging.version import Version
 
     UNWHEELED = ("1.24.0", "1.25.0", "1.26.0", "1.27.0", "1.28.0")
-    MACOS_INTEL = {"sys_platform": "darwin", "platform_machine": "x86_64"}
+    MACOS_INTEL = {"sys_platform": "darwin", "platform_machine": "x86_64", "platform_system": "Darwin"}
     narrow = f"onnxruntime>=1.21.0,<1.24; {ONNXRUNTIME_MACOS_INTEL.split(';', 1)[1]}"
     wide = f"onnxruntime>=1.21.0,<1.29; {ONNXRUNTIME_MACOS_INTEL.split(';', 1)[1]}"
 
@@ -235,6 +242,49 @@ def test_swapping_the_bounds_would_reintroduce_the_defect():
     assert Marker(str(Requirement(narrow).marker)).evaluate(MACOS_INTEL)
     assert admits(narrow) == []
     assert admits(wide) == list(UNWHEELED)
+
+
+def test_openbsd_does_not_select_unpublished_native_extras():
+    """OpenBSD's sys.platform is openbsdN. Gate on platform.system(), not that string.
+
+    These packages publish no OpenBSD wheel, and PyPI's cryptography build rejects
+    this interpreter. Lexical memory must still be installable.
+    """
+    from packaging.markers import Marker
+    from packaging.requirements import Requirement
+
+    native = (
+        "onnxruntime",
+        "fastembed",
+        "sqlite-vec",
+        "llama-cpp-python",
+        "ctransformers",
+        "cryptography",
+    )
+    openbsd = {
+        "sys_platform": "openbsd8",
+        "platform_machine": "amd64",
+        "platform_system": "OpenBSD",
+    }
+    linux = {
+        "sys_platform": "linux",
+        "platform_machine": "x86_64",
+        "platform_system": "Linux",
+    }
+    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    block = text.split("[project.optional-dependencies]", 1)[1].split("\n[", 1)[0]
+    declared = [Requirement(item) for item in re.findall(r'"([^"]+)"', block)]
+    selected = [item for item in declared if item.name in native]
+    assert {item.name for item in selected} == set(native)
+    for item in selected:
+        assert item.marker is not None, item
+        assert not Marker(str(item.marker)).evaluate(openbsd), item
+    for name in native:
+        applicable = [
+            item for item in selected
+            if item.name == name and Marker(str(item.marker)).evaluate(linux)
+        ]
+        assert applicable, name
 
 
 if __name__ == "__main__":
