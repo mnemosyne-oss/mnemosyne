@@ -411,7 +411,10 @@ When you install via pipx, the package registers two entry points:
 - `hermes_agent.memory_providers` - discovered by Hermes' `discover_memory_providers()`
   so `hermes memory status` sees it as an installed plugin
 - `hermes_agent.plugins` - discovered by Hermes' `PluginManager` for tool and
-  CLI registration
+  CLI registration. The target is `_mnemosyne_hermes_plugin:register`, a module
+  that does not import Mnemosyne. Hermes loads that target while resolving model
+  providers; `register(ctx)` imports the provider package only when PluginManager
+  actually calls it.
 
 Hermes checks pipx-installed packages alongside directory-based plugins. No
 extra setup steps needed.
