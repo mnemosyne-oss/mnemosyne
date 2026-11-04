@@ -130,7 +130,7 @@ def test_unreadable_marker_bypasses_enhanced_cache_without_log_spam(
     )
 
 
-@pytest.mark.parametrize("previous_version", [6, 7, 8, 9, 10, 11, 12, 13])
+@pytest.mark.parametrize("previous_version", [6, 7, 8, 9, 10, 11, 12, 13, 14])
 def test_cache_version_bump_invalidates_prior_candidate_and_cap_entries(
     enhanced, monkeypatch, tmp_path: Path, previous_version: int
 ):
@@ -142,7 +142,8 @@ def test_cache_version_bump_invalidates_prior_candidate_and_cap_entries(
     polyphonic session scope before voice limits, and version 11 predates
     hash-independent polyphonic order. Version 12 predates veracity and
     memory_type filters before voice limits. Version 13 predates hydration of
-    the first eligible tier. The ``v2:`` key prefix stays fixed
+    the first eligible tier. Version 14 predates bind-budget-independent
+    linear candidate ordering. The ``v2:`` key prefix stays fixed
     for QueryCache's opaque-key path.
     """
     memory, calls = enhanced
