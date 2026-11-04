@@ -12,7 +12,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize("ambient_source", ["home", "hermes_home", "data_dir"])
+@pytest.mark.parametrize("ambient_source", ["home", "hermes_home", "data_dir", "windows_home"])
 def test_ambient_quality_profile_cannot_change_collection_or_test_defaults(tmp_path, ambient_source):
     developer = tmp_path / "developer"
     hermes = developer / ".hermes"
@@ -35,6 +35,12 @@ def test_ambient_quality_profile_cannot_change_collection_or_test_defaults(tmp_p
     (project / "test_probe.py").write_text(
         '''from pathlib import Path
 import os
+import ntpath
+
+# Exercise the Windows stdlib home-selection rule on every test platform.
+if __WINDOWS_HOME__:
+    Path.home = classmethod(lambda cls: cls(ntpath.expanduser("~")))
+
 from mnemosyne.core.config import get_config, MnemosyneConfig
 from mnemosyne.core.beam import BeamMemory
 
@@ -43,6 +49,7 @@ def assert_isolated_fallback_paths():
     data = Path(os.environ["MNEMOSYNE_DATA_DIR"])
     hermes = Path(os.environ["HERMES_HOME"])
     home = Path(os.environ["HOME"])
+    assert Path.home() == home
     try:
         for expected in (data / "config.yaml", hermes / "mnemosyne" / "config.yaml", home / ".hermes" / "mnemosyne" / "config.yaml"):
             MnemosyneConfig.reset_instance()
@@ -87,10 +94,10 @@ def test_explicit_test_configuration_is_honored(tmp_path, monkeypatch):
 def test_next_test_gets_clean_defaults():
     assert get_config().get_bool("cross_session") is False
     assert get_config().get("default_scope", "session") == "session"
-''', encoding="utf-8",
+'''.replace("__WINDOWS_HOME__", repr(ambient_source == "windows_home")), encoding="utf-8",
     )
     environment = os.environ.copy()
-    environment.update(HOME=str(developer), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
+    environment.update(HOME=str(developer), USERPROFILE=str(developer), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     environment.pop("MNEMOSYNE_DATA_DIR", None)
     environment.pop("HERMES_HOME", None)
     if ambient_source == "hermes_home":
@@ -137,9 +144,14 @@ def test_checkout_named_mnemosyne_does_not_load_plugin_as_core(tmp_path, suite):
         )
     environment = os.environ.copy()
     environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    environment["USERPROFILE"] = str(tmp_path / "ambient-profile")
+    if suite == "tests":
+        environment.pop("USERPROFILE")
+        drive, tail = os.path.splitdrive(str(tmp_path / "ambient-profile"))
+        environment.update(HOMEDRIVE=drive, HOMEPATH=tail)
     code = (
         "import os, pytest, sys\n"
-        "keys = ('HOME', 'HERMES_HOME', 'MNEMOSYNE_DATA_DIR')\n"
+        "keys = ('HOME', 'USERPROFILE', 'HERMES_HOME', 'MNEMOSYNE_DATA_DIR')\n"
         "previous = {key: os.environ.get(key) for key in keys}\n"
         f"result = pytest.main({['-q', *suites]!r})\n"
         "assert {key: os.environ.get(key) for key in keys} == previous\n"
