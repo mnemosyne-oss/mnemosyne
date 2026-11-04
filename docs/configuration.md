@@ -12,7 +12,15 @@ Mnemosyne is designed to work with zero configuration. All settings have sensibl
 | `MNEMOSYNE_EMBEDDING_MAX_BYTES` | unset (disabled) | Optional per-input **UTF-8 byte** cap on API and local fastembed inputs, applied after `MNEMOSYNE_EMBEDDING_MAX_CHARS`. It counts the complete prefixed input. The cut never splits a character, lone surrogates are dropped, and truncations are logged without input content. An input the cap would reduce to nothing raises an error rather than sending an empty request. `0`, a negative value, a blank value or an unparsable value disables it; an unparsable value is logged. UTF-8 bytes bound the input itself for byte-level BPE tokenizers but not tokens added by an endpoint or ONNX memory use. |
 | `MNEMOSYNE_JOURNAL_MODE` | `wal` | SQLite journal mode for store connections (the sync client reuses the beam connection, so it inherits the mode too). Valid: `delete`, `truncate`, `persist`, `memory`, `wal`, `off`; the value is trimmed and lower-cased, unset or blank falls back to `wal`, and non-blank invalid values warn and fall back to `wal`. Only `wal` persists in the database file; other modes are per-connection and revert to SQLite's default (`delete`) on reopen, so each connection re-applies the mode. `memory` and `off` remove disk-backed rollback protection and can corrupt the database after a crash. See README for the virtiofs motivation. |
 
+API embedding endpoints require NumPy in the Mnemosyne interpreter, independently of FastEmbed. Install it with `python -m pip install numpy`. If it cannot be imported, diagnostics report embeddings unavailable and direct embedding calls raise a dependency error before sending input. A later successful import restores API embeddings without a restart.
+
 > **Privacy:** embeddings go to a remote API whenever `MNEMOSYNE_EMBEDDING_API_URL` points at a custom (non-OpenRouter) endpoint, the model name is API-shaped (`openai/*`, `text-embedding*`), or `MNEMOSYNE_EMBEDDINGS_VIA_API` is truthy (the last two are what route on the OpenRouter default; no custom URL set means the OpenRouter default); that service receives the text of your memories and of your recall queries for vectorization. For privacy-sensitive or local-first deployments prefer local embeddings (the `[embeddings]` / `[all]` install profiles).
+
+Changing either input cap changes future query and document embeddings only.
+Existing stored document vectors are not regenerated. Reindex the affected
+bank after changing caps when consistent query/document input policy is needed.
+The enhanced-recall cache tracks both effective caps; changing either cannot
+reuse a result ranked under the previous policy.
 
 ## Data Directory
 

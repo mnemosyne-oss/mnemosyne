@@ -386,6 +386,8 @@ for gates, conservative reservation and cost-logging limits.
 | `mnemosyne-memory[all]` | Full-featured -- local embeddings + local LLM consolidation | ~1.5 GB | Adds `sentence-transformers` + local LLM deps (`ctransformers`). Maximum capability. |
 | `mnemosyne-hermes` | Hermes Agent users -- always pair with one of the above | Same as base | Wraps core library with plugin manifest + entry points; degrades instead of exiting on core init errors. Run `hermes config set memory.provider mnemosyne` after install. |
 
+API embeddings require NumPy in the interpreter running Mnemosyne. For an API-only installation, use `python -m pip install mnemosyne-memory numpy` (or add `numpy` alongside `mnemosyne-memory[mcp]`). FastEmbed and a local model are not required. Missing or broken NumPy is reported before any embedding request; after installing or repairing it, calls can retry without restarting.
+
 **Hardware guidance:** Core alone runs on a Raspberry Pi 4 (4 GB) with ~300 MB free for LLM. `[embeddings]` needs at least 2 GB free RAM. `[all]` recommends 8 GB+.
 
 For optional per-input character and UTF-8 byte limits on both local and API embeddings, see [embedding input caps](docs/configuration.md#custom-embedding-endpoint). These caps default to off and do not guarantee a local inference memory ceiling.

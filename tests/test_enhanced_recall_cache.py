@@ -130,7 +130,7 @@ def test_unreadable_marker_bypasses_enhanced_cache_without_log_spam(
     )
 
 
-@pytest.mark.parametrize("previous_version", [6, 7, 8, 9, 10, 11, 12, 13])
+@pytest.mark.parametrize("previous_version", [6, 7, 8, 9, 10, 11, 12, 13, 14])
 def test_cache_version_bump_invalidates_prior_candidate_and_cap_entries(
     enhanced, monkeypatch, tmp_path: Path, previous_version: int
 ):
@@ -142,7 +142,8 @@ def test_cache_version_bump_invalidates_prior_candidate_and_cap_entries(
     polyphonic session scope before voice limits, and version 11 predates
     hash-independent polyphonic order. Version 12 predates veracity and
     memory_type filters before voice limits. Version 13 predates hydration of
-    the first eligible tier. The ``v2:`` key prefix stays fixed
+    the first eligible tier. Version 14 predates bind-budget-independent
+    linear candidate ordering. The ``v2:`` key prefix stays fixed
     for QueryCache's opaque-key path.
     """
     memory, calls = enhanced
@@ -1787,3 +1788,25 @@ def test_sleep_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
         assert len(recall_calls) == 1  # recomputed, not served from cache
     finally:
         _close_memory(memory)
+
+
+def test_input_cap_cache_generation_rejects_previous_main_results(enhanced, monkeypatch):
+    memory, calls = enhanced
+    with monkeypatch.context() as context:
+        context.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 15)
+        stale = _call(memory)
+    assert memory._ENHANCED_RECALL_CACHE_VERSION >= 16
+    fresh = _call(memory)
+    assert len(calls) == 2
+    assert fresh[0]["id"] != stale[0]["id"]
+
+
+@pytest.mark.parametrize("cap", ["MNEMOSYNE_EMBEDDING_MAX_CHARS", "MNEMOSYNE_EMBEDDING_MAX_BYTES"])
+def test_disabled_cap_values_share_effective_outer_cache_policy(enhanced, monkeypatch, cap):
+    memory, calls = enhanced
+    monkeypatch.delenv(cap, raising=False)
+    first = _call(memory)
+    for value in ("0", "-1", "", "invalid"):
+        monkeypatch.setenv(cap, value)
+        assert _call(memory) == first
+    assert len(calls) == 1

@@ -510,13 +510,19 @@ def _build_mcp_server() -> Server:
                 tool_name = candidate_name
             result = handle_tool_call(tool_name, params.arguments or {})
             content = [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
-            error_code = result.get("error") if isinstance(result, dict) else None
-            is_error = (
-                isinstance(result, dict)
-                and result.get("status") == "error"
-                and type(error_code) is str
-                and error_code in {"batch_validation_failed", "batch_failed"}
-            )
+            if tool_name == "mnemosyne_batch":
+                # Preserve the batch envelope's deliberately narrow contract.
+                error_code = result.get("error") if isinstance(result, dict) else None
+                is_error = (
+                    isinstance(result, dict)
+                    and result.get("status") == "error"
+                    and type(error_code) is str
+                    and error_code in {"batch_validation_failed", "batch_failed"}
+                )
+            else:
+                is_error = isinstance(result, dict) and (
+                    "error" in result or result.get("status") == "failed"
+                )
             return CallToolResult(content=content, is_error=is_error)
         except Exception as e:
             if tool_name == "mnemosyne_batch":
