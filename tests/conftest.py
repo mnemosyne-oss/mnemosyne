@@ -108,7 +108,7 @@ def _close_cached_connections():
 
 
 @pytest.fixture
-def _before_connection_reset():
+def _before_connection_reset(_isolated_mnemosyne_config):
     """Overridable hook for setup that must precede connection imports."""
 
 
