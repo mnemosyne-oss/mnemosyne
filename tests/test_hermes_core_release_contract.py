@@ -25,6 +25,7 @@ CORE_INIT = ROOT / "mnemosyne" / "__init__.py"
 STANDALONE_PROJECT = ROOT / "integrations" / "hermes" / "pyproject.toml"
 CATALOG_PROJECT = ROOT / "integrations" / "hermes-catalog" / "pyproject.toml"
 STANDALONE_CORE_FLOOR = "4.0.0"
+CATALOG_CORE_FLOOR = "4.0.0"
 LEGACY_HERMES_MANIFEST = ROOT / "integrations" / "hermes" / "plugin.yaml"
 CORE_HERMES_MANIFEST = ROOT / "hermes_memory_provider" / "plugin.yaml"
 REQUIRED_CORE_API = (
@@ -85,7 +86,7 @@ def test_hermes_packages_require_their_supported_core_api_release() -> None:
     for project, floor, groups in (
         (STANDALONE_PROJECT, STANDALONE_CORE_FLOOR,
          {"base": "embeddings", "llm": "llm", "mcp": "mcp", "all": "all"}),
-        (CATALOG_PROJECT, core_version, {"base": "embeddings"}),
+        (CATALOG_PROJECT, CATALOG_CORE_FLOOR, {"base": "embeddings"}),
     ):
         requirements = _mnemosyne_memory_specs(project)
         for group, extra in groups.items():
