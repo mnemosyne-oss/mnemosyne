@@ -20,6 +20,7 @@ def test_ambient_quality_profile_cannot_change_collection_or_test_defaults(
     if inherited_overrides:
         monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION", "true")
         monkeypatch.setenv("MNEMOSYNE_DEFAULT_SCOPE", "global")
+        monkeypatch.setenv("PYTEST_ADDOPTS", "--collect-only")
     developer = tmp_path / "developer"
     hermes = developer / ".hermes"
     data = tmp_path / "external-data"
@@ -103,6 +104,7 @@ def test_next_test_gets_clean_defaults():
 '''.replace("__WINDOWS_HOME__", repr(ambient_source == "windows_home")), encoding="utf-8",
     )
     environment = os.environ.copy()
+    environment.pop("PYTEST_ADDOPTS", None)
     environment.update(HOME=str(developer), USERPROFILE=str(developer), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     environment.pop("MNEMOSYNE_DATA_DIR", None)
     environment.pop("HERMES_HOME", None)
@@ -117,6 +119,7 @@ def test_next_test_gets_clean_defaults():
         cwd=project, env=environment, text=True, capture_output=True, timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    assert "3 passed" in result.stdout, result.stdout + result.stderr
     # The synthetic developer profiles must remain intact.
     assert "cross_session: true" in (hermes / "mnemosyne" / "config.yaml").read_text()
     assert "cross_session: true" in (data / "config.yaml").read_text()
@@ -130,8 +133,9 @@ def test_checkout_named_mnemosyne_does_not_load_plugin_as_core(tmp_path, suite):
 
 
 @pytest.mark.parametrize("suite", ["tests", "integrations/hermes/tests", "both"])
-def test_collection_rejects_precached_ambient_singleton(tmp_path, suite):
+def test_collection_rejects_precached_ambient_singleton(tmp_path, monkeypatch, suite):
     """A preload before pytest.main must be detected during collection."""
+    monkeypatch.setenv("PYTEST_ADDOPTS", "--continue-on-collection-errors")
     result = _run_checkout_probe(tmp_path, suite, preload_config=True)
     output = result.stdout + result.stderr
     assert result.returncode == 2, output
@@ -196,6 +200,7 @@ def _run_checkout_probe(tmp_path, suite, *, preload_config=False):
             encoding="utf-8",
         )
     environment = os.environ.copy()
+    environment.pop("PYTEST_ADDOPTS", None)
     environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     environment.update(
         HOME=str(ambient), USERPROFILE=str(ambient),
