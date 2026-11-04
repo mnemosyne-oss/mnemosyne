@@ -155,7 +155,7 @@ def test_checkout_named_mnemosyne_does_not_load_plugin_as_core(tmp_path, suite):
             "from pathlib import Path\n"
             "import os\n"
             "import ntpath\n"
-            "from mnemosyne.core.config import get_config, MnemosyneConfig\n"
+            "from mnemosyne.core.config import get_config\n"
             "Path.home = classmethod(lambda cls: cls(ntpath.expanduser('~')))\n"
             "home = Path(os.environ['HOME'])\n"
             f"assert home != Path({str(ambient)!r}), 'collection home escaped isolation'\n"
@@ -164,10 +164,12 @@ def test_checkout_named_mnemosyne_does_not_load_plugin_as_core(tmp_path, suite):
             "assert Path(os.environ['HERMES_HOME']) == home / '.hermes'\n"
             "data = Path(os.environ['MNEMOSYNE_DATA_DIR'])\n"
             "assert data == home / 'data'\n"
-            "MnemosyneConfig.reset_instance()\n"
-            "assert get_config().config_path == data / 'config.yaml'\n"
-            "assert get_config().get_bool('cross_session') is False\n"
-            "assert get_config().get('default_scope', 'session') == 'session'\n"
+            # Inspect the existing singleton before any reset can hide an
+            # ambient configuration read during conftest import.
+            "config = get_config()\n"
+            "assert config.config_path == data / 'config.yaml', 'cached collection config escaped isolation'\n"
+            "assert config.get_bool('cross_session') is False\n"
+            "assert config.get('default_scope', 'session') == 'session'\n"
         )
         (directory / filename).write_text(
             collection_probe
