@@ -1,11 +1,10 @@
 """Tests for lazy import self-healing in mnemosyne.core.embeddings.
 
-Root cause (already proven): ``np`` and ``TextEmbedding`` are bound at import
-time, and ``_FASTEMBED_AVAILABLE`` is evaluated once at import. When
-``mnemosyne.core.embeddings`` is imported during a window where the dense stack
-is unreachable (the Hermes plugin-loader import window, or a venv without the
-embeddings extra), both globals bind to None and ``available()`` returns False
-for the whole process lifetime, even after the stack becomes importable.
+``TextEmbedding`` is not imported with this module: fastembed pulls onnxruntime,
+and most processes never construct a local model. ``_ensure_fastembed()`` binds
+it on first use. If that first attempt fails because the dense stack is
+unreachable, ``available()`` must retry later rather than staying False for the
+process lifetime. ``_FASTEMBED_AVAILABLE`` remains a frozen legacy alias.
 
 These tests pin four behaviours:
 1. ``available()`` re-attempts the import when the globals are empty, so dense
@@ -273,3 +272,25 @@ def test_embed_query_recovers_without_calling_available(isolated_embeddings, tmp
         sys.path[:] = original_path
         if previous_modules is not None:
             _restore_stub_dense_stack(previous_modules)
+
+
+def test_importing_embeddings_does_not_import_fastembed():
+    """Module import must not pull onnxruntime. First use still binds TextEmbedding."""
+    sys.modules.pop("fastembed", None)
+    blocked = []
+    original_import = builtins.__import__
+
+    def spy(name, *args, **kwargs):
+        if name == "fastembed" or name.startswith("fastembed."):
+            blocked.append(name)
+            raise AssertionError("fastembed imported during embeddings import")
+        return original_import(name, *args, **kwargs)
+
+    builtins.__import__ = spy
+    try:
+        importlib.reload(embeddings)
+    finally:
+        builtins.__import__ = original_import
+    assert blocked == []
+    assert embeddings.TextEmbedding is None
+    assert "fastembed" not in sys.modules
