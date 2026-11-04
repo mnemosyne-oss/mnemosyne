@@ -189,44 +189,74 @@ except Exception as _tool_schema_import_exc:  # pragma: no cover - broken instal
     )
     ALL_TOOL_SCHEMAS = []
 
-try:
-    from mnemosyne.batch_tool import (
+_batch_tool = None
+
+
+def _load_batch_tool():
+    """Import batch helpers on first batch call, not when the plugin module loads.
+
+    ``mnemosyne.batch_tool`` imports the beam and the embedding stack. Doing that
+    at module scope makes every Hermes process that loads this plugin pay for
+    fastembed before any batch tool is called.
+    """
+    global _batch_tool
+    if _batch_tool is not None:
+        return _batch_tool
+    try:
+        from mnemosyne.batch_tool import (
+            BatchValidationError,
+            apply_beam_batch,
+            batch_validation_error_payload,
+            dry_run_batch,
+            validate_batch_operations,
+        )
+    except Exception as exc:  # pragma: no cover - broken install diagnostic path
+        logging.getLogger(__name__).warning(
+            "mnemosyne_batch helpers unavailable (%s); batch tool calls will return an error until mnemosyne-memory is upgraded.",
+            exc,
+        )
+
+        class BatchValidationError(ValueError):
+            """Fallback validation error used when mnemosyne.batch_tool is unavailable."""
+
+        def validate_batch_operations(_operations):
+            raise BatchValidationError("mnemosyne_batch is unavailable; upgrade mnemosyne-memory")
+
+        def batch_validation_error_payload(_exc: Exception) -> Dict[str, Any]:
+            return {
+                "status": "error",
+                "error": "batch_validation_failed",
+                "failed_index": None,
+                "action": None,
+            }
+
+        def dry_run_batch(_operations):
+            return {"status": "error", "error": "mnemosyne_batch is unavailable; upgrade mnemosyne-memory"}
+
+        def apply_beam_batch(*_args, **_kwargs):
+            return {
+                "status": "error",
+                "error": "batch_failed",
+                "failed_index": None,
+                "action": None,
+            }
+
+        _batch_tool = (
+            BatchValidationError,
+            validate_batch_operations,
+            batch_validation_error_payload,
+            dry_run_batch,
+            apply_beam_batch,
+        )
+        return _batch_tool
+    _batch_tool = (
         BatchValidationError,
-        apply_beam_batch,
+        validate_batch_operations,
         batch_validation_error_payload,
         dry_run_batch,
-        validate_batch_operations,
+        apply_beam_batch,
     )
-except Exception as _batch_tool_import_exc:  # pragma: no cover - broken install diagnostic path
-    logging.getLogger(__name__).warning(
-        "mnemosyne_batch helpers unavailable (%s); batch tool calls will return an error until mnemosyne-memory is upgraded.",
-        _batch_tool_import_exc,
-    )
-
-    class BatchValidationError(ValueError):
-        """Fallback validation error used when mnemosyne.batch_tool is unavailable."""
-
-    def validate_batch_operations(_operations):
-        raise BatchValidationError("mnemosyne_batch is unavailable; upgrade mnemosyne-memory")
-
-    def batch_validation_error_payload(_exc: Exception) -> Dict[str, Any]:
-        return {
-            "status": "error",
-            "error": "batch_validation_failed",
-            "failed_index": None,
-            "action": None,
-        }
-
-    def dry_run_batch(_operations):
-        return {"status": "error", "error": "mnemosyne_batch is unavailable; upgrade mnemosyne-memory"}
-
-    def apply_beam_batch(*_args, **_kwargs):
-        return {
-            "status": "error",
-            "error": "batch_failed",
-            "failed_index": None,
-            "action": None,
-        }
+    return _batch_tool
 
 try:
     from mnemosyne.hermes_config import read_hermes_config_key
@@ -3654,6 +3684,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         })
 
     def _handle_batch(self, args: Dict[str, Any]) -> str:
+        (
+            BatchValidationError,
+            validate_batch_operations,
+            batch_validation_error_payload,
+            dry_run_batch,
+            apply_beam_batch,
+        ) = _load_batch_tool()
         try:
             normalized = validate_batch_operations(args.get("operations"))
         except BatchValidationError as exc:

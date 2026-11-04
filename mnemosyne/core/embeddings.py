@@ -38,10 +38,9 @@ warnings.filterwarnings(
     message=".*multilingual-e5-large.*now uses mean pooling.*",
 )
 
-try:
-    from fastembed import TextEmbedding
-except Exception:
-    TextEmbedding = None
+# Do not import fastembed here. It pulls onnxruntime and is only needed when a
+# local embedding model is constructed. _ensure_fastembed() binds TextEmbedding.
+TextEmbedding = None
 
 # Module-level import guard. While True (during module load) a failed dense-stack
 # import does not emit its one-time warning; the warning is deferred to the
@@ -180,8 +179,9 @@ def _is_fastembed_available() -> bool:
     return _ensure_fastembed()
 
 # Backward-compatible alias for legacy users who import this constant.
-# Use _is_fastembed_available() in new code — it re-evaluates on each call.
-_FASTEMBED_AVAILABLE = _is_fastembed_available()
+# Frozen legacy alias. Evaluating the probe here would import fastembed at
+# module import. New code calls _is_fastembed_available().
+_FASTEMBED_AVAILABLE = False
 _IMPORTING = False
 # Allow CI / scripted environments to redirect the fastembed cache to a
 # stable path that can be restored by actions/cache. Defaults to
