@@ -382,7 +382,7 @@ for gates, conservative reservation and cost-logging limits.
 | Profile | When to use | RAM | Key tradeoff |
 |---------|-------------|-----|-------------|
 | `mnemosyne-memory` (core) | Low-resource (Raspberry Pi, 1 GB VPS), or when using a remote embedding API | ~50 MB | No local embeddings. Point `MNEMOSYNE_EMBEDDING_API_URL` to an external endpoint, and set `MNEMOSYNE_EMBEDDING_DIM` for models not in the built-in table (else direct startup fails loudly). |
-| `mnemosyne-memory[embeddings]` | Mid-range systems with local embedding support | ~800 MB | Adds `fastembed` for local vector generation. Best for single-user desktop agents. |
+| `mnemosyne-memory[embeddings]` | Mid-range systems with local embedding support | ~800 MB | Adds `fastembed` for local vector generation. Best for single-user desktop agents. Selected only where wheels are published (Linux, macOS, Windows); other systems keep the lexical core. |
 | `mnemosyne-memory[all]` | Full-featured -- local embeddings + local LLM consolidation | ~1.5 GB | Adds `sentence-transformers` + local LLM deps (`ctransformers`). Maximum capability. |
 | `mnemosyne-hermes` | Hermes Agent users -- always pair with one of the above | Same as base | Wraps core library with plugin manifest + entry points; degrades instead of exiting on core init errors. Run `hermes config set memory.provider mnemosyne` after install. |
 
