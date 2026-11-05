@@ -5,9 +5,74 @@ from datetime import datetime, timezone
 
 import pytest
 
-from mnemosyne.core.beam import _polyphonic_scope_where
+from mnemosyne.core.beam import BeamMemory, _polyphonic_scope_where
 from mnemosyne.core.episodic_graph import EpisodicGraph, Fact, Gist, GraphEdge
 from mnemosyne.core.polyphonic_recall import PolyphonicRecallEngine
+
+
+@pytest.mark.parametrize("tier", ["working", "episodic"])
+@pytest.mark.parametrize("seed_kind", ["gist", "fact"])
+@pytest.mark.parametrize("query", ["Alice then Bob", "Bob then Alice"])
+@pytest.mark.parametrize("state", ["active", "future", "expired", "superseded", "foreign", "split-evidence"])
+def test_scoped_graph_seed_needs_visibility_and_validity_on_same_row(
+    tmp_path, monkeypatch, tier, seed_kind, query, state
+):
+    """An invalid one-hop seed must not displace an active two-hop route."""
+    for voice in ("VECTOR", "TEMPORAL", "FACT"):
+        monkeypatch.setenv(f"MNEMOSYNE_VOICE_{voice}", "0")
+    beam = BeamMemory(session_id="a", db_path=tmp_path / "active-seeds.db")
+    graph = EpisodicGraph(db_path=beam.db_path, conn=beam.conn)
+    ts = datetime.now(timezone.utc).isoformat()
+
+    def row(table, mid, *, session="a", until=None, superseded=None):
+        beam.conn.execute(
+            f"INSERT INTO {table}_memory "
+            "(id, content, source, timestamp, session_id, scope, valid_until, superseded_by) "
+            "VALUES (?, ?, 'test', ?, ?, 'session', ?, ?)",
+            (mid, f"content for {mid}", ts, session, until, superseded),
+        )
+
+    for mid in ("Alice", "middle", "target"):
+        row("working", mid)
+    row(tier, "Bob", session="b" if state == "foreign" else "a",
+        until="2000-01-01T00:00:00Z" if state in ("expired", "split-evidence") else (
+            "2999-01-01T00:00:00Z" if state == "future" else None),
+        superseded="Alice" if state == "superseded" else None)
+    other = "episodic" if tier == "working" else "working"
+    if state == "split-evidence":
+        row(other, "Bob", session="b")
+    elif state == "future":
+        # An invalid, foreign twin must not veto an eligible backing row.
+        row(other, "Bob", session="b", superseded="Alice")
+    for name in ("Alice", "Bob"):
+        if seed_kind == "gist":
+            graph.store_gist(Gist(f"gist_{name}", name, ts, [name], None, None, None), name)
+        else:
+            graph.store_fact(Fact(f"fact_seed_{name}", name, "uses", "Python", ts, 0.9), name)
+    for source, target in (("Alice", "middle"), ("middle", "target"), ("Bob", "target")):
+        graph.add_edge(GraphEdge(source, target, "ctx", 0.9, ts))
+    beam.conn.commit()
+    engine = PolyphonicRecallEngine(db_path=beam.db_path, conn=beam.conn)
+    scope_where, scope_params = _polyphonic_scope_where(session_id="a", cross_session=False)
+    expected_seed = "Bob" if state in ("active", "future") else "Alice"
+    expected_depth = 1 if expected_seed == "Bob" else 2
+    try:
+        raw = engine._graph_voice(query, scope_where=scope_where, scope_params=scope_params)
+        target = next(r for r in raw if r.memory_id == "target")
+        assert target.metadata["seed"] == expected_seed
+        assert target.metadata["depth"] == expected_depth
+        assert target.score == pytest.approx(0.4 if expected_seed == "Bob" else 0.2)
+        final = engine.recall(query, scope_where=scope_where, scope_params=scope_params)
+        target = next(r for r in final if r.memory_id == "target")
+        assert target.metadata["seed"] == expected_seed
+        assert target.metadata["depth"] == expected_depth
+        assert target.content == "content for target"
+        if expected_seed == "Alice":
+            assert "Bob" not in {r.memory_id for r in final}
+        unscoped = engine._graph_voice(query)
+        assert next(r for r in unscoped if r.memory_id == "target").metadata["seed"] == "Bob"
+    finally:
+        beam.conn.close()
 
 
 @pytest.mark.parametrize("query", ["Alice then Bob", "Bob then Alice"])

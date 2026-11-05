@@ -881,11 +881,11 @@ class PolyphonicRecallEngine:
         if scope_where is not None and seed_ids:
             # Gists/facts have no shared scope column. Resolve their derived
             # memory IDs against both backing tiers before they can influence
-            # traversal or fusion. Use the same any-tier eligibility check as
-            # the final fused prune, including its missing-tier handling and
-            # SQL error propagation. Unscoped standalone calls are unchanged.
+            # traversal or fusion. Visibility and active validity must hold
+            # on the same backing row; two ineligible tier copies cannot
+            # supply one half each. Unscoped standalone calls are unchanged.
             eligible = {mid: PolyphonicResult(mid, 0.0, {}, {}) for mid in seed_ids}
-            self._drop_out_of_scope(eligible, scope_where, scope_params)
+            self._drop_out_of_scope(eligible, scope_where, scope_params, require_active=True)
             seed_ids = {mid: None for mid in seed_ids if mid in eligible}
             results = [result for result in results if result.memory_id in seed_ids]
 
@@ -1085,7 +1085,8 @@ class PolyphonicRecallEngine:
         return list(dict.fromkeys(entities))
     
     def _drop_out_of_scope(self, results: Dict[str, PolyphonicResult],
-                           scope_where: str, scope_params: Sequence[Any]) -> None:
+                           scope_where: str, scope_params: Sequence[Any], *,
+                           require_active: bool = False) -> None:
         """Remove memories outside the caller's scope before the fused cut.
 
         Graph and fact hits come from stores with no session column, so they
@@ -1093,6 +1094,9 @@ class PolyphonicRecallEngine:
         any tier holding it is in scope. Ids with no memory row in either tier
         (consolidated facts, gists) are removed too: BeamMemory can only
         resolve memory rows, so they would hold a slot and then be discarded.
+        Graph seeds additionally require an unsuperseded, unexpired backing
+        row in that same scope. Minimal standalone schemas without validity
+        columns retain their existing visibility-only behavior.
         """
         if not results:
             return
@@ -1108,6 +1112,7 @@ class PolyphonicRecallEngine:
         try:
             memory_ids = tuple(results)
             in_scope, out_of_scope = set(), set()
+            now_iso = datetime.now(timezone.utc).isoformat()
             for table in ("working_memory", "episodic_memory"):
                 # A standalone engine may point at a store without one of the
                 # tiers; any other failure must surface, or foreign rows would
@@ -1116,14 +1121,23 @@ class PolyphonicRecallEngine:
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
                 ).fetchone() is None:
                     continue
+                visible = f"({scope_where})"
+                visible_params = list(scope_params)
+                if require_active:
+                    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                    if "superseded_by" in columns:
+                        visible += " AND superseded_by IS NULL"
+                    if "valid_until" in columns:
+                        visible += " AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))"
+                        visible_params.append(now_iso)
                 # Chunked under SQLite's bound-variable limit, as the vec scans do.
                 for offset in range(0, len(memory_ids), 900):
                     chunk = memory_ids[offset : offset + 900]
                     placeholders = ", ".join("?" for _ in chunk)
                     rows = conn.execute(
-                        f"SELECT id, ({scope_where}) AS visible FROM {table} "
+                        f"SELECT id, ({visible}) AS visible FROM {table} "
                         f"WHERE id IN ({placeholders})",
-                        (*scope_params, *chunk),
+                        (*visible_params, *chunk),
                     ).fetchall()
                     for row in rows:
                         (in_scope if row["visible"] else out_of_scope).add(row["id"])
