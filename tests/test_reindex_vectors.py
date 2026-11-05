@@ -597,6 +597,82 @@ def test_reindex_reports_a_held_write_lock_before_any_embedding(tmp_path, monkey
     assert not beam.conn.in_transaction
 
 @pytest.mark.skipif(_mib is None, reason="binary episodic writer unavailable")
+@pytest.mark.parametrize("factory_kind", ["tuple", "row", "dict"])
+@pytest.mark.parametrize("connection_kind", ["beam", "bare"])
+@pytest.mark.parametrize("use_vec", [True, False])
+@pytest.mark.parametrize("callback_error", [None, RuntimeError, KeyboardInterrupt])
+def test_reindex_progress_keeps_callers_row_factory(
+    tmp_path, monkeypatch, factory_kind, connection_kind, use_vec, callback_error
+):
+    """Progress queries use the caller's rows, including when progress aborts."""
+    beam = _reindex_fixture_beam(tmp_path, working=1, episodic=1)
+    conn = beam.conn
+    if use_vec and not beam_module._vec_available(conn):
+        pytest.skip("sqlite-vec unavailable")
+    if connection_kind == "bare":
+        conn.close()
+        conn = sqlite3.connect(str(tmp_path / "m.db"))
+        if use_vec:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+    if not use_vec:
+        monkeypatch.setattr(beam_module, "_vec_available", lambda _conn: False)
+        monkeypatch.setattr(beam_module, "_wm_vec_available", lambda _conn: False)
+    factory = {
+        "tuple": None,
+        "row": sqlite3.Row,
+        "dict": lambda cursor, row: dict(zip((col[0] for col in cursor.description), row)),
+    }[factory_kind]
+    conn.row_factory = factory
+    seen_texts = []
+    seen_progress = []
+
+    def embed(contents):
+        seen_texts.extend(contents)
+        return [[0.1] * E.EMBEDDING_DIM for _ in contents]
+
+    def progress(store, done, total):
+        assert conn.row_factory is factory
+        row = conn.execute("SELECT 1 AS probe").fetchone()
+        if factory_kind == "dict":
+            assert row.get("probe") == 1
+        elif factory_kind == "row":
+            assert row["probe"] == 1
+        else:
+            assert row == (1,)
+        seen_progress.append((store, done, total))
+        if callback_error:
+            raise callback_error("progress interrupted")
+
+    monkeypatch.setattr(E, "available", lambda: True)
+    monkeypatch.setattr(E, "embed", embed)
+    try:
+        if callback_error:
+            with pytest.raises(callback_error, match="progress interrupted"):
+                reindex_vectors(conn, batch_size=1, progress=progress)
+        else:
+            plan = reindex_vectors(conn, batch_size=1, progress=progress)
+            assert plan["status"] == "reindexed"
+            assert seen_progress == [("working_memory", 1, 1), ("episodic_memory", 1, 1)]
+            assert seen_texts == ["working source 0", "episodic source 0"]
+        assert conn.row_factory is factory
+        conn.row_factory = None
+        assert conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0] == (
+            0 if callback_error else 1
+        )
+        assert conn.execute(
+            "SELECT binary_vector IS NOT NULL FROM episodic_memory"
+        ).fetchone()[0] == (0 if callback_error else 1)
+        if use_vec:
+            for table in ("vec_working", "vec_episodes"):
+                assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == (
+                    0 if callback_error else 1
+                )
+    finally:
+        conn.close()
+
+
 def test_reindex_works_with_a_bare_sqlite3_connect_row_factory_unset(
     tmp_path, monkeypatch
 ):
@@ -605,9 +681,9 @@ def test_reindex_works_with_a_bare_sqlite3_connect_row_factory_unset(
     ``reindex_vectors``, which indexes rows by column name. Before the fix the
     first ``working_memory`` embedding batch crashed with
     ``TypeError: tuple indices must be integers or slices, not str`` AFTER the
-    vec tables had already been dropped and recreated empty — leaving the DB in
-    a half-rebuilt state. reindex_vectors now adopts sqlite3.Row indexing itself
-    when the caller left the factory unset.
+    vec tables had already been dropped and recreated inside the rebuild's
+    transaction, which is rolled back on failure. reindex_vectors now adopts
+    sqlite3.Row indexing internally when the caller left the factory unset.
     """
     import mnemosyne.core.beam as beam_module
 
