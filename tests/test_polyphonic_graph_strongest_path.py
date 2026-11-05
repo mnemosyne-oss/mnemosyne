@@ -49,7 +49,8 @@ def test_scoped_graph_seed_needs_visibility_and_validity_on_same_row(
             graph.store_gist(Gist(f"gist_{name}", name, ts, [name], None, None, None), name)
         else:
             graph.store_fact(Fact(f"fact_seed_{name}", name, "uses", "Python", ts, 0.9), name)
-    for source, target in (("Alice", "middle"), ("middle", "target"), ("Bob", "target")):
+    for source, target in (("Alice", "middle"), ("middle", "target"),
+                           ("Bob", "target"), ("Alice", "Bob")):
         graph.add_edge(GraphEdge(source, target, "ctx", 0.9, ts))
     beam.conn.commit()
     engine = PolyphonicRecallEngine(db_path=beam.db_path, conn=beam.conn)
@@ -62,6 +63,9 @@ def test_scoped_graph_seed_needs_visibility_and_validity_on_same_row(
         assert target.metadata["seed"] == expected_seed
         assert target.metadata["depth"] == expected_depth
         assert target.score == pytest.approx(0.4 if expected_seed == "Bob" else 0.2)
+        # Every discovered seed stays excluded as an output, even if its
+        # backing row was removed from the eligible traversal sources.
+        assert not any(r.memory_id == "Bob" and r.voice == "graph_traversal" for r in raw)
         final = engine.recall(query, scope_where=scope_where, scope_params=scope_params)
         target = next(r for r in final if r.memory_id == "target")
         assert target.metadata["seed"] == expected_seed

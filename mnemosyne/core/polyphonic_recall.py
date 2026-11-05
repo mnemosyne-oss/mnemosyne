@@ -878,6 +878,8 @@ class PolyphonicRecallEngine:
                     metadata={"entity": entity, "fact": f"{fact.subject} {fact.predicate} {fact.object}"}
                 ))
 
+        # Pruned seeds cannot become output rows through another seed's walk.
+        seed_exclusion_ids = set(seed_ids)
         if scope_where is not None and seed_ids:
             # Gists/facts have no shared scope column. Resolve their derived
             # memory IDs against both backing tiers before they can influence
@@ -899,7 +901,7 @@ class PolyphonicRecallEngine:
             )
             for rel in related:
                 mid = rel["memory_id"]
-                if mid in seed_ids:
+                if mid in seed_exclusion_ids:
                     continue
                 score = 0.4 / rel["depth"]  # Score decays with hop distance
                 previous = traversed.get(mid)
