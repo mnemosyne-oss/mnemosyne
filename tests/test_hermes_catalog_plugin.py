@@ -106,7 +106,7 @@ def test_wrapper_pyproject_declares_the_package_and_is_not_a_distribution():
     deps = {req.name: req for req in map(Requirement, data["project"]["dependencies"])}
     provider, core = deps["mnemosyne-hermes"], deps["mnemosyne-memory"]
     assert str(provider.specifier) == "<0.8,>=0.7.7"
-    assert str(core.specifier) == ">=4.0.0" and core.extras == {"embeddings"}
+    assert str(core.specifier) == ">=4.0.1" and core.extras == {"embeddings"}
     assert provider.marker is not None and core.marker is not None
     assert str(provider.marker) == str(core.marker)
     for platform in ("android", "emscripten", "linux", "darwin", "win32"):
