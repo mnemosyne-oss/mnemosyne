@@ -186,6 +186,11 @@ def _norm_pair(a: str, b: str) -> tuple:
     return (a, b) if a <= b else (b, a)
 
 
+# A foreign SQLite lock must not consume the session-end sleep budget.
+# An unreadable candidate is reported and makes the measured bound fail closed.
+_CENSUS_READ_TIMEOUT = 0.05
+
+
 def _read_bank(bank: Path) -> Optional[Dict[str, Any]]:
     """Read one bank's conflict rows.
 
@@ -195,7 +200,9 @@ def _read_bank(bank: Path) -> Optional[Dict[str, Any]]:
     of aborting the census. The connection is opened ``mode=ro`` — a
     read-only URI that SQLite refuses to write through.
     """
-    connection = sqlite3.connect(f"{bank.as_uri()}?mode=ro", uri=True)
+    connection = sqlite3.connect(
+        f"{bank.as_uri()}?mode=ro", uri=True, timeout=_CENSUS_READ_TIMEOUT
+    )
     try:
         if not connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conflicts'"
