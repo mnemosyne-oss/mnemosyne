@@ -3082,9 +3082,11 @@ def _recency_decay(timestamp_str: str, halflife_hours: float = RECENCY_HALFLIFE_
         # A stored timestamp can never be in the future, so the age cannot be negative and the
         # factor cannot exceed 1.0. It can nonetheless *compute* above 1.0: pre-round-4 producers
         # stamped naive LOCAL wall time (see the producer-contract note above
-        # ``_parse_iso_datetime_utc``), and those rows are read as UTC, which places them
-        # `utcoffset` hours in the future — measured 1.055 at UTC+9. decay feeds the score as a
-        # multiplier, so >1.0 silently *rewards* a row for being misdated.
+        # ``_parse_iso_datetime_utc``), and those rows are read as UTC, which shifts them by the
+        # host offset — on a host with a POSITIVE offset that places them `utcoffset` hours in the
+        # future (measured 1.055 at UTC+9). A negative offset does not produce a bonus; it makes
+        # the row read older and is penalised twice. decay feeds the score as a multiplier, so
+        # >1.0 silently *rewards* a row for being misdated.
         #
         # Clamp the AGE, not the result: `math.exp` overflows to OverflowError once the exponent
         # passes ~709, and a far-future timestamp would then fall into the handler below and
@@ -11199,7 +11201,10 @@ class BeamMemory:
     # 16: _recency_decay clamps the AGE, so a legacy local-naive row that reads
     # as future-dated no longer scores above 1.0. Generation 15 entries hold the
     # inflated score for exactly those rows, so they must not survive the change.
-    # Generation 16 is also claimed by #1275; whichever lands second takes 17.
+    # Generation 16 is also claimed by #1275, #1308 and #1315. Whichever change
+    # lands first takes 16; each later independently merged semantic change takes
+    # the next generation that is actually free in the integration history at that
+    # point — not a number reserved here, since another change may consume it first.
     _ENHANCED_RECALL_CACHE_VERSION = 16
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version

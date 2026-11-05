@@ -1795,12 +1795,17 @@ def test_sleep_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
 def test_warm_persistent_cache_does_not_serve_a_pre_clamp_score(monkeypatch, tmp_path: Path):
     """A generation-15 entry holding an inflated score must be recomputed, not served.
 
-    Legacy local-naive rows read as future-dated on a non-UTC host, so the pre-clamp decay
-    returned above 1.0 and that value was written into the persistent enhanced-recall cache.
-    The clamp changes the score without changing the query, so the cache generation is the
-    only thing that can invalidate the entry. Reproduced across a restart over the same
-    QueryCache database: the pre-clamp score must not survive it, or a warm cache keeps
+    Legacy local-naive rows read as future-dated on a host with a positive UTC offset, so the
+    pre-clamp decay returned above 1.0 and that value was written into the persistent
+    enhanced-recall cache. The clamp changes the score without changing the query, so the cache
+    generation is the only thing that can invalidate the entry. Reproduced across a restart over
+    the same QueryCache database: the pre-clamp score must not survive it, or a warm cache keeps
     serving the bonus until the entry expires.
+
+    The assertions are about observed cache behaviour rather than about the version constant, so
+    that neither a cache which stops persisting nor one which stops reading can satisfy them: the
+    stale entry must be on disk and retrievable under its own key, the restarted instance must
+    miss, and the second of two identical requests must not run recall again.
     """
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setattr(
@@ -1812,16 +1817,29 @@ def test_warm_persistent_cache_does_not_serve_a_pre_clamp_score(monkeypatch, tmp
     ).replace(tzinfo=None).isoformat()
     cache_path = tmp_path / "query_cache.db"
 
-    def build_memory(decay):
+    def build_memory(decay, seen_keys=None, calls=None):
         memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
         memory._query_cache = QueryCache(db_path=cache_path)
+        if calls is None:
+            calls = []
 
         def fake_recall(query, top_k=40, **kwargs):
+            calls.append(query)
             return [
                 {"id": "legacy-future-row", "content": query, "score": decay(legacy_stamp)}
             ]
 
         memory.recall = fake_recall
+
+        if seen_keys is not None:
+            real_get_opaque = memory._query_cache.get_opaque
+
+            def spy_get_opaque(key):
+                value = real_get_opaque(key)
+                seen_keys.append((key, value is not None))
+                return value
+
+            memory._query_cache.get_opaque = spy_get_opaque
         return memory
 
     def release(memory: BeamMemory) -> None:
@@ -1844,23 +1862,58 @@ def test_warm_persistent_cache_does_not_serve_a_pre_clamp_score(monkeypatch, tmp
         return math.exp(-age_hours / halflife_hours)
 
     # Generation 15 + pre-clamp scoring: the entry is written holding the bonus.
+    stale_keys: list = []
     with monkeypatch.context() as ctx:
         ctx.setattr(BeamMemory, "_ENHANCED_RECALL_CACHE_VERSION", 15)
-        stale = build_memory(pre_clamp_decay)
+        stale = build_memory(pre_clamp_decay, stale_keys)
         try:
             stale_score = ask(stale)[0]["score"]
         finally:
             release(stale)
     assert stale_score > 1.0, f"setup did not reproduce the pre-clamp bonus: {stale_score}"
+    assert [hit for _key, hit in stale_keys] == [False], (
+        f"the cold generation-15 request was expected to miss once, got {stale_keys}"
+    )
+    stale_key = stale_keys[-1][0]
+
+    # The stale entry must be on disk and retrievable under its own key, or the restart below
+    # would pass for the wrong reason: a cache holding nothing never serves anything.
+    probe = QueryCache(db_path=cache_path)
+    try:
+        assert probe.stats()["size"] >= 1, "the generation-15 entry was not persisted"
+        assert probe.get_opaque(stale_key) is not None, (
+            "the generation-15 entry is not retrievable from the restarted cache database"
+        )
+    finally:
+        probe.close()
 
     # Restart over the same persistent cache with the clamped decay.
-    fresh = build_memory(beam_module._recency_decay)
+    fresh_keys: list = []
+    fresh_calls: list = []
+    fresh = build_memory(beam_module._recency_decay, fresh_keys, fresh_calls)
     try:
         corrected = ask(fresh)[0]["score"]
+        calls_after_first = len(fresh_calls)
+        repeats = ask(fresh)[0]["score"]
     finally:
         release(fresh)
 
+    fresh_key = fresh_keys[0][0]
+    assert fresh_key != stale_key, (
+        "the cache key did not change between generations, so the stale entry could still be served"
+    )
+    assert [hit for _key, hit in fresh_keys] == [False, True], (
+        "expected the first generation-16 request to miss and the second to hit; got "
+        f"{[hit for _key, hit in fresh_keys]}"
+    )
     assert corrected == pytest.approx(1.0), (
         f"the warm cache served {corrected!r} instead of recomputing; generation 16 must "
         "invalidate entries written under the pre-clamp ranking"
+    )
+    assert repeats == pytest.approx(corrected)
+    assert calls_after_first >= 1
+    assert len(fresh_calls) == calls_after_first, (
+        f"recall ran {len(fresh_calls)} times across two identical requests "
+        f"({calls_after_first} after the first); the second request must be a cache hit, "
+        "otherwise a cache that never reads would pass this test"
     )
