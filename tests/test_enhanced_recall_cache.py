@@ -142,9 +142,9 @@ def test_cache_version_bump_invalidates_prior_candidate_and_cap_entries(
     polyphonic session scope before voice limits, and version 11 predates
     hash-independent polyphonic order. Version 12 predates veracity and
     memory_type filters before voice limits. Version 13 predates hydration of
-    the first eligible tier. Version 14 predates the strongest-path fix;
-    version 15 is shared with open PR #1275 and predates scoped seed
-    eligibility. The ``v2:`` key prefix stays fixed
+    the first eligible tier. Version 14 predates bind-budget-independent
+    linear candidate ordering. Version 15 predates strongest-path selection
+    and scoped active-seed eligibility. The ``v2:`` key prefix stays fixed
     for QueryCache's opaque-key path.
     """
     memory, calls = enhanced

@@ -132,6 +132,41 @@ def _ensure_fastembed() -> bool:
         return True
 
 
+_API_NUMPY_WARNED = False
+_API_NUMPY_RETRY_AT = 0.0
+_API_NUMPY_ERROR = (
+    "API embeddings require NumPy, which is unavailable or could not be imported. "
+    "Install or repair it in the interpreter running Mnemosyne: python -m pip install numpy."
+)
+
+
+def _ensure_api_numpy() -> bool:
+    """Retry NumPy independently of the optional local FastEmbed backend."""
+    global np, _API_NUMPY_WARNED, _API_NUMPY_RETRY_AT
+    if np is not None:
+        return True
+    with _DENSE_STACK_LOCK:
+        if np is not None:
+            return True
+        if time.monotonic() < _API_NUMPY_RETRY_AT:
+            return False
+        try:
+            import numpy as _np
+        except Exception as exc:
+            if not (isinstance(exc, ModuleNotFoundError) and exc.name == "numpy"):
+                _API_NUMPY_RETRY_AT = time.monotonic() + _DENSE_STACK_BROKEN_BACKOFF
+            if not _API_NUMPY_WARNED:
+                # Import errors may contain private paths; name the dependency,
+                # not the arbitrary exception text or the embedding input.
+                logger.warning("%s", _API_NUMPY_ERROR)
+                _API_NUMPY_WARNED = True
+            return False
+        np = _np
+        _API_NUMPY_WARNED = False
+        _API_NUMPY_RETRY_AT = 0.0
+        return True
+
+
 def _is_fastembed_available() -> bool:
     """Check if fastembed is available.
 
@@ -856,6 +891,9 @@ def _embed_api(texts: List[str], base_url: Optional[str] = None) -> Optional[np.
             _cleartext_refusal_message(base_url),
         )
 
+    if not _ensure_api_numpy():
+        raise RuntimeError(_API_NUMPY_ERROR)
+
     # Append /embeddings to the path, preserving any query string. A naive
     # string append would push the route into the query value (e.g.
     # "?upstream=openrouter.ai/embeddings") and silently target the wrong
@@ -966,8 +1004,8 @@ def available() -> bool:
         # Custom endpoints (non-OpenRouter) may not require an API key
         base_url = _configured_api_url()
         if base_url and not _is_openrouter_url(base_url):
-            return True
-        return bool(_OPENAI_API_KEY)
+            return _ensure_api_numpy()
+        return bool(_OPENAI_API_KEY) and _ensure_api_numpy()
     return _is_fastembed_available()
 
 

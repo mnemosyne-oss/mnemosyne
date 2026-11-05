@@ -905,6 +905,11 @@ HYGIENE_CLEAN_SCHEMA = {
                 "description": "Override action for all candidates. If 'keep', uses each candidate's suggested_action.",
                 "default": "keep",
             },
+            "force": {
+                "type": "boolean",
+                "description": "Allow explicit delete override when some candidates are not suggested for deletion. Does not replace confirm.",
+                "default": False,
+            },
             "confirm": {
                 "type": "boolean",
                 "description": "Must be true for any modification. If false, performs dry-run only.",
