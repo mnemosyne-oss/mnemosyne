@@ -344,6 +344,10 @@ Works with: llama.cpp server, vLLM, Ollama, LM Studio, or any OpenAI-compatible 
 
 #### Conflict-check request options
 
+When LLM conflict detection is enabled, its prompt contains both memory texts.
+A remote configured conflict endpoint receives those texts over the network;
+SQLite storage and lexical retrieval remain local.
+
 The optional LLM conflict detector keeps its historical **512 output token** default.
 An explicitly set `MNEMOSYNE_LLM_MAX_TOKENS` also applies to conflict checks;
 unset, blank, invalid or non-positive values retain 512. The consolidation
@@ -353,7 +357,9 @@ Conflict checks also merge `MNEMOSYNE_LLM_EXTRA_BODY` last into the request,
 including provider-specific options such as `{"thinking":{"type":"disabled"}}`.
 As for consolidation, `messages`, `model` and `stream` are reserved and ignored;
 other fields, including `max_tokens`, can override the base request. Blank,
-malformed or non-object JSON is ignored. Rejected options produce a warning
+malformed or non-object JSON is ignored. Nonfinite numbers (`NaN`, `Infinity`,
+`-Infinity`, or an overflowing exponent such as `1e400`) anywhere in the JSON
+cause the entire extra body to be ignored. Rejected options produce a warning
 without logging the supplied values. These two variables are read for each
 conflict request, unlike the consolidation module's import-time settings.
 This does not enable conflict detection, change endpoint selection, or extend

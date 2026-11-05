@@ -76,6 +76,19 @@ class _NoConflictRedirects(HTTPRedirectHandler):
         return None
 
 
+def _reject_json_constant(_value: str) -> None:
+    """Reject non-standard JSON numeric constants before transport selection."""
+    raise ValueError("Non-standard JSON number")
+
+
+def _finite_json_float(text: str) -> float:
+    """Parse JSON decimals while refusing overflow to a nonfinite float."""
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError("Nonfinite JSON number")
+    return value
+
+
 def _conflict_request_options() -> dict:
     """Use explicit provider options, retaining the conflict-check default."""
     raw_tokens = os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "").strip()
@@ -93,7 +106,11 @@ def _conflict_request_options() -> dict:
     if not raw_body:
         return options
     try:
-        extra = json.loads(raw_body)
+        extra = json.loads(
+            raw_body,
+            parse_constant=_reject_json_constant,
+            parse_float=_finite_json_float,
+        )
     except ValueError:
         logger.warning("Conflict detection: invalid MNEMOSYNE_LLM_EXTRA_BODY; ignoring it.")
         return options
