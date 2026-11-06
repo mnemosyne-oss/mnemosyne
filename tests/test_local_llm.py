@@ -808,18 +808,16 @@ class TestModelCacheDirOverride:
         monkeypatch.setattr(local_llm, "MODEL_CACHE_DIR", Path(path))
         monkeypatch.setattr(local_llm, "MODEL_CACHE_DIR_FROM_ENV", from_env, raising=False)
 
-    _DEFAULT = Path.home() / ".hermes" / "mnemosyne" / "models"
-
     def test_unset_keeps_the_historical_location(self, monkeypatch):
         with _model_cache_env(monkeypatch, None) as module:
-            assert module.MODEL_CACHE_DIR == self._DEFAULT
+            assert module.MODEL_CACHE_DIR == Path.home() / ".hermes" / "mnemosyne" / "models"
             assert module.MODEL_CACHE_DIR_FROM_ENV is False
 
     @pytest.mark.parametrize("blank", ["", "   ", "\t"])
     def test_blank_value_keeps_the_historical_location(self, monkeypatch, blank):
         """Per spec, unset and empty behave identically."""
         with _model_cache_env(monkeypatch, blank) as module:
-            assert module.MODEL_CACHE_DIR == self._DEFAULT
+            assert module.MODEL_CACHE_DIR == Path.home() / ".hermes" / "mnemosyne" / "models"
             assert module.MODEL_CACHE_DIR_FROM_ENV is False
 
     def test_set_value_relocates_and_expands_tilde(self, monkeypatch):
@@ -839,6 +837,8 @@ class TestModelCacheDirOverride:
         built-in default, so the assertion holds when the developer running the
         suite has MNEMOSYNE_MODEL_CACHE_DIR set in their own environment.
         """
+        # The shared harness selects a fresh HOME for this test.
+        importlib.reload(local_llm)
         before = (local_llm.MODEL_CACHE_DIR, local_llm.MODEL_CACHE_DIR_FROM_ENV)
 
         with _model_cache_env(monkeypatch, "/tmp/leak-check") as module:
@@ -848,6 +848,8 @@ class TestModelCacheDirOverride:
 
     def test_module_state_is_restored_when_the_body_raises(self, monkeypatch):
         """A failing assertion must not leak the overridden path either."""
+        # The shared harness selects a fresh HOME for this test.
+        importlib.reload(local_llm)
         before = (local_llm.MODEL_CACHE_DIR, local_llm.MODEL_CACHE_DIR_FROM_ENV)
 
         with pytest.raises(RuntimeError, match="boom"):
