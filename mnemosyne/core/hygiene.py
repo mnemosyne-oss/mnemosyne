@@ -407,12 +407,27 @@ def _scan_table(
     """Scan a table for noise candidates. Returns rows as dicts."""
     cursor = conn.cursor()
     quoted_table = _quote_identifier(table_name)
-    # Audit scoring needs only this fixed contract. Metadata is intentionally
-    # excluded so a read-only doctor scan never loads raw metadata.
-    base_query = (
-        f"SELECT id, content, source, timestamp, session_id, importance "
-        f"FROM {quoted_table}"
-    )
+    # Audit scoring needs only this fixed contract. Older/simple tables such
+    # as scratchpad omit source, timestamp, session_id, and importance; project
+    # only columns actually present and supply safe defaults for absent fields.
+    # Metadata is intentionally excluded so a read-only doctor scan never loads
+    # raw metadata.
+    available = {
+        row[1] for row in conn.execute(f"PRAGMA table_info({quoted_table})")
+    }
+    defaults = {
+        "id": "''",
+        "content": "''",
+        "source": "''",
+        "timestamp": "''",
+        "session_id": "''",
+        "importance": "0.5",
+    }
+    selected = [
+        column if column in available else f"{defaults[column]} AS {column}"
+        for column in ("id", "content", "source", "timestamp", "session_id", "importance")
+    ]
+    base_query = f"SELECT {', '.join(selected)} FROM {quoted_table}"
     if after is None:
         cursor.execute(
             f"{base_query} ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?",
