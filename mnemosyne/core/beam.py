@@ -11211,9 +11211,9 @@ class BeamMemory:
     # opaque-path recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
     # 16: clamp future-dated recency ages before exponentiation.
     # 17: strongest eligible graph traversal and scoped active-seed selection.
-    # Main generation 16 can cache the pre-graph-fix ranking and paths.
-    # Recheck the actual predecessor before each later semantic integration.
-    _ENHANCED_RECALL_CACHE_VERSION = 17
+    # 18: local embedding input caps and effective cap policy in cache keys.
+    # Recheck the actual predecessor before each semantic integration.
+    _ENHANCED_RECALL_CACHE_VERSION = 18
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.
@@ -11323,6 +11323,7 @@ class BeamMemory:
             "recall_kwargs": canonicalize(effective_recall_kwargs),
             "resolved": {
                 "weights": resolved_weights,
+                "embedding_input_caps": tuple(max(0, cap) for cap in _embeddings._embedding_caps()),
                 "temporal_halflife": temporal_halflife,
                 "recency_halflife": RECENCY_HALFLIFE_HOURS,
                 "veracity_weights": {
@@ -11383,6 +11384,7 @@ class BeamMemory:
         # recognition keys off that exact prefix.
         return "v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
+    @_embeddings._embedding_cap_snapshot()
     def recall_enhanced(self, query: str, top_k: int = 40, *,
                         use_cache: bool = True,
                         use_weibull: bool = True,

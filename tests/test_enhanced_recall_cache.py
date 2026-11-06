@@ -130,7 +130,7 @@ def test_unreadable_marker_bypasses_enhanced_cache_without_log_spam(
     )
 
 
-@pytest.mark.parametrize("previous_version", [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+@pytest.mark.parametrize("previous_version", [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17])
 def test_cache_version_bump_invalidates_prior_candidate_and_cap_entries(
     enhanced, monkeypatch, tmp_path: Path, previous_version: int
 ):
@@ -144,8 +144,9 @@ def test_cache_version_bump_invalidates_prior_candidate_and_cap_entries(
     memory_type filters before voice limits. Version 13 predates hydration of
     the first eligible tier. Version 14 predates bind-budget-independent
     linear candidate ordering. Version 15 predates the recency-decay age clamp.
-    Version 16 includes that clamp but predates strongest-path selection
-    and scoped active-seed eligibility. The ``v2:`` key prefix stays fixed
+    Version 16 predates strongest-path and scoped active-seed selection.
+    Version 17 predates local input caps and their effective cache policy.
+    The ``v2:`` key prefix stays fixed
     for QueryCache's opaque-key path.
     """
     memory, calls = enhanced
@@ -1790,6 +1791,41 @@ def test_sleep_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
         assert len(recall_calls) == 1  # recomputed, not served from cache
     finally:
         _close_memory(memory)
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_input_cap_cache_generation_rejects_prior_generation_17_results(
+    enhanced, monkeypatch, restart
+):
+    """Isolate generation invalidation; real cap-driven ranking is tested separately."""
+    memory, calls = enhanced
+    with monkeypatch.context() as context:
+        context.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 17)
+        stale = _call(memory)
+    keys = [row[0] for row in memory._query_cache._conn.execute(
+        "SELECT normalized FROM query_cache"
+    )]
+    assert len(keys) == 1
+    if restart:
+        memory._query_cache.close()
+        memory._query_cache = QueryCache(db_path=memory.db_path.parent / "query_cache.db")
+    assert memory._query_cache.get_opaque(keys[0])[0]["id"] == stale[0]["id"]
+    fresh = _call(memory)
+    assert len(calls) == 2
+    assert fresh[0]["id"] != stale[0]["id"]
+    assert _call(memory) == fresh
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("cap", ["MNEMOSYNE_EMBEDDING_MAX_CHARS", "MNEMOSYNE_EMBEDDING_MAX_BYTES"])
+def test_disabled_cap_values_share_effective_outer_cache_policy(enhanced, monkeypatch, cap):
+    memory, calls = enhanced
+    monkeypatch.delenv(cap, raising=False)
+    first = _call(memory)
+    for value in ("0", "-1", "", "invalid"):
+        monkeypatch.setenv(cap, value)
+        assert _call(memory) == first
+    assert len(calls) == 1
 
 
 def test_persistent_cache_does_not_reuse_main_16_graph_ranking(monkeypatch, tmp_path: Path):
