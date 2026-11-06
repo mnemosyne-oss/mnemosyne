@@ -1096,6 +1096,21 @@ def test_pipeline_flags_and_process_ranking_configuration_change_digest(enhanced
     assert memory._enhanced_recall_cache_key(**common) != baseline
 
 
+def test_cyrillic_normalization_invalidates_generation_16_results(enhanced, monkeypatch):
+    """A pre-fold cache entry must miss once, then reuse the recomputed result."""
+    memory, calls = enhanced
+    with monkeypatch.context() as ctx:
+        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 16)
+        stale = _call(memory, "свеклы")
+    assert len(calls) == 1
+
+    fresh = _call(memory, "свеклы")
+    assert len(calls) == 2
+    assert fresh[0]["id"] != stale[0]["id"]
+    assert _call(memory, "свеклы") == fresh
+    assert len(calls) == 2
+
+
 def test_enhanced_cache_key_version_bump_invalidates_literal_flag_ranking_change(
     enhanced, monkeypatch
 ):
