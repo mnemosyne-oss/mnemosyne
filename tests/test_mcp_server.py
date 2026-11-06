@@ -22,6 +22,37 @@ from mnemosyne.mcp_tools import (
 )
 
 
+@pytest.mark.parametrize("memory_store", ["working", "episodic"])
+def test_handle_get_returns_stored_provenance(tmp_path, monkeypatch, memory_store):
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+    memory = _create_instance(channel_id="cursor", bank="default")
+    if memory_store == "working":
+        memory_id = memory.beam.remember(
+            "MCP working provenance", source="test", scope="global",
+            trust_tier="EXTERNAL_WRITE",
+        )
+    else:
+        memory_id = memory.beam.consolidate_to_episodic(
+            "MCP episodic provenance", source_wm_ids=[], source="test", scope="global"
+        )
+        memory.conn.execute(
+            "UPDATE episodic_memory SET trust_tier = ? WHERE id = ?",
+            ("EXTERNAL_WRITE", memory_id),
+        )
+        memory.conn.commit()
+
+    result = handle_tool_call(
+        "mnemosyne_get",
+        {"memory_id": memory_id, "bank": "default", "channel_id": "reader-channel"},
+    )
+
+    assert result["status"] == "ok"
+    payload = json.loads(json.dumps(result))["memory"]
+    assert payload["memory_store"] == memory_store
+    assert payload["channel_id"] == "cursor"
+    assert payload["trust_tier"] == "EXTERNAL_WRITE"
+
+
 class TestToolSchemas:
     """Verify tool schemas match MCP spec and are valid JSON."""
 

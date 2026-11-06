@@ -224,6 +224,10 @@ work_mem.remember("Sprint review on Friday")
 
 ### Advanced: BEAM Direct Access
 
+Direct reads with `beam.get(memory_id)`, `Mnemosyne.get()`, and MCP
+`mnemosyne_get` include the stored `channel_id` and `trust_tier` for working
+and episodic memories. These fields may be `None` in rows without recorded values.
+
 When consolidation uses an OpenAI-compatible LLM endpoint (`MNEMOSYNE_LLM_BASE_URL`),
 Markdown bullet facts in its summaries are preserved. Prompt/token cleanup and
 reasoning safeguards still apply; local GGUF bullet-echo cleanup is unchanged.
