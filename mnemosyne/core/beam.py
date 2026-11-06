@@ -1189,6 +1189,10 @@ def _polyphonic_scope_where(
     channel_id: Optional[str] = None,
     veracity: Optional[str] = None,
     memory_type: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    source: Optional[str] = None,
+    topic: Optional[str] = None,
 ) -> Tuple[str, List[Any]]:
     """Scope predicate the polyphonic voices apply before their own limits.
 
@@ -1196,8 +1200,9 @@ def _polyphonic_scope_where(
     keeps rows whose session_id is NULL (import writes NULL when an export
     carries one), so those rows are let through here too. The exact author,
     channel, veracity and memory_type filters match the post-filter's
-    equality checks. The date filters stay post-filter only: the post-filter
-    and SQL disagree on date-only timestamps.
+    equality checks. Date comparisons use the post-filter's string bounds,
+    including date-only timestamps and its empty-string treatment of NULL.
+    Source and topic are separate exact matches, just like the post-filter.
     """
     clause, params = _recall_scope_where(
         session_id=session_id, cross_session=cross_session,
@@ -1208,10 +1213,17 @@ def _polyphonic_scope_where(
     clauses = [clause]
     for column, value in (("author_id", author_id), ("author_type", author_type),
                           ("channel_id", channel_id), ("veracity", veracity),
-                          ("memory_type", memory_type)):
+                          ("memory_type", memory_type), ("source", source),
+                          ("source", topic)):
         if value:
             clauses.append(f"{column} = ?")
             params.append(value)
+    if from_date:
+        clauses.append("COALESCE(timestamp, '') >= ?")
+        params.append(from_date)
+    if to_date:
+        clauses.append("COALESCE(timestamp, '') <= ?")
+        params.append(f"{to_date}T23:59:59")
     return " AND ".join(clauses), params
 
 
@@ -11198,9 +11210,10 @@ class BeamMemory:
     # hashed payload; the opaque key keeps the "v2:" prefix because QueryCache's
     # opaque-path recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
     # 16: clamp future-dated recency ages before exponentiation.
-    # 17: local embedding input caps and effective cap policy in cache keys.
+    # 17: strongest eligible graph traversal and scoped active-seed selection.
+    # 18: local embedding input caps and effective cap policy in cache keys.
     # Recheck the actual predecessor before each semantic integration.
-    _ENHANCED_RECALL_CACHE_VERSION = 17
+    _ENHANCED_RECALL_CACHE_VERSION = 18
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.
@@ -11371,6 +11384,7 @@ class BeamMemory:
         # recognition keys off that exact prefix.
         return "v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
+    @_embeddings._embedding_cap_snapshot()
     def recall_enhanced(self, query: str, top_k: int = 40, *,
                         use_cache: bool = True,
                         use_weibull: bool = True,
@@ -11876,6 +11890,7 @@ class BeamMemory:
             session_id=self.session_id, cross_session=cross_session,
             author_id=author_id, author_type=author_type, channel_id=channel_id,
             veracity=veracity, memory_type=memory_type,
+            from_date=from_date, to_date=to_date, source=source, topic=topic,
         )
         try:
             polyphonic_results = engine.recall(

@@ -17,6 +17,8 @@ import urllib.parse
 import urllib.request
 from typing import List, NoReturn, Optional
 from functools import lru_cache
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from mnemosyne.core.user_agent import application_user_agent
 
@@ -733,9 +735,29 @@ def _embedding_max_bytes() -> int:
     return _env_cap("MNEMOSYNE_EMBEDDING_MAX_BYTES")
 
 
+_CAP_SNAPSHOT: ContextVar[Optional[tuple]] = ContextVar("embedding_cap_snapshot", default=None)
+
+
 def _embedding_caps() -> tuple:
-    """Both caps, as one cache key part for embed_query."""
+    """Both caps, pinned during an enhanced recall or read from current config."""
+    snapshot = _CAP_SNAPSHOT.get()
+    if snapshot is not None:
+        return snapshot
     return (_embedding_max_chars(), _embedding_max_bytes())
+
+
+@contextmanager
+def _embedding_cap_snapshot():
+    """Keep cache identity and embedding inputs on one policy for this call.
+
+    Context-local state keeps overlapping recalls independent; reset on every
+    exit so later calls observe configuration changes, including after errors.
+    """
+    token = _CAP_SNAPSHOT.set(_embedding_caps())
+    try:
+        yield
+    finally:
+        _CAP_SNAPSHOT.reset(token)
 
 
 def _cap_for_api(texts: List[str], caps: Optional[tuple] = None) -> List[str]:

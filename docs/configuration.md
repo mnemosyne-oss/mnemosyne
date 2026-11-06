@@ -17,10 +17,12 @@ API embedding endpoints require NumPy in the Mnemosyne interpreter, independentl
 > **Privacy:** embeddings go to a remote API whenever `MNEMOSYNE_EMBEDDING_API_URL` points at a custom (non-OpenRouter) endpoint, the model name is API-shaped (`openai/*`, `text-embedding*`), or `MNEMOSYNE_EMBEDDINGS_VIA_API` is truthy (the last two are what route on the OpenRouter default; no custom URL set means the OpenRouter default); that service receives the text of your memories and of your recall queries for vectorization. For privacy-sensitive or local-first deployments prefer local embeddings (the `[embeddings]` / `[all]` install profiles).
 
 Changing either input cap changes future query and document embeddings only.
-Existing stored document vectors are not regenerated. Reindex the affected
-bank after changing caps when consistent query/document input policy is needed.
-The enhanced-recall cache tracks both effective caps; changing either cannot
-reuse a result ranked under the previous policy.
+Existing stored document vectors are not regenerated. [Reindex the affected
+bank](cli-reference.md#health-and-repair) after changing caps when consistent
+query/document input policy is needed.
+Enhanced recall snapshots both effective caps for the whole request, including
+its cache key and embedding inputs. Changes during a request take effect on the
+next request, so a result cannot be cached under a different cap policy.
 
 ## Data Directory
 

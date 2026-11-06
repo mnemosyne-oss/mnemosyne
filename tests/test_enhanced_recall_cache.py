@@ -130,7 +130,7 @@ def test_unreadable_marker_bypasses_enhanced_cache_without_log_spam(
     )
 
 
-@pytest.mark.parametrize("previous_version", [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+@pytest.mark.parametrize("previous_version", [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17])
 def test_cache_version_bump_invalidates_prior_candidate_and_cap_entries(
     enhanced, monkeypatch, tmp_path: Path, previous_version: int
 ):
@@ -143,9 +143,9 @@ def test_cache_version_bump_invalidates_prior_candidate_and_cap_entries(
     hash-independent polyphonic order. Version 12 predates veracity and
     memory_type filters before voice limits. Version 13 predates hydration of
     the first eligible tier. Version 14 predates bind-budget-independent
-    linear candidate ordering. Version 15 predates the recency-decay age clamp,
-    so its entries hold an inflated score for legacy future-dated rows.
-    Version 16 predates local input caps and their effective cache policy.
+    linear candidate ordering. Version 15 predates the recency-decay age clamp.
+    Version 16 predates strongest-path and scoped active-seed selection.
+    Version 17 predates local input caps and their effective cache policy.
     The ``v2:`` key prefix stays fixed
     for QueryCache's opaque-key path.
     """
@@ -1794,13 +1794,13 @@ def test_sleep_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("restart", [False, True])
-def test_input_cap_cache_generation_rejects_prior_generation_16_results(
+def test_input_cap_cache_generation_rejects_prior_generation_17_results(
     enhanced, monkeypatch, restart
 ):
     """Isolate generation invalidation; real cap-driven ranking is tested separately."""
     memory, calls = enhanced
     with monkeypatch.context() as context:
-        context.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 16)
+        context.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 17)
         stale = _call(memory)
     keys = [row[0] for row in memory._query_cache._conn.execute(
         "SELECT normalized FROM query_cache"
@@ -1826,6 +1826,63 @@ def test_disabled_cap_values_share_effective_outer_cache_policy(enhanced, monkey
         monkeypatch.setenv(cap, value)
         assert _call(memory) == first
     assert len(calls) == 1
+
+
+def test_persistent_cache_does_not_reuse_main_16_graph_ranking(monkeypatch, tmp_path: Path):
+    """Restart invalidates the actual predecessor's cached weaker graph path.
+
+    The real graph-selection regressions live in test_polyphonic_graph_strongest_path;
+    this test isolates persistence and recomputation at the enhanced-cache boundary.
+    """
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    cache_path = tmp_path / "query_cache.db"
+    calls = []
+
+    def build_memory(score):
+        memory = BeamMemory(session_id="session-a", db_path=db_path)
+        memory._query_cache = QueryCache(db_path=cache_path)
+
+        def recall(query, top_k=40, **kwargs):
+            calls.append(query)
+            return [{"id": "target", "content": "graph cache sentinel", "score": score}]
+
+        memory.recall = recall
+        return memory
+
+    with monkeypatch.context() as ctx:
+        ctx.setattr(BeamMemory, "_ENHANCED_RECALL_CACHE_VERSION", 16)
+        old = build_memory(0.2)
+        try:
+            assert _call(old)[0]["score"] == 0.2
+            assert _call(old)[0]["score"] == 0.2
+            assert len(calls) == 1
+        finally:
+            _close_memory(old)
+
+    probe = QueryCache(db_path=cache_path)
+    try:
+        keys = [row[0] for row in probe._conn.execute("SELECT normalized FROM query_cache")]
+        assert len(keys) == 1
+        assert probe.get_opaque(keys[0])[0]["score"] == 0.2
+    finally:
+        probe.close()
+
+    fresh = build_memory(0.4)
+    try:
+        misses = fresh._query_cache.stats()["misses"]
+        assert _call(fresh)[0]["score"] == 0.4
+        assert len(calls) == 2
+        assert fresh._query_cache.stats()["misses"] == misses + 1
+        assert _call(fresh)[0]["score"] == 0.4
+        assert len(calls) == 2
+        assert fresh._query_cache.stats()["misses"] == misses + 1
+    finally:
+        _close_memory(fresh)
+
 
 def test_warm_persistent_cache_does_not_serve_a_pre_clamp_score(monkeypatch, tmp_path: Path):
     """A generation-15 entry holding an inflated score must be recomputed, not served.

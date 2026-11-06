@@ -117,3 +117,21 @@ def test_multibyte_query_prefix_cannot_be_cut_to_empty(local_model, monkeypatch)
     with pytest.raises(embeddings.EmbeddingPolicyError, match="MNEMOSYNE_EMBEDDING_MAX_BYTES"):
         embeddings.embed_query("anchor")
     assert local_model.calls == []
+
+
+def test_cap_snapshot_is_context_local_and_resets_after_exception(local_model, monkeypatch):
+    """A pinned recall must not leak its cap into another thread or later calls."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_MAX_CHARS", "10")
+    with pytest.raises(RuntimeError, match="recall failed"):
+        with embeddings._embedding_cap_snapshot():
+            monkeypatch.setenv("MNEMOSYNE_EMBEDDING_MAX_CHARS", "8")
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(embeddings.embed_query, "abcdef").result(timeout=5)
+            with embeddings._embedding_cap_snapshot():
+                embeddings.embed_query("abcdef")
+            assert local_model.calls == [["query: a"], ["query: abc"]]
+            raise RuntimeError("recall failed")
+    embeddings.embed_query("xyzxyz")
+    assert local_model.calls[-1] == ["query: x"]

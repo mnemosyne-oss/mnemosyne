@@ -12,7 +12,10 @@ from mnemosyne.core.query_cache import QueryCache
 
 @pytest.mark.parametrize("cap", ["MNEMOSYNE_EMBEDDING_MAX_CHARS", "MNEMOSYNE_EMBEDDING_MAX_BYTES"])
 @pytest.mark.parametrize("restart", [False, True])
-def test_cap_change_recomputes_real_ranking_including_persisted_cache(tmp_path, monkeypatch, cap, restart):
+@pytest.mark.parametrize("change_during_recall", [False, True])
+def test_cap_change_recomputes_real_ranking_including_persisted_cache(
+    tmp_path, monkeypatch, cap, restart, change_during_recall
+):
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
@@ -64,6 +67,23 @@ def test_cap_change_recomputes_real_ranking_including_persisted_cache(tmp_path, 
         options = dict(top_k=2, use_weibull=False, use_mmr=False, use_intent=False,
                        use_synonyms=False, use_associative=False, vec_weight=1.,
                        fts_weight=0., importance_weight=0.)
+        if change_during_recall:
+            original_recall = memory.recall
+
+            def recall_with_temporary_cap(*args, **kwargs):
+                # Change after the outer key is chosen and restore before cache write.
+                # This is an ABA change: comparing the env only at exit cannot detect it.
+                with monkeypatch.context() as context:
+                    context.setenv(cap, "6")
+                    return original_recall(*args, **kwargs)
+
+            with monkeypatch.context() as context:
+                context.setattr(memory, "recall", recall_with_temporary_cap)
+                memory.recall_enhanced("anchor gamma", **options)
+            # Compare a warm outer hit with real uncached recall after restoring caps.
+            warm = memory.recall_enhanced("anchor gamma", **options)
+            fresh = memory.recall_enhanced("anchor gamma", use_cache=False, **options)
+            assert [row["id"] for row in warm] == [row["id"] for row in fresh]
         assert memory.recall_enhanced("anchor gamma", **options)[0]["id"] == alpha
         assert model_calls == ["anchor gamma"]
         if restart:
