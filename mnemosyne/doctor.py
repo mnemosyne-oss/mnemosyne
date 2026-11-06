@@ -21,6 +21,7 @@ import tempfile
 from typing import Any
 
 from mnemosyne.core.filters import SECRET_LABELED_PATTERNS
+from mnemosyne.runtime_diagnostics import CALLING_INTERPRETER_SCOPE, RUNTIME_SCOPES
 
 
 STATUS_OK = "ok"
@@ -489,6 +490,7 @@ _RUNTIME_CHECK_NAMES = frozenset(
         "python_version",
         "platform",
         "python_executable",
+        "checks_scope",
         "mnemosyne_version",
         "fastembed",
         "sqlite_vec",
@@ -518,6 +520,22 @@ def _safe_runtime_detail(check: str, value: Any) -> str:
     return _RUNTIME_ABSOLUTE_PATH.sub("<redacted-path>", detail)
 
 
+_UNSCOPED = "unscoped"
+
+
+def _safe_runtime_scope(value: Any) -> str:
+    """Return a known scope label, never a producer-supplied free-form value.
+
+    The scope is a closed enum. Anything else -- a missing key, a dict or list,
+    an unbounded or unknown string -- becomes ``unscoped`` rather than being
+    serialized into the report or promoted to a scope it never claimed (#813).
+    """
+
+    if isinstance(value, str) and value in RUNTIME_SCOPES:
+        return value
+    return _UNSCOPED
+
+
 def _sanitize_runtime_diagnostics(runtime: Any) -> dict[str, Any]:
     """Apply the Doctor report boundary to runtime checks from any producer."""
 
@@ -536,6 +554,11 @@ def _sanitize_runtime_diagnostics(runtime: Any) -> dict[str, Any]:
             "check": entry["check"],
             "status": entry["status"],
             "detail": _safe_runtime_detail(entry["check"], entry.get("detail", "")),
+            # Carry the scope through the boundary rather than dropping it: a
+            # report that strips it leaves a green dependency result reading as a
+            # statement about whichever runtime serves recall (#813). Only known
+            # scope labels pass; anything else is labelled unscoped.
+            "scope": _safe_runtime_scope(entry.get("scope")),
         }
         for entry in runtime["checks"]
         if isinstance(entry, dict)
@@ -548,11 +571,15 @@ def _sanitize_runtime_diagnostics(runtime: Any) -> dict[str, Any]:
 class RuntimeDiagnosticsAdapter:
     """Expose pure runtime/dependency checks without constructing Mnemosyne."""
 
+    def __init__(self, scope: str = CALLING_INTERPRETER_SCOPE) -> None:
+        # The caller states its interpreter's role; Doctor cannot infer it.
+        self.scope = scope
+
     def inspect(self) -> AdapterResult:
         try:
             from mnemosyne.runtime_diagnostics import collect_runtime_diagnostics
 
-            result = collect_runtime_diagnostics()
+            result = collect_runtime_diagnostics(scope=self.scope)
         except Exception:
             return AdapterResult(
                 metrics={"status": STATUS_UNKNOWN, "error_class": "runtime_error"}
@@ -1177,18 +1204,22 @@ def build_doctor_report(
     db_path: str | Path,
     scan_limit: int = DEFAULT_SCAN_LIMIT,
     candidate_limit: int = 20,
+    *,
+    runtime_scope: str = CALLING_INTERPRETER_SCOPE,
 ) -> DoctorReport:
     """Build a complete report using only runtime checks and a read-only DB.
 
     The function intentionally does not invoke ``Mnemosyne``, provider setup,
     diagnostics repair, cleanup, reindexing, or embedding work.
+    ``runtime_scope`` names the role of the interpreter running the runtime
+    checks (see ``mnemosyne.runtime_diagnostics.RUNTIME_SCOPES``).
     """
 
     scan_limit = _validate_scan_limit(scan_limit)
     embedding_runtime = _embedding_runtime_status()
     report = DoctorReport(
         bank_name=bank_name,
-        runtime_diagnostics=RuntimeDiagnosticsAdapter().inspect().metrics,
+        runtime_diagnostics=RuntimeDiagnosticsAdapter(runtime_scope).inspect().metrics,
         embeddings=EmbeddingsStatusAdapter(
             None, scan_limit=scan_limit, runtime=embedding_runtime
         ).inspect().metrics,
@@ -1393,9 +1424,16 @@ def render_doctor_markdown(payload: dict[str, Any]) -> str:
                 if not isinstance(check, dict) or not isinstance(check.get("check"), str):
                     continue
                 detail = safe_preview(check.get("detail", ""), max_length=240)
+                rendered = {"status": check.get("status"), "detail": detail}
+                # Render the scope too: a human reading the markdown report is
+                # exactly the reader #813's report reached, and a scope that only
+                # exists in the JSON payload is no use to them.
+                scope = check.get("scope")
+                if isinstance(scope, str) and scope:
+                    rendered["scope"] = scope
                 lines.append(
                     f"- {_markdown_scalar(check['check'])}: "
-                    f"`{_compact_json({'status': check.get('status'), 'detail': detail})}`"
+                    f"`{_compact_json(rendered)}`"
                 )
     else:
         lines.append(f"- status: `{_compact_json(runtime_diagnostics)}`")

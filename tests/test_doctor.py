@@ -293,7 +293,7 @@ def test_doctor_runtime_dependency_failure_is_safe_and_unknown(tmp_path, monkeyp
     sqlite3.connect(db_path).close()
     raw_secret = "runtime-diagnostics-private-secret"  # nosec - regression fixture
 
-    def fail_runtime_diagnostics():
+    def fail_runtime_diagnostics(**_kwargs):
         raise RuntimeError(f"dependency capability failed: password={raw_secret}")
 
     monkeypatch.setattr("mnemosyne.runtime_diagnostics.collect_runtime_diagnostics", fail_runtime_diagnostics)
@@ -329,6 +329,7 @@ def test_runtime_diagnostics_marks_sqlite_vec_available_only_after_loading(monke
             "check": "sqlite_vec_available",
             "status": "YES",
             "detail": "",
+            "scope": "calling_interpreter",
         }
         for check in result["checks"]
     )
@@ -389,9 +390,11 @@ def test_runtime_metadata_is_retained_in_safe_doctor_artifacts(
     }
     monkeypatch.setattr(
         "mnemosyne.runtime_diagnostics.collect_runtime_diagnostics",
-        lambda: {
+        lambda **_kwargs: {
             "status": "ok",
             "checks": [
+                # No `scope`: this stands in for a producer that predates #813,
+                # so the boundary must label it rather than drop the entry.
                 {"check": check, "status": "OK", "detail": detail}
                 for check, detail in metadata.items()
             ],
@@ -404,6 +407,7 @@ def test_runtime_metadata_is_retained_in_safe_doctor_artifacts(
             "check": check,
             "status": "OK",
             "detail": safe_metadata[check],
+            "scope": "unscoped",
         }
         for check in metadata
     ]
@@ -416,7 +420,7 @@ def test_runtime_metadata_is_retained_in_safe_doctor_artifacts(
             runtime_diagnostics={
                 "status": "ok",
                 "checks": [
-                    {"check": check, "status": "OK", "detail": detail}
+                    {"check": check, "status": "OK", "detail": detail, "scope": "cli_interpreter"}
                     for check, detail in metadata.items()
                 ],
             },
@@ -437,6 +441,55 @@ def test_runtime_metadata_is_retained_in_safe_doctor_artifacts(
     for detail in safe_metadata.values():
         assert detail in json_artifact
         assert detail in markdown_artifact
+
+    # The scope must survive canonical rendering, not just the raw payload: a
+    # report that carries a scope on each check but never states which
+    # interpreter those scopes describe is the gap #813 reports.
+    assert "cli_interpreter" in json_artifact
+    assert "cli_interpreter" in markdown_artifact
+
+
+@pytest.mark.parametrize(
+    "raw_scope",
+    [
+        {"leak": "doctor-scope-private-secret"},
+        ["doctor-scope-private-secret"],
+        "doctor-scope-private-secret" * 50,
+        "doctor-scope-private-secret",
+        "",
+        None,
+    ],
+)
+def test_runtime_scope_is_normalized_at_the_report_boundary(raw_scope):
+    """Only known scope labels reach the artifacts; anything else is unscoped.
+
+    ``doctor_report_payload`` also accepts reports from producers that bypass
+    the adapter, so a dict, list, unbounded or unknown string in ``scope`` must
+    not be serialized as-is into the content-safe JSON or Markdown artifact.
+    """
+
+    payload = doctor_report_payload(
+        DoctorReport(
+            bank_name="default",
+            runtime_diagnostics={
+                "status": "ok",
+                "checks": [
+                    {"check": "python_version", "status": "OK", "detail": "3.13.5", "scope": raw_scope},
+                    {"check": "checks_scope", "status": "OK", "detail": "cli_interpreter", "scope": "cli_interpreter"},
+                ],
+            },
+        )
+    )
+    json_artifact = render_doctor_json(payload)
+    markdown_artifact = render_doctor_markdown(payload)
+
+    scopes = {
+        check["check"]: check["scope"]
+        for check in json.loads(json_artifact)["runtime_diagnostics"]["checks"]
+    }
+    assert scopes == {"python_version": "unscoped", "checks_scope": "cli_interpreter"}
+    assert "doctor-scope-private-secret" not in json_artifact
+    assert "doctor-scope-private-secret" not in markdown_artifact
 
 
 def test_safe_preview_redacts_cjk_labeled_secret():

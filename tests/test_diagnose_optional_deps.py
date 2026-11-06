@@ -45,7 +45,7 @@ def test_run_diagnostics_counts_lowercase_error_status(tmp_path, monkeypatch):
     monkeypatch.setattr(
         diagnose,
         "collect_runtime_diagnostics",
-        lambda: {
+        lambda **_kwargs: {
             "checks": [
                 {"category": "test", "check": "lowercase_error", "status": "error", "detail": ""},
             ]
@@ -67,7 +67,7 @@ def test_diagnose_vector_guidance_uses_valid_sleep_actions(tmp_path, monkeypatch
     monkeypatch.setattr(
         diagnose,
         "collect_runtime_diagnostics",
-        lambda: {
+        lambda **_kwargs: {
             "checks": [
                 {"category": "deps", "check": "embeddings_available", "status": "YES", "detail": ""},
                 {"category": "deps", "check": "sqlite_vec_available", "status": "YES", "detail": ""},
@@ -202,7 +202,7 @@ def test_cli_diagnose_unsuccessful_repair_is_a_process_failure(monkeypatch, repa
         cli.cmd_diagnose(["--repair-vec-working"])
 
     assert raised.value.code == 1
-    assert run_diagnostics_calls == [{"repair_vec_working": True, "dry_run": False}]
+    assert run_diagnostics_calls == [{"repair_vec_working": True, "dry_run": False, "scope": "cli_interpreter"}]
 
 
 def test_cli_diagnose_repaired_vec_working_succeeds(monkeypatch):
@@ -221,7 +221,7 @@ def test_cli_diagnose_repaired_vec_working_succeeds(monkeypatch):
 
     cli.cmd_diagnose(["--repair-vec-working"])
 
-    assert run_diagnostics_calls == [{"repair_vec_working": True, "dry_run": False}]
+    assert run_diagnostics_calls == [{"repair_vec_working": True, "dry_run": False, "scope": "cli_interpreter"}]
 
 
 def test_cli_diagnose_skipped_repair_dry_run_does_not_exit(monkeypatch):
@@ -240,4 +240,4 @@ def test_cli_diagnose_skipped_repair_dry_run_does_not_exit(monkeypatch):
 
     cli.cmd_diagnose(["--repair-vec-working", "--dry-run"])
 
-    assert run_diagnostics_calls == [{"repair_vec_working": True, "dry_run": True}]
+    assert run_diagnostics_calls == [{"repair_vec_working": True, "dry_run": True, "scope": "cli_interpreter"}]
