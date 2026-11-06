@@ -1,5 +1,7 @@
 """Identity and scope provenance for direct BEAM reads."""
 
+import sqlite3
+
 import pytest
 
 from mnemosyne.core.beam import BeamMemory
@@ -81,7 +83,7 @@ def test_get_returns_stored_channel_and_trust_tier(
         )
 
     # Existing/imported rows can differ from the current writer's identity,
-    # including nullable provenance in older data.
+    # including nullable provenance in imported data.
     memory.conn.execute(
         f"UPDATE {memory_store}_memory SET channel_id = ?, trust_tier = ? WHERE id = ?",
         (channel_id, trust_tier, memory_id),
@@ -95,6 +97,49 @@ def test_get_returns_stored_channel_and_trust_tier(
     assert result["channel_id"] == channel_id
     assert result["trust_tier"] == trust_tier
     assert memory.conn.total_changes == changes_before
+
+
+@pytest.fixture
+def legacy_provenance_db(tmp_path, monkeypatch):
+    """Create both pre-identity memory tables, with rows but no provenance columns."""
+    _use_empty_config(tmp_path, monkeypatch)
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            CREATE TABLE working_memory (
+                id TEXT PRIMARY KEY, content TEXT NOT NULL, source TEXT,
+                timestamp TEXT, session_id TEXT DEFAULT 'default',
+                importance REAL DEFAULT 0.5, metadata_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE episodic_memory (
+                rowid INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
+                content TEXT NOT NULL, source TEXT, timestamp TEXT,
+                session_id TEXT DEFAULT 'default', importance REAL DEFAULT 0.5,
+                metadata_json TEXT, summary_of TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO working_memory (id, content, session_id)
+            VALUES ('legacy-working', 'legacy working provenance', 'legacy');
+            INSERT INTO episodic_memory (id, content, session_id)
+            VALUES ('legacy-episodic', 'legacy episodic provenance', 'legacy');
+        """)
+        for pragma in ("PRAGMA table_info(working_memory)", "PRAGMA table_info(episodic_memory)"):
+            columns = {row[1] for row in conn.execute(pragma)}
+            assert "channel_id" not in columns
+            assert "trust_tier" not in columns
+    return db_path
+
+
+@pytest.mark.parametrize("memory_store", ["working", "episodic"])
+def test_get_returns_migrated_trust_default(legacy_provenance_db, memory_store):
+    memory = BeamMemory(session_id="legacy", db_path=legacy_provenance_db)
+
+    result = memory.get(f"legacy-{memory_store}")
+
+    assert result["memory_store"] == memory_store
+    assert result["channel_id"] is None
+    assert result["trust_tier"] == "STATED"
 
 
 @pytest.mark.parametrize("memory_store", ["working", "episodic"])
