@@ -3079,7 +3079,20 @@ def _recency_decay(timestamp_str: str, halflife_hours: float = RECENCY_HALFLIFE_
     try:
         ts = _parse_iso_datetime_utc(timestamp_str)
         age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
-        return math.exp(-age_hours / halflife_hours)
+        # A stored timestamp can never be in the future, so the age cannot be negative and the
+        # factor cannot exceed 1.0. It can nonetheless *compute* above 1.0: pre-round-4 producers
+        # stamped naive LOCAL wall time (see the producer-contract note above
+        # ``_parse_iso_datetime_utc``), and those rows are read as UTC, which shifts them by the
+        # host offset — on a host with a POSITIVE offset that places them `utcoffset` hours in the
+        # future (measured 1.055 at UTC+9). A negative offset does not produce a bonus; it makes
+        # the row read older and is penalised twice. decay feeds the score as a multiplier, so
+        # >1.0 silently *rewards* a row for being misdated.
+        #
+        # Clamp the AGE, not the result: `math.exp` overflows to OverflowError once the exponent
+        # passes ~709, and a far-future timestamp would then fall into the handler below and
+        # report the neutral 0.5 instead of 1.0. max(age, 0) saturates exactly at 1.0 and cannot
+        # overflow, for any halflife.
+        return math.exp(-max(age_hours, 0.0) / halflife_hours)
     except Exception:
         return 0.5
 
@@ -11184,7 +11197,15 @@ class BeamMemory:
     # so entries cached under an older digest are not reused. Part of the
     # hashed payload; the opaque key keeps the "v2:" prefix because QueryCache's
     # opaque-path recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 15
+    #
+    # 16: _recency_decay clamps the AGE, so a legacy local-naive row that reads
+    # as future-dated no longer scores above 1.0. Generation 15 entries hold the
+    # inflated score for exactly those rows, so they must not survive the change.
+    # Generation 16 is also claimed by #1275, #1308 and #1315. Whichever change
+    # lands first takes 16; each later independently merged semantic change takes
+    # the next generation that is actually free in the integration history at that
+    # point — not a number reserved here, since another change may consume it first.
+    _ENHANCED_RECALL_CACHE_VERSION = 16
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.
