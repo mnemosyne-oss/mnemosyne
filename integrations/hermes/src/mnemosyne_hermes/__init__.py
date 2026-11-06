@@ -29,6 +29,7 @@ if sys.platform in {"android", "emscripten"} or (
     )
 
 from contextlib import contextmanager, nullcontext
+import importlib
 import json
 import logging
 import math
@@ -189,20 +190,17 @@ except Exception as _tool_schema_import_exc:  # pragma: no cover - broken instal
     )
     ALL_TOOL_SCHEMAS = []
 
-try:
-    from mnemosyne.batch_tool import (
-        BatchValidationError,
-        apply_beam_batch,
-        batch_validation_error_payload,
-        dry_run_batch,
-        validate_batch_operations,
-    )
-except Exception as _batch_tool_import_exc:  # pragma: no cover - broken install diagnostic path
-    logging.getLogger(__name__).warning(
-        "mnemosyne_batch helpers unavailable (%s); batch tool calls will return an error until mnemosyne-memory is upgraded.",
-        _batch_tool_import_exc,
-    )
+_batch_tool = None
+_BATCH_EXPORTS = (
+    "BatchValidationError",
+    "validate_batch_operations",
+    "batch_validation_error_payload",
+    "dry_run_batch",
+    "apply_beam_batch",
+)
 
+
+def _fallback_batch_tool():
     class BatchValidationError(ValueError):
         """Fallback validation error used when mnemosyne.batch_tool is unavailable."""
 
@@ -227,6 +225,73 @@ except Exception as _batch_tool_import_exc:  # pragma: no cover - broken install
             "failed_index": None,
             "action": None,
         }
+
+    return (
+        BatchValidationError,
+        validate_batch_operations,
+        batch_validation_error_payload,
+        dry_run_batch,
+        apply_beam_batch,
+    )
+
+
+def _bind_batch_tool(values):
+    global _batch_tool
+    _batch_tool = values
+    globals().update(zip(_BATCH_EXPORTS, values))
+    return values
+
+
+def _disable_batch_tools(exc: BaseException):
+    logging.getLogger(__name__).warning(
+        "mnemosyne_batch helpers unavailable (%s); batch tool calls will return an error until mnemosyne-memory is upgraded.",
+        exc,
+    )
+    return _bind_batch_tool(_fallback_batch_tool())
+
+
+def _load_batch_tool():
+    """Import batch helpers on first use, not when the plugin module loads.
+
+    ``mnemosyne.batch_tool`` imports the beam. Doing that at module scope makes
+    every Hermes process that loads this plugin pay for that stack before any
+    batch tool is called. Callers that read the names as module attributes go
+    through ``__getattr__``.
+    """
+    if _batch_tool is not None:
+        return _batch_tool
+    try:
+        from mnemosyne.batch_tool import (
+            BatchValidationError,
+            apply_beam_batch,
+            batch_validation_error_payload,
+            dry_run_batch,
+            validate_batch_operations,
+        )
+    except Exception as exc:  # pragma: no cover - broken install diagnostic path
+        return _disable_batch_tools(exc)
+    return _bind_batch_tool((
+        BatchValidationError,
+        validate_batch_operations,
+        batch_validation_error_payload,
+        dry_run_batch,
+        apply_beam_batch,
+    ))
+
+
+def __getattr__(name):
+    if name in _BATCH_EXPORTS:
+        return dict(zip(_BATCH_EXPORTS, _load_batch_tool()))[name]
+    # A package __getattr__ runs before implicit submodule import. Delegate
+    # so mnemosyne_hermes.cli still loads; only a missing submodule is an
+    # attribute error.
+    fullname = f"{__name__}.{name}"
+    try:
+        return importlib.import_module(fullname)
+    except ModuleNotFoundError as exc:
+        if exc.name != fullname:
+            raise
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
 
 try:
     from mnemosyne.hermes_config import read_hermes_config_key
@@ -3654,6 +3719,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         })
 
     def _handle_batch(self, args: Dict[str, Any]) -> str:
+        (
+            BatchValidationError,
+            validate_batch_operations,
+            batch_validation_error_payload,
+            dry_run_batch,
+            apply_beam_batch,
+        ) = _load_batch_tool()
         try:
             normalized = validate_batch_operations(args.get("operations"))
         except BatchValidationError as exc:

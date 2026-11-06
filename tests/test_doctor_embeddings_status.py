@@ -3,6 +3,7 @@
 import builtins
 from dataclasses import fields
 import hashlib
+import importlib.util
 import json
 import sqlite3
 from pathlib import Path
@@ -416,6 +417,14 @@ def test_runtime_missing_dependency_and_import_error_are_non_throwing(
 
     monkeypatch.setattr(embeddings, "TextEmbedding", None)
     monkeypatch.setattr(embeddings, "_is_fastembed_available", lambda: False)
+    real_find = importlib.util.find_spec
+
+    def fastembed_absent(name, *args, **kwargs):
+        if name == "fastembed":
+            return None
+        return real_find(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fastembed_absent)
     missing = doctor._embedding_runtime_status()
     assert missing["backend"] == "fastembed_local"
     assert missing["backend_available"] is False

@@ -46,11 +46,10 @@ def __getattr__(name: str):
 
 __all__ = list(_lazy_exports.keys())
 
-# Conditionally expose MCP server if mcp package is installed
-try:
-    import mcp  # noqa: F401
+# Conditionally expose MCP server if mcp package is installed.
+# find_spec does not execute the package; `import mcp` here costs seconds.
+import importlib.util
 
+if importlib.util.find_spec("mcp") is not None:
     _lazy_exports["run_mcp_server"] = (".mcp_server", "run_mcp_server")
     __all__.append("run_mcp_server")
-except ImportError:
-    pass  # MCP is optional — core works without it
