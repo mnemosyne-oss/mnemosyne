@@ -285,6 +285,19 @@ class TestProbeScope:
                     if t["pair"] == sorted(PAIR))
         assert len(decision.chain) == len(twin["banks"]) - 1  # minus the home bank
 
+    def test_symlink_fleet_root_uses_census_snapshot_pruning(self, tmp_path):
+        snapshot_root = tmp_path / "state-snapshots"
+        _make_bank(snapshot_root / "pre-update.partial" / "mnemosyne.db", [PAIR + (None,)])
+        fleet_alias = tmp_path / "fleet-alias"
+        fleet_alias.symlink_to(snapshot_root, target_is_directory=True)
+        home = _make_bank(tmp_path / "home" / "mnemosyne.db", [])
+
+        census = fleet_census.census(root=fleet_alias)
+        decision = fh.probe_fleet(PAIR, home, fleet_root=fleet_alias, sleep=_noop_sleep)
+
+        assert census["banks"] == []
+        assert decision.probed_banks == []
+
     def test_standalone_bank_has_no_peers_and_inserts_anyway(self, tmp_path):
         """The gate is on by default, but a bank outside a fleet has nothing
         to probe — which is what makes default-on safe."""

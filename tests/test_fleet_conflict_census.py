@@ -17,6 +17,7 @@ than a slogan:
 """
 
 import hashlib
+import logging
 import re
 import sqlite3
 from datetime import datetime, timedelta
@@ -520,16 +521,68 @@ class TestReadOnly:
         assert report["banks_scanned"] == 0
         assert report["unreadable"] == []
 
-    def test_cache_and_backup_dirs_are_pruned(self, fleet_env):
-        _build_fleet(fleet_env, {"home-a": [_TWIN + (None,)]})
+    def test_partial_snapshot_dirs_are_pruned_without_hiding_completed_banks(
+            self, fleet_env, caplog):
+        productive = _make_bank(
+            fleet_env / "profiles" / "active" / "mnemosyne" / "data" / "mnemosyne.db",
+            [_TWIN + (None,)],
+        )
+        productive_with_partial_dir = _make_bank(
+            fleet_env / "profiles" / "active" / "mnemosyne" / "data.partial" / "mnemosyne.db",
+            [("cf_productive_partial_a", "cf_productive_partial_b", None)],
+        )
+        completed_snapshot = _make_bank(
+            fleet_env / "state-snapshots" / "snapshot-20261028" / "mnemosyne.db",
+            [("cf_completed_a", "cf_completed_b", None)],
+        )
+        completed_snapshot_with_partial_in_name = _make_bank(
+            fleet_env / "state-snapshots" / "snapshot.partial.backup" / "mnemosyne.db",
+            [("cf_completed_partial_a", "cf_completed_partial_b", None)],
+        )
+        partial = (
+            fleet_env / "state-snapshots" /
+            ".20261028-123456-pre-update.123456.partial" / "state.db"
+        )
+        partial.parent.mkdir(parents=True)
+        partial.write_bytes(b"this is not a sqlite file" * 40)
+        profile_partial = (
+            fleet_env / "profiles" / "active" / "state-snapshots" /
+            ".20261028-123456-pre-update.123456.partial" / "state.db"
+        )
+        profile_partial.parent.mkdir(parents=True)
+        profile_partial.write_bytes(b"this is not a sqlite file" * 40)
         for dirname in ("backups", "cache", ".cache"):
             _make_bank(fleet_env / dirname / "old" / "mnemosyne.db", [_TWIN + (None,)])
 
-        report = fleet_census.census()
+        with caplog.at_level(logging.WARNING, logger=fleet_census.__name__):
+            report = fleet_census.census()
 
-        # Had the copies been counted, this would be a 4-bank home↔home twin.
-        assert report["banks_scanned"] == 1
-        assert report["home_home_twin_count"] == 0
+        assert {Path(bank["path"]) for bank in report["banks"]} == {
+            productive,
+            productive_with_partial_dir,
+            completed_snapshot,
+            completed_snapshot_with_partial_in_name,
+        }
+        assert report["unreadable"] == []
+        assert str(partial) not in caplog.text
+        assert str(profile_partial) not in caplog.text
+
+    def test_partial_snapshot_dirs_are_pruned_when_root_is_snapshot_dir(self, tmp_path):
+        snapshot_root = tmp_path / "state-snapshots"
+        partial = snapshot_root / "pre-update.partial" / "state.db"
+        partial.parent.mkdir(parents=True)
+        partial.write_bytes(b"this is not a sqlite file" * 40)
+
+        assert fleet_census.discover_banks(snapshot_root) == []
+
+    def test_snapshot_ancestor_does_not_hide_live_partial_dir(self, tmp_path):
+        root = tmp_path / "state-snapshots" / "fleet"
+        productive = _make_bank(
+            root / "live.partial" / "mnemosyne.db",
+            [("cf_live_partial_a", "cf_live_partial_b", None)],
+        )
+
+        assert fleet_census.discover_banks(root) == [productive]
 
 
 # --------------------------------------------------------------------------

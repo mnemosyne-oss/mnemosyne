@@ -782,7 +782,7 @@ def _probe_scope(
     if banks is not None:
         raw_candidates = [_resolve(Path(b)) for b in banks]
     elif fleet_root is not None:
-        raw_candidates = sorted({_resolve(Path(b)) for b in fleet_census.discover_banks(fleet_root)})
+        raw_candidates = sorted({_resolve(Path(b)) for b in fleet_census.discover_banks(_resolve(fleet_root))})
     else:
         raw_candidates = []
 
