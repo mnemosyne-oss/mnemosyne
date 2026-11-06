@@ -343,6 +343,12 @@ Full reference: [docs/configuration.md](docs/configuration.md)
 
 ### Language Support
 
+The Russian lexical fallback folds case and `ё`/`е` spelling when selecting
+candidates and scoring inflections (for example, `свеклы` can match `Свёкла`).
+Stored text is preserved. The fallback still averages scores over query words
+and uses the normal lexical admission gate; this does not guarantee admission
+for multi-word paraphrases or cross-language queries.
+
 Default embeddings are English-optimized (`bge-small-en-v1.5`). For **non-English or multilingual** recall, swap the model:
 
 ```bash

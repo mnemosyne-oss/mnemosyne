@@ -5558,23 +5558,29 @@ def _ngrams(s: str, n: int = 3) -> set:
     return {s[i:i + n] for i in range(len(s) - n + 1)}
 
 
+def _normalize_cyrillic_text(text: str) -> str:
+    """Fold case and optional Russian ё spelling for fallback matching only."""
+    return text.lower().replace("ё", "е")
+
+
 def _cyrillic_score(query: str, content: str, n: int = 3) -> float:
     """Trigram Jaccard score in [0, 1] for Russian/Cyrillic recall.
 
     For each query word, find the best-matching content word by Jaccard
     similarity of their character n-gram sets. Return the mean across
     query words. Words shorter than 3 characters are ignored to avoid
-    noisy matches on stop words and punctuation.
+    noisy matches on stop words and punctuation. Case and ё/е spelling
+    are folded before extracting n-grams; stored content is unchanged.
 
     N-gram sets are computed once per unique word and cached in a dict
     to avoid redundant recomputation when the same content word is
     compared against multiple query words.
     """
     q_words = [
-        w for w in re.findall(r"[а-яёa-z0-9]+", query.lower()) if len(w) >= 3
+        w for w in re.findall(r"[а-яёa-z0-9]+", _normalize_cyrillic_text(query)) if len(w) >= 3
     ]
     c_words = [
-        w for w in re.findall(r"[а-яёa-z0-9]+", content.lower()) if len(w) >= 3
+        w for w in re.findall(r"[а-яёa-z0-9]+", _normalize_cyrillic_text(content)) if len(w) >= 3
     ]
     if not q_words or not c_words:
         return 0.0
@@ -5624,10 +5630,13 @@ def _cyrillic_like_search(
 
     # SQLite's default LOWER() and LIKE are ASCII-only, so they cannot
     # case-fold Cyrillic letters (Т ≠ т, Ё ≠ ё). Register a Python
-    # UDF on the connection that performs a real Unicode lower(). It
-    # is safe to register the same name multiple times — SQLite will
-    # overwrite the previous function with the same name and arity.
-    conn.create_function("_py_lower", 1, lambda s: s.lower() if isinstance(s, str) else s)
+    # UDF for Unicode case-folding and ё/е normalization, matching the
+    # scorer. Without the spelling fold here, candidates are lost before
+    # re-ranking. Re-registering the same name and arity is safe.
+    conn.create_function(
+        "_py_cyrillic_normalize", 1,
+        lambda s: _normalize_cyrillic_text(s) if isinstance(s, str) else s,
+    )
 
     # Use a 4-character prefix for LIKE matching. Query words and
     # stored content are inflected forms of the same lemma (тёмная
@@ -5635,15 +5644,15 @@ def _cyrillic_like_search(
     # over-selector that still prunes the candidate set down to a
     # trigram-scoring-sized slice.
     q_words = [
-        w for w in re.findall(r"[а-яёa-z0-9]+", query.lower()) if len(w) >= 4
+        w for w in re.findall(r"[а-яёa-z0-9]+", _normalize_cyrillic_text(query)) if len(w) >= 4
     ]
     if not q_words:
         return []
 
     conditions = " OR ".join(
-        ["_py_lower(content) LIKE ? ESCAPE '\\'"] * len(q_words)
+        ["_py_cyrillic_normalize(content) LIKE ? ESCAPE '\\'"] * len(q_words)
     )
-    params = [f"%{w[:4].lower()}%" for w in q_words]
+    params = [f"%{w[:4]}%" for w in q_words]
     try:
         all_rows = conn.execute(
             f"SELECT {id_col}, content FROM {table} WHERE {conditions} LIMIT ?",
@@ -11205,7 +11214,9 @@ class BeamMemory:
     # lands first takes 16; each later independently merged semantic change takes
     # the next generation that is actually free in the integration history at that
     # point — not a number reserved here, since another change may consume it first.
-    _ENHANCED_RECALL_CACHE_VERSION = 16
+    # 17: Cyrillic fallback folds ё/е in candidate selection and scoring.
+    # Entries from before the fold can omit matching rows or retain old scores.
+    _ENHANCED_RECALL_CACHE_VERSION = 17
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.
