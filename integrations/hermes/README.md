@@ -432,6 +432,7 @@ No required config. Everything defaults to `~/.mnemosyne/`. Optional overrides:
 | Variable | Default | Description |
 |---|---|---|
 | `MNEMOSYNE_HOME` | `~/.mnemosyne` | Storage directory |
+| `MNEMOSYNE_BANKS_MAP` | `<data dir>/banks_map.json` | Per-chat bank routing map. Routing stays off until the file exists and maps somebody; a map that cannot be parsed routes into the quarantine instead of falling back to the private profile storage. See [`docs/bank-routing.md`](../../docs/bank-routing.md). |
 | `MNEMOSYNE_VEC_WEIGHT` | `0.5` | Vector similarity weight in hybrid recall |
 | `MNEMOSYNE_FTS_WEIGHT` | `0.3` | Full-text search weight |
 | `MNEMOSYNE_IMPORTANCE_WEIGHT` | `0.2` | Importance score weight |
