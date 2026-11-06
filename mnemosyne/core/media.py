@@ -862,9 +862,16 @@ class MediaStore:
         *,
         provider: Optional[str] = None,
         provider_model: Optional[str] = None,
+        replace_provenance: bool = False,
     ) -> bool:
         """Move an asset along the degradation ladder. Returns whether a row
-        was updated."""
+        was updated.
+
+        ``provider`` and ``provider_model`` are written only when given, unless
+        ``replace_provenance`` is true: then both columns take the values passed,
+        and ``None`` clears them. ``remember_media`` uses that so the asset's
+        provenance always names the description behind its current status.
+        """
         status_norm = str(status or "").strip().lower()
         if status_norm not in UNDERSTANDING_STATUSES:
             raise ValueError(
@@ -873,10 +880,10 @@ class MediaStore:
             )
         assignments = ["understanding_status = ?"]
         params: List[Any] = [status_norm]
-        if provider is not None:
+        if provider is not None or replace_provenance:
             assignments.append("provider = ?")
             params.append(provider)
-        if provider_model is not None:
+        if provider_model is not None or replace_provenance:
             assignments.append("provider_model = ?")
             params.append(provider_model)
         params.append(asset_id)
@@ -1406,6 +1413,7 @@ def remember_media(
     moment_ids: List[str] = []
     memory_ids: List[str] = []
     status = "unavailable"
+    result = None
 
     try:
         anchor_memory_id = _ensure_anchor_memory(
@@ -1478,8 +1486,17 @@ def remember_media(
     finally:
         # A constraint error mid-loop must not strand the asset at 'pending' --
         # nothing retries that state, and doctor would not flag it either.
+        # Provenance follows the status: only a description that produced
+        # moments names a provider, and every other outcome clears what an
+        # earlier ingest of the same asset left behind.
+        described = status in ("ok", "partial")
         try:
-            store.set_understanding_status(asset_id, status)
+            store.set_understanding_status(
+                asset_id, status,
+                provider=getattr(result, "provider", None) if described else None,
+                provider_model=getattr(result, "model", None) if described else None,
+                replace_provenance=True,
+            )
         except Exception:
             logger.info("media: could not finalize status for %s", asset_id, exc_info=True)
 
