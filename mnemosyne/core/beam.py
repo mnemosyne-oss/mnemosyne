@@ -7966,7 +7966,8 @@ class BeamMemory:
         cursor.execute("""
             SELECT id, content, source, timestamp, session_id,
                    importance, metadata_json, veracity, created_at,
-                   author_id, author_type, scope
+                   author_id, author_type, scope,
+                   channel_id, trust_tier
             FROM working_memory
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (memory_id, self.session_id))
@@ -7985,6 +7986,8 @@ class BeamMemory:
                 "author_id": row[9],
                 "author_type": row[10],
                 "scope": row[11],
+                "channel_id": row[12],
+                "trust_tier": row[13],
                 "memory_store": "working",
             }
 
@@ -7993,7 +7996,8 @@ class BeamMemory:
             SELECT id, content, source, timestamp, session_id,
                    importance, metadata_json, veracity, created_at,
                    author_id, author_type, scope,
-                   event_date, event_date_precision
+                   event_date, event_date_precision,
+                   channel_id, trust_tier
             FROM episodic_memory
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (memory_id, self.session_id))
@@ -8014,6 +8018,8 @@ class BeamMemory:
                 "scope": row[11],
                 "event_date": row[12],
                 "event_date_precision": row[13],
+                "channel_id": row[14],
+                "trust_tier": row[15],
                 "memory_store": "episodic",
             }
 
