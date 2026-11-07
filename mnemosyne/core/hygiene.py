@@ -407,17 +407,20 @@ def _scan_table(
     """Scan a table for noise candidates. Returns rows as dicts."""
     cursor = conn.cursor()
     quoted_table = _quote_identifier(table_name)
-    # Audit scoring needs only this fixed contract. Older/simple tables such
-    # as scratchpad omit source, timestamp, session_id, and importance; project
-    # only columns actually present and supply safe defaults for absent fields.
+    # Audit scoring requires authentic identity and text. Older/simple tables
+    # may omit optional metadata, but missing required columns are incompatible.
     # Metadata is intentionally excluded so a read-only doctor scan never loads
     # raw metadata.
     available = {
         row[1] for row in conn.execute(f"PRAGMA table_info({quoted_table})")
     }
+    if not {"id", "content"}.issubset(available):
+        logger.warning(
+            "Skipping hygiene scan for table %s: required columns id and content are needed",
+            table_name,
+        )
+        return []
     defaults = {
-        "id": "''",
-        "content": "''",
         "source": "''",
         "timestamp": "''",
         "session_id": "''",
