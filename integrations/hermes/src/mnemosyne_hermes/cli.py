@@ -323,6 +323,30 @@ def _cli_db_path(data_dir: Path | None, bank: str | None) -> Path | None:
     )
 
 
+def _run_cli_diagnostics(bank: str | None, db_path: Path | None, data_dir: Path | None):
+    """Preserve profile selection with Core versions predating explicit paths.
+
+    Older Core accepts only ``bank``. Its environment resolver can be pinned in
+    a separate process, not in this potentially multiplexed Hermes process.
+    """
+    from mnemosyne.diagnose import run_diagnostics
+    import inspect
+    if db_path is None or "db_path" in inspect.signature(run_diagnostics).parameters:
+        return run_diagnostics(bank=bank, db_path=db_path) if db_path else run_diagnostics(bank=bank)
+
+    import subprocess
+    env = dict(os.environ, MNEMOSYNE_DATA_DIR=str(data_dir))
+    script = (
+        "import json, sys; from mnemosyne.diagnose import run_diagnostics; "
+        "print(json.dumps(run_diagnostics(bank=sys.argv[1] or None)))"
+    )
+    child = subprocess.run(
+        [sys.executable, "-c", script, bank or ""], env=env,
+        capture_output=True, text=True, timeout=120, check=True,
+    )
+    return json.loads(child.stdout)
+
+
 def mnemosyne_command(args):
     """Dispatch ``hermes mnemosyne <subcommand>``."""
     cmd = getattr(args, "mnemosyne_cmd", None)
@@ -463,8 +487,8 @@ def mnemosyne_command(args):
         # Unknown-bank guard now runs before the beam is built (see top of
         # mnemosyne_command), so bank is guaranteed to exist here.
         try:
-            from mnemosyne.diagnose import auto_fix, run_diagnostics
-            result = run_diagnostics(bank=bank, db_path=db_path)
+            from mnemosyne.diagnose import auto_fix
+            result = _run_cli_diagnostics(bank, db_path, data_dir)
             resolved_bank = bank or "default"
             print("\nMnemosyne Diagnostics")
             print("=" * 40)
