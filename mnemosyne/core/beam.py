@@ -1189,6 +1189,10 @@ def _polyphonic_scope_where(
     channel_id: Optional[str] = None,
     veracity: Optional[str] = None,
     memory_type: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    source: Optional[str] = None,
+    topic: Optional[str] = None,
 ) -> Tuple[str, List[Any]]:
     """Scope predicate the polyphonic voices apply before their own limits.
 
@@ -1196,8 +1200,9 @@ def _polyphonic_scope_where(
     keeps rows whose session_id is NULL (import writes NULL when an export
     carries one), so those rows are let through here too. The exact author,
     channel, veracity and memory_type filters match the post-filter's
-    equality checks. The date filters stay post-filter only: the post-filter
-    and SQL disagree on date-only timestamps.
+    equality checks. Date comparisons use the post-filter's string bounds,
+    including date-only timestamps and its empty-string treatment of NULL.
+    Source and topic are separate exact matches, just like the post-filter.
     """
     clause, params = _recall_scope_where(
         session_id=session_id, cross_session=cross_session,
@@ -1208,10 +1213,17 @@ def _polyphonic_scope_where(
     clauses = [clause]
     for column, value in (("author_id", author_id), ("author_type", author_type),
                           ("channel_id", channel_id), ("veracity", veracity),
-                          ("memory_type", memory_type)):
+                          ("memory_type", memory_type), ("source", source),
+                          ("source", topic)):
         if value:
             clauses.append(f"{column} = ?")
             params.append(value)
+    if from_date:
+        clauses.append("COALESCE(timestamp, '') >= ?")
+        params.append(from_date)
+    if to_date:
+        clauses.append("COALESCE(timestamp, '') <= ?")
+        params.append(f"{to_date}T23:59:59")
     return " AND ".join(clauses), params
 
 
@@ -3079,7 +3091,20 @@ def _recency_decay(timestamp_str: str, halflife_hours: float = RECENCY_HALFLIFE_
     try:
         ts = _parse_iso_datetime_utc(timestamp_str)
         age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
-        return math.exp(-age_hours / halflife_hours)
+        # A stored timestamp can never be in the future, so the age cannot be negative and the
+        # factor cannot exceed 1.0. It can nonetheless *compute* above 1.0: pre-round-4 producers
+        # stamped naive LOCAL wall time (see the producer-contract note above
+        # ``_parse_iso_datetime_utc``), and those rows are read as UTC, which shifts them by the
+        # host offset — on a host with a POSITIVE offset that places them `utcoffset` hours in the
+        # future (measured 1.055 at UTC+9). A negative offset does not produce a bonus; it makes
+        # the row read older and is penalised twice. decay feeds the score as a multiplier, so
+        # >1.0 silently *rewards* a row for being misdated.
+        #
+        # Clamp the AGE, not the result: `math.exp` overflows to OverflowError once the exponent
+        # passes ~709, and a far-future timestamp would then fall into the handler below and
+        # report the neutral 0.5 instead of 1.0. max(age, 0) saturates exactly at 1.0 and cannot
+        # overflow, for any halflife.
+        return math.exp(-max(age_hours, 0.0) / halflife_hours)
     except Exception:
         return 0.5
 
@@ -11184,7 +11209,11 @@ class BeamMemory:
     # so entries cached under an older digest are not reused. Part of the
     # hashed payload; the opaque key keeps the "v2:" prefix because QueryCache's
     # opaque-path recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 15
+    # 16: clamp future-dated recency ages before exponentiation.
+    # 17: strongest eligible graph traversal and scoped active-seed selection.
+    # 18: local embedding input caps and effective cap policy in cache keys.
+    # Recheck the actual predecessor before each semantic integration.
+    _ENHANCED_RECALL_CACHE_VERSION = 18
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.
@@ -11294,6 +11323,7 @@ class BeamMemory:
             "recall_kwargs": canonicalize(effective_recall_kwargs),
             "resolved": {
                 "weights": resolved_weights,
+                "embedding_input_caps": tuple(max(0, cap) for cap in _embeddings._embedding_caps()),
                 "temporal_halflife": temporal_halflife,
                 "recency_halflife": RECENCY_HALFLIFE_HOURS,
                 "veracity_weights": {
@@ -11354,6 +11384,7 @@ class BeamMemory:
         # recognition keys off that exact prefix.
         return "v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
+    @_embeddings._embedding_cap_snapshot()
     def recall_enhanced(self, query: str, top_k: int = 40, *,
                         use_cache: bool = True,
                         use_weibull: bool = True,
@@ -11859,6 +11890,7 @@ class BeamMemory:
             session_id=self.session_id, cross_session=cross_session,
             author_id=author_id, author_type=author_type, channel_id=channel_id,
             veracity=veracity, memory_type=memory_type,
+            from_date=from_date, to_date=to_date, source=source, topic=topic,
         )
         try:
             polyphonic_results = engine.recall(

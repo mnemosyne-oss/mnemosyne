@@ -130,7 +130,7 @@ def test_unreadable_marker_bypasses_enhanced_cache_without_log_spam(
     )
 
 
-@pytest.mark.parametrize("previous_version", [6, 7, 8, 9, 10, 11, 12, 13, 14])
+@pytest.mark.parametrize("previous_version", [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17])
 def test_cache_version_bump_invalidates_prior_candidate_and_cap_entries(
     enhanced, monkeypatch, tmp_path: Path, previous_version: int
 ):
@@ -143,7 +143,10 @@ def test_cache_version_bump_invalidates_prior_candidate_and_cap_entries(
     hash-independent polyphonic order. Version 12 predates veracity and
     memory_type filters before voice limits. Version 13 predates hydration of
     the first eligible tier. Version 14 predates bind-budget-independent
-    linear candidate ordering. The ``v2:`` key prefix stays fixed
+    linear candidate ordering. Version 15 predates the recency-decay age clamp.
+    Version 16 predates strongest-path and scoped active-seed selection.
+    Version 17 predates local input caps and their effective cache policy.
+    The ``v2:`` key prefix stays fixed
     for QueryCache's opaque-key path.
     """
     memory, calls = enhanced
@@ -1788,3 +1791,221 @@ def test_sleep_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
         assert len(recall_calls) == 1  # recomputed, not served from cache
     finally:
         _close_memory(memory)
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_input_cap_cache_generation_rejects_prior_generation_17_results(
+    enhanced, monkeypatch, restart
+):
+    """Isolate generation invalidation; real cap-driven ranking is tested separately."""
+    memory, calls = enhanced
+    with monkeypatch.context() as context:
+        context.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 17)
+        stale = _call(memory)
+    keys = [row[0] for row in memory._query_cache._conn.execute(
+        "SELECT normalized FROM query_cache"
+    )]
+    assert len(keys) == 1
+    if restart:
+        memory._query_cache.close()
+        memory._query_cache = QueryCache(db_path=memory.db_path.parent / "query_cache.db")
+    assert memory._query_cache.get_opaque(keys[0])[0]["id"] == stale[0]["id"]
+    fresh = _call(memory)
+    assert len(calls) == 2
+    assert fresh[0]["id"] != stale[0]["id"]
+    assert _call(memory) == fresh
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("cap", ["MNEMOSYNE_EMBEDDING_MAX_CHARS", "MNEMOSYNE_EMBEDDING_MAX_BYTES"])
+def test_disabled_cap_values_share_effective_outer_cache_policy(enhanced, monkeypatch, cap):
+    memory, calls = enhanced
+    monkeypatch.delenv(cap, raising=False)
+    first = _call(memory)
+    for value in ("0", "-1", "", "invalid"):
+        monkeypatch.setenv(cap, value)
+        assert _call(memory) == first
+    assert len(calls) == 1
+
+
+def test_persistent_cache_does_not_reuse_main_16_graph_ranking(monkeypatch, tmp_path: Path):
+    """Restart invalidates the actual predecessor's cached weaker graph path.
+
+    The real graph-selection regressions live in test_polyphonic_graph_strongest_path;
+    this test isolates persistence and recomputation at the enhanced-cache boundary.
+    """
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    db_path = tmp_path / "memories.db"
+    cache_path = tmp_path / "query_cache.db"
+    calls = []
+
+    def build_memory(score):
+        memory = BeamMemory(session_id="session-a", db_path=db_path)
+        memory._query_cache = QueryCache(db_path=cache_path)
+
+        def recall(query, top_k=40, **kwargs):
+            calls.append(query)
+            return [{"id": "target", "content": "graph cache sentinel", "score": score}]
+
+        memory.recall = recall
+        return memory
+
+    with monkeypatch.context() as ctx:
+        ctx.setattr(BeamMemory, "_ENHANCED_RECALL_CACHE_VERSION", 16)
+        old = build_memory(0.2)
+        try:
+            assert _call(old)[0]["score"] == 0.2
+            assert _call(old)[0]["score"] == 0.2
+            assert len(calls) == 1
+        finally:
+            _close_memory(old)
+
+    probe = QueryCache(db_path=cache_path)
+    try:
+        keys = [row[0] for row in probe._conn.execute("SELECT normalized FROM query_cache")]
+        assert len(keys) == 1
+        assert probe.get_opaque(keys[0])[0]["score"] == 0.2
+    finally:
+        probe.close()
+
+    fresh = build_memory(0.4)
+    try:
+        misses = fresh._query_cache.stats()["misses"]
+        assert _call(fresh)[0]["score"] == 0.4
+        assert len(calls) == 2
+        assert fresh._query_cache.stats()["misses"] == misses + 1
+        assert _call(fresh)[0]["score"] == 0.4
+        assert len(calls) == 2
+        assert fresh._query_cache.stats()["misses"] == misses + 1
+    finally:
+        _close_memory(fresh)
+
+
+def test_warm_persistent_cache_does_not_serve_a_pre_clamp_score(monkeypatch, tmp_path: Path):
+    """A generation-15 entry holding an inflated score must be recomputed, not served.
+
+    Legacy local-naive rows read as future-dated on a host with a positive UTC offset, so the
+    pre-clamp decay returned above 1.0 and that value was written into the persistent
+    enhanced-recall cache. The clamp changes the score without changing the query, so the cache
+    generation is the only thing that can invalidate the entry. Reproduced across a restart over
+    the same QueryCache database: the pre-clamp score must not survive it, or a warm cache keeps
+    serving the bonus until the entry expires.
+
+    The assertions are about observed cache behaviour rather than about the version constant, so
+    that neither a cache which stops persisting nor one which stops reading can satisfy them: the
+    stale entry must be on disk and retrievable under its own key, the restarted instance must
+    miss, and the second of two identical requests must not run recall again.
+    """
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+
+    legacy_stamp = (
+        datetime.now(timezone.utc) + timedelta(hours=9)
+    ).replace(tzinfo=None).isoformat()
+    cache_path = tmp_path / "query_cache.db"
+
+    def build_memory(decay, seen_keys=None, calls=None):
+        memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
+        memory._query_cache = QueryCache(db_path=cache_path)
+        if calls is None:
+            calls = []
+
+        def fake_recall(query, top_k=40, **kwargs):
+            calls.append(query)
+            return [
+                {"id": "legacy-future-row", "content": query, "score": decay(legacy_stamp)}
+            ]
+
+        memory.recall = fake_recall
+
+        if seen_keys is not None:
+            real_get_opaque = memory._query_cache.get_opaque
+
+            def spy_get_opaque(key):
+                value = real_get_opaque(key)
+                seen_keys.append((key, value is not None))
+                return value
+
+            memory._query_cache.get_opaque = spy_get_opaque
+        return memory
+
+    def release(memory: BeamMemory) -> None:
+        memory._query_cache.close()
+        memory.conn.close()
+
+    def ask(memory: BeamMemory):
+        return memory.recall_enhanced(
+            "legacy query",
+            use_weibull=False,
+            use_mmr=False,
+            use_intent=False,
+            use_synonyms=False,
+        )
+
+    def pre_clamp_decay(timestamp_str, halflife_hours=beam_module.RECENCY_HALFLIFE_HOURS):
+        """The pre-#1329 behaviour: no age clamp, so a future timestamp scores > 1.0."""
+        ts = beam_module._parse_iso_datetime_utc(timestamp_str)
+        age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
+        return math.exp(-age_hours / halflife_hours)
+
+    # Generation 15 + pre-clamp scoring: the entry is written holding the bonus.
+    stale_keys: list = []
+    with monkeypatch.context() as ctx:
+        ctx.setattr(BeamMemory, "_ENHANCED_RECALL_CACHE_VERSION", 15)
+        stale = build_memory(pre_clamp_decay, stale_keys)
+        try:
+            stale_score = ask(stale)[0]["score"]
+        finally:
+            release(stale)
+    assert stale_score > 1.0, f"setup did not reproduce the pre-clamp bonus: {stale_score}"
+    assert [hit for _key, hit in stale_keys] == [False], (
+        f"the cold generation-15 request was expected to miss once, got {stale_keys}"
+    )
+    stale_key = stale_keys[-1][0]
+
+    # The stale entry must be on disk and retrievable under its own key, or the restart below
+    # would pass for the wrong reason: a cache holding nothing never serves anything.
+    probe = QueryCache(db_path=cache_path)
+    try:
+        assert probe.stats()["size"] >= 1, "the generation-15 entry was not persisted"
+        assert probe.get_opaque(stale_key) is not None, (
+            "the generation-15 entry is not retrievable from the restarted cache database"
+        )
+    finally:
+        probe.close()
+
+    # Restart over the same persistent cache with the clamped decay.
+    fresh_keys: list = []
+    fresh_calls: list = []
+    fresh = build_memory(beam_module._recency_decay, fresh_keys, fresh_calls)
+    try:
+        corrected = ask(fresh)[0]["score"]
+        calls_after_first = len(fresh_calls)
+        repeats = ask(fresh)[0]["score"]
+    finally:
+        release(fresh)
+
+    fresh_key = fresh_keys[0][0]
+    assert fresh_key != stale_key, (
+        "the cache key did not change between generations, so the stale entry could still be served"
+    )
+    assert [hit for _key, hit in fresh_keys] == [False, True], (
+        "expected the first current-generation request to miss and the second to hit; got "
+        f"{[hit for _key, hit in fresh_keys]}"
+    )
+    assert corrected == pytest.approx(1.0), (
+        f"the warm cache served {corrected!r} instead of recomputing; the current generation must "
+        "invalidate entries written under the pre-clamp ranking"
+    )
+    assert repeats == pytest.approx(corrected)
+    assert calls_after_first >= 1
+    assert len(fresh_calls) == calls_after_first, (
+        f"recall ran {len(fresh_calls)} times across two identical requests "
+        f"({calls_after_first} after the first); the second request must be a cache hit, "
+        "otherwise a cache that never reads would pass this test"
+    )
