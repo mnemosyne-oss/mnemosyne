@@ -26,7 +26,12 @@ Grid: cut site x visibility mode.
   author-type-only recall, which must retain matching rows from another session;
   combined channel and author recall, which must reject other authors on the same
   channel and the same author on another channel;
-  a channel recall whose noise is the caller's own session on another channel.
+  a channel recall whose noise is the caller's own session on another channel;
+  a veracity or memory_type filter, where target and noise are both the
+  caller's own and only the filter tells them apart (#1278), including NULL
+  noise and both filters at once with noise that matches only one. The post-filter
+  compares these with plain equality, and both tiers always have the columns,
+  so the pushed-down ``=`` keeps exactly the rows the post-filter keeps.
 """
 import sqlite3
 
@@ -98,6 +103,26 @@ MODES = {
         "other", {"channel_id": "c1", "author_id": "a1"},
         "other", {"channel_id": "c2", "author_id": "a1"},
         {"channel_id": "c1", "author_id": "a1"}, False),
+    "veracity": ("caller", {"veracity": "stated"}, "caller", {"veracity": "inferred"},
+                 {"veracity": "stated"}, False),
+    "memory_type": ("caller", {"memory_type": "artifact"}, "caller", {"memory_type": "episode"},
+                    {"memory_type": "artifact"}, False),
+    "veracity-null-noise": ("caller", {"veracity": "stated"}, "caller", {"veracity": None},
+                            {"veracity": "stated"}, False),
+    "both-filters-noise-matches-veracity": (
+        "caller", {"veracity": "stated", "memory_type": "artifact"},
+        "caller", {"veracity": "stated", "memory_type": "episode"},
+        {"veracity": "stated", "memory_type": "artifact"}, False),
+    "both-filters-noise-matches-type": (
+        "caller", {"veracity": "stated", "memory_type": "artifact"},
+        "caller", {"veracity": "inferred", "memory_type": "artifact"},
+        {"veracity": "stated", "memory_type": "artifact"}, False),
+    "memory_type-null-noise": ("caller", {"memory_type": "artifact"}, "caller", {"memory_type": None},
+                               {"memory_type": "artifact"}, False),
+    "both-filters-cross-session": (
+        "other", {"veracity": "stated", "memory_type": "artifact"},
+        "other", {"veracity": "inferred", "memory_type": "artifact"},
+        {"veracity": "stated", "memory_type": "artifact"}, True),
 }
 
 
@@ -121,8 +146,8 @@ def _seed(caller, other, mode, target_first):
 
 def _check(results, mode, target_id, noise_ids):
     ids = [r["id"] for r in results]
-    if MODES[mode][5]:
-        # Cross-session: the noise is visible, so it legitimately outranks the target.
+    if MODES[mode][5] and not MODES[mode][4]:
+        # Cross-session with no filter: the noise is visible, so it legitimately outranks the target.
         assert set(ids) & noise_ids
     else:
         assert target_id in ids
@@ -160,7 +185,7 @@ def test_fused_cut_is_scoped(env, mode):
     target_id, noise_ids = _seed(caller, other, mode, target_first=False)
     ranked = [*sorted(noise_ids), target_id]
 
-    def graph_voice(self, query):
+    def graph_voice(self, query, *, scope_where=None, scope_params=()):
         # A graph store with no session column, ranking every noise row above the target.
         return [RecallResult(memory_id=mid, score=1.0 - i / 100, voice="graph", metadata={})
                 for i, mid in enumerate(ranked)]
@@ -185,7 +210,7 @@ def test_fused_cut_keeps_id_in_scope_in_either_tier(env):
     caller.conn.commit()
     ranked = [*sorted(noise_ids), target_id]
 
-    def graph_voice(self, query):
+    def graph_voice(self, query, *, scope_where=None, scope_params=()):
         return [RecallResult(memory_id=mid, score=1.0 - i / 100, voice="graph", metadata={})
                 for i, mid in enumerate(ranked)]
 
@@ -213,7 +238,7 @@ def test_fused_cut_prune_stays_under_sqlite_variable_limit(env):
     caller.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 1000)
     ranked = [*noise_ids, target_id]
 
-    def graph_voice(self, query):
+    def graph_voice(self, query, *, scope_where=None, scope_params=()):
         return [RecallResult(memory_id=mid, score=1.0 - i / 10000, voice="graph", metadata={})
                 for i, mid in enumerate(ranked)]
 
@@ -229,7 +254,7 @@ def test_fused_cut_drops_ids_with_no_memory_row(env):
     target_id = caller.remember("target recent quokka", source="user", dedupe=False)
     ranked = [*(f"gist-{i}" for i in range(NOISE)), target_id]
 
-    def graph_voice(self, query):
+    def graph_voice(self, query, *, scope_where=None, scope_params=()):
         return [RecallResult(memory_id=mid, score=1.0 - i / 100, voice="graph", metadata={})
                 for i, mid in enumerate(ranked)]
 
