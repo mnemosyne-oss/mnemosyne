@@ -15,6 +15,7 @@ from pathlib import Path
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
+import pytest
 import yaml
 
 try:
@@ -171,6 +172,10 @@ def test_built_release_pair_completes_the_provider_lifecycle(tmp_path: Path) -> 
     _assert_provider_lifecycle(core_wheel, hermes_wheel, tmp_path, _core_version())
 
 
+@pytest.mark.skipif(
+    os.environ.get("MNEMOSYNE_TEST_PUBLISHED_CORE") != "1",
+    reason="Online release check; set MNEMOSYNE_TEST_PUBLISHED_CORE=1 to download the pinned wheel",
+)
 def test_published_minimum_core_completes_the_provider_lifecycle(tmp_path: Path) -> None:
     """The current provider must also run with the declared published Core floor."""
     wheel_dir = tmp_path / "wheels"
