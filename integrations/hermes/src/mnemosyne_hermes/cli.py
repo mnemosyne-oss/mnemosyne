@@ -308,6 +308,21 @@ def _resolve_cli_bank(args, cmd):
         return _BANK_RESOLUTION_FAILED if cmd == "export" else None
 
 
+def _cli_data_dir() -> Path | None:
+    """Select the provider's profile root without changing global environment."""
+    home = os.environ.get("HERMES_HOME")
+    return Path(home).expanduser().resolve() / "mnemosyne" / "data" if home else None
+
+
+def _cli_db_path(data_dir: Path | None, bank: str | None) -> Path | None:
+    if data_dir is None:
+        return None
+    return (
+        data_dir / "banks" / bank / "mnemosyne.db"
+        if bank and bank != "default" else data_dir / "mnemosyne.db"
+    )
+
+
 def mnemosyne_command(args):
     """Dispatch ``hermes mnemosyne <subcommand>``."""
     cmd = getattr(args, "mnemosyne_cmd", None)
@@ -325,6 +340,9 @@ def mnemosyne_command(args):
         print("Bank resolution failed")
         return 1
 
+    data_dir = _cli_data_dir()
+    db_path = _cli_db_path(data_dir, bank)
+
     # Reject unknown named banks BEFORE touching the filesystem. Mnemosyne(bank=)
     # would otherwise lazily create an empty bank directory + DB on first access
     # (e.g. via the beam below), defeating the guard and silently writing junk.
@@ -336,7 +354,11 @@ def mnemosyne_command(args):
     if cmd == "doctor" and bank:
         try:
             from mnemosyne.core.banks import bank_exists_read_only
-            if not bank_exists_read_only(bank):
+            exists = (
+                bank_exists_read_only(bank, data_dir=data_dir)
+                if data_dir is not None else bank_exists_read_only(bank)
+            )
+            if not exists:
                 print(f"Bank not found: {bank}")
                 return 1
         except ValueError:
@@ -352,11 +374,14 @@ def mnemosyne_command(args):
     if cmd == "export" and bank:
         try:
             from mnemosyne.core.banks import get_bank_db_path_read_only
-            db_path = get_bank_db_path_read_only(bank)
-            if not db_path.is_file():
+            selected = (
+                get_bank_db_path_read_only(bank, data_dir=data_dir)
+                if data_dir is not None else get_bank_db_path_read_only(bank)
+            )
+            if not selected.is_file():
                 print(f"Bank not found: {bank}")
                 return 1
-            if not _export_schema_is_complete_read_only(db_path):
+            if not _export_schema_is_complete_read_only(selected):
                 print(f"Bank schema incomplete: {bank}")
                 return 1
         except (FileNotFoundError, ValueError):
@@ -387,10 +412,10 @@ def mnemosyne_command(args):
             # Bank-aware beam (Mnemosyne routes the bank to its own SQLite DB),
             # mirroring how the provider builds its beam under profile_isolation.
             from mnemosyne.core.memory import Mnemosyne
-            beam = Mnemosyne(session_id="hermes_default", bank=bank).beam
+            beam = Mnemosyne(session_id="hermes_default", bank=bank, db_path=db_path).beam
         else:
             from mnemosyne.core.beam import BeamMemory
-            beam = BeamMemory(session_id="hermes_default")
+            beam = BeamMemory(session_id="hermes_default", db_path=db_path)
     except Exception as e:
         print(f"Error: Mnemosyne not available: {e}")
         return 1
@@ -439,7 +464,7 @@ def mnemosyne_command(args):
         # mnemosyne_command), so bank is guaranteed to exist here.
         try:
             from mnemosyne.diagnose import auto_fix, run_diagnostics
-            result = run_diagnostics(bank=bank)
+            result = run_diagnostics(bank=bank, db_path=db_path)
             resolved_bank = bank or "default"
             print("\nMnemosyne Diagnostics")
             print("=" * 40)
@@ -477,7 +502,7 @@ def mnemosyne_command(args):
             return 1
         try:
             from mnemosyne.core.memory import Mnemosyne
-            mem = Mnemosyne(session_id="hermes_default", bank=bank)
+            mem = Mnemosyne(session_id="hermes_default", bank=bank, db_path=db_path)
             result = mem.export_to_file(output_path)
             print(f"Exported {result['working_memory_count']} working, {result['episodic_memory_count']} episodic, {result['legacy_memories_count']} legacy, {result['triples_count']} triples to {output_path}")
             _print_completeness_warning(result, imported=False)
@@ -538,7 +563,7 @@ def mnemosyne_command(args):
         try:
             from mnemosyne.core.memory import Mnemosyne
             mem = Mnemosyne(session_id=session_id or "import_session",
-                            channel_id=channel_id)
+                            channel_id=channel_id, bank=bank, db_path=db_path)
         except Exception as e:
             print(f"Error: Mnemosyne not available: {e}")
             return 1

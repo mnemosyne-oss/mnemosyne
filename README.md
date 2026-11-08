@@ -364,6 +364,8 @@ See [docs/configuration.md#custom-embedding-models](docs/configuration.md#custom
 
 When used with Hermes Agent, Mnemosyne exposes provider tools for the memory lifecycle, lifecycle hooks for automatic context injection, and MCP support.
 
+The packaged `hermes mnemosyne` CLI uses the provider's database under `HERMES_HOME/mnemosyne/data`, even when `MNEMOSYNE_DATA_DIR` points elsewhere. Profile-isolated commands select the active profile bank below that root; `doctor` reports its selected database. Standalone Core commands still honor `MNEMOSYNE_DATA_DIR`, and the packaged CLI uses the Core resolver when `HERMES_HOME` is unset. Existing stores are not moved or merged.
+
 `mnemosyne_resolve_conflicts` remains gated off by default. Its `dry_run`
 argument defaults to `false` (apply): use `dry_run=true` for deterministic
 preview, with no LLM calls or reflection reservation. Explicit
