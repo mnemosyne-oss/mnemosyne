@@ -673,6 +673,50 @@ def test_reindex_progress_keeps_callers_row_factory(
         conn.close()
 
 
+@pytest.mark.parametrize("factory_kind", ["tuple", "row", "dict"])
+@pytest.mark.parametrize("exit_kind", ["dry_run", "embedding_failure", "unavailable"])
+def test_reindex_restores_factory_on_non_success_exits(
+    tmp_path, monkeypatch, factory_kind, exit_kind
+):
+    """A plan or failed rebuild preserves the caller's connection and store."""
+    beam = _reindex_fixture_beam(tmp_path, working=1, episodic=1)
+    db_path = tmp_path / "m.db"
+    before = _store_state(db_path)
+    beam.conn.close()
+    conn = _open_fresh(db_path)
+    factory = {
+        "tuple": None,
+        "row": sqlite3.Row,
+        "dict": lambda cur, row: dict(zip((col[0] for col in cur.description), row)),
+    }[factory_kind]
+    conn.row_factory = factory
+    monkeypatch.setattr(E, "available", lambda: exit_kind != "unavailable")
+
+    def fail_embedding(_contents):
+        raise OSError("synthetic embedding failure")
+
+    monkeypatch.setattr(E, "embed", fail_embedding)
+    try:
+        if exit_kind == "dry_run":
+            plan = reindex_vectors(conn, dry_run=True)
+            assert plan["dry_run"] is True
+        else:
+            with pytest.raises(RuntimeError):
+                reindex_vectors(conn)
+        assert conn.row_factory is factory
+        row = conn.execute("SELECT 1 AS probe").fetchone()
+        if factory_kind == "tuple":
+            assert row == (1,)
+        elif factory_kind == "dict":
+            assert row.get("probe") == 1
+        elif factory_kind == "row":
+            assert row["probe"] == 1
+        assert not conn.in_transaction
+        assert _store_state(db_path) == before
+    finally:
+        conn.close()
+
+
 def test_reindex_works_with_a_bare_sqlite3_connect_row_factory_unset(
     tmp_path, monkeypatch
 ):
