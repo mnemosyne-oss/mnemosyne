@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 
@@ -125,3 +127,61 @@ def test_packaged_cli_selects_provider_root_for_stats_inspect_doctor(tmp_path, o
         assert result["standalone_db"] != result["provider_db"]
     else:
         assert result["standalone_db"] == result["provider_db"]
+
+
+_RELEASE_PROBE = r'''
+import contextlib
+import inspect
+import io
+import os
+from pathlib import Path
+import socket
+from types import SimpleNamespace
+
+socket.socket.connect = lambda *a, **k: (_ for _ in ()).throw(AssertionError("network disabled"))
+import mnemosyne
+from mnemosyne.core.beam import BeamMemory
+from mnemosyne.diagnose import run_diagnostics
+from mnemosyne_hermes.cli import mnemosyne_command
+
+home = Path(os.environ["HERMES_HOME"])
+site = Path(os.environ["TEST_CORE_SITE"])
+assert Path(mnemosyne.__file__).resolve().is_relative_to(site)
+assert mnemosyne.__version__ == "4.0.0"
+assert "db_path" not in inspect.signature(run_diagnostics).parameters
+root = home / "mnemosyne" / "data"
+for bank, selected in ((None, root / "mnemosyne.db"),
+                       (home.name, root / "banks" / home.name / "mnemosyne.db")):
+    BeamMemory(db_path=selected, session_id="hermes_default").remember("marker", scope="global")
+    if bank:
+        (home / "config.yaml").write_text("memory:\n  mnemosyne:\n    profile_isolation: true\n")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = mnemosyne_command(SimpleNamespace(mnemosyne_cmd="doctor", bank=None, no_fix=True))
+    assert rc == 0, out.getvalue()
+    assert f"resolved_db: {selected}" in out.getvalue()
+    assert f"resolved_bank: {bank or 'default'}" in out.getvalue()
+    assert os.environ["MNEMOSYNE_DATA_DIR"] == str(home / "mnemosyne")
+'''
+
+
+def test_published_core_400_cli_doctor_compatibility(tmp_path):
+    """Opt-in offline check of the minimum supported Core wheel, not a mock."""
+    wheel = os.environ.get("MNEMOSYNE_CORE_400_WHEEL")
+    if not wheel:
+        pytest.skip("set MNEMOSYNE_CORE_400_WHEEL to a local published wheel")
+    site = tmp_path / "site"
+    site.mkdir()
+    with ZipFile(wheel) as archive:
+        archive.extractall(site)
+    home = tmp_path / "profile"
+    home.mkdir()
+    provider_src = Path(__file__).resolve().parents[1] / "src"
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("MNEMOSYNE_", "HERMES_"))}
+    env.update(HOME=str(tmp_path), HERMES_HOME=str(home),
+               MNEMOSYNE_DATA_DIR=str(home / "mnemosyne"), MNEMOSYNE_NO_EMBEDDINGS="1",
+               TEST_CORE_SITE=str(site), PYTHONPATH=os.pathsep.join((str(site), str(provider_src))))
+    result = subprocess.run([sys.executable, "-c", _RELEASE_PROBE], cwd=tmp_path,
+                            env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
