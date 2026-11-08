@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib
 import importlib.util
 import os
 import subprocess
 import sys
 import textwrap
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -166,6 +168,34 @@ def test_built_release_pair_completes_the_provider_lifecycle(tmp_path: Path) -> 
     wheel_dir.mkdir()
     core_wheel = _build_wheel(ROOT, wheel_dir)
     hermes_wheel = _build_wheel(ROOT / "integrations" / "hermes", wheel_dir)
+    _assert_provider_lifecycle(core_wheel, hermes_wheel, tmp_path, _core_version())
+
+
+def test_published_minimum_core_completes_the_provider_lifecycle(tmp_path: Path) -> None:
+    """The current provider must also run with the declared published Core floor."""
+    wheel_dir = tmp_path / "wheels"
+    wheel_dir.mkdir()
+    core_wheel = wheel_dir / "mnemosyne_memory-4.0.0-py3-none-any.whl"
+    # Published PyPI 4.0.0 artifact, not a relabelled build of current source.
+    url = (
+        "https://files.pythonhosted.org/packages/af/d3/"
+        "ebab3bdf259c8d6f1b572552356751e5f224e2bce4494040611708c3657d/"
+        "mnemosyne_memory-4.0.0-py3-none-any.whl"
+    )
+    with urllib.request.urlopen(url, timeout=30) as response:
+        payload = response.read()
+    assert hashlib.sha256(payload).hexdigest() == (
+        "3e80bff63921ab554d3dbc1716900e064c31744b7e60135d9975f73a73026a76"
+    ), "Published minimum-Core wheel checksum differs"
+    core_wheel.write_bytes(payload)
+    hermes_wheel = _build_wheel(ROOT / "integrations" / "hermes", wheel_dir)
+    _assert_provider_lifecycle(core_wheel, hermes_wheel, tmp_path, CATALOG_CORE_FLOOR)
+
+
+def _assert_provider_lifecycle(
+    core_wheel: Path, hermes_wheel: Path, tmp_path: Path, expected_core_version: str
+) -> None:
+    """Exercise wheel-only imports, persistence and provider lifecycle transitions."""
     site = tmp_path / "site"
     site.mkdir()
     _extract_wheel(core_wheel, site)
@@ -185,6 +215,7 @@ def test_built_release_pair_completes_the_provider_lifecycle(tmp_path: Path) -> 
         sys.path.insert(1, {str(dependency_site)!r})
         import mnemosyne
         import mnemosyne_hermes
+        assert mnemosyne.__version__ == {expected_core_version!r}, mnemosyne.__version__
         for module in (mnemosyne, mnemosyne_hermes):
             assert Path(module.__file__).resolve().is_relative_to(site), module.__file__
         required_core_api = {REQUIRED_CORE_API!r}

@@ -1130,19 +1130,63 @@ def test_cyrillic_normalization_rejects_persisted_main_generation_18(
             _close_memory(target)
 
 
-def test_cyrillic_normalization_invalidates_generation_16_results(enhanced, monkeypatch):
-    """A pre-fold cache entry must miss once, then reuse the recomputed result."""
-    memory, calls = enhanced
-    with monkeypatch.context() as ctx:
-        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 16)
-        stale = _call(memory, "свеклы")
-    assert len(calls) == 1
-
-    fresh = _call(memory, "свеклы")
-    assert len(calls) == 2
-    assert fresh[0]["id"] != stale[0]["id"]
-    assert _call(memory, "свеклы") == fresh
-    assert len(calls) == 2
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("store", ["working", "episodic"])
+@pytest.mark.parametrize("query,content", [
+    ("свеклы", "Свёкла тушёная хранится отдельно"),
+    ("свёклы", "Свекла тушеная хранится отдельно"),
+])
+def test_real_cyrillic_recall_replaces_stale_generation_18(
+    monkeypatch, tmp_path, restart, store, query, content
+):
+    """A persisted pre-fold miss is recomputed into a real match and cached."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.delenv("MNEMOSYNE_LEXICAL_GATE_MIN", raising=False)
+    memory = BeamMemory(session_id="cyrillic-cache", db_path=tmp_path / "memories.db")
+    target = memory
+    try:
+        if store == "working":
+            wanted = memory.remember(content, source="test", importance=0.8)
+            unrelated = memory.remember("Автобус отправляется утром", source="test")
+        else:
+            wanted = memory.consolidate_to_episodic(content, source_wm_ids=[], source="test")
+            unrelated = memory.consolidate_to_episodic(
+                "Автобус отправляется утром", source_wm_ids=[], source="test"
+            )
+        # Reproduce the actual pre-fold result, rather than faking recall.
+        with monkeypatch.context() as ctx:
+            ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 18)
+            ctx.setattr(beam_module, "_normalize_cyrillic_text", lambda text: text.lower())
+            stale = _call(memory, query)
+        assert stale == []
+        keys = [row[0] for row in memory._query_cache._conn.execute(
+            "SELECT normalized FROM query_cache"
+        )]
+        assert len(keys) == 1
+        if restart:
+            _close_memory(memory)
+            target = BeamMemory(session_id=memory.session_id, db_path=memory.db_path)
+            target._query_cache = QueryCache(db_path=memory.db_path.parent / "query_cache.db")
+        assert target._query_cache.get_opaque(keys[0]) == []
+        misses = target._query_cache.stats()["misses"]
+        fresh = _call(target, query)
+        assert [row["id"] for row in fresh] == [wanted]
+        assert fresh[0]["content"] == content
+        assert unrelated not in {row["id"] for row in fresh}
+        assert target._query_cache.stats()["misses"] == misses + 1
+        hits = target._query_cache.stats()["hits"]
+        assert _call(target, query) == fresh
+        assert target._query_cache.stats()["hits"] == hits + 1
+        table = "working_memory" if store == "working" else "episodic_memory"
+        assert target.conn.execute(
+            f"SELECT content FROM {table} WHERE id=?", (wanted,)
+        ).fetchone()[0] == content
+    finally:
+        if target is not memory:
+            _close_memory(target)
+        _close_memory(memory)
 
 
 def test_enhanced_cache_key_version_bump_invalidates_literal_flag_ranking_change(
