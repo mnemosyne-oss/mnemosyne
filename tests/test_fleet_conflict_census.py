@@ -413,6 +413,34 @@ def _schema_and_counts(path: Path):
 
 
 class TestReadOnly:
+    def test_census_read_connection_has_short_timeout_and_rejects_writes(
+        self, fleet_env, monkeypatch
+    ):
+        """Pin the per-file budget without relying on scheduler timing."""
+        bank = _make_bank(fleet_env / "bank.db", [_TWIN + (None,)])
+        before = _file_digest(bank)
+        connect = sqlite3.connect
+        observed = []
+
+        def inspect_connection(*args, **kwargs):
+            conn = connect(*args, **kwargs)
+            try:
+                observed.append(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+                with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                    conn.execute("DELETE FROM conflicts")
+            except BaseException:
+                conn.close()
+                raise
+            return conn
+
+        monkeypatch.setattr(fleet_census.sqlite3, "connect", inspect_connection)
+        report = fleet_census.census(banks=[bank])
+        assert observed == [50]
+        assert report["banks_scanned"] == 1
+        assert report["unreadable"] == []
+        assert report["bound_holds"] is True
+        assert _file_digest(bank) == before
+
     def test_foreign_exclusive_locks_do_not_delay_the_fleet(self, fleet_env):
         """Browser databases must not consume the session-end census budget."""
         bank = _make_bank(fleet_env / "custom" / "bank.db", [_TWIN + (None,)])
