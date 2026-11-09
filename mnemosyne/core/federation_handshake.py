@@ -771,28 +771,28 @@ def _probe_scope(
     as the same fail-closed refusal a probe failure produces.
     """
     home = _resolve(home_bank)
-    if fleet_root is not None:
+    root_bank = root_db if root_db is not None else (
+        root_db_path(fleet_root) if fleet_root is not None else None
+    )
+    for scope_path in (fleet_root, root_bank):
+        if scope_path is None:
+            continue
         try:
-            Path(fleet_root).expanduser().resolve(strict=True)
-        except RuntimeError as exc:
-            failure = _failure(fleet_root, exc)
+            Path(scope_path).expanduser().resolve(strict=True)
+        except (RuntimeError, OSError) as exc:
+            # Older pathlib raises RuntimeError for loops; newer versions
+            # report ELOOP in strict mode. Missing paths remain optional.
+            if isinstance(exc, OSError) and exc.errno != errno.ELOOP:
+                continue
+            failure = _failure(scope_path, exc)
             failure["error_class"] = "scope_error"
             failure["error_message"] = f"fleet scope resolution failed: {exc}"[:500]
             return [], [failure]
-        except OSError as exc:
-            if exc.errno == errno.ELOOP:
-                failure = _failure(fleet_root, exc)
-                failure["error_class"] = "scope_error"
-                failure["error_message"] = f"fleet scope resolution failed: {exc}"[:500]
-                return [], [failure]
 
     surface = shared_db if shared_db is not None else (
         fleet_census.shared_db_path(fleet_root) if fleet_root is not None else None
     )
     surface = _resolve(surface) if surface is not None else None
-    root_bank = root_db if root_db is not None else (
-        root_db_path(fleet_root) if fleet_root is not None else None
-    )
     root_bank = _resolve(root_bank) if root_bank is not None else None
 
     if banks is not None:

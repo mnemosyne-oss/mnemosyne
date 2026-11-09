@@ -350,6 +350,29 @@ class TestProbeScope:
         assert not list(tmp_path.rglob("*.db-wal"))
         assert not list(tmp_path.rglob("*.db-shm"))
 
+    def test_derived_root_bank_symlink_loop_refuses_without_writes(self, tmp_path, monkeypatch):
+        """A valid fleet directory can still contain a looping root bank."""
+        monkeypatch.delenv("MNEMOSYNE_HOME", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_SHARED_DB_PATH", raising=False)
+        fleet_root = tmp_path / "fleet"
+        root_bank = fleet_root / "mnemosyne" / "data" / "mnemosyne.db"
+        root_bank.parent.mkdir(parents=True)
+        root_bank.symlink_to(root_bank)
+        home = _make_bank(tmp_path / "home" / "mnemosyne.db", [])
+        before = _fingerprint(home)
+
+        decision = fh.probe_fleet(PAIR, home, fleet_root=fleet_root, sleep=_noop_sleep)
+
+        assert decision.refused is True
+        assert decision.proceed is False
+        assert decision.probed_banks == []
+        assert decision.probes_run == 0
+        assert decision.failed[0]["error_class"] == "scope_error"
+        assert decision.failed[0]["probe_target"] == str(root_bank)
+        assert _fingerprint(home) == before
+        assert not list(tmp_path.rglob("*.db-wal"))
+        assert not list(tmp_path.rglob("*.db-shm"))
+
     def test_standalone_bank_has_no_peers_and_inserts_anyway(self, tmp_path):
         """The gate is on by default, but a bank outside a fleet has nothing
         to probe — which is what makes default-on safe."""
