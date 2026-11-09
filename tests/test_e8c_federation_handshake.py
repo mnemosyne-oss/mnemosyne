@@ -298,6 +298,59 @@ class TestProbeScope:
         assert census["banks"] == []
         assert decision.probed_banks == []
 
+    def test_self_referential_fleet_root_default_paths_refuses_without_writes(self, tmp_path):
+        """A loop in the default scope must refuse, never escape as an exception.
+
+        Before the scope failure is structured, resolving the default shared
+        path raises ``RuntimeError: Symlink loop`` from ``Path.resolve()``.
+        """
+        fleet_root = tmp_path / "fleet-loop"
+        fleet_root.symlink_to(fleet_root, target_is_directory=True)
+        home = _make_bank(tmp_path / "home" / "mnemosyne.db", [])
+        before = _fingerprint(home)
+
+        decision = fh.probe_fleet(PAIR, home, fleet_root=fleet_root, sleep=_noop_sleep)
+
+        assert decision.refused is True
+        assert decision.proceed is False
+        assert decision.chain == []
+        assert decision.probed_banks == []
+        assert decision.probes_run == 0
+        assert decision.failed[0]["error_class"] == "scope_error"
+        assert "fleet scope resolution failed" in decision.failed[0]["error_message"]
+        assert _fingerprint(home) == before
+        assert not list(tmp_path.rglob("*.db-wal"))
+        assert not list(tmp_path.rglob("*.db-shm"))
+
+    def test_self_referential_fleet_root_explicit_paths_refuses_without_writes(self, tmp_path):
+        """Explicit surface/root paths leave census discovery to reject the loop.
+
+        Before the scope failure is structured, these explicit paths bypass
+        default path resolution and ``Path.resolve()`` raises ``RuntimeError``
+        while normalizing the fleet root for census discovery.
+        """
+        fleet_root = tmp_path / "fleet-loop"
+        fleet_root.symlink_to(fleet_root, target_is_directory=True)
+        home = _make_bank(tmp_path / "home" / "mnemosyne.db", [])
+        shared = _make_bank(tmp_path / "shared" / "mnemosyne.db", [])
+        root = _make_bank(tmp_path / "root" / "mnemosyne.db", [])
+        before = {bank: _fingerprint(bank) for bank in (home, shared, root)}
+
+        decision = fh.probe_fleet(
+            PAIR, home, fleet_root=fleet_root, shared_db=shared, root_db=root,
+            sleep=_noop_sleep)
+
+        assert decision.refused is True
+        assert decision.proceed is False
+        assert decision.chain == []
+        assert decision.probed_banks == []
+        assert decision.probes_run == 0
+        assert decision.failed[0]["error_class"] == "scope_error"
+        assert "fleet scope resolution failed" in decision.failed[0]["error_message"]
+        assert {bank: _fingerprint(bank) for bank in (home, shared, root)} == before
+        assert not list(tmp_path.rglob("*.db-wal"))
+        assert not list(tmp_path.rglob("*.db-shm"))
+
     def test_standalone_bank_has_no_peers_and_inserts_anyway(self, tmp_path):
         """The gate is on by default, but a bank outside a fleet has nothing
         to probe — which is what makes default-on safe."""

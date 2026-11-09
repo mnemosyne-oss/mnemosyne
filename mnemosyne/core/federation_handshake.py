@@ -770,19 +770,46 @@ def _probe_scope(
     as the same fail-closed refusal a probe failure produces.
     """
     home = _resolve(home_bank)
-    surface = shared_db if shared_db is not None else (
-        fleet_census.shared_db_path(fleet_root) if fleet_root is not None else None
-    )
-    surface = _resolve(surface) if surface is not None else None
-    root_bank = root_db if root_db is not None else (
-        root_db_path(fleet_root) if fleet_root is not None else None
-    )
-    root_bank = _resolve(root_bank) if root_bank is not None else None
+
+    if shared_db is not None:
+        surface = _resolve(shared_db)
+    elif fleet_root is not None:
+        surface = fleet_census.shared_db_path(fleet_root)
+        try:
+            surface = _resolve(surface)
+        except RuntimeError as exc:
+            failure = _failure(surface, exc)
+            failure["error_class"] = "scope_error"
+            failure["error_message"] = f"fleet scope resolution failed: {exc}"[:500]
+            return [], [failure]
+    else:
+        surface = None
+    if root_db is not None:
+        root_bank = _resolve(root_db)
+    elif fleet_root is not None:
+        root_bank = root_db_path(fleet_root)
+        try:
+            root_bank = _resolve(root_bank)
+        except RuntimeError as exc:
+            failure = _failure(root_bank, exc)
+            failure["error_class"] = "scope_error"
+            failure["error_message"] = f"fleet scope resolution failed: {exc}"[:500]
+            return [], [failure]
+    else:
+        root_bank = None
 
     if banks is not None:
         raw_candidates = [_resolve(Path(b)) for b in banks]
     elif fleet_root is not None:
-        raw_candidates = sorted({_resolve(Path(b)) for b in fleet_census.discover_banks(_resolve(fleet_root))})
+        try:
+            census_root = _resolve(fleet_root)
+        except RuntimeError as exc:
+            failure = _failure(fleet_root, exc)
+            failure["error_class"] = "scope_error"
+            failure["error_message"] = f"fleet scope resolution failed: {exc}"[:500]
+            return [], [failure]
+        raw_candidates = sorted(
+            {_resolve(Path(b)) for b in fleet_census.discover_banks(census_root)})
     else:
         raw_candidates = []
 
