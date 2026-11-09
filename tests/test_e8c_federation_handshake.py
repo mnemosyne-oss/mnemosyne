@@ -301,8 +301,8 @@ class TestProbeScope:
     def test_self_referential_fleet_root_default_paths_refuses_without_writes(self, tmp_path):
         """A loop in the default scope must refuse, never escape as an exception.
 
-        Before the scope failure is structured, resolving the default shared
-        path raises ``RuntimeError: Symlink loop`` from ``Path.resolve()``.
+        Before strict fleet-root validation, loop handling varied by Python
+        version and could return a decision that allowed the insert.
         """
         fleet_root = tmp_path / "fleet-loop"
         fleet_root.symlink_to(fleet_root, target_is_directory=True)
@@ -325,9 +325,8 @@ class TestProbeScope:
     def test_self_referential_fleet_root_explicit_paths_refuses_without_writes(self, tmp_path):
         """Explicit surface/root paths leave census discovery to reject the loop.
 
-        Before the scope failure is structured, these explicit paths bypass
-        default path resolution and ``Path.resolve()`` raises ``RuntimeError``
-        while normalizing the fleet root for census discovery.
+        Explicit paths leave only the fleet-root validation responsible for
+        rejecting the loop before census discovery or any DB probe.
         """
         fleet_root = tmp_path / "fleet-loop"
         fleet_root.symlink_to(fleet_root, target_is_directory=True)
