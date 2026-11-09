@@ -245,6 +245,11 @@ def _assert_provider_lifecycle(
         assert call(provider, "mnemosyne_remember", {{"content": token}})["status"] == "stored"
         recalled = call(provider, "mnemosyne_recall", {{"query": token, "limit": 5}})
         assert any(token in row.get("content", "") for row in recalled["results"])
+        recovery_token = "release_contract_persistent_marker"
+        stored = call(provider, "mnemosyne_remember", {{
+            "content": recovery_token, "scope": "global",
+        }})
+        assert stored["status"] == "stored"
         provider.initialize(
             "release-pair-skip",
             agent_context="subagent",
@@ -262,6 +267,8 @@ def _assert_provider_lifecycle(
         )
         assert provider._beam is not None, provider._init_error
         assert call(provider, "mnemosyne_stats", {{}}).get("status") != "memory_unavailable"
+        recovered = call(provider, "mnemosyne_recall", {{"query": recovery_token, "limit": 5}})
+        assert any(recovery_token in row.get("content", "") for row in recovered["results"])
         provider.shutdown()
         """
     )
