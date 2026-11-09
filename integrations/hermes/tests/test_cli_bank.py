@@ -414,29 +414,50 @@ def test_export_selected_missing_or_incomplete_bank_has_no_artifacts(
     without ``mnemosyne.db``; it deliberately accepts any existing SQLite file
     and does not validate that file's schema.
     """
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
+    ambient_dir = tmp_path / "ambient-data"
+    ambient_dir.mkdir()
     output = tmp_path / "export.json"
-    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(ambient_dir))
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     if selection == "implicit":
         home = tmp_path / "profiles" / bank
         _write_config(home, "true")
         monkeypatch.setenv("HERMES_HOME", str(home))
+        selected_root = home / "mnemosyne" / "data"
         args = _export_args(output)
     else:
         monkeypatch.delenv("HERMES_HOME", raising=False)
+        selected_root = ambient_dir
         args = _export_args(output, bank=bank)
+    selected_path = selected_root / "banks" / bank
     if state == "incomplete":
-        (data_dir / "banks" / bank).mkdir(parents=True)
+        selected_path.mkdir(parents=True)
+        (selected_path / "keep.txt").write_text("untouched")
 
-    selected_path = data_dir / "banks" / bank
-    before = sorted(path.relative_to(data_dir) for path in data_dir.rglob("*"))
+    assert (selected_path.exists(), (selected_path / "mnemosyne.db").exists()) == (
+        (state == "incomplete"), False
+    )
+    if selection == "implicit":
+        assert selected_root != ambient_dir
+        assert not (ambient_dir / "banks" / bank).exists()
+    assert not output.exists()
+
+    def snapshot(root):
+        return {
+            str(path.relative_to(root)): None if path.is_dir() else path.read_bytes()
+            for path in root.rglob("*")
+        } if root.exists() else None
+
+    before_ambient = snapshot(ambient_dir)
+    before_selected = snapshot(selected_root)
+    before_output = snapshot(output.parent)
     assert mnemosyne_command(args) == 1
     assert "Bank not found:" in capsys.readouterr().out
     assert not output.exists()
     assert not (selected_path / "mnemosyne.db").exists()
-    assert sorted(path.relative_to(data_dir) for path in data_dir.rglob("*")) == before
+    assert snapshot(ambient_dir) == before_ambient
+    assert snapshot(selected_root) == before_selected
+    assert snapshot(output.parent) == before_output
 
 
 def test_export_bank_validation_error_does_not_disclose_exception_details(

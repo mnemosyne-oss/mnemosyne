@@ -174,7 +174,13 @@ def _distribution_version(distribution: str) -> str:
 
 def register_cli(subparser):
     """Register CLI subcommands for ``hermes mnemosyne``."""
-    mn_cmds = subparser.add_subparsers(dest="mnemosyne_cmd")
+    mn_cmds = subparser.add_subparsers(
+        dest="mnemosyne_cmd",
+        description=(
+            "With HERMES_HOME set, CLI uses HERMES_HOME/mnemosyne/data before "
+            "MNEMOSYNE_DATA_DIR. Without HERMES_HOME, standalone Core resolution applies."
+        ),
+    )
 
     stats_cmd = mn_cmds.add_parser("stats", help="Show memory statistics")
     stats_cmd.add_argument("--global", "-g", action="store_true", help="Show global stats across all sessions")
@@ -340,11 +346,23 @@ def _run_cli_diagnostics(bank: str | None, db_path: Path | None, data_dir: Path 
         "import json, sys; from mnemosyne.diagnose import run_diagnostics; "
         "print(json.dumps(run_diagnostics(bank=sys.argv[1] or None)))"
     )
-    child = subprocess.run(
-        [sys.executable, "-c", script, bank or ""], env=env,
-        capture_output=True, text=True, timeout=120, check=True,
-    )
-    return json.loads(child.stdout)
+    try:
+        child = subprocess.run(
+            [sys.executable, "-c", script, bank or ""], env=env,
+            capture_output=True, text=True, timeout=120, check=True,
+        )
+    except subprocess.CalledProcessError:
+        # Exception strings include the entire command and may include child output.
+        raise RuntimeError("legacy diagnostic subprocess exited unsuccessfully") from None
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("legacy diagnostic subprocess timed out") from None
+    try:
+        result = json.loads(child.stdout)
+        if not isinstance(result, dict):
+            raise ValueError("not a diagnostic object")
+        return result
+    except (ValueError, TypeError):
+        raise RuntimeError("legacy diagnostic subprocess returned invalid JSON") from None
 
 
 def mnemosyne_command(args):
