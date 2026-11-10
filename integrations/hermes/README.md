@@ -456,6 +456,7 @@ No required config. Everything defaults to `~/.mnemosyne/`. Optional overrides:
 | `MNEMOSYNE_CROSS_SESSION_MIN_GAP_HOURS` | `0` | Minimum hour-gap between cross-session candidate pairs before they are flagged for contradiction (relaxed to 0 for independent threads) |
 | `MNEMOSYNE_CROSS_SESSION_MAX_CANDIDATES` | `10000` | Per-bank row cap for the cross-session candidate scan (bounds the pairwise comparison and embedding load); truncation is reported in the tool result |
 | `MNEMOSYNE_CROSS_SESSION_MAX_LLM_VALIDATIONS` | `20` | Per-run cap on pair validations during apply or an explicit LLM preview. A validation may retry its transport; this is not an exact HTTP-request or dollar cap. The tool reports `llm_cap_reached` when the cap was hit (alongside `candidates_truncated` for the row cap), so operators can tell when candidate pairs remain pending for a later explicit run |
+| `MNEMOSYNE_CROSS_SESSION_VERDICT_TTL_DAYS` | `30` | How long an LLM `reject` verdict stays cached for the cross-session resolver. A rejected pair is not re-validated while its verdict is fresh (reported as `skipped_cached` in the tool result); after the TTL elapses the pair is re-adjudicated. Cache writes happen on an explicit apply only |
 
 Both the standalone `mnemosyne_hermes` provider and the bundled
 `hermes_memory_provider` copy expose the same `dry_run`/`llm_eval` resolver
