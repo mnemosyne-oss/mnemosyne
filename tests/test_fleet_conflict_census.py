@@ -680,6 +680,24 @@ class TestReadOnly:
 
         assert fleet_census.discover_banks(root) == [productive]
 
+    @pytest.mark.parametrize(
+        "root_name,alias_name,keep_partial",
+        [("state-snapshots", "snapshot-alias", False), ("fleet", "state-snapshots", True)],
+    )
+    def test_discover_banks_classifies_alias_by_target(
+            self, tmp_path, root_name, alias_name, keep_partial):
+        """Use the target's snapshot status while preserving alias-relative paths."""
+        root = tmp_path / "targets" / root_name
+        completed = _make_bank(root / "complete" / "state.db", [])
+        partial = _make_bank(root / "sample.partial" / "state.db", [])
+        alias = tmp_path / alias_name
+        alias.symlink_to(root, target_is_directory=True)
+        expected = [alias / completed.relative_to(root)]
+        if keep_partial:
+            expected.append(alias / partial.relative_to(root))
+
+        assert fleet_census.discover_banks(alias) == expected
+
 
 # --------------------------------------------------------------------------
 # 3. The clock seam
