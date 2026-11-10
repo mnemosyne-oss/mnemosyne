@@ -23,7 +23,11 @@ from mnemosyne.mcp_tools import (
 
 
 @pytest.mark.parametrize("memory_store", ["working", "episodic"])
-def test_handle_get_returns_stored_provenance(tmp_path, monkeypatch, memory_store):
+@pytest.mark.parametrize("channel_id", ["cursor", None])
+@pytest.mark.parametrize("trust_tier", ["EXTERNAL_WRITE", None])
+def test_handle_get_returns_stored_provenance(
+    tmp_path, monkeypatch, memory_store, channel_id, trust_tier
+):
     """MCP serialization retains stored provenance for both memory tiers."""
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
     memory = _create_instance(channel_id="cursor", bank="default")
@@ -36,11 +40,12 @@ def test_handle_get_returns_stored_provenance(tmp_path, monkeypatch, memory_stor
         memory_id = memory.beam.consolidate_to_episodic(
             "MCP episodic provenance", source_wm_ids=[], source="test", scope="global"
         )
-        memory.conn.execute(
-            "UPDATE episodic_memory SET trust_tier = ? WHERE id = ?",
-            ("EXTERNAL_WRITE", memory_id),
-        )
-        memory.conn.commit()
+
+    memory.conn.execute(
+        f"UPDATE {memory_store}_memory SET channel_id = ?, trust_tier = ? WHERE id = ?",
+        (channel_id, trust_tier, memory_id),
+    )
+    memory.conn.commit()
 
     result = handle_tool_call(
         "mnemosyne_get",
@@ -50,8 +55,8 @@ def test_handle_get_returns_stored_provenance(tmp_path, monkeypatch, memory_stor
     assert result["status"] == "ok"
     payload = json.loads(json.dumps(result))["memory"]
     assert payload["memory_store"] == memory_store
-    assert payload["channel_id"] == "cursor"
-    assert payload["trust_tier"] == "EXTERNAL_WRITE"
+    assert payload["channel_id"] == channel_id
+    assert payload["trust_tier"] == trust_tier
 
 
 class TestToolSchemas:
