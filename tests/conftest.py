@@ -9,6 +9,7 @@ make real CPU inference calls when a model is available on disk.
 
 import os
 import sys
+import tempfile
 
 # Scrub deployment env BEFORE any test module imports mnemosyne.core.beam:
 # the module-level RECALL_CONTENT_CAP constant resolves at
@@ -17,6 +18,40 @@ import sys
 # default-behavior tests environment-dependent. Tests that want custom values
 # set them explicitly on the resolved module attributes.
 os.environ.pop("MNEMOSYNE_RECALL_CONTENT_CAP", None)
+
+# --- Deployment-environment isolation -------------------------------------
+#
+# The deployment exports the bank map and the data directory.  A test suite
+# must not inherit them:
+#
+# * MNEMOSYNE_BANKS_MAP (and a map inside the data directory) turns the
+#   per-chat bank routing ON.  Tests that expect a write to land in the
+#   private profile storage instead see it land in a routed bank -- and the
+#   routed bank is a bank of the RUNNING deployment, so the test writes into
+#   production data.
+# * MNEMOSYNE_DATA_DIR points at the production data directory, so a test
+#   that does not pin its own directory writes into production storage.
+#
+# Both are neutralized here, before any test module is imported.  Tests that
+# want a specific value set it themselves (monkeypatch.setenv), which
+# overrides whatever this module does.
+#
+# The data directory is redirected to a per-session temporary directory
+# rather than removed: the suite resolves a default data directory from
+# HOME, and the real home directory is not a place a test suite should write
+# to either.
+#
+# Why this lives here and not in a conftest.py at the repository root: the
+# repository root carries an __init__.py (the Hermes plugin entry point).
+# pytest derives the package name of a root-level conftest.py from the
+# directory name, so in a checkout that is named "mnemosyne" -- which is how
+# CI checks the repository out -- importing the root conftest makes the
+# plugin stub shadow the real "mnemosyne" package in sys.modules.  Every
+# test module that then imports hermes_memory_provider fails with
+# "No module named 'mnemosyne.integrations.hermes_persona_prompt'".
+# A conftest.py inside a directory that is NOT a package has no such effect.
+os.environ.pop("MNEMOSYNE_BANKS_MAP", None)
+os.environ["MNEMOSYNE_DATA_DIR"] = tempfile.mkdtemp(prefix="mnemosyne-test-data-")
 
 import pytest
 
