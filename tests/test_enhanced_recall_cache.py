@@ -1135,6 +1135,7 @@ def test_cyrillic_normalization_rejects_persisted_main_generation_18(
 @pytest.mark.parametrize("query,content", [
     ("свеклы", "Свёкла тушёная хранится отдельно"),
     ("свёклы", "Свекла тушеная хранится отдельно"),
+    ("СВЁКЛЫ", "Свекла тушеная хранится отдельно"),
 ])
 def test_real_cyrillic_recall_replaces_stale_generation_18(
     monkeypatch, tmp_path, restart, store, query, content
@@ -1156,9 +1157,11 @@ def test_real_cyrillic_recall_replaces_stale_generation_18(
                 "Автобус отправляется утром", source_wm_ids=[], source="test"
             )
         # Reproduce the actual pre-fold result, rather than faking recall.
+        assert beam_module._cyrillic_score(query, content) == pytest.approx(0.6)
         with monkeypatch.context() as ctx:
             ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 18)
             ctx.setattr(beam_module, "_normalize_cyrillic_text", lambda text: text.lower())
+            assert beam_module._cyrillic_score(query, content) == pytest.approx(0.0)
             stale = _call(memory, query)
         assert stale == []
         keys = [row[0] for row in memory._query_cache._conn.execute(

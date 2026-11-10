@@ -5658,8 +5658,10 @@ def _cyrillic_like_search(
     receive comparable scores regardless of which surface form appears
     in the stored text.
 
-    The candidate-generation LIMIT is ``k * 5`` to keep the Python-side
-    scoring bounded; this matches the CJK fallback's behaviour.
+    Python scoring is bounded to ``k * 5`` candidates. Half of that pool
+    is reserved for the original spelling's prefixes, so newly admitted
+    ё/е variants cannot crowd out all pre-fold matches. The folded stage
+    fills any remaining slots; both stages use a stable identifier order.
     """
     if not _has_cyrillic(query):
         return []
@@ -5677,6 +5679,10 @@ def _cyrillic_like_search(
         "_py_cyrillic_normalize", 1,
         lambda s: _normalize_cyrillic_text(s) if isinstance(s, str) else s,
     )
+    conn.create_function(
+        "_py_cyrillic_lower", 1,
+        lambda s: s.lower() if isinstance(s, str) else s,
+    )
 
     # Use a 4-character prefix for LIKE matching. Query words and
     # stored content are inflected forms of the same lemma (тёмная
@@ -5689,15 +5695,35 @@ def _cyrillic_like_search(
     if not q_words:
         return []
 
-    conditions = " OR ".join(
-        ["_py_cyrillic_normalize(content) LIKE ? ESCAPE '\\'"] * len(q_words)
-    )
-    params = [f"%{w[:4]}%" for w in q_words]
+    original_words = [
+        w for w in re.findall(r"[а-яёa-z0-9]+", query.lower()) if len(w) >= 4
+    ]
+    budget = k * 5
+    if budget <= 0:
+        return []
+    all_rows = []
+    seen_ids = set()
     try:
-        all_rows = conn.execute(
-            f"SELECT {id_col}, content FROM {table} WHERE {conditions} LIMIT ?",
-            params + [k * 5],
-        ).fetchall()
+        for normalizer, words, stage_limit in (
+            ("_py_cyrillic_lower", original_words, max(1, budget // 2)),
+            ("_py_cyrillic_normalize", q_words, budget),
+        ):
+            conditions = " OR ".join(
+                [f"{normalizer}(content) LIKE ? ESCAPE '\\'"] * len(words)
+            )
+            params = [f"%{w[:4]}%" for w in words]
+            rows = conn.execute(
+                f"SELECT {id_col}, content FROM {table} WHERE {conditions}"
+                f" ORDER BY {id_col} LIMIT ?",
+                params + [stage_limit],
+            ).fetchall()
+            for row in rows:
+                if row[id_col] in seen_ids:
+                    continue
+                seen_ids.add(row[id_col])
+                all_rows.append(row)
+                if len(all_rows) >= budget:
+                    break
     except Exception:
         return []
 

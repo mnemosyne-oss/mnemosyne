@@ -247,6 +247,7 @@ def _open(db_path: Path) -> sqlite3.Connection:
     ("СВЁКЛЫ", "СВЕКЛА ТУШЕНАЯ ХРАНИТСЯ ОТДЕЛЬНО"),
 ])
 def test_yo_spelling_fallback_reaches_both_memory_tiers(temp_db, working, query, content):
+    """Both fallback entry points admit folded inflections and retain stored text."""
     seed = _seed_working if working else _seed_episodic
     seed(temp_db, [
         ("target", content, 0.8),
@@ -278,6 +279,7 @@ def test_yo_spelling_fallback_reaches_both_memory_tiers(temp_db, working, query,
     ("свёклы", "Свекла тушеная хранится отдельно"),
 ])
 def test_yo_spelling_passes_linear_recall_gate(temp_db, monkeypatch, query, content):
+    """Real linear recall admits either ё/е spelling through the lexical gate."""
     monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.delenv("MNEMOSYNE_LEXICAL_GATE_MIN", raising=False)
@@ -288,6 +290,46 @@ def test_yo_spelling_passes_linear_recall_gate(temp_db, monkeypatch, query, cont
     assert relevance == pytest.approx(0.6)
     results = memory.recall(query, top_k=5)
     assert [row["id"] for row in results] == [target]
+
+
+@pytest.mark.parametrize("working", [True, False])
+@pytest.mark.parametrize("query,content,noise", [
+    ("свёклы", "Свёкла тушёная хранится отдельно", "Свекор приехал утром"),
+    ("свеклы", "Свекла тушеная хранится отдельно", "Свёкор приехал утром"),
+    ("СВЁКЛЫ", "СВЁКЛА ТУШЁНАЯ ХРАНИТСЯ ОТДЕЛЬНО", "СВЕКОР ПРИЕХАЛ УТРОМ"),
+])
+def test_spelling_fold_keeps_original_candidates_under_pressure(
+    temp_db, monkeypatch, working, query, content, noise,
+):
+    """New spelling variants cannot consume the original-prefix candidate pool."""
+    k = 5
+    seed = _seed_working if working else _seed_episodic
+    competitors = [(f"noise-{i:03}", noise, 0.8) for i in range(k * 5 + 6)]
+    seed(temp_db, competitors + [("zz-target", content, 0.8)])
+    conn = _open(temp_db)
+    scorer = beam_module._cyrillic_score
+    scored = []
+
+    def track_score(query, content):
+        """Count candidates handed to the expensive Python scorer."""
+        scored.append(content)
+        return scorer(query, content)
+
+    monkeypatch.setattr(beam_module, "_cyrillic_score", track_score)
+    expected_id = "zz-target" if working else len(competitors) + 1
+    result_key = "id" if working else "rowid"
+    try:
+        for search in (
+            lambda: _cyrillic_like_search(conn, query, k=k, working=working),
+            lambda: (_fts_search_working if working else _fts_search)(conn, query, k=k),
+        ):
+            scored.clear()
+            results = search()
+            assert results[0][result_key] == expected_id
+            assert results[0]["rank"] == pytest.approx(-0.6)
+            assert len(scored) <= k * 5
+    finally:
+        conn.close()
 
 
 class TestCyrillicLikeSearchWorking:

@@ -250,6 +250,19 @@ def _assert_provider_lifecycle(
             "content": recovery_token, "scope": "global",
         }})
         assert stored["status"] == "stored"
+        private_token = "release_contract_session_marker"
+        private = call(provider, "mnemosyne_remember", {{
+            "content": private_token, "scope": "session",
+        }})
+        assert private["status"] == "stored"
+        batch_token = "release_contract_batch_marker"
+        batch = call(provider, "mnemosyne_batch", {{"operations": [{{
+            "action": "remember", "content": batch_token, "scope": "global",
+        }}]}})
+        assert batch["status"] == "ok", batch
+        assert batch["operations_count"] == 1, batch
+        batch_recalled = call(provider, "mnemosyne_recall", {{"query": batch_token, "limit": 5}})
+        assert any(batch_token in row.get("content", "") for row in batch_recalled["results"])
         provider.initialize(
             "release-pair-skip",
             agent_context="subagent",
@@ -269,11 +282,23 @@ def _assert_provider_lifecycle(
         assert call(provider, "mnemosyne_stats", {{}}).get("status") != "memory_unavailable"
         recovered = call(provider, "mnemosyne_recall", {{"query": recovery_token, "limit": 5}})
         assert any(recovery_token in row.get("content", "") for row in recovered["results"])
+        isolated = call(provider, "mnemosyne_recall", {{"query": private_token, "limit": 5}})
+        assert not any(private_token in row.get("content", "") for row in isolated["results"])
+        provider.initialize(
+            "release-pair-primary",
+            agent_context="primary",
+            hermes_home={str(home)!r},
+            auto_sleep=False,
+        )
+        assert provider._beam is not None, provider._init_error
+        original = call(provider, "mnemosyne_recall", {{"query": private_token, "limit": 5}})
+        assert any(private_token in row.get("content", "") for row in original["results"])
         provider.shutdown()
         """
     )
     env = os.environ.copy()
     env["MNEMOSYNE_NO_EMBEDDINGS"] = "1"
+    env["MNEMOSYNE_CROSS_SESSION"] = "0"
     env.pop("PYTHONPATH", None)
     result = subprocess.run(
         [sys.executable, "-S", "-c", code],
