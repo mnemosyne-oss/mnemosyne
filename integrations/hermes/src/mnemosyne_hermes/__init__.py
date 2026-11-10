@@ -1863,6 +1863,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         except Exception:
             return False
 
+    def unavailable_reason(self) -> str:
+        """Explain why the engine-backed provider cannot be activated."""
+        try:
+            _get_beam_class()
+        except Exception as exc:
+            return (
+                f"Mnemosyne engine is unavailable ({type(exc).__name__}: {exc}). "
+                "Install or repair the provider and engine in this Hermes environment, e.g. "
+                f'uv pip install --python "{sys.executable}" --upgrade mnemosyne-hermes'
+            )
+        return ""
+
     @classmethod
     def _parse_sync_roles(cls, raw: Any) -> tuple[set[str], bool]:
         """Return allowed roles and whether a nonempty value is invalid."""

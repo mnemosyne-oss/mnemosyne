@@ -74,6 +74,20 @@ def test_package_entry_point_targets_package_and_preserves_cli():
     assert not (PACKAGE_DIR / "config_schema.py").exists()
 
 
+def test_unavailable_reason_reports_engine_install_command(monkeypatch):
+    import mnemosyne_hermes as provider_module
+
+    def missing_engine():
+        raise ModuleNotFoundError("No module named 'mnemosyne'", name="mnemosyne")
+
+    monkeypatch.setattr(provider_module, "_get_beam_class", missing_engine)
+    reason = MnemosyneMemoryProvider().unavailable_reason()
+
+    assert "Mnemosyne engine is unavailable" in reason
+    assert f'--python "{sys.executable}"' in reason
+    assert "--upgrade mnemosyne-hermes" in reason
+
+
 def test_generated_persistent_wrapper_keeps_cli_without_declared_schema(tmp_path):
     site_packages = tmp_path / "side-venv" / "site-packages"
     site_packages.mkdir(parents=True)
