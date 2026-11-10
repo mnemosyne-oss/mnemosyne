@@ -194,7 +194,10 @@ class PolyphonicRecallEngine:
                     excluded = resolve_exclusions(conn, exclude_captures)
                 finally:
                     conn.close()
-        graph_results = self._graph_voice(query)
+        graph_results = (
+            self._graph_voice(query) if scope_where is None else
+            self._graph_voice(query, scope_where=scope_where, scope_params=scope_params)
+        )
         fact_results = self._fact_voice(query)
         if excluded:
             # These voices carry no producing-tier evidence. An ambiguous
@@ -826,7 +829,8 @@ class PolyphonicRecallEngine:
             if own_conn:
                 conn.close()
     
-    def _graph_voice(self, query: str) -> List[RecallResult]:
+    def _graph_voice(self, query: str, scope_where: Optional[str] = None,
+                     scope_params: Sequence[Any] = ()) -> List[RecallResult]:
         """
         Voice 2: Episodic graph traversal.
 
@@ -874,21 +878,37 @@ class PolyphonicRecallEngine:
                     metadata={"entity": entity, "fact": f"{fact.subject} {fact.predicate} {fact.object}"}
                 ))
 
+        # Pruned seeds cannot become output rows through another seed's walk.
+        seed_exclusion_ids = set(seed_ids)
+        if scope_where is not None and seed_ids:
+            # Gists/facts have no shared scope column. Resolve their derived
+            # memory IDs against both backing tiers before they can influence
+            # traversal or fusion. Visibility and active validity must hold
+            # on the same backing row; two ineligible tier copies cannot
+            # supply one half each. Unscoped standalone calls are unchanged.
+            eligible = {mid: PolyphonicResult(mid, 0.0, {}, {}) for mid in seed_ids}
+            self._drop_out_of_scope(eligible, scope_where, scope_params, require_active=True)
+            seed_ids = {mid: None for mid in seed_ids if mid in eligible}
+            results = [result for result in results if result.memory_id in seed_ids]
+
         # Graph traversal: from seed memory IDs, walk edges to
         # discover indirectly related memories (ctx edges only,
         # moderate weight threshold to avoid noise).
-        traversed_ids = set()
+        traversed = {}
         for seed_id in seed_ids:
             related = self.graph.find_related_memories(
                 seed_id, depth=2, edge_type="ctx", min_weight=0.3
             )
             for rel in related:
                 mid = rel["memory_id"]
-                if mid not in traversed_ids and mid not in seed_ids:
-                    traversed_ids.add(mid)
-                    results.append(RecallResult(
+                if mid in seed_exclusion_ids:
+                    continue
+                score = 0.4 / rel["depth"]  # Score decays with hop distance
+                previous = traversed.get(mid)
+                if previous is None or score > previous.score:
+                    traversed[mid] = RecallResult(
                         memory_id=mid,
-                        score=0.4 / rel["depth"],  # Score decays with hop distance
+                        score=score,
                         voice="graph_traversal",
                         metadata={
                             "seed": seed_id,
@@ -896,8 +916,9 @@ class PolyphonicRecallEngine:
                             "depth": rel["depth"],
                             "weight": rel["weight"],
                         }
-                    ))
+                    )
 
+        results.extend(traversed.values())
         return results
     
     def _fact_voice(self, query: str) -> List[RecallResult]:
@@ -1066,7 +1087,8 @@ class PolyphonicRecallEngine:
         return list(dict.fromkeys(entities))
     
     def _drop_out_of_scope(self, results: Dict[str, PolyphonicResult],
-                           scope_where: str, scope_params: Sequence[Any]) -> None:
+                           scope_where: str, scope_params: Sequence[Any], *,
+                           require_active: bool = False) -> None:
         """Remove memories outside the caller's scope before the fused cut.
 
         Graph and fact hits come from stores with no session column, so they
@@ -1074,6 +1096,9 @@ class PolyphonicRecallEngine:
         any tier holding it is in scope. Ids with no memory row in either tier
         (consolidated facts, gists) are removed too: BeamMemory can only
         resolve memory rows, so they would hold a slot and then be discarded.
+        Graph seeds additionally require an unsuperseded, unexpired backing
+        row in that same scope. Minimal standalone schemas without validity
+        columns retain their existing visibility-only behavior.
         """
         if not results:
             return
@@ -1089,6 +1114,7 @@ class PolyphonicRecallEngine:
         try:
             memory_ids = tuple(results)
             in_scope, out_of_scope = set(), set()
+            now_iso = datetime.now(timezone.utc).isoformat()
             for table in ("working_memory", "episodic_memory"):
                 # A standalone engine may point at a store without one of the
                 # tiers; any other failure must surface, or foreign rows would
@@ -1097,14 +1123,23 @@ class PolyphonicRecallEngine:
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
                 ).fetchone() is None:
                     continue
+                visible = f"({scope_where})"
+                visible_params = list(scope_params)
+                if require_active:
+                    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                    if "superseded_by" in columns:
+                        visible += " AND superseded_by IS NULL"
+                    if "valid_until" in columns:
+                        visible += " AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))"
+                        visible_params.append(now_iso)
                 # Chunked under SQLite's bound-variable limit, as the vec scans do.
                 for offset in range(0, len(memory_ids), 900):
                     chunk = memory_ids[offset : offset + 900]
                     placeholders = ", ".join("?" for _ in chunk)
                     rows = conn.execute(
-                        f"SELECT id, ({scope_where}) AS visible FROM {table} "
+                        f"SELECT id, ({visible}) AS visible FROM {table} "
                         f"WHERE id IN ({placeholders})",
-                        (*scope_params, *chunk),
+                        (*visible_params, *chunk),
                     ).fetchall()
                     for row in rows:
                         (in_scope if row["visible"] else out_of_scope).add(row["id"])

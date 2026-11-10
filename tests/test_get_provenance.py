@@ -8,6 +8,7 @@ from mnemosyne.core.beam import BeamMemory
 
 
 def _use_empty_config(tmp_path, monkeypatch):
+    """Isolate provenance checks from the user's configured write defaults."""
     data_dir = tmp_path / "config-data"
     data_dir.mkdir()
     (data_dir / "config.yaml").write_text("")
@@ -15,6 +16,7 @@ def _use_empty_config(tmp_path, monkeypatch):
 
 
 def test_get_returns_working_memory_author_and_scope(tmp_path, monkeypatch):
+    """Direct working-memory reads preserve the writer's identity and scope."""
     _use_empty_config(tmp_path, monkeypatch)
     memory = BeamMemory(
         session_id="fleet",
@@ -36,6 +38,7 @@ def test_get_returns_working_memory_author_and_scope(tmp_path, monkeypatch):
 
 
 def test_get_returns_episodic_memory_author_and_scope(tmp_path, monkeypatch):
+    """Direct episodic reads preserve writer provenance and event dates."""
     _use_empty_config(tmp_path, monkeypatch)
     memory = BeamMemory(
         session_id="fleet",
@@ -69,6 +72,7 @@ def test_get_returns_episodic_memory_author_and_scope(tmp_path, monkeypatch):
 def test_get_returns_stored_channel_and_trust_tier(
     tmp_path, monkeypatch, memory_store, channel_id, trust_tier
 ):
+    """Read stored provenance, including SQL NULL, without writing either tier."""
     _use_empty_config(tmp_path, monkeypatch)
     memory = BeamMemory(
         session_id="fleet",
@@ -133,6 +137,7 @@ def legacy_provenance_db(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("memory_store", ["working", "episodic"])
 def test_get_returns_migrated_trust_default(legacy_provenance_db, memory_store):
+    """Read the STATED trust default installed by legacy-schema migration."""
     memory = BeamMemory(session_id="legacy", db_path=legacy_provenance_db)
 
     result = memory.get(f"legacy-{memory_store}")
@@ -144,6 +149,7 @@ def test_get_returns_migrated_trust_default(legacy_provenance_db, memory_store):
 
 @pytest.mark.parametrize("memory_store", ["working", "episodic"])
 def test_get_provenance_keeps_session_visibility(tmp_path, monkeypatch, memory_store):
+    """Return the writer's provenance while retaining private-row isolation."""
     _use_empty_config(tmp_path, monkeypatch)
     writer = BeamMemory(
         session_id="writer", db_path=tmp_path / "mnemosyne.db", channel_id="cursor"

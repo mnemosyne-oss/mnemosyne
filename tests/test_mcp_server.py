@@ -24,6 +24,7 @@ from mnemosyne.mcp_tools import (
 
 @pytest.mark.parametrize("memory_store", ["working", "episodic"])
 def test_handle_get_returns_stored_provenance(tmp_path, monkeypatch, memory_store):
+    """MCP serialization retains stored provenance for both memory tiers."""
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
     memory = _create_instance(channel_id="cursor", bank="default")
     if memory_store == "working":

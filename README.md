@@ -368,6 +368,8 @@ See [docs/configuration.md#custom-embedding-models](docs/configuration.md#custom
 
 When used with Hermes Agent, Mnemosyne exposes provider tools for the memory lifecycle, lifecycle hooks for automatic context injection, and MCP support.
 
+The packaged `hermes mnemosyne` CLI uses the provider's database under `HERMES_HOME/mnemosyne/data`, even when `MNEMOSYNE_DATA_DIR` points elsewhere. Profile-isolated commands select the active profile bank below that root; `doctor` reports its selected database. Standalone Core commands still honor `MNEMOSYNE_DATA_DIR`, and the packaged CLI uses the Core resolver when `HERMES_HOME` is unset. Existing stores are not moved or merged.
+
 `mnemosyne_resolve_conflicts` remains gated off by default. Its `dry_run`
 argument defaults to `false` (apply): use `dry_run=true` for deterministic
 preview, with no LLM calls or reflection reservation. Explicit
@@ -393,6 +395,8 @@ for gates, conservative reservation and cost-logging limits.
 API embeddings require NumPy in the interpreter running Mnemosyne. For an API-only installation, use `python -m pip install mnemosyne-memory numpy` (or add `numpy` alongside `mnemosyne-memory[mcp]`). FastEmbed and a local model are not required. Missing or broken NumPy is reported before any embedding request; after installing or repairing it, calls can retry without restarting.
 
 **Hardware guidance:** Core alone runs on a Raspberry Pi 4 (4 GB) with ~300 MB free for LLM. `[embeddings]` needs at least 2 GB free RAM. `[all]` recommends 8 GB+.
+
+For optional per-input character and UTF-8 byte limits on both local and API embeddings, see [embedding input caps](docs/configuration.md#custom-embedding-endpoint). These caps default to off and do not guarantee a local inference memory ceiling.
 
 > **Privacy note on remote embedding endpoints.** Embeddings go to a remote API whenever `MNEMOSYNE_EMBEDDING_API_URL` points at a custom (non-OpenRouter) endpoint, the model name is API-shaped (`openai/*`, `text-embedding*`), or `MNEMOSYNE_EMBEDDINGS_VIA_API` is truthy; on the OpenRouter default (or an OpenRouter URL) the last two are what route, and with no URL set the OpenRouter default is used. That service receives the text of your memories and of your recall queries (working-memory content, summaries, annotations, and search queries) for vectorization. For privacy-sensitive or local-first deployments prefer a local-embedding profile (`[embeddings]` or `[all]`); use a remote endpoint only when you accept that the embedding provider sees your content.
 
