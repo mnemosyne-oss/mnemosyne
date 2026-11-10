@@ -511,13 +511,18 @@ def auto_fix(
             if verified_runtime.get("unavailable") or not any(
                 entry.get("status") == "OK" for entry in verified_checks
             ):
+                scope = (
+                    "the selected interpreter"
+                    if python_executable is not None
+                    else "the CLI interpreter (pip on PATH may use a different environment)"
+                )
                 result["failed"].append(
                     {
                         "label": label,
-                        "error": "pip exited successfully, but the dependency was not verified in the selected interpreter",
+                        "error": f"pip exited successfully, but the dependency was not verified in {scope}",
                     }
                 )
-                print(f"   ❌ Could not verify {label} after installation")
+                print(f"   ❌ Could not verify {label} in {scope} after installation")
                 continue
             result["fixed"].append(label)
             print(f"   ✅ {label} installed")
@@ -528,8 +533,9 @@ def auto_fix(
             result["failed"].append({"label": label, "error": "pip install timed out after 600 seconds"})
             print(f"   ❌ Timed out installing {label}")
         except FileNotFoundError:
-            result["failed"].append({"label": label, "error": "pip not found"})
-            print("   ❌ pip not found in PATH")
+            error = "selected Python not found" if python_executable is not None else "pip not found in PATH"
+            result["failed"].append({"label": label, "error": error})
+            print(f"   ❌ {error}")
 
     return result
 

@@ -4,11 +4,15 @@ import subprocess
 import sys
 import venv
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from mnemosyne import cli, diagnose
+
+
+def _completed(command, returncode=0, stdout="", stderr=""):
+    """Return a subprocess result with the same fields as the real runner."""
+    return subprocess.CompletedProcess(command, returncode, stdout, stderr)
 
 
 def _check(payload, name):
@@ -83,14 +87,20 @@ def test_unavailable_target_does_not_fall_back_to_cli_interpreter(tmp_path):
     assert str(tmp_path) not in json.dumps(payload)
 
 
-def test_target_payload_with_invalid_check_is_unavailable(monkeypatch):
-    """Reject malformed check entries even when the child exits successfully."""
+@pytest.mark.parametrize("stdout,returncode", [
+    ('MNEMOSYNE_DIAGNOSTICS={"checks":[null]}\n', 0),
+    ('MNEMOSYNE_DIAGNOSTICS={"checks":[{"check":"numpy","status":"OK"}]}\n', 0),
+    ('MNEMOSYNE_DIAGNOSTICS={"checks":{}}\n', 0),
+    ('MNEMOSYNE_DIAGNOSTICS=[]\n', 0),
+    ('MNEMOSYNE_DIAGNOSTICS=invalid JSON\n', 0),
+    ('no diagnostic marker\n', 0),
+    ('MNEMOSYNE_DIAGNOSTICS={"checks":[]}\n', 1),
+])
+def test_target_payload_with_invalid_check_is_unavailable(monkeypatch, stdout, returncode):
+    """Malformed or unsuccessful target output must never become a usable report."""
     monkeypatch.setattr(
         "mnemosyne.runtime_diagnostics.subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0,
-            stdout='MNEMOSYNE_DIAGNOSTICS={"checks":[null]}\n',
-        ),
+        lambda command, **kwargs: _completed(command, returncode, stdout),
     )
 
     result = diagnose.collect_runtime_diagnostics("./python")
@@ -105,7 +115,7 @@ def test_target_runtime_replaces_invalid_child_output_bytes(monkeypatch):
 
     def run(command, **kwargs):
         captured.update(kwargs)
-        return SimpleNamespace(returncode=1, stdout="", stderr="\ufffd")
+        return _completed(command, returncode=1, stderr="\ufffd")
 
     monkeypatch.setattr("mnemosyne.runtime_diagnostics.subprocess.run", run)
 
@@ -119,8 +129,6 @@ def test_unavailable_target_is_unknown_and_never_auto_installs(tmp_path, monkeyp
     """Leave unknown target dependencies untouched instead of attempting pip."""
     monkeypatch.setattr(diagnose, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
-    calls = []
-    monkeypatch.setattr(diagnose.subprocess, "run", lambda *args, **kwargs: calls.append(args))
     target_python = str(tmp_path / "missing-python")
 
     result = diagnose.run_diagnostics(python_executable=target_python)
@@ -128,7 +136,11 @@ def test_unavailable_target_is_unknown_and_never_auto_installs(tmp_path, monkeyp
     assert result["runtime_scope"] == "target_interpreter"
     assert any("dependency status is unknown" in finding for finding in result["key_findings"])
     assert not any("fastembed not available" in finding for finding in result["key_findings"])
-    calls.clear()
+    calls = []
+    monkeypatch.setattr(
+        diagnose.subprocess, "run",
+        lambda command, **kwargs: calls.append(command) or _completed(command),
+    )
     fix_result = diagnose.auto_fix(result["entries"], python_executable=target_python)
     assert fix_result["failed"] == [
         {"label": "target Python", "error": "diagnostics could not run in the selected interpreter"}
@@ -144,7 +156,7 @@ def test_auto_fix_uses_selected_python_module_pip(monkeypatch, tmp_path):
     monkeypatch.setattr(
         diagnose.subprocess,
         "run",
-        lambda command, **kwargs: calls.append((command, kwargs)) or SimpleNamespace(stderr=""),
+        lambda command, **kwargs: calls.append((command, kwargs)) or _completed(command),
     )
     monkeypatch.setattr(
         diagnose,
@@ -170,17 +182,18 @@ def test_auto_fix_uses_selected_python_module_pip(monkeypatch, tmp_path):
     assert verified_pythons == [str(target_python.resolve())]
 
 
+@pytest.mark.parametrize("selected", [False, True])
 def test_auto_fix_does_not_claim_success_when_isolated_check_still_fails(
-    monkeypatch, tmp_path, capsys
+    monkeypatch, tmp_path, capsys, selected
 ):
     """A successful pip exit cannot substitute for a successful isolated import."""
-    target_python = tmp_path / "provider env" / "python.exe"
+    target_python = str(tmp_path / "provider env" / "python.exe") if selected else None
     calls = []
     verified_pythons = []
     monkeypatch.setattr(
         diagnose.subprocess,
         "run",
-        lambda command, **kwargs: calls.append((command, kwargs)) or SimpleNamespace(stderr=""),
+        lambda command, **kwargs: calls.append((command, kwargs)) or _completed(command),
     )
     monkeypatch.setattr(
         diagnose,
@@ -191,19 +204,29 @@ def test_auto_fix_does_not_claim_success_when_isolated_check_still_fails(
 
     result = diagnose.auto_fix(
         [{"check": "sqlite_vec", "status": "MISSING"}],
-        python_executable=str(target_python),
+        python_executable=target_python,
     )
 
+    expected_scope = (
+        "the selected interpreter"
+        if selected
+        else "the CLI interpreter (pip on PATH may use a different environment)"
+    )
     assert result["fixed"] == []
     assert result["failed"] == [
         {
             "label": "sqlite-vec (vector search)",
-            "error": "pip exited successfully, but the dependency was not verified in the selected interpreter",
+            "error": f"pip exited successfully, but the dependency was not verified in {expected_scope}",
         }
     ]
-    assert calls[0][0][0] == str(target_python.resolve())
-    assert verified_pythons == [str(target_python.resolve())]
-    assert "Could not verify sqlite-vec" in capsys.readouterr().out
+    if selected:
+        assert calls[0][0] == [str(Path(target_python).resolve()), "-m", "pip", "install", "sqlite-vec"]
+    else:
+        assert calls[0][0] == ["pip", "install", "sqlite-vec"]
+    assert verified_pythons == [str(Path(target_python).resolve()) if selected else None]
+    output = capsys.readouterr().out
+    assert "Could not verify sqlite-vec" in output
+    assert expected_scope in output
 
 
 @pytest.mark.parametrize("selected", [False, True])
@@ -233,6 +256,8 @@ def test_auto_fix_reports_pip_timeout_without_verifying_or_claiming_success(
     assert calls[0][1]["timeout"] == 600
     if selected:
         assert calls[0][0][:3] == [str(Path(target).resolve()), "-m", "pip"]
+    else:
+        assert calls[0][0] == ["pip", "install", "sqlite-vec"]
     assert verified_pythons == []
     assert "Timed out installing sqlite-vec" in capsys.readouterr().out
 
@@ -248,7 +273,7 @@ def test_target_python_bare_name_resolves_through_path(monkeypatch):
     monkeypatch.setattr(
         "mnemosyne.runtime_diagnostics.subprocess.run",
         lambda command, **kwargs: commands.append(command)
-        or SimpleNamespace(returncode=1, stdout="", stderr=""),
+        or _completed(command, returncode=1),
     )
 
     diagnose.collect_runtime_diagnostics("python")
@@ -260,7 +285,10 @@ def test_auto_fix_dry_run_uses_selected_python_basename(monkeypatch, tmp_path):
     """Describe a target-specific install without launching pip in dry-run mode."""
     target_python = tmp_path / "provider env" / "python.exe"
     calls = []
-    monkeypatch.setattr(diagnose.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(
+        diagnose.subprocess, "run",
+        lambda command, **kwargs: calls.append(command) or _completed(command),
+    )
 
     result = diagnose.auto_fix(
         [{"check": "fastembed", "status": "MISSING"}],
@@ -325,6 +353,97 @@ def test_cli_accepts_equals_form_for_python_option(monkeypatch):
     assert calls[0]["python_executable"] == "provider/python"
 
 
+@pytest.mark.parametrize("args", [["--python"], ["--python="], ["--python", "--fix"]])
+def test_cli_rejects_missing_python_value_before_running_diagnostics(monkeypatch, capsys, args):
+    """Invalid target options must fail before diagnosing or installing anything."""
+    monkeypatch.setattr(diagnose, "run_diagnostics", lambda **kwargs: pytest.fail("diagnostics ran"))
+    monkeypatch.setattr(diagnose, "auto_fix", lambda *args, **kwargs: pytest.fail("repair ran"))
+
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_diagnose(args)
+
+    assert exc.value.code == 2
+    assert "--python requires a value" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("selected", [False, True])
+def test_auto_fix_without_entries_diagnoses_the_requested_runtime(monkeypatch, tmp_path, selected):
+    """Discover missing dependencies in the same runtime used for a dry-run repair."""
+    target = str(tmp_path / "provider" / "python.exe") if selected else None
+    calls = []
+
+    def run_diagnostics(**kwargs):
+        calls.append(kwargs)
+        return {"entries": [{"check": "sqlite_vec", "status": "MISSING"}]}
+
+    monkeypatch.setattr(diagnose, "run_diagnostics", run_diagnostics)
+    monkeypatch.setattr(diagnose.subprocess, "run", lambda *args, **kwargs: pytest.fail("pip ran"))
+
+    result = diagnose.auto_fix(dry_run=True, python_executable=target)
+
+    assert calls == [{"python_executable": target} if selected else {}]
+    assert result["failed"] == []
+    assert len(result["fixed"]) == 1
+    command = "python.exe -m pip install sqlite-vec" if selected else "pip install sqlite-vec"
+    assert result["fixed"] == [f"WOULD install: sqlite-vec (vector search) ({command})"]
+
+
+@pytest.mark.parametrize("failure", ["exit", "missing"])
+def test_selected_python_install_errors_do_not_recheck_or_claim_success(
+    monkeypatch, tmp_path, capsys, failure
+):
+    """Installer launch and execution failures must not claim a dependency repair."""
+    target = str(tmp_path / "private-provider" / "python.exe")
+    calls = []
+
+    def fail(command, **kwargs):
+        calls.append(command)
+        if failure == "exit":
+            raise subprocess.CalledProcessError(1, command, stderr="installation refused")
+        raise FileNotFoundError(target)
+
+    monkeypatch.setattr(diagnose.subprocess, "run", fail)
+    monkeypatch.setattr(
+        diagnose, "collect_runtime_diagnostics", lambda *args: pytest.fail("verification ran")
+    )
+
+    result = diagnose.auto_fix(
+        [{"check": "sqlite_vec", "status": "MISSING"}], python_executable=target
+    )
+
+    assert calls == [[str(Path(target).resolve()), "-m", "pip", "install", "sqlite-vec"]]
+    assert result["fixed"] == []
+    error = "installation refused" if failure == "exit" else "selected Python not found"
+    assert result["failed"] == [{"label": "sqlite-vec (vector search)", "error": error}]
+    output = capsys.readouterr().out
+    assert error in output
+    assert str(tmp_path) not in output
+
+
+def test_diagnose_module_forwards_target_and_never_repairs_an_unavailable_runtime(tmp_path, monkeypatch):
+    """Exercise the argparse entry point in a real child with a missing target."""
+    target = tmp_path / "missing-python"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
+
+    process = subprocess.run(
+        [sys.executable, "-m", "mnemosyne.diagnose", "--python", str(target), "--fix"],
+        check=True, capture_output=True, text=True, encoding="utf-8", timeout=120,
+    )
+    diagnostic_json, fix_json = process.stdout.split("--- Auto-fix ---", 1)
+    report, repair = json.loads(diagnostic_json), json.loads(fix_json)
+
+    assert report["runtime_scope"] == "target_interpreter"
+    assert report["runtime_executable"] == target.name
+    assert _check(report, "target_interpreter")["status"] == "ERROR"
+    assert repair["fixed"] == []
+    assert repair["failed"] == [{
+        "label": "target Python", "error": "diagnostics could not run in the selected interpreter",
+    }]
+
+
 def test_default_auto_fix_finds_dependency_added_with_cached_directory(
     tmp_path, monkeypatch
 ):
@@ -352,7 +471,7 @@ def test_default_auto_fix_finds_dependency_added_with_cached_directory(
         # filesystem clock resolution or pip finishing within one clock tick.
         os.utime(tmp_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
         assert importlib.util.find_spec("sqlite_vec") is None
-        return SimpleNamespace(returncode=0)
+        return _completed(command)
 
     monkeypatch.setattr(diagnose.subprocess, "run", install)
     try:
@@ -371,9 +490,7 @@ def test_target_probe_is_isolated_and_bounded(monkeypatch, tmp_path):
 
     def run(command, **kwargs):
         calls.append((command, kwargs))
-        return SimpleNamespace(
-            returncode=0, stdout='MNEMOSYNE_DIAGNOSTICS={"checks":[]}\n'
-        )
+        return _completed(command, stdout='MNEMOSYNE_DIAGNOSTICS={"checks":[]}\n')
 
     monkeypatch.setattr("mnemosyne.runtime_diagnostics.subprocess.run", run)
     result = diagnose.collect_runtime_diagnostics(str(target))
