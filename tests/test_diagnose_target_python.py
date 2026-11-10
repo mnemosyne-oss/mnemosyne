@@ -430,8 +430,9 @@ def test_diagnose_module_forwards_target_and_never_repairs_an_unavailable_runtim
 
     process = subprocess.run(
         [sys.executable, "-m", "mnemosyne.diagnose", "--python", str(target), "--fix"],
-        check=True, capture_output=True, text=True, encoding="utf-8", timeout=120,
+        check=False, capture_output=True, text=True, encoding="utf-8", timeout=120,
     )
+    assert process.returncode == 0, process.stderr
     diagnostic_json, fix_json = process.stdout.split("--- Auto-fix ---", 1)
     report, repair = json.loads(diagnostic_json), json.loads(fix_json)
 
