@@ -8,6 +8,7 @@ import json
 import sys
 import threading
 import types
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -83,6 +84,33 @@ def _tool_schemas(module):
 def _config_schema(module):
     provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
     return {entry["key"]: entry for entry in provider.get_config_schema()}
+
+
+def test_on_memory_write_preserves_hermes_metadata(provider_modules, monkeypatch):
+    filters = types.ModuleType("mnemosyne.core.filters")
+    filters.write_policy_operation = lambda _policy: nullcontext()
+    monkeypatch.setitem(sys.modules, "mnemosyne.core.filters", filters)
+
+    metadata = {"native_entry_id": "entry-42", "session_id": "session-7"}
+
+    class RecordingBeam:
+        kwargs = None
+
+        def remember(self, **kwargs):
+            self.kwargs = kwargs
+
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+        beam = RecordingBeam()
+        provider._beam = beam
+        provider._resolve_effective_write_policy = lambda: None
+        provider._current_operation_write_policy = lambda: None
+        provider._ensure_beam_access_lock = lambda: nullcontext()
+        provider._beam_session_scope = lambda _session_id: nullcontext(beam)
+
+        provider.on_memory_write("add", "user", "remember this", metadata=metadata)
+
+        assert beam.kwargs["metadata"] == metadata
 
 
 def test_import_module_restores_prior_package_identity():

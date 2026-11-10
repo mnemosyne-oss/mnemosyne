@@ -5392,7 +5392,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         except Exception as e:
             logger.debug("Mnemosyne session-end sleep failed: %s", e)
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if action not in ("add", "replace"):
             return
         try:
@@ -5410,6 +5416,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     source=f"builtin_memory_{target}",
                     importance=0.7 if target == "user" else 0.5,
                     scope=scope,
+                    metadata=metadata,
                     _write_policy=self._current_operation_write_policy(),
                 )
         except Exception as e:
