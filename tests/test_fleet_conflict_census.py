@@ -616,6 +616,7 @@ class TestReadOnly:
 
     def test_partial_snapshot_dirs_are_pruned_without_hiding_completed_banks(
             self, fleet_env, caplog):
+        """Prune partial snapshots while retaining completed and active banks."""
         productive = _make_bank(
             fleet_env / "profiles" / "active" / "mnemosyne" / "data" / "mnemosyne.db",
             [_TWIN + (None,)],
@@ -661,6 +662,7 @@ class TestReadOnly:
         assert str(profile_partial) not in caplog.text
 
     def test_partial_snapshot_dirs_are_pruned_when_root_is_snapshot_dir(self, tmp_path):
+        """Prune partial snapshots when the walk starts at the snapshot root."""
         snapshot_root = tmp_path / "state-snapshots"
         partial = snapshot_root / "pre-update.partial" / "state.db"
         partial.parent.mkdir(parents=True)
@@ -669,6 +671,7 @@ class TestReadOnly:
         assert fleet_census.discover_banks(snapshot_root) == []
 
     def test_snapshot_ancestor_does_not_hide_live_partial_dir(self, tmp_path):
+        """A snapshot directory above the fleet root does not affect pruning."""
         root = tmp_path / "state-snapshots" / "fleet"
         productive = _make_bank(
             root / "live.partial" / "mnemosyne.db",

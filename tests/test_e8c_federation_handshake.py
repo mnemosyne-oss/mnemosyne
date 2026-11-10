@@ -286,6 +286,7 @@ class TestProbeScope:
         assert len(decision.chain) == len(twin["banks"]) - 1  # minus the home bank
 
     def test_symlink_fleet_root_uses_census_snapshot_pruning(self, tmp_path):
+        """Census and federation retain completed snapshots through a fleet alias."""
         snapshot_root = tmp_path / "state-snapshots"
         partial = snapshot_root / "pre-update.partial" / "mnemosyne.db"
         partial.parent.mkdir(parents=True)
