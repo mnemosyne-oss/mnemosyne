@@ -27,6 +27,25 @@ def test_cli_help_names_profile_root_precedence_and_standalone_fallback(capsys):
     assert "standalone" in help_text.lower()
 
 
+def test_doctor_reports_install_command_when_engine_is_missing(monkeypatch, capsys):
+    from types import SimpleNamespace
+    import mnemosyne_hermes.cli as cli
+
+    def missing_engine(*_args, **_kwargs):
+        raise ModuleNotFoundError("No module named 'mnemosyne'", name="mnemosyne")
+
+    monkeypatch.setattr(cli, "_run_cli_diagnostics", missing_engine)
+    result = cli.mnemosyne_command(
+        SimpleNamespace(mnemosyne_cmd="doctor", bank=None, no_fix=True)
+    )
+
+    output = capsys.readouterr().out
+    assert result == 1
+    assert "Mnemosyne core is missing" in output
+    assert f'--python "{sys.executable}"' in output
+    assert "--upgrade mnemosyne-hermes" in output
+
+
 @pytest.mark.parametrize("outcome", ["nonzero", "timeout", "malformed", "wrong-shape", "success"])
 def test_legacy_doctor_subprocess_reports_safe_failure_categories(
     tmp_path, monkeypatch, capsys, outcome

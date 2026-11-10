@@ -533,6 +533,17 @@ def mnemosyne_command(args):
                 if not fix_result["fixed"] and not fix_result["failed"]:
                     print("  Nothing to fix - all dependencies are healthy.")
             print(f"\nFull log: {result.get('log_path', 'unknown')}")
+        except ModuleNotFoundError as e:
+            if e.name == "mnemosyne":
+                print("Diagnostic failed: Mnemosyne core is missing from this Python environment.")
+                print("Install or repair the provider and its engine in this Hermes environment:")
+                print(
+                    f'  uv pip install --python "{sys.executable}" '
+                    "--upgrade mnemosyne-hermes"
+                )
+            else:
+                print(f"Diagnostic failed: {e}")
+            return 1
         except Exception as e:
             print(f"Diagnostic failed: {e}")
             return 1
