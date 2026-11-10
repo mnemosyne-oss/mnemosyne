@@ -11,6 +11,7 @@ session `invalidate` + recall filtering) is real and non-vacuous.
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
@@ -652,3 +653,113 @@ def test_resolver_scan_uses_utc_now_under_non_utc_host(temp_db, monkeypatch, dis
         else:
             monkeypatch.setenv("TZ", original)
         time.tzset()
+
+
+def test_reject_cached_then_skipped(temp_db, monkeypatch):
+    """#714 follow-up: an LLM-rejected pair is cached with a TTL and later
+    runs skip re-validating it (the perpetual LLM re-validation churn)."""
+    A = BeamMemory(session_id="tCRA", db_path=temp_db)
+    B = BeamMemory(session_id="tCRB", db_path=temp_db)
+    a1 = A.remember("[USER] favorite color is blue", source="conversation",
+                    importance=0.7, scope="global")
+    b1 = B.remember("[USER] favorite color is green now", source="conversation",
+                    importance=0.7, scope="global")
+
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+    monkeypatch.setattr(lcd, "validate_conflict_pair",
+                        lambda older, newer, session_id, db_path: (False, 0.2, None))
+
+    # run 1: LLM rejects -> nothing invalidated, pair persisted to the cache.
+    C1 = BeamMemory(session_id="tCRA", db_path=temp_db)
+    C1._detect_conflicts = _stub_detect_pair(a1, b1)
+    r1 = C1.resolve_cross_session_conflicts()
+    assert r1["llm_validations"] == 1
+    assert r1["skipped_cached"] == 0
+    assert r1["invalidated"] == 0
+
+    # run 2: the same rejected pair is now served from the cache (no LLM call).
+    C2 = BeamMemory(session_id="tCRA", db_path=temp_db)
+    C2._detect_conflicts = _stub_detect_pair(a1, b1)
+    r2 = C2.resolve_cross_session_conflicts()
+    assert r2["llm_validations"] == 0
+    assert r2["skipped_cached"] == 1
+    assert r2["invalidated"] == 0
+
+    # the reject was persisted with a TTL.
+    rows = _cache_rows(temp_db)
+    assert len(rows) == 1
+    assert rows[0]["verdict"] == "reject"
+    assert rows[0]["expires_at"]
+
+
+def test_dry_run_reports_cache_without_mutating(temp_db, monkeypatch):
+    """#714 follow-up: a dry run reads the cache (reports the skip) but never
+    writes it — dry runs stay read-only."""
+    A = BeamMemory(session_id="tCRD", db_path=temp_db)
+    B = BeamMemory(session_id="tCRD2", db_path=temp_db)
+    a1 = A.remember("[USER] favorite color is blue", source="conversation",
+                    importance=0.7, scope="global")
+    b1 = B.remember("[USER] favorite color is green now", source="conversation",
+                    importance=0.7, scope="global")
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+    monkeypatch.setattr(lcd, "validate_conflict_pair",
+                        lambda older, newer, session_id, db_path: (False, 0.2, None))
+
+    # seed the cache with an apply.
+    C1 = BeamMemory(session_id="tCRD", db_path=temp_db)
+    C1._detect_conflicts = _stub_detect_pair(a1, b1)
+    C1.resolve_cross_session_conflicts()
+    assert len(_cache_rows(temp_db)) == 1
+
+    # a dry run reports the skip but adds no row.
+    C2 = BeamMemory(session_id="tCRD", db_path=temp_db)
+    C2._detect_conflicts = _stub_detect_pair(a1, b1)
+    r = C2.resolve_cross_session_conflicts(dry_run=True)
+    assert r["skipped_cached"] == 1
+    assert len(_cache_rows(temp_db)) == 1
+
+
+def test_expired_verdict_is_readjudicated(temp_db, monkeypatch):
+    """#714 follow-up: once the TTL elapses the pair is re-validated."""
+    A = BeamMemory(session_id="tCRE", db_path=temp_db)
+    B = BeamMemory(session_id="tCRE2", db_path=temp_db)
+    a1 = A.remember("[USER] favorite color is blue", source="conversation",
+                    importance=0.7, scope="global")
+    b1 = B.remember("[USER] favorite color is green now", source="conversation",
+                    importance=0.7, scope="global")
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+    monkeypatch.setattr(lcd, "validate_conflict_pair",
+                        lambda older, newer, session_id, db_path: (False, 0.2, None))
+
+    C1 = BeamMemory(session_id="tCRE", db_path=temp_db)
+    C1._detect_conflicts = _stub_detect_pair(a1, b1)
+    C1.resolve_cross_session_conflicts()
+    assert len(_cache_rows(temp_db)) == 1
+
+    # expire the verdict in place.
+    conn = sqlite3.connect(temp_db)
+    conn.execute("UPDATE cross_session_verdict_cache SET expires_at = '2000-01-01'")
+    conn.commit()
+    conn.close()
+
+    C2 = BeamMemory(session_id="tCRE", db_path=temp_db)
+    C2._detect_conflicts = _stub_detect_pair(a1, b1)
+    r2 = C2.resolve_cross_session_conflicts()
+    assert r2["skipped_cached"] == 0
+    assert r2["llm_validations"] == 1  # re-adjudicated after expiry
+
+
+def _cache_rows(db_path):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM cross_session_verdict_cache")]
+    finally:
+        conn.close()
+    return rows

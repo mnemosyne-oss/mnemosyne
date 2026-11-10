@@ -6285,6 +6285,22 @@ def _cross_session_max_llm_validations() -> int:
     except ValueError:
         return _CROSS_SESSION_MAX_LLM_VALIDATIONS
 
+_CROSS_SESSION_VERDICT_TTL_DAYS_DEFAULT = 30
+
+
+def _cross_session_verdict_ttl_days() -> int:
+    """TTL (days) for cached cross-session LLM reject verdicts.
+
+    Override with ``MNEMOSYNE_CROSS_SESSION_VERDICT_TTL_DAYS`` (default 30).
+    A cached reject is re-adjudicated once its TTL elapses, so context
+    drift is eventually revisited.
+    """
+    raw = os.environ.get("MNEMOSYNE_CROSS_SESSION_VERDICT_TTL_DAYS", "").strip()
+    try:
+        return max(1, int(raw)) if raw else _CROSS_SESSION_VERDICT_TTL_DAYS_DEFAULT
+    except ValueError:
+        return _CROSS_SESSION_VERDICT_TTL_DAYS_DEFAULT
+
 
 class BeamMemory:
     """
@@ -14014,6 +14030,20 @@ class BeamMemory:
         network round-trips that a provider tool performs while its shared Beam
         access lock is held.
 
+        Rejected (LLM-declined) pairs are persisted with a TTL in a local
+        `cross_session_verdict_cache` table, so later runs skip already
+        adjudicated pairs without re-issuing the LLM call (each run re-scans
+        the whole queue, and without this the same rejected pairs burned an
+        LLM validation on every run). The TTL — `MNEMOSYNE_CROSS_SESSION
+        VERDICT_TTL_DAYS`, default 30 days — bounds how long a verdict is
+        trusted, so context drift is eventually re-adjudicated. Skipped pairs
+        are counted in the result payload as `skipped_cached`. Cache writes
+        only happen on an explicit apply (a dry run reports cache hits but
+        never pre-warms the table) and join the caller's transaction when one
+        is open, so a run commits its verdicts atomically with any
+        invalidations. The cache is best-effort: any cache failure degrades to
+        the normal always-LLM behavior.
+
         This is phase one of the cross-session resolution work: candidate
         reporting (`dry_run=True`) and explicit apply (`dry_run=False`). An
         automatic invocation from `sleep_all_sessions` is deliberately deferred
@@ -14030,7 +14060,7 @@ class BeamMemory:
                            "(set MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION=1)",
                 "rows_scanned": 0, "pairs_flagged": 0,
                 "conflicts_resolved": 0, "invalidated": 0,
-                "llm_validations": 0, "llm_cap_reached": False,
+                "llm_validations": 0, "skipped_cached": 0, "llm_cap_reached": False,
                 "candidates_truncated": False,
             }
 
@@ -14115,6 +14145,18 @@ class BeamMemory:
         invalidated = 0
         llm_validations = 0
         llm_cap_reached = False
+        # Negative cache of LLM 'reject' verdicts so repeated runs don't
+        # re-burn the same already-adjudicated pairs forever (each sleep
+        # re-flags the queue; without this the same first ~20 pairs in
+        # sorted order spent an LLM call every run with the cap always
+        # reached). Best-effort: any cache failure degrades to the normal
+        # always-LLM path.
+        cached_rejects = {}
+        try:
+            cached_rejects = self._csverdict_cached_rejects()
+        except Exception:
+            cached_rejects = {}
+        skipped_cached = 0
         # IDs superseded, or used as a replacement/target, during THIS run.
         # Rows are SELECTed once, so in-memory state is authoritative here.
         # The sets guard chained detector pairs such as (A,B),(B,C): without
@@ -14154,11 +14196,21 @@ class BeamMemory:
                 run_llm = LLM_CONFLICT_DETECTION_ENABLED and not dry_run
                 if dry_run and llm_eval:
                     run_llm = True
+                cache_hit = cached_rejects.get((older_id, newer_id))
+                if cache_hit is not None:
+                    # This (older,newer) pair was already LLM-adjudicated as a
+                    # non-contradiction and is still within its TTL — skip the
+                    # LLM call entirely. Checked outside `if run_llm:` so a
+                    # plain dry run reports the same cache skips as an apply
+                    # (dry-run == apply parity).
+                    cached_rejects.pop((older_id, newer_id))
+                    skipped_cached += 1
+                    continue
                 if run_llm:
                     if llm_validations >= max_llm_validations:
                         llm_cap_reached = True
                         break
-                    is_conflict, _, _ = validate_conflict_pair(
+                    is_conflict, confidence, _ = validate_conflict_pair(
                         content_map.get(older_id, ""),
                         content_map.get(newer_id, ""),
                         session_id=self.session_id,
@@ -14166,6 +14218,15 @@ class BeamMemory:
                     )
                     llm_validations += 1
                     confirmed = is_conflict
+                    if not is_conflict and not dry_run:
+                        # Persist the reject so later runs skip this pair.
+                        # Only on a real apply: a dry run (incl. llm_eval)
+                        # must stay read-only, so it reports cache hits but
+                        # never pre-warms the table. The TTL bounds staleness.
+                        try:
+                            self._csverdict_record(older_id, newer_id, "reject", confidence)
+                        except Exception:
+                            pass
                 if not confirmed:
                     continue
                 # Track chained pairs in BOTH dry-run and apply so a dry run
@@ -14199,9 +14260,73 @@ class BeamMemory:
             "invalidated": invalidated,
             "rows_scanned": len(rows),
             "llm_validations": llm_validations,
+            "skipped_cached": skipped_cached,
             "llm_cap_reached": llm_cap_reached,
             "candidates_truncated": truncated,
         }
+
+    # ------------------------------------------------------------------
+    # Cross-session LLM reject negative-cache
+    # ------------------------------------------------------------------
+    def _csverdict_ensure_schema(self):
+        """Idempotently create the verdict-cache table."""
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS cross_session_verdict_cache ("
+            " older_id TEXT NOT NULL, newer_id TEXT NOT NULL, "
+            " verdict TEXT NOT NULL, confidence REAL, "
+            " decided_at TEXT NOT NULL, expires_at TEXT NOT NULL, "
+            " PRIMARY KEY (older_id, newer_id))"
+        )
+
+    def _csverdict_cached_rejects(self) -> Dict[tuple, tuple]:
+        """Return {(older_id, newer_id): (confidence, expires_at)} for
+        non-expired cached reject verdicts. Empty dict if the table is
+        absent or on any error (callers treat that as no-cache).
+        """
+        self._csverdict_ensure_schema()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT older_id, newer_id, confidence, expires_at "
+            "FROM cross_session_verdict_cache WHERE verdict = 'reject'"
+        )
+        out: Dict[tuple, tuple] = {}
+        for older_id, newer_id, conf, expires_at in cursor.fetchall():
+            if expires_at and expires_at < now_iso:
+                continue
+            out[(older_id, newer_id)] = (conf, expires_at)
+        return out
+
+    def _csverdict_record(
+        self, older_id: str, newer_id: str, verdict: str, confidence=None
+    ) -> None:
+        """Persist a cross-session LLM verdict with its TTL expiry.
+
+        Writes join the caller's transaction when one is active (the same
+        ownership pattern ``invalidate`` uses) so a resolve run commits
+        cache entries atomically with any invalidations; otherwise the
+        write commits itself.
+        """
+        self._csverdict_ensure_schema()
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(days=_cross_session_verdict_ttl_days())
+        def _write():
+            self.conn.execute(
+                "INSERT INTO cross_session_verdict_cache "
+                "(older_id, newer_id, verdict, confidence, decided_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(older_id, newer_id) DO UPDATE SET "
+                "verdict=excluded.verdict, confidence=excluded.confidence, "
+                "decided_at=excluded.decided_at, expires_at=excluded.expires_at",
+                (older_id, newer_id, verdict, confidence,
+                 now.isoformat(), expires.isoformat()),
+            )
+        if self.conn.in_transaction:
+            # Caller owns the transaction; join it (no inner commit).
+            _write()
+        else:
+            with _guarded_transaction(self.conn):
+                _write()
 
     def get_consolidation_log(self, limit: int = 10) -> List[Dict]:
         cursor = self.conn.cursor()
