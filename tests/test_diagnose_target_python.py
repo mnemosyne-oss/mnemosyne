@@ -17,7 +17,8 @@ def _check(payload, name):
     return next(entry for entry in entries if entry["check"] == name)
 
 
-def test_runtime_checks_run_in_the_selected_venv(tmp_path, monkeypatch):
+@pytest.mark.parametrize("explicit_db", [False, True])
+def test_runtime_checks_run_in_the_selected_venv(tmp_path, monkeypatch, explicit_db):
     """Inspect a real isolated venv and keep its absolute path out of output."""
     environment = tmp_path / "provider-env"
     venv.EnvBuilder(with_pip=False).create(environment)
@@ -34,7 +35,16 @@ def test_runtime_checks_run_in_the_selected_venv(tmp_path, monkeypatch):
 
     monkeypatch.setattr(diagnose, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
-    payload = diagnose.run_diagnostics(python_executable=str(python))
+    kwargs = {}
+    if explicit_db:
+        from mnemosyne.core.beam import BeamMemory
+
+        selected_db = tmp_path / "selected" / "mnemosyne.db"
+        beam = BeamMemory(session_id="hermes_default", db_path=selected_db)
+        beam.remember("selected database marker", scope="global")
+        kwargs["db_path"] = selected_db
+
+    payload = diagnose.run_diagnostics(python_executable=str(python), **kwargs)
 
     assert payload["runtime_scope"] == "target_interpreter"
     assert payload["runtime_executable"] == python.name
@@ -42,6 +52,10 @@ def test_runtime_checks_run_in_the_selected_venv(tmp_path, monkeypatch):
     assert _check(payload, "fastembed")["detail"] == "version=provider-only"
     assert _check(payload, "fastembed")["scope"] == "target_interpreter"
     assert str(environment) not in json.dumps(payload)
+    if explicit_db:
+        assert Path(payload["resolved_db"]).resolve() == selected_db.resolve()
+        assert _check(payload, "working_total")["status"] == "1"
+        assert not (tmp_path / "data" / "mnemosyne.db").exists()
 
 
 def test_default_runtime_checks_are_labeled_as_cli_interpreter(tmp_path, monkeypatch):

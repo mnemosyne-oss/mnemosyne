@@ -161,6 +161,7 @@ def run_diagnostics(
     dry_run: bool = False,
     bank: str | None = None,
     python_executable: str | None = None,
+    db_path: Path | None = None,
 ) -> dict:
     """
     Run full diagnostic scan and write PII-safe log.
@@ -175,6 +176,8 @@ def run_diagnostics(
             against the bank's own SQLite DB (data/banks/<bank>/mnemosyne.db).
             When None, the default/profile-root DB is used.
         python_executable: Optional explicit interpreter used for runtime checks.
+        db_path: Optional database path selected by a host CLI. When supplied,
+            it takes precedence over ambient data-dir overrides.
     """
     log_path = _log_path()
     if python_executable is not None:
@@ -212,7 +215,9 @@ def run_diagnostics(
     # --- Database state ---
     try:
         from mnemosyne.core.memory import Mnemosyne
-        if bank:
+        if db_path is not None:
+            mem = Mnemosyne(session_id="hermes_default", bank=bank, db_path=db_path)
+        elif bank:
             mem = Mnemosyne(session_id="hermes_default", bank=bank)
         else:
             mem = Mnemosyne()
