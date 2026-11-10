@@ -130,11 +130,11 @@ def test_unreadable_marker_bypasses_enhanced_cache_without_log_spam(
     )
 
 
-@pytest.mark.parametrize("previous_version", [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17])
+@pytest.mark.parametrize("previous_version", [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18])
 def test_cache_version_bump_invalidates_prior_candidate_and_cap_entries(
     enhanced, monkeypatch, tmp_path: Path, previous_version: int
 ):
-    """Every prior cache generation misses under the content-cap contract.
+    """Every prior cache generation misses under the current recall contract.
 
     Version 6 predates staged FTS candidate selection, version 7 predates
     vector admission/ranking, version 8 predates the cap as cache material,
@@ -146,6 +146,7 @@ def test_cache_version_bump_invalidates_prior_candidate_and_cap_entries(
     linear candidate ordering. Version 15 predates the recency-decay age clamp.
     Version 16 predates strongest-path and scoped active-seed selection.
     Version 17 predates local input caps and their effective cache policy.
+    Version 18 predates Cyrillic ё/е normalization.
     The ``v2:`` key prefix stays fixed
     for QueryCache's opaque-key path.
     """
@@ -1095,6 +1096,100 @@ def test_pipeline_flags_and_process_ranking_configuration_change_digest(enhanced
     monkeypatch.undo()
     monkeypatch.setattr(beam_module, "weibull_boost", None)
     assert memory._enhanced_recall_cache_key(**common) != baseline
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_cyrillic_normalization_rejects_persisted_main_generation_18(
+    enhanced, monkeypatch, restart
+):
+    """Main's prior generation misses after integration, including a Beam restart."""
+    memory, calls = enhanced
+    query = "свеклы"
+    with monkeypatch.context() as ctx:
+        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 18)
+        stale = _call(memory, query)
+    keys = [row[0] for row in memory._query_cache._conn.execute(
+        "SELECT normalized FROM query_cache"
+    )]
+    assert len(keys) == 1
+    target = memory
+    try:
+        if restart:
+            _close_memory(memory)
+            target = BeamMemory(session_id=memory.session_id, db_path=memory.db_path)
+            target.recall = memory.recall
+            target._query_cache = QueryCache(db_path=memory.db_path.parent / "query_cache.db")
+        assert target._query_cache.get_opaque(keys[0])[0]["id"] == stale[0]["id"]
+        fresh = _call(target, query)
+        assert len(calls) == 2
+        assert fresh[0]["id"] != stale[0]["id"]
+        assert _call(target, query) == fresh
+        assert len(calls) == 2
+    finally:
+        if target is not memory:
+            _close_memory(target)
+
+
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("store", ["working", "episodic"])
+@pytest.mark.parametrize("query,content", [
+    ("свеклы", "Свёкла тушёная хранится отдельно"),
+    ("свёклы", "Свекла тушеная хранится отдельно"),
+    ("СВЁКЛЫ", "Свекла тушеная хранится отдельно"),
+])
+def test_real_cyrillic_recall_replaces_stale_generation_18(
+    monkeypatch, tmp_path, restart, store, query, content
+):
+    """A persisted pre-fold miss is recomputed into a real match and cached."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.delenv("MNEMOSYNE_LEXICAL_GATE_MIN", raising=False)
+    memory = BeamMemory(session_id="cyrillic-cache", db_path=tmp_path / "memories.db")
+    target = memory
+    try:
+        if store == "working":
+            wanted = memory.remember(content, source="test", importance=0.8)
+            unrelated = memory.remember("Автобус отправляется утром", source="test")
+        else:
+            wanted = memory.consolidate_to_episodic(content, source_wm_ids=[], source="test")
+            unrelated = memory.consolidate_to_episodic(
+                "Автобус отправляется утром", source_wm_ids=[], source="test"
+            )
+        # Reproduce the actual pre-fold result, rather than faking recall.
+        assert beam_module._cyrillic_score(query, content) == pytest.approx(0.6)
+        with monkeypatch.context() as ctx:
+            ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 18)
+            ctx.setattr(beam_module, "_normalize_cyrillic_text", lambda text: text.lower())
+            assert beam_module._cyrillic_score(query, content) == pytest.approx(0.0)
+            stale = _call(memory, query)
+        assert stale == []
+        keys = [row[0] for row in memory._query_cache._conn.execute(
+            "SELECT normalized FROM query_cache"
+        )]
+        assert len(keys) == 1
+        if restart:
+            _close_memory(memory)
+            target = BeamMemory(session_id=memory.session_id, db_path=memory.db_path)
+            target._query_cache = QueryCache(db_path=memory.db_path.parent / "query_cache.db")
+        assert target._query_cache.get_opaque(keys[0]) == []
+        misses = target._query_cache.stats()["misses"]
+        fresh = _call(target, query)
+        assert [row["id"] for row in fresh] == [wanted]
+        assert fresh[0]["content"] == content
+        assert unrelated not in {row["id"] for row in fresh}
+        assert target._query_cache.stats()["misses"] == misses + 1
+        hits = target._query_cache.stats()["hits"]
+        assert _call(target, query) == fresh
+        assert target._query_cache.stats()["hits"] == hits + 1
+        table = "working_memory" if store == "working" else "episodic_memory"
+        assert target.conn.execute(
+            f"SELECT content FROM {table} WHERE id=?", (wanted,)
+        ).fetchone()[0] == content
+    finally:
+        if target is not memory:
+            _close_memory(target)
+        _close_memory(memory)
 
 
 def test_enhanced_cache_key_version_bump_invalidates_literal_flag_ranking_change(
