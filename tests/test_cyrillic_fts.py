@@ -293,19 +293,22 @@ def test_yo_spelling_passes_linear_recall_gate(temp_db, monkeypatch, query, cont
 
 
 @pytest.mark.parametrize("working", [True, False])
+@pytest.mark.parametrize("k", [1, 5])
 @pytest.mark.parametrize("query,content,noise", [
     ("свёклы", "Свёкла тушёная хранится отдельно", "Свекор приехал утром"),
     ("свеклы", "Свекла тушеная хранится отдельно", "Свёкор приехал утром"),
     ("СВЁКЛЫ", "СВЁКЛА ТУШЁНАЯ ХРАНИТСЯ ОТДЕЛЬНО", "СВЕКОР ПРИЕХАЛ УТРОМ"),
+    ("свёклы", "Свекла тушеная хранится отдельно", "Свёкор приехал утром"),
+    ("свеклы", "Свёкла тушёная хранится отдельно", "Свекор приехал утром"),
 ])
-def test_spelling_fold_keeps_original_candidates_under_pressure(
-    temp_db, monkeypatch, working, query, content, noise,
+def test_spelling_fold_keeps_both_candidate_groups_under_pressure(
+    temp_db, monkeypatch, working, k, query, content, noise,
 ):
-    """New spelling variants cannot consume the original-prefix candidate pool."""
-    k = 5
+    """Either spelling can survive a full candidate pool of the other spelling."""
     seed = _seed_working if working else _seed_episodic
-    competitors = [(f"noise-{i:03}", noise, 0.8) for i in range(k * 5 + 6)]
-    seed(temp_db, competitors + [("zz-target", content, 0.8)])
+    competitors = [(f"noise-{i:03}", f"{noise} {i}", 0.8) for i in range(k * 5 + 6)]
+    unrelated = "Автобус отправляется вечером"
+    seed(temp_db, [("aa-unrelated", unrelated, 0.8)] + competitors + [("zz-target", content, 0.8)])
     conn = _open(temp_db)
     scorer = beam_module._cyrillic_score
     scored = []
@@ -316,7 +319,7 @@ def test_spelling_fold_keeps_original_candidates_under_pressure(
         return scorer(query, content)
 
     monkeypatch.setattr(beam_module, "_cyrillic_score", track_score)
-    expected_id = "zz-target" if working else len(competitors) + 1
+    expected_id = "zz-target" if working else len(competitors) + 2
     result_key = "id" if working else "rowid"
     try:
         for search in (
@@ -327,7 +330,8 @@ def test_spelling_fold_keeps_original_candidates_under_pressure(
             results = search()
             assert results[0][result_key] == expected_id
             assert results[0]["rank"] == pytest.approx(-0.6)
-            assert len(scored) <= k * 5
+            assert len(scored) == len(set(scored)) == k * 5
+            assert unrelated not in scored
     finally:
         conn.close()
 

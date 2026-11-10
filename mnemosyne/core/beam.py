@@ -5658,10 +5658,10 @@ def _cyrillic_like_search(
     receive comparable scores regardless of which surface form appears
     in the stored text.
 
-    Python scoring is bounded to ``k * 5`` candidates. Half of that pool
-    is reserved for the original spelling's prefixes, so newly admitted
-    ё/е variants cannot crowd out all pre-fold matches. The folded stage
-    fills any remaining slots; both stages use a stable identifier order.
+    Python scoring is bounded to ``k * 5`` candidates. Original-prefix
+    matches get half the pool first, and folded-only matches get the
+    remaining slots. Extra original-prefix matches fill any space left.
+    Both groups use a stable identifier order.
     """
     if not _has_cyrillic(query):
         return []
@@ -5701,32 +5701,31 @@ def _cyrillic_like_search(
     budget = k * 5
     if budget <= 0:
         return []
-    all_rows = []
-    seen_ids = set()
+    original_conditions = " OR ".join(
+        ["_py_cyrillic_lower(content) LIKE ? ESCAPE '\\'"] * len(original_words)
+    )
+    folded_conditions = " OR ".join(
+        ["_py_cyrillic_normalize(content) LIKE ? ESCAPE '\\'"] * len(q_words)
+    )
+    original_params = [f"%{w[:4]}%" for w in original_words]
+    folded_params = [f"%{w[:4]}%" for w in q_words]
     try:
-        for normalizer, words, stage_limit in (
-            ("_py_cyrillic_lower", original_words, max(1, budget // 2)),
-            ("_py_cyrillic_normalize", q_words, budget),
-        ):
-            conditions = " OR ".join(
-                [f"{normalizer}(content) LIKE ? ESCAPE '\\'"] * len(words)
-            )
-            params = [f"%{w[:4]}%" for w in words]
-            rows = conn.execute(
-                f"SELECT {id_col}, content FROM {table} WHERE {conditions}"
-                f" ORDER BY {id_col} LIMIT ?",
-                params + [stage_limit],
-            ).fetchall()
-            for row in rows:
-                if row[id_col] in seen_ids:
-                    continue
-                seen_ids.add(row[id_col])
-                all_rows.append(row)
-                if len(all_rows) >= budget:
-                    break
+        original_rows = conn.execute(
+            f"SELECT {id_col}, content FROM {table} WHERE {original_conditions}"
+            f" ORDER BY {id_col} LIMIT ?",
+            original_params + [budget],
+        ).fetchall()
+        original_count = min(len(original_rows), budget // 2)
+        variant_rows = conn.execute(
+            f"SELECT {id_col}, content FROM {table} WHERE ({folded_conditions})"
+            f" AND NOT ({original_conditions}) ORDER BY {id_col} LIMIT ?",
+            folded_params + original_params + [budget - original_count],
+        ).fetchall()
     except Exception:
         return []
 
+    remaining = budget - len(variant_rows)
+    all_rows = original_rows[:original_count] + variant_rows + original_rows[original_count:remaining]
     if not all_rows:
         return []
 

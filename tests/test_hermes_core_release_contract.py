@@ -282,6 +282,8 @@ def _assert_provider_lifecycle(
         assert call(provider, "mnemosyne_stats", {{}}).get("status") != "memory_unavailable"
         recovered = call(provider, "mnemosyne_recall", {{"query": recovery_token, "limit": 5}})
         assert any(recovery_token in row.get("content", "") for row in recovered["results"])
+        recovered_batch = call(provider, "mnemosyne_recall", {{"query": batch_token, "limit": 5}})
+        assert any(batch_token in row.get("content", "") for row in recovered_batch["results"])
         isolated = call(provider, "mnemosyne_recall", {{"query": private_token, "limit": 5}})
         assert not any(private_token in row.get("content", "") for row in isolated["results"])
         provider.initialize(
