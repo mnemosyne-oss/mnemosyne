@@ -5875,6 +5875,86 @@ def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]
     return rows
 
 
+def _supplement_cjk_working(conn, query, rows, k, terms):
+    """Recover strong CJK rows outside a nonempty FTS pool, with bounded work."""
+    cap = min(k, 16)
+    if cap <= 0 or not rows or not _has_cjk(query):
+        return rows
+    groups = [
+        tuple(dict.fromkeys(run[i:i + 2] for i in range(len(run) - 1)))
+        for run in re.findall(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+", query)
+        if len(run) >= 2
+    ]
+    anchors = tuple(dict.fromkeys(anchor for group in groups for anchor in group))
+    if not anchors or len(anchors) > 32 or len(groups) > 4:
+        return rows
+
+    # A shared pair can identify the topic without supporting a second
+    # requested fact. Require an independent pair where that run has one.
+    groups = [
+        tuple(pair for pair in group if sum(pair in other for other in groups) == 1) or group
+        for group in groups
+    ]
+    try:
+        seen = {row["id"] for row in rows}
+        precise_terms = _fts_precise_terms(query) if len(rows) < k else None
+        complete = precise_terms is not None and (not precise_terms or precise_terms == terms)
+        if not complete:
+            # Staging or a filled ranked slice cannot prove raw completeness.
+            raw_limit = 257
+            raw = conn.execute(
+                "SELECT id FROM fts_working WHERE fts_working MATCH ? LIMIT ?",
+                (" OR ".join(terms), raw_limit),
+            ).fetchall()
+            if len(raw) == raw_limit:
+                return rows
+            seen.update(row["id"] for row in raw)
+        sql_groups = sorted(groups, key=len)
+        # Filter on the exact pair evidence before fetching candidate text.
+        predicate = " AND ".join(
+            "(" + " OR ".join("instr(content, ?)" for _ in group) + ")"
+            for group in sql_groups
+        )
+        patterns = tuple(pair for group in sql_groups for pair in group)
+        # Find the same bounded windows using rowids alone, then filter the
+        # base table directly. This avoids staging full text in temporary rows.
+        candidates = conn.execute(
+            "WITH bounds AS (SELECT coalesce((SELECT rowid FROM working_memory"
+            " ORDER BY rowid LIMIT 1 OFFSET 383),9223372036854775807) AS head,"
+            " (SELECT rowid FROM working_memory ORDER BY rowid DESC LIMIT 1 OFFSET 127) AS tail)"
+            " SELECT rowid,id,content FROM working_memory"
+            f" WHERE rowid <= (SELECT head FROM bounds) AND {predicate}"
+            " UNION ALL SELECT rowid,id,content FROM working_memory"
+            " WHERE rowid >= (SELECT tail FROM bounds) AND rowid > (SELECT head FROM bounds)"
+            f" AND {predicate}",
+            (*patterns, *patterns),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return rows
+
+    tokens = _recall_tokens(query)
+    prepared = _prepare_lexical_query(tokens, query.lower())
+    floor = _minimum_recall_relevance(tokens)
+    evidence = 1 if len(anchors) <= 2 else 2
+    scored = []
+    for row in candidates:
+        content = row["content"]
+        mid = row["id"]
+        if mid in seen:
+            continue
+        seen.add(mid)
+        if sum(anchor in content for anchor in anchors) < evidence:
+            continue
+        score = _lexical_relevance_for_query(prepared, content)
+        if score > 0 and score >= floor:
+            scored.append((score, row["rowid"], mid))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return rows + [
+        {"id": mid, "rank": None, "cjk_supplement": True}
+        for _, _, mid in scored[:cap]
+    ]
+
+
 def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]:
     """Search FTS5 working memory and return ids with ranks."""
     terms = _fts_query_terms(query)
@@ -5889,7 +5969,7 @@ def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> Li
         return _cjk_like_search(conn, query, k=k, working=True)
     if not rows and _has_cyrillic(query):
         return _cyrillic_like_search(conn, query, k=k, working=True)
-    return rows
+    return _supplement_cjk_working(conn, query, rows, k, terms)
 
 
 def _wm_vec_search(conn: sqlite3.Connection, query_embedding, k: int = 20,
@@ -10055,7 +10135,8 @@ class BeamMemory:
         _wm_fts_raw_count = len(wm_fts)
 
         wm_ids = {r["id"] for r in wm_fts}
-        wm_ranks = {r["id"]: r["rank"] for r in wm_fts}
+        wm_ranks = {r["id"]: r["rank"] for r in wm_fts if not r.get("cjk_supplement")}
+        cjk_supplement_ids = wm_ids - wm_ranks.keys()
 
         # Build temporal/filter clause for working memory before vector search
         # so _wm_vec_search can push the same recall filters into SQL instead
@@ -10258,17 +10339,15 @@ class BeamMemory:
                 if temporal_weight > 0.0:
                     t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
                     score *= (1.0 + temporal_weight * t_boost)
-                # [C4] Per-row tier attribution. Credit FTS for any
-                # row in wm_ranks (overlap with vec credited to FTS
-                # so the union sum stays consistent). Vec-only rows
-                # (in wm_vec_sims but not wm_ranks) credit wm_vec.
+                # [C4] The primary lexical tier counts both ranked FTS
+                # and CJK supplements. Lexical/vector overlaps count once.
                 # Rows reached via the fallback branch (wm_ids empty)
                 # credit wm_fallback. Each row credits exactly one
                 # tier so `wm_fts + wm_vec + wm_fallback` = total
                 # kept WM rows for this call.
                 if _wm_fallback_used:
                     _wm_fallback_kept += 1
-                elif wm_ranks and row["id"] in wm_ranks:
+                elif row["id"] in wm_ranks or row["id"] in cjk_supplement_ids:
                     _wm_fts_kept += 1
                 elif row["id"] in wm_vec_sims:
                     _wm_vec_kept += 1
@@ -11276,7 +11355,7 @@ class BeamMemory:
     # 18: local embedding input caps and effective cap policy in cache keys.
     # 19: Cyrillic ё/е folding in fallback candidates and scores.
     # Recheck the actual predecessor before each semantic integration.
-    _ENHANCED_RECALL_CACHE_VERSION = 19
+    _ENHANCED_RECALL_CACHE_VERSION = 20
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.
