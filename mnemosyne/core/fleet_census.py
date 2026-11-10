@@ -161,13 +161,22 @@ def discover_banks(root: Path) -> List[Path]:
 
     Candidates still have to prove they hold a ``conflicts`` table when
     read; this only spares the reader a connect on obviously-empty files.
+    Snapshot pruning uses the resolved root name, while returned paths
+    preserve the caller's root spelling.
     """
     root = Path(root)
     candidates: List[Path] = []
     if not root.is_dir():
         return candidates
+    root_is_snapshot_tree = root.resolve().name == "state-snapshots"
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIR_NAMES)
+        relative_parts = Path(dirpath).relative_to(root).parts
+        in_snapshot_tree = root_is_snapshot_tree or "state-snapshots" in relative_parts
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in _SKIP_DIR_NAMES
+            and (not in_snapshot_tree or not d.endswith(".partial"))
+        )
         for filename in sorted(filenames):
             if not filename.endswith(".db"):
                 continue
