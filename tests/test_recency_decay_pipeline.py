@@ -157,6 +157,14 @@ def test_future_dated_row_scores_no_higher_than_a_present_row(
         f"{present['score']} ({100 * (future['score'] / present['score'] - 1):.2f}% "
         f"more): the clamp is not reaching {table}"
     )
+    # Two-sided: the clamp must not boost the misdated row, and it must not
+    # penalise it either. A one-sided bound would accept a regression that
+    # multiplies the future row down while every other assertion still holds.
+    assert future["score"] >= present["score"] * (1 - MAX_UNEARNED_MARGIN), (
+        f"future-dated row scored {future['score']} against a present row's "
+        f"{present['score']} ({100 * (future['score'] / present['score'] - 1):.2f}%): "
+        f"a future stamp must be treated as new, not as stale, in {table}"
+    )
     assert present["score"] > 0.0, "sanity: the row must actually score"
 
 
@@ -211,6 +219,19 @@ def test_stale_row_keeps_its_full_penalty(tmp_path: Path, lexical_only, table: s
     """
     hits, ids = _three_row_ranking(tmp_path, table)
     stale = hits[_row_id(table, "stale")]
+
+    # The expectation is derived from the shipped half-life rather than
+    # hard-coded, because this file guards the clamp and not the curve's
+    # calibration -- a deliberate default change should move the expectation
+    # with it. What must not happen silently is a half-life so large that 30
+    # days stops costing anything: then "ranks last" would assert nothing. The
+    # constant is env-overridable (MNEMOSYNE_RECENCY_HALFLIFE), so express the
+    # requirement as a property of the derived penalty, not of the constant.
+    assert STALE_DECAY < 0.05, (
+        f"at {STALE} the expected decay is {STALE_DECAY:.4f} under a "
+        f"{HALFLIFE_HOURS:g}h half-life -- too close to 1.0 for a stale-last "
+        f"ranking assertion to mean anything; re-derive this test"
+    )
 
     assert stale["recency_decay"] == pytest.approx(STALE_DECAY, abs=1e-4), (
         f"expected the ordinary curve at {STALE}: {STALE_DECAY:.4f}, got "
