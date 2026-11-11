@@ -10,6 +10,12 @@ from mnemosyne.core.beam import BeamMemory
 
 @pytest.fixture
 def beam(tmp_path, monkeypatch):
+    """Keep linker writes local and independent of deployment filters/backends."""
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("MNEMOSYNE_IGNORE_PATTERNS", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_WRITE_CLASSIFIER", raising=False)
+    for name in ("MNEMOSYNE_NO_EMBEDDINGS", "MNEMOSYNE_SKIP_EMBEDDINGS", "MNEMOSYNE_EMBEDDINGS_OFF"):
+        monkeypatch.setenv(name, "1")
     monkeypatch.setenv("MNEMOSYNE_PROACTIVE_LINKING", "1")
     return BeamMemory(session_id="s", db_path=tmp_path / "memory.db")
 
