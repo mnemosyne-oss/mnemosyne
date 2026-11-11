@@ -171,8 +171,8 @@ def test_detected_pairs_are_logged(caplog, temp_db, monkeypatch):
 
 
 def test_gate_enabled_without_endpoint_counts_detected_only(temp_db, monkeypatch):
-    """Gate=true with NO endpoint: validate_conflict_pair returns
-    not-conflict for every pair, which used to drop them from BOTH
+    """Gate=true with NO endpoint: validate_conflict_pair returns a
+    FAILED validation for every pair, which used to drop them from BOTH
     counters. They must land in conflicts_detected_only instead."""
     monkeypatch.setattr(
         "mnemosyne.core.llm_conflict_detector.LLM_CONFLICT_DETECTION_ENABLED",
@@ -249,7 +249,7 @@ def test_invalidate_failure_counts_as_detected(temp_db, monkeypatch):
     with patch.object(beam, "_detect_conflicts", return_value=[(id_a, id_b)]), \
          patch(
              "mnemosyne.core.llm_conflict_detector.validate_conflict_pair",
-             return_value=(True, 0.97, "the corrected fact"),
+             return_value=(True, 0.97, "the corrected fact", "valid"),
          ), \
          patch.object(beam, "invalidate", return_value=False):
         result = beam.sleep(force=True)
