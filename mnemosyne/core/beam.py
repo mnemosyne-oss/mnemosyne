@@ -1189,6 +1189,10 @@ def _polyphonic_scope_where(
     channel_id: Optional[str] = None,
     veracity: Optional[str] = None,
     memory_type: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    source: Optional[str] = None,
+    topic: Optional[str] = None,
 ) -> Tuple[str, List[Any]]:
     """Scope predicate the polyphonic voices apply before their own limits.
 
@@ -1196,8 +1200,9 @@ def _polyphonic_scope_where(
     keeps rows whose session_id is NULL (import writes NULL when an export
     carries one), so those rows are let through here too. The exact author,
     channel, veracity and memory_type filters match the post-filter's
-    equality checks. The date filters stay post-filter only: the post-filter
-    and SQL disagree on date-only timestamps.
+    equality checks. Date comparisons use the post-filter's string bounds,
+    including date-only timestamps and its empty-string treatment of NULL.
+    Source and topic are separate exact matches, just like the post-filter.
     """
     clause, params = _recall_scope_where(
         session_id=session_id, cross_session=cross_session,
@@ -1208,10 +1213,17 @@ def _polyphonic_scope_where(
     clauses = [clause]
     for column, value in (("author_id", author_id), ("author_type", author_type),
                           ("channel_id", channel_id), ("veracity", veracity),
-                          ("memory_type", memory_type)):
+                          ("memory_type", memory_type), ("source", source),
+                          ("source", topic)):
         if value:
             clauses.append(f"{column} = ?")
             params.append(value)
+    if from_date:
+        clauses.append("COALESCE(timestamp, '') >= ?")
+        params.append(from_date)
+    if to_date:
+        clauses.append("COALESCE(timestamp, '') <= ?")
+        params.append(f"{to_date}T23:59:59")
     return " AND ".join(clauses), params
 
 
@@ -3079,7 +3091,20 @@ def _recency_decay(timestamp_str: str, halflife_hours: float = RECENCY_HALFLIFE_
     try:
         ts = _parse_iso_datetime_utc(timestamp_str)
         age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
-        return math.exp(-age_hours / halflife_hours)
+        # A stored timestamp can never be in the future, so the age cannot be negative and the
+        # factor cannot exceed 1.0. It can nonetheless *compute* above 1.0: pre-round-4 producers
+        # stamped naive LOCAL wall time (see the producer-contract note above
+        # ``_parse_iso_datetime_utc``), and those rows are read as UTC, which shifts them by the
+        # host offset — on a host with a POSITIVE offset that places them `utcoffset` hours in the
+        # future (measured 1.055 at UTC+9). A negative offset does not produce a bonus; it makes
+        # the row read older and is penalised twice. decay feeds the score as a multiplier, so
+        # >1.0 silently *rewards* a row for being misdated.
+        #
+        # Clamp the AGE, not the result: `math.exp` overflows to OverflowError once the exponent
+        # passes ~709, and a far-future timestamp would then fall into the handler below and
+        # report the neutral 0.5 instead of 1.0. max(age, 0) saturates exactly at 1.0 and cannot
+        # overflow, for any halflife.
+        return math.exp(-max(age_hours, 0.0) / halflife_hours)
     except Exception:
         return 0.5
 
@@ -4676,6 +4701,34 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     if batch_size <= 0:
         raise ValueError("batch_size must be a positive integer")
 
+
+    # Standalone callers may pass a bare sqlite3.connect() connection whose
+    # default row_factory yields plain tuples; the row reads below index by
+    # column name, so the rebuild runs on a sqlite3.Row connection and the
+    # caller's own factory is restored for progress callbacks and on every
+    # exit path afterwards. Callbacks may query this same connection.
+    _caller_row_factory = getattr(conn, "row_factory", None)
+    _caller_progress = progress
+    if _caller_progress is not None:
+        def progress(*args):
+            conn.row_factory = _caller_row_factory
+            try:
+                return _caller_progress(*args)
+            finally:
+                conn.row_factory = sqlite3.Row
+
+    conn.row_factory = sqlite3.Row
+    try:
+        return _reindex_vectors_impl(conn, batch_size=batch_size, dry_run=dry_run,
+                                     progress=progress)
+    finally:
+        try:
+            conn.row_factory = _caller_row_factory
+        except (AttributeError, sqlite3.ProgrammingError):
+            pass
+
+
+def _reindex_vectors_impl(conn, *, batch_size, dry_run, progress):
     target_dim = int(_embeddings.EMBEDDING_DIM)
     vec_type = _effective_vec_type(conn)
     vec_ok = _vec_available(conn)
@@ -5545,23 +5598,29 @@ def _ngrams(s: str, n: int = 3) -> set:
     return {s[i:i + n] for i in range(len(s) - n + 1)}
 
 
+def _normalize_cyrillic_text(text: str) -> str:
+    """Fold case and optional Russian ё spelling for fallback matching only."""
+    return text.lower().replace("ё", "е")
+
+
 def _cyrillic_score(query: str, content: str, n: int = 3) -> float:
     """Trigram Jaccard score in [0, 1] for Russian/Cyrillic recall.
 
     For each query word, find the best-matching content word by Jaccard
     similarity of their character n-gram sets. Return the mean across
     query words. Words shorter than 3 characters are ignored to avoid
-    noisy matches on stop words and punctuation.
+    noisy matches on stop words and punctuation. Case and ё/е spelling
+    are folded before extracting n-grams; stored content is unchanged.
 
     N-gram sets are computed once per unique word and cached in a dict
     to avoid redundant recomputation when the same content word is
     compared against multiple query words.
     """
     q_words = [
-        w for w in re.findall(r"[а-яёa-z0-9]+", query.lower()) if len(w) >= 3
+        w for w in re.findall(r"[а-яёa-z0-9]+", _normalize_cyrillic_text(query)) if len(w) >= 3
     ]
     c_words = [
-        w for w in re.findall(r"[а-яёa-z0-9]+", content.lower()) if len(w) >= 3
+        w for w in re.findall(r"[а-яёa-z0-9]+", _normalize_cyrillic_text(content)) if len(w) >= 3
     ]
     if not q_words or not c_words:
         return 0.0
@@ -5599,8 +5658,10 @@ def _cyrillic_like_search(
     receive comparable scores regardless of which surface form appears
     in the stored text.
 
-    The candidate-generation LIMIT is ``k * 5`` to keep the Python-side
-    scoring bounded; this matches the CJK fallback's behaviour.
+    Python scoring is bounded to ``k * 5`` candidates. Original-prefix
+    matches get half the pool first, and folded-only matches get the
+    remaining slots. Extra original-prefix matches fill any space left.
+    Both groups use a stable identifier order.
     """
     if not _has_cyrillic(query):
         return []
@@ -5611,10 +5672,17 @@ def _cyrillic_like_search(
 
     # SQLite's default LOWER() and LIKE are ASCII-only, so they cannot
     # case-fold Cyrillic letters (Т ≠ т, Ё ≠ ё). Register a Python
-    # UDF on the connection that performs a real Unicode lower(). It
-    # is safe to register the same name multiple times — SQLite will
-    # overwrite the previous function with the same name and arity.
-    conn.create_function("_py_lower", 1, lambda s: s.lower() if isinstance(s, str) else s)
+    # UDF for Unicode case-folding and ё/е normalization, matching the
+    # scorer. Without the spelling fold here, candidates are lost before
+    # re-ranking. Re-registering the same name and arity is safe.
+    conn.create_function(
+        "_py_cyrillic_normalize", 1,
+        lambda s: _normalize_cyrillic_text(s) if isinstance(s, str) else s,
+    )
+    conn.create_function(
+        "_py_cyrillic_lower", 1,
+        lambda s: s.lower() if isinstance(s, str) else s,
+    )
 
     # Use a 4-character prefix for LIKE matching. Query words and
     # stored content are inflected forms of the same lemma (тёмная
@@ -5622,23 +5690,42 @@ def _cyrillic_like_search(
     # over-selector that still prunes the candidate set down to a
     # trigram-scoring-sized slice.
     q_words = [
-        w for w in re.findall(r"[а-яёa-z0-9]+", query.lower()) if len(w) >= 4
+        w for w in re.findall(r"[а-яёa-z0-9]+", _normalize_cyrillic_text(query)) if len(w) >= 4
     ]
     if not q_words:
         return []
 
-    conditions = " OR ".join(
-        ["_py_lower(content) LIKE ? ESCAPE '\\'"] * len(q_words)
+    original_words = [
+        w for w in re.findall(r"[а-яёa-z0-9]+", query.lower()) if len(w) >= 4
+    ]
+    budget = k * 5
+    if budget <= 0:
+        return []
+    original_conditions = " OR ".join(
+        ["_py_cyrillic_lower(content) LIKE ? ESCAPE '\\'"] * len(original_words)
     )
-    params = [f"%{w[:4].lower()}%" for w in q_words]
+    folded_conditions = " OR ".join(
+        ["_py_cyrillic_normalize(content) LIKE ? ESCAPE '\\'"] * len(q_words)
+    )
+    original_params = [f"%{w[:4]}%" for w in original_words]
+    folded_params = [f"%{w[:4]}%" for w in q_words]
     try:
-        all_rows = conn.execute(
-            f"SELECT {id_col}, content FROM {table} WHERE {conditions} LIMIT ?",
-            params + [k * 5],
+        original_rows = conn.execute(
+            f"SELECT {id_col}, content FROM {table} WHERE {original_conditions}"
+            f" ORDER BY {id_col} LIMIT ?",
+            original_params + [budget],
+        ).fetchall()
+        original_count = min(len(original_rows), budget // 2)
+        variant_rows = conn.execute(
+            f"SELECT {id_col}, content FROM {table} WHERE ({folded_conditions})"
+            f" AND NOT ({original_conditions}) ORDER BY {id_col} LIMIT ?",
+            folded_params + original_params + [budget - original_count],
         ).fetchall()
     except Exception:
         return []
 
+    remaining = budget - len(variant_rows)
+    all_rows = original_rows[:original_count] + variant_rows + original_rows[original_count:remaining]
     if not all_rows:
         return []
 
@@ -11184,7 +11271,12 @@ class BeamMemory:
     # so entries cached under an older digest are not reused. Part of the
     # hashed payload; the opaque key keeps the "v2:" prefix because QueryCache's
     # opaque-path recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 15
+    # 16: clamp future-dated recency ages before exponentiation.
+    # 17: strongest eligible graph traversal and scoped active-seed selection.
+    # 18: local embedding input caps and effective cap policy in cache keys.
+    # 19: Cyrillic ё/е folding in fallback candidates and scores.
+    # Recheck the actual predecessor before each semantic integration.
+    _ENHANCED_RECALL_CACHE_VERSION = 19
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.
@@ -11294,6 +11386,7 @@ class BeamMemory:
             "recall_kwargs": canonicalize(effective_recall_kwargs),
             "resolved": {
                 "weights": resolved_weights,
+                "embedding_input_caps": tuple(max(0, cap) for cap in _embeddings._embedding_caps()),
                 "temporal_halflife": temporal_halflife,
                 "recency_halflife": RECENCY_HALFLIFE_HOURS,
                 "veracity_weights": {
@@ -11354,6 +11447,7 @@ class BeamMemory:
         # recognition keys off that exact prefix.
         return "v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
+    @_embeddings._embedding_cap_snapshot()
     def recall_enhanced(self, query: str, top_k: int = 40, *,
                         use_cache: bool = True,
                         use_weibull: bool = True,
@@ -11859,6 +11953,7 @@ class BeamMemory:
             session_id=self.session_id, cross_session=cross_session,
             author_id=author_id, author_type=author_type, channel_id=channel_id,
             veracity=veracity, memory_type=memory_type,
+            from_date=from_date, to_date=to_date, source=source, topic=topic,
         )
         try:
             polyphonic_results = engine.recall(
