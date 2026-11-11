@@ -12,6 +12,7 @@ TARGET = "鹽田的參觀名額為每日三十人，夜間的導覽時間是晚�
 
 
 def test_supplement_preserves_ranked_fts_pool_and_recovers_split_cjk():
+    """Append split CJK matches without changing the ranked FTS prefix or schema."""
     with sqlite3.connect(":memory:") as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(
@@ -34,6 +35,7 @@ def test_supplement_preserves_ranked_fts_pool_and_recovers_split_cjk():
 
 
 def test_zero_match_uses_original_fallback():
+    """Retain the original CJK fallback when FTS finds no rows."""
     with sqlite3.connect(":memory:") as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(
@@ -47,6 +49,7 @@ def test_zero_match_uses_original_fallback():
 
 
 def test_addition_needs_evidence_for_each_cjk_run():
+    """Reject candidates lacking evidence for a separate query part."""
     with sqlite3.connect(":memory:") as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(
@@ -63,6 +66,7 @@ def test_addition_needs_evidence_for_each_cjk_run():
 
 
 def test_shared_pair_does_not_count_for_an_unanswered_query_part():
+    """A shared topic pair cannot satisfy an unanswered query part."""
     query = "屋上花壇の散水、屋上改修の工費"
     rows = [
         ("literal", "屋上花壇の散水 。見出し例。"),
@@ -94,6 +98,7 @@ def test_shared_pair_does_not_count_for_an_unanswered_query_part():
 def test_recall_explain_counts_supplement_and_preserves_fts_score(
     tmp_path, monkeypatch, query, literal, target, expected_relevance,
 ):
+    """Credit supplemental rows in explain while preserving existing FTS scores."""
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
     memory = beam.BeamMemory(session_id="cjk", db_path=tmp_path / "cjk.db")
@@ -105,6 +110,7 @@ def test_recall_explain_counts_supplement_and_preserves_fts_score(
         )
 
     def recall():
+        """Run the same public recall without updating usage counters."""
         return memory.recall(query, top_k=3, explain=True, _track_recall=False)
 
     with monkeypatch.context() as baseline:
@@ -125,6 +131,7 @@ def test_recall_explain_counts_supplement_and_preserves_fts_score(
 
 @pytest.fixture
 def supplement_conn():
+    """Provide a disposable SQLite store with real FTS5 for bounded-search controls."""
     with sqlite3.connect(":memory:") as conn:
         conn.row_factory = sqlite3.Row
         conn.executescript(
@@ -136,6 +143,7 @@ def supplement_conn():
 
 @pytest.mark.parametrize(("raw_hits", "supplements"), [(256, ["gold"]), (257, [])])
 def test_supplement_raw_match_boundary(supplement_conn, raw_hits, supplements):
+    """Supplement at 256 raw matches and decline the saturated 257-match pool."""
     conn = supplement_conn
     conn.executemany(
         "INSERT INTO fts_working VALUES(?, '鹽田參觀名額')",
@@ -152,6 +160,7 @@ def test_supplement_raw_match_boundary(supplement_conn, raw_hits, supplements):
 
 @pytest.mark.parametrize(("k", "expected"), [(3, 3), (50, 16)])
 def test_supplement_candidate_cap(supplement_conn, k, expected):
+    """Apply both the requested candidate limit and the sixteen-row supplement cap."""
     conn = supplement_conn
     conn.execute("INSERT INTO fts_working VALUES('literal', '鹽田參觀名額')")
     conn.executemany(
@@ -164,6 +173,7 @@ def test_supplement_candidate_cap(supplement_conn, k, expected):
 
 
 def test_supplement_bounded_rowid_windows(supplement_conn):
+    """Include boundary rows from the head and tail while excluding the middle."""
     conn = supplement_conn
     conn.execute("INSERT INTO fts_working VALUES('literal', '鹽田參觀名額')")
     edge_rows = {1, 384, 385, 387, 388, 515}
@@ -185,6 +195,7 @@ def test_supplement_bounded_rowid_windows(supplement_conn):
     ],
 )
 def test_supplement_query_limits(supplement_conn, query, allowed):
+    """Bound query work by the permitted number of CJK runs and pairs."""
     conn = supplement_conn
     conn.execute("INSERT INTO working_memory VALUES('gold', ?)", (query,))
     # Supply a ranked hit directly to isolate the supplement's query guards.
@@ -196,6 +207,7 @@ def test_supplement_query_limits(supplement_conn, query, allowed):
 
 
 def test_supplement_sqlite_error_preserves_ranked_pool(supplement_conn):
+    """Keep the original ranked candidates when supplemental SQL fails."""
     conn = supplement_conn
     conn.execute("INSERT INTO fts_working VALUES('literal', '鹽田參觀名額')")
     terms = beam._fts_query_terms(QUERY)
@@ -222,6 +234,7 @@ def test_supplement_sqlite_error_preserves_ranked_pool(supplement_conn):
 def test_filtered_supplements_do_not_consume_visible_slots(
     tmp_path, monkeypatch, field, blocked, kwargs,
 ):
+    """Apply recall visibility filters before filling supplemental slots."""
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
     memory = beam.BeamMemory(session_id="local", db_path=tmp_path / "visible.db")
@@ -246,6 +259,7 @@ def test_filtered_supplements_do_not_consume_visible_slots(
 
 
 def test_supplement_rejects_insufficient_pair_evidence(supplement_conn):
+    """Reject a candidate matching too few independent character pairs."""
     conn = supplement_conn
     for table in ("working_memory", "fts_working"):
         conn.executemany(
@@ -256,6 +270,7 @@ def test_supplement_rejects_insufficient_pair_evidence(supplement_conn):
 
 
 def test_supplement_rejects_positive_score_below_floor(supplement_conn, monkeypatch):
+    """Enforce the relevance floor even when lexical similarity is positive."""
     monkeypatch.setenv("MNEMOSYNE_LEXICAL_GATE_MIN", "0.9")
     conn = supplement_conn
     conn.execute("INSERT INTO fts_working VALUES('literal', '鹽田參觀名額')")
@@ -264,6 +279,7 @@ def test_supplement_rejects_positive_score_below_floor(supplement_conn, monkeypa
 
 
 def test_staged_short_pool_excludes_raw_hits(supplement_conn):
+    """Exclude raw MATCH hits omitted from a shorter staged FTS pool."""
     conn = supplement_conn
     query = "전시장안내에서, 주차장요금은"
     target = "전시장 안내는 입구에서 받고 주차장 요금은 출구에서 냅니다."
@@ -283,6 +299,7 @@ def test_staged_short_pool_excludes_raw_hits(supplement_conn):
     [("天地玄，宇宙洪，日月盈，寒來暑", True), ("天地玄，宇宙洪，日月盈，寒來暑，秋收冬", False)],
 )
 def test_query_run_limit_through_fts(supplement_conn, query, allowed):
+    """Exercise the run-count guard through the actual FTS entry point."""
     conn = supplement_conn
     literal = query.split("，")[0]
     target = query.replace("，", "的")
@@ -294,6 +311,7 @@ def test_query_run_limit_through_fts(supplement_conn, query, allowed):
 
 
 def test_supplement_preserves_multiple_bm25_scores(tmp_path, monkeypatch):
+    """Leave distinct existing BM25 scores unchanged when appending a candidate."""
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
     memory = beam.BeamMemory(session_id="cjk", db_path=tmp_path / "ranks.db")
@@ -323,6 +341,7 @@ def test_supplement_preserves_multiple_bm25_scores(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("target_position", [1, 599], ids=["head", "tail"])
 def test_filtered_cjk_recall_at_31_variable_limit(tmp_path, monkeypatch, target_position):
+    """Preserve filtered recall in both row windows under a low SQLite bind limit."""
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
     memory = beam.BeamMemory(session_id="local", db_path=tmp_path / "limits.db")
@@ -356,6 +375,7 @@ def test_filtered_cjk_recall_at_31_variable_limit(tmp_path, monkeypatch, target_
 
 @pytest.mark.parametrize("k", [1, 50])
 def test_supplement_orders_by_score_before_rowid_and_cap(supplement_conn, k):
+    """Prefer stronger evidence before rowid tie-breaking and candidate truncation."""
     conn = supplement_conn
     conn.execute("INSERT INTO fts_working VALUES('literal', '鹽田參觀名額')")
     conn.executemany(
