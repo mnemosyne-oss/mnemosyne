@@ -95,9 +95,25 @@ def _recall(beam: BeamMemory):
     return hits, [h["id"] for h in hits]
 
 
-def _score_single_row(tmp_path: Path, table: str, offset: timedelta):
+def _stamp(offset: timedelta, *, naive: bool = False) -> str:
+    """ISO stamp at ``now + offset``, optionally in the legacy naive shape.
+
+    ``naive=True`` drops the offset, reproducing what pre-round-4 producers
+    wrote: a wall-clock stamp from a host in a positive-offset timezone. The
+    reader normalises a naive value to UTC, so such a row is placed
+    ``utcoffset`` hours in the future if the writer was ahead of UTC -- which is
+    the row shape the clamp exists for. With an aware stamp the age is already
+    correct and the clamp never engages, so both shapes are asserted here.
+    """
+    stamp = datetime.now(timezone.utc) + offset
+    if naive:
+        stamp = stamp.replace(tzinfo=None)
+    return stamp.isoformat()
+
+
+def _score_single_row(tmp_path: Path, table: str, offset: timedelta, *, naive: bool = False):
     """Seed one row at ``now + offset`` and return its explain hit."""
-    stamp = (datetime.now(timezone.utc) + offset).isoformat()
+    stamp = _stamp(offset, naive=naive)
     beam = BeamMemory(session_id="s-present", db_path=tmp_path / f"{table}.db")
     _insert(beam, table, [(_row_id(table, "only"), stamp, "s-present")])
     hits, ids = _recall(beam)
@@ -105,18 +121,17 @@ def _score_single_row(tmp_path: Path, table: str, offset: timedelta):
     return hits[0]
 
 
-def _three_row_ranking(tmp_path: Path, table: str):
+def _three_row_ranking(tmp_path: Path, table: str, *, naive_future: bool = False):
     """Present, future-dated and stale rows with identical content.
 
     Identical content is deliberate: base score, lexical score and importance
     are then equal by construction, so the surviving ordering difference can
     only come from the recency factor.
     """
-    now = datetime.now(timezone.utc)
     rows = [
-        (_row_id(table, "present"), now.isoformat(), "s-present"),
-        (_row_id(table, "future"), (now + FUTURE).isoformat(), "s-future"),
-        (_row_id(table, "stale"), (now - STALE).isoformat(), "s-stale"),
+        (_row_id(table, "present"), _stamp(timedelta(0)), "s-present"),
+        (_row_id(table, "future"), _stamp(FUTURE, naive=naive_future), "s-future"),
+        (_row_id(table, "stale"), _stamp(-STALE), "s-stale"),
     ]
     beam = BeamMemory(session_id="s-present", db_path=tmp_path / f"{table}-rank.db")
     _insert(beam, table, rows)
@@ -130,9 +145,10 @@ def _three_row_ranking(tmp_path: Path, table: str):
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("naive", [False, True], ids=["aware", "legacy-naive"])
 @pytest.mark.parametrize("table", ["working_memory", "episodic_memory"])
 def test_future_dated_row_scores_no_higher_than_a_present_row(
-    tmp_path: Path, lexical_only, table: str
+    tmp_path: Path, lexical_only, table: str, naive: bool
 ):
     """The multiplier must not reward a row for being misdated.
 
@@ -140,9 +156,13 @@ def test_future_dated_row_scores_no_higher_than_a_present_row(
     their base scores are equal. Unclamped, the future row's decay is above 1.0
     and multiplies its score ~3.7% above the present row's; clamped, the two are
     equal to the last bit.
+
+    The ``legacy-naive`` case is the one the clamp was written for: a stamp with
+    no offset, written as local wall time by a host ahead of UTC. Both shapes are
+    asserted because they reach the scorer by different routes.
     """
     present = _score_single_row(tmp_path / "present", table, timedelta(0))
-    future = _score_single_row(tmp_path / "future", table, FUTURE)
+    future = _score_single_row(tmp_path / "future", table, FUTURE, naive=naive)
 
     # Reported values are ``round(x, 4)``: the present row's true decay is
     # 0.99999845 (it is microseconds old by recall time), so compare at
@@ -173,8 +193,9 @@ def test_future_dated_row_scores_no_higher_than_a_present_row(
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("naive", [False, True], ids=["aware", "legacy-naive"])
 @pytest.mark.parametrize("table", ["working_memory", "episodic_memory"])
-def test_future_dated_row_gains_no_unearned_margin(tmp_path: Path, lexical_only, table: str):
+def test_future_dated_row_gains_no_unearned_margin(tmp_path: Path, lexical_only, table: str, naive: bool):
     """On identical content the misdated row may tie the newest row, never lead it by a margin.
 
     Which of the two ranks first is deliberately *not* pinned: the clamp
@@ -184,8 +205,12 @@ def test_future_dated_row_gains_no_unearned_margin(tmp_path: Path, lexical_only,
     flaky assertion. The defect was a *margin*: unclamped, the future row's
     factor reached 1.055, adding ~3.7% to its score on identical content and
     taking rank 0 outright.
+
+    ``legacy-naive`` writes the future stamp with no offset, the shape a
+    positive-offset host produced before the producer contract was fixed -- the
+    exact row the clamp was added for.
     """
-    hits, ids = _three_row_ranking(tmp_path, table)
+    hits, ids = _three_row_ranking(tmp_path, table, naive_future=naive)
     present = hits[_row_id(table, "present")]
     future = hits[_row_id(table, "future")]
 
