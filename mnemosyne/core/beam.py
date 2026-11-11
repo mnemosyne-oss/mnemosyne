@@ -5916,11 +5916,9 @@ def _cjk_supplement_candidates(conn, groups, where_sql=None, where_params=()):
         " (SELECT rowid FROM working_memory ORDER BY rowid DESC LIMIT 1"
         f" OFFSET {_CJK_SUPPLEMENT_TAIL_ROWS - 1}) AS tail)"
         " SELECT rowid,id,content FROM working_memory"
-        f" WHERE rowid <= (SELECT head FROM bounds) AND {predicate}{visibility}"
-        " UNION ALL SELECT rowid,id,content FROM working_memory"
-        " WHERE rowid >= (SELECT tail FROM bounds) AND rowid > (SELECT head FROM bounds)"
+        " WHERE (rowid <= (SELECT head FROM bounds) OR rowid >= (SELECT tail FROM bounds))"
         f" AND {predicate}{visibility}",
-        (*params, *params),
+        params,
     ).fetchall()
 
 

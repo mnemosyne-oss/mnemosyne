@@ -319,3 +319,52 @@ def test_supplement_preserves_multiple_bm25_scores(tmp_path, monkeypatch):
     assert result["gold"]["keyword_score"] == result["gold"]["fts_score"] == 0.5455
     for mid in original:
         assert result[mid]["fts_score"] == original[mid]["fts_score"]
+
+
+@pytest.mark.parametrize("target_position", [1, 599], ids=["head", "tail"])
+def test_filtered_cjk_recall_at_31_variable_limit(tmp_path, monkeypatch, target_position):
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    memory = beam.BeamMemory(session_id="local", db_path=tmp_path / "limits.db")
+    if not hasattr(memory.conn, "setlimit"):
+        pytest.skip("runtime SQLite limits require Python 3.11+")
+    rows = [("literal", "鹽田參觀名額")]
+    rows.extend((f"background-{i}", "background") for i in range(598))
+    rows.insert(target_position, ("gold", TARGET))
+    with memory.conn:
+        memory.conn.executemany(
+            "INSERT INTO working_memory"
+            "(id,content,source,timestamp,scope,session_id,author_id,author_type,"
+            "channel_id,veracity,memory_type)"
+            " VALUES(?,?,'preference','2026-09-15T10:00:00','session','local',"
+            "'alice','human','channel','confirmed','fact')",
+            rows,
+        )
+    kwargs = dict(
+        top_k=3, _cross_session=False, _track_recall=False, source="preference",
+        author_id="alice", author_type="human", channel_id="channel",
+        veracity="confirmed", memory_type="fact", from_date="2026-01-01", to_date="2026-12-31",
+    )
+    expected = memory.recall(QUERY, **kwargs)
+    assert {row["id"] for row in expected} == {"literal", "gold"}
+    memory.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 31)
+    # Flush prepared statements so the lowered limit applies to every query.
+    for i in range(160):
+        memory.conn.execute(f"SELECT {i}").fetchall()
+    assert memory.recall(QUERY, **kwargs) == expected
+
+
+@pytest.mark.parametrize("k", [1, 50])
+def test_supplement_orders_by_score_before_rowid_and_cap(supplement_conn, k):
+    conn = supplement_conn
+    conn.execute("INSERT INTO fts_working VALUES('literal', '鹽田參觀名額')")
+    conn.executemany(
+        "INSERT INTO working_memory VALUES(?, ?)",
+        [(f"weak-{i:02}", "鹽田的名額有限，夜間活動另行通知。") for i in range(20)]
+        + [("gold", TARGET)],
+    )
+    result = beam._fts_search_working(conn, QUERY, k)
+    assert result[0]["id"] == "literal"
+    assert result[1]["id"] == "gold"
+    assert len(result[1:]) == min(k, 16)
+    assert [row["id"] for row in result[2:]] == [f"weak-{i:02}" for i in range(min(k, 16) - 1)]
