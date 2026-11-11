@@ -859,13 +859,97 @@ def test_content_edit_invalidates_cached_verdict(temp_db, monkeypatch):
     assert r3["llm_validations"] == 0 and r3["skipped_cached"] == 1
 
 
+def test_migrated_null_signature_re_adjudicated(temp_db, monkeypatch):
+    """A legacy verdict row migrated WITHOUT a content_sig (NULL) must read
+    as stale — re-adjudicated and its row replaced with a real signature —
+    never trusted as a cache hit (the migration adds the column without
+    populating existing rows)."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+
+    A = BeamMemory(session_id="tCRL", db_path=temp_db)
+    B = BeamMemory(session_id="tCRL2", db_path=temp_db)
+    a1 = A.remember("[USER] favorite color is blue", source="conversation",
+                    importance=0.7, scope="global")
+    b1 = B.remember("[USER] favorite color is green now", source="conversation",
+                    importance=0.7, scope="global")
+    monkeypatch.setattr(lcd, "validate_conflict_pair",
+                        lambda older, newer, session_id, db_path: (False, 0.2, None, "valid"))
+
+    # seed the cache with one valid reject ...
+    C1 = BeamMemory(session_id="tCRL", db_path=temp_db)
+    C1._detect_conflicts = _stub_detect_pair(a1, b1)
+    r1 = C1.resolve_cross_session_conflicts()
+    assert r1["llm_validations"] == 1 and r1["skipped_cached"] == 0
+
+    # ... then simulate the apply-time migration leaving the row
+    # unsigned (NULL content_sig).
+    legacy = sqlite3.connect(str(temp_db))
+    legacy.execute("UPDATE cross_session_verdict_cache SET content_sig = NULL")
+    legacy.commit()
+    legacy.close()
+
+    # a NULL signature must NOT be trusted as a hit.
+    C2 = BeamMemory(session_id="tCRL", db_path=temp_db)
+    C2._detect_conflicts = _stub_detect_pair(a1, b1)
+    r2 = C2.resolve_cross_session_conflicts()
+    assert r2["llm_validations"] == 1, "a NULL signature must be re-adjudicated"
+    assert r2["skipped_cached"] == 0
+    rows = _cache_rows(temp_db)
+    assert len(rows) == 1 and rows[0]["content_sig"] is not None, (
+        "the migrated row must be replaced with a signed one")
+
+
+def test_content_sig_embedded_delimiter_no_collision(temp_db, monkeypatch):
+    """The content-sig encoding must be delimiter-free: swapping the two
+    contents of a pair whose text contains the old separator byte
+    sequence (\\n---\\n) is a DIFFERENT pair and must not collide on
+    the same signature."""
+    from mnemosyne.core.beam import _csverdict_content_sig
+
+    # direct unit check of the exact collision CodeRabbit described.
+    assert _csverdict_content_sig("A", "B\\n---\\nC") != \
+        _csverdict_content_sig("A\\n---\\nB", "C")
+
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+
+    A = BeamMemory(session_id="tCRM", db_path=temp_db)
+    B = BeamMemory(session_id="tCRM2", db_path=temp_db)
+    a1 = A.remember("[USER] A", source="conversation",
+                    importance=0.7, scope="global")
+    b1 = B.remember("[USER] B\\n---\\nC", source="conversation",
+                    importance=0.7, scope="global")
+    monkeypatch.setattr(lcd, "validate_conflict_pair",
+                        lambda older, newer, session_id, db_path: (False, 0.2, None, "valid"))
+
+    C1 = BeamMemory(session_id="tCRM", db_path=temp_db)
+    C1._detect_conflicts = _stub_detect_pair(a1, b1)
+    r1 = C1.resolve_cross_session_conflicts()
+    assert r1["llm_validations"] == 1 and r1["skipped_cached"] == 0
+
+    # an edit that moves the separator across the boundary changes the
+    # PAIR, not just one memory — the verdict must be re-adjudicated.
+    assert A.update_working(a1, content="[USER] A\\n---\\nB")
+    assert B.update_working(b1, content="[USER] C")
+    C2 = BeamMemory(session_id="tCRM", db_path=temp_db)
+    C2._detect_conflicts = _stub_detect_pair(a1, b1)
+    r2 = C2.resolve_cross_session_conflicts()
+    assert r2["llm_validations"] == 1, "an embedded-separator edit must re-adjudicate"
+    assert r2["skipped_cached"] == 0
+
+
 def test_cache_write_does_not_block_second_connection(temp_db, monkeypatch):
     """Cache writes must not hold the writer lock across a later LLM
     validation call: with a caller-owned deferred transaction and two
     rejected pairs (default WAL journal), a separate connection must be
     able to become a WRITER during the second validation. (timeout=0 so a
     regression fails fast instead of waiting out the default 5s busy
-    timeout.)"""
+    timeout.) The flush is queued through the after-commit hook — visible
+    from a third connection after the caller commits, and absent after the
+    caller rolls back (the cache must not outlive its transaction)."""
     monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
     import mnemosyne.core.llm_conflict_detector as lcd
     monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
@@ -890,7 +974,7 @@ def test_cache_write_does_not_block_second_connection(temp_db, monkeypatch):
             conn2 = sqlite3.connect(str(temp_db), timeout=0)
             try:
                 conn2.execute(
-                    "INSERT INTO working_memory "
+                    "INSERT OR IGNORE INTO working_memory "
                     "(id, content, source, timestamp, session_id, scope) "
                     "VALUES ('tcrh-writer', '[USER] concurrent write', "
                     "'conversation', '2026-11-11T00:00:00', 'tCRH', 'global')")
@@ -902,12 +986,27 @@ def test_cache_write_does_not_block_second_connection(temp_db, monkeypatch):
 
     monkeypatch.setattr(lcd, "validate_conflict_pair", _validate)
 
-    C = BeamMemory(session_id="tCRH", db_path=temp_db)
-    C._detect_conflicts = (
-        lambda items, similarity_threshold=0.88, min_gap_hours=1.0:
-        [(a1, b1), (a2, b2)])
-    # caller-owned deferred transaction (as the Hermes provider does).
-    C.conn.execute("BEGIN DEFERRED")
+    def _cache_count():
+        conn = sqlite3.connect(str(temp_db))
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM cross_session_verdict_cache").fetchone()[0]
+        except sqlite3.OperationalError:
+            return 0  # the table does not exist yet
+        finally:
+            conn.close()
+
+    def _run():
+        C = BeamMemory(session_id="tCRH", db_path=temp_db)
+        C._detect_conflicts = (
+            lambda items, similarity_threshold=0.88, min_gap_hours=1.0:
+            [(a1, b1), (a2, b2)])
+        # caller-owned deferred transaction (as the Hermes provider does).
+        C.conn.execute("BEGIN DEFERRED")
+        return C
+
+    # Phase 1: commit path.
+    C = _run()
     try:
         r = C.resolve_cross_session_conflicts()
         assert r["llm_validations"] == 2
@@ -916,14 +1015,121 @@ def test_cache_write_does_not_block_second_connection(temp_db, monkeypatch):
             "a second connection must be able to write while the apply is "
             "validating: the cache must not hold the writer lock across a "
             "validate_conflict_pair call")
-    finally:
-        # the caller commits its transaction (which now also carries the
-        # queued verdict writes).
+        # the flush must NOT have written yet: it is queued behind the
+        # caller's transaction, which still owns the writer lock.
+        assert _cache_count() == 0, (
+            "the flush must run after the caller's commit, not inside it")
+        # the caller commits its transaction; the after-commit hook fires
+        # and the flush writes on its own connection.
         C.conn.commit()
+        # visible from an independent connection, without the caller
+        # having committed anything cache-related itself.
+        check = sqlite3.connect(str(temp_db), timeout=5.0)
+        try:
+            n = check.execute(
+                "SELECT COUNT(*) FROM cross_session_verdict_cache").fetchone()[0]
+        finally:
+            check.close()
+        assert n == 2, "the after-commit flush must persist both reject verdicts"
+    finally:
+        C.conn.close()
 
-    # the deferred writes flushed after the validations, inside the caller
-    # transaction.
-    assert len(_cache_rows(temp_db)) == 2
+    # Phase 2: rollback path — the flush must NOT run for a transaction
+    # the caller rolled back (the cache must not outlive it).
+    calls["n"] = 0
+    C2 = _run()
+    try:
+        C2.resolve_cross_session_conflicts()
+        assert C2.conn.in_transaction
+        assert _cache_count() == 2  # still only phase-1's verdicts
+        C2.conn.rollback()
+        assert _cache_count() == 2, (
+            "a rolled-back transaction must not flush its queued verdicts")
+    finally:
+        C2.conn.close()
+
+
+def test_flush_waits_for_caller_commit_after_confirmed_pair(temp_db, monkeypatch):
+    """Flush timing with a MIXED confirmed + rejected pair (the case a
+    pure reject run never exercises): the confirmation's invalidate()
+    legitimately holds the writer lock, but the reject's cache flush must
+    still be queued as an after-commit hook and fire ONLY after the
+    caller commits — and not at all if the caller rolls back."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+
+    A = BeamMemory(session_id="tCRN", db_path=temp_db)
+    B = BeamMemory(session_id="tCRN2", db_path=temp_db)
+    a1 = A.remember("[USER] favorite color is blue", source="conversation",
+                    importance=0.7, scope="global")
+    b1 = B.remember("[USER] favorite color is green now", source="conversation",
+                    importance=0.7, scope="global")
+    a2 = A.remember("[USER] fact two", source="conversation",
+                    importance=0.7, scope="global")
+    b2 = B.remember("[USER] fact two changed", source="conversation",
+                    importance=0.7, scope="global")
+
+    calls = {"n": 0}
+
+    def _validate(older, newer, session_id=None, db_path=None):
+        calls["n"] += 1
+        # first pair confirmed (its invalidate() takes the writer lock),
+        # second pair rejected (queued for the cache).
+        if calls["n"] == 1:
+            return (True, 0.95, None, "valid")
+        return (False, 0.2, None, "valid")
+
+    monkeypatch.setattr(lcd, "validate_conflict_pair", _validate)
+
+    def _cache_count():
+        conn = sqlite3.connect(str(temp_db))
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM cross_session_verdict_cache").fetchone()[0]
+        except sqlite3.OperationalError:
+            return 0
+        finally:
+            conn.close()
+
+    def _run():
+        C = BeamMemory(session_id="tCRN", db_path=temp_db)
+        C._detect_conflicts = (
+            lambda items, similarity_threshold=0.88, min_gap_hours=1.0:
+            [(a1, b1), (a2, b2)])
+        C.conn.execute("BEGIN DEFERRED")
+        return C
+
+    # commit path: the flush is queued, fires only on the caller's commit.
+    C = _run()
+    try:
+        r = C.resolve_cross_session_conflicts()
+        assert r["llm_validations"] == 2
+        assert r["conflicts_resolved"] == 1 and r["invalidated"] == 1
+        assert _cache_count() == 0, (
+            "with the caller's transaction still open the flush must wait")
+        C.conn.commit()
+        check = sqlite3.connect(str(temp_db), timeout=5.0)
+        try:
+            n = check.execute(
+                "SELECT COUNT(*) FROM cross_session_verdict_cache").fetchone()[0]
+        finally:
+            check.close()
+        assert n == 1, "the after-commit flush must persist the reject verdict"
+    finally:
+        C.conn.close()
+
+    # rollback path: nothing is flushed.
+    calls["n"] = 0
+    C2 = _run()
+    try:
+        C2.resolve_cross_session_conflicts()
+        assert C2.conn.in_transaction
+        C2.conn.rollback()
+        assert _cache_count() == 1, (
+            "a rolled-back transaction must not flush its queued verdicts")
+    finally:
+        C2.conn.close()
 
 
 def test_dry_run_cold_and_evaluated_preview(temp_db, monkeypatch):

@@ -6293,10 +6293,14 @@ def _csverdict_content_sig(older_content: str, newer_content: str) -> str:
 
     A cached verdict is only trustworthy for the exact contents it was
     recorded against: any content change of either memory (e.g.
-    ``update_working`` keeps the id) makes the verdict stale.
+    ``update_working`` keeps the id) makes the verdict stale. The pair is
+    JSON-encoded as a two-element array so the encoding is length-
+    delimited: no delimiter byte sequence can collide across the two
+    contents (a "\n---\n" embedded in one memory cannot make a
+    different pair hash to the same signature).
     """
     return hashlib.sha256(
-        f"{older_content}\n---\n{newer_content}".encode("utf-8")
+        json.dumps([older_content, newer_content], separators=(",", ":")).encode("utf-8")
     ).hexdigest()
 
 
@@ -14234,11 +14238,13 @@ class BeamMemory:
                 cache_hit = cached_rejects.get((older_id, newer_id))
                 if cache_hit is not None:
                     _conf, _expires_at, _cached_sig = cache_hit
-                    if _cached_sig is not None and _cached_sig != pair_sig:
+                    if _cached_sig != pair_sig:
                         # Either memory's content changed since the verdict
-                        # was recorded (e.g. update_working keeps the id):
-                        # the verdict is stale — queue the row for deletion
-                        # and fall through to re-adjudicate the pair.
+                        # was recorded (e.g. update_working keeps the id),
+                        # or the row predates the content_sig column and
+                        # carries no signature: the verdict is stale —
+                        # queue the row for deletion and fall through to
+                        # re-adjudicate the pair.
                         cached_rejects.pop((older_id, newer_id))
                         stale_verdicts.append((older_id, newer_id))
                     else:
@@ -14292,15 +14298,29 @@ class BeamMemory:
                     # False is not a resolved conflict.
                     conflicts_resolved += 1
 
-        # Flush the queued verdicts now — after every LLM validation call in
-        # this run has completed — so the cache never holds the writer lock
-        # across a validate_conflict_pair call. A dry run (incl. llm_eval)
-        # stays read-only: it reports cache hits but never writes.
+        # Flush the queued verdicts after every LLM validation call in this
+        # run has completed, so the cache never holds the writer lock across
+        # a validate_conflict_pair call. A dry run (incl. llm_eval) stays
+        # read-only: it reports cache hits but never writes.
+        #
+        # When the connection carries a caller-owned transaction, the flush
+        # is queued through the connection's after-commit hook machinery: it
+        # runs only AFTER the caller has committed (the writer lock must be
+        # released before the flush's dedicated connection writes), and a
+        # rollback drops it — the best-effort cache must not outlive the
+        # rolled-back mutation, and a dropped flush simply degrades the next
+        # run to re-validation. With no open transaction there is no lock to
+        # wait out, so the flush runs immediately on its own connection.
         if not dry_run and (pending_verdicts or stale_verdicts):
-            try:
-                self._csverdict_flush(pending_verdicts, stale_verdicts)
-            except Exception:
-                logger.debug("cross-session verdict cache flush skipped", exc_info=True)
+            if self.conn.in_transaction:
+                self.conn._after_commit_hooks.append(
+                    lambda: self._csverdict_flush(pending_verdicts, stale_verdicts))
+            else:
+                try:
+                    self._csverdict_flush(pending_verdicts, stale_verdicts)
+                except Exception:
+                    logger.debug(
+                        "cross-session verdict cache flush skipped", exc_info=True)
 
         if dry_run:
             status = "dry_run"
@@ -14419,9 +14439,13 @@ class BeamMemory:
         The cache is derived, best-effort state, so it deliberately does
         NOT share the caller's transaction: a rolled-back invalidate
         still leaves a valid reject verdict, and a failed flush simply
-        degrades the next run to re-validation. Stale deletions run
-        first so a pair that is both stale and re-rejected this run ends
-        up with its NEW verdict.
+        degrades the next run to re-validation. It is invoked either
+        directly (no open transaction on the connection, so no writer lock
+        to wait out) or through an after-commit hook (a caller-owned
+        transaction is still open, so the caller's commit must land first);
+        in neither case does it commit the caller's transaction.
+        Stale deletions run first so a pair that is both stale and
+        re-rejected this run ends up with its NEW verdict.
         """
         import sqlite3 as _sqlite3
 
