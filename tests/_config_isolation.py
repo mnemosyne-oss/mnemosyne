@@ -25,6 +25,7 @@ def pytest_configure(config):
     config._mnemosyne_config_isolated = True
 
     def restore_environment():
+        """Restore the prior environment and release the collection-time directory."""
         for key, value in previous.items():
             if value is None:
                 os.environ.pop(key, None)

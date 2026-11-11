@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_ambient_quality_profile_cannot_change_collection_or_test_defaults(
     tmp_path, monkeypatch, ambient_source, inherited_overrides,
 ):
+    """Keep inherited profiles out of collection and per-test defaults."""
     if inherited_overrides:
         monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION", "true")
         monkeypatch.setenv("MNEMOSYNE_DEFAULT_SCOPE", "global")
