@@ -214,7 +214,12 @@ def test_future_dated_row_gains_no_unearned_margin(tmp_path: Path, lexical_only,
     present = hits[_row_id(table, "present")]
     future = hits[_row_id(table, "future")]
 
-    assert present["recency_decay"] == 1.0, present["recency_decay"]
+    # Same rounding caveat as the score test: the present row is a fraction of
+    # a microsecond old by the time ``recall`` runs, so its true decay is
+    # 0.99999845 and only rounds to 1.0. Compare at 4-dp precision.
+    assert present["recency_decay"] == pytest.approx(1.0, abs=1e-4), (
+        f"the present row must be treated as new, got {present['recency_decay']}"
+    )
     assert future["recency_decay"] == 1.0, (
         f"a row {FUTURE} in the future must saturate at 1.0, got "
         f"{future['recency_decay']}"
