@@ -46,9 +46,10 @@ CONTENT = "the deploy window opens at dusk, operator standing by"
 FUTURE = timedelta(hours=9)  # a UTC+9 local-naive stamp read as UTC
 STALE = timedelta(days=30)
 
-# One halflife expressed in hours, so the stale expectation tracks the constant
-# instead of hard-coding 168.
-HALFLIFE_HOURS = beam_module.RECENCY_HALFLIFE_HOURS
+# Pin test calibration independently of ambient configuration. At 168 hours,
+# a 30-day-old row reports about 0.0138, distinguishable from zero at 4 dp.
+HALFLIFE_HOURS = 168.0
+IMPORTANCE_WEIGHT = 0.2
 STALE_DECAY = math.exp(-(STALE.total_seconds() / 3600.0) / HALFLIFE_HOURS)
 
 # ``recall()`` reports ``score`` as ``round(score, 4)`` while ordering uses the
@@ -61,8 +62,11 @@ MAX_UNEARNED_MARGIN = 0.01
 
 @pytest.fixture
 def lexical_only(monkeypatch):
-    """Score on the lexical path alone: no model load, no vector drift."""
+    """Pin the lexical path and the decay default captured at import time."""
     monkeypatch.setattr("mnemosyne.core.embeddings.available", lambda: False)
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setattr(beam_module, "RECENCY_HALFLIFE_HOURS", HALFLIFE_HOURS)
+    monkeypatch.setattr(beam_module._recency_decay, "__defaults__", (HALFLIFE_HOURS,))
 
 
 def _row_id(table: str, suffix: str) -> str:
@@ -94,7 +98,11 @@ def _recall(beam: BeamMemory):
     the assertions read; ``_cross_session=True`` keeps rows written under other
     session ids in the candidate set.
     """
-    out = beam.recall(QUERY, top_k=10, explain=True, _cross_session=True)
+    out = beam.recall(
+        QUERY, top_k=10, explain=True, _cross_session=True,
+        vec_weight=0.0, fts_weight=1.0 - IMPORTANCE_WEIGHT,
+        importance_weight=IMPORTANCE_WEIGHT, temporal_weight=0.0,
+    )
     if isinstance(out, dict):
         hits = out.get("hits") or out.get("results") or []
     else:  # older signature returned a bare list
@@ -233,11 +241,17 @@ def test_future_dated_row_gains_no_unearned_margin(tmp_path: Path, lexical_only,
     )
     # Reported scores are 4-dp rounded, so the tolerance clears quantisation
     # rather than the sub-second tie; see MAX_UNEARNED_MARGIN.
+    assert present["score"] > 0.0, "the present control must actually score"
     margin = future["score"] - present["score"]
     assert margin <= present["score"] * MAX_UNEARNED_MARGIN, (
         f"the future-dated row gained {margin:.6f} over the present row "
         f"({future['score']} vs {present['score']}), i.e. "
         f"{100 * margin / present['score']:.2f}% on identical content"
+    )
+    assert margin >= -present["score"] * MAX_UNEARNED_MARGIN, (
+        f"the future-dated row lost {-margin:.6f} against the present row "
+        f"({future['score']} vs {present['score']}): the multi-row path "
+        "must treat a future stamp as new, not penalise it"
     )
     assert ids[-1] == _row_id(table, "stale"), f"the stale row must rank last; got {ids}"
 
@@ -252,22 +266,18 @@ def test_stale_row_keeps_its_full_penalty(tmp_path: Path, lexical_only, table: s
     """A mutation that returns 1.0 for everything must fail here.
 
     The clamp exists to stop ages below zero. It must not lift any other age,
-    so a 30-day-old row keeps ``exp(-720/168)`` of its score and ranks last.
+    so a 30-day-old row keeps ``exp(-720/168)`` decay and the tier's weighted
+    score penalty, rather than multiplying its whole score by that decay.
     """
     hits, ids = _three_row_ranking(tmp_path, table)
     stale = hits[_row_id(table, "stale")]
 
-    # The expectation is derived from the shipped half-life rather than
-    # hard-coded, because this file guards the clamp and not the curve's
-    # calibration -- a deliberate default change should move the expectation
-    # with it. What must not happen silently is a half-life so large that 30
-    # days stops costing anything: then "ranks last" would assert nothing. The
-    # constant is env-overridable (MNEMOSYNE_RECENCY_HALFLIFE), so express the
-    # requirement as a property of the derived penalty, not of the constant.
-    assert STALE_DECAY < 0.05, (
+    # Keep the expected value clear of both zero and one: neither flattening
+    # the curve nor over-penalising stale rows may satisfy this regression.
+    assert 1e-3 < STALE_DECAY < 0.05, (
         f"at {STALE} the expected decay is {STALE_DECAY:.4f} under a "
-        f"{HALFLIFE_HOURS:g}h half-life -- too close to 1.0 for a stale-last "
-        f"ranking assertion to mean anything; re-derive this test"
+        f"{HALFLIFE_HOURS:g}h half-life -- outside the useful band away from "
+        f"both zero and one; re-derive this test"
     )
 
     assert stale["recency_decay"] == pytest.approx(STALE_DECAY, abs=1e-4), (
@@ -277,7 +287,20 @@ def test_stale_row_keeps_its_full_penalty(tmp_path: Path, lexical_only, table: s
     assert ids[-1] == _row_id(table, "stale"), (
         f"the stale row must rank last; got {ids}"
     )
-    assert stale["score"] < hits[_row_id(table, "present")]["score"], (
-        f"stale scored {stale['score']}, present scored "
-        f"{hits[_row_id(table, 'present')]['score']}: recency is not being applied"
+    present = hits[_row_id(table, "present")]
+    assert present["score"] > 0.0
+    assert stale["keyword_score"] == present["keyword_score"]
+    assert stale["importance"] == present["importance"]
+    assert stale["dense_score"] == present["dense_score"] == 0.0
+    # Identical content and importance cancel the base score. Working memory
+    # retains (1 - importance_weight) * 0.4; episodic retains 0.7. Check the
+    # weighted penalty, not merely "stale scores lower" or pure exp(-age/h).
+    retained_share = (1.0 - IMPORTANCE_WEIGHT) * 0.4 if table == "working_memory" else 0.7
+    expected_multiplier = retained_share + (1.0 - retained_share) * STALE_DECAY
+    # Both public scores are rounded to 4 dp; allow their combined rounding.
+    assert stale["score"] == pytest.approx(
+        present["score"] * expected_multiplier, abs=1e-4, rel=0.0,
+    ), (
+        f"stale scored {stale['score']}, present scored {present['score']}: "
+        f"expected the {table} weighted multiplier {expected_multiplier:.6f}"
     )
