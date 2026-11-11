@@ -5875,9 +5875,58 @@ def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]
     return rows
 
 
-def _supplement_cjk_working(conn, query, rows, k, terms):
+_CJK_SUPPLEMENT_CAP = 16
+_CJK_SUPPLEMENT_RAW_LIMIT = 257
+_CJK_SUPPLEMENT_HEAD_ROWS = 384
+_CJK_SUPPLEMENT_TAIL_ROWS = 128
+_CJK_SUPPLEMENT_MAX_PAIRS = 32
+_CJK_SUPPLEMENT_MAX_RUNS = 4
+
+
+def _cjk_supplement_seen_ids(conn, query, rows, k, terms):
+    """Return all raw FTS IDs, or decline a saturated raw pool."""
+    seen = {row["id"] for row in rows}
+    precise_terms = _fts_precise_terms(query) if len(rows) < k else None
+    if precise_terms is not None and (not precise_terms or precise_terms == terms):
+        return seen
+    raw = conn.execute(
+        "SELECT id FROM fts_working WHERE fts_working MATCH ? LIMIT ?",
+        (" OR ".join(terms), _CJK_SUPPLEMENT_RAW_LIMIT),
+    ).fetchall()
+    if len(raw) == _CJK_SUPPLEMENT_RAW_LIMIT:
+        return None
+    seen.update(row["id"] for row in raw)
+    return seen
+
+
+def _cjk_supplement_candidates(conn, groups, where_sql=None, where_params=()):
+    """Fetch bounded pair matches passing the caller's working-memory filters."""
+    sql_groups = sorted(groups, key=len)
+    predicate = " AND ".join(
+        "(" + " OR ".join("instr(content, ?)" for _ in group) + ")"
+        for group in sql_groups
+    )
+    patterns = tuple(pair for group in sql_groups for pair in group)
+    visibility = f" AND ({where_sql})" if where_sql else ""
+    params = (*patterns, *where_params) if where_sql else patterns
+    return conn.execute(
+        "WITH bounds AS (SELECT coalesce((SELECT rowid FROM working_memory"
+        f" ORDER BY rowid LIMIT 1 OFFSET {_CJK_SUPPLEMENT_HEAD_ROWS - 1}),"
+        "9223372036854775807) AS head,"
+        " (SELECT rowid FROM working_memory ORDER BY rowid DESC LIMIT 1"
+        f" OFFSET {_CJK_SUPPLEMENT_TAIL_ROWS - 1}) AS tail)"
+        " SELECT rowid,id,content FROM working_memory"
+        f" WHERE rowid <= (SELECT head FROM bounds) AND {predicate}{visibility}"
+        " UNION ALL SELECT rowid,id,content FROM working_memory"
+        " WHERE rowid >= (SELECT tail FROM bounds) AND rowid > (SELECT head FROM bounds)"
+        f" AND {predicate}{visibility}",
+        (*params, *params),
+    ).fetchall()
+
+
+def _supplement_cjk_working(conn, query, rows, k, terms, *, where_sql=None, where_params=()):
     """Recover strong CJK rows outside a nonempty FTS pool, with bounded work."""
-    cap = min(k, 16)
+    cap = min(k, _CJK_SUPPLEMENT_CAP)
     if cap <= 0 or not rows or not _has_cjk(query):
         return rows
     groups = [
@@ -5886,7 +5935,8 @@ def _supplement_cjk_working(conn, query, rows, k, terms):
         if len(run) >= 2
     ]
     anchors = tuple(dict.fromkeys(anchor for group in groups for anchor in group))
-    if not anchors or len(anchors) > 32 or len(groups) > 4:
+    if (not anchors or len(anchors) > _CJK_SUPPLEMENT_MAX_PAIRS
+            or len(groups) > _CJK_SUPPLEMENT_MAX_RUNS):
         return rows
 
     # A shared pair can identify the topic without supporting a second
@@ -5896,39 +5946,10 @@ def _supplement_cjk_working(conn, query, rows, k, terms):
         for group in groups
     ]
     try:
-        seen = {row["id"] for row in rows}
-        precise_terms = _fts_precise_terms(query) if len(rows) < k else None
-        complete = precise_terms is not None and (not precise_terms or precise_terms == terms)
-        if not complete:
-            # Staging or a filled ranked slice cannot prove raw completeness.
-            raw_limit = 257
-            raw = conn.execute(
-                "SELECT id FROM fts_working WHERE fts_working MATCH ? LIMIT ?",
-                (" OR ".join(terms), raw_limit),
-            ).fetchall()
-            if len(raw) == raw_limit:
-                return rows
-            seen.update(row["id"] for row in raw)
-        sql_groups = sorted(groups, key=len)
-        # Filter on the exact pair evidence before fetching candidate text.
-        predicate = " AND ".join(
-            "(" + " OR ".join("instr(content, ?)" for _ in group) + ")"
-            for group in sql_groups
-        )
-        patterns = tuple(pair for group in sql_groups for pair in group)
-        # Find the same bounded windows using rowids alone, then filter the
-        # base table directly. This avoids staging full text in temporary rows.
-        candidates = conn.execute(
-            "WITH bounds AS (SELECT coalesce((SELECT rowid FROM working_memory"
-            " ORDER BY rowid LIMIT 1 OFFSET 383),9223372036854775807) AS head,"
-            " (SELECT rowid FROM working_memory ORDER BY rowid DESC LIMIT 1 OFFSET 127) AS tail)"
-            " SELECT rowid,id,content FROM working_memory"
-            f" WHERE rowid <= (SELECT head FROM bounds) AND {predicate}"
-            " UNION ALL SELECT rowid,id,content FROM working_memory"
-            " WHERE rowid >= (SELECT tail FROM bounds) AND rowid > (SELECT head FROM bounds)"
-            f" AND {predicate}",
-            (*patterns, *patterns),
-        ).fetchall()
+        seen = _cjk_supplement_seen_ids(conn, query, rows, k, terms)
+        if seen is None:
+            return rows
+        candidates = _cjk_supplement_candidates(conn, groups, where_sql, where_params)
     except sqlite3.OperationalError:
         return rows
 
@@ -5955,7 +5976,10 @@ def _supplement_cjk_working(conn, query, rows, k, terms):
     ]
 
 
-def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]:
+def _fts_search_working(
+    conn: sqlite3.Connection, query: str, k: int = 20,
+    *, where_sql: Optional[str] = None, where_params: Tuple[Any, ...] = (),
+) -> List[Dict]:
     """Search FTS5 working memory and return ids with ranks."""
     terms = _fts_query_terms(query)
     if not terms:
@@ -5969,7 +5993,9 @@ def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> Li
         return _cjk_like_search(conn, query, k=k, working=True)
     if not rows and _has_cyrillic(query):
         return _cyrillic_like_search(conn, query, k=k, working=True)
-    return _supplement_cjk_working(conn, query, rows, k, terms)
+    return _supplement_cjk_working(
+        conn, query, rows, k, terms, where_sql=where_sql, where_params=where_params,
+    )
 
 
 def _wm_vec_search(conn: sqlite3.Connection, query_embedding, k: int = 20,
@@ -10126,18 +10152,6 @@ class BeamMemory:
         # row. Overfetch by excluded ROWS bounds all possible FTS dropouts.
         _excluded_wm_ids = resolve_exclusions(self.conn, exclude_captures)
         _echo_overfetch = len(_excluded_wm_ids)
-        try:
-            wm_fts = _fts_search_working(
-                self.conn, query, k=max(top_k * 3, 50) + _echo_overfetch
-            )
-        except Exception:
-            wm_fts = []
-        _wm_fts_raw_count = len(wm_fts)
-
-        wm_ids = {r["id"] for r in wm_fts}
-        wm_ranks = {r["id"]: r["rank"] for r in wm_fts if not r.get("cjk_supplement")}
-        cjk_supplement_ids = wm_ids - wm_ranks.keys()
-
         # Build temporal/filter clause for working memory before vector search
         # so _wm_vec_search can push the same recall filters into SQL instead
         # of scanning broad memory_embeddings rows and filtering later.
@@ -10192,6 +10206,19 @@ class BeamMemory:
             wm_params.append(channel_id)
         
         wm_where = " AND ".join(wm_where_clauses)
+
+        try:
+            wm_fts = _fts_search_working(
+                self.conn, query, k=max(top_k * 3, 50) + _echo_overfetch,
+                where_sql=wm_where, where_params=tuple(wm_params),
+            )
+        except Exception:
+            wm_fts = []
+        _wm_fts_raw_count = len(wm_fts)
+
+        wm_ids = {r["id"] for r in wm_fts}
+        wm_ranks = {r["id"]: r["rank"] for r in wm_fts if not r.get("cjk_supplement")}
+        cjk_supplement_ids = wm_ids - wm_ranks.keys()
 
         # Vector pool isolation (#696): raw dialog capture (source='conversation',
         # source='honcho_message') stays fully FTS-reachable but is excluded from
