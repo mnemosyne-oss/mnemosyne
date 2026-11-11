@@ -5909,7 +5909,15 @@ def _cjk_supplement_candidates(conn, groups, where_sql=None, where_params=()):
     patterns = tuple(pair for group in sql_groups for pair in group)
     visibility = f" AND ({where_sql})" if where_sql else ""
     params = (*patterns, *where_params) if where_sql else patterns
-    return conn.execute(
+    getlimit = getattr(conn, "getlimit", None)
+    limit = getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) if callable(getlimit) else 999
+    filter_pairs_in_python = len(params) > limit
+    if filter_pairs_in_python:
+        # Keep visibility in SQL and evaluate only the pair predicate locally.
+        # The rowid windows still bound this fallback to at most 512 rows.
+        predicate = "1"
+        params = params[len(patterns):]
+    rows = conn.execute(
         "WITH bounds AS (SELECT coalesce((SELECT rowid FROM working_memory"
         f" ORDER BY rowid LIMIT 1 OFFSET {_CJK_SUPPLEMENT_HEAD_ROWS - 1}),"
         "9223372036854775807) AS head,"
@@ -5920,6 +5928,13 @@ def _cjk_supplement_candidates(conn, groups, where_sql=None, where_params=()):
         f" AND {predicate}{visibility}",
         params,
     ).fetchall()
+    if filter_pairs_in_python:
+        return [
+            row for row in rows
+            if row["content"] is not None
+            and all(any(pair in row["content"] for pair in group) for group in sql_groups)
+        ]
+    return rows
 
 
 def _supplement_cjk_working(conn, query, rows, k, terms, *, where_sql=None, where_params=()):

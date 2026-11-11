@@ -339,17 +339,31 @@ def test_supplement_preserves_multiple_bm25_scores(tmp_path, monkeypatch):
         assert result[mid]["fts_score"] == original[mid]["fts_score"]
 
 
+@pytest.mark.parametrize(
+    ("query", "literal", "target"),
+    [
+        (QUERY, "鹽田參觀名額", TARGET),
+        (
+            "天地玄黃宇宙洪荒日月盈昃辰宿列張寒來暑往秋收冬藏閏餘成歲律呂調陽雲",
+            "天地玄黃宇宙洪荒日月盈昃辰宿列張寒來暑往秋收冬藏閏餘成歲律呂調陽雲",
+            "天地玄黃宇宙洪荒日月盈昃辰宿列張的寒來暑往秋收冬藏閏餘成歲律呂調陽雲",
+        ),
+    ],
+    ids=["short-query", "32-distinct-pairs"],
+)
 @pytest.mark.parametrize("target_position", [1, 599], ids=["head", "tail"])
-def test_filtered_cjk_recall_at_31_variable_limit(tmp_path, monkeypatch, target_position):
+def test_filtered_cjk_recall_at_31_variable_limit(
+    tmp_path, monkeypatch, target_position, query, literal, target,
+):
     """Preserve filtered recall in both row windows under a low SQLite bind limit."""
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
     memory = beam.BeamMemory(session_id="local", db_path=tmp_path / "limits.db")
     if not hasattr(memory.conn, "setlimit"):
         pytest.skip("runtime SQLite limits require Python 3.11+")
-    rows = [("literal", "鹽田參觀名額")]
+    rows = [("literal", literal)]
     rows.extend((f"background-{i}", "background") for i in range(598))
-    rows.insert(target_position, ("gold", TARGET))
+    rows.insert(target_position, ("gold", target))
     with memory.conn:
         memory.conn.executemany(
             "INSERT INTO working_memory"
@@ -364,13 +378,13 @@ def test_filtered_cjk_recall_at_31_variable_limit(tmp_path, monkeypatch, target_
         author_id="alice", author_type="human", channel_id="channel",
         veracity="confirmed", memory_type="fact", from_date="2026-01-01", to_date="2026-12-31",
     )
-    expected = memory.recall(QUERY, **kwargs)
+    expected = memory.recall(query, **kwargs)
     assert {row["id"] for row in expected} == {"literal", "gold"}
     memory.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 31)
     # Flush prepared statements so the lowered limit applies to every query.
     for i in range(160):
         memory.conn.execute(f"SELECT {i}").fetchall()
-    assert memory.recall(QUERY, **kwargs) == expected
+    assert memory.recall(query, **kwargs) == expected
 
 
 @pytest.mark.parametrize("k", [1, 50])
@@ -388,3 +402,27 @@ def test_supplement_orders_by_score_before_rowid_and_cap(supplement_conn, k):
     assert result[1]["id"] == "gold"
     assert len(result[1:]) == min(k, 16)
     assert [row["id"] for row in result[2:]] == [f"weak-{i:02}" for i in range(min(k, 16) - 1)]
+
+
+def test_bind_fallback_preserves_groups_filters_and_row_windows(supplement_conn):
+    """Low bind budgets preserve each run, visibility, NULL rejection and bounds."""
+    conn = supplement_conn
+    conn.execute("ALTER TABLE working_memory ADD COLUMN visible INTEGER")
+    runs = ("天地玄黃宇宙洪荒日月盈昃辰宿列張寒", "來暑往秋收冬藏閏餘成歲律呂調陽雲騰")
+    groups = [tuple(run[i:i + 2] for i in range(len(run) - 1)) for run in runs]
+    both = "天地、來暑"
+    special = {1: (both, 1), 2: (both, 0), 3: ("天地玄黃", 1),
+               4: (None, 1), 385: (both, 1), 600: (both, 1)}
+    conn.executemany(
+        "INSERT INTO working_memory(rowid,id,content,visible) VALUES(?,?,?,?)",
+        [(i, str(i), *special.get(i, ("background", 1))) for i in range(1, 601)],
+    )
+    expected = beam._cjk_supplement_candidates(conn, groups, "visible = ?", (1,))
+    assert {row["id"] for row in expected} == {"1", "600"}
+    if not hasattr(conn, "setlimit"):
+        pytest.skip("runtime SQLite limits require Python 3.11+")
+    conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 31)
+    for i in range(160):
+        conn.execute(f"SELECT {i}").fetchall()
+    actual = beam._cjk_supplement_candidates(conn, groups, "visible = ?", (1,))
+    assert {row["id"] for row in actual} == {"1", "600"}
