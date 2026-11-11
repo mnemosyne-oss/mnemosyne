@@ -66,6 +66,7 @@ def lexical_only(monkeypatch):
 
 
 def _row_id(table: str, suffix: str) -> str:
+    """Build the deterministic row id the assertions look up by."""
     return f"{table}-{suffix}"
 
 
@@ -87,6 +88,12 @@ def _insert(beam: BeamMemory, table: str, rows) -> None:
 
 
 def _recall(beam: BeamMemory):
+    """Recall with explain on, returning ``(hits, ids)``.
+
+    ``explain=True`` is what exposes ``recency_decay`` and the rounded ``score``
+    the assertions read; ``_cross_session=True`` keeps rows written under other
+    session ids in the candidate set.
+    """
     out = beam.recall(QUERY, top_k=10, explain=True, _cross_session=True)
     if isinstance(out, dict):
         hits = out.get("hits") or out.get("results") or []
