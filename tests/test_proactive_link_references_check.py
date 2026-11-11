@@ -21,11 +21,13 @@ def beam(tmp_path, monkeypatch):
 
 
 def _references(beam):
+    """Return reference-edge endpoints in stable insertion order."""
     return [tuple(r) for r in beam.conn.execute(
         "SELECT source, target FROM graph_edges WHERE edge_type = 'references' ORDER BY id")]
 
 
 def test_duplicate_check_searches_the_new_memorys_edges(beam):
+    """Require the duplicate lookup to use the new memory's source index."""
     beam.remember("Alice met Bob in Paris.", source="user", extract_entities=True)
     statements = []
     beam.conn.set_trace_callback(statements.append)
@@ -41,6 +43,7 @@ def test_duplicate_check_searches_the_new_memorys_edges(beam):
 
 
 def test_check_still_finds_an_existing_references_edge(beam):
+    """Re-running the linker must preserve an existing reference edge."""
     # Calling the linker again for the same memory must not add a second edge.
     beam.remember("Alice met Bob in Paris.", source="user", extract_entities=True)
     second = beam.remember("Alice called Bob from Paris.", source="user", extract_entities=True)
@@ -53,6 +56,7 @@ def test_check_still_finds_an_existing_references_edge(beam):
 
 
 def test_check_ignores_other_edge_types_between_the_same_memories(beam):
+    """An edge of another type must not suppress a reference between the same pair."""
     # The filter must still apply: a related_to edge is not a references edge.
     first = beam.remember("Alice met Bob in Paris.", source="user", extract_entities=True)
     second = beam.remember("Alice called Bob from Paris.", source="user", extract_entities=True)
@@ -68,6 +72,7 @@ def test_check_ignores_other_edge_types_between_the_same_memories(beam):
 
 
 def test_edge_to_one_target_does_not_stop_a_link_to_another(beam):
+    """Restore a missing target edge without duplicating a different target edge."""
     # The check must compare the target too, not only look for any edge from the source.
     first = beam.remember("Alice met Bob in Paris.", source="user", extract_entities=True)
     second = beam.remember("Alice saw Bob in Paris.", source="user", extract_entities=True)
