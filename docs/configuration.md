@@ -358,17 +358,29 @@ SQLite storage and lexical retrieval remain local.
 
 The optional LLM conflict detector keeps its historical **512 output token** default.
 An explicitly set `MNEMOSYNE_LLM_MAX_TOKENS` also applies to conflict checks;
-unset, blank, invalid or non-positive values retain 512. The consolidation
-module's separate 2048 default does not change this default.
+unset, blank, invalid or non-positive values retain 512 **in the conflict request**.
+The consolidation module retains its separate import-time parsing and 2048
+default. A non-integer value (including whitespace-only input) set before
+`local_llm` is first imported raises `ValueError` there; this can prevent
+`sleep()` from reaching the conflict check. The conflict request's fallback
+does not repair that separate configuration error.
 
 Conflict checks also merge `MNEMOSYNE_LLM_EXTRA_BODY` last into the request,
 including provider-specific options such as `{"thinking":{"type":"disabled"}}`.
+Set the environment-only `MNEMOSYNE_CONFLICT_LLM_EXTRA_BODY` when the conflict
+endpoint needs different provider options. If unset, it inherits the shared
+`MNEMOSYNE_LLM_EXTRA_BODY`. If set, its object **replaces** the shared body;
+`{}` (or a blank value) suppresses the shared body entirely. Invalid overrides
+are ignored without falling back to shared options. This allows a separate
+conflict endpoint to avoid unsupported provider fields while consolidation
+keeps its own settings. The override does not change the token-budget fallback.
+
 As for consolidation, `messages`, `model` and `stream` are reserved and ignored;
 other fields, including `max_tokens`, can override the base request. Blank,
 malformed or non-object JSON is ignored. Nonfinite numbers (`NaN`, `Infinity`,
 `-Infinity`, or an overflowing exponent such as `1e400`) anywhere in the JSON
 cause the entire extra body to be ignored. Rejected options produce a warning
-without logging the supplied values. These two variables are read for each
+without logging the supplied values. All three variables are read for each
 conflict request, unlike the consolidation module's import-time settings.
 This does not enable conflict detection, change endpoint selection, or extend
 its existing request deadline.

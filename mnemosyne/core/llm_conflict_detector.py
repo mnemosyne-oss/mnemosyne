@@ -102,7 +102,13 @@ def _conflict_request_options() -> dict:
             logger.warning("Conflict detection: invalid MNEMOSYNE_LLM_MAX_TOKENS; using 512.")
             max_tokens = 512
     options = {"max_tokens": max_tokens}
-    raw_body = os.environ.get("MNEMOSYNE_LLM_EXTRA_BODY", "").strip()
+    body_variable = "MNEMOSYNE_LLM_EXTRA_BODY"
+    raw_body = os.environ.get("MNEMOSYNE_CONFLICT_LLM_EXTRA_BODY")
+    if raw_body is None:
+        raw_body = os.environ.get("MNEMOSYNE_LLM_EXTRA_BODY", "")
+    else:
+        body_variable = "MNEMOSYNE_CONFLICT_LLM_EXTRA_BODY"
+    raw_body = raw_body.strip()
     if not raw_body:
         return options
     try:
@@ -112,14 +118,14 @@ def _conflict_request_options() -> dict:
             parse_float=_finite_json_float,
         )
     except ValueError:
-        logger.warning("Conflict detection: invalid MNEMOSYNE_LLM_EXTRA_BODY; ignoring it.")
+        logger.warning("Conflict detection: invalid %s; ignoring it.", body_variable)
         return options
     if not isinstance(extra, dict):
-        logger.warning("Conflict detection: MNEMOSYNE_LLM_EXTRA_BODY must be an object; ignoring it.")
+        logger.warning("Conflict detection: %s must be an object; ignoring it.", body_variable)
         return options
     reserved = {"messages", "model", "stream"}
     if reserved.intersection(extra):
-        logger.warning("Conflict detection: reserved fields in MNEMOSYNE_LLM_EXTRA_BODY were ignored.")
+        logger.warning("Conflict detection: reserved fields in %s were ignored.", body_variable)
     options.update({key: value for key, value in extra.items() if key not in reserved})
     return options
 
