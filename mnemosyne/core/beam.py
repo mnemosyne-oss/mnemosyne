@@ -5875,7 +5875,124 @@ def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]
     return rows
 
 
-def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]:
+_CJK_SUPPLEMENT_CAP = 16
+_CJK_SUPPLEMENT_RAW_LIMIT = 257
+_CJK_SUPPLEMENT_HEAD_ROWS = 384
+_CJK_SUPPLEMENT_TAIL_ROWS = 128
+_CJK_SUPPLEMENT_MAX_PAIRS = 32
+_CJK_SUPPLEMENT_MAX_RUNS = 4
+
+
+def _cjk_supplement_seen_ids(conn, query, rows, k, terms):
+    """Return all raw FTS IDs, or decline a saturated raw pool."""
+    seen = {row["id"] for row in rows}
+    precise_terms = _fts_precise_terms(query) if len(rows) < k else None
+    if precise_terms is not None and (not precise_terms or precise_terms == terms):
+        return seen
+    raw = conn.execute(
+        "SELECT id FROM fts_working WHERE fts_working MATCH ? LIMIT ?",
+        (" OR ".join(terms), _CJK_SUPPLEMENT_RAW_LIMIT),
+    ).fetchall()
+    if len(raw) == _CJK_SUPPLEMENT_RAW_LIMIT:
+        return None
+    seen.update(row["id"] for row in raw)
+    return seen
+
+
+def _cjk_supplement_candidates(conn, groups, where_sql=None, where_params=()):
+    """Fetch bounded pair matches passing the caller's working-memory filters."""
+    sql_groups = sorted(groups, key=len)
+    predicate = " AND ".join(
+        "(" + " OR ".join("instr(content, ?)" for _ in group) + ")"
+        for group in sql_groups
+    )
+    patterns = tuple(pair for group in sql_groups for pair in group)
+    visibility = f" AND ({where_sql})" if where_sql else ""
+    params = (*patterns, *where_params) if where_sql else patterns
+    getlimit = getattr(conn, "getlimit", None)
+    limit = getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) if callable(getlimit) else 999
+    filter_pairs_in_python = len(params) > limit
+    if filter_pairs_in_python:
+        # Keep visibility in SQL and evaluate only the pair predicate locally.
+        # The rowid windows still bound this fallback to at most 512 rows.
+        predicate = "1"
+        params = params[len(patterns):]
+    rows = conn.execute(
+        "WITH bounds AS (SELECT coalesce((SELECT rowid FROM working_memory"
+        f" ORDER BY rowid LIMIT 1 OFFSET {_CJK_SUPPLEMENT_HEAD_ROWS - 1}),"
+        "9223372036854775807) AS head,"
+        " (SELECT rowid FROM working_memory ORDER BY rowid DESC LIMIT 1"
+        f" OFFSET {_CJK_SUPPLEMENT_TAIL_ROWS - 1}) AS tail)"
+        " SELECT rowid,id,content FROM working_memory"
+        " WHERE (rowid <= (SELECT head FROM bounds) OR rowid >= (SELECT tail FROM bounds))"
+        f" AND {predicate}{visibility}",
+        params,
+    ).fetchall()
+    if filter_pairs_in_python:
+        return [
+            row for row in rows
+            if row["content"] is not None
+            and all(any(pair in row["content"] for pair in group) for group in sql_groups)
+        ]
+    return rows
+
+
+def _supplement_cjk_working(conn, query, rows, k, terms, *, where_sql=None, where_params=()):
+    """Recover strong CJK rows outside a nonempty FTS pool, with bounded work."""
+    cap = min(k, _CJK_SUPPLEMENT_CAP)
+    if cap <= 0 or not rows or not _has_cjk(query):
+        return rows
+    groups = [
+        tuple(dict.fromkeys(run[i:i + 2] for i in range(len(run) - 1)))
+        for run in re.findall(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+", query)
+        if len(run) >= 2
+    ]
+    anchors = tuple(dict.fromkeys(anchor for group in groups for anchor in group))
+    if (not anchors or len(anchors) > _CJK_SUPPLEMENT_MAX_PAIRS
+            or len(groups) > _CJK_SUPPLEMENT_MAX_RUNS):
+        return rows
+
+    # A shared pair can identify the topic without supporting a second
+    # requested fact. Require an independent pair where that run has one.
+    groups = [
+        tuple(pair for pair in group if sum(pair in other for other in groups) == 1) or group
+        for group in groups
+    ]
+    try:
+        seen = _cjk_supplement_seen_ids(conn, query, rows, k, terms)
+        if seen is None:
+            return rows
+        candidates = _cjk_supplement_candidates(conn, groups, where_sql, where_params)
+    except sqlite3.OperationalError:
+        return rows
+
+    tokens = _recall_tokens(query)
+    prepared = _prepare_lexical_query(tokens, query.lower())
+    floor = _minimum_recall_relevance(tokens)
+    evidence = 1 if len(anchors) <= 2 else 2
+    scored = []
+    for row in candidates:
+        content = row["content"]
+        mid = row["id"]
+        if mid in seen:
+            continue
+        seen.add(mid)
+        if sum(anchor in content for anchor in anchors) < evidence:
+            continue
+        score = _lexical_relevance_for_query(prepared, content)
+        if score > 0 and score >= floor:
+            scored.append((score, row["rowid"], mid))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return rows + [
+        {"id": mid, "rank": None, "cjk_supplement": True}
+        for _, _, mid in scored[:cap]
+    ]
+
+
+def _fts_search_working(
+    conn: sqlite3.Connection, query: str, k: int = 20,
+    *, where_sql: Optional[str] = None, where_params: Tuple[Any, ...] = (),
+) -> List[Dict]:
     """Search FTS5 working memory and return ids with ranks."""
     terms = _fts_query_terms(query)
     if not terms:
@@ -5889,7 +6006,9 @@ def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> Li
         return _cjk_like_search(conn, query, k=k, working=True)
     if not rows and _has_cyrillic(query):
         return _cyrillic_like_search(conn, query, k=k, working=True)
-    return rows
+    return _supplement_cjk_working(
+        conn, query, rows, k, terms, where_sql=where_sql, where_params=where_params,
+    )
 
 
 def _wm_vec_search(conn: sqlite3.Connection, query_embedding, k: int = 20,
@@ -7194,8 +7313,11 @@ class BeamMemory:
                     ).fetchall()
                     for match in related:
                         rid = match["memory_id"]
+                        # Unary + leaves only idx_edges_source for the planner. The type can
+                        # dominate the table and the target can be a hub, but the source is
+                        # the memory being linked, which has far fewer edges than a busy target.
                         existing = self.episodic_graph.conn.execute(
-                            "SELECT 1 FROM graph_edges WHERE source = ? AND target = ? AND edge_type = 'references'",
+                            "SELECT 1 FROM graph_edges WHERE source = ? AND +target = ? AND +edge_type = 'references'",
                             (memory_id, rid)
                         ).fetchone()
                         if existing:
@@ -10052,17 +10174,6 @@ class BeamMemory:
         # row. Overfetch by excluded ROWS bounds all possible FTS dropouts.
         _excluded_wm_ids = resolve_exclusions(self.conn, exclude_captures)
         _echo_overfetch = len(_excluded_wm_ids)
-        try:
-            wm_fts = _fts_search_working(
-                self.conn, query, k=max(top_k * 3, 50) + _echo_overfetch
-            )
-        except Exception:
-            wm_fts = []
-        _wm_fts_raw_count = len(wm_fts)
-
-        wm_ids = {r["id"] for r in wm_fts}
-        wm_ranks = {r["id"]: r["rank"] for r in wm_fts}
-
         # Build temporal/filter clause for working memory before vector search
         # so _wm_vec_search can push the same recall filters into SQL instead
         # of scanning broad memory_embeddings rows and filtering later.
@@ -10117,6 +10228,19 @@ class BeamMemory:
             wm_params.append(channel_id)
         
         wm_where = " AND ".join(wm_where_clauses)
+
+        try:
+            wm_fts = _fts_search_working(
+                self.conn, query, k=max(top_k * 3, 50) + _echo_overfetch,
+                where_sql=wm_where, where_params=tuple(wm_params),
+            )
+        except Exception:
+            wm_fts = []
+        _wm_fts_raw_count = len(wm_fts)
+
+        wm_ids = {r["id"] for r in wm_fts}
+        wm_ranks = {r["id"]: r["rank"] for r in wm_fts if not r.get("cjk_supplement")}
+        cjk_supplement_ids = wm_ids - wm_ranks.keys()
 
         # Vector pool isolation (#696): raw dialog capture (source='conversation',
         # source='honcho_message') stays fully FTS-reachable but is excluded from
@@ -10264,17 +10388,15 @@ class BeamMemory:
                 if temporal_weight > 0.0:
                     t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
                     score *= (1.0 + temporal_weight * t_boost)
-                # [C4] Per-row tier attribution. Credit FTS for any
-                # row in wm_ranks (overlap with vec credited to FTS
-                # so the union sum stays consistent). Vec-only rows
-                # (in wm_vec_sims but not wm_ranks) credit wm_vec.
+                # [C4] The primary lexical tier counts both ranked FTS
+                # and CJK supplements. Lexical/vector overlaps count once.
                 # Rows reached via the fallback branch (wm_ids empty)
                 # credit wm_fallback. Each row credits exactly one
                 # tier so `wm_fts + wm_vec + wm_fallback` = total
                 # kept WM rows for this call.
                 if _wm_fallback_used:
                     _wm_fallback_kept += 1
-                elif wm_ranks and row["id"] in wm_ranks:
+                elif row["id"] in wm_ranks or row["id"] in cjk_supplement_ids:
                     _wm_fts_kept += 1
                 elif row["id"] in wm_vec_sims:
                     _wm_vec_kept += 1
@@ -11281,8 +11403,9 @@ class BeamMemory:
     # 17: strongest eligible graph traversal and scoped active-seed selection.
     # 18: local embedding input caps and effective cap policy in cache keys.
     # 19: Cyrillic ё/е folding in fallback candidates and scores.
+    # 20: Bounded CJK supplement for linear working-memory recall.
     # Recheck the actual predecessor before each semantic integration.
-    _ENHANCED_RECALL_CACHE_VERSION = 19
+    _ENHANCED_RECALL_CACHE_VERSION = 20
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.
