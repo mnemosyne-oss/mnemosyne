@@ -84,6 +84,7 @@ offset — derived from ONE instant so a reader can check they agree.
 
 from __future__ import annotations
 
+import errno
 import logging
 import math
 import os
@@ -770,19 +771,34 @@ def _probe_scope(
     as the same fail-closed refusal a probe failure produces.
     """
     home = _resolve(home_bank)
+    root_bank = root_db if root_db is not None else (
+        root_db_path(fleet_root) if fleet_root is not None else None
+    )
+    for scope_path in (fleet_root, root_bank):
+        if scope_path is None:
+            continue
+        try:
+            Path(scope_path).expanduser().resolve(strict=True)
+        except (RuntimeError, OSError) as exc:
+            # Older pathlib raises RuntimeError for loops; newer versions
+            # report ELOOP in strict mode. Missing paths remain optional.
+            if isinstance(exc, OSError) and exc.errno != errno.ELOOP:
+                continue
+            failure = _failure(scope_path, exc)
+            failure["error_class"] = "scope_error"
+            failure["error_message"] = f"fleet scope resolution failed: {exc}"[:500]
+            return [], [failure]
+
     surface = shared_db if shared_db is not None else (
         fleet_census.shared_db_path(fleet_root) if fleet_root is not None else None
     )
     surface = _resolve(surface) if surface is not None else None
-    root_bank = root_db if root_db is not None else (
-        root_db_path(fleet_root) if fleet_root is not None else None
-    )
     root_bank = _resolve(root_bank) if root_bank is not None else None
 
     if banks is not None:
         raw_candidates = [_resolve(Path(b)) for b in banks]
     elif fleet_root is not None:
-        raw_candidates = sorted({_resolve(Path(b)) for b in fleet_census.discover_banks(fleet_root)})
+        raw_candidates = sorted({_resolve(Path(b)) for b in fleet_census.discover_banks(_resolve(fleet_root))})
     else:
         raw_candidates = []
 

@@ -151,7 +151,8 @@ def _sqlite_integrity_diagnostics(conn) -> dict[str, str]:
     return {"quick_check": result, "detail": ""}
 
 
-def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, bank: str | None = None) -> dict:
+def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False,
+                    bank: str | None = None, db_path: Path | None = None) -> dict:
     """
     Run full diagnostic scan and write PII-safe log.
     Returns summary dict for display.
@@ -164,6 +165,8 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, 
         bank: Optional named bank to diagnose. When provided, diagnostics run
             against the bank's own SQLite DB (data/banks/<bank>/mnemosyne.db).
             When None, the default/profile-root DB is used.
+        db_path: Optional database path selected by a host CLI. When supplied,
+            it takes precedence over ambient data-dir overrides.
     """
     log_path = _log_path()
     entries: list[dict] = []
@@ -188,7 +191,9 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, 
     # --- Database state ---
     try:
         from mnemosyne.core.memory import Mnemosyne
-        if bank:
+        if db_path is not None:
+            mem = Mnemosyne(session_id="hermes_default", bank=bank, db_path=db_path)
+        elif bank:
             mem = Mnemosyne(session_id="hermes_default", bank=bank)
         else:
             mem = Mnemosyne()

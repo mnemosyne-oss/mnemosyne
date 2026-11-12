@@ -32,7 +32,7 @@ def _run_hook(
         env = {"HOME": str(tmp_path / "home"), "LC_ALL": "C", "PATH": f"{python_bin}:/usr/bin:/bin"}
 
     return subprocess.run(
-        ["/usr/bin/bash", ".githooks/pre-push"],
+        ["/bin/bash", ".githooks/pre-push"],
         cwd=repo,
         input="".join(_tag_push(tag) for tag in tags),
         capture_output=True,
@@ -48,13 +48,14 @@ def _release_repo(
     *,
     high_standalone_tag: bool = False,
     project_toml: str | None = None,
+    core_assignment: str = '__version__ = "3.16.0"',
 ) -> Path:
     repo = tmp_path / "release-repo"
     (repo / ".githooks").mkdir(parents=True)
     (repo / "mnemosyne").mkdir()
     (repo / "integrations" / "hermes").mkdir(parents=True)
     shutil.copy2(HOOK, repo / ".githooks" / "pre-push")
-    (repo / "mnemosyne" / "__init__.py").write_text('__version__ = "3.16.0"\n')
+    (repo / "mnemosyne" / "__init__.py").write_text(core_assignment + "\n")
     (repo / "integrations" / "hermes" / "pyproject.toml").write_text(
         project_toml
         or "[project]\nname = \"mnemosyne-hermes\"\n" f"version = \"{standalone_version}\"\n"
@@ -116,6 +117,28 @@ def test_hook_keeps_standalone_and_core_namespaces_independent(tmp_path):
     high_standalone_repo = _release_repo(tmp_path / "high", high_standalone_tag=True)
     core_result = _run_hook(high_standalone_repo, "v3.16.0")
     assert core_result.returncode == 0, core_result.stderr + core_result.stdout
+
+
+@pytest.mark.parametrize(
+    "core_assignment",
+    [
+        pytest.param('__version__\t=\t"3.16.0"', id="tabs"),
+        pytest.param('__version__="3.16.0"', id="no-spaces"),
+        pytest.param("__version__ = '3.16.0'", id="single-quotes"),
+    ],
+)
+def test_hook_parses_core_version_assignment_variants(tmp_path, core_assignment):
+    """Accept each supported assignment syntax while enforcing the core version."""
+    repo = _release_repo(tmp_path, core_assignment=core_assignment)
+
+    matching = _run_hook(repo, "v3.16.0")
+    assert matching.returncode == 0, matching.stderr + matching.stdout
+
+    mismatched = _run_hook(repo, "v3.17.0")
+    assert mismatched.returncode != 0
+    assert "does not match the release version" in mismatched.stdout
+    assert "mnemosyne/__init__.py" in mismatched.stdout
+    assert "Version: 3.16.0" in mismatched.stdout
 
 
 def test_hook_rejects_mismatched_standalone_tag_before_release(tmp_path):
