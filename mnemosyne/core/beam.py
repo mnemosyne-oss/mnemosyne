@@ -60,6 +60,53 @@ def _recall_id_batches(conn, ids, reserved=0):
         yield distinct[start:start + size]
 
 
+class _SleepClaimLost(Exception):
+    """sleep() no longer owns the claim on rows it was about to summarize."""
+
+
+# A claim older than this is a candidate for recovery. The age is only a
+# trigger: the recovery itself hands the claim over with a compare-and-swap on
+# the exact stamp it observed, and every claim holder re-checks that stamp at
+# its summary-write and claim-clear boundaries, so a slow-but-alive holder
+# loses ownership cleanly instead of racing the new one.
+_ORPHAN_STALE_AFTER_S = 3600
+
+
+def _orphan_cutoff() -> str:
+    """Naive-UTC ISO cutoff: claims older than this may be recovered."""
+    return (
+        datetime.now(timezone.utc).replace(tzinfo=None)
+        - timedelta(seconds=_ORPHAN_STALE_AFTER_S)
+    ).isoformat()
+
+
+def _claim_completed_sql(alias: str) -> str:
+    """SQL predicate: a summary completed THIS claim of working row ``alias``.
+
+    A summary that merely references the row id is not enough: a row can be
+    summarized, refreshed by remember() (which clears both markers) and claimed
+    again, leaving an older summary that names the same id. Completion evidence
+    is a summary written at or after the current claim stamp. ``created_at`` is
+    second-granular, so a summary written in the same second as the claim counts
+    as complete -- the safe direction (never a second summary).
+    """
+    return (
+        "EXISTS (SELECT 1 FROM episodic_memory em "
+        f"WHERE instr(',' || COALESCE(em.summary_of, '') || ',', ',' || {alias}.id || ',') > 0 "
+        "AND (em.created_at IS NULL "
+        f"OR datetime(em.created_at) >= datetime({alias}.consolidation_claimed_at)))"
+    )
+
+
+# Rows sleep() may take: never-consolidated rows, plus rows whose claim is
+# stale and has no summary completing it. One bind parameter: the orphan cutoff.
+_SLEEP_ELIGIBLE_SQL = (
+    "(consolidated_at IS NULL OR ("
+    "consolidation_claimed_at IS NOT NULL AND consolidation_claimed_at < ? "
+    f"AND NOT {_claim_completed_sql('working_memory')}))"
+)
+
+
 def _select_recall_rows_by_ids(conn, sql, ids, params=(), *, key="id"):
     """Load an IN lookup without dropping filters or truncating its candidates.
 
@@ -8411,6 +8458,73 @@ class BeamMemory:
     # ------------------------------------------------------------------
     # Episodic Memory
     # ------------------------------------------------------------------
+    def _require_sleep_claim(self, ids, stamp: str) -> None:
+        """Raise _SleepClaimLost unless every id still holds claim ``stamp``.
+
+        Takes the write lock first so the check and the caller's following
+        write are one atomic step: nothing can re-stamp a claim in between.
+        """
+        if not self.conn.in_transaction:
+            self.conn.execute("BEGIN IMMEDIATE")
+        wanted = list(dict.fromkeys(ids))
+        owned = 0
+        for chunk in _recall_id_batches(self.conn, wanted, 1):
+            placeholders = ",".join("?" * len(chunk))
+            owned += self.conn.execute(
+                f"SELECT COUNT(*) FROM working_memory WHERE id IN ({placeholders}) "
+                "AND consolidation_claimed_at = ?",
+                (*chunk, stamp),
+            ).fetchone()[0]
+        if owned != len(wanted):
+            raise _SleepClaimLost(
+                f"{len(wanted) - owned} of {len(wanted)} rows no longer carry claim {stamp}"
+            )
+
+    def _claim_sleep_rows(self, rows, stamp: str) -> set:
+        """Take ownership of ``rows`` for one sleep pass; return the ids won.
+
+        Fresh rows are claimed only while ``consolidated_at`` is still NULL.
+        A recovered orphan is taken over by compare-and-swap on the exact claim
+        it was read with, so the swap fails if its holder finished, refreshed it
+        or another pass recovered it first. ``consolidated_at`` is never NULL
+        during the swap, which keeps the row exempt from trim for the whole
+        recovery. Every statement honours the connection's live bind limit.
+        """
+        cursor = self.conn.cursor()
+        fresh = [r["id"] for r in rows if r["_prev_consolidated"] is None]
+        orphans = [
+            (stamp, stamp, r["id"], r["_prev_consolidated"], r["_prev_claim"])
+            for r in rows if r["_prev_consolidated"] is not None
+        ]
+        changed = 0
+        for chunk in _recall_id_batches(self.conn, fresh, 2):
+            placeholders = ",".join("?" * len(chunk))
+            cursor.execute(
+                "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? "
+                f"WHERE id IN ({placeholders}) AND consolidated_at IS NULL",
+                (stamp, stamp, *chunk),
+            )
+            changed += cursor.rowcount
+        if orphans:
+            cursor.executemany(
+                "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? "
+                "WHERE id = ? AND consolidated_at = ? AND consolidation_claimed_at = ?",
+                orphans,
+            )
+            changed += cursor.rowcount
+        if changed == len(rows):
+            return {r["id"] for r in rows}
+        owned = set()
+        for chunk in _recall_id_batches(self.conn, [r["id"] for r in rows], 1):
+            placeholders = ",".join("?" * len(chunk))
+            cursor.execute(
+                f"SELECT id FROM working_memory WHERE id IN ({placeholders}) "
+                "AND consolidation_claimed_at = ?",
+                (*chunk, stamp),
+            )
+            owned.update(r["id"] for r in cursor.fetchall())
+        return owned
+
     def consolidate_to_episodic(self, summary: str, source_wm_ids: List[str],
                                 source: str = "consolidation", importance: float = 0.6,
                                 metadata: Dict = None, valid_until: str = None,
@@ -8422,9 +8536,15 @@ class BeamMemory:
                                 event_date_precision: 'Optional[str]' = None,
                                 emit_event: bool = True,
                                 _write_kind: object = "public",
-                                _write_policy=None) -> Optional[str]:
+                                _write_policy=None,
+                                _claim_stamp: Optional[str] = None) -> Optional[str]:
         """
         Store a consolidated summary into episodic_memory with optional embedding.
+
+        ``_claim_stamp`` is private to sleep(): when set, every id in
+        ``source_wm_ids`` must still carry that exact sleep claim when the
+        INSERT runs, checked under the same write lock. A holder whose claim was
+        recovered by another pass raises ``_SleepClaimLost`` and writes nothing.
 
         Post-insert field overrides (applied atomically before the committing
         vector write; never manufacture fields the caller did not supply):
@@ -8599,6 +8719,8 @@ class BeamMemory:
         # this method opened the transaction itself.
         _owned_txn = not self.conn.in_transaction
         with _guarded_transaction(self.conn):
+            if _claim_stamp is not None:
+                self._require_sleep_claim(source_wm_ids, _claim_stamp)
             cursor.execute("""
                 INSERT INTO episodic_memory
                 (id, content, source, timestamp, session_id, importance, metadata_json, summary_of, valid_until, scope,
@@ -13046,14 +13168,23 @@ class BeamMemory:
         stale_after_seconds: int = 3600,
         limit: int = 1000,
     ) -> Dict:
-        """Clear stale sleep claims that have no episodic summary.
+        """Clear stale sleep claims that no episodic summary completed.
+
+        This is the manual maintenance entry point. sleep() performs the same
+        recovery automatically, but without ever clearing ``consolidated_at``
+        (which would end the row's trim exemption); prefer it. Clearing the
+        marker here makes the row trim-eligible again until the next sleep, so
+        run this only when sleep() cannot be (for example to inspect with
+        ``dry_run=True``).
 
         sleep() claims working rows by setting ``consolidated_at`` before it
         writes the episodic summary. A process crash in that narrow window can
         leave rows permanently skipped by later sleep() runs. This maintenance
         helper finds old claims whose id does not appear in any
-        ``episodic_memory.summary_of`` CSV token and clears the marker so a
-        later sleep pass can summarize them.
+        ``episodic_memory.summary_of`` CSV token written at or after the claim
+        and clears the marker so a later sleep pass can summarize them. A
+        summary of an EARLIER claim of the same row does not count as
+        completion.
         """
         # Clamp to a finite, overflow-safe window (round-7 R7-I): inf/nan
         # or 10**12 would otherwise escape as OverflowError/ValueError from
@@ -13075,23 +13206,19 @@ class BeamMemory:
             }
 
         cursor = self.conn.cursor()
-        orphan_query = """
-            SELECT wm.id
+        orphan_query = f"""
+            SELECT wm.id, wm.consolidation_claimed_at AS claim
             FROM working_memory wm
             WHERE wm.consolidated_at IS NOT NULL
               AND wm.consolidation_claimed_at IS NOT NULL
               AND wm.consolidation_claimed_at < ?
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM episodic_memory em
-                  WHERE instr(',' || COALESCE(em.summary_of, '') || ',',
-                              ',' || wm.id || ',') > 0
-              )
+              AND NOT {_claim_completed_sql('wm')}
             ORDER BY wm.consolidated_at ASC
             LIMIT ?
         """
         cursor.execute(orphan_query, (cutoff, limit))
-        candidate_ids = [row["id"] for row in cursor.fetchall()]
+        _orphan_rows = cursor.fetchall()
+        candidate_ids = [row["id"] for row in _orphan_rows]
         if not candidate_ids:
             return {
                 "status": "dry_run" if dry_run else "no_op",
@@ -13112,24 +13239,21 @@ class BeamMemory:
                 "candidate_ids": candidate_ids,
             }
 
-        placeholders = ",".join("?" * len(candidate_ids))
-        cursor.execute(
-            f"""
+        # Compare-and-swap on the exact claim each row was read with, so a
+        # holder that finished (or a pass that already recovered the row) is
+        # never overwritten. One statement per row keeps the bind count at
+        # three regardless of how many candidates there are, so SQLite's
+        # variable limit cannot make a large backlog silently unrecoverable.
+        cursor.executemany(
+            """
             UPDATE working_memory
             SET consolidated_at = NULL,
                 consolidation_claimed_at = NULL
-            WHERE id IN ({placeholders})
+            WHERE id = ?
               AND consolidated_at IS NOT NULL
-              AND consolidation_claimed_at IS NOT NULL
-              AND consolidation_claimed_at < ?
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM episodic_memory em
-                  WHERE instr(',' || COALESCE(em.summary_of, '') || ',',
-                              ',' || working_memory.id || ',') > 0
-              )
+              AND consolidation_claimed_at = ?
             """,
-            (*candidate_ids, cutoff),
+            [(row["id"], row["claim"]) for row in _orphan_rows],
         )
         reclaimed = cursor.rowcount
         self.conn.commit()
@@ -13262,7 +13386,9 @@ class BeamMemory:
         # earliest, the same degradation contract as the Python side in
         # _row_sort_key.
         cursor.execute(f"""
-            SELECT id, content, source, timestamp, importance, metadata_json, scope, valid_until, veracity, event_date, event_date_precision, superseded_by
+            SELECT id, content, source, timestamp, importance, metadata_json, scope, valid_until, veracity, event_date, event_date_precision, superseded_by,
+                   consolidated_at AS _prev_consolidated,
+                   consolidation_claimed_at AS _prev_claim
             FROM working_memory
             WHERE COALESCE(session_id, 'default') = ?
               AND {_SQL_CHRONO_TS} < ?
@@ -13273,12 +13399,12 @@ class BeamMemory:
               -- behind them never consolidate. The Python filter below
               -- stays as a second validation gate.
               AND {_SQL_PLACEABLE_TS}
-              AND consolidated_at IS NULL
+              AND {_SLEEP_ELIGIBLE_SQL}
               AND (pinned IS NULL OR pinned = 0)
               AND superseded_by IS NULL
             ORDER BY {_SQL_CHRONO_TS} ASC
             LIMIT {SLEEP_BATCH_SIZE}
-        """, (self.session_id, cutoff))
+        """, (self.session_id, cutoff, _orphan_cutoff()))
         rows = cursor.fetchall()
         # Skip rows whose timestamp cannot actually be placed on the
         # timeline (round-6 F3a): consolidating an all-bad group stamped
@@ -13351,29 +13477,17 @@ class BeamMemory:
         #     consolidated_at if needed.
         # The dry_run branch skips the claim entirely so it stays
         # side-effect-free.
+        recovered_orphans = 0
+        claim_stamp = None
         if not dry_run:
             now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
-            ids_to_claim = [row["id"] for row in rows]
-            placeholders = ",".join("?" * len(ids_to_claim))
-            cursor.execute(
-                f"UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? "
-                f"WHERE id IN ({placeholders}) AND consolidated_at IS NULL",
-                (now_iso, now_iso, *ids_to_claim),
-            )
-            claimed_ids = set()
-            if cursor.rowcount == len(ids_to_claim):
-                # Fast path: we got all of them.
-                claimed_ids = set(ids_to_claim)
-            else:
-                # Slow path: at least one row was claimed concurrently
-                # by another sleep. Re-read which ones we actually own
-                # so we only summarize those.
-                cursor.execute(
-                    f"SELECT id FROM working_memory "
-                    f"WHERE id IN ({placeholders}) AND consolidated_at = ?",
-                    (*ids_to_claim, now_iso),
-                )
-                claimed_ids = {r["id"] for r in cursor.fetchall()}
+            claim_stamp = now_iso
+            # Fresh rows are claimed while consolidated_at is NULL; a stale
+            # orphan is taken over by compare-and-swap on the claim it was read
+            # with, so it never leaves the trim exemption and a holder that is
+            # merely slow loses the swap instead of racing us. Both honour the
+            # connection's live bind limit.
+            claimed_ids = self._claim_sleep_rows(rows, claim_stamp)
 
             if not claimed_ids:
                 # Lost the race entirely. Close the connection, then still
@@ -13387,6 +13501,10 @@ class BeamMemory:
                 }, _fleet_census)
 
             # Filter rows to only those we successfully claimed.
+            recovered_orphans = sum(
+                1 for r in rows
+                if r["id"] in claimed_ids and r["_prev_consolidated"] is not None
+            )
             rows = [r for r in rows if r["id"] in claimed_ids]
             self.conn.commit()
             # The claim flips consolidated_at on live working rows, which
@@ -13401,6 +13519,7 @@ class BeamMemory:
 
         consolidated_ids = []
         summaries_created = 0
+        claims_lost = 0
         llm_used_count = 0
         conflicts_resolved = 0
         conflicts_detected_only = 0
@@ -13715,25 +13834,37 @@ class BeamMemory:
                     _agg_event_date_precision = "unknown"
                 if sleep_write_policy is None:
                     sleep_write_policy = current_write_policy()
-                self.consolidate_to_episodic(
-                    summary=summary,
-                    source_wm_ids=ids,
-                    source="sleep_consolidation",
-                    event_timestamp=_event_ts,
-                    event_date=_agg_event_date,
-                    event_date_precision=_agg_event_date_precision,
-                    importance=0.6,
-                    scope=aggregated_scope,
-                    valid_until=aggregated_valid_until,
-                    veracity=aggregated_veracity,
-                    _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
-                    _write_policy=sleep_write_policy,
-                    metadata={
-                        "original_count": len(items),
-                        "source": source,
-                        "llm_used": llm_succeeded
-                    }
-                )
+                try:
+                    self.consolidate_to_episodic(
+                        summary=summary,
+                        source_wm_ids=ids,
+                        source="sleep_consolidation",
+                        event_timestamp=_event_ts,
+                        event_date=_agg_event_date,
+                        event_date_precision=_agg_event_date_precision,
+                        importance=0.6,
+                        scope=aggregated_scope,
+                        valid_until=aggregated_valid_until,
+                        veracity=aggregated_veracity,
+                        _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
+                        _write_policy=sleep_write_policy,
+                        _claim_stamp=claim_stamp,
+                        metadata={
+                            "original_count": len(items),
+                            "source": source,
+                            "llm_used": llm_succeeded
+                        }
+                    )
+                except _SleepClaimLost:
+                    # Another pass recovered this claim while we were
+                    # summarizing. It owns the rows now: write nothing and
+                    # leave its claim marker alone.
+                    logger.warning(
+                        "sleep: claim %s on %d row(s) was recovered by another "
+                        "pass; discarding this summary", claim_stamp, len(ids),
+                    )
+                    claims_lost += 1
+                    continue
                 if proposals:
                     from mnemosyne.core import model_refresh
                     proposal_ts = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
@@ -13772,12 +13903,14 @@ class BeamMemory:
                         if model_refresh.maybe_auto_apply_model_refresh_proposal(self, proposal_id, owner_id=model_refresh_owner_id):
                             model_refresh_applied += 1
                     self.conn.commit()
-                group_placeholders = ",".join("?" * len(ids))
-                cursor.execute(
-                    f"UPDATE working_memory SET consolidation_claimed_at = NULL "
-                    f"WHERE id IN ({group_placeholders})",
-                    tuple(ids),
-                )
+                for _chunk in _recall_id_batches(self.conn, ids, 1):
+                    group_placeholders = ",".join("?" * len(_chunk))
+                    cursor.execute(
+                        f"UPDATE working_memory SET consolidation_claimed_at = NULL "
+                        f"WHERE id IN ({group_placeholders}) "
+                        f"AND consolidation_claimed_at = ?",
+                        (*_chunk, claim_stamp),
+                    )
                 # Commit the claim-clear NOW. Leaving this UPDATE uncommitted
                 # opened an implicit write transaction that stayed open across
                 # the NEXT group's LLM calls (validate_conflict_pair /
@@ -13830,6 +13963,8 @@ class BeamMemory:
             "llm_used": llm_used_count,
             "method": method,
             "consolidated_ids": consolidated_ids,
+            "recovered_orphans": recovered_orphans,
+            "claims_lost": claims_lost,
             "degradation": degrade_result,
             "model_refresh": {
                 "proposals": model_refresh_proposals,
@@ -13849,6 +13984,12 @@ class BeamMemory:
         When force=True, skips the age cutoff and consolidates all
         non-consolidated working memories across all sessions immediately.
         """
+        # Claims a crashed sleep() left behind (consolidated_at set, no summary
+        # completing that claim) are recovered inside sleep() itself, per
+        # session, by compare-and-swap on the claim they were read with. The
+        # row keeps its trim exemption throughout and is re-summarized in the
+        # same pass, so there is no window between "released" and "summarized".
+        reclaimed_orphans = 0
         cursor = self.conn.cursor()
         _cutoff_raw = (
             datetime.now(timezone.utc)
@@ -13864,11 +14005,11 @@ class BeamMemory:
             FROM working_memory
             WHERE {_SQL_CHRONO_TS} < ?
               AND {_SQL_PLACEABLE_TS}
-              AND consolidated_at IS NULL
+              AND {_SLEEP_ELIGIBLE_SQL}
               AND (pinned IS NULL OR pinned = 0)
             GROUP BY session_id
             ORDER BY MIN({_SQL_CHRONO_TS}) ASC
-        """, (cutoff,))
+        """, (cutoff, _orphan_cutoff()))
         session_rows = cursor.fetchall()
         if not session_rows:
             return self._attach_fleet_conflict_census({
@@ -13877,6 +14018,7 @@ class BeamMemory:
                 "conflicts_resolved": 0,
                 "conflicts_detected_only": 0,
                 "sessions_scanned": 0,
+                "reclaimed_orphans": reclaimed_orphans,
                 "sessions_consolidated": 0,
                 "items_consolidated": 0,
                 "summaries_created": 0,
@@ -13924,6 +14066,7 @@ class BeamMemory:
                 result = dict(result)
                 result["session_id"] = session_id
                 result["eligible"] = row["eligible"] if hasattr(row, "keys") else row[1]
+                reclaimed_orphans += int(result.get("recovered_orphans", 0) or 0)
                 session_results.append(result)
 
                 if result.get("status") in ("consolidated", "dry_run"):
@@ -13953,6 +14096,7 @@ class BeamMemory:
         result = {
             "status": "dry_run" if dry_run else ("consolidated" if items_consolidated else "no_op"),
             "sessions_scanned": len(session_rows),
+            "reclaimed_orphans": reclaimed_orphans,
             "sessions_consolidated": sessions_consolidated,
             "items_consolidated": items_consolidated,
             "summaries_created": summaries_created,
