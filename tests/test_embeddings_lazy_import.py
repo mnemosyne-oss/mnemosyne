@@ -275,7 +275,7 @@ def test_embed_query_recovers_without_calling_available(isolated_embeddings, tmp
 
 
 def test_importing_embeddings_does_not_import_fastembed():
-    """Attempted FastEmbed imports cannot hide behind an exception handler."""
+    """Neither FastEmbed nor ONNX Runtime may load, even behind caught errors."""
     import subprocess
     from pathlib import Path
 
@@ -285,14 +285,14 @@ sys.path.insert(0, sys.argv[1])
 attempts=[]
 class BlockFastEmbed(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname == 'fastembed' or fullname.startswith('fastembed.'):
+        if fullname.split('.')[0] in {'fastembed', 'onnxruntime'}:
             attempts.append(fullname)
-            raise ImportError('FastEmbed must remain unloaded')
+            raise ImportError('dense backend must remain unloaded')
 sys.meta_path.insert(0, BlockFastEmbed())
 from mnemosyne.core import embeddings
 assert not attempts, attempts
 assert embeddings.TextEmbedding is None
-assert 'fastembed' not in sys.modules
+assert not any(n.split('.')[0] in {'fastembed', 'onnxruntime'} for n in sys.modules)
 """
     result = subprocess.run(
         [sys.executable, '-I', '-c', code, str(Path(__file__).resolve().parents[1])],
