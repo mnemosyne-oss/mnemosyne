@@ -32,7 +32,7 @@ def _run_hook(
         env = {"HOME": str(tmp_path / "home"), "LC_ALL": "C", "PATH": f"{python_bin}:/usr/bin:/bin"}
 
     return subprocess.run(
-        ["/usr/bin/bash", ".githooks/pre-push"],
+        ["/bin/bash", ".githooks/pre-push"],
         cwd=repo,
         input="".join(_tag_push(tag) for tag in tags),
         capture_output=True,
