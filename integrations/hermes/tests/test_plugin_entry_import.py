@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -32,16 +34,29 @@ assert not any(n == 'mnemosyne' or n.startswith(('mnemosyne.', 'mnemosyne_hermes
 ''', SRC)
 
 
+def _build_metadata_snapshot(project):
+    """Record build metadata so the fixture cannot contaminate later installs."""
+    roots = [project / "build", *list((project / "src").glob("*.egg-info"))]
+    return {str(p.relative_to(project)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for root in roots if root.exists() for p in root.rglob("*") if p.is_file()}
+
+
 @pytest.fixture(scope="module")
 def packaged_plugin(tmp_path_factory):
     """Build and extract the owning wheel so entry metadata and code agree."""
     root = tmp_path_factory.mktemp("plugin-wheel")
+    project = ROOT / "integrations/hermes"
+    before = _build_metadata_snapshot(project)
+    source = root / "source"
+    shutil.copytree(project, source, ignore=shutil.ignore_patterns(
+        "build", "dist", "*.egg-info", "__pycache__"))
     result = subprocess.run(
         [sys.executable, "-m", "build", "--wheel",
-         str(ROOT / "integrations/hermes"), "--outdir", str(root / "dist")],
+         str(source), "--outdir", str(root / "dist")],
         capture_output=True, text=True, timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    assert _build_metadata_snapshot(project) == before, "wheel fixture changed checkout build metadata"
     wheel = next((root / "dist").glob("*.whl"))
     package = root / "package"
     with zipfile.ZipFile(wheel) as archive:
