@@ -37,7 +37,7 @@ def packaged_plugin(tmp_path_factory):
     """Build and extract the owning wheel so entry metadata and code agree."""
     root = tmp_path_factory.mktemp("plugin-wheel")
     result = subprocess.run(
-        [sys.executable, "-m", "build", "--no-isolation", "--wheel",
+        [sys.executable, "-m", "build", "--wheel",
          str(ROOT / "integrations/hermes"), "--outdir", str(root / "dist")],
         capture_output=True, text=True, timeout=120,
     )
