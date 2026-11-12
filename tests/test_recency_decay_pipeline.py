@@ -69,6 +69,14 @@ def lexical_only(monkeypatch):
     monkeypatch.setattr(beam_module._recency_decay, "__defaults__", (HALFLIFE_HOURS,))
 
 
+@pytest.fixture
+def fallback(request, monkeypatch):
+    """Force an empty episodic FTS arm only for the fallback variant."""
+    if request.param:
+        monkeypatch.setattr(beam_module, "_fts_search", lambda *args, **kwargs: [])
+    return request.param
+
+
 def _row_id(table: str, suffix: str) -> str:
     """Build the deterministic row id the assertions look up by."""
     return f"{table}-{suffix}"
@@ -91,7 +99,7 @@ def _insert(beam: BeamMemory, table: str, rows) -> None:
     beam.conn.commit()
 
 
-def _recall(beam: BeamMemory):
+def _recall(beam: BeamMemory, table: str, *, fallback: bool = False):
     """Recall with explain on, returning ``(hits, ids)``.
 
     ``explain=True`` is what exposes ``recency_decay`` and the rounded ``score``
@@ -103,10 +111,14 @@ def _recall(beam: BeamMemory):
         vec_weight=0.0, fts_weight=1.0 - IMPORTANCE_WEIGHT,
         importance_weight=IMPORTANCE_WEIGHT, temporal_weight=0.0,
     )
-    if isinstance(out, dict):
-        hits = out.get("hits") or out.get("results") or []
-    else:  # older signature returned a bare list
-        hits = out
+    hits = out["results"]
+    prefix = "wm" if table == "working_memory" else "em"
+    stage_name = f"{prefix}_{'fallback' if fallback else 'primary'}"
+    stages = {stage["name"]: stage for stage in out["explain"]["stages"]}
+    assert stage_name in stages, f"expected {stage_name}, got {list(stages)}"
+    stage = stages[stage_name]
+    assert stage["fallback_used"] is fallback
+    assert stage["kept_count"] == len(hits) > 0, stage
     return hits, [h["id"] for h in hits]
 
 
@@ -126,17 +138,21 @@ def _stamp(offset: timedelta, *, naive: bool = False) -> str:
     return stamp.isoformat()
 
 
-def _score_single_row(tmp_path: Path, table: str, offset: timedelta, *, naive: bool = False):
+def _score_single_row(
+    tmp_path: Path, table: str, offset: timedelta, *, naive: bool = False, fallback: bool = False,
+):
     """Seed one row at ``now + offset`` and return its explain hit."""
     stamp = _stamp(offset, naive=naive)
     beam = BeamMemory(session_id="s-present", db_path=tmp_path / f"{table}.db")
     _insert(beam, table, [(_row_id(table, "only"), stamp, "s-present")])
-    hits, ids = _recall(beam)
+    hits, ids = _recall(beam, table, fallback=fallback)
     assert len(hits) == 1, f"expected a single recalled row, got {ids}"
     return hits[0]
 
 
-def _three_row_ranking(tmp_path: Path, table: str, *, naive_future: bool = False):
+def _three_row_ranking(
+    tmp_path: Path, table: str, *, naive_future: bool = False, fallback: bool = False,
+):
     """Present, future-dated and stale rows with identical content.
 
     Identical content is deliberate: base score, lexical score and importance
@@ -150,7 +166,7 @@ def _three_row_ranking(tmp_path: Path, table: str, *, naive_future: bool = False
     ]
     beam = BeamMemory(session_id="s-present", db_path=tmp_path / f"{table}-rank.db")
     _insert(beam, table, rows)
-    hits, ids = _recall(beam)
+    hits, ids = _recall(beam, table, fallback=fallback)
     assert len(hits) == 3, f"expected all three rows back, got {ids}"
     return {h["id"]: h for h in hits}, ids
 
@@ -161,9 +177,13 @@ def _three_row_ranking(tmp_path: Path, table: str, *, naive_future: bool = False
 
 
 @pytest.mark.parametrize("naive", [False, True], ids=["aware", "legacy-naive"])
-@pytest.mark.parametrize("table", ["working_memory", "episodic_memory"])
+@pytest.mark.parametrize(
+    "table,fallback",
+    [("working_memory", False), ("episodic_memory", False), ("episodic_memory", True)],
+    indirect=["fallback"], ids=["working", "episodic", "episodic-fallback"],
+)
 def test_future_dated_row_scores_no_higher_than_a_present_row(
-    tmp_path: Path, lexical_only, table: str, naive: bool
+    tmp_path: Path, lexical_only, table: str, naive: bool, fallback: bool,
 ):
     """The multiplier must not reward a row for being misdated.
 
@@ -176,8 +196,8 @@ def test_future_dated_row_scores_no_higher_than_a_present_row(
     no offset, written as local wall time by a host ahead of UTC. Both shapes are
     asserted because they reach the scorer by different routes.
     """
-    present = _score_single_row(tmp_path / "present", table, timedelta(0))
-    future = _score_single_row(tmp_path / "future", table, FUTURE, naive=naive)
+    present = _score_single_row(tmp_path / "present", table, timedelta(0), fallback=fallback)
+    future = _score_single_row(tmp_path / "future", table, FUTURE, naive=naive, fallback=fallback)
 
     # Reported values are ``round(x, 4)``: the present row's true decay is
     # 0.99999845 (it is microseconds old by recall time), so compare at
@@ -209,8 +229,14 @@ def test_future_dated_row_scores_no_higher_than_a_present_row(
 
 
 @pytest.mark.parametrize("naive", [False, True], ids=["aware", "legacy-naive"])
-@pytest.mark.parametrize("table", ["working_memory", "episodic_memory"])
-def test_future_dated_row_gains_no_unearned_margin(tmp_path: Path, lexical_only, table: str, naive: bool):
+@pytest.mark.parametrize(
+    "table,fallback",
+    [("working_memory", False), ("episodic_memory", False), ("episodic_memory", True)],
+    indirect=["fallback"], ids=["working", "episodic", "episodic-fallback"],
+)
+def test_future_dated_row_gains_no_unearned_margin(
+    tmp_path: Path, lexical_only, table: str, naive: bool, fallback: bool,
+):
     """On identical content the misdated row may tie the newest row, never lead it by a margin.
 
     Which of the two ranks first is deliberately *not* pinned: the clamp
@@ -225,7 +251,7 @@ def test_future_dated_row_gains_no_unearned_margin(tmp_path: Path, lexical_only,
     positive-offset host produced before the producer contract was fixed -- the
     exact row the clamp was added for.
     """
-    hits, ids = _three_row_ranking(tmp_path, table, naive_future=naive)
+    hits, ids = _three_row_ranking(tmp_path, table, naive_future=naive, fallback=fallback)
     present = hits[_row_id(table, "present")]
     future = hits[_row_id(table, "future")]
 
@@ -261,15 +287,21 @@ def test_future_dated_row_gains_no_unearned_margin(tmp_path: Path, lexical_only,
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("table", ["working_memory", "episodic_memory"])
-def test_stale_row_keeps_its_full_penalty(tmp_path: Path, lexical_only, table: str):
+@pytest.mark.parametrize(
+    "table,fallback",
+    [("working_memory", False), ("episodic_memory", False), ("episodic_memory", True)],
+    indirect=["fallback"], ids=["working", "episodic", "episodic-fallback"],
+)
+def test_stale_row_keeps_its_full_penalty(
+    tmp_path: Path, lexical_only, table: str, fallback: bool,
+):
     """A mutation that returns 1.0 for everything must fail here.
 
     The clamp exists to stop ages below zero. It must not lift any other age,
     so a 30-day-old row keeps ``exp(-720/168)`` decay and the tier's weighted
     score penalty, rather than multiplying its whole score by that decay.
     """
-    hits, ids = _three_row_ranking(tmp_path, table)
+    hits, ids = _three_row_ranking(tmp_path, table, fallback=fallback)
     stale = hits[_row_id(table, "stale")]
 
     # Keep the expected value clear of both zero and one: neither flattening
@@ -293,9 +325,13 @@ def test_stale_row_keeps_its_full_penalty(tmp_path: Path, lexical_only, table: s
     assert stale["importance"] == present["importance"]
     assert stale["dense_score"] == present["dense_score"] == 0.0
     # Identical content and importance cancel the base score. Working memory
-    # retains (1 - importance_weight) * 0.4; episodic retains 0.7. Check the
+    # and episodic fallback retain (1 - importance_weight) * 0.4; primary
+    # episodic retains 0.7. Check the
     # weighted penalty, not merely "stale scores lower" or pure exp(-age/h).
-    retained_share = (1.0 - IMPORTANCE_WEIGHT) * 0.4 if table == "working_memory" else 0.7
+    retained_share = (
+        0.7 if table == "episodic_memory" and not fallback
+        else (1.0 - IMPORTANCE_WEIGHT) * 0.4
+    )
     expected_multiplier = retained_share + (1.0 - retained_share) * STALE_DECAY
     # Both public scores are rounded to 4 dp; allow their combined rounding.
     assert stale["score"] == pytest.approx(
