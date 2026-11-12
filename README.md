@@ -343,6 +343,12 @@ Full reference: [docs/configuration.md](docs/configuration.md)
 
 ### Language Support
 
+The Russian lexical fallback folds case and `ё`/`е` spelling when selecting
+candidates and scoring inflections (for example, `свеклы` can match `Свёкла`).
+Stored text is preserved. The fallback still averages scores over query words
+and uses the normal lexical admission gate; this does not guarantee admission
+for multi-word paraphrases or cross-language queries.
+
 Default embeddings are English-optimized (`bge-small-en-v1.5`). For **non-English or multilingual** recall, swap the model:
 
 ```bash
@@ -363,6 +369,8 @@ See [docs/configuration.md#custom-embedding-models](docs/configuration.md#custom
 ## Hermes Plugin
 
 When used with Hermes Agent, Mnemosyne exposes provider tools for the memory lifecycle, lifecycle hooks for automatic context injection, and MCP support.
+
+The packaged `hermes mnemosyne` CLI uses the provider's database under `HERMES_HOME/mnemosyne/data`, even when `MNEMOSYNE_DATA_DIR` points elsewhere. Profile-isolated commands select the active profile bank below that root; `doctor` reports its selected database. Standalone Core commands still honor `MNEMOSYNE_DATA_DIR`, and the packaged CLI uses the Core resolver when `HERMES_HOME` is unset. Existing stores are not moved or merged.
 
 `mnemosyne_resolve_conflicts` remains gated off by default. Its `dry_run`
 argument defaults to `false` (apply): use `dry_run=true` for deterministic

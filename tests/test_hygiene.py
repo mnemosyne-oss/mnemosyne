@@ -545,7 +545,8 @@ class TestAuditNoise:
             ((), 1),
         ],
     )
-    def test_audit_skips_tables_missing_required_columns(self, tmp_path, columns, batch_size):
+    def test_audit_skips_tables_missing_required_columns(self, tmp_path, columns, batch_size, caplog):
+        """Incompatible rows are skipped visibly, without manufactured identities."""
         db_path = tmp_path / "incompatible.db"
         conn = sqlite3.connect(db_path)
         definitions = {"id": "TEXT", "content": "TEXT"}
@@ -574,27 +575,34 @@ class TestAuditNoise:
         assert report.total_scanned == 0
         assert report.summary["table_counts"]["malformed"] == 0
         assert report.candidates == []
+        assert any(
+            record.levelname == "WARNING" and "malformed" in record.message
+            and "id" in record.message and "content" in record.message
+            for record in caplog.records
+        )
 
-    def test_audit_scan_all_scratchpad_without_source_column(self, temp_db):
+    @pytest.mark.parametrize("batch_size", [1, 2, 10])
+    @pytest.mark.parametrize("offset", [0, 1])
+    def test_audit_scan_all_scratchpad_without_source_column(self, temp_db, batch_size, offset):
+        """Every page preserves real row IDs, without gaps, duplicates or writes."""
         db_path, beam = temp_db
         beam.conn.execute("DELETE FROM scratchpad")
-        beam.conn.execute(
+        beam.conn.executemany(
             "INSERT INTO scratchpad (id, content, session_id) VALUES (?, ?, ?)",
-            ("scratch-noise", "heartbeat", "test"),
+            [(f"scratch-{i}", "heartbeat", "test") for i in range(5)],
         )
         beam.conn.commit()
-
+        before = beam.conn.execute("SELECT id, content, session_id FROM scratchpad ORDER BY id").fetchall()
         report = audit_noise(
-            db_path=db_path,
-            tables=["scratchpad"],
-            scan_all=True,
-            batch_size=1,
-            min_score=0.3,
+            db_path=db_path, tables=["scratchpad"], scan_all=True,
+            offset=offset, batch_size=batch_size, min_score=0.0,
         )
-
-        assert report.total_scanned == 1
-        assert report.summary["table_counts"]["scratchpad"] == 1
-        assert [candidate.memory_id for candidate in report.candidates] == ["scratch-noise"]
+        expected = {f"scratch-{i}" for i in range(5 - offset)}
+        assert report.total_scanned == 5 - offset
+        assert report.summary["table_counts"]["scratchpad"] == 5 - offset
+        ids = [candidate.memory_id for candidate in report.candidates]
+        assert set(ids) == expected and len(ids) == len(expected)
+        assert beam.conn.execute("SELECT id, content, session_id FROM scratchpad ORDER BY id").fetchall() == before
 
     def test_audit_offset_and_scan_all(self, temp_db):
         db_path, beam = temp_db
