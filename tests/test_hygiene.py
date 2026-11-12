@@ -602,7 +602,62 @@ class TestAuditNoise:
         assert report.summary["table_counts"]["scratchpad"] == 5 - offset
         ids = [candidate.memory_id for candidate in report.candidates]
         assert set(ids) == expected and len(ids) == len(expected)
+        assert all(c.content_preview == "heartbeat" for c in report.candidates)
+        assert all(c.noise_score == 0.8 for c in report.candidates)
+        assert all(c.content_length == 9 for c in report.candidates)
         assert beam.conn.execute("SELECT id, content, session_id FROM scratchpad ORDER BY id").fetchall() == before
+
+    @pytest.mark.parametrize("batch_size", [1, 2, 10])
+    @pytest.mark.parametrize("offset", [0, 1])
+    def test_audit_minimal_columns_keep_content_and_optional_defaults(self, tmp_path, batch_size, offset):
+        """Minimal tables retain authentic text and established metadata defaults."""
+        db_path = tmp_path / "minimal.db"
+        fixture = [
+            ("row-0", "heartbeat", 0.8),
+            ("row-1", "Storage handshake traces are retained for audit.", 0.0),
+            ("row-2", "ping", 0.8),
+            ("row-3", "Deployment architecture uses one writer.", 0.0),
+            ("row-4", "ok", 0.8),
+        ]
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("CREATE TABLE minimal (id TEXT PRIMARY KEY, content TEXT)")
+            conn.executemany("INSERT INTO minimal VALUES (?, ?)", [(i, text) for i, text, _ in fixture])
+            conn.commit()
+            assert hygiene_module._scan_table(conn, "minimal", 1) == [{
+                "id": "row-4", "content": "ok", "source": "", "timestamp": "",
+                "session_id": "", "importance": 0.5,
+            }]
+        report = audit_noise(db_path, tables=["minimal"], scan_all=True,
+                             batch_size=batch_size, offset=offset, min_score=0.0)
+        expected = {i: (text, score) for i, text, score in fixture[:5-offset]}
+        assert report.total_scanned == len(expected)
+        assert len(report.candidates) == len(expected)
+        assert {c.memory_id for c in report.candidates} == set(expected)
+        for candidate in report.candidates:
+            text, score = expected[candidate.memory_id]
+            assert (candidate.content_preview, candidate.noise_score) == (text, score)
+            assert candidate.content_length == len(text)
+            assert (candidate.source, candidate.timestamp, candidate.importance) == ("", "", 0.5)
+
+    def test_audit_populated_optional_metadata_is_preserved(self, tmp_path):
+        """Existing metadata drives scores and is never replaced by fallback values."""
+        db_path = tmp_path / "metadata.db"
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("CREATE TABLE complete (id TEXT, content TEXT, source TEXT, timestamp TEXT, session_id TEXT, importance REAL)")
+            conn.executemany("INSERT INTO complete VALUES (?, ?, ?, ?, ?, ?)", [
+                ("a", "Storage handshake traces retained.", "manual", "2026-01-01", "session-a", 0.1),
+                ("b", "Storage handshake traces retained.", "cron", "2026-01-02", "session-b", 0.9),
+            ])
+            conn.commit()
+            assert hygiene_module._scan_table(conn, "complete", 10) == [
+                {"id": "b", "content": "Storage handshake traces retained.", "source": "cron",
+                 "timestamp": "2026-01-02", "session_id": "session-b", "importance": 0.9},
+                {"id": "a", "content": "Storage handshake traces retained.", "source": "manual",
+                 "timestamp": "2026-01-01", "session_id": "session-a", "importance": 0.1},
+            ]
+        report = audit_noise(db_path, tables=["complete"], scan_all=True, batch_size=1, min_score=0.0)
+        actual = {c.memory_id: (c.source, c.timestamp, c.importance, c.noise_score) for c in report.candidates}
+        assert actual == {"a": ("manual", "2026-01-01", 0.1, 0.5), "b": ("cron", "2026-01-02", 0.9, 0.7)}
 
     def test_audit_offset_and_scan_all(self, temp_db):
         db_path, beam = temp_db
