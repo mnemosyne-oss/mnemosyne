@@ -526,9 +526,10 @@ def auto_fix(
                 continue
             result["fixed"].append(label)
             print(f"   ✅ {label} installed")
-        except subprocess.CalledProcessError as e:
-            result["failed"].append({"label": label, "error": e.stderr.strip()})
-            print(f"   ❌ Failed: {e.stderr.strip()[:200]}")
+        except subprocess.CalledProcessError:
+            error = "pip installation failed"
+            result["failed"].append({"label": label, "error": error})
+            print(f"   ❌ {label}: {error}")
         except subprocess.TimeoutExpired:
             result["failed"].append({"label": label, "error": "pip install timed out after 600 seconds"})
             print(f"   ❌ Timed out installing {label}")

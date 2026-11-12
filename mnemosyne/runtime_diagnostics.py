@@ -69,6 +69,10 @@ def _collect_target_runtime_diagnostics(python_executable: str) -> dict[str, Any
             isinstance(check, dict) and required_keys <= check.keys()
             for check in payload["checks"]
         )
+        or not all(
+            any(check["check"] == name for check in payload["checks"])
+            for name in ("embeddings_available", "sqlite_vec_available")
+        )
     ):
         return {
             "status": "unavailable",
@@ -193,7 +197,7 @@ def collect_runtime_diagnostics(python_executable: str | None = None) -> dict[st
         if _SQLITE_VEC_AVAILABLE and not vec_can_load:
             add("core", "sqlite_vec_warning", "NO", "extension loading unavailable")
     except Exception:
-        add("core", "sqlite_vec", "ERROR", "sqlite-vec capability unavailable")
+        add("core", "sqlite_vec_available", "ERROR", "sqlite-vec capability unavailable")
 
     statuses = {entry["status"] for entry in checks}
     overall = "unavailable" if "ERROR" in statuses else "warning" if statuses & {"MISSING", "NO"} else "ok"

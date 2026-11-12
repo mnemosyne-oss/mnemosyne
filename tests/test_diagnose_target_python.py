@@ -125,6 +125,46 @@ def test_target_runtime_replaces_invalid_child_output_bytes(monkeypatch):
     assert result["unavailable"] is True
 
 
+@pytest.mark.parametrize("names", [[], ["python_version"], ["embeddings_available"], ["sqlite_vec_available"]])
+def test_incomplete_target_capabilities_are_unknown_and_not_repaired(tmp_path, monkeypatch, names):
+    """Missing capability evidence must not be interpreted as missing packages."""
+    checks = [{"category": "core", "check": name, "status": "NO", "detail": ""} for name in names]
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return _completed(command, stdout="MNEMOSYNE_DIAGNOSTICS=" + json.dumps({"checks": checks}))
+
+    monkeypatch.setattr("mnemosyne.runtime_diagnostics.subprocess.run", run)
+    monkeypatch.setattr(diagnose, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    payload = diagnose.run_diagnostics(python_executable="./python")
+
+    assert _check(payload, "target_interpreter")["status"] == "ERROR"
+    assert any("dependency status is unknown" in finding for finding in payload["key_findings"])
+    result = diagnose.auto_fix(payload["entries"], python_executable="./python")
+    assert result["fixed"] == []
+    assert result["failed"][0]["label"] == "target Python"
+    assert len(calls) == 1
+
+
+def test_collector_names_vector_capability_when_beam_import_fails(monkeypatch):
+    """An import failure must still emit the capability required by the reader."""
+    import builtins
+
+    original_import = builtins.__import__
+
+    def import_without_beam(name, *args, **kwargs):
+        if name == "mnemosyne.core.beam":
+            raise ImportError("controlled Beam import failure")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_beam)
+    payload = diagnose.collect_runtime_diagnostics()
+    assert _check(payload, "embeddings_available")
+    assert _check(payload, "sqlite_vec_available")["status"] == "ERROR"
+
+
 def test_unavailable_target_is_unknown_and_never_auto_installs(tmp_path, monkeypatch):
     """Leave unknown target dependencies untouched instead of attempting pip."""
     monkeypatch.setattr(diagnose, "LOG_DIR", tmp_path / "logs")
@@ -413,11 +453,35 @@ def test_selected_python_install_errors_do_not_recheck_or_claim_success(
 
     assert calls == [[str(Path(target).resolve()), "-m", "pip", "install", "sqlite-vec"]]
     assert result["fixed"] == []
-    error = "installation refused" if failure == "exit" else "selected Python not found"
+    error = "pip installation failed" if failure == "exit" else "selected Python not found"
     assert result["failed"] == [{"label": "sqlite-vec (vector search)", "error": error}]
     output = capsys.readouterr().out
     assert error in output
     assert str(tmp_path) not in output
+
+
+@pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("stderr", [None, "", "SYNTHETIC_API_KEY_AND_PRIVATE_MEMORY"])
+def test_failed_install_does_not_disclose_child_output(monkeypatch, tmp_path, capsys, selected, stderr):
+    """Report failure without returning or printing untrusted child diagnostics."""
+    target = str(tmp_path / "private-provider" / "python") if selected else None
+    secret_stdout = "SYNTHETIC_PRIVATE_STDOUT"
+
+    def fail(command, **kwargs):
+        raise subprocess.CalledProcessError(1, command, output=secret_stdout, stderr=stderr)
+
+    monkeypatch.setattr(diagnose.subprocess, "run", fail)
+    monkeypatch.setattr(diagnose, "collect_runtime_diagnostics", lambda *a: pytest.fail("verification ran"))
+    result = diagnose.auto_fix([{"check": "sqlite_vec", "status": "MISSING"}], python_executable=target)
+
+    assert result["fixed"] == []
+    assert result["failed"] == [{"label": "sqlite-vec (vector search)", "error": "pip installation failed"}]
+    output = capsys.readouterr()
+    combined = json.dumps(result) + output.out + output.err
+    assert secret_stdout not in combined
+    if stderr:
+        assert stderr not in combined
+    assert str(tmp_path) not in combined
 
 
 def test_diagnose_module_forwards_target_and_never_repairs_an_unavailable_runtime(tmp_path, monkeypatch):
@@ -491,7 +555,9 @@ def test_target_probe_is_isolated_and_bounded(monkeypatch, tmp_path):
 
     def run(command, **kwargs):
         calls.append((command, kwargs))
-        return _completed(command, stdout='MNEMOSYNE_DIAGNOSTICS={"checks":[]}\n')
+        return _completed(command, stdout='MNEMOSYNE_DIAGNOSTICS={"checks":['
+                          '{"category":"core","check":"embeddings_available","status":"NO","detail":""},'
+                          '{"category":"core","check":"sqlite_vec_available","status":"NO","detail":""}]}\n')
 
     monkeypatch.setattr("mnemosyne.runtime_diagnostics.subprocess.run", run)
     result = diagnose.collect_runtime_diagnostics(str(target))
