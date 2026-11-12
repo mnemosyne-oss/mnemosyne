@@ -220,6 +220,7 @@ def test_dry_run_llm_eval_switches_llm_without_mutating(temp_db, monkeypatch, di
     # default dry run: deterministic, LLM never consulted even when the flag is on
     calls = []
     def _confirm(older, newer, session_id, db_path):
+        """Stub LLM validator: records the pair and always confirms it."""
         calls.append((older, newer))
         return True, 0.9, "now", "valid"
     monkeypatch.setattr(lcd, "validate_conflict_pair", _confirm)
@@ -364,7 +365,9 @@ def test_llm_validation_cap_bounds_calls(temp_db, monkeypatch, disable_llm):
 
 def test_bank_scan_failure_returns_failed(temp_db, monkeypatch, disable_llm):
     """If a bank query fails, resolution is aborted with an explicit status and
-    nothing is mutated (no silent single-bank resolution)."""
+    nothing is mutated (no silent single-bank resolution). The failed result
+    carries the SAME key shape as the success paths (including
+    ``skipped_cached``), so consumers can rely on a uniform contract."""
     monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
     A = BeamMemory(session_id="tA", db_path=temp_db)
     A.remember("[USER] favorite color is blue", source="conversation",
@@ -375,6 +378,12 @@ def test_bank_scan_failure_returns_failed(temp_db, monkeypatch, disable_llm):
     res = A.resolve_cross_session_conflicts()
     assert res["status"] == "failed"
     assert res["invalidated"] == 0 and res["conflicts_resolved"] == 0
+    # The failed path must report skipped_cached (no cache was consulted or
+    # skipped on this abort), matching the success-path result shape.
+    assert res["skipped_cached"] == 0
+    for key in ("pairs_flagged", "rows_scanned", "llm_validations",
+                "llm_cap_reached", "candidates_truncated", "message"):
+        assert key in res, f"the failed result must carry {key}"
     row = A.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()
     assert row[0] == 1, "nothing may be mutated on a failed scan"
 
@@ -756,6 +765,8 @@ def test_expired_verdict_is_readjudicated(temp_db, monkeypatch):
 
 
 def _cache_rows(db_path):
+    """Read back every row of the verdict cache using a fresh, independent
+    connection (so the caller's open transaction cannot affect the view)."""
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
@@ -783,6 +794,7 @@ def test_failed_validation_not_cached(temp_db, monkeypatch):
     states = iter(["failed", "valid"])
 
     def _stateful(older, newer, session_id=None, db_path=None):
+        """Stateful validator: cycles through the given verdict statuses."""
         return (False, 0.2, None, next(states))
 
     monkeypatch.setattr(lcd, "validate_conflict_pair", _stateful)
@@ -902,42 +914,62 @@ def test_migrated_null_signature_re_adjudicated(temp_db, monkeypatch):
 
 
 def test_content_sig_embedded_delimiter_no_collision(temp_db, monkeypatch):
-    """The content-sig encoding must be delimiter-free: swapping the two
-    contents of a pair whose text contains the old separator byte
-    sequence (\\n---\\n) is a DIFFERENT pair and must not collide on
-    the same signature."""
-    from mnemosyne.core.beam import _csverdict_content_sig
+    """The content-sig encoding must be delimiter-free.
 
-    # direct unit check of the exact collision CodeRabbit described.
-    assert _csverdict_content_sig("A", "B\\n---\\nC") != \
-        _csverdict_content_sig("A\\n---\\nB", "C")
+    The old implementation hashed ``older + "<newline>---<newline>" + newer``
+    (ACTUAL newline characters), which let a different pair whose text embeds
+    that delimiter sequence collide on the same signature. This test pins the
+    collision with real newlines and drives the SAME collision through the
+    integration path: if the signature function regressed to the old
+    delimiter encoding, the second (colliding) pair would be served from the
+    cache instead of re-adjudicated.
+    """
+    from mnemosyne.core.beam import _csverdict_content_sig
+    import hashlib
+
+    sep = "\n---\n"  # the former delimiter (real newline characters)
+    # Two DIFFERENT pairs whose concatenated contents are IDENTICAL under
+    # the old delimiter encoding (the collision it could not prevent).
+    pair_a = ("[USER] X", "[USER] Y" + sep + "[USER] Z")
+    pair_b = ("[USER] X" + sep + "[USER] Y", "[USER] Z")
+    assert pair_a != pair_b
+    # The old encoding really does collide on this pair (documents why it
+    # was unsafe); a regression to it must make this test fail.
+    old_sig = lambda o, n: hashlib.sha256(f"{o}{sep}{n}".encode("utf-8")).hexdigest()
+    assert old_sig(*pair_a) == old_sig(*pair_b)
+    # The current JSON (length-delimited) encoding must not collide:
+    assert _csverdict_content_sig(*pair_a) != _csverdict_content_sig(*pair_b)
 
     monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
     import mnemosyne.core.llm_conflict_detector as lcd
     monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+    monkeypatch.setattr(lcd, "validate_conflict_pair",
+                        lambda older, newer, session_id, db_path: (False, 0.2, None, "valid"))
 
     A = BeamMemory(session_id="tCRM", db_path=temp_db)
     B = BeamMemory(session_id="tCRM2", db_path=temp_db)
-    a1 = A.remember("[USER] A", source="conversation",
+    a1 = A.remember(pair_a[0], source="conversation",
                     importance=0.7, scope="global")
-    b1 = B.remember("[USER] B\\n---\\nC", source="conversation",
+    b1 = B.remember(pair_a[1], source="conversation",
                     importance=0.7, scope="global")
-    monkeypatch.setattr(lcd, "validate_conflict_pair",
-                        lambda older, newer, session_id, db_path: (False, 0.2, None, "valid"))
 
     C1 = BeamMemory(session_id="tCRM", db_path=temp_db)
     C1._detect_conflicts = _stub_detect_pair(a1, b1)
     r1 = C1.resolve_cross_session_conflicts()
     assert r1["llm_validations"] == 1 and r1["skipped_cached"] == 0
 
-    # an edit that moves the separator across the boundary changes the
-    # PAIR, not just one memory — the verdict must be re-adjudicated.
-    assert A.update_working(a1, content="[USER] A\\n---\\nB")
-    assert B.update_working(b1, content="[USER] C")
+    # An edit that moves the delimiter across the pair boundary changes the
+    # pair to pair_b — the pair that collides with pair_a under the OLD
+    # encoding. Under a regressed (delimiter) signature it would be served
+    # from the cache; with the current encoding it must be re-adjudicated.
+    assert A.update_working(a1, content=pair_b[0])
+    assert B.update_working(b1, content=pair_b[1])
     C2 = BeamMemory(session_id="tCRM", db_path=temp_db)
     C2._detect_conflicts = _stub_detect_pair(a1, b1)
     r2 = C2.resolve_cross_session_conflicts()
-    assert r2["llm_validations"] == 1, "an embedded-separator edit must re-adjudicate"
+    assert r2["llm_validations"] == 1, (
+        "a pair that collides with the cached pair under the old "
+        "delimiter encoding must still be re-adjudicated")
     assert r2["skipped_cached"] == 0
 
 
@@ -964,11 +996,19 @@ def test_cache_write_does_not_block_second_connection(temp_db, monkeypatch):
                     importance=0.7, scope="global")
     b2 = B.remember("[USER] fact two changed", source="conversation",
                     importance=0.7, scope="global")
+    # A FRESH pair, uncached in either phase: each phase queues its own
+    # reject, so the rollback phase verifies the discard of a verdict that
+    # was actually queued (not an empty second phase).
+    a3 = A.remember("[USER] fact three", source="conversation",
+                    importance=0.7, scope="global")
+    b3 = B.remember("[USER] fact three changed", source="conversation",
+                    importance=0.7, scope="global")
 
     calls = {"n": 0}
     second_writes = []
 
     def _validate(older, newer, session_id=None, db_path=None):
+        """Validator that performs a concurrent writer write on the 2nd call."""
         calls["n"] += 1
         if calls["n"] == 2:
             conn2 = sqlite3.connect(str(temp_db), timeout=0)
@@ -987,6 +1027,7 @@ def test_cache_write_does_not_block_second_connection(temp_db, monkeypatch):
     monkeypatch.setattr(lcd, "validate_conflict_pair", _validate)
 
     def _cache_count():
+        """Row count of the verdict cache via an independent connection."""
         conn = sqlite3.connect(str(temp_db))
         try:
             return conn.execute(
@@ -996,17 +1037,18 @@ def test_cache_write_does_not_block_second_connection(temp_db, monkeypatch):
         finally:
             conn.close()
 
-    def _run():
+    def _run(pairs):
+        """Open a resolver on the deferred transaction with the given pairs."""
         C = BeamMemory(session_id="tCRH", db_path=temp_db)
         C._detect_conflicts = (
             lambda items, similarity_threshold=0.88, min_gap_hours=1.0:
-            [(a1, b1), (a2, b2)])
+            pairs)
         # caller-owned deferred transaction (as the Hermes provider does).
         C.conn.execute("BEGIN DEFERRED")
         return C
 
     # Phase 1: commit path.
-    C = _run()
+    C = _run([(a1, b1), (a2, b2)])
     try:
         r = C.resolve_cross_session_conflicts()
         assert r["llm_validations"] == 2
@@ -1035,15 +1077,32 @@ def test_cache_write_does_not_block_second_connection(temp_db, monkeypatch):
         C.conn.close()
 
     # Phase 2: rollback path — the flush must NOT run for a transaction
-    # the caller rolled back (the cache must not outlive it).
+    # the caller rolled back (the cache must not outlive it). Phase 2 uses
+    # a FRESH uncached pair so it queues its own reject; the assertion
+    # below proves that queued verdict is discarded on rollback (verified
+    # from an independent connection), rather than an empty second phase.
     calls["n"] = 0
-    C2 = _run()
+    C2 = _run([(a3, b3)])
     try:
-        C2.resolve_cross_session_conflicts()
+        r2 = C2.resolve_cross_session_conflicts()
+        assert r2["llm_validations"] == 1, (
+            "the fresh pair must be validated and its reject queued")
+        assert r2["skipped_cached"] == 0
         assert C2.conn.in_transaction
-        assert _cache_count() == 2  # still only phase-1's verdicts
+        assert _cache_count() == 2  # still only phase-1's verdicts (flush queued)
         C2.conn.rollback()
-        assert _cache_count() == 2, (
+        # From an independent connection: the fresh verdict must be absent
+        # (rollback dropped the queued flush), phase-1's rows intact.
+        check2 = sqlite3.connect(str(temp_db), timeout=5.0)
+        try:
+            n2 = check2.execute(
+                "SELECT COUNT(*) FROM cross_session_verdict_cache").fetchone()[0]
+            fresh = check2.execute(
+                "SELECT COUNT(*) FROM cross_session_verdict_cache "
+                "WHERE older_id=? AND newer_id=?", (a3, b3)).fetchone()[0]
+        finally:
+            check2.close()
+        assert n2 == 2 and fresh == 0, (
             "a rolled-back transaction must not flush its queued verdicts")
     finally:
         C2.conn.close()
@@ -1069,20 +1128,28 @@ def test_flush_waits_for_caller_commit_after_confirmed_pair(temp_db, monkeypatch
                     importance=0.7, scope="global")
     b2 = B.remember("[USER] fact two changed", source="conversation",
                     importance=0.7, scope="global")
-
-    calls = {"n": 0}
+    # A FRESH pair, uncached in either phase: the rollback phase queues its
+    # own reject, so it verifies the discard of a verdict that was actually
+    # queued (not an empty second phase).
+    a3 = A.remember("[USER] fact three", source="conversation",
+                    importance=0.7, scope="global")
+    b3 = B.remember("[USER] fact three changed", source="conversation",
+                    importance=0.7, scope="global")
 
     def _validate(older, newer, session_id=None, db_path=None):
-        calls["n"] += 1
-        # first pair confirmed (its invalidate() takes the writer lock),
-        # second pair rejected (queued for the cache).
-        if calls["n"] == 1:
+        """Validator: the mixed pair confirms, every other pair rejects."""
+        # The mixed pair (favorite color) is CONFIRMED — its invalidate()
+        # legitimately takes the writer lock; every other pair is REJECTED
+        # (queued for the cache). Content-based so phase ordering (and the
+        # fresh rollback pair) is handled uniformly.
+        if older == "[USER] favorite color is blue":
             return (True, 0.95, None, "valid")
         return (False, 0.2, None, "valid")
 
     monkeypatch.setattr(lcd, "validate_conflict_pair", _validate)
 
     def _cache_count():
+        """Row count of the verdict cache via an independent connection."""
         conn = sqlite3.connect(str(temp_db))
         try:
             return conn.execute(
@@ -1092,16 +1159,19 @@ def test_flush_waits_for_caller_commit_after_confirmed_pair(temp_db, monkeypatch
         finally:
             conn.close()
 
-    def _run():
+    def _run(pairs):
+        """Open a resolver on the deferred transaction with the given pairs."""
         C = BeamMemory(session_id="tCRN", db_path=temp_db)
         C._detect_conflicts = (
             lambda items, similarity_threshold=0.88, min_gap_hours=1.0:
-            [(a1, b1), (a2, b2)])
+            pairs)
         C.conn.execute("BEGIN DEFERRED")
         return C
 
     # commit path: the flush is queued, fires only on the caller's commit.
-    C = _run()
+    # Pair (a1,b1) is the MIXED confirmed one (its invalidate() takes the
+    # writer lock); pair (a2,b2) is rejected and queued for the cache.
+    C = _run([(a1, b1), (a2, b2)])
     try:
         r = C.resolve_cross_session_conflicts()
         assert r["llm_validations"] == 2
@@ -1119,14 +1189,28 @@ def test_flush_waits_for_caller_commit_after_confirmed_pair(temp_db, monkeypatch
     finally:
         C.conn.close()
 
-    # rollback path: nothing is flushed.
-    calls["n"] = 0
-    C2 = _run()
+    # rollback path: the FRESH uncached pair (a3,b3) is validated and its
+    # reject queued; the rollback must drop that queued verdict (verified
+    # from an independent connection) rather than an empty second phase.
+    C2 = _run([(a3, b3)])
     try:
-        C2.resolve_cross_session_conflicts()
+        r2 = C2.resolve_cross_session_conflicts()
+        assert r2["llm_validations"] == 1, (
+            "the fresh pair must be validated and its reject queued")
+        assert r2["skipped_cached"] == 0
         assert C2.conn.in_transaction
+        assert _cache_count() == 1  # still only phase-1's verdict (flush queued)
         C2.conn.rollback()
-        assert _cache_count() == 1, (
+        check2 = sqlite3.connect(str(temp_db), timeout=5.0)
+        try:
+            n2 = check2.execute(
+                "SELECT COUNT(*) FROM cross_session_verdict_cache").fetchone()[0]
+            fresh = check2.execute(
+                "SELECT COUNT(*) FROM cross_session_verdict_cache "
+                "WHERE older_id=? AND newer_id=?", (a3, b3)).fetchone()[0]
+        finally:
+            check2.close()
+        assert n2 == 1 and fresh == 0, (
             "a rolled-back transaction must not flush its queued verdicts")
     finally:
         C2.conn.close()

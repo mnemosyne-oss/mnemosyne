@@ -179,7 +179,7 @@ def validate_conflict_pair(
     session_id: str,
     db_path: Optional[Path] = None,
     *, deadline: Optional[float] = None,
-) -> Tuple[bool, float, Optional[str]]:
+) -> Tuple[bool, float, Optional[str], str]:
     """
     Use an LLM to validate if older_content is contradicted/superseded by newer_content.
     

@@ -14140,11 +14140,14 @@ class BeamMemory:
         if scan_error is not None:
             # A bank query failed: abort before any resolution so we never
             # mutate on a partial cross-bank scan, and surface the failure.
+            # Report skipped_cached=0 so the result shape matches the other
+            # paths (no cache was consulted or skipped on this abort).
             return {
                 "status": "failed",
                 "message": f"could not scan bank {scan_error[0]}: {scan_error[1]}",
                 "rows_scanned": len(rows),
                 "pairs_flagged": 0, "conflicts_resolved": 0, "invalidated": 0,
+                "skipped_cached": 0,
                 "llm_validations": 0, "llm_cap_reached": False,
                 "candidates_truncated": truncated,
             }
