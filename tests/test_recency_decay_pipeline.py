@@ -1,0 +1,342 @@
+"""Pipeline-level coverage for the recency-decay age clamp.
+
+Three other files touch this behaviour and none of them makes this statement:
+
+``test_recency_decay_upper_bound.py`` pins ``_recency_decay`` at the function
+boundary (exact frozen-clock values in the near-1.0 band, exact saturation for
+future stamps, a 20-year overflow case). ``test_enhanced_recall_cache.py`` pins
+*invalidation*, with ``recall`` stubbed, because that is the property it tests.
+``test_beam.py``'s future-dated cases are the ``#525`` ``valid_until`` tests:
+they exercise read filtering, not row-``timestamp`` scoring.
+
+What is left uncovered is what the defect actually looked like from outside:
+decay enters the score as a **multiplier**, so a row misdated into the future
+used to outrank a row that was genuinely present. These tests write row
+timestamps explicitly, drive the real ``BeamMemory.recall()`` on both the
+working and episodic paths, and assert the reported ``recency_decay``, the
+resulting ``score``, and the order the rows come back in.
+
+Two properties are pinned, in opposite directions, so neither can be satisfied
+by flattening the curve:
+
+1. a future-dated row earns **no** bonus — it scores no higher than a row
+   stamped at the present instant, and gains no margin over it;
+2. a genuinely stale row keeps its **full** penalty — clamping the age must not
+   turn into ignoring it.
+
+Deterministic by construction: embeddings are disabled so scoring runs on the
+lexical path only, every stamp is derived from ``datetime.now(timezone.utc)``
+so the assertions hold at any wall clock, and no test writes outside ``tmp_path``.
+"""
+
+from __future__ import annotations
+
+import math
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from mnemosyne.core import beam as beam_module
+from mnemosyne.core.beam import BeamMemory
+
+QUERY = "deploy window"
+CONTENT = "the deploy window opens at dusk, operator standing by"
+
+FUTURE = timedelta(hours=9)  # a UTC+9 local-naive stamp read as UTC
+STALE = timedelta(days=30)
+
+# Pin test calibration independently of ambient configuration. At 168 hours,
+# a 30-day-old row reports about 0.0138, distinguishable from zero at 4 dp.
+HALFLIFE_HOURS = 168.0
+IMPORTANCE_WEIGHT = 0.2
+STALE_DECAY = math.exp(-(STALE.total_seconds() / 3600.0) / HALFLIFE_HOURS)
+
+# ``recall()`` reports ``score`` as ``round(score, 4)`` while ordering uses the
+# unrounded float. A tolerance therefore has to clear the 4-dp quantisation
+# (1e-4 absolute, ~1.9e-4 relative around 0.53) and still sit well below the
+# defect's margin, which was ~3.7% on identical content. 1% is 50x above the
+# quantisation and 3.7x below the bug.
+MAX_UNEARNED_MARGIN = 0.01
+
+
+@pytest.fixture
+def lexical_only(monkeypatch):
+    """Pin the lexical path and the decay default captured at import time."""
+    monkeypatch.setattr("mnemosyne.core.embeddings.available", lambda: False)
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setattr(beam_module, "RECENCY_HALFLIFE_HOURS", HALFLIFE_HOURS)
+    monkeypatch.setattr(beam_module._recency_decay, "__defaults__", (HALFLIFE_HOURS,))
+
+
+@pytest.fixture
+def fallback(request, monkeypatch):
+    """Force an empty episodic FTS arm only for the fallback variant."""
+    if request.param:
+        monkeypatch.setattr(beam_module, "_fts_search", lambda *args, **kwargs: [])
+    return request.param
+
+
+def _row_id(table: str, suffix: str) -> str:
+    """Build the deterministic row id the assertions look up by."""
+    return f"{table}-{suffix}"
+
+
+def _insert(beam: BeamMemory, table: str, rows) -> None:
+    """Insert rows with explicit timestamps, bypassing the write path.
+
+    ``remember()`` stamps the current time, so the only way to construct a
+    legacy future-dated row is to write the column directly.
+    """
+    assert table in ("working_memory", "episodic_memory"), table  # f-string below
+    for rid, stamp, session in rows:
+        beam.conn.execute(
+            f"INSERT INTO {table} "
+            "(id, content, source, timestamp, session_id, importance) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (rid, CONTENT, "test", stamp, session, 0.5),
+        )
+    beam.conn.commit()
+
+
+def _recall(beam: BeamMemory, table: str, *, fallback: bool = False):
+    """Recall with explain on, returning ``(hits, ids)``.
+
+    ``explain=True`` is what exposes ``recency_decay`` and the rounded ``score``
+    the assertions read; ``_cross_session=True`` keeps rows written under other
+    session ids in the candidate set.
+    """
+    out = beam.recall(
+        QUERY, top_k=10, explain=True, _cross_session=True,
+        vec_weight=0.0, fts_weight=1.0 - IMPORTANCE_WEIGHT,
+        importance_weight=IMPORTANCE_WEIGHT, temporal_weight=0.0,
+    )
+    hits = out["results"]
+    prefix = "wm" if table == "working_memory" else "em"
+    stage_name = f"{prefix}_{'fallback' if fallback else 'primary'}"
+    stages = {stage["name"]: stage for stage in out["explain"]["stages"]}
+    assert stage_name in stages, f"expected {stage_name}, got {list(stages)}"
+    stage = stages[stage_name]
+    assert stage["fallback_used"] is fallback
+    assert stage["kept_count"] == len(hits) > 0, stage
+    return hits, [h["id"] for h in hits]
+
+
+def _stamp(offset: timedelta, *, naive: bool = False) -> str:
+    """ISO stamp at ``now + offset``, optionally in the legacy naive shape.
+
+    ``naive=True`` drops the offset, reproducing what pre-round-4 producers
+    wrote: a wall-clock stamp from a host in a positive-offset timezone. The
+    reader normalises a naive value to UTC, so such a row is placed
+    ``utcoffset`` hours in the future if the writer was ahead of UTC -- which is
+    the row shape the clamp exists for. With an aware stamp the age is already
+    correct and the clamp never engages, so both shapes are asserted here.
+    """
+    stamp = datetime.now(timezone.utc) + offset
+    if naive:
+        stamp = stamp.replace(tzinfo=None)
+    return stamp.isoformat()
+
+
+def _score_single_row(
+    tmp_path: Path, table: str, offset: timedelta, *, naive: bool = False, fallback: bool = False,
+):
+    """Seed one row at ``now + offset`` and return its explain hit."""
+    stamp = _stamp(offset, naive=naive)
+    beam = BeamMemory(session_id="s-present", db_path=tmp_path / f"{table}.db")
+    _insert(beam, table, [(_row_id(table, "only"), stamp, "s-present")])
+    hits, ids = _recall(beam, table, fallback=fallback)
+    assert len(hits) == 1, f"expected a single recalled row, got {ids}"
+    return hits[0]
+
+
+def _three_row_ranking(
+    tmp_path: Path, table: str, *, naive_future: bool = False, fallback: bool = False,
+):
+    """Present, future-dated and stale rows with identical content.
+
+    Identical content is deliberate: base score, lexical score and importance
+    are then equal by construction, so the surviving ordering difference can
+    only come from the recency factor.
+    """
+    rows = [
+        (_row_id(table, "present"), _stamp(timedelta(0)), "s-present"),
+        (_row_id(table, "future"), _stamp(FUTURE, naive=naive_future), "s-future"),
+        (_row_id(table, "stale"), _stamp(-STALE), "s-stale"),
+    ]
+    beam = BeamMemory(session_id="s-present", db_path=tmp_path / f"{table}-rank.db")
+    _insert(beam, table, rows)
+    hits, ids = _recall(beam, table, fallback=fallback)
+    assert len(hits) == 3, f"expected all three rows back, got {ids}"
+    return {h["id"]: h for h in hits}, ids
+
+
+# --------------------------------------------------------------------------
+# 1. No bonus for a future-dated row (score)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("naive", [False, True], ids=["aware", "legacy-naive"])
+@pytest.mark.parametrize(
+    "table,fallback",
+    [("working_memory", False), ("episodic_memory", False), ("episodic_memory", True)],
+    indirect=["fallback"], ids=["working", "episodic", "episodic-fallback"],
+)
+def test_future_dated_row_scores_no_higher_than_a_present_row(
+    tmp_path: Path, lexical_only, table: str, naive: bool, fallback: bool,
+):
+    """The multiplier must not reward a row for being misdated.
+
+    Present and future rows carry identical content in identical sessions, so
+    their base scores are equal. Unclamped, the future row's decay is above 1.0
+    and multiplies its score ~3.7% above the present row's; clamped, the two are
+    equal to the last bit.
+
+    The ``legacy-naive`` case is the one the clamp was written for: a stamp with
+    no offset, written as local wall time by a host ahead of UTC. Both shapes are
+    asserted because they reach the scorer by different routes.
+    """
+    present = _score_single_row(tmp_path / "present", table, timedelta(0), fallback=fallback)
+    future = _score_single_row(tmp_path / "future", table, FUTURE, naive=naive, fallback=fallback)
+
+    # Reported values are ``round(x, 4)``: the present row's true decay is
+    # 0.99999845 (it is microseconds old by recall time), so compare at
+    # rounding precision rather than claiming exactness.
+    assert present["recency_decay"] == pytest.approx(1.0, abs=1e-4), present["recency_decay"]
+    assert future["recency_decay"] == 1.0, (
+        f"a row {FUTURE} in the future must saturate at 1.0, got "
+        f"{future['recency_decay']}"
+    )
+    assert future["score"] <= present["score"] * (1 + MAX_UNEARNED_MARGIN), (
+        f"future-dated row scored {future['score']} against a present row's "
+        f"{present['score']} ({100 * (future['score'] / present['score'] - 1):.2f}% "
+        f"more): the clamp is not reaching {table}"
+    )
+    # Two-sided: the clamp must not boost the misdated row, and it must not
+    # penalise it either. A one-sided bound would accept a regression that
+    # multiplies the future row down while every other assertion still holds.
+    assert future["score"] >= present["score"] * (1 - MAX_UNEARNED_MARGIN), (
+        f"future-dated row scored {future['score']} against a present row's "
+        f"{present['score']} ({100 * (future['score'] / present['score'] - 1):.2f}%): "
+        f"a future stamp must be treated as new, not as stale, in {table}"
+    )
+    assert present["score"] > 0.0, "sanity: the row must actually score"
+
+
+# --------------------------------------------------------------------------
+# 2. No unearned margin over a present row
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("naive", [False, True], ids=["aware", "legacy-naive"])
+@pytest.mark.parametrize(
+    "table,fallback",
+    [("working_memory", False), ("episodic_memory", False), ("episodic_memory", True)],
+    indirect=["fallback"], ids=["working", "episodic", "episodic-fallback"],
+)
+def test_future_dated_row_gains_no_unearned_margin(
+    tmp_path: Path, lexical_only, table: str, naive: bool, fallback: bool,
+):
+    """On identical content the misdated row may tie the newest row, never lead it by a margin.
+
+    Which of the two ranks first is deliberately *not* pinned: the clamp
+    saturates the future row at exactly 1.0, while the present control is a
+    fraction of a second old by the time ``recall`` runs (measured decay
+    0.99999845 against 1.0). A sub-second tie is not a defect and would be a
+    flaky assertion. The defect was a *margin*: unclamped, the future row's
+    factor reached 1.055, adding ~3.7% to its score on identical content and
+    taking rank 0 outright.
+
+    ``legacy-naive`` writes the future stamp with no offset, the shape a
+    positive-offset host produced before the producer contract was fixed -- the
+    exact row the clamp was added for.
+    """
+    hits, ids = _three_row_ranking(tmp_path, table, naive_future=naive, fallback=fallback)
+    present = hits[_row_id(table, "present")]
+    future = hits[_row_id(table, "future")]
+
+    # Same rounding caveat as the score test: the present row is a fraction of
+    # a microsecond old by the time ``recall`` runs, so its true decay is
+    # 0.99999845 and only rounds to 1.0. Compare at 4-dp precision.
+    assert present["recency_decay"] == pytest.approx(1.0, abs=1e-4), (
+        f"the present row must be treated as new, got {present['recency_decay']}"
+    )
+    assert future["recency_decay"] == 1.0, (
+        f"a row {FUTURE} in the future must saturate at 1.0, got "
+        f"{future['recency_decay']}"
+    )
+    # Reported scores are 4-dp rounded, so the tolerance clears quantisation
+    # rather than the sub-second tie; see MAX_UNEARNED_MARGIN.
+    assert present["score"] > 0.0, "the present control must actually score"
+    margin = future["score"] - present["score"]
+    assert margin <= present["score"] * MAX_UNEARNED_MARGIN, (
+        f"the future-dated row gained {margin:.6f} over the present row "
+        f"({future['score']} vs {present['score']}), i.e. "
+        f"{100 * margin / present['score']:.2f}% on identical content"
+    )
+    assert margin >= -present["score"] * MAX_UNEARNED_MARGIN, (
+        f"the future-dated row lost {-margin:.6f} against the present row "
+        f"({future['score']} vs {present['score']}): the multi-row path "
+        "must treat a future stamp as new, not penalise it"
+    )
+    assert ids[-1] == _row_id(table, "stale"), f"the stale row must rank last; got {ids}"
+
+
+# --------------------------------------------------------------------------
+# 3. Staleness still costs: the clamp is not a floor on the curve
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "table,fallback",
+    [("working_memory", False), ("episodic_memory", False), ("episodic_memory", True)],
+    indirect=["fallback"], ids=["working", "episodic", "episodic-fallback"],
+)
+def test_stale_row_keeps_its_full_penalty(
+    tmp_path: Path, lexical_only, table: str, fallback: bool,
+):
+    """A mutation that returns 1.0 for everything must fail here.
+
+    The clamp exists to stop ages below zero. It must not lift any other age,
+    so a 30-day-old row keeps ``exp(-720/168)`` decay and the tier's weighted
+    score penalty, rather than multiplying its whole score by that decay.
+    """
+    hits, ids = _three_row_ranking(tmp_path, table, fallback=fallback)
+    stale = hits[_row_id(table, "stale")]
+
+    # Keep the expected value clear of both zero and one: neither flattening
+    # the curve nor over-penalising stale rows may satisfy this regression.
+    assert 1e-3 < STALE_DECAY < 0.05, (
+        f"at {STALE} the expected decay is {STALE_DECAY:.4f} under a "
+        f"{HALFLIFE_HOURS:g}h half-life -- outside the useful band away from "
+        f"both zero and one; re-derive this test"
+    )
+
+    assert stale["recency_decay"] == pytest.approx(STALE_DECAY, abs=1e-4), (
+        f"expected the ordinary curve at {STALE}: {STALE_DECAY:.4f}, got "
+        f"{stale['recency_decay']}"
+    )
+    assert ids[-1] == _row_id(table, "stale"), (
+        f"the stale row must rank last; got {ids}"
+    )
+    present = hits[_row_id(table, "present")]
+    assert present["score"] > 0.0
+    assert stale["keyword_score"] == present["keyword_score"]
+    assert stale["importance"] == present["importance"]
+    assert stale["dense_score"] == present["dense_score"] == 0.0
+    # Identical content and importance cancel the base score. Working memory
+    # and episodic fallback retain (1 - importance_weight) * 0.4; primary
+    # episodic retains 0.7. Check the
+    # weighted penalty, not merely "stale scores lower" or pure exp(-age/h).
+    retained_share = (
+        0.7 if table == "episodic_memory" and not fallback
+        else (1.0 - IMPORTANCE_WEIGHT) * 0.4
+    )
+    expected_multiplier = retained_share + (1.0 - retained_share) * STALE_DECAY
+    # Both public scores are rounded to 4 dp; allow their combined rounding.
+    assert stale["score"] == pytest.approx(
+        present["score"] * expected_multiplier, abs=1e-4, rel=0.0,
+    ), (
+        f"stale scored {stale['score']}, present scored {present['score']}: "
+        f"expected the {table} weighted multiplier {expected_multiplier:.6f}"
+    )

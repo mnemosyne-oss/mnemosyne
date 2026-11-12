@@ -275,22 +275,27 @@ def test_embed_query_recovers_without_calling_available(isolated_embeddings, tmp
 
 
 def test_importing_embeddings_does_not_import_fastembed():
-    """Module import must not pull onnxruntime. First use still binds TextEmbedding."""
-    sys.modules.pop("fastembed", None)
-    blocked = []
-    original_import = builtins.__import__
+    """Attempted FastEmbed imports cannot hide behind an exception handler."""
+    import subprocess
+    from pathlib import Path
 
-    def spy(name, *args, **kwargs):
-        if name == "fastembed" or name.startswith("fastembed."):
-            blocked.append(name)
-            raise AssertionError("fastembed imported during embeddings import")
-        return original_import(name, *args, **kwargs)
-
-    builtins.__import__ = spy
-    try:
-        importlib.reload(embeddings)
-    finally:
-        builtins.__import__ = original_import
-    assert blocked == []
-    assert embeddings.TextEmbedding is None
-    assert "fastembed" not in sys.modules
+    code = """
+import importlib.abc, sys
+sys.path.insert(0, sys.argv[1])
+attempts=[]
+class BlockFastEmbed(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'fastembed' or fullname.startswith('fastembed.'):
+            attempts.append(fullname)
+            raise ImportError('FastEmbed must remain unloaded')
+sys.meta_path.insert(0, BlockFastEmbed())
+from mnemosyne.core import embeddings
+assert not attempts, attempts
+assert embeddings.TextEmbedding is None
+assert 'fastembed' not in sys.modules
+"""
+    result = subprocess.run(
+        [sys.executable, '-I', '-c', code, str(Path(__file__).resolve().parents[1])],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -285,6 +285,133 @@ class TestProbeScope:
                     if t["pair"] == sorted(PAIR))
         assert len(decision.chain) == len(twin["banks"]) - 1  # minus the home bank
 
+    def test_symlink_fleet_root_uses_census_snapshot_pruning(self, tmp_path):
+        """Census and federation retain completed snapshots through a fleet alias."""
+        snapshot_root = tmp_path / "state-snapshots"
+        partial = snapshot_root / "pre-update.partial" / "mnemosyne.db"
+        partial.parent.mkdir(parents=True)
+        partial.write_bytes(b"not a sqlite database" * 40)
+        complete = _make_bank(snapshot_root / "pre-update" / "mnemosyne.db", [])
+        fleet_alias = tmp_path / "fleet-alias"
+        fleet_alias.symlink_to(snapshot_root, target_is_directory=True)
+        home = _make_bank(tmp_path / "home" / "mnemosyne.db", [])
+
+        census = fleet_census.census(root=fleet_alias)
+        decision = fh.probe_fleet(PAIR, home, fleet_root=fleet_alias, sleep=_noop_sleep)
+
+        assert [bank["path"] for bank in census["banks"]] == [str(complete.resolve())]
+        assert census["unreadable"] == []
+        assert decision.probed_banks == [str(complete.resolve())]
+        assert decision.failed == []
+        assert decision.proceed is True
+
+    def test_snapshot_named_alias_retains_live_partial_bank(self, tmp_path):
+        """Snapshot pruning follows the target directory of a fleet alias."""
+        fleet = tmp_path / "fleet"
+        live = _make_bank(fleet / "live.partial" / "mnemosyne.db", [])
+        alias = tmp_path / "state-snapshots"
+        alias.symlink_to(fleet, target_is_directory=True)
+        home = _make_bank(tmp_path / "home" / "mnemosyne.db", [])
+
+        census = fleet_census.census(root=alias)
+        decision = fh.probe_fleet(PAIR, home, fleet_root=alias, sleep=_noop_sleep)
+
+        assert [bank["path"] for bank in census["banks"]] == [str(live.resolve())]
+        assert decision.probed_banks == [str(live.resolve())]
+        assert decision.failed == []
+
+    def test_absent_fleet_root_does_not_refuse(self, tmp_path):
+        """An optional fleet directory can be absent."""
+        home = _make_bank(tmp_path / "home" / "mnemosyne.db", [])
+        missing = tmp_path / "absent"
+
+        decision = fh.probe_fleet(PAIR, home, fleet_root=missing, sleep=_noop_sleep)
+
+        assert decision.proceed is True
+        assert decision.failed == []
+        assert decision.probed_banks == []
+        assert not missing.exists()
+
+    def test_self_referential_fleet_root_default_paths_refuses_without_writes(self, tmp_path):
+        """A loop in the default scope must refuse, never escape as an exception.
+
+        Before strict fleet-root validation, loop handling varied by Python
+        version and could return a decision that allowed the insert.
+        """
+        fleet_root = tmp_path / "fleet-loop"
+        fleet_root.symlink_to(fleet_root, target_is_directory=True)
+        home = _make_bank(tmp_path / "home" / "mnemosyne.db", [])
+        before = _fingerprint(home)
+
+        decision = fh.probe_fleet(
+            PAIR, home, fleet_root=fleet_root, sleep=_noop_sleep, total_budget_s=0)
+
+        assert decision.refused is True
+        assert decision.proceed is False
+        assert decision.chain == []
+        assert decision.probed_banks == []
+        assert decision.probes_run == 0
+        assert len(decision.failed) == 1
+        assert decision.failed[0]["probe_target"] == str(fleet_root)
+        assert decision.failed[0]["error_class"] == "scope_error"
+        assert "fleet scope resolution failed" in decision.failed[0]["error_message"]
+        assert _fingerprint(home) == before
+        assert not list(tmp_path.rglob("*.db-wal"))
+        assert not list(tmp_path.rglob("*.db-shm"))
+
+    def test_self_referential_fleet_root_explicit_paths_refuses_without_writes(self, tmp_path):
+        """Explicit surface/root paths leave census discovery to reject the loop.
+
+        Explicit paths leave only the fleet-root validation responsible for
+        rejecting the loop before census discovery or any DB probe.
+        """
+        fleet_root = tmp_path / "fleet-loop"
+        fleet_root.symlink_to(fleet_root, target_is_directory=True)
+        home = _make_bank(tmp_path / "home" / "mnemosyne.db", [])
+        shared = _make_bank(tmp_path / "shared" / "mnemosyne.db", [])
+        root = _make_bank(tmp_path / "root" / "mnemosyne.db", [])
+        before = {bank: _fingerprint(bank) for bank in (home, shared, root)}
+
+        decision = fh.probe_fleet(
+            PAIR, home, fleet_root=fleet_root, shared_db=shared, root_db=root,
+            banks=[shared, root], sleep=_noop_sleep, total_budget_s=0)
+
+        assert decision.refused is True
+        assert decision.proceed is False
+        assert decision.chain == []
+        assert decision.probed_banks == []
+        assert decision.probes_run == 0
+        assert len(decision.failed) == 1
+        assert decision.failed[0]["probe_target"] == str(fleet_root)
+        assert decision.failed[0]["error_class"] == "scope_error"
+        assert "fleet scope resolution failed" in decision.failed[0]["error_message"]
+        assert {bank: _fingerprint(bank) for bank in (home, shared, root)} == before
+        assert not list(tmp_path.rglob("*.db-wal"))
+        assert not list(tmp_path.rglob("*.db-shm"))
+
+    def test_derived_root_bank_symlink_loop_refuses_without_writes(self, tmp_path, monkeypatch):
+        """A valid fleet directory can still contain a looping root bank."""
+        monkeypatch.delenv("MNEMOSYNE_HOME", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_SHARED_DB_PATH", raising=False)
+        fleet_root = tmp_path / "fleet"
+        root_bank = fleet_root / "mnemosyne" / "data" / "mnemosyne.db"
+        root_bank.parent.mkdir(parents=True)
+        root_bank.symlink_to(root_bank)
+        home = _make_bank(tmp_path / "home" / "mnemosyne.db", [])
+        before = _fingerprint(home)
+
+        decision = fh.probe_fleet(PAIR, home, fleet_root=fleet_root, sleep=_noop_sleep)
+
+        assert decision.refused is True
+        assert decision.proceed is False
+        assert decision.probed_banks == []
+        assert decision.probes_run == 0
+        assert decision.failed[0]["error_class"] == "scope_error"
+        assert decision.failed[0]["probe_target"] == str(root_bank)
+        assert _fingerprint(home) == before
+        assert not list(tmp_path.rglob("*.db-wal"))
+        assert not list(tmp_path.rglob("*.db-shm"))
+
     def test_standalone_bank_has_no_peers_and_inserts_anyway(self, tmp_path):
         """The gate is on by default, but a bank outside a fleet has nothing
         to probe — which is what makes default-on safe."""
