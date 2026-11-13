@@ -176,14 +176,22 @@ _RECALL_PREVIEW_CHARS = 150
 def _recall_display_results(memory, query, results):
     """Expand selected hits for human output without changing recall or its cache.
 
-    Stored rows are read from their selected tier using get()'s session/global
-    visibility. MEMORIA aggregates are regenerated through their existing reader.
+    Stored rows are read from their selected tier using recall's current
+    cross-session visibility. MEMORIA aggregates are regenerated through their
+    existing reader.
     An unavailable source or mismatching prefix stays an explicitly labelled
     recall preview. This is a current read, not a historical content snapshot.
     """
     import sqlite3
-    from mnemosyne.core.beam import RECALL_CONTENT_CAP
+    from mnemosyne.core.beam import (
+        RECALL_CONTENT_CAP,
+        _cross_session_enabled,
+        _session_scope_filter,
+        _session_scope_params,
+    )
 
+    # Pair the predicate and binds from one hot-reloadable visibility snapshot.
+    cross_session = _cross_session_enabled()
     displayed = []
     aggregate = None
     for result in results:
@@ -198,8 +206,9 @@ def _recall_display_results(memory, query, results):
                 if table:
                     row = beam.conn.execute(
                         f"SELECT content FROM {table} WHERE id=? "
-                        "AND (session_id=? OR scope='global')",
-                        (item.get("id"), beam.session_id)).fetchone()
+                        f"AND {_session_scope_filter(cross_session=cross_session)}",
+                        (item.get("id"), *_session_scope_params(
+                            beam.session_id, cross_session=cross_session))).fetchone()
                     full = row[0] if row else None
                 elif tier == "memoria":
                     if aggregate is None:
@@ -2143,7 +2152,8 @@ def run_cli():
         print("Commands:")
         print("  version                                Show installed version")
         print("  store <content> [source] [importance]  Store a memory")
-        print("  recall <query> [top_k]                 Search memories")
+        print("  recall <query> [top_k] [--explain] [--json] [--preview]  Search memories")
+        print("    --preview: show up to 150 characters; --json keeps backend content caps")
         print("  media <path|url> [--modality M] [--json]  Remember an image, audio, video or document")
         print("  update <id> <content> [importance]     Update a memory")
         print("  delete <id>                            Delete a memory")

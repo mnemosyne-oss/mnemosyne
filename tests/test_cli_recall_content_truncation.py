@@ -112,6 +112,17 @@ def real_recall_content(request, tmp_path, monkeypatch):
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "0")
     monkeypatch.setenv("MNEMOSYNE_BANK", "default")
     monkeypatch.setattr(beam_module, "RECALL_CONTENT_CAP", 500)
+    if request.node.callspec.params.get("polyphonic", False):
+        # Only replace external embedding inference; keep the real voice, SQL,
+        # fusion, visibility, hydration and CLI paths under test.
+        import numpy as np
+
+        vector = np.ones(384, dtype=np.float32) / np.sqrt(384)
+        monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
+        monkeypatch.setattr(beam_module._embeddings, "embed_query", lambda text: vector)
+        monkeypatch.setattr(beam_module._embeddings, "embed",
+                            lambda texts: np.stack([vector for _ in texts]))
+        monkeypatch.setenv("MNEMOSYNE_VOICE_VECTOR", "1")
     memory = Mnemosyne(session_id="cli-content", db_path=tmp_path / "cli.db")
     content = "orchid version details " * 60 + "COMPLETE-記録-END"
     mid = memory.beam.remember(content, source="manual", scope="session")
@@ -200,6 +211,7 @@ def test_human_expansion_preserves_peer_visibility(tmp_path, monkeypatch, tier, 
     import mnemosyne.core.beam as beam_module
 
     monkeypatch.setattr(beam_module, "RECALL_CONTENT_CAP", 500)
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION", "0")
     memory = Mnemosyne(session_id="reader", db_path=tmp_path / "peers.db")
     table = "working_memory" if tier == "working" else "episodic_memory"
     prefix = "iris " * 100
@@ -260,6 +272,79 @@ def test_human_expansion_keeps_enhanced_cache_and_json_capped(
     cli.cmd_recall([query, "10", "--json"])
     rows = json.loads(capsys.readouterr().out)["results"]
     assert next(r for r in rows if r["id"] == mid)["content"] == content[:500]
+
+
+@pytest.mark.parametrize("real_recall_content", ["working", "episodic"], indirect=True)
+@pytest.mark.parametrize("cross_session", [False, True])
+@pytest.mark.parametrize("polyphonic", [False, True])
+def test_real_peer_recall_expands_only_when_visible(
+        real_recall_content, monkeypatch, capsys, cross_session, polyphonic):
+    """Cross-session hits expand fully while disabled recall keeps peers private."""
+    from mnemosyne import cli
+
+    memory, query, mid, content = real_recall_content
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION", "1" if cross_session else "0")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1" if polyphonic else "0")
+    for table in ("working_memory", "episodic_memory"):
+        memory.beam.conn.execute(
+            f"UPDATE {table} SET session_id='peer-session', scope='session' WHERE id=?",
+            (mid,))
+    memory.beam.conn.commit()
+    before = memory.recall(query, top_k=10)
+    selected = [r for r in before if r["id"] == mid]
+    assert bool(selected) is cross_session
+    if cross_session:
+        assert selected[0]["content"] == content[:500]
+        displayed = cli._recall_display_results(memory, query, before)
+        assert next(r for r in displayed if r["id"] == mid)["content"] == content
+        assert [(r["id"], r["score"]) for r in displayed] == [
+            (r["id"], r["score"]) for r in before]
+    cli.cmd_recall([query, "10"])
+    human = capsys.readouterr().out
+    assert (content in human) is cross_session
+    cli.cmd_recall([query, "10", "--preview"])
+    preview = capsys.readouterr().out
+    assert (f"showing 150 of {len(content)} chars" in preview) is cross_session
+    cli.cmd_recall([query, "10", "--json"])
+    rows = json.loads(capsys.readouterr().out)["results"]
+    selected_json = [r for r in rows if r["id"] == mid]
+    assert bool(selected_json) is cross_session
+    if cross_session:
+        assert selected_json[0]["content"] == content[:500]
+        assert selected[0]["content"] == content[:500]
+        after = memory.recall(query, top_k=10)
+        assert next(r for r in after if r["id"] == mid)["content"] == content[:500]
+
+
+@pytest.mark.parametrize("real_recall_content", ["memoria"], indirect=True)
+def test_enhanced_memoria_expands_capitalized_multi_fact_query(
+        real_recall_content, monkeypatch, capsys):
+    """Full multi-key aggregates survive display without growing cached JSON."""
+    from mnemosyne import cli
+
+    memory, _, _, _ = real_recall_content
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    memory.beam.conn.execute(
+        "INSERT INTO memoria_facts "
+        "(session_id, fact_type, key, value, version_id) "
+        "VALUES ('cli-content', 'version', 'Orchid Release', ?, 1)",
+        ("release notes " * 60 + "SECOND-FACT-END",))
+    memory.beam.conn.commit()
+    query = "What is the ORCHID version?"
+    aggregate = memory.beam.memoria_retrieve(query, top_k=3)
+    full = f"[MEMORIA {aggregate['source']}]\n{aggregate['context']}"
+    assert "COMPLETE-記録-END" in full and "SECOND-FACT-END" in full
+    mid = "memoria_" + aggregate["source"]
+    before = memory.recall(query, top_k=10)
+    assert next(r for r in before if r["id"] == mid)["content"] == full[:500]
+    cli.cmd_recall([query, "10"])
+    assert full in capsys.readouterr().out
+    cli.cmd_recall([query, "10", "--preview"])
+    assert f"showing 150 of {len(full)} chars" in capsys.readouterr().out
+    cli.cmd_recall([query, "10", "--json"])
+    rows = json.loads(capsys.readouterr().out)["results"]
+    assert next(r for r in rows if r["id"] == mid)["content"] == full[:500]
+    assert next(r for r in before if r["id"] == mid)["content"] == full[:500]
 
 
 if __name__ == "__main__":
