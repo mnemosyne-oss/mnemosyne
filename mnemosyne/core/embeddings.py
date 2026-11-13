@@ -17,6 +17,8 @@ import urllib.parse
 import urllib.request
 from typing import List, NoReturn, Optional
 from functools import lru_cache
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from mnemosyne.core.user_agent import application_user_agent
 
@@ -25,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 try:
     import numpy as np
-except ImportError:
+except Exception:
     np = None
 
 # --- fastembed (local ONNX) ---
@@ -43,14 +45,146 @@ try:
 except Exception:
     TextEmbedding = None
 
+# Module-level import guard. While True (during module load) a failed dense-stack
+# import does not emit its one-time warning; the warning is deferred to the
+# first post-import attempt (e.g. available() / _ensure_fastembed()) so
+# import-time alias evaluation does not consume it. Reset to False once alias
+# evaluation completes.
+_IMPORTING = True
+
+# Dense-stack import state. _DENSE_STACK_IMPORTED remembers a successful import
+# so later calls skip re-importing; _DENSE_STACK_WARNED ensures a failing import
+# warns at most once (reset on a later success).
+_DENSE_STACK_IMPORTED = np is not None and TextEmbedding is not None
+_DENSE_STACK_WARNED = False
+_DENSE_STACK_RETRY_AT = 0.0
+_DENSE_STACK_BROKEN_BACKOFF = 1.0
+# Guards concurrent first-time imports so two threads cannot both attempt the
+# import (and both emit the warning) when the stack is absent.
+_DENSE_STACK_LOCK = threading.Lock()
+
+
+def _ensure_fastembed() -> bool:
+    """Ensure numpy and fastembed.TextEmbedding are importable, binding the
+    module globals on success.
+
+    Returns True on success (and remembers it so later calls skip re-importing)
+    and False on failure. On failure logs exactly one WARNING naming the failing
+    module ('numpy' or 'fastembed') and the reason; repeated failures do not
+    re-warn. Broken installed packages back off briefly; missing modules remain
+    immediately retryable. A later success resets warning and backoff. Thread-safe.
+    """
+    global np, TextEmbedding, _DENSE_STACK_IMPORTED, _DENSE_STACK_WARNED
+    global _DENSE_STACK_RETRY_AT
+    if _DENSE_STACK_IMPORTED and np is not None and TextEmbedding is not None:
+        return True
+    if _DENSE_STACK_IMPORTED and (np is None or TextEmbedding is None):
+        _DENSE_STACK_IMPORTED = False
+
+    with _DENSE_STACK_LOCK:
+        # Re-check under the lock: another thread may have imported meanwhile.
+        if np is not None and TextEmbedding is not None:
+            _DENSE_STACK_IMPORTED = True
+            return True
+        if time.monotonic() < _DENSE_STACK_RETRY_AT:
+            return False
+
+        try:
+            import numpy as _np
+        except Exception as exc:  # noqa: BLE001
+            # Defer cooldown along with the warning during alias evaluation,
+            # so the first runtime call can report the broken dependency.
+            if not _IMPORTING and not (
+                isinstance(exc, ModuleNotFoundError) and exc.name == "numpy"
+            ):
+                _DENSE_STACK_RETRY_AT = time.monotonic() + _DENSE_STACK_BROKEN_BACKOFF
+            if not _DENSE_STACK_WARNED and not _IMPORTING:
+                logger.warning("could not import numpy: %s", exc)
+                _DENSE_STACK_WARNED = True
+            return False
+        try:
+            from fastembed import TextEmbedding as _TE
+        except Exception as exc:  # noqa: BLE001
+            # Defer cooldown along with the warning during alias evaluation,
+            # so the first runtime call can report the broken dependency.
+            if not _IMPORTING and not (
+                isinstance(exc, ModuleNotFoundError) and exc.name == "fastembed"
+            ):
+                _DENSE_STACK_RETRY_AT = time.monotonic() + _DENSE_STACK_BROKEN_BACKOFF
+            if not _DENSE_STACK_WARNED and not _IMPORTING:
+                logger.warning("could not import fastembed: %s", exc)
+                _DENSE_STACK_WARNED = True
+            return False
+
+        np = _np
+        TextEmbedding = _TE
+        _DENSE_STACK_IMPORTED = True
+        _DENSE_STACK_WARNED = False
+        _DENSE_STACK_RETRY_AT = 0.0
+        # First successful bind: drop any cached failure from embed_query().
+        # _embed_query_cached memoises its result, so a query that ran before
+        # the stack was importable holds a cached None and would keep returning
+        # None even though the model can now load.
+        _cached = globals().get("_embed_query_cached")
+        if _cached is not None:
+            try:
+                _cached.cache_clear()
+            except Exception:  # pragma: no cover - cache_clear is best effort
+                pass
+        return True
+
+
+_API_NUMPY_WARNED = False
+_API_NUMPY_RETRY_AT = 0.0
+_API_NUMPY_ERROR = (
+    "API embeddings require NumPy, which is unavailable or could not be imported. "
+    "Install or repair it in the interpreter running Mnemosyne: python -m pip install numpy."
+)
+
+
+def _ensure_api_numpy() -> bool:
+    """Retry NumPy independently of the optional local FastEmbed backend."""
+    global np, _API_NUMPY_WARNED, _API_NUMPY_RETRY_AT
+    if np is not None:
+        return True
+    with _DENSE_STACK_LOCK:
+        if np is not None:
+            return True
+        if time.monotonic() < _API_NUMPY_RETRY_AT:
+            return False
+        try:
+            import numpy as _np
+        except Exception as exc:
+            if not (isinstance(exc, ModuleNotFoundError) and exc.name == "numpy"):
+                _API_NUMPY_RETRY_AT = time.monotonic() + _DENSE_STACK_BROKEN_BACKOFF
+            if not _API_NUMPY_WARNED:
+                # Import errors may contain private paths; name the dependency,
+                # not the arbitrary exception text or the embedding input.
+                logger.warning("%s", _API_NUMPY_ERROR)
+                _API_NUMPY_WARNED = True
+            return False
+        np = _np
+        _API_NUMPY_WARNED = False
+        _API_NUMPY_RETRY_AT = 0.0
+        return True
+
+
 def _is_fastembed_available() -> bool:
-    """Check if fastembed is available. Evaluates lazily, so a correct
-    sys.path ordering at call time won't be shadowed by an early import."""
-    return np is not None and TextEmbedding is not None
+    """Check if fastembed is available.
+
+    When the ``np``/``TextEmbedding`` globals are empty (e.g. site-packages is
+    absent for the whole process lifetime, as in the gateway venv), re-attempt
+    the import via :func:`_ensure_fastembed` instead of trusting import-time
+    state. Returns True when both are bound.
+    """
+    if np is not None and TextEmbedding is not None:
+        return True
+    return _ensure_fastembed()
 
 # Backward-compatible alias for legacy users who import this constant.
 # Use _is_fastembed_available() in new code — it re-evaluates on each call.
 _FASTEMBED_AVAILABLE = _is_fastembed_available()
+_IMPORTING = False
 # Allow CI / scripted environments to redirect the fastembed cache to a
 # stable path that can be restored by actions/cache. Defaults to
 # <HERMES_HOME>/cache/fastembed, falling back to ~/.hermes/cache/fastembed
@@ -588,9 +722,8 @@ def _env_cap(name: str) -> int:
 
 def _embedding_max_chars() -> int:
     """Resolve the optional per-input character cap at call time (default:
-    disabled). Set MNEMOSYNE_EMBEDDING_MAX_CHARS for local OpenAI-compatible
-    servers (llama.cpp et al.) whose per-slot context window rejects long
-    inputs with HTTP 400, aborting the whole batch; 0 or negative disables."""
+    disabled). Applies to both API and local embedding inputs; 0 or negative
+    disables the cap."""
     return _env_cap("MNEMOSYNE_EMBEDDING_MAX_CHARS")
 
 
@@ -602,18 +735,38 @@ def _embedding_max_bytes() -> int:
     return _env_cap("MNEMOSYNE_EMBEDDING_MAX_BYTES")
 
 
+_CAP_SNAPSHOT: ContextVar[Optional[tuple]] = ContextVar("embedding_cap_snapshot", default=None)
+
+
 def _embedding_caps() -> tuple:
-    """Both caps, as one cache key part for embed_query."""
+    """Both caps, pinned during an enhanced recall or read from current config."""
+    snapshot = _CAP_SNAPSHOT.get()
+    if snapshot is not None:
+        return snapshot
     return (_embedding_max_chars(), _embedding_max_bytes())
 
 
-def _cap_for_api(texts: List[str]) -> List[str]:
-    """Cap each text before the API call when MNEMOSYNE_EMBEDDING_MAX_CHARS
+@contextmanager
+def _embedding_cap_snapshot():
+    """Keep cache identity and embedding inputs on one policy for this call.
+
+    Context-local state keeps overlapping recalls independent; reset on every
+    exit so later calls observe configuration changes, including after errors.
+    """
+    token = _CAP_SNAPSHOT.set(_embedding_caps())
+    try:
+        yield
+    finally:
+        _CAP_SNAPSHOT.reset(token)
+
+
+def _cap_for_api(texts: List[str], caps: Optional[tuple] = None) -> List[str]:
+    """Cap each text before an API or local embedding call when MNEMOSYNE_EMBEDDING_MAX_CHARS
     and/or MNEMOSYNE_EMBEDDING_MAX_BYTES is set. Off by default: characters
     are not a token budget, and silent head-truncation can drop retrieval
     content on endpoints that accept the full text. When enabled, every
     truncation is logged."""
-    limit, byte_limit = _embedding_max_chars(), _embedding_max_bytes()
+    limit, byte_limit = _embedding_caps() if caps is None else caps
     if limit <= 0 and byte_limit <= 0:
         return texts
     capped: List[str] = []
@@ -739,11 +892,11 @@ def _ensure_api_vectors(result: Optional[np.ndarray], base_url: str, expected: i
     return result
 
 
-def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
+def _embed_api(texts: List[str], base_url: Optional[str] = None) -> Optional[np.ndarray]:
     """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint)."""
     global _API_CALL_COUNT
     # Require API key for OpenRouter; custom endpoints may not need one.
-    base_url = _effective_base_url()
+    base_url = base_url or _effective_base_url()
     is_custom = not _is_openrouter_url(base_url)
     if not is_custom and not _OPENAI_API_KEY:
         logger.warning(
@@ -758,6 +911,9 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
             "credentialed-cleartext",
             _cleartext_refusal_message(base_url),
         )
+
+    if not _ensure_api_numpy():
+        raise RuntimeError(_API_NUMPY_ERROR)
 
     # Append /embeddings to the path, preserving any query string. A naive
     # string append would push the route into the query value (e.g.
@@ -869,9 +1025,9 @@ def available() -> bool:
         # Custom endpoints (non-OpenRouter) may not require an API key
         base_url = _configured_api_url()
         if base_url and not _is_openrouter_url(base_url):
-            return True
-        return bool(_OPENAI_API_KEY)
-    return _FASTEMBED_AVAILABLE
+            return _ensure_api_numpy()
+        return bool(_OPENAI_API_KEY) and _ensure_api_numpy()
+    return _is_fastembed_available()
 
 
 def available_api() -> bool:
@@ -889,22 +1045,50 @@ def embed_query(text: str) -> Optional[np.ndarray]:
         return None
     if not text:
         return None
-    # The effective caps are part of the key: _embed_api reads MNEMOSYNE_EMBEDDING_MAX_CHARS / _BYTES at call time, so a
+    # The effective caps are part of the key: embedding calls read MNEMOSYNE_EMBEDDING_MAX_CHARS / _BYTES at call time, so a
     # vector embedded under one cap must not be served after the cap changes (review #1052).
-    return _embed_query_cached(_get_prefix("query") + text, _embedding_caps())
+    # The backend is part of the key too: embeddings_via_api or the API URL can change at runtime,
+    # and a cached local vector must not be compared against API document vectors.
+    api_url = _effective_base_url() if _is_api_model(_DEFAULT_MODEL) else None
+    if api_url is None:
+        # Direct callers never touch available(), so retry the dense-stack
+        # import here. If it still cannot be imported, return WITHOUT consulting
+        # (or populating) the cache: memoising a failure is what let a stale
+        # None outlive recovery. A successful bind also drops any entry cached
+        # by an older revision (see _ensure_fastembed).
+        if not _is_fastembed_available():
+            return None
+    try:
+        return _embed_query_cached(_get_prefix("query") + text, _embedding_caps(), api_url)
+    except _ConfigChangedDuringQuery:
+        return None
+
+
+class _ConfigChangedDuringQuery(Exception):
+    """Raised inside the cached function so lru_cache stores nothing for this call."""
 
 
 @lru_cache(maxsize=512)
-def _embed_query_cached(prefixed: str, _caps: tuple = (0, 0)) -> Optional[np.ndarray]:
-    if _is_api_model(_DEFAULT_MODEL):
-        result = _embed_api([prefixed])
-        _ensure_api_vectors(result, _effective_base_url(), 1)
+def _embed_query_cached(
+    prefixed: str, _caps: tuple = (0, 0), api_url: Optional[str] = None
+) -> Optional[np.ndarray]:
+    if api_url is not None:
+        result = _embed_api([prefixed], api_url)
+        _ensure_api_vectors(result, api_url, 1)
         return result[0]
 
     model = _get_model()
-    if model is None or model == "api":
+    # The key was chosen for the local backend, but the loader answers for the config as
+    # it is now. If that moved to the API or to opt-out in between, this call has no local
+    # vector, and caching None would keep serving it after the config moves back. The
+    # import-recovery preflight in embed_query handles missing local dependencies;
+    # a successful later bind clears old cached failures. Asking _is_disabled()
+    # again here would race the same way.
+    if model == "api" or (model is None and _is_fastembed_available()):
+        raise _ConfigChangedDuringQuery
+    if model is None:
         return None
-    vectors = list(model.embed([prefixed]))
+    vectors = list(model.embed(_cap_for_api([prefixed], _caps)))
     if not vectors:
         return None
     return vectors[0].astype(np.float32)
@@ -928,7 +1112,7 @@ def embed(texts: List[str]) -> Optional[np.ndarray]:
     model = _get_model()
     if model is None or model == "api":
         return None
-    vectors = list(model.embed(prefixed))
+    vectors = list(model.embed(_cap_for_api(prefixed)))
     return np.stack(vectors).astype(np.float32)
 
 

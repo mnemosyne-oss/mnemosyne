@@ -9,18 +9,21 @@ Model cache: ~/.hermes/mnemosyne/models/
 Default model: openbmb/MiniCPM5-1B-GGUF (Q4_K_M, ~656MB)
 """
 
+import hashlib
 import logging
 import os
 import sys
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from mnemosyne.core.user_agent import application_user_agent
 
 # --- Config ------------------------------------------------------------------
-DEFAULT_MODEL_REPO = "openbmb/MiniCPM5-1B-GGUF"
-DEFAULT_MODEL_FILE = "MiniCPM5-1B-Q4_K_M.gguf"
+# The shipped artifact, in one place: the size notice below has to recognise it
+# however it was selected.
+_SHIPPED_MODEL = ("openbmb/MiniCPM5-1B-GGUF", "MiniCPM5-1B-Q4_K_M.gguf")
+DEFAULT_MODEL_REPO, DEFAULT_MODEL_FILE = _SHIPPED_MODEL
 MODEL_CACHE_DIR = Path.home() / ".hermes" / "mnemosyne" / "models"
 
 logger = logging.getLogger(__name__)
@@ -30,15 +33,11 @@ LLM_MAX_TOKENS=int(os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "2048") or "2048")
 LLM_N_THREADS = int(os.environ.get("MNEMOSYNE_LLM_N_THREADS", "4"))
 LLM_N_CTX = int(os.environ.get("MNEMOSYNE_LLM_N_CTX", "2048"))
 
-# Override model via env
-_env_repo = os.environ.get("MNEMOSYNE_LLM_REPO")
-_env_file = os.environ.get("MNEMOSYNE_LLM_FILE")
-if _env_repo and _env_file:
-    DEFAULT_MODEL_REPO = _env_repo
-    DEFAULT_MODEL_FILE = _env_file
+# Model selection is resolved per call, not captured here, so REPO and FILE set
+# after import still apply. See _resolve_model_selection().
 
-# Override the cache location via env. Environment-only and read at import, like
-# the repo/file overrides above. Unset or blank keeps the historical path.
+# Override the cache location via env. Environment-only and read at import,
+# unlike the model selection above. Unset or blank keeps the historical path.
 #
 # `strip()` decides only whether anything was named; the raw value is what
 # becomes the path, because a POSIX directory name may legitimately begin or end
@@ -158,9 +157,63 @@ def _ensure_sys_path():
         sys.path.append(sp)
 
 
+def _resolve_model_selection() -> Tuple[str, str]:
+    """Return the (repo id, filename) pair to load, resolved on every call.
+
+    FILE names the artifact and REPO names where to fetch it, and either one
+    works alone. A blank value counts as unset, matching the cache-dir override.
+    """
+    repo = (os.environ.get("MNEMOSYNE_LLM_REPO") or "").strip() or DEFAULT_MODEL_REPO
+    filename = (
+        (os.environ.get("MNEMOSYNE_LLM_FILE") or "").strip() or DEFAULT_MODEL_FILE
+    )
+    return repo, _checked_cache_filename(filename)
+
+
+def _checked_cache_filename(filename: str) -> str:
+    """Reject a parent-directory component in the selected filename.
+
+    A ``..`` component climbs out of the repository cache root, so one selection
+    could reach another repository's cached file, which is the collision this
+    change set out to remove. An absolute path is left alone: naming one exact
+    file is an explicit operator choice, and REPO does not apply to it.
+    """
+    if ".." in Path(filename).parts:
+        raise ValueError(
+            "MNEMOSYNE_LLM_FILE must not contain a parent-directory component, "
+            f"got {filename!r}"
+        )
+    return filename
+
+
+def _model_cache_root(repo_id: str) -> Path:
+    """Return the cache directory that holds this repository's artifacts.
+
+    The shipped repo keeps the historical flat root so existing caches keep
+    working. Any other repo is namespaced by a hash, because a filename alone
+    does not identify an artifact: two repos can ship the same name.
+    """
+    if repo_id == _SHIPPED_MODEL[0]:
+        return MODEL_CACHE_DIR
+    repo_key = hashlib.sha256(repo_id.encode("utf-8")).hexdigest()
+    return MODEL_CACHE_DIR / ".repositories" / repo_key
+
+
+def _model_cache_path(repo_id: str, filename: str) -> Path:
+    """Return the full cache path for one (repo id, filename) pair."""
+    return _model_cache_root(repo_id) / filename
+
+
 def _model_path() -> Optional[Path]:
-    """Return path to the local GGUF model file, or None if not downloaded."""
-    candidate = MODEL_CACHE_DIR / DEFAULT_MODEL_FILE
+    """Return path to the cached GGUF model file, or None if it is not there."""
+    try:
+        repo_id, filename = _resolve_model_selection()
+    except ValueError as exc:
+        # _load_llm() calls this outside its own try, so degrade here and say why
+        # rather than let an invalid selection escape to the caller.
+        logger.warning("%s", exc)
+        return None
+    candidate = _model_cache_path(repo_id, filename)
     return candidate if candidate.exists() else None
 
 
@@ -203,11 +256,27 @@ def _ensure_model_cache_dir() -> Path:
 
 
 def _download_model() -> Path:
-    """Download the GGUF model from HuggingFace if not present."""
+    """Download the selected GGUF model from HuggingFace if it is not cached."""
     _ensure_model_cache_dir()
-    local_path = MODEL_CACHE_DIR / DEFAULT_MODEL_FILE
+    repo_id, filename = _resolve_model_selection()
+    local_path = _model_cache_path(repo_id, filename)
     if local_path.exists():
         return local_path
+
+    if Path(filename).is_absolute():
+        # Nothing to fetch by name: the Hub needs a relative filename, and the
+        # selection already said exactly which file it means. Log first, because
+        # _load_llm() swallows this exception, so the record is the only
+        # diagnostic the operator ever sees.
+        logger.warning(
+            "MNEMOSYNE_LLM_FILE=%s is an absolute path that does not exist; "
+            "an absolute selection cannot be downloaded by name.",
+            filename,
+        )
+        raise ValueError(
+            "MNEMOSYNE_LLM_FILE is an absolute path, so the file must already "
+            f"exist; {filename!r} is not there and cannot be downloaded."
+        )
 
     try:
         from huggingface_hub import hf_hub_download
@@ -216,27 +285,55 @@ def _download_model() -> Path:
             "huggingface_hub not installed. Run: pip install huggingface-hub"
         )
 
-    default_artifact = (
-        DEFAULT_MODEL_REPO == "openbmb/MiniCPM5-1B-GGUF"
-        and DEFAULT_MODEL_FILE == "MiniCPM5-1B-Q4_K_M.gguf"
+    # The download root, not the file's parent: hf_hub_download joins the root
+    # with the filename, so a nested filename must keep its own separators.
+    cache_root = _model_cache_root(repo_id)
+    try:
+        cache_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "Could not create the local model cache directory %s for %s from %s: %s. "
+            "Point MNEMOSYNE_MODEL_CACHE_DIR at a writable directory, or fix its "
+            "permissions.",
+            cache_root,
+            filename,
+            repo_id,
+            exc,
+        )
+        raise
+    size_notice = (
+        " (approximately 656 MB)" if (repo_id, filename) == _SHIPPED_MODEL else ""
     )
-    size_notice = " (approximately 656 MB)" if default_artifact else ""
     logger.warning(
         "Downloading local LLM model %s from %s%s to %s. "
         "The current operation will block until the download completes. "
         "Set MNEMOSYNE_LLM_ENABLED=false for AAAK-only consolidation, "
         "or pre-cache the GGUF to avoid this download.",
-        DEFAULT_MODEL_FILE,
-        DEFAULT_MODEL_REPO,
+        filename,
+        repo_id,
         size_notice,
-        MODEL_CACHE_DIR,
+        local_path.parent,
     )
-    downloaded = hf_hub_download(
-        repo_id=DEFAULT_MODEL_REPO,
-        filename=DEFAULT_MODEL_FILE,
-        local_dir=str(MODEL_CACHE_DIR),
-        local_dir_use_symlinks=False,
-    )
+    try:
+        downloaded = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            local_dir=str(cache_root),
+            local_dir_use_symlinks=False,
+        )
+    except Exception as exc:
+        # _load_llm() swallows this and degrades to AAAK, so the message has to
+        # reach the log or a wrong repo/filename stays invisible.
+        logger.warning(
+            "Could not download local LLM model %s from %s into %s: %s. "
+            "Check MNEMOSYNE_LLM_REPO and MNEMOSYNE_LLM_FILE, or pre-cache the "
+            "GGUF at that path.",
+            filename,
+            repo_id,
+            local_path.parent,
+            exc,
+        )
+        raise
     return Path(downloaded)
 
 

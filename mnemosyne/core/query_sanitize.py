@@ -24,6 +24,11 @@ _PREFETCH_NAME_STAMP_RE = re.compile(
 )
 _NAME_INNER_RE = re.compile(r"[^\W\d_](?:[^\W\d_]|[ .'’\-]){0,47}")
 
+# Recognize only Hermes' serialized recent-channel envelope at the start.
+# A marker or sender stamp alone cannot distinguish an envelope from body text.
+_BACKFILL_HEADER = "[Recent channel messages]\n"
+_BACKFILL_MARKER = "\n\n[New message]\n"
+
 
 # Bracketed tokens that look name-shaped but are common content tags, not
 # speakers. Matched case-insensitively against the stamp's inner text.
@@ -105,14 +110,36 @@ def _is_name_stamp(inner: str) -> bool:
 
 
 def sanitize_prefetch_query(query: str) -> str:
-    """Remove leading speaker stamps without rewriting any retained query text.
+    """Remove channel backfill and leading speaker stamps without rewriting
+    any retained query text.
 
     Classification uses NFKC on bounded candidates, never on the query. The
-    returned suffix is sliced once from original input; no-stamp input is
-    returned unchanged. Separating whitespace belongs to the removed prefix.
-    Punctuation-only residue after a stamp is treated as no topical query.
+    returned suffix is sliced from the original input; input with neither
+    backfill nor stamp is returned unchanged. Separating whitespace belongs
+    to the removed prefix. Punctuation-only residue after a stamp is treated
+    as no topical query.
+
+    A recent-channel envelope must start with the exact header, contain
+    nonempty history, and have exactly one blank-line-delimited marker.
+    With multiple markers, history and current-body text are indistinguishable:
+    choosing the first can retain history; choosing the last can delete body
+    text. Keep such inputs intact rather than guess. Reliable removal for
+    those inputs requires an out-of-band current body or escaped serialization.
+    This is a serialization convention, not authentication; other channel
+    context formats are conservatively retained.
     """
     original = query or ""
+    if original.startswith(_BACKFILL_HEADER):
+        # An empty-history marker can share the header's final newline.
+        # Count it too, so a later body marker cannot look unique.
+        marker_start = len(_BACKFILL_HEADER) - 1
+        marker = original.find(_BACKFILL_MARKER, marker_start)
+        if (
+            marker >= 0
+            and marker == original.rfind(_BACKFILL_MARKER, marker_start)
+            and original[len(_BACKFILL_HEADER):marker].strip()
+        ):
+            original = original[marker + len(_BACKFILL_MARKER):]
     offset = 0
     while offset < len(original) and original[offset].isspace():
         offset += 1

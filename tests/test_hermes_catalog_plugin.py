@@ -8,9 +8,11 @@ PyPI project in integrations/hermes, and what the manifest declares matches the 
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -127,6 +129,62 @@ def test_declared_tools_are_real_package_tools():
     assert len(declared) == len(set(declared)), "duplicate tool declarations"
     assert set(declared) <= real, sorted(set(declared) - real)
     assert "mnemosyne_recall" in declared and "mnemosyne_remember" in declared
+
+
+def test_manifest_tools_match_isolated_wrapper_registrations(tmp_path):
+    """Hermes admission compares provides_tools with actual register(ctx) calls."""
+    code = textwrap.dedent("""\
+        import importlib.util
+        import json
+        import sys
+
+        sys.path.insert(0, sys.argv[1])
+        spec = importlib.util.spec_from_file_location("mnemosyne_catalog", sys.argv[2])
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        class RecordingContext:
+            plugin_config = {}
+            profile_name = "default"
+
+            def __init__(self):
+                self.tools = []
+
+            def register_memory_provider(self, provider):
+                self.provider = provider
+
+            def register_cli_command(self, **kwargs):
+                pass
+
+            def register_tool(self, name, **kwargs):
+                self.tools.append(name)
+
+        ctx = RecordingContext()
+        module.register(ctx)
+        print("registered-tools:" + json.dumps(ctx.tools))
+        """)
+    out = subprocess.run(
+        [sys.executable, "-c", code, str(PACKAGE_SRC), str(CATALOG / "__init__.py")],
+        capture_output=True, text=True, timeout=120, cwd=tmp_path,
+        env={
+            "HOME": str(tmp_path),
+            "HERMES_HOME": str(tmp_path / "hermes"),
+            "MNEMOSYNE_DATA_DIR": str(tmp_path / "mnemosyne"),
+            "MNEMOSYNE_NO_EMBEDDINGS": "1",
+            "PATH": "/usr/bin:/bin",
+        },
+    )
+    assert out.returncode == 0, out.stderr
+    registered = json.loads(next(
+        line.removeprefix("registered-tools:")
+        for line in out.stdout.splitlines() if line.startswith("registered-tools:")
+    ))
+    declared = _manifest()["provides_tools"]
+    assert registered, "wrapper register(ctx) registered no tools"
+    assert set(registered) == set(declared), {
+        "undeclared": sorted(set(registered) - set(declared)),
+        "unregistered": sorted(set(declared) - set(registered)),
+    }
 
 
 def test_shim_loads_in_a_fresh_process_and_exports_both_hooks():

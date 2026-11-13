@@ -61,6 +61,32 @@ validation in the corresponding Hermes distribution and release.
 
 ## Setup
 
+### Recall query bodies and channel envelopes
+
+Both Hermes providers sanitize prefetch and explicit `mnemosyne_recall` queries
+without changing captured text or stored memories. They recognize one serialized
+recent-channel envelope only when the query starts exactly with
+`[Recent channel messages]\n`, followed by nonempty history and a
+`\n\n[New message]\n` separator. Backfill is removed only when there is
+**exactly one** such separator. The remaining suffix then receives the usual
+leading speaker-stamp removal.
+
+Multiple separators make the boundary ambiguous: relay history can contain
+literal markers, and the current body can contain the same markers or nested
+envelopes. Choosing the first can retain old messages; choosing the last can
+truncate the current message. Both providers therefore retain the entire query
+in this case, including history. This avoids deleting current-message text but
+does **not** guarantee history-free recall. Even a single complete envelope can
+be ordinary quoted text; the header is a caller convention, not proof of origin.
+Callers needing reliable separation must pass the current body separately from
+channel history, or agree on an escaped or length-delimited upstream format.
+
+A marker or sender stamp alone does not identify an envelope. Unwrapped bodies,
+incomplete envelopes, and other channel-context formats retain their text,
+apart from the existing leading-stamp handling. This is a narrow text format
+contract, not sender authentication: callers must pass an ordinary body unless
+they intend the exact leading format above to be interpreted as an envelope.
+
 ### Step 1: Install
 
 **Choose an install mode first.** The default writes a symbolic link into the
@@ -460,27 +486,63 @@ mnemosyne-hermes install
 
 This creates the historical plugin symlink. Use wrapper mode above for Docker and persistent side venv deployments.
 
-#### Legacy manual symlink fallback
+#### Recover a legacy per-file plugin directory
 
-Hermes discovers directory plugins by scanning a folder on disk, not by reading pip metadata. Use the following manual fallback only for a local, mutable venv that is not using wrapper mode and has no existing plugin target. If you previously ran `mnemosyne-hermes install`, run `mnemosyne-hermes uninstall` first. Do not use this block as a troubleshooting step on top of an installer-managed symlink:
+Do not link individual package files. An upgrade can add a relative import without adding its link to an existing directory. The supported installer above links the whole package directory. Package-only upgrades do not repair a per-file directory.
+
+This recovery is only for an existing directory of per-file links into the **same** installed `mnemosyne_hermes` package, in an explicitly selected Hermes home. First determine the actual active `HERMES_HOME` and gateway Python using the installation route above; a PM-managed environment or shared install needs its own owner-approved package update before this step. Do not infer either path from the shell, a build venv or a profile name. Stop if the provider is a directory symlink, a wrapper, a foreign/custom plugin, or has profile-local plugin targets; handle those separately without deleting them. Never use `install --force` on this legacy directory: it can remove its contents.
+
+Export both variables to the verified paths, then run the following block once. The subshell stops on any failed check, install or status command without changing the caller's shell options. It checks ownership of every per-file link and moves the entire old directory to a backup **outside** the plugin discovery tree before invoking the installer. Regular custom files remain in that backup, not in the new package link. An existing backup blocks the operation.
+
+Before running the block, verify that `HERMES_PYTHON` imports the exact installed `mnemosyne_hermes` package that owns the legacy per-file links. A `mnemosyne-hermes` executable on `PATH`, or a provider installed only in a separate pipx environment, does not satisfy this prerequisite. Do not substitute the CLI interpreter without verifying ownership of those links.
 
 ```bash
-TARGET="$HOME/.hermes/plugins/mnemosyne"
-if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
-  printf 'Refusing to replace existing plugin target: %s\n' "$TARGET" >&2
-  exit 1
-fi
-PKG="$(~/.hermes/hermes-agent/venv/bin/python -c 'import pathlib, mnemosyne_hermes; print(pathlib.Path(mnemosyne_hermes.__file__).resolve().parent)')"
-if [ ! -d "$PKG" ]; then
-  printf 'Could not locate mnemosyne_hermes in the selected venv\n' >&2
-  exit 1
-fi
-mkdir -p "$TARGET"
-# Symlink the installed package contents into the manual plugin directory.
-ln -s "$PKG"/* "$TARGET/"
+(
+set -e
+: "${HERMES_HOME:?select the actual Hermes home first}"
+: "${HERMES_PYTHON:?select the gateway Python first}"
+"$HERMES_PYTHON" - <<'PY'
+import os
+from pathlib import Path
+import mnemosyne_hermes
+
+home = Path(os.environ["HERMES_HOME"]).expanduser().resolve(strict=True)
+package = Path(mnemosyne_hermes.__file__).resolve().parent
+target = home / "plugins" / "mnemosyne"
+backup = home / "mnemosyne-legacy-plugin-backup"
+if target.parent.is_symlink() or target.is_symlink() or not target.is_dir():
+    raise SystemExit("Not a local per-file directory; no changes made")
+if (home / "plugins" / "hermes-mnemosyne").exists() or (home / "plugins" / "hermes-mnemosyne").is_symlink():
+    raise SystemExit("Old plugin path also exists; inspect it first")
+if backup.exists() or backup.is_symlink():
+    raise SystemExit("Backup already exists; inspect it first")
+profiles = home / "profiles"
+if profiles.is_dir() and any(
+    (profile / "plugins" / "mnemosyne").exists()
+    or (profile / "plugins" / "mnemosyne").is_symlink()
+    for profile in profiles.iterdir() if profile.is_dir()
+):
+    raise SystemExit("Profile plugin targets exist; inspect their ownership first")
+init = target / "__init__.py"
+if not init.is_symlink() or init.resolve(strict=True) != package / "__init__.py":
+    raise SystemExit("Plugin initializer does not belong to this package")
+for child in target.iterdir():
+    if child.is_symlink():
+        link = Path(os.readlink(child))
+        if not link.is_absolute():
+            link = child.parent / link
+        if link.absolute() != package / child.name:
+            raise SystemExit(f"Foreign per-file link: {child}")
+target.rename(backup)
+print(f"Legacy directory retained at {backup}")
+PY
+"$HERMES_PYTHON" -m mnemosyne_hermes.install --hermes-home "$HERMES_HOME" install --mode symlink --python "$HERMES_PYTHON" --no-profile-links
+"$HERMES_PYTHON" -m mnemosyne_hermes.install --hermes-home "$HERMES_HOME" status
+hermes memory status
+)
 ```
 
-If you installed in a custom venv (for example, `~/.hermes-venv`), replace `~/.hermes/hermes-agent/venv/bin/python` with the Python binary inside that venv. Do not combine this manual mode with a wrapper directory, and do not use it to link Docker profiles to the side venv's `site-packages` package.
+If the installer or status fails, keep the backup and investigate the selected interpreter and home; do not rerun the move or remove the backup. Restart the active Hermes process after both statuses succeed, then verify capture, remember and recall in an isolated test session. This procedure does not establish survival across a native macOS PM update or repair cron initialization.
 
 #### Migrating from the legacy `mnemosyne-install` route
 
@@ -614,6 +676,23 @@ mnemosyne import-hindsight hindsight-export.json hermes
 mnemosyne doctor --bank default --format both
 mnemosyne repair --report mnemosyne-doctor.json --select working_memory:<ID> --dry-run
 ```
+
+JSON import restores working-memory rows without generating new embeddings.
+Newly restored `legacy_embeddings` do not populate `vec_working` in that import
+pass. Existing vectors in the destination's `memory_embeddings` can be backfilled
+into `vec_working`, including during a repeated import. When the export contains
+`legacy_embeddings`, their `memory_embeddings` vectors are restored and can serve
+working-memory vector recall through the JSON fallback when the dedicated index
+yields no candidates.
+Rows without exported vectors need embedding/index generation before dense
+retrieval; linear recall still applies its normal lexical admission rules.
+Episodic embeddings are restored from `episodic_embeddings` when present and
+supported by `sqlite-vec`. Use `mnemosyne store` for new memories. To rebuild
+vectors for existing rows, follow the [`mnemosyne reindex` workflow](cli-reference.md#health-and-repair):
+it re-embeds memories with non-empty content and, when `sqlite-vec` is available,
+rebuilds the vector tables. Preview with
+`--dry-run`; run it in the intended embedding runtime with the provider/gateway
+stopped. It backs up by default unless `--no-backup` is specified.
 
 For a database containing sqlite-vec `vec0` tables, install the optional
 `embeddings` extra (or compatible `sqlite-vec`) in the **same runtime** for
