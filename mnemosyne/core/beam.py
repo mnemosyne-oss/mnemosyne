@@ -8162,7 +8162,8 @@ class BeamMemory:
         cursor.execute("""
             SELECT id, content, source, timestamp, session_id,
                    importance, metadata_json, veracity, created_at,
-                   author_id, author_type, scope
+                   author_id, author_type, scope,
+                   channel_id, trust_tier
             FROM working_memory
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (memory_id, self.session_id))
@@ -8181,6 +8182,8 @@ class BeamMemory:
                 "author_id": row[9],
                 "author_type": row[10],
                 "scope": row[11],
+                "channel_id": row[12],
+                "trust_tier": row[13],
                 "memory_store": "working",
             }
 
@@ -8189,7 +8192,8 @@ class BeamMemory:
             SELECT id, content, source, timestamp, session_id,
                    importance, metadata_json, veracity, created_at,
                    author_id, author_type, scope,
-                   event_date, event_date_precision
+                   event_date, event_date_precision,
+                   channel_id, trust_tier
             FROM episodic_memory
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (memory_id, self.session_id))
@@ -8210,6 +8214,8 @@ class BeamMemory:
                 "scope": row[11],
                 "event_date": row[12],
                 "event_date_precision": row[13],
+                "channel_id": row[14],
+                "trust_tier": row[15],
                 "memory_store": "episodic",
             }
 
@@ -14324,7 +14330,7 @@ class BeamMemory:
                    metadata_json, valid_until, superseded_by, scope,
                    recall_count, last_recalled, created_at, veracity,
                    consolidated_at, consolidation_claimed_at,
-                   event_date, event_date_precision, pinned
+                   event_date, event_date_precision, pinned, channel_id, trust_tier
             FROM working_memory
             ORDER BY session_id, timestamp
         """)
@@ -14335,7 +14341,7 @@ class BeamMemory:
             SELECT rowid, id, content, source, timestamp, session_id, importance,
                    metadata_json, summary_of, valid_until, superseded_by, scope,
                    recall_count, last_recalled, created_at,
-                   event_date, event_date_precision
+                   event_date, event_date_precision, channel_id, trust_tier
             FROM episodic_memory
             ORDER BY session_id, timestamp
         """)
@@ -14466,8 +14472,8 @@ class BeamMemory:
                 (id, content, source, timestamp, session_id, importance, metadata_json,
                  valid_until, superseded_by, scope, recall_count, last_recalled, created_at,
                  veracity, consolidated_at, consolidation_claimed_at,
-                 event_date, event_date_precision, pinned)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 event_date, event_date_precision, pinned, channel_id, trust_tier)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 mid, item.get("content"), item.get("source"), _ts_for_insert,
                 item.get("session_id", "default"), item.get("importance", 0.5),
@@ -14485,6 +14491,9 @@ class BeamMemory:
                 # pinned rows keep their consolidation/trim exemption.
                 *_sanitize_import_event_date(item.get("event_date"), item.get("event_date_precision")),
                 _pin_for_insert,
+                # Missing keys retain the old import defaults; explicit NULL
+                # provenance must survive without adopting the reader's channel.
+                item.get("channel_id"), item.get("trust_tier", "STATED"),
             ))
         self.conn.commit()
         try:
@@ -14576,8 +14585,8 @@ class BeamMemory:
                 INSERT INTO episodic_memory
                 (id, content, source, timestamp, session_id, importance, metadata_json,
                  summary_of, valid_until, superseded_by, scope, recall_count, last_recalled, created_at,
-                 event_date, event_date_precision)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 event_date, event_date_precision, channel_id, trust_tier)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 mid, item.get("content"), item.get("source"), _ts_for_insert,
                 item.get("session_id", "default"), item.get("importance", 0.5),
@@ -14586,6 +14595,7 @@ class BeamMemory:
                 item.get("scope", "session"), item.get("recall_count", 0),
                 item.get("last_recalled"), item.get("created_at"),
                 *_sanitize_import_event_date(item.get("event_date"), item.get("event_date_precision")),
+                item.get("channel_id"), item.get("trust_tier", "STATED"),
             ))
             new_rowid = cursor.lastrowid
             old_to_new_rowid[item.get("rowid")] = new_rowid
