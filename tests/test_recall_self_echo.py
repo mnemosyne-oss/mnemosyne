@@ -132,6 +132,7 @@ def test_same_id_episodic_twin_keeps_own_content_tier_and_score(beam, monkeypatc
     from mnemosyne.core import embeddings
     monkeypatch.setattr(embeddings, "available", lambda: True)
     monkeypatch.setattr(embeddings, "embed", lambda _: np.array([[1.0, 0.0, 0.0]], dtype=np.float32))
+    monkeypatch.setattr(embeddings, "embed_query", lambda _: np.array([1.0, 0.0, 0.0], dtype=np.float32))
     engine = beam._get_polyphonic_engine()
     # Establish the actual episodic vector signal, without a temporal WM boost.
     only_episode = engine._vector_voice(np.array([1.0, 0.0, 0.0]), source=None,
@@ -161,6 +162,7 @@ def test_ineligible_episodic_twin_never_rescues_working_content(beam, monkeypatc
     from mnemosyne.core import embeddings
     monkeypatch.setattr(embeddings, "available", lambda: True)
     monkeypatch.setattr(embeddings, "embed", lambda _: np.array([[1.0, 0.0, 0.0]], dtype=np.float32))
+    monkeypatch.setattr(embeddings, "embed_query", lambda _: np.array([1.0, 0.0, 0.0], dtype=np.float32))
     assert recall(beam, snapshot(proof)) == []
 
 
