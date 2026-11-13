@@ -8426,6 +8426,9 @@ class BeamMemory:
         """
         Store a consolidated summary into episodic_memory with optional embedding.
 
+        New rows derive trust_tier from source using the same mapping as
+        remember(). Existing rows retain their stored provenance.
+
         Post-insert field overrides (applied atomically before the committing
         vector write; never manufacture fields the caller did not supply):
           - `event_timestamp`: propagates the source-row INGEST time into
@@ -8589,6 +8592,7 @@ class BeamMemory:
         # Resolve + clamp the initial tier and include it in the INSERT
         # (previously omitted -> schema default 1). See #506.
         row_tier = resolve_consolidation_tier(tier)
+        row_trust_tier = _source_to_trust_tier(source)
         # The episodic row, its metadata overrides and the vector write form
         # one transaction: a failure anywhere between the INSERT and the
         # commit rolls the whole row back (no partial episodic row can
@@ -8602,11 +8606,11 @@ class BeamMemory:
             cursor.execute("""
                 INSERT INTO episodic_memory
                 (id, content, source, timestamp, session_id, importance, metadata_json, summary_of, valid_until, scope,
-                 author_id, author_type, channel_id, memory_type, veracity, tier)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 author_id, author_type, channel_id, memory_type, veracity, tier, trust_tier)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (memory_id, _sanitize_utf8(summary), source, timestamp, self.session_id, importance,
                   json.dumps(metadata or {}), ",".join(source_wm_ids), valid_until, scope,
-                  self.author_id, self.author_type, self.channel_id, ep_type, row_veracity, row_tier))
+                  self.author_id, self.author_type, self.channel_id, ep_type, row_veracity, row_tier, row_trust_tier))
             rowid = cursor.lastrowid
 
             # Apply post-insert field overrides inside the same transaction.
