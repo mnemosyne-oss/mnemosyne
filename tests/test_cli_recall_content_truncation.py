@@ -1,9 +1,9 @@
 """Regression: `mnemosyne recall` must not silently truncate record content.
 
 The reporter in #685 could not tell a 150-char preview from a complete record:
-the line ended in `...` with nothing saying the record was cut. `--json` already
-emits full content, but it is undiscoverable from the truncated output and forces
-a machine-readable shape for a human who just wants to read the record.
+the line ended in `...` with nothing saying the record was cut. Public recall
+and JSON retain the backend content cap; human display can read selected stored
+or MEMORIA content without changing that bounded payload contract.
 
 These tests pin the property that matters: when the displayed content is shorter
 than the stored content, the output must say so, and a full read must be available
@@ -59,12 +59,6 @@ def test_truncation_is_announced_when_a_preview_cap_applies():
     assert not out.rstrip().endswith("..."), "a bare ellipsis still hides that the record was cut"
 
 
-def test_json_output_still_carries_full_content():
-    """The machine path is already correct and must not regress."""
-    payload = [{"id": "x", "content": LONG, "score": 0.5}]
-    assert json.loads(json.dumps({"query": "q", "results": payload}))["results"][0]["content"] == LONG
-
-
 def _run_cmd_recall(monkeypatch, args):
     """Drive the real command entry point with a stubbed memory backend.
 
@@ -104,6 +98,168 @@ def test_cmd_recall_json_flag_is_parsed_and_stays_complete(monkeypatch):
     out, _ = _run_cmd_recall(monkeypatch, ["network", "--json"])
     payload = json.loads(out)
     assert payload["results"][0]["content"] == LONG
+
+
+@pytest.fixture(params=["working", "episodic", "memoria"])
+def real_recall_content(request, tmp_path, monkeypatch):
+    """Exercise actual stored and generated recall content beyond the 500-char cap."""
+    from mnemosyne import cli
+    from mnemosyne.core.memory import Mnemosyne
+    import mnemosyne.core.beam as beam_module
+
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_BANK", "default")
+    monkeypatch.setattr(beam_module, "RECALL_CONTENT_CAP", 500)
+    memory = Mnemosyne(session_id="cli-content", db_path=tmp_path / "cli.db")
+    content = "orchid version details " * 60 + "COMPLETE-記録-END"
+    mid = memory.beam.remember(content, source="manual", scope="session")
+    query = "orchid version"
+    if request.param == "episodic":
+        memory.beam.conn.execute(
+            "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, importance) "
+            "SELECT id, content, source, timestamp, session_id, importance "
+            "FROM working_memory WHERE id=?", (mid,))
+        memory.beam.conn.execute("DELETE FROM working_memory WHERE id=?", (mid,))
+        memory.beam.conn.commit()
+    elif request.param == "memoria":
+        query = "What is the Orchid version?"
+        memory.beam.conn.execute(
+            "INSERT INTO memoria_facts "
+            "(session_id, fact_type, key, value, version_id, source_memory_id) "
+            "VALUES ('cli-content', 'version', 'Orchid', ?, 1, ?)", (content, mid))
+        memory.beam.conn.commit()
+        context = memory.beam.memoria_retrieve(query, top_k=3)
+        content = f"[MEMORIA {context['source']}]\n{context['context']}"
+        mid = "memoria_" + context["source"]
+    monkeypatch.setattr(cli, "_get_memory", lambda: memory)
+    return memory, query, mid, content
+
+
+@pytest.mark.parametrize("mode", ["human", "preview", "json", "explain"])
+def test_real_backend_cli_content_contract(real_recall_content, capsys, mode):
+    """Human output can expand selected hits; public recall and JSON stay capped."""
+    from mnemosyne import cli
+    import mnemosyne.core.beam as beam_module
+
+    memory, query, mid, content = real_recall_content
+    before = memory.recall(query, top_k=10)
+    original = next(r for r in before if r["id"] == mid)
+    assert original["content"] == content[:500], "fixture must hit the real backend cap"
+    displayed = cli._recall_display_results(memory, query, before)
+    assert [r["id"] for r in displayed] == [r["id"] for r in before]
+    assert [r["score"] for r in displayed] == [r["score"] for r in before]
+    args = [query, "10"]
+    if mode != "human":
+        args += ["--" + mode]
+    cli.cmd_recall(args)
+    out = capsys.readouterr().out
+    if mode == "preview":
+        assert f"showing 150 of {len(content)} chars" in out
+        assert "COMPLETE-記録-END" not in out
+    elif mode == "json":
+        row = next(r for r in json.loads(out)["results"] if r["id"] == mid)
+        assert row["content"] == content[:500]
+    else:
+        assert content in out
+    assert original["content"] == content[:500], "rendering must not mutate recall payloads"
+    assert beam_module.RECALL_CONTENT_CAP == 500
+    after = memory.recall(query, top_k=10)
+    assert next(r for r in after if r["id"] == mid)["content"] == content[:500]
+
+
+@pytest.mark.parametrize("tier", ["working", "episodic"])
+def test_human_expansion_keeps_selected_tier_with_duplicate_ids(tmp_path, monkeypatch, tier):
+    """A working-first get() must not replace an episodic hit with its ID alias."""
+    from mnemosyne import cli
+    from mnemosyne.core.memory import Mnemosyne
+    import mnemosyne.core.beam as beam_module
+
+    monkeypatch.setattr(beam_module, "RECALL_CONTENT_CAP", 500)
+    memory = Mnemosyne(session_id="reader", db_path=tmp_path / "aliases.db")
+    prefix = "iris " * 100
+    for table, tail in [("working_memory", "WORKING-END"), ("episodic_memory", "EPISODIC-END")]:
+        memory.beam.conn.execute(
+            f"INSERT INTO {table} (id, content, source, timestamp, session_id) "
+            "VALUES ('same-id', ?, 'manual', '2026-01-01', 'reader')", (prefix + tail,))
+    memory.beam.conn.commit()
+    result = {"id": "same-id", "tier": tier, "content": prefix, "score": 0.5}
+    expanded = cli._recall_display_results(memory, "iris", [result])
+    tail = "WORKING-END" if tier == "working" else "EPISODIC-END"
+    assert expanded[0]["content"] == prefix + tail
+    assert result["content"] == prefix
+
+
+@pytest.mark.parametrize("tier", ["working", "episodic"])
+@pytest.mark.parametrize("scope,visible", [("session", False), ("global", True)])
+def test_human_expansion_preserves_peer_visibility(tmp_path, monkeypatch, tier, scope, visible):
+    """The full-text reader accepts global peers and refuses private peers in both tiers."""
+    from mnemosyne import cli
+    from mnemosyne.core.memory import Mnemosyne
+    import mnemosyne.core.beam as beam_module
+
+    monkeypatch.setattr(beam_module, "RECALL_CONTENT_CAP", 500)
+    memory = Mnemosyne(session_id="reader", db_path=tmp_path / "peers.db")
+    table = "working_memory" if tier == "working" else "episodic_memory"
+    prefix = "iris " * 100
+    memory.beam.conn.execute(
+        f"INSERT INTO {table} (id, content, source, timestamp, session_id, scope) "
+        "VALUES ('peer', ?, 'manual', '2026-01-01', 'other-session', ?)",
+        (prefix + "PEER-TAIL", scope))
+    memory.beam.conn.commit()
+    result = {"id": "peer", "tier": tier, "content": prefix, "score": 0.5}
+    expanded = cli._recall_display_results(memory, "iris", [result])[0]
+    assert expanded["content"] == (prefix + "PEER-TAIL" if visible else prefix)
+    assert bool(expanded.get("_cli_incomplete_content")) is (not visible)
+
+
+@pytest.mark.parametrize("case", ["changed", "missing", "unknown-tier"])
+def test_unavailable_full_content_has_explicit_unknown_length(
+        tmp_path, monkeypatch, capsys, case):
+    """Never substitute changed text or claim a capped total is full."""
+    from mnemosyne import cli
+    from mnemosyne.core.memory import Mnemosyne
+    import mnemosyne.core.beam as beam_module
+
+    monkeypatch.setattr(beam_module, "RECALL_CONTENT_CAP", 500)
+    memory = Mnemosyne(session_id="reader", db_path=tmp_path / "scope.db")
+    prefix = "iris " * 100
+    body = "changed " + prefix if case == "changed" else prefix + "PRIVATE-TAIL"
+    if case != "missing":
+        memory.beam.conn.execute(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id, scope) "
+            "VALUES ('selected', ?, 'manual', '2026-01-01', ?, 'session')",
+            (body, "reader"))
+        memory.beam.conn.commit()
+    result = {"id": "selected", "tier": "other" if case == "unknown-tier" else "working",
+              "content": prefix, "score": 0.5}
+    expanded = cli._recall_display_results(memory, "iris", [result])
+    assert expanded[0]["content"] == prefix
+    cli._print_recall_results("iris", expanded)
+    out = capsys.readouterr().out
+    assert "Full content unavailable; showing recall preview" in out
+    assert "PRIVATE-TAIL" not in out
+    cli._print_recall_results("iris", expanded, preview=True)
+    preview = capsys.readouterr().out
+    assert "full length unavailable" in preview
+    assert "of 500" not in preview
+
+
+@pytest.mark.parametrize("real_recall_content", ["working"], indirect=True)
+def test_human_expansion_keeps_enhanced_cache_and_json_capped(
+        real_recall_content, monkeypatch, capsys):
+    """Displaying a warmed enhanced hit cannot grow later cached/public payloads."""
+    from mnemosyne import cli
+
+    memory, query, mid, content = real_recall_content
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    memory.recall(query, top_k=10)
+    cli.cmd_recall([query, "10"])
+    assert content in capsys.readouterr().out
+    cli.cmd_recall([query, "10", "--json"])
+    rows = json.loads(capsys.readouterr().out)["results"]
+    assert next(r for r in rows if r["id"] == mid)["content"] == content[:500]
 
 
 if __name__ == "__main__":

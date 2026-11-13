@@ -173,6 +173,49 @@ def cmd_store(args):
 _RECALL_PREVIEW_CHARS = 150
 
 
+def _recall_display_results(memory, query, results):
+    """Expand selected hits for human output without changing recall or its cache.
+
+    Stored rows are read from their selected tier using get()'s session/global
+    visibility. MEMORIA aggregates are regenerated through their existing reader.
+    An unavailable source or mismatching prefix stays an explicitly labelled
+    recall preview. This is a current read, not a historical content snapshot.
+    """
+    import sqlite3
+    from mnemosyne.core.beam import RECALL_CONTENT_CAP
+
+    displayed = []
+    aggregate = None
+    for result in results:
+        item = dict(result)
+        content = item.get("content", "")
+        if isinstance(content, str) and len(content) >= RECALL_CONTENT_CAP:
+            full = None
+            tier = item.get("tier")
+            table = {"working": "working_memory", "episodic": "episodic_memory"}.get(tier)
+            try:
+                beam = memory.beam
+                if table:
+                    row = beam.conn.execute(
+                        f"SELECT content FROM {table} WHERE id=? "
+                        "AND (session_id=? OR scope='global')",
+                        (item.get("id"), beam.session_id)).fetchone()
+                    full = row[0] if row else None
+                elif tier == "memoria":
+                    if aggregate is None:
+                        aggregate = beam.memoria_retrieve(query, top_k=3)
+                    if item.get("id") == "memoria_" + aggregate.get("source", ""):
+                        full = f"[MEMORIA {aggregate['source']}]\n{aggregate.get('context', '')}"
+            except sqlite3.Error:
+                full = None
+            if isinstance(full, str) and full.startswith(content):
+                item["content"] = full
+            else:
+                item["_cli_incomplete_content"] = True
+        displayed.append(item)
+    return displayed
+
+
 def _print_recall_results(query, results, *, preview=False):
     """Render recall results for a human reader.
 
@@ -189,9 +232,14 @@ def _print_recall_results(query, results, *, preview=False):
         print(f"  ID: {r.get('id', '?')}")
         if preview and len(content) > _RECALL_PREVIEW_CHARS:
             print(f"  Content: {content[:_RECALL_PREVIEW_CHARS]}")
-            print(f"  Content truncated: showing {_RECALL_PREVIEW_CHARS} of {len(content)} chars")
+            if r.get("_cli_incomplete_content"):
+                print(f"  Content truncated: showing {_RECALL_PREVIEW_CHARS} chars; full length unavailable")
+            else:
+                print(f"  Content truncated: showing {_RECALL_PREVIEW_CHARS} of {len(content)} chars")
         else:
             print(f"  Content: {content}")
+            if r.get("_cli_incomplete_content"):
+                print("  Full content unavailable; showing recall preview")
         print(f"  Score: {score:.3f}")
         if r.get("entity_match"):
             print("  [entity match]")
@@ -248,7 +296,7 @@ def cmd_recall(args):
             print(json.dumps({"query": query, "top_k": top_k, "results": results}, ensure_ascii=False, default=str))
         return
 
-    _print_recall_results(query, results, preview=preview)
+    _print_recall_results(query, _recall_display_results(mem, query, results), preview=preview)
 
 
 def cmd_media(args):
