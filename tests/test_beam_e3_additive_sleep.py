@@ -17,14 +17,112 @@ This blocks experiment Arm B (ADD-only ingest) of the BEAM-recovery
 experiment.
 """
 
+import os
 import sqlite3
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from mnemosyne.core.beam import BeamMemory
+
+
+def _naive_utc_now():
+    """Naive-UTC "now", the shape reclaim_orphans() and the working-memory
+    TTL trim build their cutoffs in. Fixtures compared against those
+    cutoffs must use it; datetime.now() shifts them by the host offset."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+@pytest.fixture(params=["UTC", "Asia/Tokyo", "America/Los_Angeles"])
+def utc_boundary_clock(request, monkeypatch):
+    """Exercise real host offsets while fixing the UTC instant for boundaries."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("host timezone switching requires tzset")
+    import mnemosyne.core.beam as beam_module
+
+    previous = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", request.param)
+    time.tzset()
+    instant = datetime(2030, 6, 15, 12, tzinfo=timezone.utc)
+
+    class FixedClock(datetime):
+        """Preserve datetime.now's local-vs-aware behavior at one fixed instant."""
+
+        @classmethod
+        def now(cls, tz=None):
+            return (instant.astimezone(tz) if tz is not None
+                    else instant.astimezone().replace(tzinfo=None))
+
+    monkeypatch.setattr(beam_module, "datetime", FixedClock)
+    monkeypatch.setitem(_naive_utc_now.__globals__, "datetime", FixedClock)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+
+
+def test_reclaim_utc_fixture_pins_stale_boundary(temp_db, utc_boundary_clock):
+    """A local-wall-clock fixture would reclaim the wrong boundary rows."""
+    now = _naive_utc_now()
+    assert now == datetime(2030, 6, 15, 12)
+    assert now.tzinfo is None
+    beam = BeamMemory(session_id="boundary", db_path=temp_db)
+    claims = {
+        "stale": now - timedelta(hours=1, seconds=1),
+        "exact": now - timedelta(hours=1),
+        "fresh": now - timedelta(hours=1) + timedelta(seconds=1),
+        "referenced": now - timedelta(hours=1, seconds=1),
+    }
+    beam.conn.executemany(
+        "INSERT INTO working_memory "
+        "(id, content, source, timestamp, session_id, consolidated_at, consolidation_claimed_at) "
+        "VALUES (?, ?, 'conversation', '2030-06-01T00:00:00', 'boundary', ?, ?)",
+        [(mid, mid, claim.isoformat(), claim.isoformat()) for mid, claim in claims.items()])
+    beam.conn.execute(
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, summary_of) "
+        "VALUES ('summary', 'retained summary', 'sleep_consolidation', "
+        "'2030-06-15T12:00:00', 'boundary', 'referenced')")
+    beam.conn.commit()
+
+    result = beam.reclaim_orphans(stale_after_seconds=3600)
+    assert result["candidate_ids"] == ["stale"]
+    assert result["reclaimed"] == 1
+    with sqlite3.connect(temp_db) as reader:
+        rows = dict(reader.execute("SELECT id, consolidation_claimed_at FROM working_memory"))
+    assert rows["stale"] is None
+    assert all(rows[mid] == claims[mid].isoformat() for mid in ("exact", "fresh", "referenced"))
+
+
+def test_trim_utc_fixture_pins_ttl_and_preservation(temp_db, utc_boundary_clock, monkeypatch):
+    """TTL deletes only expired unprotected rows in the active session."""
+    import mnemosyne.core.beam as beam_module
+
+    monkeypatch.setattr(beam_module, "WORKING_MEMORY_TTL_HOURS", 24)
+    monkeypatch.setattr(beam_module, "WORKING_MEMORY_MAX_ITEMS", 100)
+    beam = BeamMemory(session_id="boundary", db_path=temp_db)
+    cutoff = _naive_utc_now() - timedelta(hours=24)
+    beam.conn.executemany(
+        "INSERT INTO working_memory "
+        "(id, content, source, timestamp, session_id, consolidated_at, pinned) "
+        "VALUES (?, ?, 'conversation', ?, ?, ?, ?)",
+        [("stale", "stale", (cutoff - timedelta(seconds=1)).isoformat(), "boundary", None, 0),
+         ("exact", "exact", cutoff.isoformat(), "boundary", None, 0),
+         ("fresh", "fresh", (cutoff + timedelta(seconds=1)).isoformat(), "boundary", None, 0),
+         ("consolidated", "original", "2030-06-01T00:00:00", "boundary", "2030-06-14", 0),
+         ("pinned", "pinned", "2030-06-01T00:00:00", "boundary", None, 1),
+         ("peer", "peer", "2030-06-01T00:00:00", "other-session", None, 0)])
+    beam.conn.commit()
+    beam._trim_working_memory()
+    with sqlite3.connect(temp_db) as reader:
+        remaining = {row[0] for row in reader.execute("SELECT id FROM working_memory")}
+    assert remaining == {"exact", "fresh", "consolidated", "pinned", "peer"}
 
 
 @pytest.fixture
@@ -377,7 +475,7 @@ class TestE3AdditiveSleep:
 
         # Backdate the row past the trim cutoff (= WORKING_MEMORY_TTL_HOURS).
         very_old = (
-            datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS + 5)
+            _naive_utc_now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS + 5)
         ).isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.execute(
@@ -452,7 +550,7 @@ class TestE3AdditiveSleep:
     def test_reclaim_orphans_clears_stale_claim_without_summary(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         _seed_old_wm(temp_db, "s1", n=1)
-        stale_claim = (datetime.now() - timedelta(hours=2)).isoformat()
+        stale_claim = (_naive_utc_now() - timedelta(hours=2)).isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.execute(
             "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? WHERE id = ?",
@@ -471,7 +569,7 @@ class TestE3AdditiveSleep:
     def test_reclaim_orphans_preserves_referenced_claims_and_avoids_partial_matches(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
-        stale_claim = (datetime.now() - timedelta(hours=2)).isoformat()
+        stale_claim = (_naive_utc_now() - timedelta(hours=2)).isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.executemany(
             """
@@ -503,8 +601,8 @@ class TestE3AdditiveSleep:
     def test_reclaim_orphans_respects_stale_threshold(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
-        stale_claim = (datetime.now() - timedelta(hours=2)).isoformat()
-        fresh_claim = datetime.now().isoformat()
+        stale_claim = (_naive_utc_now() - timedelta(hours=2)).isoformat()
+        fresh_claim = _naive_utc_now().isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.executemany(
             """
@@ -529,7 +627,7 @@ class TestE3AdditiveSleep:
     def test_reclaim_orphans_dry_run_writes_nothing(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         _seed_old_wm(temp_db, "s1", n=1)
-        stale_claim = (datetime.now() - timedelta(hours=2)).isoformat()
+        stale_claim = (_naive_utc_now() - timedelta(hours=2)).isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.execute(
             "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? WHERE id = ?",
@@ -606,7 +704,7 @@ class TestE3AdditiveSleep:
         )
         beam = BeamMemory(session_id="maintenance", db_path=temp_db)
         _seed_old_wm(temp_db, "s1", n=1)
-        stale_claim = (datetime.now() - timedelta(hours=2)).isoformat()
+        stale_claim = (_naive_utc_now() - timedelta(hours=2)).isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.execute(
             "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? WHERE id = ?",
