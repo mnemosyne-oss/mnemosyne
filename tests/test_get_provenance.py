@@ -1,6 +1,8 @@
 """Identity and scope provenance for direct BEAM reads."""
 
+import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -175,3 +177,114 @@ def test_get_provenance_keeps_session_visibility(tmp_path, monkeypatch, memory_s
     assert result["trust_tier"] == "STATED"
     assert reader.get(private_id) is None
     assert reader.get("missing-memory-id") is None
+
+
+@pytest.mark.parametrize("memory_store", ["working", "episodic"])
+@pytest.mark.parametrize(
+    ("channel_id", "trust_tier"),
+    [("cursor", "EXTERNAL_WRITE"), (None, "IMPORTED"), ("archive", None), (None, None)],
+)
+def test_json_roundtrip_preserves_stored_provenance(
+    tmp_path, monkeypatch, memory_store, channel_id, trust_tier
+):
+    """Backup, restore and forced restore retain values and explicit NULLs."""
+    _use_empty_config(tmp_path, monkeypatch)
+    source = BeamMemory(session_id="fleet", db_path=tmp_path / "source.db")
+    target = BeamMemory(
+        session_id="fleet", db_path=tmp_path / "target.db", channel_id="reader"
+    )
+    try:
+        if memory_store == "working":
+            memory_id = source.remember("backup provenance sentinel", source="mcp")
+        else:
+            memory_id = source.consolidate_to_episodic(
+                "backup provenance sentinel", [], source="mcp"
+            )
+        source.conn.execute(
+            f"UPDATE {memory_store}_memory SET channel_id = ?, trust_tier = ? WHERE id = ?",
+            (channel_id, trust_tier, memory_id),
+        )
+        source.conn.commit()
+        payload = json.loads(json.dumps(source.export_to_dict()))
+        exported = next(row for row in payload[f"{memory_store}_memory"] if row["id"] == memory_id)
+        assert exported["channel_id"] == channel_id
+        assert exported["trust_tier"] == trust_tier
+
+        stats = target.import_from_dict(payload)
+        assert stats[f"{memory_store}_memory"]["inserted"] == 1
+        result = target.get(memory_id)
+        assert result["channel_id"] == channel_id
+        assert result["trust_tier"] == trust_tier
+
+        target.conn.execute(
+            f"UPDATE {memory_store}_memory SET channel_id = 'existing', trust_tier = 'STATED' WHERE id = ?",
+            (memory_id,),
+        )
+        target.conn.commit()
+        stats = target.import_from_dict(payload)
+        assert stats[f"{memory_store}_memory"]["skipped"] == 1
+        assert target.get(memory_id)["channel_id"] == "existing"
+        stats = target.import_from_dict(payload, force=True)
+        assert stats[f"{memory_store}_memory"]["overwritten"] == 1
+        result = target.get(memory_id)
+        assert result["channel_id"] == channel_id
+        assert result["trust_tier"] == trust_tier
+    finally:
+        source.conn.close()
+        target.conn.close()
+
+
+@pytest.mark.parametrize("memory_store", ["working", "episodic"])
+def test_import_without_provenance_keeps_legacy_defaults(tmp_path, monkeypatch, memory_store):
+    """Older exports without the new keys retain the previous import defaults."""
+    _use_empty_config(tmp_path, monkeypatch)
+    memory = BeamMemory(session_id="fleet", db_path=tmp_path / "legacy-import.db")
+    try:
+        payload = {
+            f"{memory_store}_memory": [{
+                "id": "legacy-import", "content": "old export provenance sentinel",
+                "timestamp": "2026-01-01T00:00:00", "session_id": "fleet",
+                "source": "mcp",
+            }]
+        }
+        memory.import_from_dict(json.loads(json.dumps(payload)))
+        result = memory.get("legacy-import")
+        assert result["channel_id"] is None
+        assert result["trust_tier"] == "STATED"
+    finally:
+        memory.conn.close()
+
+
+def test_sleep_summary_has_derived_provenance(tmp_path, monkeypatch):
+    """The real sleep write stores generated summaries as DERIVED, not STATED."""
+    _use_empty_config(tmp_path, monkeypatch)
+    from mnemosyne.core import local_llm
+
+    summary = "The user prefers dark mode for the project dashboard."
+    monkeypatch.setattr(local_llm, "llm_available", lambda: True)
+    monkeypatch.setattr(local_llm, "_summarize_memories", lambda *_args, **_kwargs: summary)
+    memory = BeamMemory(
+        session_id="fleet", db_path=tmp_path / "sleep.db", channel_id="writer"
+    )
+    try:
+        memory_id = memory.remember("The project dashboard should use dark mode.", source="conversation")
+        old_timestamp = (
+            datetime.now(timezone.utc) - timedelta(hours=200)
+        ).replace(tzinfo=None).isoformat()
+        memory.conn.execute(
+            "UPDATE working_memory SET timestamp = ? WHERE id = ?", (old_timestamp, memory_id)
+        )
+        memory.conn.commit()
+        outcome = memory.sleep()
+        assert outcome["status"] == "consolidated"
+        assert outcome["llm_used"] == 1
+        row = memory.conn.execute(
+            "SELECT id FROM episodic_memory WHERE source = 'sleep_consolidation'"
+        ).fetchone()
+        result = memory.get(row["id"])
+        assert result["content"] == summary
+        assert result["channel_id"] == "writer"
+        assert result["trust_tier"] == "DERIVED"
+        assert memory.get(memory_id)["trust_tier"] == "STATED"
+    finally:
+        memory.conn.close()

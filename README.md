@@ -227,6 +227,10 @@ work_mem.remember("Sprint review on Friday")
 Direct reads with `beam.get(memory_id)`, `Mnemosyne.get()`, and MCP
 `mnemosyne_get` include the stored `channel_id` and `trust_tier` for working
 and episodic memories. These fields may be `None` in rows without recorded values.
+JSON export/import preserves both fields, including explicit `None` values.
+Older exports without these keys retain the import defaults (`channel_id=None`,
+`trust_tier="STATED"`). Newly consolidated summaries derive their trust tier from
+their source; sleep summaries are stored as `DERIVED`.
 
 When consolidation uses an OpenAI-compatible LLM endpoint (`MNEMOSYNE_LLM_BASE_URL`),
 Markdown bullet facts in its summaries are preserved. Prompt/token cleanup and
