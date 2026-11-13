@@ -33,7 +33,7 @@ except Exception:
 # --- fastembed (local ONNX) ---
 import warnings
 
-# fastembed >=0.7 switched several supported models (multilingual-e5-large,
+# fastembed >=0.6 switched several supported models (multilingual-e5-large,
 # paraphrase-multilingual-MiniLM-L12-v2, paraphrase-multilingual-mpnet-base-v2,
 # thenlper/gte-large) from CLS -> mean pooling. The new behaviour matches their
 # SentenceTransformers pooling configuration; suppress the migration warning.

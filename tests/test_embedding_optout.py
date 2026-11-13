@@ -46,21 +46,30 @@ def test_is_disabled_default_false():
     assert embeddings._is_disabled() is False
 
 
-def test_fastembed_mean_pooling_warning_is_suppressed_for_multilingual_minilm():
-    """FastEmbed's expected pooling migration warning must not pollute startup."""
+@pytest.mark.parametrize("model", [
+    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "intfloat/multilingual-e5-large",
+])
+def test_fastembed_mean_pooling_warning_preserves_other_diagnostics(model):
+    """Suppress the migration UserWarning, preserving category and stderr controls."""
     env = os.environ.copy()
     env.pop("PYTHONWARNINGS", None)
+    env["MNEMOSYNE_NO_EMBEDDINGS"] = "1"
     result = subprocess.run(
         [
             sys.executable,
             "-c",
             (
-                "import warnings\n"
+                "import sys, warnings\n"
+                "warnings.simplefilter('always')\n"
                 "from mnemosyne.core import embeddings\n"
-                "warnings.warn("
-                "'The model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 "
-                "now uses mean pooling instead of CLS embedding.', UserWarning)"
+                "message = 'The model ' + sys.argv[1] + ' now uses mean pooling instead of CLS embedding.'\n"
+                "warnings.warn('expected-user-control: ' + message, UserWarning)\n"
+                "warnings.warn('category-control: ' + message, RuntimeWarning)\n"
+                "warnings.warn('unrelated-user-control', UserWarning)\n"
+                "sys.stderr.write('native-device-control\\n')\n"
             ),
+            model,
         ],
         capture_output=True,
         check=True,
@@ -71,7 +80,10 @@ def test_fastembed_mean_pooling_warning_is_suppressed_for_multilingual_minilm():
     # Unrelated native logging (e.g. onnxruntime's device_discovery PCI
     # warnings on some CI runners) may reach stderr; the only thing under
     # test is that the pooling migration warning is suppressed.
-    assert "now uses mean pooling" not in result.stderr
+    assert "expected-user-control" not in result.stderr
+    assert "category-control" in result.stderr
+    assert "unrelated-user-control" in result.stderr
+    assert "native-device-control" in result.stderr
 
 
 def test_is_disabled_no_embeddings_flag(monkeypatch):
