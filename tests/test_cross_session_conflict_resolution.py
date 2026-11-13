@@ -776,6 +776,188 @@ def _cache_rows(db_path):
     return rows
 
 
+@pytest.fixture
+def cache_pair(temp_db, monkeypatch):
+    """Use real global memories; stub only detection and external LLM verdicts."""
+    import mnemosyne.core.llm_conflict_detector as lcd
+
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+    monkeypatch.setattr(lcd, "validate_conflict_pair",
+                        lambda *a, **kw: (False, 0.2, None, "valid"))
+    older = BeamMemory(session_id="cache-older", db_path=temp_db)
+    newer = BeamMemory(session_id="cache-newer", db_path=temp_db)
+    ids = (
+        older.remember("[USER] cache fact one", source="conversation",
+                       importance=0.7, scope="global"),
+        newer.remember("[USER] cache fact two", source="conversation",
+                       importance=0.7, scope="global"),
+    )
+    older._detect_conflicts = _stub_detect_pair(*ids)
+    return older, newer, ids
+
+
+@pytest.mark.parametrize("raw,days", [
+    (None, 30), ("7", 7), ("invalid", 30), ("0", 1), ("-2", 1),
+])
+def test_cache_persisted_ttl_honors_configuration(cache_pair, monkeypatch, raw, days):
+    """Ignoring TTL configuration must change the independently read expiry."""
+    resolver, _, ids = cache_pair
+    name = "MNEMOSYNE_CROSS_SESSION_VERDICT_TTL_DAYS"
+    if raw is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, raw)
+
+    result = resolver.resolve_cross_session_conflicts()
+    assert result["llm_validations"] == 1
+    rows = _cache_rows(resolver.db_path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row["older_id"], row["newer_id"]) == ids
+    assert row["verdict"] == "reject"
+    assert (datetime.fromisoformat(row["expires_at"])
+            - datetime.fromisoformat(row["decided_at"])) == timedelta(days=days)
+
+
+@pytest.mark.parametrize("llm_eval", [False, True])
+def test_cache_legacy_schema_is_read_only_until_apply(cache_pair, llm_eval):
+    """Preview must not migrate; apply must revalidate an actual unsigned row."""
+    resolver, _, ids = cache_pair
+    resolver.conn.execute(
+        "CREATE TABLE cross_session_verdict_cache ("
+        "older_id TEXT NOT NULL, newer_id TEXT NOT NULL, verdict TEXT NOT NULL, "
+        "confidence REAL, decided_at TEXT NOT NULL, expires_at TEXT NOT NULL, "
+        "PRIMARY KEY (older_id, newer_id))")
+    resolver.conn.execute(
+        "INSERT INTO cross_session_verdict_cache VALUES (?, ?, 'reject', 0.9, ?, ?)",
+        (*ids, "2000-01-01T00:00:00+00:00", "9999-01-01T00:00:00+00:00"))
+    resolver.conn.commit()
+
+    with sqlite3.connect(resolver.db_path) as reader:
+        before_schema = reader.execute(
+            "SELECT sql FROM sqlite_master WHERE name='cross_session_verdict_cache'"
+        ).fetchone()[0]
+    before_rows = _cache_rows(resolver.db_path)
+    preview = resolver.resolve_cross_session_conflicts(dry_run=True, llm_eval=llm_eval)
+    assert preview["status"] == "dry_run"
+    assert preview["skipped_cached"] == 0
+    assert preview["llm_validations"] == int(llm_eval)
+    assert not resolver.conn.in_transaction
+    with sqlite3.connect(resolver.db_path) as reader:
+        assert reader.execute(
+            "SELECT sql FROM sqlite_master WHERE name='cross_session_verdict_cache'"
+        ).fetchone()[0] == before_schema
+    assert _cache_rows(resolver.db_path) == before_rows
+
+    applied = resolver.resolve_cross_session_conflicts()
+    assert applied["llm_validations"] == 1
+    assert applied["skipped_cached"] == 0
+    assert not resolver.conn.in_transaction
+    with sqlite3.connect(resolver.db_path) as reader:
+        assert "content_sig" in {r[1] for r in reader.execute(
+            "PRAGMA table_info(cross_session_verdict_cache)")}
+    rows = _cache_rows(resolver.db_path)
+    assert len(rows) == 1
+    assert (rows[0]["older_id"], rows[0]["newer_id"]) == ids
+    assert rows[0]["content_sig"]
+    assert rows[0]["confidence"] == 0.2  # actual re-adjudication replaces 0.9
+    cached = resolver.resolve_cross_session_conflicts()
+    assert cached["llm_validations"] == 0 and cached["skipped_cached"] == 1
+
+
+@pytest.mark.parametrize("failure", ["lookup", "flush", "after_commit_flush"])
+def test_cache_failure_preserves_result_and_caller_transaction(
+        cache_pair, monkeypatch, failure):
+    """An optional-cache exception cannot fail resolution or commit caller work."""
+    resolver, _, ids = cache_pair
+    resolver.conn.execute("CREATE TABLE caller_marker (value TEXT)")
+    resolver.conn.commit()
+    failures = []
+
+    def fail_cache(*args, **kwargs):
+        """Inject a genuine cache error at the chosen I/O boundary."""
+        failures.append(failure)
+        raise sqlite3.OperationalError("injected optional-cache failure")
+
+    target = "_csverdict_cached_rejects" if failure == "lookup" else "_csverdict_flush"
+    monkeypatch.setattr(resolver, target, fail_cache)
+    if failure == "after_commit_flush":
+        resolver.conn.execute("BEGIN DEFERRED")
+        resolver.conn.execute("INSERT INTO caller_marker VALUES ('caller-owned')")
+
+    result = resolver.resolve_cross_session_conflicts()
+    assert result["status"] == "no_op"
+    assert result["llm_validations"] == 1
+    assert result["invalidated"] == result["conflicts_resolved"] == 0
+    assert result["skipped_cached"] == 0
+    assert result["llm_cap_reached"] is False
+    with sqlite3.connect(resolver.db_path) as reader:
+        assert reader.execute("SELECT * FROM caller_marker").fetchall() == []
+        retained = reader.execute(
+            "SELECT id FROM working_memory WHERE superseded_by IS NULL AND id IN (?, ?)",
+            ids).fetchall()
+        assert {row[0] for row in retained} == set(ids)
+
+    if failure == "after_commit_flush":
+        assert resolver.conn.in_transaction
+        assert failures == [], "flush must wait for the caller's commit"
+        resolver.conn.commit()  # cache-hook failure must not undo or raise after commit
+        assert not resolver.conn.in_transaction
+        with sqlite3.connect(resolver.db_path) as reader:
+            assert reader.execute("SELECT * FROM caller_marker").fetchall() == [
+                ("caller-owned",)]
+    else:
+        assert not resolver.conn.in_transaction
+    assert failures == [failure], "the injected failure path must actually execute"
+    with sqlite3.connect(resolver.db_path) as reader:
+        table = reader.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='cross_session_verdict_cache'"
+        ).fetchone()
+    if failure == "lookup":
+        assert len(_cache_rows(resolver.db_path)) == 1  # lookup failure still validates/writes
+    else:
+        assert table is None  # failed flush cannot pretend its verdict was saved
+
+
+def test_cached_reject_does_not_consume_uncached_validation_budget(cache_pair, monkeypatch):
+    """A cache hit before a fresh contradiction must leave its sole LLM slot free."""
+    import mnemosyne.core.llm_conflict_detector as lcd
+
+    resolver, newer, cached_ids = cache_pair
+    assert resolver.resolve_cross_session_conflicts()["llm_validations"] == 1
+    before_cache = _cache_rows(resolver.db_path)
+    fresh_ids = (
+        resolver.remember("[USER] fresh fact before", source="conversation",
+                          importance=0.7, scope="global"),
+        newer.remember("[USER] fresh fact after", source="conversation",
+                       importance=0.7, scope="global"),
+    )
+    resolver._detect_conflicts = lambda *a, **kw: [cached_ids, fresh_ids]
+    validations = []
+
+    def confirm_fresh(older, newer, **kwargs):
+        """Make the uncached pair's real supersession observable."""
+        validations.append((older, newer))
+        return True, 0.99, None, "valid"
+
+    monkeypatch.setattr(lcd, "validate_conflict_pair", confirm_fresh)
+    result = resolver.resolve_cross_session_conflicts(max_llm_validations=1)
+    assert result["skipped_cached"] == 1
+    assert result["llm_validations"] == 1
+    assert result["llm_cap_reached"] is False
+    assert result["status"] == "resolved"
+    assert result["invalidated"] == result["conflicts_resolved"] == 1
+    assert validations == [("[USER] fresh fact before", "[USER] fresh fact after")]
+    assert _cache_rows(resolver.db_path) == before_cache
+    with sqlite3.connect(resolver.db_path) as reader:
+        rows = dict(reader.execute(
+            "SELECT id, superseded_by FROM working_memory"))
+    assert rows[fresh_ids[0]] == fresh_ids[1]
+    assert rows[fresh_ids[1]] is None
+    assert all(rows[mid] is None for mid in cached_ids)
+
+
 def test_failed_validation_not_cached(temp_db, monkeypatch):
     """A FAILED validation (provider unavailable / malformed response) is a
     distinct status from a valid negative verdict and must NOT be cached:
