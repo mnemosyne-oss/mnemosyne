@@ -208,8 +208,10 @@ def test_sql_failure_keeps_existing_optional_primary_fallback(tmp_path):
     """An actual SQLite read denial stays best-effort and permits episodic evidence."""
     beam = _make_beam(tmp_path, "episodic")
     _seed(beam, ["fallback"], "episodic")
+    denied = []
     def deny_primary_read(action, table, _column, _database, _trigger):
         if action == sqlite3.SQLITE_READ and table == "memory_embeddings":
+            denied.append(table)
             return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
     beam.conn.set_authorizer(deny_primary_read)
@@ -217,5 +219,32 @@ def test_sql_failure_keeps_existing_optional_primary_fallback(tmp_path):
         result = beam._embedding_map(["fallback"])
     finally:
         beam.conn.set_authorizer(None)
+    assert denied, "the primary lookup must encounter the real SQLite denial"
     assert set(result) == {"fallback"}
     np.testing.assert_array_equal(result["fallback"], np.ones(8, dtype=np.float32))
+
+
+@pytest.mark.parametrize("primary", ["older", "newer"])
+def test_mixed_source_conflict_crosses_batch_boundary(tmp_path, primary):
+    """A mixed JSON/fallback pair must survive on opposite sides of a900-ID batch."""
+    beam = _make_beam(tmp_path, "episodic")
+    fallback = "newer" if primary == "older" else "older"
+    _seed(beam, [primary], "json")
+    _seed(beam, [fallback], "episodic")
+    older = {"id": "older", "timestamp": "2020-01-01T00:00:00", "content": "favorite color is blue for the car", "superseded_by": None}
+    newer = {"id": "newer", "timestamp": "2020-01-02T00:00:00", "content": "my favorite color choice is green grass everywhere", "superseded_by": None}
+    padding = [
+        {"id": f"gap-{i}", "timestamp": "2020-01-01T12:00:00", "content": "unrelated text", "superseded_by": None}
+        for i in range(1000)
+    ]
+    rows = [older, *padding, newer]
+    _apply_budget(beam, "legacy")
+    changes = beam.conn.total_changes
+    assert beam._detect_conflicts([older, newer]) == [("older", "newer")]
+    assert beam._detect_conflicts(rows) == [("older", "newer")]
+    result = beam._embedding_map([r["id"] for r in rows])
+    assert set(result) == {"older", "newer"}
+    np.testing.assert_array_equal(result["older"], np.ones(8, dtype=np.float32))
+    np.testing.assert_array_equal(result["newer"], np.ones(8, dtype=np.float32))
+    assert beam.conn.total_changes == changes
+    assert max(beam.conn.bind_counts) <= 999
