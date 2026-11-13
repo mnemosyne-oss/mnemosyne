@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 from hermes_memory_provider import MnemosyneMemoryProvider
 
@@ -134,4 +138,383 @@ def test_private_remember_does_not_write_shared_db(tmp_path, monkeypatch):
 
     assert private["status"] == "stored"
     assert shared_count == 0
+
+
+def test_invalidate_missing_replacement_reports_its_own_status(tmp_path, monkeypatch):
+    """A visible target with an invisible replacement must not be reported
+    as if the target itself were missing."""
+    provider, _ = _provider(tmp_path, monkeypatch)
+    stored = _call(provider, "mnemosyne_remember", {
+        "content": "target with an unreadable replacement", "source": "fact",
+    })
+
+    result = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": stored["memory_id"],
+        "replacement_id": "0000000000000000",
+    })
+
+    assert result == {
+        "status": "replacement_not_found",
+        "memory_id": stored["memory_id"],
+        "replacement_id": "0000000000000000",
+        "bank": "private",
+    }
+    row = provider._beam.conn.execute(
+        "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?",
+        (stored["memory_id"],),
+    ).fetchone()
+    assert tuple(row) == (None, None)
+
+
+def test_invalidate_missing_target_stays_memory_not_found(tmp_path, monkeypatch):
+    """The existing target-not-found status is preserved even when the
+    replacement itself is valid."""
+    provider, _ = _provider(tmp_path, monkeypatch)
+    replacement = _call(provider, "mnemosyne_remember", {
+        "content": "healthy replacement row", "source": "fact",
+    })
+
+    result = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": "ffffffffffffffff",
+        "replacement_id": replacement["memory_id"],
+    })
+
+    assert result["status"] == "memory_not_found"
+    assert result["bank"] == "private"
+
+
+def test_invalidate_inactive_target_stays_memory_not_found(tmp_path, monkeypatch):
+    """The replacement is healthy; the target is not. Re-invalidating an
+    already-superseded row must report the target, not blame the live
+    replacement (review on #1113) — invalidate() only touches ACTIVE rows."""
+    provider, _ = _provider(tmp_path, monkeypatch)
+    first = _call(provider, "mnemosyne_remember", {
+        "content": "row that gets superseded first", "source": "fact",
+    })
+    successor = _call(provider, "mnemosyne_remember", {
+        "content": "healthy successor row", "source": "fact",
+    })
+
+    retired = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": first["memory_id"],
+        "replacement_id": successor["memory_id"],
+    })
+    assert retired["status"] == "invalidated"
+
+    result = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": first["memory_id"],
+        "replacement_id": successor["memory_id"],
+    })
+    assert result["status"] == "memory_not_found"
+
+
+def test_invalidate_expired_target_stays_memory_not_found(tmp_path, monkeypatch):
+    """The predicate under test also handles `valid_until`, not just
+    superseded_by (review on #1113, second round). The expired stamp is
+    written in the same naive-local ISO family that
+    BeamMemory.invalidate(replacement_id=...) compares against, one day in
+    the past — so the row is expired on every host timezone, and the case
+    isolates the valid_until half of the predicate (superseded_by stays
+    NULL). A bare get() still returns the row, which is exactly what used
+    to make the failed invalidation wrongly blame the healthy replacement."""
+    provider, _ = _provider(tmp_path, monkeypatch)
+    target = _call(provider, "mnemosyne_remember", {
+        "content": "row expired through valid_until", "source": "fact",
+    })
+    replacement = _call(provider, "mnemosyne_remember", {
+        "content": "healthy replacement row", "source": "fact",
+    })
+
+    past = (datetime.now() - timedelta(days=1)).isoformat()
+    provider._beam.conn.execute(
+        "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+        (past, target["memory_id"]),
+    )
+    provider._beam.conn.commit()
+
+    result = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": target["memory_id"],
+        "replacement_id": replacement["memory_id"],
+    })
+    assert result["status"] == "memory_not_found"
+
+
+def test_invalidate_failed_activity_probe_with_real_get_shape_falls_closed(tmp_path, monkeypatch):
+    """Review on #1113 (reproduced by the maintainer): with a REAL expired
+    target, a healthy replacement, and a failing activity SELECT, the
+    degraded fallback consulted ``beam.get()`` — whose real row shape does
+    NOT include superseded_by/valid_until at all. Absent fields used to be
+    read as 'active', so the answer wrongly blamed the healthy replacement
+    (replacement_not_found) instead of the expired target. A get() row that
+    does not positively declare its status means UNKNOWN, and unknown fails
+    closed to memory_not_found: the replacement is only blamed when the
+    target's activity is established. The store must stay untouched."""
+    provider, _ = _provider(tmp_path, monkeypatch)
+    target = _call(provider, "mnemosyne_remember", {
+        "content": "expired target behind a broken probe", "source": "fact",
+    })
+    replacement = _call(provider, "mnemosyne_remember", {
+        "content": "healthy replacement row", "source": "fact",
+    })
+    past = (datetime.now() - timedelta(days=1)).isoformat()
+    provider._beam.conn.execute(
+        "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+        (past, target["memory_id"]),
+    )
+    provider._beam.conn.commit()
+
+    class _ProbeDownBeam:
+        """Same store — only the helper's activity query cannot run. get()
+        stays the real BeamMemory method, so the row shape is real."""
+        def __init__(self, real):
+            self._real = real
+
+        @property
+        def conn(self):
+            raise sqlite3.OperationalError("activity probe unavailable")
+
+        def get(self, memory_id):
+            return self._real.get(memory_id)
+
+        def invalidate(self, memory_id, replacement_id=None):
+            return self._real.invalidate(memory_id, replacement_id=replacement_id)
+
+    orig = provider._invalidate_target_active
+    monkeypatch.setattr(
+        provider, "_invalidate_target_active",
+        lambda beam, memory_id: orig(_ProbeDownBeam(beam), memory_id))
+
+    result = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": target["memory_id"],
+        "replacement_id": replacement["memory_id"],
+    })
+    assert result["status"] == "memory_not_found", (
+        "an unknown target state must never blame the replacement")
+    row = provider._beam.conn.execute(
+        "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?",
+        (target["memory_id"],),
+    ).fetchone()
+    assert row[1] is None  # no store mutation
+
+
+def test_invalidate_rejects_self_replacement(tmp_path, monkeypatch):
+    provider, _ = _provider(tmp_path, monkeypatch)
+    stored = _call(provider, "mnemosyne_remember", {
+        "content": "row guarded against self-supersede", "source": "fact",
+    })
+
+    result = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": stored["memory_id"],
+        "replacement_id": stored["memory_id"],
+    })
+
+    assert "error" in result
+    row = provider._beam.conn.execute(
+        "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?",
+        (stored["memory_id"],),
+    ).fetchone()
+    assert tuple(row) == (None, None)
+
+
+def test_invalidate_replacement_must_be_visible_in_the_routed_bank(tmp_path, monkeypatch):
+    provider, _ = _provider(tmp_path, monkeypatch)
+    surface = _call(provider, "mnemosyne_shared_remember", {
+        "content": "surface target for cross-bank check", "kind": "meta",
+    })
+    private = _call(provider, "mnemosyne_remember", {
+        "content": "private replacement lives in the other bank", "source": "fact",
+    })
+
+    result = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": surface["memory_id"],
+        "replacement_id": private["memory_id"],
+    })
+    assert result["status"] == "replacement_not_found"
+    assert result["bank"] == "surface"
+
+    surface_repl = _call(provider, "mnemosyne_shared_remember", {
+        "content": "surface replacement for chaining", "kind": "meta",
+    })
+    ok = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": surface["memory_id"],
+        "replacement_id": surface_repl["memory_id"],
+    })
+    assert ok["status"] == "invalidated"
+    assert ok["bank"] == "surface"
+    row = provider._surface_beam.conn.execute(
+        "SELECT superseded_by FROM working_memory WHERE id = ?",
+        (surface["memory_id"],),
+    ).fetchone()
+    assert row[0] == surface_repl["memory_id"]
+
+
+def test_invalidate_explicit_surface_selector_beats_prefix_inference(tmp_path, monkeypatch):
+    """A bare (no sf_ prefix) id must invalidate through the surface beam when
+    the caller names the bank, and through the private bank when it does not —
+    so prefix inference can never mask a broken selector."""
+    provider, _ = _provider(tmp_path, monkeypatch)
+    provider._ensure_surface_beam()
+    target = provider._surface_beam.remember(
+        "explicit selector target", source="surface_manual", scope="global",
+    )
+    replacement = provider._surface_beam.remember(
+        "explicit selector replacement", source="surface_manual", scope="global",
+    )
+    assert not target.startswith("sf_")
+
+    # Without the selector the bare id resolves to the private bank, where it
+    # does not exist.
+    inferred = _call(provider, "mnemosyne_invalidate", {"memory_id": target})
+    assert inferred == {
+        "status": "memory_not_found", "memory_id": target, "bank": "private",
+    }
+
+    # Selector plus no replacement: the surface beam answers.
+    out = _call(provider, "mnemosyne_invalidate", {"memory_id": target, "bank": "surface"})
+    assert out == {"status": "invalidated", "memory_id": target, "bank": "surface"}
+    row = provider._surface_beam.conn.execute(
+        "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?",
+        (target,),
+    ).fetchone()
+    assert row[0] is not None and row[1] is None
+
+    # Selector plus replacement: both ids resolve on the surface and chain.
+    target2 = provider._surface_beam.remember(
+        "chained selector target", source="surface_manual", scope="global",
+    )
+    out = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": target2, "replacement_id": replacement, "bank": "surface",
+    })
+    assert out["status"] == "invalidated"
+    assert out["bank"] == "surface"
+    row = provider._surface_beam.conn.execute(
+        "SELECT superseded_by FROM working_memory WHERE id = ?",
+        (target2,),
+    ).fetchone()
+    assert row[0] == replacement
+
+
+def test_activity_probe_judges_offset_bearing_expiry(tmp_path, monkeypatch):
+    """Review on #1113 (fifth round): the probe mirrors core's active-row
+    predicate, so it must read a stored offset-bearing expiry the way every
+    julianday-based surface does. A legacy/imported row carrying
+    ``...T18:30:00+07:00`` (11:30Z, already past) sorts lexically AFTER an
+    aware-UTC now string; the old text comparison called that dead row
+    active, which let a failed invalidation wrongly blame a healthy
+    replacement. The probe is exercised directly here because the end-to-end
+    status also depends on core's own predicate (fixed in the companion
+    UTC/expiry PR).
+    """
+    provider, _ = _provider(tmp_path, monkeypatch)
+    dead = _call(provider, "mnemosyne_remember", {
+        "content": "offset-expired target for probe", "source": "fact",
+    })
+    now = datetime.now(timezone.utc)
+    stored = (now - timedelta(minutes=30)).astimezone(
+        timezone(timedelta(hours=7))).isoformat()
+    # Fixture sanity: this value genuinely misleads a lexical comparison.
+    assert stored > now.isoformat()
+    provider._beam.conn.execute(
+        "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+        (stored, dead["memory_id"]),
+    )
+    provider._beam.conn.commit()
+    assert provider._invalidate_target_active(provider._beam, dead["memory_id"]) is False, (
+        "an expiry already past in UTC must not read as active")
+
+    # A future expiry stored at UTC-05 sorts lexically BEFORE aware-UTC now
+    # (misleading the other way) but is chronologically active.
+    alive = _call(provider, "mnemosyne_remember", {
+        "content": "future-offset row for probe", "source": "fact",
+    })
+    stored_future = (now + timedelta(hours=1)).astimezone(
+        timezone(timedelta(hours=-5))).isoformat()
+    assert stored_future < now.isoformat()
+    provider._beam.conn.execute(
+        "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+        (stored_future, alive["memory_id"]),
+    )
+    provider._beam.conn.commit()
+    assert provider._invalidate_target_active(provider._beam, alive["memory_id"]) is True, (
+        "a chronologically future expiry must read as active")
+
+
+def test_invalidate_parity_on_west_of_utc_host(tmp_path, monkeypatch):
+    """Review on #1113 (fourth round): the activity checks in both providers
+    and in core's replacement path must compare ``valid_until`` against UTC,
+    never host-local wall time.
+
+    On a west-of-UTC host the local-naive clock trails UTC stamps by the
+    host offset, so an expiry inside that window (yesterday 23:00Z is
+    expired for hours) still compared "active" against local now. That
+    turned a correctly rejected invalidation of an expired target into a
+    wrong ``replacement_not_found`` — and an active replacement could be
+    judged not-active by the same skew. This test pins the whole contract
+    under TZ=America/Los_Angeles: the expired target stays
+    ``memory_not_found``, an active pair invalidates, and the stamp core
+    writes is aware UTC.
+    """
+    import os
+    import time
+
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset() unavailable on this platform")
+    original_tz = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    time.tzset()
+    try:
+        provider, _ = _provider(tmp_path, monkeypatch)
+        expired = _call(provider, "mnemosyne_remember", {
+            "content": "expired target for UTC parity", "source": "fact",
+        })
+        healthy = _call(provider, "mnemosyne_remember", {
+            "content": "healthy replacement for UTC parity", "source": "fact",
+        })
+        # Expired ~1h ago in UTC terms, but yesterday on a west-of-UTC wall
+        # clock — inside the skew window that used to flip the verdict.
+        recent_past = (
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).replace(tzinfo=None).isoformat()
+        provider._beam.conn.execute(
+            "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+            (recent_past, expired["memory_id"]),
+        )
+        provider._beam.conn.commit()
+
+        result = _call(provider, "mnemosyne_invalidate", {
+            "memory_id": expired["memory_id"],
+            "replacement_id": healthy["memory_id"],
+        })
+        assert result["status"] == "memory_not_found", (
+            "on a west-of-UTC host an expired target must never be read "
+            "as active and blame a healthy replacement")
+
+        # And the happy path still works on the same clock: an active
+        # target + active replacement must invalidate (a local-naive
+        # replacement check could reject it as not-yet-active).
+        fresh_a = _call(provider, "mnemosyne_remember", {
+            "content": "active target west skew", "source": "fact",
+        })
+        fresh_b = _call(provider, "mnemosyne_remember", {
+            "content": "active replacement west skew", "source": "fact",
+        })
+        result = _call(provider, "mnemosyne_invalidate", {
+            "memory_id": fresh_a["memory_id"],
+            "replacement_id": fresh_b["memory_id"],
+        })
+        assert result["status"] == "invalidated"
+        row = provider._beam.conn.execute(
+            "SELECT valid_until FROM working_memory WHERE id = ?",
+            (fresh_a["memory_id"],),
+        ).fetchone()
+        stamped = datetime.fromisoformat(row[0])
+        assert stamped.utcoffset() == timedelta(0), (
+            "core's replacement path must stamp aware UTC, like the "
+            "no-replacement path already does")
+    finally:
+        if original_tz is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", original_tz)
+        time.tzset()
 

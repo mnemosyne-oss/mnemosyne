@@ -2,22 +2,16 @@
 Mnemosyne E7 Migration — 3.11.1 schema additions
 ===============================================
 
-Idempotent migration that adds the two tables introduced in
-mnemosyne-memory 3.11.1 to an existing bank at the older 54-table
-schema:
+Adds ``memory_events`` and ``sync_meta`` when absent, and backfills
+``memory_events.device_id`` before creating its index when the table
+already exists. The table definitions below are a 3.11-era snapshot,
+not the current full SyncEngine schema. Historical event rows and other
+legacy sync fields are not converted.
 
-  - memory_events  (created by SyncManager._init_events_table)
-  - sync_meta       (created by SyncManager._init_events_table)
-
-The DDL is copied verbatim from the canonical source at
-``mnemosyne/core/sync.py:641-665`` (SyncManager._init_events_table)
-and the indices that method creates (``sync.py:668-672``). We do
-NOT invent DDL here; if the upstream source changes its DDL, this
-migration should be updated to match.
-
-Safe to re-run (idempotent — uses ``CREATE TABLE IF NOT EXISTS``
-and try/except for indices, matching the upstream behavior). The
-migration does not delete any data or drop any tables.
+Safe to re-run: missing tables, columns and indices are checked before
+DDL. Index and unrelated column DDL failures propagate; earlier DDL may
+remain applied after a later failure, so retry completes only the missing
+steps. The migration does not delete data or drop tables.
 """
 
 from __future__ import annotations
@@ -27,9 +21,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, Union, overload
 
 
-# Canonical DDL from mnemosyne/core/sync.py:641-665
-# (SyncManager._init_events_table). If the upstream source changes
-# its DDL, update this migration to match.
+# 3.11-era table definition; not a copy of the current SyncEngine schema.
 _MEMORY_EVENTS_DDL = """
 CREATE TABLE IF NOT EXISTS memory_events (
     event_id TEXT PRIMARY KEY,
@@ -53,9 +45,7 @@ CREATE TABLE IF NOT EXISTS sync_meta (
 )
 """.strip()
 
-# Canonical index DDL from mnemosyne/core/sync.py:668-672
-# (try/except because IF NOT EXISTS for indices is not supported
-# in all SQLite versions, matching the upstream behavior).
+# Indices created by this migration; SyncEngine may create additional ones.
 _MEMORY_EVENTS_INDICES = [
     (
         "idx_me_timestamp",
@@ -71,6 +61,10 @@ _MEMORY_EVENTS_INDICES = [
     ),
 ]
 
+_MEMORY_EVENTS_LEGACY_COLUMNS = [
+    ("device_id", "device_id TEXT NOT NULL DEFAULT ''"),
+]
+
 
 # The new tables this migration adds (in 3.11.1).
 NEW_TABLES = ("memory_events", "sync_meta")
@@ -84,6 +78,7 @@ class MigrationReport(TypedDict):
     added: int
     tables_added: list[str]
     tables_already_present: list[str]
+    columns_added: list[str]
     indices_added: int
 
 
@@ -91,6 +86,7 @@ class MigrationDryRunReport(MigrationReport):
     # Report-only (dry-run) fields; present in every dry-run report.
     would_add: int
     tables_would_add: list[str]
+    columns_would_add: list[str]
     indices_would_add: int
 
 
@@ -108,6 +104,21 @@ def _has_index(conn: sqlite3.Connection, name: str) -> bool:
         (name,),
     )
     return cursor.fetchone() is not None
+
+
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    cursor = conn.execute(f"PRAGMA table_info({table})")
+    return any(row[1] == column for row in cursor.fetchall())
+
+
+def _missing_memory_events_columns(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    if not _has_table(conn, "memory_events"):
+        return []
+    return [
+        (name, ddl)
+        for name, ddl in _MEMORY_EVENTS_LEGACY_COLUMNS
+        if not _has_column(conn, "memory_events", name)
+    ]
 
 
 @overload
@@ -137,17 +148,19 @@ def migrate_311_tables(
     (``mode=ro`` + ``PRAGMA query_only=ON``), no DDL is executed and no
     commit happens. The report keeps ``added`` / ``tables_added`` /
     ``indices_added`` at zero and instead exposes ``would_add`` /
-    ``tables_would_add`` / ``indices_would_add`` for the pending DDL
-    (all zero/empty when the bank does not exist yet).
+    ``tables_would_add`` / ``columns_would_add`` /
+    ``indices_would_add`` for the pending DDL (all zero/empty when
+    the bank does not exist yet).
 
     Returns a report dict with:
       - added: int (number of tables added in this call)
       - tables_added: List[str] (names of tables added in this call)
       - tables_already_present: List[str] (names already in the schema)
+      - columns_added: List[str] (legacy columns added in this call)
       - indices_added: int (number of indices added in this call)
       - dry-run reports additionally carry would_add /
-        tables_would_add / indices_would_add describing the DDL a real
-        run would execute.
+        tables_would_add / columns_would_add / indices_would_add
+        describing the DDL a real run would execute.
     """
     db_path = Path(db_path)
     if dry_run:
@@ -155,9 +168,11 @@ def migrate_311_tables(
             "added": 0,
             "tables_added": [],
             "tables_already_present": [],
+            "columns_added": [],
             "indices_added": 0,
             "would_add": 0,
             "tables_would_add": [],
+            "columns_would_add": [],
             "indices_would_add": 0,
         }
         if not db_path.exists():
@@ -172,6 +187,8 @@ def migrate_311_tables(
                 else:
                     dry_report["tables_would_add"].append(name)
                     dry_report["would_add"] += 1
+            for name, _ddl in _missing_memory_events_columns(conn):
+                dry_report["columns_would_add"].append(f"memory_events.{name}")
             for index_name, _index_ddl in _MEMORY_EVENTS_INDICES:
                 if not _has_index(conn, index_name):
                     dry_report["indices_would_add"] += 1
@@ -183,6 +200,7 @@ def migrate_311_tables(
         "added": 0,
         "tables_added": [],
         "tables_already_present": [],
+        "columns_added": [],
         "indices_added": 0,
     }
     if not db_path.exists():
@@ -198,18 +216,34 @@ def migrate_311_tables(
             applied_report["tables_added"].append(name)
             applied_report["added"] += 1
 
-        # Indices (best-effort; IF NOT EXISTS may not be supported
-        # in all SQLite versions, matching the upstream behavior).
+        for name, ddl in _missing_memory_events_columns(conn):
+            try:
+                conn.execute(f"ALTER TABLE memory_events ADD COLUMN {ddl}")
+            except sqlite3.OperationalError as exc:
+                if str(exc).lower() != f"duplicate column name: {name}".lower():
+                    raise
+                # A concurrent migrator may have added the column after our
+                # schema read. Only accept the exact declaration we add here.
+                matches = [
+                    row for row in conn.execute("PRAGMA table_info(memory_events)")
+                    if row[1] == name
+                ]
+                if len(matches) != 1 or not (
+                    matches[0][2].strip().upper() == "TEXT"
+                    and matches[0][3] == 1
+                    and matches[0][4] == "''"
+                ):
+                    raise
+                continue
+            applied_report["columns_added"].append(f"memory_events.{name}")
+
+        # Let index DDL errors propagate, as for column DDL above. Existing
+        # device_id columns are checked for presence, not runtime compatibility.
         for index_name, index_ddl in _MEMORY_EVENTS_INDICES:
             if _has_index(conn, index_name):
                 continue
-            try:
-                conn.execute(index_ddl)
-                applied_report["indices_added"] += 1
-            except sqlite3.OperationalError:
-                # IF NOT EXISTS not supported in this SQLite version.
-                # Indices are best-effort; not fatal.
-                pass
+            conn.execute(index_ddl)
+            applied_report["indices_added"] += 1
         conn.commit()
     finally:
         conn.close()

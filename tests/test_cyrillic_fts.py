@@ -31,6 +31,7 @@ import pytest
 
 from mnemosyne.core import beam as beam_module
 from mnemosyne.core.beam import (
+    BeamMemory,
     init_beam,
     _has_cyrillic,
     _ngrams,
@@ -125,16 +126,32 @@ class TestCyrillicScore:
         # "тёмная" vs "встреча" share no trigrams at all -> 0
         assert _cyrillic_score("тёмная", "встреча") == 0.0
 
-    def test_yo_vs_e_collapses(self):
-        # We deliberately do NOT collapse ё -> е; the regex preserves
-        # the user's exact spelling. Trigrams differ, so the score is
-        # the same as for any unrelated substitution.
-        s_with_yo = _cyrillic_score("ёжик", "ёжики")
-        s_with_e = _cyrillic_score("ежик", "ежики")
-        # Both should be the same since the logic is symmetric
-        assert s_with_yo == pytest.approx(s_with_e)
-        # And both should be reasonably high
-        assert s_with_yo > 0.3
+    @pytest.mark.parametrize("query,content,expected", [
+        ("ежик", "ёжик", 1.0),
+        ("ЁЖИК", "ежик", 1.0),
+        ("свеклы", "свёкла", 0.6),
+        ("СВЁКЛЫ", "свекла", 0.6),
+        ("тёмная", "темную", 1 / 3),
+    ])
+    def test_yo_vs_e_collapses(self, query, content, expected):
+        # Cross-spelling pairs must work, including uppercase and inflection.
+        assert _cyrillic_score(query, content) == pytest.approx(expected)
+
+    def test_yo_normalization_preserves_query_word_mean(self):
+        # Folding spelling does not make unrelated query words disappear from
+        # the denominator or change the aggregation policy discussed in #1295.
+        assert _cyrillic_score("большая свеклы", "свёкла") == pytest.approx(0.3)
+        assert _cyrillic_score(
+            "какая у него любимая клавиатура и буквы на ней",
+            "он рассказал про механическую клавиатуру с подсветкой вчера",
+        ) == pytest.approx((7 / 9) / 6)
+
+    @pytest.mark.parametrize("query,content", [
+        ("жёлтый", "автобус"),
+        ("автобус", "ёлочка"),
+    ])
+    def test_yo_normalization_does_not_admit_unrelated_words(self, query, content):
+        assert _cyrillic_score(query, content) == 0.0
 
     def test_short_query_words_ignored(self):
         # 1-2 char words are skipped to avoid stop-word noise
@@ -220,6 +237,103 @@ def _open(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+@pytest.mark.parametrize("working", [True, False])
+@pytest.mark.parametrize("query,content", [
+    ("свеклы", "Свёкла тушёная хранится отдельно"),
+    ("свёклы", "Свекла тушеная хранится отдельно"),
+    ("СВЕКЛЫ", "СВЁКЛА ТУШЁНАЯ ХРАНИТСЯ ОТДЕЛЬНО"),
+    ("СВЁКЛЫ", "СВЕКЛА ТУШЕНАЯ ХРАНИТСЯ ОТДЕЛЬНО"),
+])
+def test_yo_spelling_fallback_reaches_both_memory_tiers(temp_db, working, query, content):
+    """Both fallback entry points admit folded inflections and retain stored text."""
+    seed = _seed_working if working else _seed_episodic
+    seed(temp_db, [
+        ("target", content, 0.8),
+        ("unrelated", "Автобус отправляется утром", 0.8),
+    ])
+    conn = _open(temp_db)
+    try:
+        # No exact FTS match: the query and stored word have different endings.
+        fts_table = "fts_working" if working else "fts_episodes"
+        assert conn.execute(
+            f"SELECT count(*) FROM {fts_table} WHERE {fts_table} MATCH ?", (query,)
+        ).fetchone()[0] == 0
+        direct = _cyrillic_like_search(conn, query, k=5, working=working)
+        routed = (_fts_search_working if working else _fts_search)(conn, query, k=5)
+        table = "working_memory" if working else "episodic_memory"
+        assert conn.execute(
+            f"SELECT content FROM {table} WHERE id = ?", ("target",)
+        ).fetchone()[0] == content
+    finally:
+        conn.close()
+    result_key, expected_id = ("id", "target") if working else ("rowid", 1)
+    for results in (direct, routed):
+        assert [row[result_key] for row in results] == [expected_id]
+        assert results[0]["rank"] == pytest.approx(-0.6)
+
+
+@pytest.mark.parametrize("query,content", [
+    ("свеклы", "Свёкла тушёная хранится отдельно"),
+    ("свёклы", "Свекла тушеная хранится отдельно"),
+])
+def test_yo_spelling_passes_linear_recall_gate(temp_db, monkeypatch, query, content):
+    """Real linear recall admits either ё/е spelling through the lexical gate."""
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.delenv("MNEMOSYNE_LEXICAL_GATE_MIN", raising=False)
+    memory = BeamMemory(session_id="yo-normalization", db_path=temp_db)
+    target = memory.remember(content, source="test", importance=0.8)
+    memory.remember("Автобус отправляется утром", source="test", importance=0.8)
+    relevance = _lexical_relevance(_recall_tokens(query), content, query)
+    assert relevance == pytest.approx(0.6)
+    results = memory.recall(query, top_k=5)
+    assert [row["id"] for row in results] == [target]
+
+
+@pytest.mark.parametrize("working", [True, False])
+@pytest.mark.parametrize("k", [1, 5])
+@pytest.mark.parametrize("query,content,noise", [
+    ("свёклы", "Свёкла тушёная хранится отдельно", "Свекор приехал утром"),
+    ("свеклы", "Свекла тушеная хранится отдельно", "Свёкор приехал утром"),
+    ("СВЁКЛЫ", "СВЁКЛА ТУШЁНАЯ ХРАНИТСЯ ОТДЕЛЬНО", "СВЕКОР ПРИЕХАЛ УТРОМ"),
+    ("свёклы", "Свекла тушеная хранится отдельно", "Свёкор приехал утром"),
+    ("свеклы", "Свёкла тушёная хранится отдельно", "Свекор приехал утром"),
+])
+def test_spelling_fold_keeps_both_candidate_groups_under_pressure(
+    temp_db, monkeypatch, working, k, query, content, noise,
+):
+    """Either spelling can survive a full candidate pool of the other spelling."""
+    seed = _seed_working if working else _seed_episodic
+    competitors = [(f"noise-{i:03}", f"{noise} {i}", 0.8) for i in range(k * 5 + 6)]
+    unrelated = "Автобус отправляется вечером"
+    seed(temp_db, [("aa-unrelated", unrelated, 0.8)] + competitors + [("zz-target", content, 0.8)])
+    conn = _open(temp_db)
+    scorer = beam_module._cyrillic_score
+    scored = []
+
+    def track_score(query, content):
+        """Count candidates handed to the expensive Python scorer."""
+        scored.append(content)
+        return scorer(query, content)
+
+    monkeypatch.setattr(beam_module, "_cyrillic_score", track_score)
+    expected_id = "zz-target" if working else len(competitors) + 2
+    result_key = "id" if working else "rowid"
+    try:
+        for search in (
+            lambda: _cyrillic_like_search(conn, query, k=k, working=working),
+            lambda: (_fts_search_working if working else _fts_search)(conn, query, k=k),
+        ):
+            scored.clear()
+            results = search()
+            assert results[0][result_key] == expected_id
+            assert results[0]["rank"] == pytest.approx(-0.6)
+            assert len(scored) == len(set(scored)) == k * 5
+            assert unrelated not in scored
+    finally:
+        conn.close()
 
 
 class TestCyrillicLikeSearchWorking:
@@ -364,6 +478,16 @@ class TestLexicalRelevanceCyrillicGate:
     then dropped it at the relevance gate, so the recall returned 0
     results for the very queries Cyrillic users actually type.
     """
+
+    def test_nonzero_prior_score_still_suppresses_fallback(self, monkeypatch):
+        def unexpected_fallback(*args):
+            pytest.fail("a nonzero lexical score must not invoke Cyrillic fallback")
+
+        monkeypatch.setattr(beam_module, "_cyrillic_score", unexpected_fallback)
+        query = "рецепт блюдо кухня свеклы"
+        assert _lexical_relevance(
+            _recall_tokens(query), "кухня свёкла", query
+        ) == pytest.approx(0.25)
 
     def test_inflected_query_passes_gate(self):
         # Nominative "тёмная тема" vs accusative "тёмную тему":

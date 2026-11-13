@@ -341,8 +341,8 @@ CONFIG_DESCRIPTIONS = {
 
     # Prefetch and turn limits
     "prefetch_content_chars": "Truncate prefetched memory content to this many characters. `0` disables truncation.",
-    "sync_turn_user_limit": "Maximum user turns captured per sync pass.",
-    "sync_turn_assistant_limit": "Maximum assistant turns captured per sync pass.",
+    "sync_turn_user_limit": "Maximum user message characters captured per sync turn. `0` disables truncation.",
+    "sync_turn_assistant_limit": "Maximum assistant message characters captured per sync turn. `0` disables truncation.",
 
     # Persona (L3)
     "persona_enabled": "Inject L3 persona facts into the system prompt.",
@@ -360,6 +360,7 @@ CONFIG_DESCRIPTIONS = {
     "sleep_model_refresh_min_evidence": "Minimum supporting memories before proposing a change.",
     "sleep_model_refresh_conflict_min_confidence": "Minimum confidence to auto-apply a proposal that contradicts a current fact.",
     "sleep_model_refresh_conflict_min_evidence": "Minimum supporting memories for a contradicting change.",
+    "dream_active": "Whether Dream mode is active, disabling automated model-refresh mutations.",
 
     # SHMR
     "shmr_batch_size": "Memories per SHMR harmonization batch.",
@@ -395,6 +396,9 @@ EFFECTIVE_DEFAULT_PROSE = {
     "fts_weight": "Recall weights resolve as `config.yaml > MNEMOSYNE_*_WEIGHT > defaults` at request time.",
     "importance_weight": "Recall weights resolve as `config.yaml > MNEMOSYNE_*_WEIGHT > defaults` at request time.",
     "llm_enabled": "Note the direction: `config.py` declares this off while the module defaults it on.",
+    "prefetch_content_chars": "Zero disables truncation, but a zero can still fall back to a profile limit downstream -- `0` is not always unlimited.",
+    "sync_turn_user_limit": "Per-message characters, not turns: caps user content per sync turn (500 chars).",
+    "sync_turn_assistant_limit": "Per-message characters, not turns: caps assistant content per sync turn (800 chars).",
 }
 
 # These keys are resolved by _resolve_recall_weights() at request time through
@@ -407,14 +411,24 @@ RUNTIME_CONFIG_RESOLVED_KEYS = {
 }
 
 
-def _scan_effective_defaults(env_map: dict, defaults: dict) -> dict:
+def _scan_effective_defaults(env_map: dict, defaults: dict,
+                               roots=("mnemosyne",)) -> tuple:
     """Find keys whose runtime default differs from the declared one.
 
-    Returns {config_key: (effective_value, source_file)}.
+    Returns (divergences, conflicts): divergences maps
+    {config_key: (effective_value, [source_files])}; conflicts maps
+    {config_key: [(value, source), ...]} for keys whose roots disagree.
 
     Matches module-level `os.environ.get("MNEMOSYNE_X", "literal")`. Values
     that differ only in spelling (`true` vs `1`, `0.7` vs `0.70`, an empty
     declared default) are not divergences and are filtered out.
+
+    `roots` are package directories walked relative to the repo root. The
+    provider packages (`hermes_memory_provider/`, `integrations/`) carry
+    divergent keys of the same class that a single-root scan cannot see
+    (#586). When roots disagree on one key's effective value, the first
+    root in order wins the reported value and every source is listed, so
+    the conflict is visible instead of silently first-wins.
     """
     import glob
     import re
@@ -426,20 +440,46 @@ def _scan_effective_defaults(env_map: dict, defaults: dict) -> dict:
     env_to_key = {v: k for k, v in env_map.items()}
 
     found = {}
-    root = os.path.join(REPO_ROOT, "mnemosyne")
-    for path in glob.glob(os.path.join(root, "**", "*.py"), recursive=True):
-        try:
-            with open(path, encoding="utf-8") as f:
-                text = f.read()
-        except OSError:
-            continue
-        for m in pattern.finditer(text):
-            envvar = m.group(1)
-            value = m.group(2) if m.group(2) is not None else m.group(3)
-            key = env_to_key.get(envvar)
-            if key is None or key in found or key in RUNTIME_CONFIG_RESOLVED_KEYS:
+    for root in roots:
+        root = os.path.join(REPO_ROOT, root)
+        # Sorted: glob returns filesystem order, which varies between
+        # machines. Insertion order decides the reported fallback, so an
+        # unsorted walk would make the reference nondeterministic.
+        # Cross-root precedence is unaffected: the outer loop still
+        # follows roots order.
+        for path in sorted(glob.glob(os.path.join(root, "**", "*.py"), recursive=True)):
+            # Build outputs are copies, not sources: `pip install -e` drops
+            # e.g. integrations/hermes/build/lib/... into the tree, and the
+            # test job installs before running the suite. Scanning those
+            # copies would duplicate every source they contain -- and a
+            # stale copy would report a phantom conflict. Same for
+            # distribution and bytecode caches.
+            segments = os.path.relpath(path, REPO_ROOT).split(os.sep)
+            if any(
+                seg in ("build", "dist", "__pycache__")
+                or seg.endswith(".egg-info")
+                for seg in segments
+            ):
                 continue
-            found[key] = (value, os.path.relpath(path, REPO_ROOT))
+            try:
+                with open(path, encoding="utf-8") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for m in pattern.finditer(text):
+                envvar = m.group(1)
+                value = m.group(2) if m.group(2) is not None else m.group(3)
+                key = env_to_key.get(envvar)
+                if key is None or key in RUNTIME_CONFIG_RESOLVED_KEYS:
+                    continue
+                rel = os.path.relpath(path, REPO_ROOT)
+                entry = found.setdefault(key, {"by_value": {}})
+                entry["by_value"].setdefault(value, [])
+                if rel not in entry["by_value"][value]:
+                    entry["by_value"][value].append(rel)
+                # Every distinct value keeps its own source list, so a
+                # cross-root conflict reports where each value was seen
+                # instead of cross-pairing every value with every source.
 
     def _same(declared, effective: str) -> bool:
         if declared is None:
@@ -458,7 +498,31 @@ def _scan_effective_defaults(env_map: dict, defaults: dict) -> dict:
             return False
 
     out = {}
-    for key, (value, src) in found.items():
+    conflicts = {}
+    for key, entry in found.items():
+        values = [v for v in entry["by_value"] if v.strip() != ""]
+        # First *nonempty* fallback: an earlier root can legitimately read
+        # the env var with an empty default ("unset"), in which case the
+        # first real fallback comes from a later root. Using the raw
+        # insertion-first value would let an "" shadow it, and the empty
+        # check below would then drop a real divergence silently.
+        first_value = values[0] if values else next(iter(entry["by_value"]))
+        # Sources for the reported value only: files that read the env var
+        # with an empty fallback ("unset") did not set this value, so they
+        # are not listed here. Per-value lists stay on the entry for the
+        # conflict report below.
+        sources = sorted(entry["by_value"][first_value])
+        if len(values) > 1:
+            # Same key, different real fallbacks in different files:
+            # report each value with the sources that set it. Empty
+            # fallbacks are "unset", not competing defaults, and are
+            # excluded the same way the divergence filter excludes them.
+            conflicts[key] = [
+                (v, s)
+                for v in values
+                for s in sorted(entry["by_value"][v])
+            ]
+        value = first_value
         declared = defaults.get(key)
         # An empty declared default means "unset", which the module fallback
         # fills in. That is the documented design, not a contradiction.
@@ -470,8 +534,8 @@ def _scan_effective_defaults(env_map: dict, defaults: dict) -> dict:
         if value.strip() == "":
             continue
         if not _same(declared, value):
-            out[key] = (value, src)
-    return out
+            out[key] = (value, sources)
+    return out, conflicts
 
 # Env vars read directly via os.environ, bypassing MnemosyneConfig. These
 # are NOT in ENV_VAR_MAP, so they cannot be set in config.yaml and are
@@ -486,6 +550,7 @@ ENV_ONLY_DESCRIPTIONS = {
     "MNEMOSYNE_BINARY_BONUS": "A/B toggle for the binary vector bonus in episodic scoring.",
     "MNEMOSYNE_BUSY_TIMEOUT_MS": "SQLite `busy_timeout` in milliseconds.",
     "MNEMOSYNE_CHANNEL_ID": "Channel or session identifier for memory scoping.",
+    "MNEMOSYNE_CONSOLIDATION_TIER": "Initial tier for sleep/consolidation summaries, applied to **newly inserted rows only**. Sets **ranking weight only** — the configured tier selects the recall multiplier a summary enters at (tier 1 = 1.0×, tier 2 = 0.5×, tier 3 = 0.25×), so the default of `3` places summaries at 0.25× instead of tier 1's full weight, which reduces the ranking pressure derived rows place on the sources they paraphrase; it is a weight, not a guarantee of ordering, since vector, FTS and temporal signals also contribute to the final score. Stored text is not truncated (`degrade_episodic()` rewrites content only for rows it moves down from tier 1 or 2). Set `1` for the legacy behavior. Clamped to {1,2,3}. Default `3`. Existing rows are **not** migrated — see [Migrating existing banks](#migrating-existing-banks).",
     "MNEMOSYNE_CONTEXT_INCLUDE_CONSOLIDATED": "Include already-consolidated rows in assembled context.",
     "MNEMOSYNE_CROSS_TIER_DEDUP": "A/B toggle for deduplication across working and episodic results.",
     "MNEMOSYNE_EMBEDDING_DOC_PREFIX": "Prefix prepended verbatim to every document before embedding. Unset or empty by default, preserving the original text. When `MNEMOSYNE_EMBEDDING_API_URL` is configured with a remote endpoint, prefixed text may be sent to that embedding API; privacy-sensitive deployments should remain local-first by using local embeddings or a locally hosted endpoint.",
@@ -499,6 +564,8 @@ ENV_ONLY_DESCRIPTIONS = {
     "MNEMOSYNE_IMPORTED_WEIGHT": "Veracity multiplier for imported memories.",
     "MNEMOSYNE_INFERRED_WEIGHT": "Veracity multiplier for inferred memories.",
     "MNEMOSYNE_LEXICAL_GATE_MIN": "Override the lexical admission gate (float 0.0–1.0, clamped; non-finite/invalid values fall back to the historical query-length thresholds 0.15/0.5/0.3). `0.0` admits purely-vector candidates (recall-first, at a precision cost). Read on every recall call; retrieval stays local (sqlite-vec + JSON/NumPy embeddings, or lexical-only FTS5 when embeddings are unavailable).",
+    "MNEMOSYNE_LLM_EXTRA_BODY": "JSON object merged last into every chat-completions request to the primary remote endpoint, for provider-specific keys the OpenAI shape has no name for (a thinking-mode toggle, provider routing). Unset, blank, invalid JSON or a non-object value means nothing is merged, and the reserved keys `messages`, `model` and `stream` are dropped from an otherwise valid object so the escape hatch cannot silently change the request the logs describe. Read at import.",
+    "MNEMOSYNE_LLM_FALLBACK_EXTRA_BODY": "Same as `MNEMOSYNE_LLM_EXTRA_BODY`, for requests to the fallback endpoint (`MNEMOSYNE_LLM_FALLBACK_MODELS`). Read at import.",
     "MNEMOSYNE_MCP_ALLOWED_HOSTS": "Comma-separated Host header values allowed for a non-loopback MCP Streamable HTTP bind (exact names or `name:*` patterns covering any port). A non-loopback Streamable HTTP bind additionally requires this variable; HTTP authentication can be supplied by `MNEMOSYNE_MCP_TOKENS` (which takes precedence) or `MNEMOSYNE_MCP_TOKEN`. Requests presenting any other Host are rejected with HTTP 421.",
     "MNEMOSYNE_MCP_ALLOWED_ORIGINS": "Optional comma-separated browser Origins allowed for a non-loopback MCP Streamable HTTP bind. Requests with no Origin header (CLI/SDK clients) always pass; any Origin not listed is rejected with HTTP 403. Origins only narrow the exposure boundary; the token and Host policy above are always required.",
     "MNEMOSYNE_MCP_BANK": "Memory bank used by the MCP server.",
@@ -509,6 +576,7 @@ ENV_ONLY_DESCRIPTIONS = {
     "MNEMOSYNE_PREFETCH_MODEL_SLOT_LIMIT": "Maximum canonical slots prefetched per turn.",
     "MNEMOSYNE_PREFETCH_MODEL_SLOT_MIN_OVERLAP": "Minimum token overlap for a canonical slot to count as relevant.",
     "MNEMOSYNE_PREFETCH_PROFILE": "Prefetch profile name, for example `general` or `coding`.",
+    "MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP": "Ceiling on the ranking importance of newly written `sleep_model_refresh_proposal` rows. The generating LLM's raw self-reported confidence is preserved in metadata (which the review/auto-apply flow reads) rather than used as a retrieval priority. Clamped to [0, 1]. Default `0.5`. Existing rows are **not** migrated — see [Migrating existing banks](#migrating-existing-banks).",
     "MNEMOSYNE_RECALL_PROVENANCE": "Set to `1` to make linear `recall()` append one JSONL audit line per call to `<db>.recall_provenance.jsonl` (plaintext: up to 200 chars of raw query text, plus the first 20 results with id/tier/score/importance/timestamp). Default OFF, read per call. The file is created `0600`, rotates at 1 MB (the current file plus one `.1` are retained), and reads are bounded to a 256 KB tail of the current generation. `explain=True` calls are intentionally excluded: their trace object is the audit surface for that call. Provenance is suppressed only when `recall_enhanced()` takes its enhanced branch (`MNEMOSYNE_ENHANCED_RECALL=1`); with the flag unset it is a plain passthrough into `recall()` and its calls ARE logged. Polyphonic paths are never logged. Fail-open: a provenance failure never breaks recall. When enabled, each call pays one small locked append (no fsync); local filesystems only.",
     "MNEMOSYNE_SESSION_END_TIMEOUT": "Seconds allowed for end-of-session memory writes.",
     "MNEMOSYNE_SHUTDOWN_DRAIN_TIMEOUT": "Seconds allowed to drain pending writes on shutdown.",
@@ -616,8 +684,10 @@ def _render_tool_list(tools) -> list:
     return lines
 
 
-def _render_config(env_map, defaults, restart, version: str, effective=None) -> str:
+def _render_config(env_map, defaults, restart, version: str, effective=None,
+                   conflicts=None) -> str:
     effective = effective or {}
+    conflicts = conflicts or {}
     lines = [
         "---",
         'title: "Configuration"',
@@ -661,6 +731,8 @@ def _render_config(env_map, defaults, restart, version: str, effective=None) -> 
             shown = f"`{effective[key][0]}` [^{key}] (declared {declared})"
         else:
             shown = declared
+        if key in conflicts:
+            shown = f"{shown} [^{key}-conflict]"
         lines.append("| `{}` | `{}` | {} | {} | {} |".format(
             key,
             env_map[key],
@@ -669,30 +741,53 @@ def _render_config(env_map, defaults, restart, version: str, effective=None) -> 
             CONFIG_DESCRIPTIONS.get(key, ""),
         ))
 
-    if effective:
-        lines += [
-            "",
-            f"### Keys whose effective default bypasses `config.py` ({len(effective)})",
-            "",
-            "For these keys a module-level constant reads the environment variable "
-            "directly with its own fallback, so the value in `DEFAULTS` is not what "
-            "the runtime uses and a `config.yaml` entry alone does not reach the "
-            "module. Treat the environment variable as authoritative.",
-            "",
-            "This list is derived by scanning the package for "
-            "`os.environ.get(\"MNEMOSYNE_...\", default)` and diffing against "
-            "`DEFAULTS`, so it cannot fall out of date.",
-            "",
-        ]
-        for key in sorted(effective):
-            value, src = effective[key]
-            prose = EFFECTIVE_DEFAULT_PROSE.get(key, "")
-            tail = f" {prose}" if prose else ""
-            lines.append(
-                f"[^{key}]: `{key}` -- effective default `{value}`, set in "
-                f"`{src}`, not the `{_fmt_default(defaults.get(key))}` declared in "
-                f"`config.py`.{tail}"
-            )
+    if effective or conflicts:
+        if effective:
+            lines += [
+                "",
+                f"### Keys whose effective default bypasses `config.py` ({len(effective)})",
+                "",
+                "For these keys a module-level constant reads the environment variable "
+                "directly with its own fallback, so the value in `DEFAULTS` is not what "
+                "the runtime uses and a `config.yaml` entry alone does not reach the "
+                "module. Treat the environment variable as authoritative.",
+                "",
+                "This list is derived by scanning the package for "
+                "`os.environ.get(\"MNEMOSYNE_...\", default)` and diffing against "
+                "`DEFAULTS`, so it cannot fall out of date.",
+                "",
+            ]
+        else:
+            lines += [
+                "",
+                "### Keys with conflicting defaults across roots "
+                f"({len(conflicts)})",
+                "",
+                "These keys resolve to different fallbacks in different "
+                "provider roots. Each value is listed with the sources "
+                "that set it.",
+                "",
+            ]
+        for key in sorted(set(effective) | set(conflicts)):
+            if key in effective:
+                value, sources = effective[key]
+                prose = EFFECTIVE_DEFAULT_PROSE.get(key, "")
+                tail = f" {prose}" if prose else ""
+                src_list = ", ".join(f"`{s}`" for s in sources)
+                lines.append(
+                    f"[^{key}]: `{key}` -- effective default `{value}`, set in "
+                    f"{src_list}, not the `{_fmt_default(defaults.get(key))}` declared in "
+                    f"`config.py`.{tail}"
+                )
+            if key in conflicts:
+                each = "; ".join(
+                    f"`{v}` in `{s}`" for v, s in sorted(set(conflicts[key]))
+                )
+                lines.append(
+                    f"[^{key}-conflict]: `{key}` -- provider roots disagree on the "
+                    f"effective default ({each}). The disagreement needs a decision, "
+                    f"not silent first-wins."
+                )
 
     lines += [
         "",
@@ -721,6 +816,32 @@ def _render_config(env_map, defaults, restart, version: str, effective=None) -> 
         "They resolve at request time as `config.yaml > MNEMOSYNE_*_WEIGHT > defaults`.",
         "A config reload applies to the next request, and enhanced-recall cache entries",
         "are isolated by the effective weight snapshot.",
+        "",
+        "---",
+        "",
+        "## Migrating existing banks",
+        "",
+        "`MNEMOSYNE_CONSOLIDATION_TIER` and `MNEMOSYNE_PROPOSAL_IMPORTANCE_CAP` apply when a",
+        "row is written, so upgrading does not reweight rows already in the bank. Sleep summaries",
+        "written before the upgrade keep their current stored tier, and model-refresh proposals",
+        "keep their current stored importance until migrated.",
+        "",
+        "Existing banks can be demoted in place using the same fields the writer sets:",
+        "",
+        "```sql",
+        "-- Derived summaries: full ranking weight (1.0x) -> tier 3 (0.25x)",
+        "UPDATE episodic_memory SET tier = 3 WHERE source = 'sleep_consolidation';",
+        "",
+        "-- Model-refresh proposals: drop below the 0.65 prefetch rescue floor",
+        "-- (monotonic: only demotes rows currently above 0.35)",
+        "UPDATE working_memory SET importance = MIN(importance, 0.35)",
+        "  WHERE source = 'sleep_model_refresh_proposal' AND importance > 0.35;",
+        "```",
+        "",
+        "Neither statement is applied automatically: silently reweighting a user's existing",
+        "memories on upgrade is worse than requiring one deliberate statement. Back up the",
+        "database first (`VACUUM INTO` works on a live WAL bank), and note that both fields",
+        "affect ranking only — no content is modified or deleted.",
         "",
     ]
     return "\n".join(lines).rstrip() + "\n"
@@ -829,16 +950,21 @@ def main() -> None:
     tools = _collect_tools()
     env_map, defaults, restart = _collect_config()
     _validate_descriptions(env_map)
-    effective = _scan_effective_defaults(env_map, defaults)
+    effective, conflicts = _scan_effective_defaults(
+        env_map, defaults,
+        roots=("mnemosyne", "hermes_memory_provider", "integrations"),
+    )
 
     mcp_count = sum(1 for t in tools if t["mcp"])
     schema_mdx = _render_tool_schema(tools, version)
-    config_mdx = _render_config(env_map, defaults, restart, version, effective)
+    config_mdx = _render_config(env_map, defaults, restart, version, effective,
+                                conflicts)
 
     if check_only:
         print(f"v{version} | {len(tools)} tools ({mcp_count} over MCP) | "
               f"{len(env_map)} config keys | {len(ENV_ONLY_DESCRIPTIONS)} env-only | "
-              f"{len(effective)} effective-default divergences")
+              f"{len(effective)} effective-default divergences | "
+              f"{len(conflicts)} cross-root conflicts")
         return
 
     canonical = os.path.join(REPO_ROOT, "docs", "api")

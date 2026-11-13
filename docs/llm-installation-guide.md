@@ -18,18 +18,47 @@
 
 ## Path A: Hermes provider install
 
-For a persistent Docker/image install, use a persistent side venv and the wrapper installer. It keeps the plugin directory independent from a rebuildable Hermes venv. Set `HERMES_HOME` to the directory that contains the active Hermes `config.yaml`; `/opt/data` below is the Docker/image example and must be replaced for other deployments:
+For a persistent Docker/image install, use a persistent side venv and the wrapper installer. It keeps the plugin directory independent from a rebuildable Hermes venv. The side venv must use the same Python **major/minor** as the running Hermes gateway; do not substitute `python3` from `PATH` or run bare `uv venv`.
+
+Set `HERMES_HOME` to the directory that contains the active Hermes `config.yaml`; `/opt/data` below is the Docker/image example and must be replaced for other deployments. Before creating the side venv, set `HERMES_PYTHON` to the virtual-environment interpreter used by the **actual running Hermes gateway**, verified with the deployment operator or runtime configuration. Keep the venv interpreter path, not its resolved base-Python symlink target. If ownership cannot be determined, **stop**; an executable or a version probe alone does not establish ownership.
+
+The standalone installer's bounded discovery supports validated launcher-based installations and recorded staged runtimes; it does not simply trust an executable sibling of `hermes`. A recorded but unusable staged runtime must not fall back to the checkout's anchor venv. For wrappers, shims, containers, or an otherwise uncertain layout, obtain the verified interpreter from the deployment rather than reproducing discovery with a sibling lookup. The explicit `--python` used below bypasses discovery and selects the side environment the wrapper imports. See [`_find_hermes_python`](../integrations/hermes/src/mnemosyne_hermes/install.py).
 
 ```bash
+: "${HERMES_PYTHON:?Set this to the deployment-verified Python that starts the running Hermes gateway}"
+if [ ! -f "$HERMES_PYTHON" ] || [ ! -x "$HERMES_PYTHON" ]; then
+  printf 'Hermes Python is not an executable file: %s\n' "$HERMES_PYTHON" >&2
+  exit 1
+fi
+"$HERMES_PYTHON" -c 'import sys; raise SystemExit(sys.prefix == sys.base_prefix)' || {
+  printf 'Hermes Python is not a virtual-environment runtime: %s\n' "$HERMES_PYTHON" >&2
+  exit 1
+}
+"$HERMES_PYTHON" --version || exit 1
+```
+
+Then create the side venv with that exact interpreter. Stop on the first failure;
+do not register or restart a partially installed provider:
+
+```bash
+set -e
 export HERMES_HOME=/opt/data
 VENV="$HERMES_HOME/.mnemosyne/venv"
-python3 -m venv "$VENV"
+if [ -e "$VENV" ] || [ -L "$VENV" ]; then
+  printf 'Refusing to create side venv at existing path: %s\n' "$VENV" >&2
+  exit 1
+fi
+"$HERMES_PYTHON" -m venv "$VENV"
+"$VENV/bin/python" -m pip --version
 "$VENV/bin/python" -m pip install --upgrade pip
 "$VENV/bin/python" -m pip install 'mnemosyne-memory[embeddings]' mnemosyne-hermes
 "$VENV/bin/mnemosyne-hermes" install --mode wrapper --python "$VENV/bin/python"
 hermes config set memory.provider mnemosyne
-hermes gateway restart
 ```
+
+If venv creation or the pip probe fails, stop. After preserving any partial target and choosing a new, nonexistent persistent path for `VENV`, a seeded fallback is `uv venv --seed --python "$HERMES_PYTHON" "$VENV"`. Use the same verified interpreter, rerun the pip probe and install commands only after success, and never silently overwrite an existing environment. For the native Windows equivalent, see [Windows persistent side-venv wrapper](hermes-integration.md#windows-persistent-side-venv-wrapper).
+
+For Docker or Compose, restart the actual deployment service using its deployment tooling. Do not substitute `hermes gateway restart` inside the container.
 
 The wrapper installer registers the provider plugin in `$HERMES_HOME/plugins`. Verify the active profile rather than adding a separate `plugins.enabled` entry:
 
@@ -44,7 +73,13 @@ These status commands report local provider state only; they do not prove databa
 
 ## Path B: pip install + Register with Hermes
 
-Install the PyPI package, then register it as Hermes's memory provider.
+Install the core package, then register it with the local Hermes installation.
+The compatibility installer now delegates to the standalone provider, so also
+install `mnemosyne-hermes` in the activated environment before Step 2.
+
+This provider requires the core embeddings extra even if the core was initially
+installed without extras. Unlike Path A, the local route may bootstrap packages
+into Hermes' mutable runtime; it does not preserve them across its replacement.
 
 ### Step 1: Install the package
 
@@ -75,10 +110,18 @@ pip install mnemosyne-memory[all]
 ### Step 2: Register with Hermes
 
 ```bash
+pip install mnemosyne-hermes
 python -m mnemosyne.install
 ```
 
-This creates `~/.hermes/plugins/mnemosyne/` and sets `memory.provider: mnemosyne` in config.
+The core command migrates recognized legacy links, delegates to the standalone
+provider, sets `memory.provider: mnemosyne`, and verifies status. It fails if the
+standalone provider cannot be found; it does not recreate the old
+`hermes_memory_provider` link. The standalone installer defaults to symlink mode
+on Linux/macOS/WSL and wrapper mode on native Windows. For explicit interpreter
+selection, use `mnemosyne-hermes install --python` with the verified Hermes
+runtime, as described in the [canonical local install guide](hermes-integration.md#step-2-link-the-plugin-in-a-local-mutable-environment).
+See also the [core compatibility entry point](../mnemosyne/install.py).
 
 ### Step 3: Verify
 
@@ -119,6 +162,7 @@ print(results)
 git clone https://github.com/mnemosyne-oss/mnemosyne.git
 cd mnemosyne
 pip install -e ".[all,dev]"
+pip install -e integrations/hermes
 ```
 
 Then register with Hermes:
@@ -214,19 +258,22 @@ export HERMES_HOME=/opt/data  # Replace with the active Hermes home
 VENV="$HERMES_HOME/.mnemosyne/venv"
 "$VENV/bin/python" -m pip install --upgrade 'mnemosyne-memory[embeddings]' mnemosyne-hermes
 "$VENV/bin/mnemosyne-hermes" install --mode wrapper --force --python "$VENV/bin/python"
-hermes gateway restart
+# For Docker or Compose, restart the actual deployment service with its deployment tooling.
 ```
 
-The forced install regenerates the wrapper plugin files and does not modify the Mnemosyne database.
+The forced install regenerates the wrapper plugin files and does not modify the Mnemosyne database. Use `--force` only after confirming the target is the Mnemosyne link or wrapper you intend to replace. If Hermes' Python major/minor changed, create a new matching side venv using the verified runtime before refreshing the wrapper; do not keep using incompatible packages.
 
 ```bash
 # Path B: direct PyPI install
-pip install --upgrade mnemosyne-memory
+pip install --upgrade mnemosyne-memory mnemosyne-hermes
+python -m mnemosyne.install
 hermes gateway restart
 
 # Path D: source install
 cd mnemosyne && git pull
 pip install -e ".[all,dev]"
+pip install -e integrations/hermes
+python -m mnemosyne.install
 hermes gateway restart
 ```
 
@@ -241,10 +288,11 @@ Set `HERMES_HOME` to the active Hermes home before removing a Path A wrapper ins
 ```bash
 export HERMES_HOME=/opt/data  # Replace with the active Hermes home
 hermes memory off  # Disable the external provider; built-in memory remains active
-hermes gateway restart  # Run from a shell outside the gateway process
 "$HERMES_HOME/.mnemosyne/venv/bin/mnemosyne-hermes" uninstall
 rm -rf "$HERMES_HOME/.mnemosyne/venv"  # Only if this venv was created by Path A
 ```
+
+For Docker or Compose, restart the actual deployment service with its deployment tooling after removing the wrapper.
 
 ### Path B or Path D: pip/source install
 
@@ -261,12 +309,15 @@ python -m mnemosyne.install --uninstall
 ### "Provider not found" after install
 
 ```bash
-# Check the symlink exists
+# Check the plugin target (symlink or wrapper directory)
 ls -la ~/.hermes/plugins/mnemosyne
 
-# If missing, recreate it
+# Local Path B/D only: delegate registration to the standalone provider
 python -m mnemosyne.install
 ```
+
+For Path A, use the verified compatible side venv and wrapper install/status
+commands above, not the local compatibility entry point.
 
 ### "No module named mnemosyne"
 
@@ -318,8 +369,10 @@ If the `hermes_plugin` hook uses a different session ID than the MemoryProvider,
 
 ### When to use mnemosyne_remember vs the legacy memory tool
 
-- **ALWAYS use `mnemosyne_remember`** for durable facts, preferences, and insights
-- The legacy `memory` tool is deprecated for durable storage
+- Use `mnemosyne_remember` for bulk durable facts, preferences, and insights
+- The legacy `memory` tool is deprecated for bulk durable storage: facts, preferences, and insights should go through `mnemosyne_remember`
+- Small standing rules and context anchors (binding rules such as "if X happens, do Y", time-sensitive notes, short pointers) may stay in the always-injected memory tier, which remains a supported complementary tier. Mnemosyne is ranked retrieval, so a recalled memory surfaces only when it ranks for the current turn. The always-injected tier is bounded and loaded as a snapshot per session; it is not unlimited or live. This exception takes precedence over the general storage guidance above
+- The bundled `mnemosyne-memory-override` skill is a stricter policy that routes all durable storage to Mnemosyne. It applies only when the user consciously selects it; installing the plugin, the skill appearing in the skills index, or an ordinary memory task is not that selection
 - Mnemosyne supports importance scoring (0.0-1.0), global scope, expiry dates, and entity extraction — features the legacy tool doesn't have
 
 ### Memory survives gateway restarts, machine reboots, and Fly.io VM recycles

@@ -90,7 +90,7 @@ def _seed_legacy_parent(conn, memory_id: str, session_id: str) -> None:
     conn.commit()
 
 
-def test_forget_working_preserves_children_when_legacy_parent_shares_id(
+def test_forget_working_ignores_a_legacy_mirror_with_the_same_id(
     tmp_path: Path,
 ):
     beam = BeamMemory(session_id="owner", db_path=tmp_path / "forget.db")
@@ -106,11 +106,11 @@ def test_forget_working_preserves_children_when_legacy_parent_shares_id(
     assert beam.forget_working("collision") is True
     assert beam.conn.execute(
         "SELECT COUNT(*) FROM memories WHERE id = 'collision'"
-    ).fetchone()[0] == 1
-    assert _child_counts(beam.conn, "collision") == (1, 1, 1)
+    ).fetchone()[0] == 0
+    assert _child_counts(beam.conn, "collision") == (0, 0, 0)
 
 
-def test_forget_episodic_preserves_children_when_legacy_parent_shares_id(
+def test_forget_episodic_ignores_a_legacy_mirror_with_the_same_id(
     tmp_path: Path,
 ):
     beam = BeamMemory(session_id="owner", db_path=tmp_path / "forget.db")
@@ -121,8 +121,8 @@ def test_forget_episodic_preserves_children_when_legacy_parent_shares_id(
     assert beam.forget_episodic("collision") is True
     assert beam.conn.execute(
         "SELECT COUNT(*) FROM memories WHERE id = 'collision'"
-    ).fetchone()[0] == 1
-    assert _child_counts(beam.conn, "collision") == (1, 1, 1)
+    ).fetchone()[0] == 0
+    assert _child_counts(beam.conn, "collision") == (0, 0, 0)
 
 
 def test_forget_deletes_owned_episodic_row_and_unambiguous_children(

@@ -105,12 +105,12 @@ class TestRegexEntityExtraction(unittest.TestCase):
         # lowercase values were ever unique to the quote patterns, and they
         # are the ones that dodged the stop-word filter ('okay,' != 'okay').
         result = extract_entities_regex(
-            "'Okay,' she said. 'The room is quiet now.'"
+            "'Mira,' she said. 'The room is quiet now.'"
         )
-        self.assertNotIn("Okay,", result)
+        self.assertNotIn("Mira,", result)
         self.assertNotIn("The room is quiet now.", result)
         # The bare capitalized word is still a candidate; the fragment is not.
-        self.assertIn("Okay", result)
+        self.assertIn("Mira", result)
         # Double quotes, and a value no capitalized pattern can reproduce, so
         # this one bites if the double-quote pattern ever comes back. The
         # comma is what let it dodge the stop-word filter before.

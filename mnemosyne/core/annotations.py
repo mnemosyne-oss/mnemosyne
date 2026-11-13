@@ -474,7 +474,17 @@ class AnnotationStore:
                 seen_ids.add(row_id)
 
         # BEGIN IMMEDIATE for snapshot consistency (codex review #6).
-        cursor.execute("BEGIN IMMEDIATE")
+        owns_transaction = not self.conn.in_transaction
+        savepoint = None
+        if owns_transaction:
+            cursor.execute("BEGIN IMMEDIATE")
+        else:
+            savepoint = (
+                self.conn._next_savepoint_name("import_annotations")
+                if hasattr(self.conn, "_next_savepoint_name")
+                else "mnemosyne_import_annotations"
+            )
+            cursor.execute(f"SAVEPOINT {savepoint}")
         try:
             cursor.execute(
                 "SELECT id, memory_id, kind, value, source, confidence, "
@@ -581,9 +591,16 @@ class AnnotationStore:
                 except sqlite3.IntegrityError:
                     stats["skipped"] += 1
 
-            self.conn.commit()
+            if owns_transaction:
+                self.conn.commit()
+            else:
+                cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
         except Exception:
-            self.conn.rollback()
+            if owns_transaction:
+                self.conn.rollback()
+            else:
+                cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
         return stats
 

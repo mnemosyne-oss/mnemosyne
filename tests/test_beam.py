@@ -39,6 +39,7 @@ def _same_utc_day_future(
         return None
     return candidate
 from mnemosyne.core.memory import Mnemosyne
+from mnemosyne.core.streaming import EventType
 
 
 @pytest.fixture
@@ -88,6 +89,203 @@ def test_get_working_memory_respects_global_cross_session_visibility(temp_db):
     assert cross_session_global["id"] == global_id
     assert cross_session_global["memory_store"] == "working"
     assert reader.get(private_id) is None
+
+
+def test_update_working_respects_global_cross_session_visibility(temp_db):
+    writer = BeamMemory(session_id="session-a", db_path=temp_db)
+    global_id = writer.remember("global before", source="test", scope="global")
+    private_id = writer.remember("private before", source="test", scope="session")
+
+    updater = BeamMemory(session_id="session-b", db_path=temp_db)
+    assert updater.update_working(global_id, content="global after") is True
+    assert updater.get(global_id)["content"] == "global after"
+
+    assert updater.update_working(private_id, content="private after") is False
+    assert writer.get(private_id)["content"] == "private before"
+
+
+def test_update_working_stream_gate_rejects_before_any_write(temp_db):
+    writer = BeamMemory(session_id="session-a", db_path=temp_db)
+    memory_id = writer.remember("before", source="test", scope="global")
+    events = []
+    updater = BeamMemory(
+        session_id="session-b", db_path=temp_db, event_emitter=events.append
+    )
+    changes_before = updater.conn.total_changes
+
+    updater.conn.execute("BEGIN")
+    try:
+        with pytest.raises(
+            beam_module.MemoryTransactionStateError,
+            match="commit before updating",
+        ):
+            updater.update_working(memory_id, content="after")
+
+        assert updater.conn.in_transaction is True
+        assert updater.conn.total_changes == changes_before
+        assert updater.get(memory_id)["content"] == "before"
+        assert events == []
+    finally:
+        updater.conn.rollback()
+
+
+def test_mnemosyne_update_reports_success_for_beam_only_global_memory(temp_db):
+    writer = BeamMemory(session_id="session-a", db_path=temp_db)
+    memory_id = writer.remember("beam only before", source="test", scope="global")
+
+    updater = Mnemosyne(session_id="session-b", db_path=temp_db)
+    assert updater.update(memory_id, content="beam only after") is True
+    assert updater.get(memory_id)["content"] == "beam only after"
+
+
+def test_mnemosyne_update_keeps_dual_written_global_memory_in_sync(temp_db):
+    writer = Mnemosyne(session_id="session-a", db_path=temp_db)
+    memory_id = writer.remember("dual before", source="test", scope="global")
+
+    updater = Mnemosyne(session_id="session-b", db_path=temp_db)
+    assert updater.update(memory_id, content="dual after", importance=0.9) is True
+    updated = updater.get(memory_id)
+    assert updated["content"] == "dual after"
+    assert updated["importance"] == 0.9
+    legacy_content, legacy_importance = updater.conn.execute(
+        "SELECT content, importance FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()
+    assert legacy_content == "dual after"
+    assert legacy_importance == 0.9
+
+
+def test_mnemosyne_update_rejects_dual_written_private_memory_cross_session(temp_db):
+    writer = Mnemosyne(session_id="session-a", db_path=temp_db)
+    memory_id = writer.remember("private before", source="test", scope="session")
+
+    updater = Mnemosyne(session_id="session-b", db_path=temp_db)
+    assert updater.update(memory_id, content="private after") is False
+    assert writer.get(memory_id)["content"] == "private before"
+    legacy_content = updater.conn.execute(
+        "SELECT content FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()[0]
+    assert legacy_content == "private before"
+
+
+def test_mnemosyne_update_unknown_memory_emits_no_event(temp_db):
+    memory = Mnemosyne(session_id="session-a", db_path=temp_db).enable_streaming()
+
+    assert memory.update("unknown-memory", content="after") is False
+    assert memory.stream.get_buffer(event_types=[EventType.MEMORY_UPDATED]) == []
+
+
+def test_mnemosyne_update_foreign_private_memory_emits_no_event(temp_db):
+    writer = Mnemosyne(session_id="session-a", db_path=temp_db)
+    memory_id = writer.remember("private before", source="test", scope="session")
+    updater = Mnemosyne(session_id="session-b", db_path=temp_db).enable_streaming()
+
+    assert updater.update(memory_id, content="private after") is False
+    assert writer.get(memory_id)["content"] == "private before"
+    assert updater.stream.get_buffer(event_types=[EventType.MEMORY_UPDATED]) == []
+
+
+def test_mnemosyne_update_stream_gate_rejects_before_any_write_or_event(temp_db):
+    writer = Mnemosyne(session_id="session-a", db_path=temp_db)
+    memory_id = writer.remember("before", source="test", scope="global")
+    updater = Mnemosyne(session_id="session-b", db_path=temp_db).enable_streaming()
+    changes_before = updater.conn.total_changes
+
+    updater.conn.execute("BEGIN")
+    try:
+        with pytest.raises(
+            beam_module.MemoryTransactionStateError,
+            match="commit before updating",
+        ):
+            updater.update(memory_id, content="after", importance=0.9)
+
+        assert updater.conn.in_transaction is True
+        assert updater.conn.total_changes == changes_before
+        assert tuple(updater.conn.execute(
+            "SELECT content, importance FROM memories WHERE id = ?", (memory_id,)
+        ).fetchone()) == ("before", 0.5)
+        assert tuple(updater.conn.execute(
+            "SELECT content, importance FROM working_memory WHERE id = ?",
+            (memory_id,),
+        ).fetchone()) == ("before", 0.5)
+        assert updater.stream.get_buffer(event_types=[EventType.MEMORY_UPDATED]) == []
+    finally:
+        updater.conn.rollback()
+
+
+def test_mnemosyne_update_rolls_back_and_emits_no_event_when_beam_write_fails(
+    temp_db, monkeypatch
+):
+    writer = Mnemosyne(session_id="session-a", db_path=temp_db)
+    memory_id = writer.remember("before", source="test", scope="global")
+    updater = Mnemosyne(session_id="session-b", db_path=temp_db).enable_streaming()
+
+    def fail_second_dual_write(*args, **kwargs):
+        raise RuntimeError("forced BEAM update failure")
+
+    monkeypatch.setattr(updater.beam, "update_working", fail_second_dual_write)
+
+    with pytest.raises(RuntimeError, match="forced BEAM update failure"):
+        updater.update(memory_id, content="after", importance=0.9)
+
+    legacy_content, legacy_importance = writer.conn.execute(
+        "SELECT content, importance FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()
+    assert (legacy_content, legacy_importance) == ("before", 0.5)
+    unchanged = writer.get(memory_id)
+    assert (unchanged["content"], unchanged["importance"]) == ("before", 0.5)
+    assert updater.stream.get_buffer(event_types=[EventType.MEMORY_UPDATED]) == []
+
+
+def test_mnemosyne_update_emits_once_after_dual_write_commit(temp_db):
+    writer = Mnemosyne(session_id="session-a", db_path=temp_db)
+    memory_id = writer.remember("before", source="test", scope="global")
+    updater = Mnemosyne(session_id="session-b", db_path=temp_db).enable_streaming()
+    observed = []
+
+    def observe(event):
+        legacy = updater.conn.execute(
+            "SELECT content, importance FROM memories WHERE id = ?", (memory_id,)
+        ).fetchone()
+        working = updater.conn.execute(
+            "SELECT content, importance FROM working_memory WHERE id = ?", (memory_id,)
+        ).fetchone()
+        observed.append((event, legacy, working, updater.conn.in_transaction))
+
+    updater.stream.on(EventType.MEMORY_UPDATED, observe)
+
+    assert updater.update(memory_id, content="after", importance=0.9) is True
+    events = updater.stream.get_buffer(event_types=[EventType.MEMORY_UPDATED])
+    assert len(events) == 1
+    assert events[0].memory_id == memory_id
+    assert len(observed) == 1
+    _, legacy, working, in_transaction = observed[0]
+    assert tuple(legacy) == ("after", 0.9)
+    assert tuple(working) == ("after", 0.9)
+    assert in_transaction is False
+
+
+def test_mnemosyne_update_preserves_legacy_only_session_compatibility(temp_db):
+    writer = Mnemosyne(session_id="session-a", db_path=temp_db)
+    memory_id = "legacy-only-memory"
+    writer.conn.execute(
+        """
+        INSERT INTO memories (id, content, source, timestamp, session_id, importance)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (memory_id, "legacy before", "test", "2026-01-01T00:00:00", "session-a", 0.5),
+    )
+    writer.conn.commit()
+
+    assert writer.update(memory_id, content="legacy after") is True
+    assert writer.conn.execute(
+        "SELECT content FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()[0] == "legacy after"
+
+    other_session = Mnemosyne(session_id="session-b", db_path=temp_db)
+    assert other_session.update(memory_id, content="should not update") is False
+    assert writer.conn.execute(
+        "SELECT content FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()[0] == "legacy after"
 
 
 class _FakeAnnotations:
@@ -1059,6 +1257,104 @@ class TestWorkingMemory:
         assert past_mid not in ctx
         assert future_mid in {r["id"] for r in beam.recall("offset stored future", top_k=10)}
         assert past_mid not in {r["id"] for r in beam.recall("offset stored past", top_k=10)}
+
+    def test_invalidate_rejects_offset_bearing_expiry(self, temp_db):
+        """Review on #1113 (fifth round): the invalidate() active check must
+        judge ``valid_until`` chronologically, like every julianday-based
+        surface. A legacy/imported row can store an offset-bearing expiry
+        (e.g. ``...T18:30:00+07:00`` = 11:30Z, already expired at a 12:00Z
+        now) whose digits still sort AFTER a UTC ``now`` string, so the old
+        lexical ``>`` read the dead target as active and superseded it.
+        """
+        now = datetime.now(timezone.utc)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        target = beam.remember("offset-expired target", source="test", importance=0.9)
+        replacement = beam.remember("healthy replacement", source="test", importance=0.9)
+        # Expired 30 minutes ago, stored at UTC+07:00.
+        stored = (now - timedelta(minutes=30)).astimezone(
+            timezone(timedelta(hours=7))
+        ).isoformat()
+        # Fixture sanity: this value genuinely misleads a lexical filter —
+        # the displayed clock (now-30min+7h) always sorts after now, whether
+        # the date rolled over or not.
+        assert stored > now.isoformat(), (
+            "fixture: the stored value must sort lexically AFTER aware-UTC now")
+        beam.conn.execute(
+            "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+            (stored, target),
+        )
+        beam.conn.commit()
+
+        assert beam.invalidate(target, replacement_id=replacement) is False, (
+            "an expired target must never accept supersession")
+        row = beam.conn.execute(
+            "SELECT superseded_by FROM working_memory WHERE id = ?", (target,)
+        ).fetchone()
+        assert row[0] is None, "the original memory must not be superseded"
+
+    def test_invalidate_rejects_equal_instant(self, temp_db, monkeypatch):
+        """Review on #1113: eligibility is a strict ``>`` — a row whose
+        expiry is exactly ``now`` is expired, not still active.
+
+        The clock is frozen at the stored instant for the invalidation call,
+        so the two operands are the same instant to the microsecond; a
+        ``>=`` regression would accept the supersession and fail here
+        (review on #1142: without freezing, the captured ``at_now`` drifts
+        microseconds ahead of ``invalidate``'s own ``now`` and the equality
+        boundary is not actually pinned).
+        """
+        import datetime as _dt
+
+        frozen = _dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=_dt.timezone.utc)
+
+        class _FrozenDatetime(_dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return frozen if tz is not None else frozen.replace(tzinfo=None)
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        target = beam.remember("equal-instant target", source="test", importance=0.9)
+        replacement = beam.remember("healthy replacement", source="test", importance=0.9)
+        beam.conn.execute(
+            "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+            (frozen.isoformat(), target),
+        )
+        beam.conn.commit()
+
+        monkeypatch.setattr(beam_module, "datetime", _FrozenDatetime)
+        assert beam.invalidate(target, replacement_id=replacement) is False
+        row = beam.conn.execute(
+            "SELECT superseded_by FROM working_memory WHERE id = ?", (target,)
+        ).fetchone()
+        assert row[0] is None
+
+    def test_invalidate_accepts_future_offset_bearing_target(self, temp_db):
+        """Review on #1113: the fix must not lose still-valid rows. A future
+        expiry stored at UTC-05:00 sorts lexically BEFORE aware-UTC now
+        (misleading the old check into reading it expired) but is
+        chronologically active, so the invalidation must succeed.
+        """
+        now = datetime.now(timezone.utc)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        target = beam.remember("future-offset target", source="test", importance=0.9)
+        replacement = beam.remember("healthy replacement", source="test", importance=0.9)
+        stored = (now + timedelta(hours=1)).astimezone(
+            timezone(timedelta(hours=-5))
+        ).isoformat()
+        assert stored < now.isoformat(), (
+            "fixture: the stored value must sort lexically BEFORE aware-UTC now")
+        beam.conn.execute(
+            "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+            (stored, target),
+        )
+        beam.conn.commit()
+
+        assert beam.invalidate(target, replacement_id=replacement) is True, (
+            "a chronologically future expiry must stay supersede-able")
+        row = beam.conn.execute(
+            "SELECT superseded_by FROM working_memory WHERE id = ?", (target,)
+        ).fetchone()
+        assert row[0] == replacement
 
     def test_lowercase_t_valid_until_normalized_to_utc(self, temp_db, non_utc_tz):
         """#525: valid_until with a lowercase ``t`` separator is normalized.
@@ -2315,13 +2611,26 @@ class TestTieredDegradation:
         assert any("tier" in idx for idx in indexes), "idx_em_tier index missing"
         conn.close()
 
-    def test_episodic_memory_defaults_to_tier_1(self, temp_db):
-        """New episodic memories should default to tier 1."""
+    def test_episodic_memory_defaults_to_configured_consolidation_tier(self, temp_db, monkeypatch):
+        """New consolidation summaries default to MNEMOSYNE_CONSOLIDATION_TIER (3).
+
+        Pre-#506 the INSERT omitted `tier` entirely, so summaries landed on the
+        schema default of 1 (full ranking weight) and outranked the sources they
+        paraphrase. Derived rows now enter degraded; the schema default of 1 is
+        still what a caller gets by passing `tier=1` explicitly.
+        """
+        monkeypatch.delenv("MNEMOSYNE_CONSOLIDATION_TIER", raising=False)
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         eid = beam.consolidate_to_episodic(
-            summary="Default tier should be 1",
+            summary="Default tier should be the consolidation tier",
             source_wm_ids=["wm1"],
             importance=0.8
+        )
+        legacy_eid = beam.consolidate_to_episodic(
+            summary="Explicit tier 1 restores the legacy weight",
+            source_wm_ids=["wm1"],
+            importance=0.8,
+            tier=1,
         )
 
         conn = sqlite3.connect(temp_db)
@@ -2329,8 +2638,12 @@ class TestTieredDegradation:
         tier = cursor.execute(
             "SELECT tier FROM episodic_memory WHERE id = ?", (eid,)
         ).fetchone()[0]
+        legacy_tier = cursor.execute(
+            "SELECT tier FROM episodic_memory WHERE id = ?", (legacy_eid,)
+        ).fetchone()[0]
         conn.close()
-        assert tier == 1, f"Expected tier=1, got tier={tier}"
+        assert tier == 3, f"Expected tier=3, got tier={tier}"
+        assert legacy_tier == 1, f"Expected tier=1, got tier={legacy_tier}"
 
     def test_degrade_episodic_tier1_to_tier2(self, temp_db, monkeypatch):
         """Tier 1 memories older than TIER2_DAYS should degrade to tier 2."""
@@ -2342,7 +2655,8 @@ class TestTieredDegradation:
         eid = beam.consolidate_to_episodic(
             summary="This memory is old enough for tier 2 degradation",
             source_wm_ids=["wm1"],
-            importance=0.7
+            importance=0.7,
+            tier=1,  # start hot: this test exercises the 1→2 transition
         )
 
         # Backdate the episodic memory to be older than 5 days
@@ -2375,7 +2689,8 @@ class TestTieredDegradation:
         eid = beam.consolidate_to_episodic(
             summary="This memory will go all the way to tier 3",
             source_wm_ids=["wm1"],
-            importance=0.6
+            importance=0.6,
+            tier=1,  # start hot: this test walks the full 1→2→3 path
         )
 
         # First degrade to tier 2 (older than 1 day)
@@ -2409,7 +2724,8 @@ class TestTieredDegradation:
         beam.consolidate_to_episodic(
             summary="Should be counted but not degraded",
             source_wm_ids=["wm1"],
-            importance=0.7
+            importance=0.7,
+            tier=1,  # start hot: this test exercises the 1→2 candidate count
         )
 
         conn = sqlite3.connect(temp_db)
@@ -2446,7 +2762,8 @@ class TestTieredDegradation:
             eid = beam.consolidate_to_episodic(
                 summary=f"Memory {i} for batch limit test",
                 source_wm_ids=[f"wm{i}"],
-                importance=0.5
+                importance=0.5,
+                tier=1,  # start hot: the batch limit applies to the 1→2 pass
             )
             eids.append(eid)
 
@@ -2472,7 +2789,8 @@ class TestTieredDegradation:
         eid = beam.consolidate_to_episodic(
             summary="Python projects use virtual environments for isolation",
             source_wm_ids=["wm1"],
-            importance=0.9
+            importance=0.9,
+            tier=1,  # start hot: this test degrades down to tier 3
         )
 
         # Degrade to tier 3
@@ -2544,7 +2862,8 @@ class TestTieredDegradation:
         eid = beam.consolidate_to_episodic(
             summary="The user's favorite programming language is Rust for systems work",
             source_wm_ids=["wm1"],
-            importance=0.85
+            importance=0.85,
+            tier=1,  # start hot: this test degrades down to tier 3
         )
 
         conn = sqlite3.connect(temp_db)
@@ -2937,6 +3256,40 @@ class TestConsolidationHealth:
         h = beam.health()
         assert h["status"] == "healthy"
         assert h["last_successful_consolidation"] is not None
+
+    def test_health_error_count_ignores_successful_runs_mentioning_fail(self, temp_db):
+        """A successful consolidation whose summary text contains "fail" (#717)."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        conn = sqlite3.connect(temp_db)
+        conn.execute(
+            "INSERT INTO consolidation_log (session_id, items_consolidated, "
+            "summary_preview, created_at) VALUES (?, ?, ?, datetime('now'))",
+            ("s1", 3, "consolidated memory about a failed deployment postmortem"),
+        )
+        conn.commit()
+        conn.close()
+
+        h = beam.health()
+        assert h["error_count"] == 0
+
+    def test_health_error_count_still_counts_genuine_zero_item_failures(self, temp_db):
+        """A real failed run (zero items, error-shaped summary) still counts."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        conn = sqlite3.connect(temp_db)
+        conn.executemany(
+            "INSERT INTO consolidation_log (session_id, items_consolidated, "
+            "summary_preview, created_at) VALUES (?, ?, ?, datetime('now'))",
+            [
+                ("s1", 0, "error: provider timeout during consolidation"),
+                ("s1", 0, "consolidation failed: no working memory read lock"),
+                ("s1", 0, "nothing to consolidate"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        h = beam.health()
+        assert h["error_count"] == 2
 
 
 class TestUpdateRefreshesDerivedState:

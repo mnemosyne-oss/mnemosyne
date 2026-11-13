@@ -1,6 +1,7 @@
 """Tests for the read-only, content-safe doctor foundations."""
 
 import builtins
+import errno
 import json
 import os
 import sqlite3
@@ -1021,6 +1022,9 @@ def test_atomic_two_target_failures_restore_existing_artifacts_and_clean_staging
 ):
     """A failed pair write never leaves either old artifact replaced or staged."""
 
+    if failure == "directory_fsync" and os.name == "nt":
+        pytest.skip("Windows does not provide os.open/fsync on directories")
+
     json_path = tmp_path / "doctor.json"
     markdown_path = tmp_path / "doctor.md"
     original_json = '{"previous": true}\n'
@@ -1061,6 +1065,143 @@ def test_atomic_two_target_failures_restore_existing_artifacts_and_clean_staging
     assert json_path.read_text() == original_json
     assert markdown_path.read_text() == original_markdown
     assert not list(tmp_path.glob(".doctor-*"))
+
+
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("fail_file_fsync", [False, True])
+def test_atomic_windows_directory_sync_capability(
+    tmp_path, monkeypatch, count, existing, fail_file_fsync
+):
+    """Skip only unsupported directory sync, not real staged-file fsync."""
+    targets = [tmp_path / "doctor.json", tmp_path / "doctor.md"][:count]
+    originals = [b"old json\n", b"old markdown\n"][:count]
+    texts = ['{"safe": true}\n', "# safe\n"][:count]
+    if existing:
+        for target, original in zip(targets, originals):
+            target.write_bytes(original)
+    events = []
+    error = OSError(errno.EIO, "staging file fsync failed")
+
+    def unsupported_directory_open(path, flags, *args, **kwargs):
+        if Path(path).is_dir():
+            events.append("directory-open")
+            raise PermissionError(errno.EACCES, "Windows directory open unsupported")
+        return os.open(path, flags, *args, **kwargs)
+
+    def sync_file(descriptor):
+        assert stat.S_ISREG(os.fstat(descriptor).st_mode)
+        # The written data must have been flushed before fsync.
+        assert os.fstat(descriptor).st_size > 0
+        events.append("file-fsync")
+        if fail_file_fsync:
+            raise error
+        return os.fsync(descriptor)
+
+    def replace(source, target):
+        if "-restore-" not in Path(source).name:
+            assert events.count("file-fsync") == count
+        events.append("replace")
+        return os.replace(source, target)
+
+    # Replace the module reference, NOT global os.name (which breaks pathlib).
+    simulated_os = types.SimpleNamespace(**vars(os))
+    simulated_os.name = "nt"
+    simulated_os.open = unsupported_directory_open
+    simulated_os.fsync = sync_file
+    simulated_os.replace = replace
+    monkeypatch.setattr(doctor, "os", simulated_os)
+
+    def write():
+        if count == 1:
+            doctor.write_doctor_artifact_atomically(path=targets[0], text=texts[0])
+        else:
+            write_doctor_artifacts_atomically(
+                json_path=targets[0], json_text=texts[0],
+                markdown_path=targets[1], markdown_text=texts[1],
+            )
+
+    if fail_file_fsync:
+        with pytest.raises(OSError) as raised:
+            write()
+        assert raised.value is error
+        assert events == ["file-fsync"]
+        assert [p.read_bytes() if p.exists() else None for p in targets] == (
+            originals if existing else [None] * count
+        )
+    else:
+        write()
+        assert events == ["file-fsync"] * count + ["replace"] * count
+        assert [p.read_bytes() for p in targets] == [text.encode() for text in texts]
+    assert set(tmp_path.iterdir()) == {p for p in targets if p.exists()}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires real POSIX directory descriptors")
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("failure", [None, "open", "fsync"])
+@pytest.mark.parametrize("error_number", [errno.EACCES, errno.EIO])
+def test_atomic_posix_directory_sync_contract(
+    tmp_path, monkeypatch, count, existing, failure, error_number
+):
+    """Even without O_DIRECTORY, supported directory errors must propagate."""
+    targets = [tmp_path / "doctor.json", tmp_path / "doctor.md"][:count]
+    texts = ['{"safe": true}\n', "# safe\n"][:count]
+    originals = [b"old json\n", b"old markdown\n"][:count]
+    if existing:
+        for target, original in zip(targets, originals):
+            target.write_bytes(original)
+    error = OSError(error_number, "genuine POSIX directory error")
+    opened = []
+    synced = []
+
+    def open_directory(path, flags, *args, **kwargs):
+        if Path(path).is_dir():
+            # Replacements have happened before the durability step.
+            assert [p.read_bytes() for p in targets] == [text.encode() for text in texts]
+            opened.append(Path(path))
+            assert flags == os.O_RDONLY
+            if failure == "open":
+                raise error
+        return os.open(path, flags, *args, **kwargs)
+
+    def fsync(descriptor):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            synced.append(descriptor)
+            if failure == "fsync":
+                raise error
+        return os.fsync(descriptor)
+
+    simulated_os = types.SimpleNamespace(**vars(os))
+    if hasattr(simulated_os, "O_DIRECTORY"):
+        del simulated_os.O_DIRECTORY
+    simulated_os.open = open_directory
+    simulated_os.fsync = fsync
+    monkeypatch.setattr(doctor, "os", simulated_os)
+
+    def write():
+        if count == 1:
+            doctor.write_doctor_artifact_atomically(path=targets[0], text=texts[0])
+        else:
+            write_doctor_artifacts_atomically(
+                json_path=targets[0], json_text=texts[0],
+                markdown_path=targets[1], markdown_text=texts[1],
+            )
+
+    if failure:
+        with pytest.raises(OSError) as raised:
+            write()
+        assert raised.value is error
+        assert [p.read_bytes() if p.exists() else None for p in targets] == (
+            originals if existing else [None] * count
+        )
+        assert len(opened) == 1
+        assert len(synced) == (failure == "fsync")
+    else:
+        write()
+        assert len(opened) == len(synced) == count
+        assert [p.read_bytes() for p in targets] == [text.encode() for text in texts]
+    assert set(tmp_path.iterdir()) == {p for p in targets if p.exists()}
 
 
 def test_finding_details_are_redacted_and_json_safe():

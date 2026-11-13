@@ -1,6 +1,6 @@
 name: mnemosyne
 kind: exclusive
-version: 0.7.3
+version: 0.7.7
 description: "Native local memory for Hermes - SQLite with vector search, FTS5 hybrid ranking, episodic consolidation, and temporal triples. Zero cloud. Installed from the Hermes plugin catalog; the implementation is the mnemosyne-hermes package declared in pyproject.toml."
 author: Abdias J
 # A floor, not a pin: Hermes refuses to load this plugin when the running version fails this
@@ -37,6 +37,7 @@ provides_tools:
   - mnemosyne_remember
   - mnemosyne_remember_canonical
   - mnemosyne_remember_media
+  - mnemosyne_resolve_conflicts
   - mnemosyne_scratchpad_clear
   - mnemosyne_scratchpad_read
   - mnemosyne_scratchpad_write

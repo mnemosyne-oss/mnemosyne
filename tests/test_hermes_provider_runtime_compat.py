@@ -53,6 +53,7 @@ for name in (
     'mnemosyne.core',
     'mnemosyne.core.episodic_graph',
     'mnemosyne.core.beam',
+    'mnemosyne.core.prefetch',
     'mnemosyne.batch_tool',
     'mnemosyne.hermes_config',
     'mnemosyne.integrations',
@@ -64,6 +65,13 @@ for name in (
 
 sys.modules['mnemosyne.core.episodic_graph'].GraphEdge = type('GraphEdge', (), {})
 sys.modules['mnemosyne.core.beam'].WORKING_MEMORY_TTL_HOURS = 1
+# Runtime-selection tests stub the extracted prefetch imports; no provider IO.
+import ast
+provider_tree = ast.parse(Path(__LEGACY_TARGET__).read_text(encoding='utf-8'))
+for node in provider_tree.body:
+    if isinstance(node, ast.ImportFrom) and node.module == 'mnemosyne.core.prefetch':
+        for imported in node.names:
+            setattr(sys.modules['mnemosyne.core.prefetch'], imported.name, lambda *a, **k: None)
 batch_tool = sys.modules['mnemosyne.batch_tool']
 batch_tool.BatchValidationError = Exception
 batch_tool.apply_beam_batch = lambda *args, **kwargs: None
@@ -78,7 +86,7 @@ sys.modules['mnemosyne.integrations.hermes_persona_prompt'].HermesPersonaPromptM
 
 
 def _load_legacy_entrypoint_code(entrypoint: str, target: Path, site_packages: Path) -> str:
-    provider_stubs = _legacy_provider_stubs() if entrypoint == "__init__.py" else ""
+    provider_stubs = _legacy_provider_stubs().replace("__LEGACY_TARGET__", repr(str(target))) if entrypoint == "__init__.py" else ""
     return f"""
 import importlib.util
 import sys

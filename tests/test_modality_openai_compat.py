@@ -515,6 +515,23 @@ def test_the_caller_owns_the_prompt():
     )
 
 
+def test_hint_replaces_even_an_env_template_verbatim(monkeypatch):
+    monkeypatch.setenv("MNEMOSYNE_MODALITY_PROMPT", "ENV for {modality}: {max_moments}")
+    hint = '  Return {"summary": "literal {modality}", "moments": []}\n'
+    assert adapter.build_prompt(_request(hint=hint)) == hint
+
+
+@pytest.mark.parametrize("hint", [None, ""])
+@pytest.mark.parametrize("template", [None, "ENV for {modality}: {max_moments}"])
+def test_absent_hint_uses_the_prompt_template(monkeypatch, hint, template):
+    if template is None:
+        monkeypatch.delenv("MNEMOSYNE_MODALITY_PROMPT", raising=False)
+    else:
+        monkeypatch.setenv("MNEMOSYNE_MODALITY_PROMPT", template)
+    expected = (template or adapter.DEFAULT_PROMPT).format(modality="image", max_moments=4)
+    assert adapter.build_prompt(_request(hint=hint, max_moments=4)) == expected
+
+
 def test_the_prompt_is_env_overridable(monkeypatch):
     monkeypatch.setenv("MNEMOSYNE_MODALITY_PROMPT", "custom for {modality}")
     assert adapter.build_prompt(_request()) == "custom for image"

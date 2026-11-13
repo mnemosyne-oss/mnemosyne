@@ -15,6 +15,7 @@ from typing import List, Dict
 
 from mnemosyne.core.filters import _RESTORE_WRITE_CAPABILITY
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
+from mnemosyne.core.user_agent import application_user_agent
 
 
 class SuperMemoryImporter(BaseImporter):
@@ -108,6 +109,7 @@ class SuperMemoryImporter(BaseImporter):
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            "User-Agent": application_user_agent(),
         }
 
         all_items = []

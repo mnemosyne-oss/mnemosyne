@@ -12,6 +12,18 @@ module eagerly in every process; the memory subsystem imports it only when
 ``memory.provider`` names ``mnemosyne``.
 """
 
+import sys
+
+# File-loaded entry points cannot rely on a parent package guard.
+if sys.platform in {"android", "emscripten"} or (
+    sys.platform == "linux" and hasattr(sys, "getandroidapilevel")
+):
+    _platform_label = "android" if sys.platform == "linux" else sys.platform
+    raise RuntimeError(
+        f"Mnemosyne native Hermes integration is unsupported on {_platform_label}; "
+        "no provider or tools were activated."
+    )
+
 from mnemosyne_hermes import register, register_memory_provider  # noqa: F401
 
 __all__ = ["register", "register_memory_provider"]

@@ -31,21 +31,27 @@ The three flags on `sleep` are parsed but undocumented in the built-in help. `--
 | `doctor` | `doctor [--db PATH \| --bank NAME] [--format json\|markdown\|both]`. Bounded, read-only health report |
 | `repair` | `repair --report REPORT.json --select working_memory:ID [--apply]`. Applies one narrow doctor-gated fix |
 | `verify` | `verify [db_path] [--quick]`. Integrity check |
-| `reindex` | `reindex [--db PATH \| --bank NAME] [--model NAME] [--dry-run] [--yes] [--no-backup]`. Re-embeds everything and rebuilds the sqlite-vec tables |
+| `reindex` | `reindex [--db PATH \| --bank NAME] [--model NAME] [--batch-size N] [--dry-run] [--yes] [--no-backup]`. Re-embeds everything and rebuilds the sqlite-vec tables |
 
 `reindex` is the recovery path for a vector dimension mismatch. It is synchronous, backs up first unless told otherwise, and prompts unless `--yes`. Its `--dry-run` option prints a rebuild plan without writing.
 
-For automation, do not treat a non-zero exit from a non-dry-run `mnemosyne reindex` as success: it means the vector rebuild did not complete. Likewise, non-dry-run `mnemosyne diagnose --repair-vec-working` exits non-zero unless the requested repair reaches `repaired`; its `--dry-run` mode reports what it would repair without writing.
+`--batch-size N` sets the maximum number of source texts embedded per batch for both working and episodic memory (default **64**). For an API endpoint capped at 10 inputs per request, use `mnemosyne reindex --batch-size 8`. Smaller batches do not truncate texts or retry rejected requests. A missing, malformed, zero, or negative value is rejected before target resolution, model setup, database opening, or backup creation, including with `--dry-run`.
 
-`doctor` and `repair` are the only commands that do not create the data directory as a side effect.
+For automation, do not treat a non-zero exit from a non-dry-run `mnemosyne reindex` as success: it means the vector rebuild did not complete. A rebuild that did not complete changes nothing: it runs as a single transaction (and holds the database write lock until it commits), so a failed or killed run leaves the previous vectors and format marker in place and the command can simply be run again. Likewise, non-dry-run `mnemosyne diagnose --repair-vec-working` exits non-zero unless the requested repair reaches `repaired`; its `--dry-run` mode reports what it would repair without writing.
+
+`doctor` and `repair` do not create the data directory as a side effect. `reindex` without `--db` or `--bank` creates it. `reindex --db PATH` creates it only when `MNEMOSYNE_DATA_DIR` is set, since `config.yaml` lives there in that case. A missing `--db` file or `--bank` name, or an invalid option, makes `reindex` exit before it creates anything.
 
 ## Backup and restore
 
 | Command | Usage |
 |---|---|
-| `backup` | `backup [output_dir]`. Compressed snapshot |
-| `restore` | `restore <backup.db.gz>` |
+| `backup` | `backup [output_dir]`. Compressed snapshot of the bank `MNEMOSYNE_BANK` selects |
+| `restore` | `restore <backup.db.gz>`. Writes to the bank `MNEMOSYNE_BANK` selects |
 | `backups` | `backups [backup_dir]`. List available snapshots |
+
+Backup snapshots contain local memory data, and their `.gz.json` metadata may disclose the absolute source database path in `source_db`. Keep both the snapshot and its metadata private when copying, sharing, or storing them.
+
+`backup` and `restore` use the default bank when `MNEMOSYNE_BANK` is unset. A named bank must already exist: a missing one makes both commands exit before they write anything, including the data directory. `restore` into an existing bank whose `mnemosyne.db` is missing creates that file; `backup` of such a bank exits before it writes anything. `backup` of a named bank without `output_dir`, `reindex --db` and `reindex --bank` back up their target to `<backup dir>/stores/<db stem>-<first 32 hex of the sha256 of the resolved path>/`, and each `.gz.json` file names the source database in `source_db`. `backups`, rotation, the health check and emergency restore read only the backup directory they are given, so they do not list, rotate or pick these snapshots. `backups <store dir>` lists them, and `mnemosyne.dr.recovery.rotate_backups(backup_dir=Path(store_dir))` rotates them. Restore a store outside the data directory with `mnemosyne.dr.recovery.restore_backup(Path(backup), db_path=Path(store))`. Emergency restore picks only backups whose `source_db` names the database it restores. Backups without `source_db`, including every backup written before this field existed, stay on disk and are never picked automatically. One can be restored explicitly with `restore <backup.db.gz>` after checking that it belongs to the bank `MNEMOSYNE_BANK` selects, but only when its `.gz.json` metadata sidecar is present: a backup without a sidecar has no recorded checksums, and `restore` refuses it under the checksum-verification contract.
 
 ## Import and export
 

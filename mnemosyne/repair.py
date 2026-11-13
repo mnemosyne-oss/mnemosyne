@@ -10,6 +10,7 @@ table's data.
 from __future__ import annotations
 
 import ctypes
+import errno
 from dataclasses import asdict, dataclass
 import json
 import math
@@ -674,35 +675,41 @@ def _bind_authorized_database(anchored: _AnchoredDatabase) -> _BoundDatabase:
         directory_flags |= os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):
         directory_flags |= os.O_CLOEXEC
+    operation = "source fstat"
     try:
         source_info = os.fstat(anchored.source_fd)
         if not stat.S_ISREG(source_info.st_mode) or _stat_identity(source_info) != anchored.identity:
             raise RepairError("Repair report does not authorize the selected database")
+        operation = "private stage mkdir"
         os.mkdir(stage_name, 0o700, dir_fd=anchored.parent_fd)
+        operation = "private stage open"
         directory_fd = os.open(stage_name, directory_flags, dir_fd=anchored.parent_fd)
+        operation = "private stage fstat"
         stage_info = os.fstat(directory_fd)
-        if (
-            not stat.S_ISDIR(stage_info.st_mode)
-            or stat.S_IMODE(stage_info.st_mode) != 0o700
-            or stage_info.st_dev != source_info.st_dev
-        ):
-            raise RepairError("Database could not be safely bound for repair")
+        if not stat.S_ISDIR(stage_info.st_mode):
+            raise RepairError("Database could not be safely bound for repair: private stage is not a directory")
+        if stat.S_IMODE(stage_info.st_mode) != 0o700:
+            raise RepairError("Database could not be safely bound for repair: private stage mode must be 0700")
+        if stage_info.st_dev != source_info.st_dev:
+            raise RepairError("Database could not be safely bound for repair: private stage must be on the same device")
         # Give SQLite a path anchored to this retained private directory FD,
         # not its mutable parent-directory spelling.
         stage_path = Path("/proc/self/fd") / str(directory_fd) / "database.sqlite"
         # This is deliberately the final original-name operation: no public DB
         # path is reopened between this dirfd recheck and linkat(AT_EMPTY_PATH).
         _reject_original_sidecars(anchored)
+        operation = "linkat(AT_EMPTY_PATH)"
         _link_open_fd(anchored.source_fd, directory_fd, stage_path.name)
+        operation = "linked database stat"
         linked_info = os.stat(stage_path.name, dir_fd=directory_fd, follow_symlinks=False)
+        operation = "source post-link fstat"
         source_after_link = os.fstat(anchored.source_fd)
-        if (
-            not stat.S_ISREG(linked_info.st_mode)
-            or _stat_identity(linked_info) != anchored.identity
-            or _stat_identity(source_after_link) != anchored.identity
-            or linked_info.st_nlink < 2
-        ):
-            raise RepairError("Database could not be safely bound for repair")
+        if not stat.S_ISREG(linked_info.st_mode):
+            raise RepairError("Database could not be safely bound for repair: linked database is not a regular file")
+        if _stat_identity(linked_info) != anchored.identity or _stat_identity(source_after_link) != anchored.identity:
+            raise RepairError("Database could not be safely bound for repair: post-link database identity does not match")
+        if linked_info.st_nlink < 2:
+            raise RepairError("Database could not be safely bound for repair: linked database link count must be at least 2")
         bound = _BoundDatabase(
             stage_path,
             anchored.source_fd,
@@ -718,7 +725,11 @@ def _bind_authorized_database(anchored: _AnchoredDatabase) -> _BoundDatabase:
     except RepairError:
         raise
     except (OSError, ValueError) as error:
-        raise RepairError("Database could not be safely bound for repair") from error
+        # Only observed operations/errno belong in public diagnostics, never
+        # filenames or raw exception text. Errno does not establish a cause.
+        code = error.errno if isinstance(error, OSError) else None
+        detail = f"{errno.errorcode.get(code, 'UNKNOWN')} ({code})" if code is not None else "errno unavailable"
+        raise RepairError(f"Database could not be safely bound for repair: {operation} failed; {detail}") from error
     finally:
         if bound is None:
             if anchored.parent_fd >= 0:

@@ -12,6 +12,7 @@ All imports are guarded — this module loads safely even if mcp is not installe
 """
 
 from typing import TYPE_CHECKING, Dict, Any, List, TypeAlias
+import copy
 import json
 import logging
 import math  # noqa: F401
@@ -77,7 +78,7 @@ def __getattr__(name: str) -> Any:
 
 TOOLS: List[Dict[str, Any]] = []
 for _s in ALL_TOOL_SCHEMAS:
-    _t = dict(_s)
+    _t = copy.deepcopy(_s)
     # ``mcp`` SDK 2.x renamed the wire field on ``Tool`` from the camelCase
     # ``inputSchema`` (1.x) to the snake_case ``input_schema``. The
     # canonical Python-side key matches the model field. Pydantic still
@@ -87,6 +88,17 @@ for _s in ALL_TOOL_SCHEMAS:
         _t["input_schema"] = _t.pop("inputSchema")
     elif "parameters" in _t:
         _t["input_schema"] = _t.pop("parameters")
+    if _t.get("name") == "mnemosyne_remember":
+        # Remove static scope default for the MCP surface so clients do not
+        # materialize 'session', allowing server-side _resolve_default_scope()
+        # to apply (#653).
+        _props = _t.get("input_schema", {}).get("properties", {})
+        if "scope" in _props:
+            _props["scope"].pop("default", None)
+            _props["scope"]["description"] = (
+                "'session' or 'global'. Default is resolved server-side from "
+                "MNEMOSYNE_DEFAULT_SCOPE, falling back to 'global'."
+            )
     TOOLS.append(_t)
 
 # ---------------------------------------------------------------------------
@@ -233,13 +245,14 @@ def _resolve_bank(arguments: Dict[str, Any]) -> str:
 def _resolve_default_scope() -> str:
     """Resolve default scope for remember() calls.
     
-    Precedence: MNEMOSYNE_DEFAULT_SCOPE env var, falling back to 'session'.
+    Precedence: MNEMOSYNE_DEFAULT_SCOPE env var, falling back to 'global'.
     Only 'session' and 'global' are accepted; unrecognized values fall through
     to the hardcoded default."""
     raw = os.environ.get("MNEMOSYNE_DEFAULT_SCOPE", "").strip().lower()
     if raw in ("session", "global"):
         return raw
-    return "session"
+    # ponytail: default to 'global' so MCP writes are visible to CLI/Hermes/SDK readers (#653)
+    return "global"
 
 
 def _serialize(obj):
@@ -675,6 +688,8 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
                 if gists_table is not None:
                     conn.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
                 conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
+                target_beam._delete_derived_memory_rows(conn, memory_id)
+                target_beam._delete_orphaned_legacy_mirror(conn, memory_id)
             elif action == "update":
                 conn.execute(
                     "UPDATE working_memory SET content = ?, validator = ?, "
@@ -1239,7 +1254,14 @@ def _handle_hygiene_audit(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_hygiene_clean tool call."""
-    from mnemosyne.core.hygiene import NoiseCandidate, clean_noise, validate_hygiene_candidate
+    from mnemosyne.core.hygiene import NoiseCandidate, clean_noise, validate_delete_override, validate_hygiene_candidate
+
+    force = arguments.get("force", False)
+    if type(force) is not bool:
+        return {"error": "force must be a boolean"}
+    confirm = arguments.get("confirm", False)
+    if type(confirm) is not bool:
+        return {"error": "confirm must be a boolean"}
 
     candidates_json = arguments.get("candidates_json", "[]")
     try:
@@ -1272,12 +1294,14 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
             )
         )
 
+    action = arguments.get("action", "keep")
+    override_error = validate_delete_override(candidates, action, force)
+    if override_error:
+        return {"error": override_error}
+
     bank = _resolve_bank(arguments)
     mem = _create_instance(bank=bank)
     db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
-
-    action = arguments.get("action", "keep")
-    confirm = arguments.get("confirm", False)
     dry_run = not confirm
 
     result = clean_noise(
@@ -1286,9 +1310,10 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
         action=action,
         confirm=confirm,
         dry_run=dry_run,
+        force=force,
     )
     return {
-        "status": "dry_run" if dry_run else "applied",
+        "status": "failed" if result.errors else ("dry_run" if dry_run else "applied"),
         "result": result.to_dict(),
         "bank": bank,
     }

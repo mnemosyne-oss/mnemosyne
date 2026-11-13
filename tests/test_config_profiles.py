@@ -17,17 +17,13 @@ import pytest
 
 from mnemosyne.core.config import (
     ENV_VAR_MAP,
-    REQUIRES_RESTART,
     MnemosyneConfig,
-    get_config,
 )
 from mnemosyne.core.profiles import (
     PROFILES,
     TEMPLATE_KEYS,
     validate_profile,
     validate_all_profiles,
-    list_profiles,
-    get_profile,
     apply_profile,
     create_profile,
 )
@@ -315,7 +311,7 @@ class TestConfigReader:
         monkeypatch.delenv("MNEMOSYNE_SYNC_ROLES", raising=False)
         monkeypatch.delenv("MNEMOSYNE_SKIP_CONTEXTS", raising=False)
         config_path = tmp_path / "config.yaml"
-        MnemosyneConfig(config_path=config_path)
+        MnemosyneConfig(config_path=config_path).ensure_seeded()
         seeded = yaml.safe_load(config_path.read_text())
         assert seeded["sync_roles"] == "user"
         assert seeded["skip_contexts"] == (
@@ -331,7 +327,7 @@ class TestConfigReader:
         monkeypatch.setenv("MNEMOSYNE_SYNC_ROLES", "user,assistant")
         monkeypatch.setenv("MNEMOSYNE_SKIP_CONTEXTS", "")
         config_path = tmp_path / "config.yaml"
-        MnemosyneConfig(config_path=config_path)
+        MnemosyneConfig(config_path=config_path).ensure_seeded()
         seeded_text = config_path.read_text()
 
         MnemosyneConfig(config_path=config_path)
@@ -505,3 +501,17 @@ class TestProfileCreate:
         assert USER_PROFILES["custom"]["settings"]["wm_max_items"] == "7777"
         # Cleanup so it doesn't leak into other tests
         USER_PROFILES.pop("custom", None)
+
+    def test_reading_config_never_creates_the_file(self, tmp_path):
+        """Reads must not write: seeding belongs to explicit config commands.
+
+        Seeding on first access turned every read into a write, so read-only
+        commands grew a file in the data tree and the seed snapshotted the
+        process env into a file that then outranked later env changes.
+        """
+        config_path = tmp_path / "config.yaml"
+        config = MnemosyneConfig(config_path=config_path)
+        assert config.get("definitely_not_a_config_key", "fallback") == "fallback"
+        assert not config_path.exists()
+        config.ensure_seeded()
+        assert config_path.exists()

@@ -63,6 +63,11 @@ def collect_runtime_diagnostics() -> dict[str, Any]:
         from mnemosyne.core import embeddings as _embeddings
 
         add("core", "embeddings_available", "YES" if _embeddings.available() else "NO")
+        # available() reports env/key presence, so it stays YES while every
+        # credentialed call is being refused; surface the refusal itself.
+        refusal = _embeddings.policy_refusal_message()
+        if refusal:
+            add("core", "embedding_policy_refusal", "ERROR", refusal)
         add("core", "embeddings_model", "OK", _embeddings._DEFAULT_MODEL)
         # Surface the resolved dimension so operators can confirm their
         # MNEMOSYNE_EMBEDDING_DIM / model-table resolution via the doctor,

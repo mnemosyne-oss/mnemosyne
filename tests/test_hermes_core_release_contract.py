@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib
 import importlib.util
 import os
-import re
 import subprocess
 import sys
 import textwrap
+import urllib.request
 import zipfile
 from pathlib import Path
 
 from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 from packaging.version import Version
+import pytest
+import yaml
 
 try:
     import tomllib
@@ -21,10 +25,12 @@ except ImportError:  # Python 3.10
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE_INIT = ROOT / "mnemosyne" / "__init__.py"
-HERMES_PROJECTS = (
-    ROOT / "integrations" / "hermes" / "pyproject.toml",
-    ROOT / "integrations" / "hermes-catalog" / "pyproject.toml",
-)
+STANDALONE_PROJECT = ROOT / "integrations" / "hermes" / "pyproject.toml"
+CATALOG_PROJECT = ROOT / "integrations" / "hermes-catalog" / "pyproject.toml"
+STANDALONE_CORE_FLOOR = "4.0.0"
+# Catalog promotion chooses a compatibility floor independently of Core's
+# current source version; a compatible Core iteration must not raise it.
+CATALOG_CORE_FLOOR = "4.0.0"
 LEGACY_HERMES_MANIFEST = ROOT / "integrations" / "hermes" / "plugin.yaml"
 CORE_HERMES_MANIFEST = ROOT / "hermes_memory_provider" / "plugin.yaml"
 REQUIRED_CORE_API = (
@@ -55,39 +61,69 @@ def _core_version() -> str:
     raise AssertionError("mnemosyne.__version__ not found")
 
 
-def _mnemosyne_memory_specs(project: Path) -> list[str]:
-    """Collect core dependency specifications from one project file."""
+def _mnemosyne_memory_specs(project: Path) -> dict[str, list[Requirement]]:
+    """Keep parsed Core requirements associated with their dependency group."""
     data = tomllib.loads(project.read_text(encoding="utf-8"))
-    specs = list(data["project"].get("dependencies", []))
-    for values in data["project"].get("optional-dependencies", {}).values():
-        specs.extend(values)
-    return [spec for spec in specs if re.match(r"mnemosyne-memory(?:\[[^]]+\])?", spec)]
+    groups = {"base": data["project"].get("dependencies", [])}
+    groups.update(data["project"].get("optional-dependencies", {}))
+    return {group: _core_requirements(specs) for group, specs in groups.items()}
 
 
-def test_hermes_packages_require_the_current_core_api_release() -> None:
-    """Require every Hermes package surface to pin the current core API release."""
+def _core_requirements(specs: list[str]) -> list[Requirement]:
+    """Parse dependency declarations while allowing unrelated packages."""
+    requirements = [Requirement(spec) for spec in specs]
+    return [r for r in requirements if canonicalize_name(r.name) == "mnemosyne-memory"]
+
+
+def _assert_core_requirement(requirements: list[Requirement], expected: str) -> None:
+    """Require one exact Core contract, including extras and parsed specifiers."""
+    assert len(requirements) == 1, requirements
+    actual, wanted = requirements[0], Requirement(expected)
+    assert canonicalize_name(actual.name) == canonicalize_name(wanted.name)
+    assert actual.extras == wanted.extras, (actual, wanted)
+    assert actual.specifier == wanted.specifier, (actual, wanted)
+
+
+def test_hermes_packages_require_their_supported_core_api_release() -> None:
+    """Standalone prerelease support and catalog promotion have separate floors."""
     core_version = _core_version()
     parsed_version = Version(core_version)
-    for project in HERMES_PROJECTS:
-        specs = _mnemosyne_memory_specs(project)
-        assert specs, project
-        for spec in specs:
-            requirement = Requirement(spec)
+    for project, floor, groups in (
+        (STANDALONE_PROJECT, STANDALONE_CORE_FLOOR,
+         {"base": "embeddings", "llm": "llm", "mcp": "mcp", "all": "all"}),
+        (CATALOG_PROJECT, CATALOG_CORE_FLOOR, {"base": "embeddings"}),
+    ):
+        requirements = _mnemosyne_memory_specs(project)
+        for group, extra in groups.items():
+            specs = requirements.get(group, [])
+            _assert_core_requirement(specs, f"mnemosyne-memory[{extra}]>={floor}")
+            requirement = specs[0]
+            if project == STANDALONE_PROJECT:
+                # Core is mandatory on every supported standalone environment.
+                assert requirement.marker is None, (group, requirement)
             assert parsed_version in requirement.specifier, (
                 project,
                 core_version,
-                spec,
+                requirement,
             )
-            assert any(
-                item.operator == ">=" and item.version == core_version
-                for item in requirement.specifier
-            ), (project, core_version, spec)
-    assert f"mnemosyne-memory>={core_version}" in LEGACY_HERMES_MANIFEST.read_text(
-        encoding="utf-8"
+    manifest = yaml.safe_load(LEGACY_HERMES_MANIFEST.read_text(encoding="utf-8"))
+    _assert_core_requirement(
+        _core_requirements(manifest.get("pip_dependencies", [])),
+        f"mnemosyne-memory[embeddings]>={STANDALONE_CORE_FLOOR}",
     )
     assert f"version: {core_version}" in CORE_HERMES_MANIFEST.read_text(
         encoding="utf-8"
     )
+
+
+def test_standalone_core_requirements_admit_final_without_admitting_betas() -> None:
+    """Every extra must require Core 4.0.0 final, so no install pairs 0.7.7 with a beta."""
+    for requirements in _mnemosyne_memory_specs(STANDALONE_PROJECT).values():
+        for requirement in requirements:
+            for version in ("4.0.0", "4.0.1"):
+                assert Version(version) in requirement.specifier, (requirement, version)
+            for version in ("3.15.1", "4.0.0b5", "4.0.0b6", "4.0.0rc1"):
+                assert Version(version) not in requirement.specifier, (requirement, version)
 
 
 def test_hermes_required_core_api_is_present() -> None:
@@ -133,6 +169,38 @@ def test_built_release_pair_completes_the_provider_lifecycle(tmp_path: Path) -> 
     wheel_dir.mkdir()
     core_wheel = _build_wheel(ROOT, wheel_dir)
     hermes_wheel = _build_wheel(ROOT / "integrations" / "hermes", wheel_dir)
+    _assert_provider_lifecycle(core_wheel, hermes_wheel, tmp_path, _core_version())
+
+
+@pytest.mark.skipif(
+    os.environ.get("MNEMOSYNE_TEST_PUBLISHED_CORE") != "1",
+    reason="Online release check; set MNEMOSYNE_TEST_PUBLISHED_CORE=1 to download the pinned wheel",
+)
+def test_published_minimum_core_completes_the_provider_lifecycle(tmp_path: Path) -> None:
+    """The current provider must also run with the declared published Core floor."""
+    wheel_dir = tmp_path / "wheels"
+    wheel_dir.mkdir()
+    core_wheel = wheel_dir / "mnemosyne_memory-4.0.0-py3-none-any.whl"
+    # Published PyPI 4.0.0 artifact, not a relabelled build of current source.
+    url = (
+        "https://files.pythonhosted.org/packages/af/d3/"
+        "ebab3bdf259c8d6f1b572552356751e5f224e2bce4494040611708c3657d/"
+        "mnemosyne_memory-4.0.0-py3-none-any.whl"
+    )
+    with urllib.request.urlopen(url, timeout=30) as response:
+        payload = response.read()
+    assert hashlib.sha256(payload).hexdigest() == (
+        "3e80bff63921ab554d3dbc1716900e064c31744b7e60135d9975f73a73026a76"
+    ), "Published minimum-Core wheel checksum differs"
+    core_wheel.write_bytes(payload)
+    hermes_wheel = _build_wheel(ROOT / "integrations" / "hermes", wheel_dir)
+    _assert_provider_lifecycle(core_wheel, hermes_wheel, tmp_path, CATALOG_CORE_FLOOR)
+
+
+def _assert_provider_lifecycle(
+    core_wheel: Path, hermes_wheel: Path, tmp_path: Path, expected_core_version: str
+) -> None:
+    """Exercise wheel-only imports, persistence and provider lifecycle transitions."""
     site = tmp_path / "site"
     site.mkdir()
     _extract_wheel(core_wheel, site)
@@ -152,6 +220,7 @@ def test_built_release_pair_completes_the_provider_lifecycle(tmp_path: Path) -> 
         sys.path.insert(1, {str(dependency_site)!r})
         import mnemosyne
         import mnemosyne_hermes
+        assert mnemosyne.__version__ == {expected_core_version!r}, mnemosyne.__version__
         for module in (mnemosyne, mnemosyne_hermes):
             assert Path(module.__file__).resolve().is_relative_to(site), module.__file__
         required_core_api = {REQUIRED_CORE_API!r}
@@ -176,6 +245,24 @@ def test_built_release_pair_completes_the_provider_lifecycle(tmp_path: Path) -> 
         assert call(provider, "mnemosyne_remember", {{"content": token}})["status"] == "stored"
         recalled = call(provider, "mnemosyne_recall", {{"query": token, "limit": 5}})
         assert any(token in row.get("content", "") for row in recalled["results"])
+        recovery_token = "release_contract_persistent_marker"
+        stored = call(provider, "mnemosyne_remember", {{
+            "content": recovery_token, "scope": "global",
+        }})
+        assert stored["status"] == "stored"
+        private_token = "release_contract_session_marker"
+        private = call(provider, "mnemosyne_remember", {{
+            "content": private_token, "scope": "session",
+        }})
+        assert private["status"] == "stored"
+        batch_token = "release_contract_batch_marker"
+        batch = call(provider, "mnemosyne_batch", {{"operations": [{{
+            "action": "remember", "content": batch_token, "scope": "global",
+        }}]}})
+        assert batch["status"] == "ok", batch
+        assert batch["operations_count"] == 1, batch
+        batch_recalled = call(provider, "mnemosyne_recall", {{"query": batch_token, "limit": 5}})
+        assert any(batch_token in row.get("content", "") for row in batch_recalled["results"])
         provider.initialize(
             "release-pair-skip",
             agent_context="subagent",
@@ -193,11 +280,27 @@ def test_built_release_pair_completes_the_provider_lifecycle(tmp_path: Path) -> 
         )
         assert provider._beam is not None, provider._init_error
         assert call(provider, "mnemosyne_stats", {{}}).get("status") != "memory_unavailable"
+        recovered = call(provider, "mnemosyne_recall", {{"query": recovery_token, "limit": 5}})
+        assert any(recovery_token in row.get("content", "") for row in recovered["results"])
+        recovered_batch = call(provider, "mnemosyne_recall", {{"query": batch_token, "limit": 5}})
+        assert any(batch_token in row.get("content", "") for row in recovered_batch["results"])
+        isolated = call(provider, "mnemosyne_recall", {{"query": private_token, "limit": 5}})
+        assert not any(private_token in row.get("content", "") for row in isolated["results"])
+        provider.initialize(
+            "release-pair-primary",
+            agent_context="primary",
+            hermes_home={str(home)!r},
+            auto_sleep=False,
+        )
+        assert provider._beam is not None, provider._init_error
+        original = call(provider, "mnemosyne_recall", {{"query": private_token, "limit": 5}})
+        assert any(private_token in row.get("content", "") for row in original["results"])
         provider.shutdown()
         """
     )
     env = os.environ.copy()
     env["MNEMOSYNE_NO_EMBEDDINGS"] = "1"
+    env["MNEMOSYNE_CROSS_SESSION"] = "0"
     env.pop("PYTHONPATH", None)
     result = subprocess.run(
         [sys.executable, "-S", "-c", code],

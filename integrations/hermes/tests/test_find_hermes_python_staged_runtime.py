@@ -370,9 +370,29 @@ def test_wrapper_install_fails_closed_for_an_unusable_record(
     assert not install.plugin_target_dir(split_world.home).exists()
 
 
-def test_status_reports_the_staged_runtime_as_hermes_python(split_world, capsys):
-    install.main(["--hermes-home", str(split_world.home), "status"])
+def test_status_reports_the_staged_runtime_as_hermes_python(split_world, capsys, monkeypatch):
+    """Metadata-only status must not probe or guess a runtime from this fixture.
 
-    out = capsys.readouterr().out
-    assert f"Hermes' Python: {split_world.staged_python} (Python 3.14.7)" in out
+    gen1/discovery-only facts and an absent plugin do not qualify PM ownership.
+    The runtime-python tests above retain their explicit runtime-probe contract.
+    """
+    calls = []
+    def forbidden(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError("metadata status must not probe either runtime")
+    for name in ("_find_hermes_python", "check_mnemosyne_core", "_check_wrapper_import"):
+        monkeypatch.setattr(install, name, forbidden)
+    monkeypatch.setattr(install.subprocess, "run", forbidden)
+    monkeypatch.setattr(install.subprocess, "Popen", forbidden)
+    assert install.main(["--hermes-home", str(split_world.home), "status"]) == 1
+
+    captured = capsys.readouterr()
+    out = captured.out
+    assert not captured.err and not calls
+    assert "Ownership: unknown" in out
+    assert "Selected environment: unknown" in out
+    assert "State: missing" in out
+    assert "Runtime/provider function/hooks/autosave: NOT CHECKED" in out
+    assert "Hermes' Python:" not in out
+    assert "3.14.7" not in out and "3.11.15" not in out
     assert str(split_world.anchor_python) not in out

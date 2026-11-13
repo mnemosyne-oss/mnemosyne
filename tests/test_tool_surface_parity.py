@@ -122,12 +122,15 @@ def test_generated_docs_match_the_code():
     tools = gen._collect_tools()
     env_map, defaults, restart = gen._collect_config()
     gen._validate_descriptions(env_map)
-    effective = gen._scan_effective_defaults(env_map, defaults)
+    effective, conflicts = gen._scan_effective_defaults(
+        env_map, defaults,
+        roots=("mnemosyne", "hermes_memory_provider", "integrations"),
+    )
 
     expected = {
         "docs/api/tool-schema.mdx": gen._render_tool_schema(tools, version),
         "docs/api/configuration.mdx": gen._render_config(
-            env_map, defaults, restart, version, effective
+            env_map, defaults, restart, version, effective, conflicts
         ),
     }
     for rel, want in expected.items():

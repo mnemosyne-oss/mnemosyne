@@ -283,7 +283,13 @@ REMEMBER_MEDIA_SCHEMA = {
             "title": {"type": "string", "description": "Short human title for the media. Optional."},
             "hint": {
                 "type": "string",
-                "description": "Guidance for the describer: what to look for, or names and jargon to expect in speech.",
+                "description": (
+                    "Guidance for the describer. For the OpenAI-compatible image adapter, "
+                    "a non-empty hint replaces the entire prompt; it is not appended. "
+                    "The caller must include instructions for the expected JSON response "
+                    "(summary and moments). An empty or omitted hint uses the configured "
+                    "or default prompt template."
+                ),
             },
             "max_moments": {
                 "type": "integer",
@@ -898,6 +904,11 @@ HYGIENE_CLEAN_SCHEMA = {
                 "enum": ["delete", "archive", "flag", "keep"],
                 "description": "Override action for all candidates. If 'keep', uses each candidate's suggested_action.",
                 "default": "keep",
+            },
+            "force": {
+                "type": "boolean",
+                "description": "Allow explicit delete override when some candidates are not suggested for deletion. Does not replace confirm.",
+                "default": False,
             },
             "confirm": {
                 "type": "boolean",

@@ -17,6 +17,7 @@ from typing import List, Dict
 
 from mnemosyne.core.filters import _RESTORE_WRITE_CAPABILITY
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
+from mnemosyne.core.user_agent import application_user_agent
 
 
 class CogneeImporter(BaseImporter):
@@ -78,7 +79,9 @@ class CogneeImporter(BaseImporter):
         else:
             url = f"{base}/datasets/data"
 
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(
+            url, headers={"User-Agent": application_user_agent()}
+        )
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode())
             return self._parse_api_data(data)

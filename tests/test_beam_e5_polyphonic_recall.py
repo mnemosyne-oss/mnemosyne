@@ -568,3 +568,72 @@ class TestE5ResultShape:
             assert r.get("content"), (
                 f"result has no content; engine didn't map row back: {r}"
             )
+
+    def test_polyphonic_results_expose_voice_provenance(
+        self, temp_db, monkeypatch, disable_llm
+    ):
+        """Flag ON: polyphonic results expose `voice_scores` provenance -- the
+        field the Hermes prefetch adapter keys its eligibility on -- instead of
+        the linear per-signal keyword/fts/dense fields. Stubbing the engine
+        makes this non-vacuous: the seeded row is returned and must carry
+        polyphonic voice keys so downstream adapters can detect it as an
+        engine-ranked result rather than dropping it for the missing fields."""
+        monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+        beam = BeamMemory(session_id="e5-voice", db_path=temp_db)
+        seed_id = beam.remember(
+            "[USER] carol discussed the voiceprovenancemarker deploy today",
+            source="conversation", importance=0.5,
+        )
+
+        from mnemosyne.core.polyphonic_recall import PolyphonicResult
+
+        class _StubEngine:
+            def recall(self, query, query_embedding=None, top_k=10, **kwargs):
+                return [PolyphonicResult(
+                    memory_id=seed_id, combined_score=0.035,
+                    voice_scores={"vector": 0.019, "temporal": 0.016},
+                    metadata={},
+                )]
+
+        monkeypatch.setattr(beam, "_get_polyphonic_engine", lambda: _StubEngine())
+        results = beam.recall("voiceprovenancemarker", top_k=10)
+        row = next((r for r in results if r["id"] == seed_id), None)
+        assert row is not None, f"stub row missing from recall: {results}"
+        vs = row.get("voice_scores", {})
+        assert vs == {"vector": 0.019, "temporal": 0.016}, (
+            "expected the exact polyphonic voice_scores mapping from the "
+            f"engine stub (not merely a supported key), got {vs}"
+        )
+
+    def test_recall_session_scope_excludes_foreign_row_sharing_query_terms(
+        self, temp_db, monkeypatch, disable_llm
+    ):
+        """Scope isolation: a foreign-session row that shares the query terms
+        under another session's scope is excluded by recall. Scope filtering is
+        engine-independent -- it is applied to the candidate queries inside
+        `BeamMemory.recall()` (session_id OR scope='global') -- so the Hermes
+        prefetch adapter, which consumes recall() output, can never see or
+        inject a foreign-session transcript that lexically matches a query.
+        Uses the deterministic linear path: polyphonic recall with embeddings
+        disabled returns no hits, which would make a real-engine scope test
+        vacuous. The scope predicate is identical for both engines."""
+        monkeypatch.delenv("MNEMOSYNE_POLYPHONIC_RECALL", raising=False)
+        beam_a = BeamMemory(session_id="scope-a", db_path=temp_db)
+        beam_b = BeamMemory(session_id="scope-b", db_path=temp_db)
+
+        marker = "scopezonemarkerx"
+        a_id = beam_a.remember(
+            f"[USER] carol discussed the {marker} deploy today",
+            source="conversation", importance=0.5,
+        )
+        b_id = beam_b.remember(
+            f"[USER] {marker} news marker is on page two",
+            source="conversation", importance=0.9,
+        )
+
+        results = beam_a.recall(marker, top_k=10)
+        ids = {r["id"] for r in results}
+        assert a_id in ids, "own-session row missing from recall -- test vacuous"
+        assert b_id not in ids, (
+            "foreign-session row sharing query terms leaked into session scope"
+        )

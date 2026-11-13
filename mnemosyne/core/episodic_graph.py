@@ -51,10 +51,14 @@ _SUBJECT_ARTICLES = frozenset({"the", "a", "an"})
 
 
 def _is_low_quality_subject(subject: str) -> bool:
-    """True if `subject` is a pronoun/demonstrative/possessive-led phrase, or
-    an article followed by a common noun, and so should not become a fact
-    triple. An article followed by a capitalised word is a name and passes.
-    See _LOW_QUALITY_SUBJECT_LEADERS and _SUBJECT_ARTICLES."""
+    """True if `subject` should not become a fact triple.
+
+    Rejects: pronoun/demonstrative/possessive-led phrases (see
+    _LOW_QUALITY_SUBJECT_LEADERS), article-led common-noun phrases (see
+    _SUBJECT_ARTICLES), sentence-word-led phrases ("If such a
+    skill"), and phrases that are not proper-noun shaped ("reliable
+    workflow", "stop doing X"). An article followed by a capitalised word
+    is a name and passes on to the proper-noun shape rule."""
     if not subject:
         return True
     tokens = [t.strip(".,!?;:'\"") for t in subject.strip().split()]
@@ -62,9 +66,25 @@ def _is_low_quality_subject(subject: str) -> bool:
     if not tokens:
         return True
     first = tokens[0].lower()
+    try:
+        from mnemosyne.core.entities import ENTITY_EXTRACTION_STOP_WORDS as _STOP
+    except Exception:
+        _STOP = frozenset()
     if first in _SUBJECT_ARTICLES:
-        return not (len(tokens) > 1 and tokens[1][:1].isupper())
-    return first in _LOW_QUALITY_SUBJECT_LEADERS
+        # The article alone cannot decide ("The Matrix" is a name, "The
+        # silence" is a common noun); the next word settles it here so the
+        # stopword check below never sees the article itself.
+        if len(tokens) < 2 or not tokens[1][:1].isupper():
+            return True
+    elif first in _LOW_QUALITY_SUBJECT_LEADERS:
+        return True
+    elif first in _STOP:
+        return True
+    words = subject.split()
+    # proper-noun shape: every word starts uppercase / is a digit / is a stopword
+    return not all(
+        w[0].isupper() or w[0].isdigit() or w.lower() in _STOP for w in words
+    )
 
 
 # Object-side counterpart to _is_low_quality_subject. The four extraction
@@ -305,15 +325,21 @@ class EpisodicGraph:
         """Extract participant names and pronouns."""
         # Common name patterns
         name_pattern = r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b"
-        names = re.findall(name_pattern, content)
+        names = [(m.start(), m.group(1)) for m in re.finditer(name_pattern, content)]
         
         # Pronouns
         pronoun_pattern = r"\b(I|you|we|they|he|she|it|me|us|them|him|her)\b"
-        pronouns = re.findall(pronoun_pattern, content, re.IGNORECASE)
+        pronouns = [
+            (m.start(), m.group(1))
+            for m in re.finditer(pronoun_pattern, content, re.IGNORECASE)
+        ]
         
-        # Combine and deduplicate
-        participants = list(set(names + pronouns))
-        return participants[:5]  # Cap at 5
+        # Keep the first spelling in text order. Case variants share a lookup
+        # identity and must not consume extra slots before the five-person cap.
+        participants = {}
+        for _, participant in sorted(names + pronouns):
+            participants.setdefault(participant.casefold(), participant)
+        return list(participants.values())[:5]
     
     def _extract_temporal_scope(self, content: str) -> Optional[str]:
         """Extract temporal references."""
@@ -557,13 +583,20 @@ class EpisodicGraph:
         seen = {memory_id}
 
         for hop in range(1, depth + 1):
-            next_level = set()
+            # A list, not a set (`seen` already dedupes): the next hop is expanded in
+            # discovery order, so results don't depend on string hashing.
+            next_level = []
             for mem in current_level:
                 cursor = self.conn.cursor()
                 if edge_type:
+                    # Unary + keeps the planner off idx_edges_type: ctx dominates, so that
+                    # index reads nearly the whole table. + also drops the column's TEXT
+                    # affinity, hence the CAST. rowid keeps insertion order, which decides
+                    # who claims a shared neighbour.
                     cursor.execute("""
                         SELECT source, target, edge_type, weight FROM graph_edges
-                        WHERE (source = ? OR target = ?) AND edge_type = ? AND weight >= ?
+                        WHERE (source = ? OR target = ?) AND +edge_type = CAST(? AS TEXT) AND weight >= ?
+                        ORDER BY rowid
                     """, (mem, mem, edge_type, min_weight))
                 else:
                     cursor.execute("""
@@ -576,7 +609,7 @@ class EpisodicGraph:
                 for row in rows:
                     neighbor = row["target"] if row["source"] == mem else row["source"]
                     if neighbor not in seen:
-                        next_level.add(neighbor)
+                        next_level.append(neighbor)
                         seen.add(neighbor)
                         results.append({
                             "memory_id": neighbor,
@@ -612,11 +645,11 @@ class EpisodicGraph:
         return facts
     
     def find_gists_by_participant(self, participant: str) -> List[Gist]:
-        """Find all gists involving a participant."""
+        """Find gists by participant, ignoring ASCII case even with case-sensitive LIKE."""
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT * FROM gists 
-            WHERE participants_json LIKE ?
+            WHERE lower(participants_json) LIKE lower(?)
             ORDER BY timestamp DESC
         """, (f'%"{participant}"%',))
         

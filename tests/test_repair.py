@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import errno
+import stat
+from types import SimpleNamespace
 import json
 import os
 from collections import Counter
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -1144,3 +1148,186 @@ def test_cli_apply_requires_an_explicit_complete_selection(tmp_path):
     result = _run_cli(["repair", "--apply", "--report", "missing.json"], tmp_path)
     assert result.returncode == 2
     assert "At least one complete --select" in result.stderr
+
+
+@pytest.mark.parametrize("fault, expected", [
+    ("stage-type", "private stage is not a directory"),
+    ("stage-mode", "private stage mode must be 0700"),
+    ("stage-device", "private stage must be on the same device"),
+    ("link-type", "linked database is not a regular file"),
+    ("link-identity", "post-link database identity does not match"),
+    ("source-identity", "post-link database identity does not match"),
+    ("link-count", "linked database link count must be at least 2"),
+    *[(f"link-{code}", f"linkat(AT_EMPTY_PATH) failed; {errno.errorcode[code]} ({code})")
+      for code in (errno.ENOENT, errno.EPERM, errno.EACCES, errno.EIO)],
+    ("link-unavailable", "linkat(AT_EMPTY_PATH) failed; errno unavailable"),
+    *[(f"{op}-{code}", f"{label} failed; {errno.errorcode[code]} ({code})")
+      for op, label in (("mkdir", "private stage mkdir"), ("open", "private stage open"),
+                        ("fstat", "private stage fstat"), ("stat", "linked database stat"))
+      for code in (errno.EIO, errno.ENOENT)],
+])
+def test_binding_diagnostics_public_apply_preserves_target(tmp_path, monkeypatch, capsys, fault, expected):
+    """Inject only at binding; public preflight/report/planning remain real.
+
+    Post-link predicates use a controlled real hardlink to isolate diagnostics
+    from host AT_EMPTY_PATH support; this is not an alternate production binding.
+    """
+    db_path = tmp_path / "private-source.sqlite"
+    _create_db(db_path)
+    _insert_memory(db_path, RAW_SECRET)
+    _insert_memory(db_path, "untouched")
+    report_path = _write_manifest(db_path, tmp_path)
+    backup = tmp_path / "private-backup.sqlite"
+    foreign_stage = tmp_path / ".mnemosyne-repair-foreign"
+    foreign_stage.mkdir()
+    (foreign_stage / "keep").write_bytes(b"foreign")
+    before = db_path.read_bytes()
+    identity = repair._stat_identity(db_path.stat())
+    with closing(sqlite3.connect(db_path)) as conn:
+        rows = conn.execute("SELECT * FROM working_memory ORDER BY id").fetchall()
+    fd_before = _fd_target_counts()
+    original_bind = repair._bind_authorized_database
+    injected_error = None
+
+    def changed(info, **values):
+        fields = {name: getattr(info, name) for name in ("st_mode", "st_dev", "st_ino", "st_nlink")}
+        return SimpleNamespace(**(fields | values))
+
+    def bind_with_fault(anchored):
+        nonlocal injected_error
+        source_fd = anchored.source_fd
+        real_fstat, real_stat = os.fstat, os.stat
+        real_mkdir, real_open = os.mkdir, os.open
+        stage_fd = None
+        linked = False
+        fired = False
+        if "-" in fault and fault.rsplit("-", 1)[1].isdigit():
+            injected_error = OSError(int(fault.rsplit("-", 1)[1]), RAW_SECRET, str(db_path))
+        elif fault == "link-unavailable":
+            injected_error = OSError("linkat unavailable " + RAW_SECRET)
+
+        def fail_once(op):
+            nonlocal fired
+            if not fired and fault.startswith(op + "-") and injected_error is not None:
+                fired = True
+                raise injected_error
+
+        def mkdir(name, *args, **kwargs):
+            fail_once("mkdir")
+            return real_mkdir(name, *args, **kwargs)
+
+        def open_stage(name, *args, **kwargs):
+            nonlocal stage_fd
+            fail_once("open")
+            stage_fd = real_open(name, *args, **kwargs)
+            return stage_fd
+
+        def fstat(fd):
+            info = real_fstat(fd)
+            if fd == stage_fd:
+                fail_once("fstat")
+                if not fired and fault.startswith("stage-"):
+                    nonlocal_fired()
+                    if fault == "stage-type":
+                        return changed(info, st_mode=stat.S_IFREG | 0o700)
+                    if fault == "stage-mode":
+                        return changed(info, st_mode=stat.S_IFDIR | 0o777)
+                    return changed(info, st_dev=info.st_dev + 1)
+            if fd == source_fd and linked and fault == "source-identity" and not fired:
+                nonlocal_fired()
+                return changed(info, st_ino=info.st_ino + 1)
+            return info
+
+        def nonlocal_fired():
+            nonlocal fired
+            fired = True
+
+        def stat_link(name, *args, **kwargs):
+            info = real_stat(name, *args, **kwargs)
+            if name == "database.sqlite" and kwargs.get("dir_fd") == stage_fd and linked:
+                fail_once("stat")
+                if not fired and fault.startswith("link-"):
+                    nonlocal_fired()
+                    if fault == "link-type":
+                        return changed(info, st_mode=stat.S_IFDIR | 0o700)
+                    if fault == "link-identity":
+                        return changed(info, st_ino=info.st_ino + 1)
+                    if fault == "link-count":
+                        return changed(info, st_nlink=1)
+            return info
+
+        def link(_source_fd, directory_fd, name):
+            nonlocal linked
+            fail_once("link")
+            # The pathname is safe only in this synthetic, single-writer fixture.
+            os.link(db_path, name, dst_dir_fd=directory_fd)
+            linked = True
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "mkdir", mkdir)
+            patch.setattr(os, "open", open_stage)
+            patch.setattr(os, "fstat", fstat)
+            patch.setattr(os, "stat", stat_link)
+            patch.setattr(repair, "_link_open_fd", link)
+            return original_bind(anchored)
+
+    monkeypatch.setattr(repair, "_bind_authorized_database", bind_with_fault)
+    with pytest.raises(RepairError) as caught:
+        run_repair(db_path=db_path, bank_name="default", report_path=report_path,
+                   selections=[f"working_memory:{RAW_SECRET}"], action="expire",
+                   apply=True, backup_path=backup)
+    assert str(caught.value) == "Database could not be safely bound for repair: " + expected
+    if injected_error is not None:
+        assert caught.value.__cause__ is injected_error
+    else:
+        assert caught.value.__cause__ is None
+    # CLI reports only str(RepairError), not the retained exception chain.
+    from mnemosyne.cli import cmd_repair
+
+    with pytest.raises(SystemExit) as exited:
+        cmd_repair(["--db", str(db_path), "--report", str(report_path),
+                    "--select", f"working_memory:{RAW_SECRET}", "--action", "expire",
+                    "--apply", "--backup", str(backup)])
+    assert exited.value.code == 1
+    captured = capsys.readouterr()
+    public_output = captured.out + captured.err
+    assert expected in public_output
+    assert "Traceback" not in public_output
+    for sensitive in (RAW_SECRET, str(db_path), str(tmp_path), str(backup)):
+        assert sensitive not in str(caught.value)
+        assert sensitive not in public_output
+    assert db_path.read_bytes() == before
+    assert repair._stat_identity(db_path.stat()) == identity
+    assert db_path.stat().st_nlink == 1
+    with closing(sqlite3.connect(db_path)) as conn:
+        assert conn.execute("SELECT * FROM working_memory ORDER BY id").fetchall() == rows
+    assert not backup.exists()
+    assert list(tmp_path.glob(".mnemosyne-repair-*")) == [foreign_stage]
+    assert (foreign_stage / "keep").read_bytes() == b"foreign"
+    leaked = _fd_target_counts() - fd_before
+    assert not {target: count for target, count in leaked.items() if str(tmp_path) in target}
+
+
+def test_dry_run_never_binds_or_probes_links(tmp_path, monkeypatch):
+    db_path = tmp_path / "offline.sqlite"
+    _create_db(db_path)
+    _insert_memory(db_path, "selected")
+    report_path = _write_manifest(db_path, tmp_path)
+
+    def snapshot():
+        return {str(path.relative_to(tmp_path)): (path.stat().st_mode, path.stat().st_ino,
+                path.stat().st_nlink, path.read_bytes() if path.is_file() else None)
+                for path in tmp_path.rglob("*")}
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("dry-run must not bind or probe links")
+
+    monkeypatch.setattr(repair, "_bind_authorized_database", forbidden)
+    monkeypatch.setattr(repair, "_link_open_fd", forbidden)
+    before = snapshot()
+    result = run_repair(db_path=db_path, bank_name="default", report_path=report_path,
+                        selections=["working_memory:selected"], action="expire",
+                        backup_path=tmp_path / "no-backup.sqlite")
+    assert result["mode"] == "dry_run"
+    assert result["backup"] is False
+    assert snapshot() == before

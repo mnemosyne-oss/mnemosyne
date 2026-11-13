@@ -10,10 +10,7 @@ are tested:
 
 from __future__ import annotations
 
-import json
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock
 
 
 # ---------------------------------------------------------------------------
@@ -179,16 +176,14 @@ class TestLegacyDefaultScope:
 # ---------------------------------------------------------------------------
 
 class TestMCPDefaultScope:
-    """Tests for MNEMOSYNE_DEFAULT_SCOPE in mnemosyne.mcp_tools."""
+    """Tests for MNEMOSYNE_DEFAULT_SCOPE in mnemosyne.mcp_tools (#653)."""
 
-    def test_resolve_default_scope_defaults_to_session(self):
-        """_resolve_default_scope returns 'session' when env var is unset."""
-        import os
-        os.environ.pop("MNEMOSYNE_DEFAULT_SCOPE", None)
+    def test_resolve_default_scope_defaults_to_global(self, monkeypatch):
+        """_resolve_default_scope defaults to 'global' when env var is unset (#653)."""
+        monkeypatch.delenv("MNEMOSYNE_DEFAULT_SCOPE", raising=False)
 
-        # Re-import to clear any cached env reading
         from mnemosyne.mcp_tools import _resolve_default_scope
-        assert _resolve_default_scope() == "session"
+        assert _resolve_default_scope() == "global"
 
     def test_resolve_default_scope_respects_global(self, monkeypatch):
         """_resolve_default_scope returns 'global' when env var is set."""
@@ -201,7 +196,7 @@ class TestMCPDefaultScope:
         assert mcp._resolve_default_scope() == "global"
 
     def test_resolve_default_scope_respects_session(self, monkeypatch):
-        """_resolve_default_scope returns 'session' when env var is set."""
+        """_resolve_default_scope returns 'session' when env var is set to session."""
         monkeypatch.setenv("MNEMOSYNE_DEFAULT_SCOPE", "session")
 
         import importlib
@@ -210,13 +205,13 @@ class TestMCPDefaultScope:
         assert mcp._resolve_default_scope() == "session"
 
     def test_resolve_default_scope_rejects_invalid(self, monkeypatch):
-        """_resolve_default_scope falls back to 'session' for invalid values."""
+        """_resolve_default_scope falls back to 'global' for invalid values (#653)."""
         monkeypatch.setenv("MNEMOSYNE_DEFAULT_SCOPE", "invalid")
 
         import importlib
         import mnemosyne.mcp_tools as mcp
         importlib.reload(mcp)
-        assert mcp._resolve_default_scope() == "session"
+        assert mcp._resolve_default_scope() == "global"
 
     def test_resolve_default_scope_case_insensitive(self, monkeypatch):
         """_resolve_default_scope normalizes to lowercase."""
@@ -226,3 +221,141 @@ class TestMCPDefaultScope:
         import mnemosyne.mcp_tools as mcp
         importlib.reload(mcp)
         assert mcp._resolve_default_scope() == "global"
+
+    def test_mcp_remember_omitted_scope_cross_session_visible(self, tmp_path, monkeypatch):
+        """[#653] An MCP-authored memory with omitted scope is visible to CLI/SDK readers."""
+        monkeypatch.delenv("MNEMOSYNE_DEFAULT_SCOPE", raising=False)
+        monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION", "0")
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+
+        from mnemosyne.core.memory import Mnemosyne
+        from mnemosyne.mcp_tools import _handle_remember
+
+        # 1. MCP write path defaults to session_id="mcp_default"
+        res = _handle_remember({"content": "cross session probe content 653"})
+        assert res.get("status") == "stored"
+        mid = res.get("memory_id")
+
+        # 2. Fresh CLI/SDK reader with different session_id (e.g. "default")
+        reader = Mnemosyne(session_id="default")
+        hits = reader.recall("cross session probe content 653", top_k=5)
+        hit_ids = [h.get("id") for h in hits]
+        assert mid in hit_ids
+
+    def test_mcp_remember_explicit_session_scope_retains_isolation(self, tmp_path, monkeypatch):
+        """[#653] An MCP-authored memory with explicit scope='session' retains session isolation."""
+        monkeypatch.delenv("MNEMOSYNE_DEFAULT_SCOPE", raising=False)
+        monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION", "0")
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+
+        from mnemosyne.core.memory import Mnemosyne
+        from mnemosyne.mcp_tools import _handle_remember
+
+        res = _handle_remember({
+            "content": "isolated probe content 653",
+            "scope": "session",
+        })
+        assert res.get("status") == "stored"
+        mid = res.get("memory_id")
+
+        # Same session (mcp_default) sees it
+        mcp_reader = Mnemosyne(session_id="mcp_default")
+        hits_mcp = mcp_reader.recall("isolated probe content 653", top_k=5)
+        assert mid in [h.get("id") for h in hits_mcp]
+
+        # Different session does NOT see it when cross_session is False (default)
+        cli_reader = Mnemosyne(session_id="default")
+        hits_cli = cli_reader.recall("isolated probe content 653", top_k=5)
+        assert mid not in [h.get("id") for h in hits_cli]
+
+    def test_mcp_remember_schema_omits_static_scope_default(self):
+        """[#653] MCP remember schema omits static scope default while Core/Hermes retains it."""
+        from mnemosyne.mcp_tools import TOOLS, get_tool_definitions
+        from mnemosyne.tool_schemas import REMEMBER_SCHEMA, ALL_TOOL_SCHEMAS
+
+        # 1. MCP TOOLS and advertised definitions have no static default on scope
+        mcp_remember = next(t for t in TOOLS if t["name"] == "mnemosyne_remember")
+        scope_prop = mcp_remember["input_schema"]["properties"]["scope"]
+        assert "default" not in scope_prop
+        assert "MNEMOSYNE_DEFAULT_SCOPE" in scope_prop["description"]
+        assert "global" in scope_prop["description"]
+
+        advertised_remember = next(t for t in get_tool_definitions() if t["name"] == "mnemosyne_remember")
+        assert "default" not in advertised_remember["input_schema"]["properties"]["scope"]
+
+        # 2. Shared Core/Hermes schemas retain unchanged static 'session' default
+        assert REMEMBER_SCHEMA["parameters"]["properties"]["scope"]["default"] == "session"
+        raw_core_remember = next(s for s in ALL_TOOL_SCHEMAS if s["name"] == "mnemosyne_remember")
+        assert raw_core_remember["parameters"]["properties"]["scope"]["default"] == "session"
+
+    def test_mcp_remember_respects_session_env_default(self, tmp_path, monkeypatch):
+        """[#653] Setting MNEMOSYNE_DEFAULT_SCOPE=session preserves session isolation on omitted scope."""
+        monkeypatch.setenv("MNEMOSYNE_DEFAULT_SCOPE", "session")
+        monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION", "0")
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+
+        from mnemosyne.core.memory import Mnemosyne
+        from mnemosyne.mcp_tools import _handle_remember
+
+        res = _handle_remember({"content": "env session content 653"})
+        assert res.get("status") == "stored"
+        mid = res.get("memory_id")
+
+        # Same session (mcp_default) sees it
+        mcp_reader = Mnemosyne(session_id="mcp_default")
+        hits_mcp = mcp_reader.recall("env session content 653", top_k=5)
+        assert mid in [h.get("id") for h in hits_mcp]
+
+        # Distinct session cannot recall it
+        cli_reader = Mnemosyne(session_id="default")
+        hits_cli = cli_reader.recall("env session content 653", top_k=5)
+        assert mid not in [h.get("id") for h in hits_cli]
+
+    def test_mcp_batch_omitted_scope_cross_session_visible(self, tmp_path, monkeypatch):
+        """[#653] An item remembered via mnemosyne_batch with omitted scope defaults to global."""
+        monkeypatch.delenv("MNEMOSYNE_DEFAULT_SCOPE", raising=False)
+        monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION", "0")
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+
+        from mnemosyne.core.memory import Mnemosyne
+        from mnemosyne.mcp_tools import _handle_batch
+
+        res = _handle_batch({
+            "operations": [
+                {"action": "remember", "content": "batch cross session probe 653"},
+            ]
+        })
+        assert res.get("status") == "ok"
+        mid = res["results"][0]["memory_id"]
+
+        # Different session reader can retrieve it
+        reader = Mnemosyne(session_id="other_session")
+        hits = reader.recall("batch cross session probe 653", top_k=5)
+        assert mid in [h.get("id") for h in hits]
+
+    def test_mcp_batch_explicit_session_scope_retains_isolation(self, tmp_path, monkeypatch):
+        """[#653] An item remembered via mnemosyne_batch with explicit scope='session' retains isolation."""
+        monkeypatch.delenv("MNEMOSYNE_DEFAULT_SCOPE", raising=False)
+        monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION", "0")
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+
+        from mnemosyne.core.memory import Mnemosyne
+        from mnemosyne.mcp_tools import _handle_batch
+
+        res = _handle_batch({
+            "operations": [
+                {"action": "remember", "content": "batch isolated probe 653", "scope": "session"},
+            ]
+        })
+        assert res.get("status") == "ok"
+        mid = res["results"][0]["memory_id"]
+
+        # Same session (mcp_default) sees it
+        mcp_reader = Mnemosyne(session_id="mcp_default")
+        hits_mcp = mcp_reader.recall("batch isolated probe 653", top_k=5)
+        assert mid in [h.get("id") for h in hits_mcp]
+
+        # Different session cannot retrieve it
+        cli_reader = Mnemosyne(session_id="other_session")
+        hits_cli = cli_reader.recall("batch isolated probe 653", top_k=5)
+        assert mid not in [h.get("id") for h in hits_cli]
