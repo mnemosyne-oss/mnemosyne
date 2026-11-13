@@ -1229,7 +1229,10 @@ def check_mnemosyne_core() -> bool:
 
 
 def check_mnemosyne_core_for_hermes_python(hermes_python: Path) -> Optional[str]:
-    """Check if Hermes' Python can import Mnemosyne's operational dependencies.
+    """Check if Hermes' Python can import Mnemosyne's operational core.
+
+    sqlite-vec is optional at runtime. Requiring it here treats a working
+    lexical install as missing and retries a native extra that may have no wheel.
 
     Returns the version string if importable, None otherwise.
     """
@@ -1237,7 +1240,7 @@ def check_mnemosyne_core_for_hermes_python(hermes_python: Path) -> Optional[str]
         result = subprocess.run(
             [str(hermes_python), "-c",
              "import mnemosyne; print(mnemosyne.__version__); "
-             "import mnemosyne.core.beam; import sqlite_vec"],
+             "import mnemosyne.core.beam"],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
