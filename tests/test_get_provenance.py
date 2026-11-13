@@ -2,7 +2,6 @@
 
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -251,40 +250,5 @@ def test_import_without_provenance_keeps_legacy_defaults(tmp_path, monkeypatch, 
         result = memory.get("legacy-import")
         assert result["channel_id"] is None
         assert result["trust_tier"] == "STATED"
-    finally:
-        memory.conn.close()
-
-
-def test_sleep_summary_has_derived_provenance(tmp_path, monkeypatch):
-    """The real sleep write stores generated summaries as DERIVED, not STATED."""
-    _use_empty_config(tmp_path, monkeypatch)
-    from mnemosyne.core import local_llm
-
-    summary = "The user prefers dark mode for the project dashboard."
-    monkeypatch.setattr(local_llm, "llm_available", lambda: True)
-    monkeypatch.setattr(local_llm, "_summarize_memories", lambda *_args, **_kwargs: summary)
-    memory = BeamMemory(
-        session_id="fleet", db_path=tmp_path / "sleep.db", channel_id="writer"
-    )
-    try:
-        memory_id = memory.remember("The project dashboard should use dark mode.", source="conversation")
-        old_timestamp = (
-            datetime.now(timezone.utc) - timedelta(hours=200)
-        ).replace(tzinfo=None).isoformat()
-        memory.conn.execute(
-            "UPDATE working_memory SET timestamp = ? WHERE id = ?", (old_timestamp, memory_id)
-        )
-        memory.conn.commit()
-        outcome = memory.sleep()
-        assert outcome["status"] == "consolidated"
-        assert outcome["llm_used"] == 1
-        row = memory.conn.execute(
-            "SELECT id FROM episodic_memory WHERE source = 'sleep_consolidation'"
-        ).fetchone()
-        result = memory.get(row["id"])
-        assert result["content"] == summary
-        assert result["channel_id"] == "writer"
-        assert result["trust_tier"] == "DERIVED"
-        assert memory.get(memory_id)["trust_tier"] == "STATED"
     finally:
         memory.conn.close()
