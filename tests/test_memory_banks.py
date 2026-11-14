@@ -554,6 +554,41 @@ class TestModuleLevelBankSwitching:
         assert served == ["default", "work", "default", "work", "default", "work"]
         assert built == ["default", "work"]
 
+    @pytest.mark.parametrize(
+        "strategy_env",
+        [
+            {},
+            {"MNEMOSYNE_ENHANCED_RECALL": "1"},
+        ],
+        ids=["linear", "enhanced"],
+    )
+    def test_recall_reads_only_the_bank_it_resolves_to(self, tmp_path, monkeypatch, strategy_env):
+        """Explicit and unqualified recall return the selected bank's memory only."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.delenv("MNEMOSYNE_ENHANCED_RECALL", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_POLYPHONIC_RECALL", raising=False)
+        for name, value in strategy_env.items():
+            monkeypatch.setenv(name, value)
+        BankManager(tmp_path).create_bank("work")
+        grocery = "Grocery list: oat milk, coffee beans"
+        sprint = "Sprint review moved to Friday"
+        remember(grocery)
+        remember(sprint, bank="work")
+
+        def contents(query, **kwargs):
+            return [result["content"] for result in recall(query, **kwargs)]
+
+        work_hits = contents("sprint review", bank="work")
+        assert sprint in work_hits and grocery not in work_hits
+        default_hits = contents("grocery list")
+        assert grocery in default_hits and sprint not in default_hits
+
+        set_bank("work")
+        work_hits = contents("sprint review")
+        assert sprint in work_hits and grocery not in work_hits
+        default_hits = contents("grocery list", bank="default")
+        assert grocery in default_hits and sprint not in default_hits
+
 
 # ============================================================================
 # Edge cases
