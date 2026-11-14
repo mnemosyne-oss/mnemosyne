@@ -1454,26 +1454,41 @@ class Mnemosyne:
 # Global instance for module-level convenience functions
 _default_instance = None
 _default_bank = "default"
+# Instance for the most recent per-call ``bank=`` other than the default.
+_per_call_instance = None
 
 
 def _get_default(bank: str = None):
-    """Get or create the default Mnemosyne instance. Supports bank switching."""
-    global _default_instance, _default_bank
-    target_bank = bank or _default_bank or "default"
-    if _default_instance is None or _default_instance.bank != target_bank:
-        _default_bank = target_bank
-        _default_instance = Mnemosyne(bank=target_bank)
-    return _default_instance
+    """Return the module-level Mnemosyne instance for ``bank``.
+
+    Without ``bank`` this is the default instance, on the bank selected by
+    ``set_bank()``. A per-call ``bank`` is served from a second cached
+    instance, so it never becomes the default for later calls.
+    """
+    global _default_instance, _per_call_instance
+    default_bank = _default_bank or "default"
+    target_bank = bank or default_bank
+    if target_bank == default_bank:
+        instance = _default_instance
+        if instance is None or instance.bank != default_bank:
+            instance = _default_instance = Mnemosyne(bank=default_bank)
+        return instance
+    instance = _per_call_instance
+    if instance is None or instance.bank != target_bank:
+        instance = _per_call_instance = Mnemosyne(bank=target_bank)
+    return instance
 
 
 def set_bank(bank: str):
     """
     Switch the global default memory bank.
-    All subsequent module-level calls (remember, recall, etc.) will use this bank.
+    All subsequent module-level calls (remember, recall, etc.) that do not
+    pass ``bank=`` will use this bank.
     """
-    global _default_bank, _default_instance
+    global _default_bank, _default_instance, _per_call_instance
     _default_bank = bank
     _default_instance = None  # Force re-creation on next access
+    _per_call_instance = None
 
 
 def get_bank() -> str:
@@ -1578,6 +1593,6 @@ def scratchpad_read(bank: str = None) -> List[Dict]:
     return _get_default(bank).scratchpad_read()
 
 
-def scratchpad_clear():
+def scratchpad_clear(bank: str = None):
     """Clear scratchpad using the global instance"""
-    return _get_default().scratchpad_clear()
+    return _get_default(bank).scratchpad_clear()
