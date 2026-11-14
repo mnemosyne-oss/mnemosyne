@@ -34,7 +34,7 @@ dev = ["mnemosyne-hermes[test]", "build", "twine"]
 all = ["mnemosyne-memory[all]>=4.0.0"]
 
 [project.entry-points."hermes_agent.plugins"]
-mnemosyne = "mnemosyne_hermes:register"
+mnemosyne = "_mnemosyne_hermes_plugin:register"
 
 [project.entry-points."hermes_agent.memory_providers"]
 mnemosyne = "mnemosyne_hermes"
@@ -49,7 +49,7 @@ Repository = "https://github.com/mnemosyne-oss/mnemosyne"
 "Bug Tracker" = "https://github.com/mnemosyne-oss/mnemosyne/issues"
 
 [tool.setuptools]
-py-modules = ["_mnemosyne_hermes_cli"]
+py-modules = ["_mnemosyne_hermes_cli", "_mnemosyne_hermes_plugin"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
