@@ -7779,20 +7779,22 @@ class BeamMemory:
         from `vec_episodes` (rowid-keyed, used when sqlite-vec is present) so
         conflict detection works uniformly over both working and episodic rows.
         Returns {memory_id: np.ndarray} for ids with a usable embedding.
+        All three ID/rowid lookups respect the live SQLite parameter limit,
+        with the existing conservative fallback when limit APIs are absent.
         """
-        cursor = self.conn.cursor()
         emb_map: Dict[str, np.ndarray] = {}
         if not memory_ids:
             return emb_map
 
-        ph = ",".join("?" * len(memory_ids))
         try:
-            cursor.execute(
-                f"SELECT memory_id, embedding_json FROM memory_embeddings "
-                f"WHERE memory_id IN ({ph})",
+            rows = _select_recall_rows_by_ids(
+                self.conn,
+                "SELECT memory_id, embedding_json FROM memory_embeddings "
+                "WHERE memory_id IN ({placeholders})",
                 memory_ids,
+                key="memory_id",
             )
-            for row in cursor.fetchall():
+            for row in rows:
                 try:
                     emb_map[row["memory_id"]] = np.array(
                         json.loads(row["embedding_json"]), dtype=np.float32
@@ -7808,20 +7810,21 @@ class BeamMemory:
             # quantized (float32/int8/bit) — decode per the stored vector type.
             vec_type = _effective_vec_type(self.conn, "vec_episodes")
             try:
-                mph = ", ".join("?" * len(missing))
-                cursor.execute(
-                    f"SELECT id, rowid FROM episodic_memory WHERE id IN ({mph})",
+                rows = _select_recall_rows_by_ids(
+                    self.conn,
+                    "SELECT id, rowid FROM episodic_memory WHERE id IN ({placeholders})",
                     missing,
                 )
-                rowid_by_id = {r["id"]: r["rowid"] for r in cursor.fetchall()}
+                rowid_by_id = {r["id"]: r["rowid"] for r in rows}
                 if rowid_by_id:
-                    rph = ", ".join("?" * len(rowid_by_id))
-                    cursor.execute(
-                        f"SELECT rowid, embedding FROM vec_episodes WHERE rowid IN ({rph})",
+                    rows = _select_recall_rows_by_ids(
+                        self.conn,
+                        "SELECT rowid, embedding FROM vec_episodes WHERE rowid IN ({placeholders})",
                         list(rowid_by_id.values()),
+                        key="rowid",
                     )
                     id_by_rid = {rid: mid for mid, rid in rowid_by_id.items()}
-                    for r in cursor.fetchall():
+                    for r in rows:
                         try:
                             vec = _decode_sqlite_vec_binary(r["embedding"], vec_type)
                             emb_map[id_by_rid[r["rowid"]]] = vec
