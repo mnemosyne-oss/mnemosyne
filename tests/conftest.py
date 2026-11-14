@@ -30,6 +30,20 @@ pytest_configure = _isolation["pytest_configure"]
 _isolated_mnemosyne_config = _isolation["_isolated_mnemosyne_config"]
 
 
+@pytest.fixture(autouse=True)
+def _clear_extraction_cache():
+    """Extraction memo is process-global; isolate every test from it.
+
+    The memo in mnemosyne.core.extraction is keyed on content, so one
+    test's extraction would otherwise satisfy a later test's identical
+    content and the second test would never reach the LLM boundary.
+    """
+    from mnemosyne.core.extraction import _EXTRACT_CACHE
+    _EXTRACT_CACHE.clear()
+    yield
+    _EXTRACT_CACHE.clear()
+
+
 def _close_cached_connections():
     """Close and reset thread-local SQLite connection caches in both modules."""
     for mod_path in (
