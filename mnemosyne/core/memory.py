@@ -1482,7 +1482,8 @@ def _get_default(bank: str = None):
 def set_bank(bank: str):
     """
     Switch the global default memory bank.
-    All subsequent module-level calls (remember, recall, etc.) will use this bank.
+    All subsequent module-level calls (remember, recall, etc.) that do not
+    pass ``bank=`` will use this bank.
     """
     global _default_bank, _default_instance, _per_call_instance
     _default_bank = bank
