@@ -137,7 +137,10 @@ def test_index_and_detail_escape_and_send_csp(tmp_path, monkeypatch):
     assert detail.status_code == 200
     assert "<img src=x onerror" not in detail.text
 
+    monkeypatch.setattr(memory_browser, "get_memory_detail", lambda *_: {"id": "m1"})
     reflected = client.get("/detail/%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E")
+    assert reflected.status_code == 200
+    assert "<h2>Memory &lt;img src=x onerror=alert(1)&gt;</h2>" in reflected.text
     assert "<img src=x onerror" not in reflected.text
 
 
