@@ -61,6 +61,46 @@ Backup snapshots contain local memory data, and their `.gz.json` metadata may di
 
 `backup` and `restore` use the default bank when `MNEMOSYNE_BANK` is unset. A named bank must already exist: a missing one makes both commands exit before they write anything, including the data directory. `restore` into an existing bank whose `mnemosyne.db` is missing creates that file; `backup` of such a bank exits before it writes anything. `backup` of a named bank without `output_dir`, `reindex --db` and `reindex --bank` back up their target to `<backup dir>/stores/<db stem>-<first 32 hex of the sha256 of the resolved path>/`, and each `.gz.json` file names the source database in `source_db`. `backups`, rotation, the health check and emergency restore read only the backup directory they are given, so they do not list, rotate or pick these snapshots. `backups <store dir>` lists them, and `mnemosyne.dr.recovery.rotate_backups(backup_dir=Path(store_dir))` rotates them. Restore a store outside the data directory with `mnemosyne.dr.recovery.restore_backup(Path(backup), db_path=Path(store))`. Emergency restore picks only backups whose `source_db` names the database it restores. Backups without `source_db`, including every backup written before this field existed, stay on disk and are never picked automatically. One can be restored explicitly with `restore <backup.db.gz>` after checking that it belongs to the bank `MNEMOSYNE_BANK` selects, but only when its `.gz.json` metadata sidecar is present: a backup without a sidecar has no recorded checksums, and `restore` refuses it under the checksum-verification contract.
 
+### Restoring a WAL store
+
+Backup and verification open the source read-only. SQLite can leave `-wal` and `-shm` files after the last read-only connection closes, even for an idle store. Restore refuses these files because their presence alone cannot establish whether readers or writers are still using the database. This can require an explicit maintenance step after backup or verification; automatic sidecar cleanup is not provided.
+
+Stop **all processes that can open the selected store**, including gateways, readers, workers and scheduled jobs. Keep them stopped throughout maintenance and restore. Then run this with the actual database path:
+
+```bash
+python - /absolute/path/to/mnemosyne.db <<'PY'
+import sqlite3
+import sys
+from contextlib import closing
+from pathlib import Path
+
+db = Path(sys.argv[1]).expanduser().resolve()
+with closing(sqlite3.connect(db.as_uri() + "?mode=rw", uri=True, timeout=0)) as conn:
+    status = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    if status[0] != 0:
+        raise SystemExit("Checkpoint busy: keep clients stopped and investigate; do not restore.")
+if any(db.with_name(db.name + suffix).exists() for suffix in ("-wal", "-shm")):
+    raise SystemExit("Sidecars remain: do not delete them; investigate open clients or cleanup errors.")
+print("SQLite maintenance completed. Retry the restore while clients remain stopped.")
+PY
+```
+
+This is an explicit read-write maintenance operation. A successful checkpoint does **not** prove that all clients have stopped; that is an external precondition. SQLite manages cleanup when the maintenance connection closes. Never manually remove sidecars or use an immutable read to bypass the restore guard. Once maintenance succeeds, retry the original restore command. Avoid running another read-only verification against the target between maintenance and restore, because it can recreate the sidecars. See SQLite's [file lifecycle](https://www.sqlite.org/walformat.html#file_lifecycles) and [WAL documentation](https://www.sqlite.org/wal.html).
+
+If maintenance fails because the database itself is corrupt, stop there and keep the original database, WAL and SHM files together. With clients still stopped, restore a backup into a **separate, fresh directory** using an explicit destination:
+
+```python
+from pathlib import Path
+from mnemosyne.dr.recovery import restore_backup
+
+restore_backup(
+    Path("/path/to/backup.db.gz"),
+    db_path=Path("/path/to/fresh-recovery-directory/mnemosyne.db"),
+)
+```
+
+The backup's checksum metadata sidecar must accompany it. This restores the backup's state, not any newer data stranded in the damaged original or its WAL. Verify the restored data before planning a separate offline cutover; the example does not replace the selected bank or switch running clients. Do not move only the original main database file or delete its sidecars to bypass a refusal.
+
 ## Import and export
 
 | Command | Usage |

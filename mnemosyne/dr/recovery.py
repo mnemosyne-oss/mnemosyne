@@ -8,13 +8,22 @@ import contextlib
 import gzip
 import io
 import os
+from typing import Iterator, List, Optional, Set, Tuple
 import json
 import hashlib
+import logging
+import re
 import shutil
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict
+
+logger = logging.getLogger(__name__)
+
+
+class _RestoreRefusedError(RuntimeError):
+    """An unusable backup or unsafe target deliberately refused by restore."""
 
 
 def get_default_paths():
@@ -168,6 +177,18 @@ def _flush_and_fsync(handle) -> None:
     os.fsync(handle.fileno())
 
 
+def _sqlite_ro_uri(db_path: Path) -> str:
+    """Return a percent-encoded ``?mode=ro`` URI for *db_path*.
+
+    Raw f-string splicing lets a path containing ``?``, ``#`` or ``%`` select a
+    different file or silently drop ``mode=ro`` (each backup then capturing an
+    unnamed read-write connection). ``Path.as_uri()`` percent-encodes the
+    reserved characters, so the query string actually applies. Absolute paths
+    only — callers always hand the function a resolved config-driven path.
+    """
+    return str(Path(db_path).absolute().as_uri()) + "?mode=ro"
+
+
 def create_backup(db_path: Optional[Path] = None, backup_dir: Optional[Path] = None, format: Optional[str] = None) -> Dict:
     """
     Create a compressed backup of the database.
@@ -224,7 +245,7 @@ def create_backup(db_path: Optional[Path] = None, backup_dir: Optional[Path] = N
             staged_sqlite = staged_backup_path.with_suffix(".tmp.db")
             sqlite_fd = os.open(str(staged_sqlite), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(sqlite_fd)
-            src = sqlite3.connect(str(db_path))
+            src = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)
             try:
                 _load_sqlite_vec(src)
                 dst = sqlite3.connect(str(staged_sqlite))
@@ -245,7 +266,7 @@ def create_backup(db_path: Optional[Path] = None, backup_dir: Optional[Path] = N
             staged_sqlite = None
         else:
             # Legacy text SQL dump format via iterdump()
-            src = sqlite3.connect(str(db_path))
+            src = sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)
             try:
                 _load_sqlite_vec(src)
                 dst = sqlite3.connect(":memory:")
@@ -355,20 +376,23 @@ def _load_sqlite_vec(conn: sqlite3.Connection) -> None:
 
 
 def _reject_active_sidecars(db_path: Path) -> None:
-    """Fail closed if WAL/SHM sidecars exist at the target.
+    """Refuse sidecars until all clients are externally quiesced and cleaned up.
 
-    A stale -wal/-shm alongside the main file means the on-disk state is the
-    union of the main file and uncommitted WAL frames. Atomically replacing
-    only the main file would silently drop those frames, so we refuse and let
-    an operator checkpoint/quiesce the writer first.
+    Sidecars may hold committed WAL frames or belong to active readers and
+    writers. A last read-only client can also leave empty files. Existence
+    alone cannot distinguish these cases, and an empty WAL or successful
+    checkpoint is not proof that all clients have stopped.
     """
     for suffix in ("-wal", "-shm"):
         sidecar = db_path.with_name(db_path.name + suffix)
         if sidecar.exists():
-            raise RuntimeError(
-                f"Refusing to restore while an active sidecar exists: {sidecar}. "
-                f"Quiesce live writers and run 'PRAGMA wal_checkpoint(TRUNCATE)' "
-                f"before restoring."
+            raise _RestoreRefusedError(
+                f"Refusing to restore while a sidecar exists: {sidecar}. "
+                "It may be active or a leftover from read-only backup/verification. "
+                "Stop all processes using this store, including readers; then run "
+                "'PRAGMA wal_checkpoint(TRUNCATE)' in a read-write maintenance "
+                "connection and close it. Retry after SQLite removes the sidecars; "
+                "do not delete them manually."
             )
 
 
@@ -393,7 +417,7 @@ def _acquire_writer_lock(db_path: Path) -> Optional[sqlite3.Connection]:
         lock_conn.execute("BEGIN IMMEDIATE")
     except sqlite3.OperationalError as exc:
         lock_conn.close()
-        raise RuntimeError(
+        raise _RestoreRefusedError(
             f"Refusing to restore: a live writer appears to hold {db_path} "
             f"({exc}). Stop all Mnemosyne processes before restoring."
         ) from exc
@@ -442,6 +466,151 @@ def _fsync_path(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _sql_statements(dump_text: str) -> Iterator[str]:
+    """Yield SQL statements without changing any character in their literals.
+
+    Only SQLite decides whether an unquoted semicolon completes a statement:
+    trigger bodies can contain several such semicolons. The small lexer avoids
+    repeatedly parsing semicolons inside long quoted values or comments.
+    """
+    start = index = 0
+    quote = None
+    comment = None
+    while index < len(dump_text):
+        char = dump_text[index]
+        pair = dump_text[index:index + 2]
+        if comment == "line":
+            if char == "\n":
+                comment = None
+        elif comment == "block":
+            if pair == "*/":
+                comment = None
+                index += 2
+                continue
+        elif quote:
+            if char == quote:
+                if quote != "]" and index + 1 < len(dump_text) and dump_text[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+        elif pair in ("--", "/*"):
+            comment = "line" if pair == "--" else "block"
+            index += 2
+            continue
+        elif char in ("'", '"', "`", "["):
+            quote = "]" if char == "[" else char
+        elif char == ";" and sqlite3.complete_statement(dump_text[start:index + 1]):
+            yield dump_text[start:index + 1]
+            start = index + 1
+        index += 1
+    if start < len(dump_text):
+        yield dump_text[start:]
+
+
+def _sql_statement_body(stmt: str) -> str:
+    """Ignore leading SQL comments for classification, leaving literals intact."""
+    return re.sub(r"\A(?:\s+|--[^\n]*(?:\n|$)|/\*.*?\*/)*", "", stmt, flags=re.DOTALL).strip()
+
+
+def _virtual_tables_in_dump(dump_text: str) -> Set[str]:
+    """Collect virtual-table names from DDL *statements* in the dump.
+
+    Scanning the raw text lets an ordinary row whose payload mentions
+    ``'CREATE VIRTUAL TABLE user USING fts5(body)'`` inject a phantom table
+    name and later cause real rows to be skipped as shadow statements. The
+    scan is therefore statement-level: a name is only accepted when it comes
+    from a literal ``CREATE VIRTUAL TABLE`` statement or from the embedded
+    DDL of an iterdump-style ``sqlite_master`` bootstrap row (see
+    :func:`_virtual_ddl_from_master_row`).
+    """
+    names: Set[str] = set()
+    for raw_stmt in _sql_statements(dump_text):
+        stmt = _sql_statement_body(raw_stmt)
+        if not stmt:
+            continue
+        embedded = _virtual_ddl_from_master_row(stmt)
+        if embedded or re.match(r"CREATE\s+VIRTUAL\s+TABLE\b", stmt, re.IGNORECASE):
+            target = _statement_target(embedded or stmt)
+            if target:
+                names.add(target)
+    return names
+
+
+_SQL_IDENTIFIER = (
+    r'''(?:"(?:[^"]|"")*"|'(?:[^']|'')*'|`(?:[^`]|``)*`|\[[^\]]*\]|'''
+    r"[A-Za-z_\u0080-\U0010ffff][A-Za-z_0-9$\u0080-\U0010ffff]*)"
+)
+_SQLITE_NAME_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _statement_target(stmt: str) -> Optional[str]:
+    """Return the target table name of a DDL/DML statement, or None."""
+    ident = _SQL_IDENTIFIER
+    target = rf"(?:{ident}\s*\.\s*)?({ident})"
+    patterns = [
+        rf"create\s+virtual\s+table\s+(?:if\s+not\s+exists\s+)?{target}",
+        rf"create\s+(?:temp(?:orary)?\s+)?table\s+(?:if\s+not\s+exists\s+)?{target}",
+        rf"insert\s+(?:or\s+\w+\s+)?into\s+{target}",
+        rf"delete\s+from\s+{target}",
+        rf"update\s+{target}",
+        rf"alter\s+table\s+{target}",
+        rf"drop\s+table\s+(?:if\s+exists\s+)?{target}",
+        rf"create\s+(?:unique\s+)?index\s+(?:if\s+not\s+exists\s+)?{ident}\s+on\s+{target}",
+    ]
+    for pat in patterns:
+        m = re.match(pat, stmt.strip(), re.IGNORECASE)
+        if m:
+            name = m.group(1)
+            if name[0] in ('"', "'", "`"):
+                name = name[1:-1].replace(name[0] * 2, name[0])
+            elif name[0] == "[":
+                name = name[1:-1]
+            # SQLite folds ASCII identifiers only, not Unicode case pairs.
+            return name.translate(_SQLITE_NAME_LOWER)
+    return None
+
+
+def _is_shadow_stmt(stmt: str, shadow_tables: Set[str]) -> bool:
+    """Skip duplicate DDL only for module-created tables, preserving their data."""
+    return bool(
+        re.match(r"CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\b", stmt, re.IGNORECASE)
+        and _statement_target(stmt) in shadow_tables
+    )
+
+
+_SQL_STRING_LITERAL = r"'(?:[^']|'')*'"
+_VT_MASTER_RE = re.compile(
+    r"^\s*INSERT\s+INTO\s+['\"]?sqlite_master['\"]?\s*"
+    r"\(\s*type\s*,\s*name\s*,\s*tbl_name\s*,\s*rootpage\s*,\s*sql\s*\)\s*"
+    rf"VALUES\s*\(\s*'table'\s*,\s*{_SQL_STRING_LITERAL}\s*,\s*"
+    rf"{_SQL_STRING_LITERAL}\s*,\s*\d+\s*,\s*(?P<sql>{_SQL_STRING_LITERAL})\s*\)\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _virtual_ddl_from_master_row(stmt: str) -> Optional[str]:
+    """Return the embedded ``CREATE VIRTUAL TABLE`` SQL, if any, from an
+    ``iterdump``-style raw ``sqlite_master`` bootstrap row.
+
+    ``sqlite3.Connection.iterdump()`` does not emit real ``CREATE VIRTUAL TABLE``
+    statements for FTS5/vec0 tables: it wraps them in a raw ``sqlite_master``
+    insert between ``PRAGMA writable_schema=ON`` and ``=OFF`` (Python bpo-44516).
+    Replaying that insert as-is registers the table row without materializing
+    the virtual table, so the following logical-row inserts fail against an
+    empty schema ("no such table"). The replay of a legacy dump must therefore
+    expand this shape: decode and execute the embedded virtual DDL instead of
+    the raw master-row insert. Returns ``None`` for every other statement shape.
+    """
+    match = _VT_MASTER_RE.fullmatch(stmt)
+    if not match:
+        return None
+    # Decode only the SQL string field, not arbitrary text or SQL around it.
+    ddl = match.group("sql")[1:-1].replace("''", "'")
+    if not re.match(r"\s*CREATE\s+VIRTUAL\s+TABLE\b", ddl, re.IGNORECASE):
+        return None
+    return ddl
 
 
 def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
@@ -494,7 +663,7 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
     # --- 1. Read backup + require readable metadata ------------------------
     meta_path = backup_path.with_suffix(".gz.json")
     if not meta_path.exists():
-        raise RuntimeError(
+        raise _RestoreRefusedError(
             f"Backup metadata sidecar not found: {meta_path}. Refusing to "
             f"restore without checksum verification."
         )
@@ -502,12 +671,12 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
         with open(meta_path) as f:
             metadata = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(
+        raise _RestoreRefusedError(
             f"Backup metadata is unreadable or malformed ({exc}). Refusing "
             f"to restore without checksum verification."
         ) from exc
     if not isinstance(metadata, dict):
-        raise RuntimeError("Backup metadata is not a JSON object; refusing to restore.")
+        raise _RestoreRefusedError("Backup metadata is not a JSON object; refusing to restore.")
 
     with gzip.open(backup_path, "rb") as f_in:
         dump_bytes = f_in.read()
@@ -517,12 +686,12 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
 
     expected_backup = metadata.get("backup_checksum")
     if not expected_backup:
-        raise RuntimeError(
+        raise _RestoreRefusedError(
             "Backup metadata lacks a backup_checksum; refusing to restore "
             "without file checksum verification."
         )
     if expected_backup != backup_checksum:
-        raise RuntimeError(
+        raise _RestoreRefusedError(
             f"Backup file checksum mismatch: metadata={expected_backup} "
             f"actual={backup_checksum}. The backup file is corrupted or was "
             f"modified; refusing to restore."
@@ -531,7 +700,7 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
     # when present, so this stays backward compatible.
     expected_dump = metadata.get("dump_checksum")
     if expected_dump and expected_dump != dump_checksum:
-        raise RuntimeError(
+        raise _RestoreRefusedError(
             f"Backup payload checksum mismatch: metadata={expected_dump} "
             f"actual={dump_checksum}. The decompressed dump is corrupted; "
             f"refusing to restore."
@@ -561,7 +730,7 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
             try:
                 integrity = tmp_db.execute("PRAGMA integrity_check").fetchone()[0]
                 if integrity != "ok":
-                    raise RuntimeError(
+                    raise _RestoreRefusedError(
                         f"Staged restore failed integrity_check: {integrity}. "
                         f"Refusing to replace target."
                     )
@@ -590,12 +759,107 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
                 )
             )
             try:
-                tmp_db.executescript(dump_bytes.decode("utf-8"))
+                dump_text = dump_bytes.decode("utf-8")
+                virtual_tables = _virtual_tables_in_dump(dump_text)
+                declared_tables = {
+                    _statement_target(body)
+                    for raw in _sql_statements(dump_text)
+                    if re.match(
+                        r"CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\b",
+                        body := _sql_statement_body(raw), re.IGNORECASE,
+                    )
+                }
+                shadow_tables: Set[str] = set()
+                snapshot_virtual_tables: Set[str] = set()
+                executed = 0
+
+                def _replay_stmt(raw_stmt: str) -> None:
+                    nonlocal executed
+                    stmt = _sql_statement_body(raw_stmt)
+                    if not stmt:
+                        return
+                    if (
+                        _statement_target(stmt) in snapshot_virtual_tables
+                        and re.match(r"INSERT\b", stmt, re.IGNORECASE)
+                    ):
+                        # iterdump includes both logical rows and physical
+                        # shadow data. Restore the latter once: logical rows
+                        # lose contentless FTS terms and implicit rowid gaps.
+                        return
+                    if _is_shadow_stmt(stmt, shadow_tables):
+                        logger.warning(
+                            "Skipping shadow-table DDL in legacy SQL dump: %s",
+                            stmt[:120],
+                        )
+                        return
+                    # iterdump emits FTS5/vec0 tables as a raw sqlite_master
+                    # bootstrap row, not a real CREATE VIRTUAL TABLE statement.
+                    # Replay the embedded virtual DDL directly: the raw master
+                    # insert would register the row without materializing the
+                    # table, and the following logical-row inserts would fail
+                    # against an empty schema (reproduced live: iterdump
+                    # #bpo-44516 shape, table items_fts unavailable).
+                    virtual_ddl = _virtual_ddl_from_master_row(stmt)
+                    is_bootstrap = virtual_ddl is not None
+                    if not virtual_ddl and re.match(r"CREATE\s+VIRTUAL\s+TABLE\b", stmt, re.IGNORECASE):
+                        virtual_ddl = stmt
+                    if virtual_ddl:
+                        before = {r[0] for r in tmp_db.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        )}
+                        tmp_db.execute(virtual_ddl)
+                        resolved_target = _statement_target(virtual_ddl)
+                        if resolved_target not in virtual_tables:
+                            raise _RestoreRefusedError("Unrecognized virtual-table name in legacy SQL dump")
+                        # Observe the module's real output, including option-
+                        # dependent FTS/vec0 tables. Suffixes alone are unsafe:
+                        # an ordinary ft_stat/ft_content can be legitimate data.
+                        created = {
+                            r[0]
+                            for r in tmp_db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                            if r[0] not in before
+                            and not r[0].startswith("sqlite_")
+                            and r[0].translate(_SQLITE_NAME_LOWER) != resolved_target
+                        }
+                        owned = {name.translate(_SQLITE_NAME_LOWER) for name in created}
+                        shadow_tables.update(owned)
+                        if owned and (is_bootstrap or owned & declared_tables):
+                            if not owned <= declared_tables:
+                                raise _RestoreRefusedError("Incomplete virtual-table snapshot in legacy SQL dump")
+                            snapshot_virtual_tables.add(resolved_target)
+                            # Module constructors seed tables such as FTS
+                            # config/data; the dump supplies their exact rows.
+                            for name in created:
+                                quoted = '"' + name.replace('"', '""') + '"'
+                                tmp_db.execute(f"DELETE FROM {quoted}")
+                        executed += 1
+                        return
+                    tmp_db.execute(raw_stmt)
+                    executed += 1
+
+                for stmt in _sql_statements(dump_text):
+                    # A trailing malformed statement raises and fails closed.
+                    _replay_stmt(stmt)
+
+                if executed == 0:
+                    raise _RestoreRefusedError(
+                        "Refusing to restore: legacy SQL dump replayed zero "
+                        "statements (empty or comments-only payload)."
+                    )
                 integrity = tmp_db.execute("PRAGMA integrity_check").fetchone()[0]
                 if integrity != "ok":
-                    raise RuntimeError(
+                    raise _RestoreRefusedError(
                         f"Staged restore failed integrity_check: {integrity}. "
                         f"Refusing to replace target."
+                    )
+                schema_objects = tmp_db.execute(
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE type IN ('table','index','view','trigger')"
+                ).fetchone()[0]
+                if schema_objects == 0:
+                    raise _RestoreRefusedError(
+                        "Refusing to restore: legacy replay created no schema "
+                        "objects (degenerate payload)."
                     )
                 tmp_db.commit()
                 try:
@@ -632,7 +896,7 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
                 shutil.copy2(preserved_path, db_path)
                 _fsync_path(db_path)
                 _fsync_dir(db_path.parent)
-            raise RuntimeError(
+            raise _RestoreRefusedError(
                 f"Post-replace integrity_check failed for {db_path}. The "
                 f"original target was restored from {preserved_path}."
             )
@@ -698,16 +962,43 @@ def emergency_restore(backup_dir: Path = None, db_path: Path = None) -> Dict:
             )
         raise FileNotFoundError("No backups found in " + str(backup_dir))
 
-    # Try each backup until one works
+    # Try each backup until one works. A candidate refusal (e.g. a missing or
+    # checksum-mismatched metadata sidecar) means THAT backup is unusable —
+    # it must not stop the search for an older valid one. Refusals are
+    # recorded: if nothing restores and a refusal exists, the newest refusal
+    # verdict is raised verbatim (fail closed, no "all backups failed"
+    # generic text misreporting that specific verdict).
+    newest_refusal: Optional[Tuple[int, Path, _RestoreRefusedError]] = None
+    last_error = None
     for attempt, backup in enumerate(backups, start=1):
         try:
             result = restore_backup(backup, db_path)
             if result["integrity_check"]:
                 return {"restored": True, "backup_used": str(backup), "attempts": attempt}
-        except Exception:
+        except _RestoreRefusedError as exc:
+            if newest_refusal is None:
+                newest_refusal = (attempt, backup, exc)
+            logger.warning(
+                "emergency_restore: candidate %s refused (%s); trying older backups",
+                backup.name, str(exc)[:120],
+            )
+            last_error = exc
+            continue
+        except Exception as exc:
+            logger.warning(
+                "emergency_restore: backup %s failed; trying older backups",
+                backup.name, exc_info=True,
+            )
+            last_error = exc
             continue
 
-    raise RuntimeError("All backups failed integrity check")
+    if newest_refusal is not None:
+        attempt, backup, refusal = newest_refusal
+        raise _RestoreRefusedError(
+            f"emergency_restore refused after trying {len(backups)} backup(s); "
+            f"newest refusal (attempt {attempt}, {backup.name}): {refusal}"
+        ) from refusal
+    raise RuntimeError("All backups failed integrity check") from last_error
 
 
 def verify_integrity(db_path: Path = None) -> bool:
@@ -725,7 +1016,7 @@ def verify_integrity(db_path: Path = None) -> bool:
         return False
 
     try:
-        with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
+        with contextlib.closing(sqlite3.connect(_sqlite_ro_uri(db_path), uri=True)) as conn:
             result = conn.execute("PRAGMA integrity_check").fetchone()
             return bool(result) and result[0] == "ok"
     except Exception:
