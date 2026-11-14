@@ -567,27 +567,26 @@ class TestModuleLevelBankSwitching:
         monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
         monkeypatch.delenv("MNEMOSYNE_ENHANCED_RECALL", raising=False)
         monkeypatch.delenv("MNEMOSYNE_POLYPHONIC_RECALL", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_FACT_RECALL_ENABLED", raising=False)
         for name, value in strategy_env.items():
             monkeypatch.setenv(name, value)
         BankManager(tmp_path).create_bank("work")
-        grocery = "Grocery list: oat milk, coffee beans"
-        sprint = "Sprint review moved to Friday"
+        # Both memories match the query, so a recall that reached the other
+        # bank would return its memory too.
+        grocery = "Weekly plan: grocery list, oat milk and coffee beans"
+        sprint = "Weekly plan: sprint review moved to Friday"
         remember(grocery)
         remember(sprint, bank="work")
 
-        def contents(query, **kwargs):
-            return [result["content"] for result in recall(query, **kwargs)]
+        def contents(**kwargs):
+            return [result["content"] for result in recall("weekly plan", **kwargs)]
 
-        work_hits = contents("sprint review", bank="work")
-        assert sprint in work_hits and grocery not in work_hits
-        default_hits = contents("grocery list")
-        assert grocery in default_hits and sprint not in default_hits
+        assert contents(bank="work") == [sprint]
+        assert contents() == [grocery]
 
         set_bank("work")
-        work_hits = contents("sprint review")
-        assert sprint in work_hits and grocery not in work_hits
-        default_hits = contents("grocery list", bank="default")
-        assert grocery in default_hits and sprint not in default_hits
+        assert contents() == [sprint]
+        assert contents(bank="default") == [grocery]
 
 
 # ============================================================================
