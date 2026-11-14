@@ -74,6 +74,8 @@ This imports all existing chat history into Mnemosyne without starting the daemo
 
 ## Memory Browser Dashboard
 
+> **Deprecated:** `mnemosyne-browser` will be removed in a future release. Use `mnemosyne recall` instead.
+
 Browse, search, and inspect all your Mnemosyne memories through a web UI.
 
 ```bash
