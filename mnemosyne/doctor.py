@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import math
 import os
@@ -627,7 +628,9 @@ def _embedding_runtime_status() -> dict[str, Any]:
             "disabled": disabled,
             "backend": backend,
             "backend_available": backend_available,
-            "fastembed_installed": embeddings.TextEmbedding is not None,
+            # Installed, not already imported. TextEmbedding stays unbound until a
+            # local model is constructed, so presence is a find_spec probe.
+            "fastembed_installed": importlib.util.find_spec("fastembed") is not None,
             "fastembed_version": version,
             "configured_model_raw": model,
             "configured_model": _safe_model_identifier(model),

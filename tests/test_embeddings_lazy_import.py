@@ -1,11 +1,10 @@
 """Tests for lazy import self-healing in mnemosyne.core.embeddings.
 
-Root cause (already proven): ``np`` and ``TextEmbedding`` are bound at import
-time, and ``_FASTEMBED_AVAILABLE`` is evaluated once at import. When
-``mnemosyne.core.embeddings`` is imported during a window where the dense stack
-is unreachable (the Hermes plugin-loader import window, or a venv without the
-embeddings extra), both globals bind to None and ``available()`` returns False
-for the whole process lifetime, even after the stack becomes importable.
+``TextEmbedding`` is not imported with this module: fastembed pulls onnxruntime,
+and most processes never construct a local model. ``_ensure_fastembed()`` binds
+it on first use. If that first attempt fails because the dense stack is
+unreachable, ``available()`` must retry later rather than staying False for the
+process lifetime. ``_FASTEMBED_AVAILABLE`` remains a frozen legacy alias.
 
 These tests pin four behaviours:
 1. ``available()`` re-attempts the import when the globals are empty, so dense
@@ -273,3 +272,30 @@ def test_embed_query_recovers_without_calling_available(isolated_embeddings, tmp
         sys.path[:] = original_path
         if previous_modules is not None:
             _restore_stub_dense_stack(previous_modules)
+
+
+def test_importing_embeddings_does_not_import_fastembed():
+    """Neither FastEmbed nor ONNX Runtime may load, even behind caught errors."""
+    import subprocess
+    from pathlib import Path
+
+    code = """
+import importlib.abc, sys
+sys.path.insert(0, sys.argv[1])
+attempts=[]
+class BlockFastEmbed(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {'fastembed', 'onnxruntime'}:
+            attempts.append(fullname)
+            raise ImportError('dense backend must remain unloaded')
+sys.meta_path.insert(0, BlockFastEmbed())
+from mnemosyne.core import embeddings
+assert not attempts, attempts
+assert embeddings.TextEmbedding is None
+assert not any(n.split('.')[0] in {'fastembed', 'onnxruntime'} for n in sys.modules)
+"""
+    result = subprocess.run(
+        [sys.executable, '-I', '-c', code, str(Path(__file__).resolve().parents[1])],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

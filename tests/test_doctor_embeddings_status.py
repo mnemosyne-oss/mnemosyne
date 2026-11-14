@@ -3,6 +3,7 @@
 import builtins
 from dataclasses import fields
 import hashlib
+import importlib.util
 import json
 import sqlite3
 from pathlib import Path
@@ -416,6 +417,14 @@ def test_runtime_missing_dependency_and_import_error_are_non_throwing(
 
     monkeypatch.setattr(embeddings, "TextEmbedding", None)
     monkeypatch.setattr(embeddings, "_is_fastembed_available", lambda: False)
+    real_find = importlib.util.find_spec
+
+    def fastembed_absent(name, *args, **kwargs):
+        if name == "fastembed":
+            return None
+        return real_find(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fastembed_absent)
     missing = doctor._embedding_runtime_status()
     assert missing["backend"] == "fastembed_local"
     assert missing["backend_available"] is False
@@ -856,3 +865,33 @@ def test_build_report_is_read_only_and_does_not_construct_or_call_embedding_rout
     assert sorted(item.name for item in tmp_path.iterdir()) == before_files
     assert not Path(f"{path}-wal").exists()
     assert not Path(f"{path}-shm").exists()
+
+
+def test_discoverable_fastembed_with_broken_import_is_not_usable(tmp_path):
+    """Installed/discoverable metadata must not imply a working local backend."""
+    import subprocess
+    import sys
+
+    package = tmp_path / 'fastembed'
+    package.mkdir()
+    marker = tmp_path / "import-attempted"
+    (package / "__init__.py").write_text(
+        f"from pathlib import Path; Path({str(marker)!r}).touch()\n"
+        "raise ImportError('broken native dependency')\n"
+    )
+    code = '''
+import importlib.util, sys
+sys.path[:0]=sys.argv[1:]
+assert importlib.util.find_spec('fastembed') is not None
+from mnemosyne import doctor
+result=doctor._embedding_runtime_status()
+assert result['backend'] == 'fastembed_local', result
+assert result['fastembed_installed'] is True, result
+assert result['backend_available'] is False, result
+'''
+    result = subprocess.run(
+        [sys.executable, '-I', '-c', code, str(tmp_path), str(Path(__file__).resolve().parents[1])],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert marker.exists(), "the discoverable FastEmbed import must actually be attempted"
