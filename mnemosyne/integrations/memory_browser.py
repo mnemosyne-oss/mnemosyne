@@ -408,6 +408,7 @@ def create_app(banks: List[str], default_bank: str, extra_hosts: Optional[List[s
 
     app = FastAPI(title="Mnemosyne Browser", lifespan=lifespan)
     allowed_hosts = set(_LOCAL_HOSTS) | {h.lower() for h in (extra_hosts or [])}
+    allowed_hosts |= {f"[{h}]" for h in allowed_hosts if ":" in h and not h.startswith("[")}
 
     @app.middleware("http")
     async def harden(request: Request, call_next):
