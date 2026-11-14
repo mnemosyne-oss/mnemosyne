@@ -6285,6 +6285,38 @@ def _cross_session_max_llm_validations() -> int:
     except ValueError:
         return _CROSS_SESSION_MAX_LLM_VALIDATIONS
 
+_CROSS_SESSION_VERDICT_TTL_DAYS_DEFAULT = 30
+
+
+def _csverdict_content_sig(older_content: str, newer_content: str) -> str:
+    """Stable signature of a pair's content snapshots.
+
+    A cached verdict is only trustworthy for the exact contents it was
+    recorded against: any content change of either memory (e.g.
+    ``update_working`` keeps the id) makes the verdict stale. The pair is
+    JSON-encoded as a two-element array so the encoding is length-
+    delimited: no delimiter byte sequence can collide across the two
+    contents (a "\n---\n" embedded in one memory cannot make a
+    different pair hash to the same signature).
+    """
+    return hashlib.sha256(
+        json.dumps([older_content, newer_content], separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _cross_session_verdict_ttl_days() -> int:
+    """TTL (days) for cached cross-session LLM reject verdicts.
+
+    Override with ``MNEMOSYNE_CROSS_SESSION_VERDICT_TTL_DAYS`` (default 30).
+    A cached reject is re-adjudicated once its TTL elapses, so context
+    drift is eventually revisited.
+    """
+    raw = os.environ.get("MNEMOSYNE_CROSS_SESSION_VERDICT_TTL_DAYS", "").strip()
+    try:
+        return max(1, int(raw)) if raw else _CROSS_SESSION_VERDICT_TTL_DAYS_DEFAULT
+    except ValueError:
+        return _CROSS_SESSION_VERDICT_TTL_DAYS_DEFAULT
+
 
 class BeamMemory:
     """
@@ -13459,7 +13491,7 @@ class BeamMemory:
                             continue
                         conflict_calls += 1
                         try:
-                            is_conflict, confidence, correct_fact = validate_conflict_pair(
+                            is_conflict, confidence, correct_fact, _status = validate_conflict_pair(
                                 content_map.get(older_id, ""),
                                 content_map.get(newer_id, ""),
                                 session_id=self.session_id,
@@ -14014,6 +14046,33 @@ class BeamMemory:
         network round-trips that a provider tool performs while its shared Beam
         access lock is held.
 
+        Rejected (LLM-declined) pairs are persisted with a TTL in a local
+        `cross_session_verdict_cache` table, so later runs skip already
+        adjudicated pairs without re-issuing the LLM call (each run re-scans
+        the whole queue, and without this the same rejected pairs burned an
+        LLM validation on every run). Only VALID negative verdicts are
+        cached: a validation failure (provider unavailable, invalid response
+        type, malformed JSON) is a distinct status and is never persisted, so
+        the next run retries the validation. Each verdict is bound to the
+        content snapshots of both memories (a `content_sig`): if either
+        memory is later edited (e.g. `update_working` keeps the id), the
+        verdict is deleted and the pair re-adjudicated. The TTL —
+        `MNEMOSYNE_CROSS_SESSION_VERDICT_TTL_DAYS`, default 30 days — bounds
+        how long a verdict is trusted, so context drift is eventually
+        re-adjudicated. Skipped pairs are counted in the result payload as
+        `skipped_cached`. Cache reads never create schema (a missing table
+        reads as an empty cache), cache writes only happen on an explicit
+        apply, and they are queued during the run and flushed once after
+        every LLM validation call has finished — so a cache write never
+        holds the writer lock across a validation call and a dry run (incl.
+        `llm_eval`) stays read-only. The flush runs on a dedicated fresh
+        connection and self-commits — it is derived, best-effort state that
+        deliberately does not share the caller's transaction, because a
+        resolver connection whose WAL snapshot predates a concurrent writer's
+        commit fails instantly (SQLITE_BUSY_SNAPSHOT) on its first write.
+        The cache is best-effort: any cache failure degrades to
+        the normal always-LLM behavior.
+
         This is phase one of the cross-session resolution work: candidate
         reporting (`dry_run=True`) and explicit apply (`dry_run=False`). An
         automatic invocation from `sleep_all_sessions` is deliberately deferred
@@ -14030,7 +14089,7 @@ class BeamMemory:
                            "(set MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION=1)",
                 "rows_scanned": 0, "pairs_flagged": 0,
                 "conflicts_resolved": 0, "invalidated": 0,
-                "llm_validations": 0, "llm_cap_reached": False,
+                "llm_validations": 0, "skipped_cached": 0, "llm_cap_reached": False,
                 "candidates_truncated": False,
             }
 
@@ -14081,11 +14140,14 @@ class BeamMemory:
         if scan_error is not None:
             # A bank query failed: abort before any resolution so we never
             # mutate on a partial cross-bank scan, and surface the failure.
+            # Report skipped_cached=0 so the result shape matches the other
+            # paths (no cache was consulted or skipped on this abort).
             return {
                 "status": "failed",
                 "message": f"could not scan bank {scan_error[0]}: {scan_error[1]}",
                 "rows_scanned": len(rows),
                 "pairs_flagged": 0, "conflicts_resolved": 0, "invalidated": 0,
+                "skipped_cached": 0,
                 "llm_validations": 0, "llm_cap_reached": False,
                 "candidates_truncated": truncated,
             }
@@ -14115,6 +14177,25 @@ class BeamMemory:
         invalidated = 0
         llm_validations = 0
         llm_cap_reached = False
+        # Negative cache of LLM 'reject' verdicts so repeated runs don't
+        # re-burn the same already-adjudicated pairs forever (each sleep
+        # re-flags the queue; without this the same first ~20 pairs in
+        # sorted order spent an LLM call every run with the cap always
+        # reached). Best-effort: any cache failure degrades to the normal
+        # always-LLM path.
+        cached_rejects = {}
+        try:
+            cached_rejects = self._csverdict_cached_rejects()
+        except Exception:
+            cached_rejects = {}
+        skipped_cached = 0
+        # Rejects queued during the LLM loop; flushed once, after EVERY
+        # validate_conflict_pair call in this run has finished, so a cache
+        # write never holds the writer lock across a later validation call.
+        # Stale verdicts (content changed since the verdict) are queued for
+        # deletion in the same flush.
+        pending_verdicts = []
+        stale_verdicts = []
         # IDs superseded, or used as a replacement/target, during THIS run.
         # Rows are SELECTed once, so in-memory state is authoritative here.
         # The sets guard chained detector pairs such as (A,B),(B,C): without
@@ -14154,11 +14235,36 @@ class BeamMemory:
                 run_llm = LLM_CONFLICT_DETECTION_ENABLED and not dry_run
                 if dry_run and llm_eval:
                     run_llm = True
+                older_content = content_map.get(older_id, "")
+                newer_content = content_map.get(newer_id, "")
+                pair_sig = _csverdict_content_sig(older_content, newer_content)
+                cache_hit = cached_rejects.get((older_id, newer_id))
+                if cache_hit is not None:
+                    _conf, _expires_at, _cached_sig = cache_hit
+                    if _cached_sig != pair_sig:
+                        # Either memory's content changed since the verdict
+                        # was recorded (e.g. update_working keeps the id),
+                        # or the row predates the content_sig column and
+                        # carries no signature: the verdict is stale —
+                        # queue the row for deletion and fall through to
+                        # re-adjudicate the pair.
+                        cached_rejects.pop((older_id, newer_id))
+                        stale_verdicts.append((older_id, newer_id))
+                    else:
+                        # This (older,newer) pair was already LLM-adjudicated
+                        # as a non-contradiction for the SAME content and is
+                        # still within its TTL — skip the LLM call entirely.
+                        # Checked outside `if run_llm:` so a plain dry run
+                        # reports the same cache skips as an apply (dry-run
+                        # == apply parity).
+                        cached_rejects.pop((older_id, newer_id))
+                        skipped_cached += 1
+                        continue
                 if run_llm:
                     if llm_validations >= max_llm_validations:
                         llm_cap_reached = True
                         break
-                    is_conflict, _, _ = validate_conflict_pair(
+                    is_conflict, confidence, _, verdict_status = validate_conflict_pair(
                         content_map.get(older_id, ""),
                         content_map.get(newer_id, ""),
                         session_id=self.session_id,
@@ -14166,6 +14272,18 @@ class BeamMemory:
                     )
                     llm_validations += 1
                     confirmed = is_conflict
+                    if not is_conflict and not dry_run and verdict_status == "valid":
+                        # Queue the reject so later runs skip this pair.
+                        # A validation FAILURE (verdict_status == "failed":
+                        # unavailable response, invalid type, malformed
+                        # JSON) is NOT a negative verdict — it is left
+                        # uncached so the next run retries the validation.
+                        # Only on a real apply: a dry run (incl. llm_eval)
+                        # must stay read-only, so it reports cache hits but
+                        # never pre-warms the table. The TTL bounds staleness.
+                        pending_verdicts.append(
+                            (older_id, newer_id, confidence,
+                             older_content, newer_content))
                 if not confirmed:
                     continue
                 # Track chained pairs in BOTH dry-run and apply so a dry run
@@ -14183,6 +14301,30 @@ class BeamMemory:
                     # False is not a resolved conflict.
                     conflicts_resolved += 1
 
+        # Flush the queued verdicts after every LLM validation call in this
+        # run has completed, so the cache never holds the writer lock across
+        # a validate_conflict_pair call. A dry run (incl. llm_eval) stays
+        # read-only: it reports cache hits but never writes.
+        #
+        # When the connection carries a caller-owned transaction, the flush
+        # is queued through the connection's after-commit hook machinery: it
+        # runs only AFTER the caller has committed (the writer lock must be
+        # released before the flush's dedicated connection writes), and a
+        # rollback drops it — the best-effort cache must not outlive the
+        # rolled-back mutation, and a dropped flush simply degrades the next
+        # run to re-validation. With no open transaction there is no lock to
+        # wait out, so the flush runs immediately on its own connection.
+        if not dry_run and (pending_verdicts or stale_verdicts):
+            if self.conn.in_transaction:
+                self.conn._after_commit_hooks.append(
+                    lambda: self._csverdict_flush(pending_verdicts, stale_verdicts))
+            else:
+                try:
+                    self._csverdict_flush(pending_verdicts, stale_verdicts)
+                except Exception:
+                    logger.debug(
+                        "cross-session verdict cache flush skipped", exc_info=True)
+
         if dry_run:
             status = "dry_run"
         elif invalidated:
@@ -14199,9 +14341,148 @@ class BeamMemory:
             "invalidated": invalidated,
             "rows_scanned": len(rows),
             "llm_validations": llm_validations,
+            "skipped_cached": skipped_cached,
             "llm_cap_reached": llm_cap_reached,
             "candidates_truncated": truncated,
         }
+
+    # ------------------------------------------------------------------
+    # Cross-session LLM reject negative-cache
+    # ------------------------------------------------------------------
+    _CSVERDICT_TABLE = "cross_session_verdict_cache"
+
+    def _csverdict_table_readable(self) -> bool:
+        """Return True only if the verdict-cache table exists WITH the
+        content_sig column. Pure read: never creates or alters schema, so a
+        dry run cannot mutate the database. An absent or legacy table reads
+        as an empty cache (the apply-time writer creates/migrates it).
+        """
+        try:
+            exists = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (self._CSVERDICT_TABLE,),
+            ).fetchone()
+            if not exists:
+                return False
+            cols = {r[1] for r in self.conn.execute(
+                f"PRAGMA table_info({self._CSVERDICT_TABLE})")}
+            return "content_sig" in cols
+        except Exception:
+            return False
+
+    def _csverdict_ensure_schema(self, conn: "sqlite3.Connection" = None) -> None:
+        """Apply-time writer: create the verdict-cache table if absent,
+        or migrate a legacy (pre-content_sig) table in place. Only the
+        flush path calls this — reads never create schema. ``conn``
+        defaults to ``self.conn``; the flush passes its dedicated
+        connection (see ``_csverdict_flush``).
+        """
+        conn = conn if conn is not None else self.conn
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (self._CSVERDICT_TABLE,),
+            ).fetchone()
+        except Exception:
+            exists = None
+        if not exists:
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {self._CSVERDICT_TABLE} ("
+                " older_id TEXT NOT NULL, newer_id TEXT NOT NULL, "
+                " content_sig TEXT, "
+                " verdict TEXT NOT NULL, confidence REAL, "
+                " decided_at TEXT NOT NULL, expires_at TEXT NOT NULL, "
+                " PRIMARY KEY (older_id, newer_id))"
+            )
+            return
+        cols = {r[1] for r in conn.execute(
+            f"PRAGMA table_info({self._CSVERDICT_TABLE})")}
+        if "content_sig" not in cols:
+            # Legacy shape from before content binding: add the column.
+            # Rows without a signature read as stale and are re-adjudicated.
+            conn.execute(
+                f"ALTER TABLE {self._CSVERDICT_TABLE} "
+                "ADD COLUMN content_sig TEXT")
+
+    def _csverdict_cached_rejects(self) -> Dict[tuple, tuple]:
+        """Return {(older_id, newer_id): (confidence, expires_at,
+        content_sig)} for non-expired cached reject verdicts. Empty dict if
+        the table is absent (or legacy) or on any error — callers treat
+        that as no-cache. Never creates schema: a missing table reads as an
+        empty cache, so a dry run stays read-only.
+        """
+        if not self._csverdict_table_readable():
+            return {}
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            f"SELECT older_id, newer_id, confidence, expires_at, content_sig "
+            f"FROM {self._CSVERDICT_TABLE} WHERE verdict = 'reject'"
+        )
+        out: Dict[tuple, tuple] = {}
+        for older_id, newer_id, conf, expires_at, sig in cursor.fetchall():
+            if expires_at and expires_at < now_iso:
+                continue
+            out[(older_id, newer_id)] = (conf, expires_at, sig)
+        return out
+
+    def _csverdict_flush(self, pending: list, stale: list) -> None:
+        """Persist queued rejects (and delete stale rows) in one batch.
+
+        Runs on a dedicated fresh connection, not ``self.conn``. The
+        resolver's connection opened a WAL read snapshot when it loaded
+        the memories at the start of the run, and in WAL mode any
+        connection whose snapshot predates a concurrent writer's commit
+        fails INSTANTLY (SQLITE_BUSY_SNAPSHOT — no busy-timeout wait)
+        when it makes its first write. That is exactly the concurrent
+        scenario this cache must survive: another session writing while
+        the apply validates. A fresh connection takes a fresh snapshot,
+        applies the standard busy timeout, and commits the batch itself.
+
+        The cache is derived, best-effort state, so it deliberately does
+        NOT share the caller's transaction: a rolled-back invalidate
+        still leaves a valid reject verdict, and a failed flush simply
+        degrades the next run to re-validation. It is invoked either
+        directly (no open transaction on the connection, so no writer lock
+        to wait out) or through an after-commit hook (a caller-owned
+        transaction is still open, so the caller's commit must land first);
+        in neither case does it commit the caller's transaction.
+        Stale deletions run first so a pair that is both stale and
+        re-rejected this run ends up with its NEW verdict.
+        """
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(str(self.db_path), timeout=5.0)
+        try:
+            self._csverdict_ensure_schema(conn)
+            now = datetime.now(timezone.utc)
+            expires = now + timedelta(days=_cross_session_verdict_ttl_days())
+            now_iso = now.isoformat()
+            expires_iso = expires.isoformat()
+
+            for older_id, newer_id in stale:
+                conn.execute(
+                    f"DELETE FROM {self._CSVERDICT_TABLE} "
+                    "WHERE older_id = ? AND newer_id = ?",
+                    (older_id, newer_id),
+                )
+            for older_id, newer_id, conf, older_c, newer_c in pending:
+                sig = _csverdict_content_sig(older_c, newer_c)
+                conn.execute(
+                    f"INSERT INTO {self._CSVERDICT_TABLE} "
+                    "(older_id, newer_id, content_sig, verdict, confidence, "
+                    " decided_at, expires_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(older_id, newer_id) DO UPDATE SET "
+                    "content_sig=excluded.content_sig, "
+                    "verdict=excluded.verdict, confidence=excluded.confidence, "
+                    "decided_at=excluded.decided_at, expires_at=excluded.expires_at",
+                    (older_id, newer_id, sig, "reject", conf,
+                     now_iso, expires_iso),
+                )
+            conn.commit()
+        finally:
+            conn.close()
 
     def get_consolidation_log(self, limit: int = 10) -> List[Dict]:
         cursor = self.conn.cursor()

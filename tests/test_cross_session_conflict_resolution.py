@@ -11,6 +11,7 @@ session `invalidate` + recall filtering) is real and non-vacuous.
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
@@ -123,7 +124,7 @@ def test_llm_branch_confirms_and_declines(temp_db, monkeypatch, disable_llm):
                        importance=0.7, scope="global")
     C._detect_conflicts = _stub_detect_pair(blue, green)
     monkeypatch.setattr(lcd, "validate_conflict_pair",
-                        lambda older, newer, session_id, db_path: (True, 0.9, "green"))
+                        lambda older, newer, session_id, db_path: (True, 0.9, "green", "valid"))
     assert C.resolve_cross_session_conflicts()["invalidated"] == 1
 
     # declined (different context / complement): nothing superseded
@@ -134,7 +135,7 @@ def test_llm_branch_confirms_and_declines(temp_db, monkeypatch, disable_llm):
     C2 = BeamMemory(session_id="tC2", db_path=temp_db)
     C2._detect_conflicts = _stub_detect_pair(b2, g2)
     monkeypatch.setattr(lcd, "validate_conflict_pair",
-                        lambda older, newer, session_id, db_path: (False, 0.2, None))
+                        lambda older, newer, session_id, db_path: (False, 0.2, None, "valid"))
     res = C2.resolve_cross_session_conflicts()
     assert res["invalidated"] == 0 and res["conflicts_resolved"] == 0
 
@@ -219,8 +220,9 @@ def test_dry_run_llm_eval_switches_llm_without_mutating(temp_db, monkeypatch, di
     # default dry run: deterministic, LLM never consulted even when the flag is on
     calls = []
     def _confirm(older, newer, session_id, db_path):
+        """Stub LLM validator: records the pair and always confirms it."""
         calls.append((older, newer))
-        return True, 0.9, "now"
+        return True, 0.9, "now", "valid"
     monkeypatch.setattr(lcd, "validate_conflict_pair", _confirm)
     res = C.resolve_cross_session_conflicts(dry_run=True)
     assert res["llm_validations"] == 0 and len(calls) == 0
@@ -239,7 +241,7 @@ def test_dry_run_llm_eval_switches_llm_without_mutating(temp_db, monkeypatch, di
     C2 = BeamMemory(session_id="tC2", db_path=temp_db)
     C2._detect_conflicts = _stub_detect_pair(blue, green)
     monkeypatch.setattr(lcd, "validate_conflict_pair",
-                        lambda older, newer, session_id, db_path: (False, 0.2, None))
+                        lambda older, newer, session_id, db_path: (False, 0.2, None, "valid"))
     declined = C2.resolve_cross_session_conflicts(dry_run=True, llm_eval=True)
     assert declined["llm_validations"] >= 1
     assert declined["conflicts_resolved"] == 0
@@ -351,7 +353,7 @@ def test_llm_validation_cap_bounds_calls(temp_db, monkeypatch, disable_llm):
     monkeypatch.setattr(
         lcd, "validate_conflict_pair",
         lambda older, newer, session_id=None, db_path=None: (
-            calls.__setitem__("n", calls["n"] + 1) or (True, 0.9, "new")
+            calls.__setitem__("n", calls["n"] + 1) or (True, 0.9, "new", "valid")
         ),
     )
     res = A.resolve_cross_session_conflicts(max_llm_validations=1)
@@ -363,7 +365,9 @@ def test_llm_validation_cap_bounds_calls(temp_db, monkeypatch, disable_llm):
 
 def test_bank_scan_failure_returns_failed(temp_db, monkeypatch, disable_llm):
     """If a bank query fails, resolution is aborted with an explicit status and
-    nothing is mutated (no silent single-bank resolution)."""
+    nothing is mutated (no silent single-bank resolution). The failed result
+    carries the SAME key shape as the success paths (including
+    ``skipped_cached``), so consumers can rely on a uniform contract."""
     monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
     A = BeamMemory(session_id="tA", db_path=temp_db)
     A.remember("[USER] favorite color is blue", source="conversation",
@@ -374,6 +378,12 @@ def test_bank_scan_failure_returns_failed(temp_db, monkeypatch, disable_llm):
     res = A.resolve_cross_session_conflicts()
     assert res["status"] == "failed"
     assert res["invalidated"] == 0 and res["conflicts_resolved"] == 0
+    # The failed path must report skipped_cached (no cache was consulted or
+    # skipped on this abort), matching the success-path result shape.
+    assert res["skipped_cached"] == 0
+    for key in ("pairs_flagged", "rows_scanned", "llm_validations",
+                "llm_cap_reached", "candidates_truncated", "message"):
+        assert key in res, f"the failed result must carry {key}"
     row = A.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()
     assert row[0] == 1, "nothing may be mutated on a failed scan"
 
@@ -436,7 +446,7 @@ def test_max_llm_validations_negative_normalized(temp_db, monkeypatch, disable_l
     monkeypatch.setattr(
         lcd, "validate_conflict_pair",
         lambda older, newer, session_id=None, db_path=None: (
-            calls.__setitem__("n", calls["n"] + 1) or (True, 0.9, "new")
+            calls.__setitem__("n", calls["n"] + 1) or (True, 0.9, "new", "valid")
         ),
     )
     res = A.resolve_cross_session_conflicts(max_llm_validations=-5)
@@ -652,3 +662,804 @@ def test_resolver_scan_uses_utc_now_under_non_utc_host(temp_db, monkeypatch, dis
         else:
             monkeypatch.setenv("TZ", original)
         time.tzset()
+
+
+def test_reject_cached_then_skipped(temp_db, monkeypatch):
+    """#714 follow-up: an LLM-rejected pair is cached with a TTL and later
+    runs skip re-validating it (the perpetual LLM re-validation churn)."""
+    A = BeamMemory(session_id="tCRA", db_path=temp_db)
+    B = BeamMemory(session_id="tCRB", db_path=temp_db)
+    a1 = A.remember("[USER] favorite color is blue", source="conversation",
+                    importance=0.7, scope="global")
+    b1 = B.remember("[USER] favorite color is green now", source="conversation",
+                    importance=0.7, scope="global")
+
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+    monkeypatch.setattr(lcd, "validate_conflict_pair",
+                        lambda older, newer, session_id, db_path: (False, 0.2, None, "valid"))
+
+    # run 1: LLM rejects -> nothing invalidated, pair persisted to the cache.
+    C1 = BeamMemory(session_id="tCRA", db_path=temp_db)
+    C1._detect_conflicts = _stub_detect_pair(a1, b1)
+    r1 = C1.resolve_cross_session_conflicts()
+    assert r1["llm_validations"] == 1
+    assert r1["skipped_cached"] == 0
+    assert r1["invalidated"] == 0
+
+    # run 2: the same rejected pair is now served from the cache (no LLM call).
+    C2 = BeamMemory(session_id="tCRA", db_path=temp_db)
+    C2._detect_conflicts = _stub_detect_pair(a1, b1)
+    r2 = C2.resolve_cross_session_conflicts()
+    assert r2["llm_validations"] == 0
+    assert r2["skipped_cached"] == 1
+    assert r2["invalidated"] == 0
+
+    # the reject was persisted with a TTL.
+    rows = _cache_rows(temp_db)
+    assert len(rows) == 1
+    assert rows[0]["verdict"] == "reject"
+    assert rows[0]["expires_at"]
+
+
+def test_dry_run_reports_cache_without_mutating(temp_db, monkeypatch):
+    """#714 follow-up: a dry run reads the cache (reports the skip) but never
+    writes it — dry runs stay read-only."""
+    A = BeamMemory(session_id="tCRD", db_path=temp_db)
+    B = BeamMemory(session_id="tCRD2", db_path=temp_db)
+    a1 = A.remember("[USER] favorite color is blue", source="conversation",
+                    importance=0.7, scope="global")
+    b1 = B.remember("[USER] favorite color is green now", source="conversation",
+                    importance=0.7, scope="global")
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+    monkeypatch.setattr(lcd, "validate_conflict_pair",
+                        lambda older, newer, session_id, db_path: (False, 0.2, None, "valid"))
+
+    # seed the cache with an apply.
+    C1 = BeamMemory(session_id="tCRD", db_path=temp_db)
+    C1._detect_conflicts = _stub_detect_pair(a1, b1)
+    C1.resolve_cross_session_conflicts()
+    assert len(_cache_rows(temp_db)) == 1
+
+    # a dry run reports the skip but adds no row.
+    C2 = BeamMemory(session_id="tCRD", db_path=temp_db)
+    C2._detect_conflicts = _stub_detect_pair(a1, b1)
+    r = C2.resolve_cross_session_conflicts(dry_run=True)
+    assert r["skipped_cached"] == 1
+    assert len(_cache_rows(temp_db)) == 1
+
+
+def test_expired_verdict_is_readjudicated(temp_db, monkeypatch):
+    """#714 follow-up: once the TTL elapses the pair is re-validated."""
+    A = BeamMemory(session_id="tCRE", db_path=temp_db)
+    B = BeamMemory(session_id="tCRE2", db_path=temp_db)
+    a1 = A.remember("[USER] favorite color is blue", source="conversation",
+                    importance=0.7, scope="global")
+    b1 = B.remember("[USER] favorite color is green now", source="conversation",
+                    importance=0.7, scope="global")
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+    monkeypatch.setattr(lcd, "validate_conflict_pair",
+                        lambda older, newer, session_id, db_path: (False, 0.2, None, "valid"))
+
+    C1 = BeamMemory(session_id="tCRE", db_path=temp_db)
+    C1._detect_conflicts = _stub_detect_pair(a1, b1)
+    C1.resolve_cross_session_conflicts()
+    assert len(_cache_rows(temp_db)) == 1
+
+    # expire the verdict in place.
+    conn = sqlite3.connect(temp_db)
+    conn.execute("UPDATE cross_session_verdict_cache SET expires_at = '2000-01-01'")
+    conn.commit()
+    conn.close()
+
+    C2 = BeamMemory(session_id="tCRE", db_path=temp_db)
+    C2._detect_conflicts = _stub_detect_pair(a1, b1)
+    r2 = C2.resolve_cross_session_conflicts()
+    assert r2["skipped_cached"] == 0
+    assert r2["llm_validations"] == 1  # re-adjudicated after expiry
+
+
+def _cache_rows(db_path):
+    """Read back every row of the verdict cache using a fresh, independent
+    connection (so the caller's open transaction cannot affect the view)."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM cross_session_verdict_cache")]
+    finally:
+        conn.close()
+    return rows
+
+
+@pytest.fixture
+def cache_pair(temp_db, monkeypatch):
+    """Use real global memories; stub only detection and external LLM verdicts."""
+    import mnemosyne.core.llm_conflict_detector as lcd
+
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+    monkeypatch.setattr(lcd, "validate_conflict_pair",
+                        lambda *a, **kw: (False, 0.2, None, "valid"))
+    older = BeamMemory(session_id="cache-older", db_path=temp_db)
+    newer = BeamMemory(session_id="cache-newer", db_path=temp_db)
+    ids = (
+        older.remember("[USER] cache fact one", source="conversation",
+                       importance=0.7, scope="global"),
+        newer.remember("[USER] cache fact two", source="conversation",
+                       importance=0.7, scope="global"),
+    )
+    older._detect_conflicts = _stub_detect_pair(*ids)
+    return older, newer, ids
+
+
+@pytest.mark.parametrize("raw,days", [
+    (None, 30), ("7", 7), ("invalid", 30), ("0", 1), ("-2", 1),
+])
+def test_cache_persisted_ttl_honors_configuration(cache_pair, monkeypatch, raw, days):
+    """Ignoring TTL configuration must change the independently read expiry."""
+    resolver, _, ids = cache_pair
+    name = "MNEMOSYNE_CROSS_SESSION_VERDICT_TTL_DAYS"
+    if raw is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, raw)
+
+    result = resolver.resolve_cross_session_conflicts()
+    assert result["llm_validations"] == 1
+    rows = _cache_rows(resolver.db_path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row["older_id"], row["newer_id"]) == ids
+    assert row["verdict"] == "reject"
+    assert (datetime.fromisoformat(row["expires_at"])
+            - datetime.fromisoformat(row["decided_at"])) == timedelta(days=days)
+
+
+@pytest.mark.parametrize("llm_eval", [False, True])
+def test_cache_legacy_schema_is_read_only_until_apply(cache_pair, llm_eval):
+    """Preview must not migrate; apply must revalidate an actual unsigned row."""
+    resolver, _, ids = cache_pair
+    resolver.conn.execute(
+        "CREATE TABLE cross_session_verdict_cache ("
+        "older_id TEXT NOT NULL, newer_id TEXT NOT NULL, verdict TEXT NOT NULL, "
+        "confidence REAL, decided_at TEXT NOT NULL, expires_at TEXT NOT NULL, "
+        "PRIMARY KEY (older_id, newer_id))")
+    resolver.conn.execute(
+        "INSERT INTO cross_session_verdict_cache VALUES (?, ?, 'reject', 0.9, ?, ?)",
+        (*ids, "2000-01-01T00:00:00+00:00", "9999-01-01T00:00:00+00:00"))
+    resolver.conn.commit()
+
+    with sqlite3.connect(resolver.db_path) as reader:
+        before_schema = reader.execute(
+            "SELECT sql FROM sqlite_master WHERE name='cross_session_verdict_cache'"
+        ).fetchone()[0]
+    before_rows = _cache_rows(resolver.db_path)
+    preview = resolver.resolve_cross_session_conflicts(dry_run=True, llm_eval=llm_eval)
+    assert preview["status"] == "dry_run"
+    assert preview["skipped_cached"] == 0
+    assert preview["llm_validations"] == int(llm_eval)
+    assert not resolver.conn.in_transaction
+    with sqlite3.connect(resolver.db_path) as reader:
+        assert reader.execute(
+            "SELECT sql FROM sqlite_master WHERE name='cross_session_verdict_cache'"
+        ).fetchone()[0] == before_schema
+    assert _cache_rows(resolver.db_path) == before_rows
+
+    applied = resolver.resolve_cross_session_conflicts()
+    assert applied["llm_validations"] == 1
+    assert applied["skipped_cached"] == 0
+    assert not resolver.conn.in_transaction
+    with sqlite3.connect(resolver.db_path) as reader:
+        assert "content_sig" in {r[1] for r in reader.execute(
+            "PRAGMA table_info(cross_session_verdict_cache)")}
+    rows = _cache_rows(resolver.db_path)
+    assert len(rows) == 1
+    assert (rows[0]["older_id"], rows[0]["newer_id"]) == ids
+    assert rows[0]["content_sig"]
+    assert rows[0]["confidence"] == 0.2  # actual re-adjudication replaces 0.9
+    cached = resolver.resolve_cross_session_conflicts()
+    assert cached["llm_validations"] == 0 and cached["skipped_cached"] == 1
+
+
+@pytest.mark.parametrize("failure", ["lookup", "flush", "after_commit_flush"])
+def test_cache_failure_preserves_result_and_caller_transaction(
+        cache_pair, monkeypatch, failure):
+    """An optional-cache exception cannot fail resolution or commit caller work."""
+    resolver, _, ids = cache_pair
+    resolver.conn.execute("CREATE TABLE caller_marker (value TEXT)")
+    resolver.conn.commit()
+    failures = []
+
+    def fail_cache(*args, **kwargs):
+        """Inject a genuine cache error at the chosen I/O boundary."""
+        failures.append(failure)
+        raise sqlite3.OperationalError("injected optional-cache failure")
+
+    target = "_csverdict_cached_rejects" if failure == "lookup" else "_csverdict_flush"
+    monkeypatch.setattr(resolver, target, fail_cache)
+    if failure == "after_commit_flush":
+        resolver.conn.execute("BEGIN DEFERRED")
+        resolver.conn.execute("INSERT INTO caller_marker VALUES ('caller-owned')")
+
+    result = resolver.resolve_cross_session_conflicts()
+    assert result["status"] == "no_op"
+    assert result["llm_validations"] == 1
+    assert result["invalidated"] == result["conflicts_resolved"] == 0
+    assert result["skipped_cached"] == 0
+    assert result["llm_cap_reached"] is False
+    with sqlite3.connect(resolver.db_path) as reader:
+        assert reader.execute("SELECT * FROM caller_marker").fetchall() == []
+        retained = reader.execute(
+            "SELECT id FROM working_memory WHERE superseded_by IS NULL AND id IN (?, ?)",
+            ids).fetchall()
+        assert {row[0] for row in retained} == set(ids)
+
+    if failure == "after_commit_flush":
+        assert resolver.conn.in_transaction
+        assert failures == [], "flush must wait for the caller's commit"
+        resolver.conn.commit()  # cache-hook failure must not undo or raise after commit
+        assert not resolver.conn.in_transaction
+        with sqlite3.connect(resolver.db_path) as reader:
+            assert reader.execute("SELECT * FROM caller_marker").fetchall() == [
+                ("caller-owned",)]
+    else:
+        assert not resolver.conn.in_transaction
+    assert failures == [failure], "the injected failure path must actually execute"
+    with sqlite3.connect(resolver.db_path) as reader:
+        table = reader.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='cross_session_verdict_cache'"
+        ).fetchone()
+    if failure == "lookup":
+        assert len(_cache_rows(resolver.db_path)) == 1  # lookup failure still validates/writes
+    else:
+        assert table is None  # failed flush cannot pretend its verdict was saved
+
+
+def test_cached_reject_does_not_consume_uncached_validation_budget(cache_pair, monkeypatch):
+    """A cache hit before a fresh contradiction must leave its sole LLM slot free."""
+    import mnemosyne.core.llm_conflict_detector as lcd
+
+    resolver, newer, cached_ids = cache_pair
+    assert resolver.resolve_cross_session_conflicts()["llm_validations"] == 1
+    before_cache = _cache_rows(resolver.db_path)
+    fresh_ids = (
+        resolver.remember("[USER] fresh fact before", source="conversation",
+                          importance=0.7, scope="global"),
+        newer.remember("[USER] fresh fact after", source="conversation",
+                       importance=0.7, scope="global"),
+    )
+    resolver._detect_conflicts = lambda *a, **kw: [cached_ids, fresh_ids]
+    validations = []
+
+    def confirm_fresh(older, newer, **kwargs):
+        """Make the uncached pair's real supersession observable."""
+        validations.append((older, newer))
+        return True, 0.99, None, "valid"
+
+    monkeypatch.setattr(lcd, "validate_conflict_pair", confirm_fresh)
+    result = resolver.resolve_cross_session_conflicts(max_llm_validations=1)
+    assert result["skipped_cached"] == 1
+    assert result["llm_validations"] == 1
+    assert result["llm_cap_reached"] is False
+    assert result["status"] == "resolved"
+    assert result["invalidated"] == result["conflicts_resolved"] == 1
+    assert validations == [("[USER] fresh fact before", "[USER] fresh fact after")]
+    assert _cache_rows(resolver.db_path) == before_cache
+    with sqlite3.connect(resolver.db_path) as reader:
+        rows = dict(reader.execute(
+            "SELECT id, superseded_by FROM working_memory"))
+    assert rows[fresh_ids[0]] == fresh_ids[1]
+    assert rows[fresh_ids[1]] is None
+    assert all(rows[mid] is None for mid in cached_ids)
+
+
+def test_failed_validation_not_cached(temp_db, monkeypatch):
+    """A FAILED validation (provider unavailable / malformed response) is a
+    distinct status from a valid negative verdict and must NOT be cached:
+    the next apply retries the validation instead of trusting a 30-day
+    reject for an attempt that never reached a verdict."""
+    A = BeamMemory(session_id="tCRF", db_path=temp_db)
+    B = BeamMemory(session_id="tCRF2", db_path=temp_db)
+    a1 = A.remember("[USER] favorite color is blue", source="conversation",
+                    importance=0.7, scope="global")
+    b1 = B.remember("[USER] favorite color is green now", source="conversation",
+                    importance=0.7, scope="global")
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+
+    states = iter(["failed", "valid"])
+
+    def _stateful(older, newer, session_id=None, db_path=None):
+        """Stateful validator: cycles through the given verdict statuses."""
+        return (False, 0.2, None, next(states))
+
+    monkeypatch.setattr(lcd, "validate_conflict_pair", _stateful)
+
+    # run 1: the validation FAILS -> nothing is cached.
+    C1 = BeamMemory(session_id="tCRF", db_path=temp_db)
+    C1._detect_conflicts = _stub_detect_pair(a1, b1)
+    r1 = C1.resolve_cross_session_conflicts()
+    assert r1["llm_validations"] == 1
+    assert r1["invalidated"] == 0
+
+    # the table must not even exist: a failed validation writes nothing.
+    conn = sqlite3.connect(str(temp_db))
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='cross_session_verdict_cache'").fetchone()
+    finally:
+        conn.close()
+    assert exists is None, "a failed validation must not create the cache"
+
+    # run 2: the pair is re-validated (not skipped from a cached reject);
+    # the now-valid verdict IS persisted for later runs.
+    C2 = BeamMemory(session_id="tCRF", db_path=temp_db)
+    C2._detect_conflicts = _stub_detect_pair(a1, b1)
+    r2 = C2.resolve_cross_session_conflicts()
+    assert r2["llm_validations"] == 1, "the failed pair must be retried"
+    assert r2["skipped_cached"] == 0
+    assert len(_cache_rows(temp_db)) == 1
+
+
+def test_content_edit_invalidates_cached_verdict(temp_db, monkeypatch):
+    """A cached verdict is bound to the content snapshots of both memories:
+    updating either memory's content (update_working keeps the id) makes the
+    verdict stale — the pair is re-adjudicated and the stale row replaced,
+    even though the pair ids and TTL are unchanged."""
+    A = BeamMemory(session_id="tCRG", db_path=temp_db)
+    B = BeamMemory(session_id="tCRG2", db_path=temp_db)
+    a1 = A.remember("[USER] favorite color is blue", source="conversation",
+                    importance=0.7, scope="global")
+    b1 = B.remember("[USER] favorite color is green now", source="conversation",
+                    importance=0.7, scope="global")
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+    monkeypatch.setattr(lcd, "validate_conflict_pair",
+                        lambda older, newer, session_id, db_path: (False, 0.2, None, "valid"))
+
+    C1 = BeamMemory(session_id="tCRG", db_path=temp_db)
+    C1._detect_conflicts = _stub_detect_pair(a1, b1)
+    r1 = C1.resolve_cross_session_conflicts()
+    assert r1["llm_validations"] == 1 and r1["skipped_cached"] == 0
+    assert len(_cache_rows(temp_db)) == 1
+
+    # edit one side of the pair (id retained, content changed).
+    assert A.update_working(a1, content="[USER] favorite color is blue AND red")
+
+    # the stale verdict is re-adjudicated (not reused) and its row replaced.
+    C2 = BeamMemory(session_id="tCRG", db_path=temp_db)
+    C2._detect_conflicts = _stub_detect_pair(a1, b1)
+    r2 = C2.resolve_cross_session_conflicts()
+    assert r2["llm_validations"] == 1, "a stale verdict must be re-adjudicated"
+    assert r2["skipped_cached"] == 0
+    rows = _cache_rows(temp_db)
+    assert len(rows) == 1, "the stale row must be replaced, not duplicated"
+    assert rows[0]["content_sig"] is not None
+    assert rows[0]["verdict"] == "reject"
+
+    # and the NEW content is now what the cache trusts: an unchanged rerun
+    # skips without an LLM call.
+    C3 = BeamMemory(session_id="tCRG", db_path=temp_db)
+    C3._detect_conflicts = _stub_detect_pair(a1, b1)
+    r3 = C3.resolve_cross_session_conflicts()
+    assert r3["llm_validations"] == 0 and r3["skipped_cached"] == 1
+
+
+def test_migrated_null_signature_re_adjudicated(temp_db, monkeypatch):
+    """A legacy verdict row migrated WITHOUT a content_sig (NULL) must read
+    as stale — re-adjudicated and its row replaced with a real signature —
+    never trusted as a cache hit (the migration adds the column without
+    populating existing rows)."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+
+    A = BeamMemory(session_id="tCRL", db_path=temp_db)
+    B = BeamMemory(session_id="tCRL2", db_path=temp_db)
+    a1 = A.remember("[USER] favorite color is blue", source="conversation",
+                    importance=0.7, scope="global")
+    b1 = B.remember("[USER] favorite color is green now", source="conversation",
+                    importance=0.7, scope="global")
+    monkeypatch.setattr(lcd, "validate_conflict_pair",
+                        lambda older, newer, session_id, db_path: (False, 0.2, None, "valid"))
+
+    # seed the cache with one valid reject ...
+    C1 = BeamMemory(session_id="tCRL", db_path=temp_db)
+    C1._detect_conflicts = _stub_detect_pair(a1, b1)
+    r1 = C1.resolve_cross_session_conflicts()
+    assert r1["llm_validations"] == 1 and r1["skipped_cached"] == 0
+
+    # ... then simulate the apply-time migration leaving the row
+    # unsigned (NULL content_sig).
+    legacy = sqlite3.connect(str(temp_db))
+    legacy.execute("UPDATE cross_session_verdict_cache SET content_sig = NULL")
+    legacy.commit()
+    legacy.close()
+
+    # a NULL signature must NOT be trusted as a hit.
+    C2 = BeamMemory(session_id="tCRL", db_path=temp_db)
+    C2._detect_conflicts = _stub_detect_pair(a1, b1)
+    r2 = C2.resolve_cross_session_conflicts()
+    assert r2["llm_validations"] == 1, "a NULL signature must be re-adjudicated"
+    assert r2["skipped_cached"] == 0
+    rows = _cache_rows(temp_db)
+    assert len(rows) == 1 and rows[0]["content_sig"] is not None, (
+        "the migrated row must be replaced with a signed one")
+
+
+def test_content_sig_embedded_delimiter_no_collision(temp_db, monkeypatch):
+    """The content-sig encoding must be delimiter-free.
+
+    The old implementation hashed ``older + "<newline>---<newline>" + newer``
+    (ACTUAL newline characters), which let a different pair whose text embeds
+    that delimiter sequence collide on the same signature. This test pins the
+    collision with real newlines and drives the SAME collision through the
+    integration path: if the signature function regressed to the old
+    delimiter encoding, the second (colliding) pair would be served from the
+    cache instead of re-adjudicated.
+    """
+    from mnemosyne.core.beam import _csverdict_content_sig
+    import hashlib
+
+    sep = "\n---\n"  # the former delimiter (real newline characters)
+    # Two DIFFERENT pairs whose concatenated contents are IDENTICAL under
+    # the old delimiter encoding (the collision it could not prevent).
+    pair_a = ("[USER] X", "[USER] Y" + sep + "[USER] Z")
+    pair_b = ("[USER] X" + sep + "[USER] Y", "[USER] Z")
+    assert pair_a != pair_b
+    # The old encoding really does collide on this pair (documents why it
+    # was unsafe); a regression to it must make this test fail.
+    old_sig = lambda o, n: hashlib.sha256(f"{o}{sep}{n}".encode("utf-8")).hexdigest()
+    assert old_sig(*pair_a) == old_sig(*pair_b)
+    # The current JSON (length-delimited) encoding must not collide:
+    assert _csverdict_content_sig(*pair_a) != _csverdict_content_sig(*pair_b)
+
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+    monkeypatch.setattr(lcd, "validate_conflict_pair",
+                        lambda older, newer, session_id, db_path: (False, 0.2, None, "valid"))
+
+    A = BeamMemory(session_id="tCRM", db_path=temp_db)
+    B = BeamMemory(session_id="tCRM2", db_path=temp_db)
+    a1 = A.remember(pair_a[0], source="conversation",
+                    importance=0.7, scope="global")
+    b1 = B.remember(pair_a[1], source="conversation",
+                    importance=0.7, scope="global")
+
+    C1 = BeamMemory(session_id="tCRM", db_path=temp_db)
+    C1._detect_conflicts = _stub_detect_pair(a1, b1)
+    r1 = C1.resolve_cross_session_conflicts()
+    assert r1["llm_validations"] == 1 and r1["skipped_cached"] == 0
+
+    # An edit that moves the delimiter across the pair boundary changes the
+    # pair to pair_b — the pair that collides with pair_a under the OLD
+    # encoding. Under a regressed (delimiter) signature it would be served
+    # from the cache; with the current encoding it must be re-adjudicated.
+    assert A.update_working(a1, content=pair_b[0])
+    assert B.update_working(b1, content=pair_b[1])
+    C2 = BeamMemory(session_id="tCRM", db_path=temp_db)
+    C2._detect_conflicts = _stub_detect_pair(a1, b1)
+    r2 = C2.resolve_cross_session_conflicts()
+    assert r2["llm_validations"] == 1, (
+        "a pair that collides with the cached pair under the old "
+        "delimiter encoding must still be re-adjudicated")
+    assert r2["skipped_cached"] == 0
+
+
+def test_cache_write_does_not_block_second_connection(temp_db, monkeypatch):
+    """Cache writes must not hold the writer lock across a later LLM
+    validation call: with a caller-owned deferred transaction and two
+    rejected pairs (default WAL journal), a separate connection must be
+    able to become a WRITER during the second validation. (timeout=0 so a
+    regression fails fast instead of waiting out the default 5s busy
+    timeout.) The flush is queued through the after-commit hook — visible
+    from a third connection after the caller commits, and absent after the
+    caller rolls back (the cache must not outlive its transaction)."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+
+    A = BeamMemory(session_id="tCRH", db_path=temp_db)
+    B = BeamMemory(session_id="tCRH2", db_path=temp_db)
+    a1 = A.remember("[USER] fact one", source="conversation",
+                    importance=0.7, scope="global")
+    a2 = A.remember("[USER] fact two", source="conversation",
+                    importance=0.7, scope="global")
+    b1 = B.remember("[USER] fact one changed", source="conversation",
+                    importance=0.7, scope="global")
+    b2 = B.remember("[USER] fact two changed", source="conversation",
+                    importance=0.7, scope="global")
+    # A FRESH pair, uncached in either phase: each phase queues its own
+    # reject, so the rollback phase verifies the discard of a verdict that
+    # was actually queued (not an empty second phase).
+    a3 = A.remember("[USER] fact three", source="conversation",
+                    importance=0.7, scope="global")
+    b3 = B.remember("[USER] fact three changed", source="conversation",
+                    importance=0.7, scope="global")
+
+    calls = {"n": 0}
+    second_writes = []
+
+    def _validate(older, newer, session_id=None, db_path=None):
+        """Validator that performs a concurrent writer write on the 2nd call."""
+        calls["n"] += 1
+        if calls["n"] == 2:
+            conn2 = sqlite3.connect(str(temp_db), timeout=0)
+            try:
+                conn2.execute(
+                    "INSERT OR IGNORE INTO working_memory "
+                    "(id, content, source, timestamp, session_id, scope) "
+                    "VALUES ('tcrh-writer', '[USER] concurrent write', "
+                    "'conversation', '2026-11-11T00:00:00', 'tCRH', 'global')")
+                conn2.commit()
+                second_writes.append(True)
+            finally:
+                conn2.close()
+        return (False, 0.2, None, "valid")
+
+    monkeypatch.setattr(lcd, "validate_conflict_pair", _validate)
+
+    def _cache_count():
+        """Row count of the verdict cache via an independent connection."""
+        conn = sqlite3.connect(str(temp_db))
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM cross_session_verdict_cache").fetchone()[0]
+        except sqlite3.OperationalError:
+            return 0  # the table does not exist yet
+        finally:
+            conn.close()
+
+    def _run(pairs):
+        """Open a resolver on the deferred transaction with the given pairs."""
+        C = BeamMemory(session_id="tCRH", db_path=temp_db)
+        C._detect_conflicts = (
+            lambda items, similarity_threshold=0.88, min_gap_hours=1.0:
+            pairs)
+        # caller-owned deferred transaction (as the Hermes provider does).
+        C.conn.execute("BEGIN DEFERRED")
+        return C
+
+    # Phase 1: commit path.
+    C = _run([(a1, b1), (a2, b2)])
+    try:
+        r = C.resolve_cross_session_conflicts()
+        assert r["llm_validations"] == 2
+        assert r["invalidated"] == 0
+        assert second_writes == [True], (
+            "a second connection must be able to write while the apply is "
+            "validating: the cache must not hold the writer lock across a "
+            "validate_conflict_pair call")
+        # the flush must NOT have written yet: it is queued behind the
+        # caller's transaction, which still owns the writer lock.
+        assert _cache_count() == 0, (
+            "the flush must run after the caller's commit, not inside it")
+        # the caller commits its transaction; the after-commit hook fires
+        # and the flush writes on its own connection.
+        C.conn.commit()
+        # visible from an independent connection, without the caller
+        # having committed anything cache-related itself.
+        check = sqlite3.connect(str(temp_db), timeout=5.0)
+        try:
+            n = check.execute(
+                "SELECT COUNT(*) FROM cross_session_verdict_cache").fetchone()[0]
+        finally:
+            check.close()
+        assert n == 2, "the after-commit flush must persist both reject verdicts"
+    finally:
+        C.conn.close()
+
+    # Phase 2: rollback path — the flush must NOT run for a transaction
+    # the caller rolled back (the cache must not outlive it). Phase 2 uses
+    # a FRESH uncached pair so it queues its own reject; the assertion
+    # below proves that queued verdict is discarded on rollback (verified
+    # from an independent connection), rather than an empty second phase.
+    calls["n"] = 0
+    C2 = _run([(a3, b3)])
+    try:
+        r2 = C2.resolve_cross_session_conflicts()
+        assert r2["llm_validations"] == 1, (
+            "the fresh pair must be validated and its reject queued")
+        assert r2["skipped_cached"] == 0
+        assert C2.conn.in_transaction
+        assert _cache_count() == 2  # still only phase-1's verdicts (flush queued)
+        C2.conn.rollback()
+        # From an independent connection: the fresh verdict must be absent
+        # (rollback dropped the queued flush), phase-1's rows intact.
+        check2 = sqlite3.connect(str(temp_db), timeout=5.0)
+        try:
+            n2 = check2.execute(
+                "SELECT COUNT(*) FROM cross_session_verdict_cache").fetchone()[0]
+            fresh = check2.execute(
+                "SELECT COUNT(*) FROM cross_session_verdict_cache "
+                "WHERE older_id=? AND newer_id=?", (a3, b3)).fetchone()[0]
+        finally:
+            check2.close()
+        assert n2 == 2 and fresh == 0, (
+            "a rolled-back transaction must not flush its queued verdicts")
+    finally:
+        C2.conn.close()
+
+
+def test_flush_waits_for_caller_commit_after_confirmed_pair(temp_db, monkeypatch):
+    """Flush timing with a MIXED confirmed + rejected pair (the case a
+    pure reject run never exercises): the confirmation's invalidate()
+    legitimately holds the writer lock, but the reject's cache flush must
+    still be queued as an after-commit hook and fire ONLY after the
+    caller commits — and not at all if the caller rolls back."""
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+
+    A = BeamMemory(session_id="tCRN", db_path=temp_db)
+    B = BeamMemory(session_id="tCRN2", db_path=temp_db)
+    a1 = A.remember("[USER] favorite color is blue", source="conversation",
+                    importance=0.7, scope="global")
+    b1 = B.remember("[USER] favorite color is green now", source="conversation",
+                    importance=0.7, scope="global")
+    a2 = A.remember("[USER] fact two", source="conversation",
+                    importance=0.7, scope="global")
+    b2 = B.remember("[USER] fact two changed", source="conversation",
+                    importance=0.7, scope="global")
+    # A FRESH pair, uncached in either phase: the rollback phase queues its
+    # own reject, so it verifies the discard of a verdict that was actually
+    # queued (not an empty second phase).
+    a3 = A.remember("[USER] fact three", source="conversation",
+                    importance=0.7, scope="global")
+    b3 = B.remember("[USER] fact three changed", source="conversation",
+                    importance=0.7, scope="global")
+
+    def _validate(older, newer, session_id=None, db_path=None):
+        """Validator: the mixed pair confirms, every other pair rejects."""
+        # The mixed pair (favorite color) is CONFIRMED — its invalidate()
+        # legitimately takes the writer lock; every other pair is REJECTED
+        # (queued for the cache). Content-based so phase ordering (and the
+        # fresh rollback pair) is handled uniformly.
+        if older == "[USER] favorite color is blue":
+            return (True, 0.95, None, "valid")
+        return (False, 0.2, None, "valid")
+
+    monkeypatch.setattr(lcd, "validate_conflict_pair", _validate)
+
+    def _cache_count():
+        """Row count of the verdict cache via an independent connection."""
+        conn = sqlite3.connect(str(temp_db))
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM cross_session_verdict_cache").fetchone()[0]
+        except sqlite3.OperationalError:
+            return 0
+        finally:
+            conn.close()
+
+    def _run(pairs):
+        """Open a resolver on the deferred transaction with the given pairs."""
+        C = BeamMemory(session_id="tCRN", db_path=temp_db)
+        C._detect_conflicts = (
+            lambda items, similarity_threshold=0.88, min_gap_hours=1.0:
+            pairs)
+        C.conn.execute("BEGIN DEFERRED")
+        return C
+
+    # commit path: the flush is queued, fires only on the caller's commit.
+    # Pair (a1,b1) is the MIXED confirmed one (its invalidate() takes the
+    # writer lock); pair (a2,b2) is rejected and queued for the cache.
+    C = _run([(a1, b1), (a2, b2)])
+    try:
+        r = C.resolve_cross_session_conflicts()
+        assert r["llm_validations"] == 2
+        assert r["conflicts_resolved"] == 1 and r["invalidated"] == 1
+        assert _cache_count() == 0, (
+            "with the caller's transaction still open the flush must wait")
+        C.conn.commit()
+        check = sqlite3.connect(str(temp_db), timeout=5.0)
+        try:
+            n = check.execute(
+                "SELECT COUNT(*) FROM cross_session_verdict_cache").fetchone()[0]
+        finally:
+            check.close()
+        assert n == 1, "the after-commit flush must persist the reject verdict"
+    finally:
+        C.conn.close()
+
+    # rollback path: the FRESH uncached pair (a3,b3) is validated and its
+    # reject queued; the rollback must drop that queued verdict (verified
+    # from an independent connection) rather than an empty second phase.
+    C2 = _run([(a3, b3)])
+    try:
+        r2 = C2.resolve_cross_session_conflicts()
+        assert r2["llm_validations"] == 1, (
+            "the fresh pair must be validated and its reject queued")
+        assert r2["skipped_cached"] == 0
+        assert C2.conn.in_transaction
+        assert _cache_count() == 1  # still only phase-1's verdict (flush queued)
+        C2.conn.rollback()
+        check2 = sqlite3.connect(str(temp_db), timeout=5.0)
+        try:
+            n2 = check2.execute(
+                "SELECT COUNT(*) FROM cross_session_verdict_cache").fetchone()[0]
+            fresh = check2.execute(
+                "SELECT COUNT(*) FROM cross_session_verdict_cache "
+                "WHERE older_id=? AND newer_id=?", (a3, b3)).fetchone()[0]
+        finally:
+            check2.close()
+        assert n2 == 1 and fresh == 0, (
+            "a rolled-back transaction must not flush its queued verdicts")
+    finally:
+        C2.conn.close()
+
+
+def test_dry_run_cold_and_evaluated_preview(temp_db, monkeypatch):
+    """Dry-run cache contract: a cold plain preview creates no table; an
+    evaluated (llm_eval) uncached rejection persists no row; a cached
+    preview preserves the complete row, including content_sig, confidence,
+    decided_at and expires_at (row counts alone could not catch an
+    overwrite of any of those)."""
+    A = BeamMemory(session_id="tCRI", db_path=temp_db)
+    B = BeamMemory(session_id="tCRI2", db_path=temp_db)
+    a1 = A.remember("[USER] favorite color is blue", source="conversation",
+                    importance=0.7, scope="global")
+    b1 = B.remember("[USER] favorite color is green now", source="conversation",
+                    importance=0.7, scope="global")
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    import mnemosyne.core.llm_conflict_detector as lcd
+    monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
+    monkeypatch.setattr(lcd, "validate_conflict_pair",
+                        lambda older, newer, session_id, db_path: (False, 0.2, None, "valid"))
+
+    def _table_exists():
+        conn = sqlite3.connect(str(temp_db))
+        try:
+            return conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='cross_session_verdict_cache'").fetchone()
+        finally:
+            conn.close()
+
+    # 1. cold plain preview: no table is created (reads never create
+    #    schema) and nothing is skipped.
+    C0 = BeamMemory(session_id="tCRI", db_path=temp_db)
+    C0._detect_conflicts = _stub_detect_pair(a1, b1)
+    r0 = C0.resolve_cross_session_conflicts(dry_run=True)
+    assert r0["skipped_cached"] == 0
+    assert _table_exists() is None, (
+        "a cold plain preview must not create the cache table")
+
+    # 2. seed with an apply.
+    C1 = BeamMemory(session_id="tCRI", db_path=temp_db)
+    C1._detect_conflicts = _stub_detect_pair(a1, b1)
+    C1.resolve_cross_session_conflicts()
+    assert len(_cache_rows(temp_db)) == 1
+    before = _cache_rows(temp_db)[0]
+
+    # 3. evaluated uncached rejection (fresh pair): persists no row and
+    #    leaves the seeded row untouched.
+    a2 = A.remember("[USER] favorite food is pasta", source="conversation",
+                    importance=0.7, scope="global")
+    b2 = B.remember("[USER] favorite food is ramen now", source="conversation",
+                    importance=0.7, scope="global")
+    C2 = BeamMemory(session_id="tCRI", db_path=temp_db)
+    C2._detect_conflicts = _stub_detect_pair(a2, b2)
+    r2 = C2.resolve_cross_session_conflicts(dry_run=True, llm_eval=True)
+    assert r2["llm_validations"] == 1
+    rows = _cache_rows(temp_db)
+    assert len(rows) == 1, "an evaluated dry-run rejection must persist no verdict"
+    assert rows[0] == before
+
+    # 4. cached preview: reports the skip and preserves the complete row.
+    C3 = BeamMemory(session_id="tCRI", db_path=temp_db)
+    C3._detect_conflicts = _stub_detect_pair(a1, b1)
+    r3 = C3.resolve_cross_session_conflicts(dry_run=True)
+    assert r3["skipped_cached"] == 1
+    after = _cache_rows(temp_db)
+    assert len(after) == 1
+    assert after[0] == before, "a cached preview must preserve the full row"

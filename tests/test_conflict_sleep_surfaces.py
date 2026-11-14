@@ -45,7 +45,7 @@ def test_public_sleep_surfaces_preserve_both_conflict_counters(
     )
     monkeypatch.setattr(
         lcd, "validate_conflict_pair",
-        lambda older, newer, **kwargs: (older.endswith("day 0"), 0.97, "corrected"),
+        lambda older, newer, **kwargs: (older.endswith("day 0"), 0.97, "corrected", "valid"),
     )
     arguments = {"force": True, "dry_run": dry_run, "all_sessions": all_sessions}
     before = sorted(beam.conn.iterdump())
