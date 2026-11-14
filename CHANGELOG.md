@@ -7,6 +7,12 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+### Deprecated
+- **`mnemosyne-browser` is deprecated and will be removed in a future release.** The optional memory browser dashboard now warns on startup. Use `mnemosyne recall` to search memories.
+
+### Security
+- **Memory browser escapes all rendered values (GHSA-g8jq-6cjq-ppw7).** The search query, the detail page id, and every stored memory field were written into HTML without escaping, so a crafted link or memory content could run script in the browser's origin and read every memory through `/api/search`. All values are now HTML-escaped, detail links are URL-encoded, responses carry a nonce-based Content-Security-Policy, and requests whose `Host` header is not local (or the explicit `--host`) are rejected to block DNS rebinding. Thanks to @orshih6 for the report.
+
 ### Added
 - **Advisory offline linear BEAM throughput benchmark (#901).** A fixed synthetic workload on a temporary database reports warm per-call latency, sequential throughput, raw samples and environment/revision metadata as JSON, with compatible same-machine baseline comparisons and a documented retention/interpretation policy. No runtime recall changes or CI timing threshold.
 

@@ -12,11 +12,18 @@ Usage:
     python -m mnemosyne.integrations.memory_browser --port 8081
 
 Then open http://localhost:8081 in your browser.
+
+Deprecated: the memory browser is deprecated and will be removed in a future
+release. Use ``mnemosyne recall`` from the CLI instead.
 """
 
 import argparse
 import logging
+import secrets
 import sqlite3
+import warnings
+from html import escape
+from urllib.parse import quote
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -24,6 +31,39 @@ from typing import Any, Dict, List, Optional
 from mnemosyne.core.banks import _default_data_dir, _validate_bank_name
 
 logger = logging.getLogger("mnemosyne-browser")
+
+DEPRECATION_MESSAGE = (
+    "mnemosyne-browser is deprecated and will be removed in a future release. "
+    "Use `mnemosyne recall` instead."
+)
+
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
+def _e(value: Any) -> str:
+    """HTML-escape any value for use in element text or a quoted attribute."""
+    return escape("" if value is None else str(value), quote=True)
+
+
+def _host_name(host_header: str) -> str:
+    """Return the lowercased host part of a Host header, without the port."""
+    host = host_header.strip().lower()
+    if host.startswith("["):
+        return host.split("]", 1)[0] + "]"
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
+def _csp(nonce: str) -> str:
+    return (
+        "default-src 'none'; "
+        f"script-src 'nonce-{nonce}'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "connect-src 'self'; "
+        "img-src 'self'; "
+        "form-action 'self'; "
+        "base-uri 'none'; "
+        "frame-ancestors 'none'"
+    )
 
 
 def _resolve_db_path(bank: str = "default") -> str:
@@ -267,13 +307,13 @@ PAGE_HTML = """<!DOCTYPE html>
       <option value="recent" {sel_recent}>Most recent</option>
       <option value="importance" {sel_importance}>Most important</option>
     </select>
-    <button onclick="search()">Search</button>
+    <button id="search-button" type="button">Search</button>
   </div>
   <div id="results">
     {results_html}
   </div>
 </div>
-<script>
+<script nonce="{nonce}">
 async function fetchStats() {{
   const resp = await fetch('/api/stats');
   const data = await resp.json();
@@ -293,6 +333,7 @@ function search() {{
   const params = new URLSearchParams({{q, src, tier, sort}});
   window.location.href = '/?' + params.toString();
 }}
+document.getElementById('search-button').addEventListener('click', search);
 document.getElementById('search').addEventListener('keydown', e => {{ if (e.key === 'Enter') search(); }});
 fetchStats();
 </script>
@@ -306,13 +347,14 @@ def _build_html(
     source: str = "",
     tier: str = "",
     sort: str = "recent",
+    nonce: str = "",
 ) -> str:
-    """Render the memory list page."""
+    """Render the memory list page. Every dynamic value is HTML-escaped."""
 
     # Source options
-    sources = set(m.get("source", "") for m in memories)
+    sources = set(str(m.get("source", "") or "") for m in memories)
     source_opts = "".join(
-        f'<option value="{s}" {"selected" if s == source else ""}>{s}</option>'
+        f'<option value="{_e(s)}" {"selected" if s == source else ""}>{_e(s)}</option>'
         for s in sorted(sources)
     )
 
@@ -321,13 +363,13 @@ def _build_html(
         results = "".join(
             f"""<div class="memory-card">
           <div class="memory-meta">
-            <span class="tag">{m.get('tier', 'memory').replace('_', ' ')}</span>
-            <span>source: {m.get('source', 'unknown')}</span>
-            <span>{str(m.get('timestamp', ''))[:19]}</span>
-            <span>importance: {m.get('importance', 0)}</span>
-            <span><a href="/detail/{m.get('id', '')}" style="color:var(--accent);text-decoration:none;">&#8599;</a></span>
+            <span class="tag">{_e(str(m.get('tier', 'memory')).replace('_', ' '))}</span>
+            <span>source: {_e(m.get('source', 'unknown'))}</span>
+            <span>{_e(str(m.get('timestamp', ''))[:19])}</span>
+            <span>importance: {_e(m.get('importance', 0))}</span>
+            <span><a href="/detail/{_e(quote(str(m.get('id', '')), safe=''))}" style="color:var(--accent);text-decoration:none;">&#8599;</a></span>
           </div>
-          <div class="memory-content">{str(m.get('content', ''))[:500]}</div>
+          <div class="memory-content">{_e(str(m.get('content', ''))[:500])}</div>
         </div>"""
             for m in memories
         )
@@ -335,7 +377,8 @@ def _build_html(
         results = '<div class="empty">No memories found.</div>'
 
     return PAGE_HTML.format(
-        query=query,
+        nonce=_e(nonce),
+        query=_e(query),
         source_options=source_opts,
         sel_working='selected' if tier == 'working' else '',
         sel_episodic='selected' if tier == 'episodic' else '',
@@ -355,15 +398,30 @@ async def lifespan(app):
     logger.info("Mnemosyne Browser shutting down")
 
 
-def create_app(banks: List[str], default_bank: str):
+def create_app(banks: List[str], default_bank: str, extra_hosts: Optional[List[str]] = None):
     """Create the FastAPI application."""
     try:
         from fastapi import FastAPI, Request
-        from fastapi.responses import HTMLResponse, JSONResponse
+        from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
     except ImportError:
         raise RuntimeError("Memory browser requires fastapi and uvicorn. Install: pip install fastapi uvicorn")
 
     app = FastAPI(title="Mnemosyne Browser", lifespan=lifespan)
+    allowed_hosts = set(_LOCAL_HOSTS) | {h.lower() for h in (extra_hosts or [])}
+
+    @app.middleware("http")
+    async def harden(request: Request, call_next):
+        # Reject requests whose Host is not local, so a DNS-rebinding page
+        # cannot reach /api/search from another origin.
+        if _host_name(request.headers.get("host", "")) not in allowed_hosts:
+            return PlainTextResponse("Forbidden host", status_code=403)
+        nonce = secrets.token_urlsafe(16)
+        request.state.csp_nonce = nonce
+        response = await call_next(request)
+        response.headers["Content-Security-Policy"] = _csp(nonce)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
 
     @app.get("/", response_class=HTMLResponse)
     async def index(
@@ -379,7 +437,10 @@ def create_app(banks: List[str], default_bank: str):
         limit = 50
         offset = (page - 1) * limit
         memories = search_memories(db_path, query=q, limit=limit, offset=offset, source=src, tier=tier, sort=sort)
-        return _build_html(memories, query=q, source=src, tier=tier, sort=sort)
+        return _build_html(
+            memories, query=q, source=src, tier=tier, sort=sort,
+            nonce=getattr(request.state, "csp_nonce", ""),
+        )
 
     @app.get("/api/stats")
     async def api_stats(bank: str = default_bank):
@@ -409,13 +470,13 @@ def create_app(banks: List[str], default_bank: str):
             return HTMLResponse("<h1>Memory not found</h1><a href='/'>Back</a>", status_code=404)
 
         fields = "".join(
-            f'<div class="field"><div class="field-label">{k}</div><div class="field-value">{v}</div></div>'
+            f'<div class="field"><div class="field-label">{_e(k)}</div><div class="field-value">{_e(v)}</div></div>'
             for k, v in mem.items()
             if k not in ("embedding", "vector")
         )
         html = f"""<!DOCTYPE html><html><head><title>Memory Detail</title><link rel="stylesheet" href="/"></head><body>
         <div class="header"><h1><a href="/" style="text-decoration:none;color:inherit;">Mnemosyne <span>Detail</span></a></h1></div>
-        <div class="container"><a href="/" class="back">&larr; Back</a><div class="detail"><h2>Memory {memory_id}</h2>{fields}</div></div></body></html>"""
+        <div class="container"><a href="/" class="back">&larr; Back</a><div class="detail"><h2>Memory {_e(memory_id)}</h2>{fields}</div></div></body></html>"""
         return HTMLResponse(html)
 
     return app
@@ -434,6 +495,8 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
+    warnings.warn(DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2)
+    logger.warning(DEPRECATION_MESSAGE)
 
     try:
         import uvicorn
@@ -441,7 +504,8 @@ def main():
         print("Memory browser requires uvicorn. Install: pip install uvicorn")
         return
 
-    app = create_app(banks=args.banks, default_bank=args.bank)
+    extra_hosts = [] if args.host in ("0.0.0.0", "::") else [args.host]
+    app = create_app(banks=args.banks, default_bank=args.bank, extra_hosts=extra_hosts)
     logger.info("Memory browser starting on http://%s:%d", args.host, args.port)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info" if args.verbose else "warning")
 
