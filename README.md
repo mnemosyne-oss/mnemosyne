@@ -162,6 +162,7 @@ mnemosyne mcp --transport streamable-http --port 8080  # Streamable HTTP (native
 # Direct memory ops
 mnemosyne store "User likes dark mode"
 mnemosyne recall "preferences"
+mnemosyne recall "preferences" --preview  # Explicit 150-character display preview
 mnemosyne stats
 mnemosyne sleep                         # Run consolidation
 
@@ -172,6 +173,14 @@ mnemosyne import backup.json
 # Sync (bidirectional memory sync between instances)
 mnemosyne sync --db-path /path/to/mnemosyne.db --remote https://my-vps:8765
 ```
+
+Human-readable `recall` output reads the current full content of selected
+working-memory, episodic-memory and MEMORIA hits. Ranking and scores stay the
+same; public `recall()` results, JSON output and cached payloads retain their
+configured content cap. `--preview` displays 150 characters and the full length
+when available. If a source is unavailable, its prefix has changed, or its hit
+type cannot be expanded, the CLI labels the remaining recall preview and reports
+the full length as unknown. These are current reads, not historical snapshots.
 
 ---
 
@@ -343,6 +352,12 @@ Full reference: [docs/configuration.md](docs/configuration.md)
 
 ### Language Support
 
+The Russian lexical fallback folds case and `ё`/`е` spelling when selecting
+candidates and scoring inflections (for example, `свеклы` can match `Свёкла`).
+Stored text is preserved. The fallback still averages scores over query words
+and uses the normal lexical admission gate; this does not guarantee admission
+for multi-word paraphrases or cross-language queries.
+
 Default embeddings are English-optimized (`bge-small-en-v1.5`). For **non-English or multilingual** recall, swap the model:
 
 ```bash
@@ -363,6 +378,8 @@ See [docs/configuration.md#custom-embedding-models](docs/configuration.md#custom
 ## Hermes Plugin
 
 When used with Hermes Agent, Mnemosyne exposes provider tools for the memory lifecycle, lifecycle hooks for automatic context injection, and MCP support.
+
+The packaged `hermes mnemosyne` CLI uses the provider's database under `HERMES_HOME/mnemosyne/data`, even when `MNEMOSYNE_DATA_DIR` points elsewhere. Profile-isolated commands select the active profile bank below that root; `doctor` reports its selected database. Standalone Core commands still honor `MNEMOSYNE_DATA_DIR`, and the packaged CLI uses the Core resolver when `HERMES_HOME` is unset. Existing stores are not moved or merged.
 
 `mnemosyne_resolve_conflicts` remains gated off by default. Its `dry_run`
 argument defaults to `false` (apply): use `dry_run=true` for deterministic
@@ -390,18 +407,11 @@ API embeddings require NumPy in the interpreter running Mnemosyne. For an API-on
 
 **Hardware guidance:** Core alone runs on a Raspberry Pi 4 (4 GB) with ~300 MB free for LLM. `[embeddings]` needs at least 2 GB free RAM. `[all]` recommends 8 GB+.
 
+For optional per-input character and UTF-8 byte limits on both local and API embeddings, see [embedding input caps](docs/configuration.md#custom-embedding-endpoint). These caps default to off and do not guarantee a local inference memory ceiling.
+
 > **Privacy note on remote embedding endpoints.** Embeddings go to a remote API whenever `MNEMOSYNE_EMBEDDING_API_URL` points at a custom (non-OpenRouter) endpoint, the model name is API-shaped (`openai/*`, `text-embedding*`), or `MNEMOSYNE_EMBEDDINGS_VIA_API` is truthy; on the OpenRouter default (or an OpenRouter URL) the last two are what route, and with no URL set the OpenRouter default is used. That service receives the text of your memories and of your recall queries (working-memory content, summaries, annotations, and search queries) for vectorization. For privacy-sensitive or local-first deployments prefer a local-embedding profile (`[embeddings]` or `[all]`); use a remote endpoint only when you accept that the embedding provider sees your content.
 
-**Install (Hermes users):**
-```bash
-source ~/.hermes/hermes-agent/venv/bin/activate
-python -m ensurepip --upgrade
-python -m pip install --upgrade pip
-python -m pip install mnemosyne-hermes
-mkdir -p ~/.hermes/plugins/mnemosyne
-ln -sfn "$(~/.hermes/hermes-agent/venv/bin/python -c 'import pathlib, mnemosyne_hermes; print(pathlib.Path(mnemosyne_hermes.__file__).resolve().parent)')"/* ~/.hermes/plugins/mnemosyne/
-hermes config set memory.provider mnemosyne
-```
+**Install (Hermes users):** Select the active Hermes home and runtime interpreter using the [Hermes integration guide](docs/hermes-integration.md). Follow the package-installation, installer and provider-status commands for your chosen route in that guide; persistent wrappers install the packages into a separate side environment. POSIX symlink mode links the package directory; native Windows, persistent wrappers and legacy recovery use their selected interpreter or route-specific executable. Do not link individual package files. Set `memory.provider` to `mnemosyne`, then check `hermes memory status` for the same home. Existing per-file plugin directories require the [ownership-checked recovery](docs/hermes-integration.md#recover-a-legacy-per-file-plugin-directory) before installation.
 
 After installing, verify the provider in the active Hermes profile and start a new session or restart the gateway:
 
