@@ -68,23 +68,24 @@ def test_provider_announces_unavailable_embedding_engine_once(monkeypatch, tmp_p
             provider.initialize("sess", **kwargs)
 
             # The consequence, the hint and both missing halves are named, once.
-            assert caplog.text.count("dense/semantic recall is disabled") == 1
+            assert caplog.text.count("embedding generation is unavailable") == 1
             assert "fastembed" in caplog.text
             assert "sqlite_vec" in caplog.text
-            assert "keyword-only" in caplog.text
+            assert "keyword-only" not in caplog.text
+            assert "non-vector recall remains available" in caplog.text
             assert "extra importable" in caplog.text
 
             # Once per process: a second provider start must not re-announce.
             second = MnemosyneMemoryProvider()
             second.initialize("sess-2", **kwargs)
-            assert caplog.text.count("dense/semantic recall is disabled") == 1
+            assert caplog.text.count("embedding generation is unavailable") == 1
 
         # Engine available -> no announcement at all.
         _engine_capability(monkeypatch, dense=True, vec=True)
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="mnemosyne_hermes"):
             provider.initialize("sess-3", **kwargs)
-            assert "dense/semantic recall is disabled" not in caplog.text
+            assert "embedding generation is unavailable" not in caplog.text
     finally:
         provider.shutdown()
         if second is not None:
@@ -105,14 +106,14 @@ def test_provider_reservation_released_so_later_outage_warns(monkeypatch, tmp_pa
             # once-per-process budget: the reservation is released again.
             provider.initialize("sess", **{"hermes_home": str(tmp_path), "auto_sleep": False})
             assert mnemosyne_hermes._EMBEDDING_ENGINE_UNAVAILABLE_LOGGED is False
-            assert "dense/semantic recall is disabled" not in caplog.text
+            assert "embedding generation is unavailable" not in caplog.text
 
             # Later outage (the flag is NOT reset in between): the released
             # guard must still let the warning through.
             monkeypatch.setattr(embeddings_module, "available", lambda: False)
             monkeypatch.setattr(beam_module, "_SQLITE_VEC_AVAILABLE", False)
             provider.initialize("sess-2", **{"hermes_home": str(tmp_path), "auto_sleep": False})
-            assert caplog.text.count("dense/semantic recall is disabled") == 1
+            assert caplog.text.count("embedding generation is unavailable") == 1
     finally:
         provider.shutdown()
 
@@ -141,6 +142,11 @@ def test_provider_announces_missing_sqlite_vec_only(monkeypatch, tmp_path, caplo
         with caplog.at_level(logging.WARNING, logger="mnemosyne_hermes"):
             provider.initialize("sess", **{"hermes_home": str(tmp_path), "auto_sleep": False})
             assert "missing sqlite_vec" in caplog.text
+            assert "native vector index unavailable" in caplog.text
+            assert "semantic fallback may remain available" in caplog.text
+            assert "embedding generation is unavailable" not in caplog.text
+            assert "dense/semantic recall is disabled" not in caplog.text
+            assert "keyword-only" not in caplog.text
             assert "fastembed" not in caplog.text
             assert "extra importable" in caplog.text
     finally:
@@ -157,7 +163,8 @@ def test_provider_reports_opt_out_without_install_hint(monkeypatch, tmp_path, ca
         with caplog.at_level(logging.WARNING, logger="mnemosyne_hermes"):
             provider.initialize("sess", **{"hermes_home": str(tmp_path), "auto_sleep": False})
             assert "opt-out env var" in caplog.text
-            assert "keyword-only" in caplog.text
+            assert "keyword-only" not in caplog.text
+            assert "non-vector recall remains available" in caplog.text
             assert "extra importable" not in caplog.text
             assert "missing fastembed" not in caplog.text
             assert "missing sqlite_vec" not in caplog.text
@@ -233,7 +240,7 @@ def test_provider_announces_api_backend_and_missing_sqlite_vec(monkeypatch, tmp_
             assert "MNEMOSYNE_EMBEDDING_API_KEY" in text
             assert "extra importable" in text
             # One warning, not two.
-            assert caplog.text.count("dense/semantic recall is disabled") == 1
+            assert caplog.text.count("embedding generation is unavailable") == 1
     finally:
         provider.shutdown()
 
@@ -265,3 +272,43 @@ def test_announcement_is_atomic_under_concurrent_calls(monkeypatch, tmp_path, ca
     # Branch-agnostic: the opt-out message and the unavailable message both
     # start with this phrase, so the count is exact either way.
     assert caplog.text.count("Mnemosyne: embedding engine") == 1
+
+
+def test_native_index_warning_matches_real_semantic_fallback(
+    monkeypatch, tmp_path, caplog
+):
+    """Missing sqlite-vec must not be described as loss of a working semantic path."""
+    import json
+
+    import numpy as np
+    from mnemosyne.core import beam as beam_module
+    from mnemosyne.core import embeddings
+
+    provider_module = mnemosyne_hermes
+    _engine_capability(monkeypatch, dense=True, vec=False)
+    monkeypatch.setattr(provider_module, "_EMBEDDING_ENGINE_UNAVAILABLE_LOGGED", False)
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setattr(embeddings, "embed_query", lambda text: np.array([1.0, 0.0]))
+    monkeypatch.setattr(embeddings, "embed", lambda texts: np.array([[0.8, 0.6] for _ in texts]))
+    memory = beam_module.BeamMemory(session_id="announcement", db_path=tmp_path / "real.db")
+    try:
+        mid = memory.remember("Cobalt telescope calibration", source="fact", extract_entities=False)
+        memory.conn.execute(
+            "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model) "
+            "VALUES (?, ?, ?)", (mid, json.dumps([0.8, 0.6]), "deterministic-test")
+        )
+        memory.conn.commit()
+        matches = beam_module._wm_vec_search(memory.conn, np.array([1.0, 0.0]))
+        assert matches == [{"id": mid, "sim": pytest.approx(0.8)}]
+        results = memory.recall("Cobalt telescope calibration", top_k=3)
+        hit = next(row for row in results if row["id"] == mid)
+        assert hit["dense_score"] == pytest.approx(0.8)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=provider_module.__name__):
+            provider_module._announce_embedding_engine_unavailable()
+        assert "native vector index unavailable" in caplog.text
+        assert "semantic fallback may remain available" in caplog.text
+        assert "keyword-only" not in caplog.text
+        assert "dense/semantic recall is disabled" not in caplog.text
+    finally:
+        memory.conn.close()

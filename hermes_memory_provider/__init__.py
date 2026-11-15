@@ -272,7 +272,8 @@ logger = logging.getLogger(__name__)
 # (2026-10-13): when fastembed is missing, every embedding write is skipped by
 # the `if available():` guard and nothing logs, so a gateway can run for weeks
 # with dense/semantic recall off; when only sqlite_vec is missing, writes still
-# happen and the limitation is vector search instead. The provider announces
+# happen and native vector indexing is unavailable; a semantic fallback may remain.
+# The provider announces
 # the degraded state once per process at startup, attributing the cause to the
 # actual capability that is unavailable. Never raises and never changes recall
 # behaviour.
@@ -298,14 +299,15 @@ def _announce_embedding_engine_unavailable() -> None:
             logger.warning(
                 "Mnemosyne: embedding engine disabled by an opt-out env var "
                 "(MNEMOSYNE_NO_EMBEDDINGS / MNEMOSYNE_SKIP_EMBEDDINGS / "
-                "MNEMOSYNE_EMBEDDINGS_OFF); dense/semantic recall is off and "
-                "recall falls back to keyword-only."
+                "MNEMOSYNE_EMBEDDINGS_OFF); embedding generation is disabled; "
+                "non-vector recall remains available."
             )
             return
 
         problems = []
         hints = []
-        if not _embeddings.available():
+        generation_available = _embeddings.available()
+        if not generation_available:
             if _embeddings._is_api_model(_embeddings._DEFAULT_MODEL):
                 # available() already returned False, so a keyless custom
                 # endpoint (the other True branch) is ruled out: the API
@@ -319,9 +321,9 @@ def _announce_embedding_engine_unavailable() -> None:
                     "point MNEMOSYNE_EMBEDDING_API_URL at a keyless endpoint"
                 )
             else:
-                problems.append("missing fastembed (no dense vectors)")
+                problems.append("missing fastembed (local embedding generation unavailable)")
         if not _beam._SQLITE_VEC_AVAILABLE:
-            problems.append("missing sqlite_vec (no vector search)")
+            problems.append("missing sqlite_vec (native vector index unavailable)")
         if not problems:
             with _EMBEDDING_ENGINE_UNAVAILABLE_LOCK:
                 _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED = False
@@ -331,11 +333,15 @@ def _announce_embedding_engine_unavailable() -> None:
                 "make the embeddings extra importable in "
                 "the runtime interpreter that runs this provider"
             )
+        consequence = (
+            "semantic fallback may remain available via stored vectors and NumPy"
+            if generation_available
+            else "embedding generation is unavailable; non-vector recall remains available"
+        )
         logger.warning(
-            "Mnemosyne: embedding engine unavailable (%s); "
-            "dense/semantic recall is disabled and recall falls back to "
-            "keyword-only. Hint: %s.",
+            "Mnemosyne: embedding engine unavailable (%s); %s. Hint: %s.",
             " and ".join(problems),
+            consequence,
             "; ".join(hints),
         )
     except Exception:
