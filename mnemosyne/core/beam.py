@@ -11401,8 +11401,9 @@ class BeamMemory:
     # 18: local embedding input caps and effective cap policy in cache keys.
     # 19: Cyrillic ё/е folding in fallback candidates and scores.
     # 20: Bounded CJK supplement for linear working-memory recall.
+    # 21: UTC-Z timestamps remain temporally eligible on Python 3.10.
     # Recheck the actual predecessor before each semantic integration.
-    _ENHANCED_RECALL_CACHE_VERSION = 20
+    _ENHANCED_RECALL_CACHE_VERSION = 21
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.
