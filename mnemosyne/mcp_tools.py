@@ -371,8 +371,10 @@ def _handle_batch(arguments: Dict[str, Any]) -> Dict[str, Any]:
             path = get_bank_db_path_read_only(bank)
             if not path.is_file():
                 return preview_unavailable()
-            # WAL mode persists in the header even after clean shutdown removes
-            # both sidecars. mode=ro can create them, so inspect before opening.
+            # Conservatively reject WAL stores already missing sidecars. This
+            # preflight is not a lifetime lock: a concurrent last-connection
+            # close can remove them, and SQLite may recreate reader coordination
+            # at the read-only open. Database/user-data writes remain prohibited.
             with path.open("rb") as file:
                 header = file.read(20)
             if header[18:20] == b"\x02\x02":

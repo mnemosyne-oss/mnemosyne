@@ -36,8 +36,14 @@ Providers using an older Core without target-aware preview return
 as a checked target. Existing apply support remains available.
 
 Opening an active WAL store with SQLite's read-only mode may update reader
-coordination marks in its existing `-shm` file. This SQLite read coordination is
-permitted; database and WAL contents, configuration and other files remain
-unchanged. The preview does not initialize storage or create required sidecars.
-MCP rejects persistent WAL databases whose required sidecars are missing rather
-than creating them or using an immutable view that misses live WAL records.
+coordination marks in `-shm`. If the last existing connection closes between
+preflight and the read-only open, SQLite can remove and recreate coordination
+sidecars. This normal SQLite read coordination is permitted. The preview never
+issues data mutations or initializes/migrates storage; it opens SQLite read-only
+and does not write database contents or committed WAL data. Concurrent writers
+and checkpoints can change those files independently, so this is not a promise
+of byte-for-byte preservation during concurrent database activity.
+
+MCP conservatively rejects persistent WAL stores whose required sidecars are
+already missing at preflight. That check does not lock their lifetime. It does
+not use an immutable view that would ignore live WAL records.

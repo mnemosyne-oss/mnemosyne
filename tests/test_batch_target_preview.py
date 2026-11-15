@@ -386,18 +386,186 @@ def test_public_preview_never_initializes_or_captures_write_policy(
     assert result == batch_tool.preview_unavailable()
 
 
-def test_mcp_closed_wal_preview_does_not_create_sidecars(tmp_path,monkeypatch):
+def test_mcp_closed_wal_preview_does_not_create_sidecars(tmp_path, monkeypatch):
     import sqlite3
-    path=tmp_path/'mnemosyne.db'
-    conn=sqlite3.connect(path)
-    conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('CREATE TABLE marker(id)')
+
+    path = tmp_path / "mnemosyne.db"
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE marker(id)")
     conn.commit()
     conn.close()
-    assert set(p.name for p in tmp_path.iterdir())=={'mnemosyne.db'}
-    before=path.read_bytes()
-    monkeypatch.setenv('MNEMOSYNE_DATA_DIR',str(tmp_path))
-    result=mcp_tools._handle_batch({'dry_run':True,'operations':[{'action':'forget','memory_id':'missing'}]})
-    assert result==batch_tool.preview_unavailable()
-    assert set(p.name for p in tmp_path.iterdir())=={'mnemosyne.db'}
-    assert path.read_bytes()==before
+    assert set(p.name for p in tmp_path.iterdir()) == {"mnemosyne.db"}
+    before = path.read_bytes()
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+    result = mcp_tools._handle_batch(
+        {"dry_run": True, "operations": [{"action": "forget", "memory_id": "missing"}]}
+    )
+    assert result == batch_tool.preview_unavailable()
+    assert set(p.name for p in tmp_path.iterdir()) == {"mnemosyne.db"}
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("package", ["hermes_memory_provider", "mnemosyne_hermes"])
+def test_public_preview_keeps_changed_tool_configuration_errors_in_json(
+    tmp_path, package
+):
+    """A post-startup exposure typo is a JSON error, not an escaping exception."""
+    import importlib
+
+    provider = importlib.import_module(package).MnemosyneMemoryProvider()
+    provider._hermes_home = str(tmp_path)
+    config = tmp_path / "config.yaml"
+    config.write_text("memory:\n  mnemosyne:\n    tools: [mnemosyne_batch]\n")
+    assert provider.has_tool("mnemosyne_batch")
+    config.write_text("memory:\n  mnemosyne:\n    tools: [mnemosyne_not_real]\n")
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "mnemosyne_batch",
+            {
+                "dry_run": True,
+                "operations": [{"action": "forget", "memory_id": "x"}],
+            },
+        )
+    )
+
+    assert "Unknown Mnemosyne tool(s) in memory.mnemosyne.tools" in result["error"]
+    assert "mnemosyne_not_real" in result["error"]
+
+
+@pytest.mark.parametrize("package", ["hermes_memory_provider", "mnemosyne_hermes"])
+@pytest.mark.parametrize(
+    "action, expected",
+    [
+        ("update", "would_update"),
+        ("forget", "would_delete"),
+        ("invalidate", "would_invalidate"),
+    ],
+)
+def test_public_active_preview_selects_targets_without_write_hooks(
+    tmp_path, monkeypatch, package, action, expected
+):
+    """Both public dispatchers reach read-only eligibility on an active Beam."""
+    import importlib
+    from mnemosyne.core.beam import BeamMemory
+
+    module = importlib.import_module(package)
+    beam = BeamMemory(session_id="owner", db_path=tmp_path / "active.db")
+    owned = beam.remember(
+        "The project meeting starts at nine on Friday.", scope="session"
+    )
+    beam.conn.execute(
+        "INSERT INTO working_memory(id,content,session_id,scope) VALUES(?,?,?,?)",
+        ("foreign", "A private meeting starts at ten on Monday.", "other", "session"),
+    )
+    beam.conn.commit()
+    provider = module.MnemosyneMemoryProvider()
+    provider._beam = beam
+    provider._session_id = "owner"
+    provider._agent_context = "primary"
+
+    def forbidden(*args, **kwargs):
+        pytest.fail(
+            "a preview invoked an initialization/write-policy/approval/audit hook"
+        )
+
+    for name in (
+        "_maybe_retry_init",
+        "_ensure_initialized_for_tools",
+        "_resolve_effective_write_policy",
+        "_audit_event",
+    ):
+        if hasattr(provider, name):
+            monkeypatch.setattr(provider, name, forbidden)
+    monkeypatch.setattr(module, "_write_approval_enabled", lambda: True)
+    monkeypatch.setattr(module, "_stage_pending_write", forbidden)
+    before = list(beam.conn.iterdump())
+    operations = [{"action": action, "memory_id": mid} for mid in (owned, "foreign")]
+    if action == "update":
+        for operation in operations:
+            operation["content"] = "The project meeting now starts at noon."
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "mnemosyne_batch",
+            {
+                "dry_run": True,
+                "operations": operations,
+            },
+        )
+    )
+
+    assert result["validation"] == "target_eligibility_snapshot"
+    assert [row["status"] for row in result["results"]] == [expected, "not_found"]
+    assert list(beam.conn.iterdump()) == before
+
+
+def test_mcp_preview_last_connection_close_only_recreates_reader_coordination(
+    tmp_path, monkeypatch
+):
+    """After another connection checkpoints/closes, preview remains data-read-only."""
+    import sqlite3
+
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+    memory = Mnemosyne(db_path=str(tmp_path / "mnemosyne.db"), session_id="mcp_default")
+    mid = memory.remember("The temporary project meeting is on Friday afternoon.")
+    path = tmp_path / "mnemosyne.db"
+    handles = {memory.conn, memory.beam.conn}
+    assert path.with_name(path.name + "-wal").exists()
+    assert path.with_name(path.name + "-shm").exists()
+    real_connect = sqlite3.connect
+    baseline = {}
+    opened = []
+    statements = []
+
+    def close_last_connection_then_open(*args, **kwargs):
+        # Interleave after the real sidecar preflight, at the actual read-only open.
+        assert kwargs.get("uri") is True
+        assert str(args[0]).endswith("?mode=ro")
+        assert "immutable" not in str(args[0])
+        for handle in handles:
+            handle.close()
+        assert not path.with_name(path.name + "-wal").exists()
+        assert not path.with_name(path.name + "-shm").exists()
+        # Closing the external writer checkpoints. Attribute that separately
+        # from whatever the preview does after this boundary.
+        baseline.update(
+            {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()}
+        )
+        conn = real_connect(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", close_last_connection_then_open)
+    result = mcp_tools._handle_batch(
+        {
+            "dry_run": True,
+            "operations": [{"action": "forget", "memory_id": mid}],
+        }
+    )
+
+    assert len(opened) == 1
+    assert result["results"][0]["status"] == "would_delete"
+    assert statements
+    assert all(
+        sql.split()[0].upper() in {"SELECT", "PRAGMA", "SAVEPOINT", "RELEASE"}
+        for sql in statements
+    )
+    after = {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()}
+    for name, contents in baseline.items():
+        assert after[name] == contents, name
+    assert set(after) - set(baseline) == {"mnemosyne.db-wal", "mnemosyne.db-shm"}
+    assert after["mnemosyne.db-wal"] == b""  # no WAL header or user-data frames
+    assert len(after["mnemosyne.db-shm"]) > 0
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        opened[0].execute("SELECT 1")
+    # Inspect stored content independently after the preview, not via its target helper.
+    with real_connect(str(path)) as reader:
+        assert (
+            reader.execute(
+                "SELECT content FROM working_memory WHERE id=?", (mid,)
+            ).fetchone()[0]
+            == "The temporary project meeting is on Friday afternoon."
+        )

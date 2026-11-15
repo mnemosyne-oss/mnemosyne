@@ -2935,8 +2935,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _handle_tool_call_locked(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """Dispatch one tool while the provider-wide Beam lock is held."""
         if tool_name == "mnemosyne_batch" and bool(args.get("dry_run", False)):
-            if not self.has_tool(tool_name):
-                return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
+            try:
+                if not self.has_tool(tool_name):
+                    return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
+            except ValueError as exc:
+                return json.dumps({"error": str(exc)})
             return self._handle_batch(args)
         from mnemosyne.core.filters import write_policy_operation
 
