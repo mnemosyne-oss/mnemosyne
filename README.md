@@ -165,6 +165,7 @@ mnemosyne recall "preferences"
 mnemosyne recall "preferences" --preview  # Explicit 150-character display preview
 mnemosyne stats
 mnemosyne sleep                         # Run consolidation
+mnemosyne diagnose --python /path/to/python  # Check a specific runtime interpreter
 
 # Export / import
 mnemosyne export backup.json
