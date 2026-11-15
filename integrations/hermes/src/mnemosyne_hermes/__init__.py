@@ -294,7 +294,8 @@ def _announce_embedding_engine_unavailable() -> None:
 
         if _embeddings._is_disabled():
             logger.warning(
-                "Mnemosyne: embedding engine disabled by an opt-out env var "
+                "Mnemosyne: embedding engine disabled by configuration or an opt-out "
+                "environment variable "
                 "(MNEMOSYNE_NO_EMBEDDINGS / MNEMOSYNE_SKIP_EMBEDDINGS / "
                 "MNEMOSYNE_EMBEDDINGS_OFF); embedding generation is disabled; "
                 "non-vector recall remains available."
@@ -306,17 +307,21 @@ def _announce_embedding_engine_unavailable() -> None:
         generation_available = _embeddings.available()
         if not generation_available:
             if _embeddings._is_api_model(_embeddings._DEFAULT_MODEL):
-                # available() already returned False, so a keyless custom
-                # endpoint (the other True branch) is ruled out: the API
-                # backend is configured but its credentials are not usable.
-                problems.append(
-                    "the configured embedding API backend has no usable "
-                    "credentials"
-                )
-                hints.append(
-                    "set MNEMOSYNE_EMBEDDING_API_KEY or OPENAI_API_KEY, or "
-                    "point MNEMOSYNE_EMBEDDING_API_URL at a keyless endpoint"
-                )
+                # Current Core checks NumPy separately from local FastEmbed.
+                # Older supported Core may not expose that optional probe.
+                ensure_numpy = getattr(_embeddings, "_ensure_api_numpy", None)
+                if callable(ensure_numpy) and not ensure_numpy():
+                    problems.append("NumPy is unavailable for the embedding API backend")
+                    hints.append("install or repair NumPy in the runtime interpreter")
+                else:
+                    problems.append(
+                        "the configured embedding API backend has no usable "
+                        "credentials"
+                    )
+                    hints.append(
+                        "set MNEMOSYNE_EMBEDDING_API_KEY or OPENAI_API_KEY, or "
+                        "point MNEMOSYNE_EMBEDDING_API_URL at a keyless endpoint"
+                    )
             else:
                 problems.append("missing fastembed (local embedding generation unavailable)")
         if not _beam._SQLITE_VEC_AVAILABLE:

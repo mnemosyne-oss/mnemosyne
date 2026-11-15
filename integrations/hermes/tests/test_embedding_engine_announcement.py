@@ -165,7 +165,7 @@ def test_provider_reports_opt_out_without_install_hint(monkeypatch, tmp_path, ca
         monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
         with caplog.at_level(logging.WARNING, logger="mnemosyne_hermes"):
             provider.initialize("sess", **{"hermes_home": str(tmp_path), "auto_sleep": False})
-            assert "opt-out env var" in caplog.text
+            assert "opt-out environment variable" in caplog.text
             assert "keyword-only" not in caplog.text
             assert "non-vector recall remains available" in caplog.text
             assert "extra importable" not in caplog.text
@@ -362,7 +362,7 @@ def test_generation_unavailable_retains_real_polyphonic_temporal_recall(
         assert "non-vector recall remains available" in caplog.text
         assert "keyword-only" not in caplog.text
         if opt_out:
-            assert "opt-out env var" in caplog.text
+            assert "opt-out environment variable" in caplog.text
             assert "extra importable" not in caplog.text
         else:
             assert "embedding generation is unavailable" in caplog.text
@@ -395,3 +395,84 @@ def test_diagnostic_exception_releases_reservation_for_retry(monkeypatch, tmp_pa
             assert caplog.text.count("embedding generation is unavailable") == 1
     finally:
         provider.shutdown()
+
+
+
+def test_config_opt_out_is_not_attributed_only_to_environment(monkeypatch, tmp_path, caplog):
+    """An actual YAML opt-out must be diagnosed with all aliases unset."""
+    from mnemosyne.core import config, embeddings
+
+    _engine_capability(monkeypatch, dense=False, vec=True)
+    config_path = tmp_path / "opt-out.yaml"
+    config_path.write_text("no_embeddings: true\n", encoding="utf-8")
+    monkeypatch.setattr(config, "_default_config_path", lambda: config_path)
+    assert embeddings._is_disabled()
+    with caplog.at_level(logging.WARNING, logger="mnemosyne_hermes"):
+        mnemosyne_hermes._announce_embedding_engine_unavailable()
+    assert "disabled by configuration or an opt-out environment variable" in caplog.text
+    assert "embedding generation is disabled" in caplog.text
+    assert "extra importable" not in caplog.text
+    assert "no usable credentials" not in caplog.text
+
+
+@pytest.mark.parametrize("vec_available", [True, False], ids=["native-index", "no-native-index"])
+@pytest.mark.parametrize("api_key, api_url", [
+    ("synthetic-test-key", ""),
+    ("", "https://synthetic.invalid/v1"),
+], ids=["credentialed", "keyless-endpoint"])
+def test_api_numpy_failure_is_not_blamed_on_credentials(
+    monkeypatch, tmp_path, caplog, vec_available, api_key, api_url
+):
+    """Real availability with a blocked NumPy import must name the missing dependency."""
+    import builtins
+
+    from mnemosyne.core import beam as beam_module
+    from mnemosyne.core import embeddings
+
+    for name in ("MNEMOSYNE_NO_EMBEDDINGS", "MNEMOSYNE_SKIP_EMBEDDINGS", "MNEMOSYNE_EMBEDDINGS_OFF"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(mnemosyne_hermes, "_EMBEDDING_ENGINE_UNAVAILABLE_LOGGED", False)
+    monkeypatch.setattr(beam_module, "_SQLITE_VEC_AVAILABLE", vec_available)
+    monkeypatch.setattr(embeddings, "_DEFAULT_MODEL", "openai/text-embedding-3-small")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", api_key)
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", api_url)
+    monkeypatch.setattr(embeddings, "np", None)
+    monkeypatch.setattr(embeddings, "_API_NUMPY_RETRY_AT", 0.0)
+    monkeypatch.setattr(embeddings, "_API_NUMPY_WARNED", False)
+    original_import = builtins.__import__
+
+    def missing_numpy(name, *args, **kwargs):
+        if name == "numpy":
+            raise ModuleNotFoundError("synthetic missing numpy", name=name)
+        return original_import(name, *args, **kwargs)
+
+    def forbidden_request(*args, **kwargs):
+        pytest.fail("availability diagnostics must not send an API request")
+
+    monkeypatch.setattr(builtins, "__import__", missing_numpy)
+    monkeypatch.setattr(embeddings.urllib.request, "urlopen", forbidden_request)
+    assert not embeddings.available()
+    with caplog.at_level(logging.WARNING, logger="mnemosyne_hermes"):
+        mnemosyne_hermes._announce_embedding_engine_unavailable()
+    warnings = [r.getMessage() for r in caplog.records if r.name == "mnemosyne_hermes"]
+    assert len(warnings) == 1
+    text = warnings[0]
+    assert "NumPy is unavailable for the embedding API backend" in text
+    assert "install or repair NumPy" in text
+    assert "no usable credentials" not in text
+    assert "MNEMOSYNE_EMBEDDING_API_KEY" not in text
+    assert "missing fastembed" not in text
+    assert ("missing sqlite_vec" in text) is (not vec_available)
+
+
+def test_older_core_without_numpy_probe_keeps_credentials_diagnostic(monkeypatch, tmp_path, caplog):
+    """A missing optional Core helper must not suppress the existing startup warning."""
+    from mnemosyne.core import embeddings
+
+    _engine_capability(monkeypatch, dense=False, vec=True)
+    monkeypatch.delattr(embeddings, "_ensure_api_numpy")
+    monkeypatch.setattr(embeddings, "_DEFAULT_MODEL", "openai/text-embedding-3-small")
+    with caplog.at_level(logging.WARNING, logger="mnemosyne_hermes"):
+        mnemosyne_hermes._announce_embedding_engine_unavailable()
+    assert "embedding API backend has no usable credentials" in caplog.text
+    assert "MNEMOSYNE_EMBEDDING_API_KEY" in caplog.text
