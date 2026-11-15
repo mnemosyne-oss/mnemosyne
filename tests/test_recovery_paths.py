@@ -14,6 +14,7 @@ import json
 import os
 import sqlite3
 import hashlib
+import sys
 from pathlib import Path
 
 import pytest
@@ -85,6 +86,14 @@ def test_create_backup_succeeds_with_sqlite_vec_tables(tmp_path):
     )
     conn.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
     conn.executemany("INSERT INTO meta VALUES (?, ?)", [("a", "1"), ("b", "2")])
+    conn.execute(
+        "INSERT INTO vec_items (rowid, embedding) VALUES (?, ?)",
+        (1, json.dumps([1.0, 0.0, 0.0, 0.0])),
+    )
+    conn.execute(
+        "INSERT INTO vec_items (rowid, embedding) VALUES (?, ?)",
+        (2, json.dumps([0.0, 1.0, 0.0, 0.0])),
+    )
     conn.commit()
     conn.close()
 
@@ -92,16 +101,44 @@ def test_create_backup_succeeds_with_sqlite_vec_tables(tmp_path):
     # raised sqlite3.OperationalError: no such module: vec0.
     result = recovery.create_backup(db_path=db_path, backup_dir=backup_dir)
 
-    # Assert: backup file exists, is non-empty, gzipped, and the gz
-    # contents contain the vec0 table definition.
+    # Assert: backup file exists, is non-empty, gzipped, and is a valid
+    # binary SQLite database preserving the vec0 table definition (#640).
     assert Path(result["backup_path"]).exists()
     assert result["backup_size"] > 0
+    assert result["format"] == "sqlite3"
     import gzip
 
-    with gzip.open(result["backup_path"], "rt") as f:
-        dump = f.read()
-    assert "vec_items" in dump
-    assert "CREATE VIRTUAL TABLE" in dump
+    decompressed = gzip.decompress(Path(result["backup_path"]).read_bytes())
+    assert decompressed[:16] == b"SQLite format 3\x00"
+
+    # Roundtrip restore into a target database
+    target = tmp_path / "vec_restored.db"
+    res = recovery.restore_backup(Path(result["backup_path"]), target)
+    assert res["restored"] is True
+    assert res["integrity_check"] is True
+
+    target_conn = sqlite3.connect(str(target))
+    try:
+        target_conn.enable_load_extension(True)
+        sqlite_vec.load(target_conn)
+        target_conn.enable_load_extension(False)
+
+        master_rows = target_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_items'"
+        ).fetchall()
+        assert len(master_rows) == 1
+
+        rows = target_conn.execute("SELECT k, v FROM meta ORDER BY k").fetchall()
+        assert rows == [("a", "1"), ("b", "2")]
+
+        knn = target_conn.execute(
+            "SELECT rowid, distance FROM vec_items WHERE embedding MATCH ? AND k = 1",
+            (json.dumps([0.9, 0.1, 0.0, 0.0]),),
+        ).fetchall()
+        assert len(knn) == 1
+        assert knn[0][0] == 1
+    finally:
+        target_conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -745,7 +782,7 @@ def test_load_sqlite_vec_disables_extension_loading_when_absent(monkeypatch):
 
 
 def test_restore_backup_rejects_load_extension_in_dump(tmp_path, monkeypatch):
-    """End-to-end: a tampered-but-checksum-valid backup whose dump SQL invokes
+    """End-to-end: a tampered-but-checksum-valid legacy dump whose dump SQL invokes
     load_extension must NOT execute that call. The staged-restore connection
     must have extension loading disabled when executescript runs.
 
@@ -765,8 +802,8 @@ def test_restore_backup_rejects_load_extension_in_dump(tmp_path, monkeypatch):
     backup_path = Path(backup["backup_path"])
     meta_path = backup_path.with_suffix(".gz.json")
 
-    raw = _gz.decompress(backup_path.read_bytes())
-    malicious = raw + b"\nSELECT load_extension('evil_extension_payload');\n"
+    # Legacy text SQL dump format containing load_extension
+    malicious = b"BEGIN TRANSACTION;\nCREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);\nSELECT load_extension('evil_extension_payload');\nCOMMIT;\n"
     backup_path.write_bytes(_gz.compress(malicious))
 
     new_backup_checksum = hashlib.sha256(backup_path.read_bytes()).hexdigest()[:16]
@@ -786,6 +823,193 @@ def test_restore_backup_rejects_load_extension_in_dump(tmp_path, monkeypatch):
         f"(extension loading was enabled on the staged connection): "
         f"{excinfo.value!r}"
     )
+
+
+def test_backup_and_restore_roundtrip_with_fts5(tmp_path):
+    """[#640] Database with FTS5 virtual tables backs up and restores successfully."""
+    db_path = tmp_path / "fts_source.db"
+    backup_dir = tmp_path / "backups"
+    restore_target = tmp_path / "fts_restored.db"
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, title TEXT)")
+    conn.execute("CREATE VIRTUAL TABLE items_fts USING fts5(title)")
+    conn.execute("INSERT INTO items (id, title) VALUES (1, 'FTS5 virtual table backup test')")
+    conn.execute("INSERT INTO items_fts (rowid, title) VALUES (1, 'FTS5 virtual table backup test')")
+    conn.commit()
+    conn.close()
+
+    # 1. create_backup produces a binary SQLite backup
+    backup = recovery.create_backup(db_path=db_path, backup_dir=backup_dir)
+    assert Path(backup["backup_path"]).exists()
+    assert backup.get("format") == "sqlite3"
+
+    decompressed = _gzip.decompress(Path(backup["backup_path"]).read_bytes())
+    assert decompressed[:16] == b"SQLite format 3\x00"
+
+    # 2. restore_backup successfully restores without shadow-table operational errors
+    result = recovery.restore_backup(Path(backup["backup_path"]), restore_target)
+    assert result["restored"] is True
+    assert result["integrity_check"] is True
+
+    # 3. Assert restored DB integrity, table counts, and FTS retrievability
+    assert recovery.verify_integrity(restore_target) is True
+    target_conn = sqlite3.connect(str(restore_target))
+    try:
+        items_count = target_conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        assert items_count == 1
+        match_rows = target_conn.execute("SELECT rowid, title FROM items_fts WHERE items_fts MATCH 'backup'").fetchall()
+        assert len(match_rows) == 1
+        assert match_rows[0][0] == 1
+    finally:
+        target_conn.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode-bit permissions are not supported on Windows")
+def test_backup_and_metadata_files_created_with_private_permissions(tmp_path):
+    """[#640] Staged and published backup files and metadata are created with mode 0600."""
+    import stat
+
+    orig_umask = os.umask(0o022)
+    try:
+        db_path = tmp_path / "perm_test.db"
+        bdir = tmp_path / "bk"
+        _make_simple_db(db_path)
+        backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+        backup_path = Path(backup["backup_path"])
+        meta_path = Path(backup["metadata_path"])
+
+        assert stat.S_IMODE(backup_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(meta_path.stat().st_mode) == 0o600
+    finally:
+        os.umask(orig_umask)
+
+
+def test_create_backup_format_selection_and_validation(tmp_path, monkeypatch):
+    """[#640] create_backup format validation, normalization, and environment precedence."""
+    db_path = tmp_path / "src.db"
+    bdir = tmp_path / "bk"
+    _make_simple_db(db_path)
+
+    # 1. Default format is sqlite3
+    monkeypatch.delenv("MNEMOSYNE_BACKUP_FORMAT", raising=False)
+    b_default = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+    assert b_default["format"] == "sqlite3"
+    assert _gzip.decompress(Path(b_default["backup_path"]).read_bytes()).startswith(b"SQLite format 3\x00")
+
+    # 2. Whitespace-padded and mixed-case normalization
+    b_norm_sql = recovery.create_backup(db_path=db_path, backup_dir=bdir, format="  SQL  ")
+    assert b_norm_sql["format"] == "sql"
+    assert not _gzip.decompress(Path(b_norm_sql["backup_path"]).read_bytes()).startswith(b"SQLite format 3\x00")
+
+    b_norm_sqlite = recovery.create_backup(db_path=db_path, backup_dir=bdir, format=" Sqlite3 ")
+    assert b_norm_sqlite["format"] == "sqlite3"
+
+    # 3. Environment variable MNEMOSYNE_BACKUP_FORMAT
+    monkeypatch.setenv("MNEMOSYNE_BACKUP_FORMAT", "sql")
+    b_env_sql = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+    assert b_env_sql["format"] == "sql"
+
+    # 4. Explicit format overrides environment variable
+    b_override = recovery.create_backup(db_path=db_path, backup_dir=bdir, format="sqlite3")
+    assert b_override["format"] == "sqlite3"
+
+    # 5. Invalid format fails closed (raises ValueError)
+    with pytest.raises(ValueError, match="Invalid backup format: 'sql3'"):
+        recovery.create_backup(db_path=db_path, backup_dir=bdir, format="sql3")
+
+    monkeypatch.setenv("MNEMOSYNE_BACKUP_FORMAT", "invalid_fmt")
+    with pytest.raises(ValueError, match="Invalid backup format: 'invalid_fmt'"):
+        recovery.create_backup(db_path=db_path, backup_dir=bdir)
+
+
+def test_restore_backup_accepts_valid_legacy_sql_dump(tmp_path):
+    """[#640] restore_backup() seamlessly restores valid legacy text SQL dumps."""
+    db_path = tmp_path / "src.db"
+    bdir = tmp_path / "bk"
+    _make_simple_db(db_path)
+
+    backup = recovery.create_backup(db_path=db_path, backup_dir=bdir, format="sql")
+    backup_path = Path(backup["backup_path"])
+    assert backup["format"] == "sql"
+
+    decompressed = _gzip.decompress(backup_path.read_bytes())
+    assert not decompressed.startswith(b"SQLite format 3\x00")
+    assert b"CREATE TABLE" in decompressed
+
+    target = tmp_path / "legacy_restored.db"
+    res = recovery.restore_backup(backup_path, target)
+    assert res["restored"] is True
+    assert res["integrity_check"] is True
+
+    target_conn = sqlite3.connect(str(target))
+    try:
+        rows = target_conn.execute("SELECT id, v FROM t ORDER BY id").fetchall()
+        assert rows == [(1, "a"), (2, "b")]
+    finally:
+        target_conn.close()
+
+
+def test_backup_and_restore_captures_committed_wal_frames(tmp_path):
+    """[#640] create_backup() captures committed WAL frames and restore delivers them."""
+    src = tmp_path / "wal_src.db"
+    bdir = tmp_path / "bk"
+    target = tmp_path / "wal_restored.db"
+
+    conn = sqlite3.connect(str(src))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE wal_items (id INTEGER PRIMARY KEY, note TEXT)")
+    conn.execute("INSERT INTO wal_items VALUES (1, 'initial')")
+    conn.commit()
+    conn.execute("INSERT INTO wal_items VALUES (2, 'committed_wal_frame')")
+    conn.commit()
+
+    wal_file = src.with_name(src.name + "-wal")
+    assert wal_file.exists()
+    assert wal_file.stat().st_size > 0
+
+    backup = recovery.create_backup(db_path=src, backup_dir=bdir)
+    res = recovery.restore_backup(Path(backup["backup_path"]), target)
+    assert res["restored"] is True
+    assert res["integrity_check"] is True
+
+    target_conn = sqlite3.connect(str(target))
+    try:
+        rows = target_conn.execute("SELECT id, note FROM wal_items ORDER BY id").fetchall()
+        assert rows == [(1, "initial"), (2, "committed_wal_frame")]
+    finally:
+        target_conn.close()
+        conn.close()
+
+
+def test_restore_backup_rejects_corrupt_binary_payload_and_cleans_stage(tmp_path):
+    """[#640] Corrupted binary payload fails restore, preserves target byte-identically, and cleans staged files."""
+    target = tmp_path / "target.db"
+    _make_simple_db(target)
+    initial_target_bytes = target.read_bytes()
+
+    src = tmp_path / "src.db"
+    bdir = tmp_path / "bk"
+    _make_simple_db(src)
+
+    backup = recovery.create_backup(db_path=src, backup_dir=bdir)
+    backup_path = Path(backup["backup_path"])
+    meta_path = Path(backup["metadata_path"])
+
+    corrupt_dump = b"SQLite format 3\x00" + b"\xff" * 4096
+    compressed_corrupt = _gzip.compress(corrupt_dump)
+    backup_path.write_bytes(compressed_corrupt)
+
+    meta = json.loads(meta_path.read_text())
+    meta["backup_checksum"] = hashlib.sha256(compressed_corrupt).hexdigest()[:16]
+    meta["dump_checksum"] = hashlib.sha256(corrupt_dump).hexdigest()
+    meta_path.write_text(json.dumps(meta, indent=2))
+
+    with pytest.raises((RuntimeError, sqlite3.DatabaseError)):
+        recovery.restore_backup(backup_path, target)
+
+    assert target.read_bytes() == initial_target_bytes
+    assert list(target.parent.glob("*restore_staged*")) == []
 
 
 # ---------------------------------------------------------------------------

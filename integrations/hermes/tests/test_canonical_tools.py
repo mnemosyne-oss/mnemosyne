@@ -20,6 +20,11 @@ _BOUND = {"profile": "profile_a"}
 @pytest.fixture(autouse=True)
 def _align_turn_profile(monkeypatch):
     try:
+        import hermes_constants as _consts
+        monkeypatch.setattr(_consts, "get_hermes_home", lambda: None)
+    except Exception:
+        pass
+    try:
         import hermes_cli.profiles as _prof
     except Exception:
         _prof = None

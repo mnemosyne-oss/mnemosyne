@@ -242,6 +242,7 @@ def persistent_hashes(root):
 
 def test_stats_read_only_no_models_network_or_repair(store, tmp_path, monkeypatch):
     add_row(store, "stored", indexed=False)
+    get_config().ensure_seeded()
     assert get_config().config_path.is_relative_to(tmp_path)
     assert get_config().config_path.is_file()
     def forbidden(*args, **kwargs):
@@ -326,6 +327,7 @@ def test_standalone_advertised_dispatch_recall_and_bank_isolation(tmp_path, monk
     assert_counts(call(q, "mnemosyne_stats")["working"], 1, 1, int(available), available)
     assert not any(r["id"] == foreign for r in call(p, "mnemosyne_recall", query)["results"])
     # Public stats are no-write too, including provider dispatch and episodic.
+    get_config().ensure_seeded()
     assert get_config().config_path.is_relative_to(tmp_path)
     assert get_config().config_path.is_file()
     def forbidden(*args, **kwargs):

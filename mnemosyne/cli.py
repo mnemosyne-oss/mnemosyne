@@ -169,26 +169,127 @@ def cmd_store(args):
     print(f"Stored: {memory_id}")
 
 
+# Cap applied only under `--preview`, for scanning many hits at once.
+_RECALL_PREVIEW_CHARS = 150
+
+
+def _recall_display_results(memory, query, results):
+    """Expand selected hits for human output without changing recall or its cache.
+
+    Stored rows are read from their selected tier using recall's current
+    cross-session visibility. MEMORIA aggregates are regenerated through their
+    existing reader.
+    An unavailable source or mismatching prefix stays an explicitly labelled
+    recall preview. This is a current read, not a historical content snapshot.
+    """
+    import sqlite3
+    from mnemosyne.core.beam import (
+        RECALL_CONTENT_CAP,
+        _cross_session_enabled,
+        _session_scope_filter,
+        _session_scope_params,
+    )
+
+    # Pair the predicate and binds from one hot-reloadable visibility snapshot.
+    cross_session = _cross_session_enabled()
+    displayed = []
+    aggregate = None
+    for result in results:
+        item = dict(result)
+        content = item.get("content", "")
+        if isinstance(content, str) and len(content) >= RECALL_CONTENT_CAP:
+            full = None
+            tier = item.get("tier")
+            table = {"working": "working_memory", "episodic": "episodic_memory"}.get(tier)
+            try:
+                beam = memory.beam
+                if table:
+                    row = beam.conn.execute(
+                        f"SELECT content FROM {table} WHERE id=? "
+                        f"AND {_session_scope_filter(cross_session=cross_session)}",
+                        (item.get("id"), *_session_scope_params(
+                            beam.session_id, cross_session=cross_session))).fetchone()
+                    full = row[0] if row else None
+                elif tier == "memoria":
+                    if aggregate is None:
+                        aggregate = beam.memoria_retrieve(query, top_k=3)
+                    if item.get("id") == "memoria_" + aggregate.get("source", ""):
+                        full = f"[MEMORIA {aggregate['source']}]\n{aggregate.get('context', '')}"
+            except sqlite3.Error:
+                full = None
+            if isinstance(full, str) and full.startswith(content):
+                item["content"] = full
+            else:
+                item["_cli_incomplete_content"] = True
+        displayed.append(item)
+    return displayed
+
+
+def _print_recall_results(query, results, *, preview=False):
+    """Render recall results for a human reader.
+
+    Content is printed whole by default. A silent 150-char preview ended records
+    in a bare ``...``, which read as the record itself (#685). The cap now lives
+    behind an explicit ``--preview`` for scanning many hits at once, and when it
+    does apply it states how much was withheld instead of ending in an
+    unexplained ellipsis.
+    """
+    print(f"\nResults for: {query}\n")
+    for r in results:
+        content = r.get("content", "")
+        score = r.get("score", 0)
+        print(f"  ID: {r.get('id', '?')}")
+        if preview and len(content) > _RECALL_PREVIEW_CHARS:
+            print(f"  Content: {content[:_RECALL_PREVIEW_CHARS]}")
+            if r.get("_cli_incomplete_content"):
+                print(f"  Content truncated: showing {_RECALL_PREVIEW_CHARS} chars; full length unavailable")
+            else:
+                print(f"  Content truncated: showing {_RECALL_PREVIEW_CHARS} of {len(content)} chars")
+        else:
+            print(f"  Content: {content}")
+            if r.get("_cli_incomplete_content"):
+                print("  Full content unavailable; showing recall preview")
+        print(f"  Score: {score:.3f}")
+        if r.get("entity_match"):
+            print("  [entity match]")
+        print()
+
+
 def cmd_recall(args):
     """Search memories."""
     if not args:
-        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json]")
+        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json] [--preview]")
 
     explain = False
     json_output = False
+    preview = False
     positionals = []
     for arg in args:
         if arg == "--explain":
             explain = True
         elif arg == "--json":
             json_output = True
+        elif arg == "--preview":
+            preview = True
         else:
             positionals.append(arg)
 
     if not positionals:
-        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json]")
+        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json] [--preview]")
     query = positionals[0]
     top_k = _parse_int(positionals[1], "top_k") if len(positionals) > 1 else 5
+
+    bank = _resolve_bank_name()
+    if bank != "default":
+        # Check before _get_memory: importing memory initializes the default DB,
+        # and BankManager's constructor creates banks/. This is path validation,
+        # not a read-only open; normal recall initialization/bookkeeping remains.
+        from mnemosyne.core.banks import get_bank_db_path_read_only
+
+        try:
+            get_bank_db_path_read_only(bank, data_dir=Path(DATA_DIR))
+        except (ValueError, FileNotFoundError) as error:
+            _fail(str(error))
 
     mem = _get_memory()
     payload = mem.recall(query, top_k=top_k, explain=explain)
@@ -204,16 +305,7 @@ def cmd_recall(args):
             print(json.dumps({"query": query, "top_k": top_k, "results": results}, ensure_ascii=False, default=str))
         return
 
-    print(f"\nResults for: {query}\n")
-    for r in results:
-        content = r.get("content", "")
-        score = r.get("score", 0)
-        print(f"  ID: {r.get('id', '?')}")
-        print(f"  Content: {content[:150]}{'...' if len(content) > 150 else ''}")
-        print(f"  Score: {score:.3f}")
-        if r.get("entity_match"):
-            print("  [entity match]")
-        print()
+    _print_recall_results(query, _recall_display_results(mem, query, results), preview=preview)
 
 
 def cmd_media(args):
@@ -337,6 +429,19 @@ def cmd_stats(args):
 
 def cmd_sleep(args):
     """Run consolidation cycle."""
+    for arg in args:
+        if arg not in {"--force", "-f", "--all-sessions", "--dry-run", "--help", "-h"}:
+            _fail(f"Unknown sleep option: {arg}")
+    if "--help" in args or "-h" in args:
+        print("Usage: mnemosyne sleep [--force|-f] [--all-sessions] [--dry-run]")
+        print("Alias: consolidate")
+        print("  --force, -f     Force consolidation")
+        print("  --all-sessions  Consolidate across all sessions")
+        print("  --dry-run       Preview consolidation without applying it")
+        print("  --help, -h      Show this help")
+        return
+
+    os.makedirs(DATA_DIR, exist_ok=True)
     mem = _get_memory()
     force = "--force" in args or "-f" in args
     all_sessions = "--all-sessions" in args
@@ -346,15 +451,39 @@ def cmd_sleep(args):
 
 
 def cmd_diagnose(args):
-    """Run PII-safe diagnostics. Use --fix to auto-install missing dependencies."""
+    """Run PII-safe diagnostics. Use --python to select the runtime interpreter."""
     fix_mode = "--fix" in args
     dry_run = "--dry-run" in args
     repair_vec_working = "--repair-vec-working" in args
+    python_executable = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--python" or args[i].startswith("--python="):
+            if args[i].startswith("--python="):
+                value = args[i].partition("=")[2]
+                if not value:
+                    _fail("--python requires a value")
+                python_executable = value
+                i += 1
+                continue
+            python_executable, i = _require_value(args, i, "--python", lambda value, _name: value)
+            if not python_executable:
+                _fail("--python requires a value")
+        else:
+            i += 1
 
     try:
         from mnemosyne.diagnose import run_diagnostics, auto_fix
-        result = run_diagnostics(repair_vec_working=repair_vec_working, dry_run=dry_run)
+        diagnose_args = {"repair_vec_working": repair_vec_working, "dry_run": dry_run}
+        if python_executable is not None:
+            diagnose_args["python_executable"] = python_executable
+        result = run_diagnostics(**diagnose_args)
         print("\nMnemosyne Diagnostics\n")
+        print(
+            "  Runtime checks: "
+            f"{result.get('runtime_scope', 'cli_interpreter')} "
+            f"({result.get('runtime_executable', 'unknown')})"
+        )
         print(f"  Checks passed: {result.get('checks_passed', 0)}/{result.get('checks_total', 0)}")
         if result.get("key_findings"):
             print("\n  Key findings:")
@@ -378,7 +507,10 @@ def cmd_diagnose(args):
 
         if fix_mode or (dry_run and not repair_vec_working):
             print("\n--- Auto-fix ---")
-            fix_result = auto_fix(result.get("entries", []), dry_run=dry_run)
+            fix_args = {"dry_run": dry_run}
+            if python_executable is not None:
+                fix_args["python_executable"] = python_executable
+            fix_result = auto_fix(result.get("entries", []), **fix_args)
             if fix_result["fixed"]:
                 for item in fix_result["fixed"]:
                     if dry_run:
@@ -1470,7 +1602,7 @@ def cmd_hygiene(args):
         print("  audit [--limit N] [--offset N] [--all [--batch-size N]] [--min-score F] [--json]")
         print("                                          Scan for noise (dry-run; --batch-size only affects --all)")
         print("  status [--limit N] [--json]             Show PII-safe hygiene status")
-        print("  clean --action delete|archive|flag [--confirm] [--dry-run] <candidates.json>")
+        print("  clean --action delete|archive|flag [--force] [--confirm] [--dry-run] <candidates.json>")
         print("  restore [--limit N]                     Restore archived memories")
         return
 
@@ -1587,6 +1719,7 @@ def cmd_hygiene(args):
 
     elif sub == "clean":
         action = "keep"
+        force = False
         confirm = False
         dry_run = True
         candidates_file = None
@@ -1599,6 +1732,9 @@ def cmd_hygiene(args):
             elif rest[i] == "--confirm":
                 confirm = True
                 dry_run = False
+                i += 1
+            elif rest[i] == "--force":
+                force = True
                 i += 1
             elif rest[i] == "--dry-run":
                 dry_run = True
@@ -1660,14 +1796,22 @@ def cmd_hygiene(args):
                 action=action,
                 confirm=confirm,
                 dry_run=dry_run,
+                force=force,
             )
         except Exception:
             _fail("hygiene_clean_failed", exit_code=1)
 
         if result.errors:
+            from mnemosyne.core.hygiene import DELETE_OVERRIDE_ERROR
+            if DELETE_OVERRIDE_ERROR in result.errors:
+                _fail(DELETE_OVERRIDE_ERROR, exit_code=1)
             _fail("hygiene_clean_failed", exit_code=1)
 
         mode = "DRY RUN" if dry_run else "APPLIED"
+        if force and action == "delete":
+            recommended = sum(c.suggested_action == "delete" for c in candidates)
+            print(f"[{mode}] override=delete scope=all candidates "
+                  f"({recommended}/{len(candidates)} recommended delete)")
         print(f"[{mode}] deleted={result.deleted} archived={result.archived} "
               f"flagged={result.flagged} kept={result.kept}")
 
@@ -1842,6 +1986,7 @@ def cmd_config(args):
         key = rest[0]
         value = rest[1]
         config = get_config()
+        config.ensure_seeded()
         config.set(key, value)
         print(f"Set {key} = {value}")
         from mnemosyne.core.config import REQUIRES_RESTART
@@ -1850,6 +1995,7 @@ def cmd_config(args):
 
     elif sub == "migrate":
         config = get_config()
+        config.ensure_seeded()
         migrated = config.migrate_from_env()
         print(f"Migrated {len(migrated)} env vars to config.yaml:")
         for key in migrated:
@@ -2033,13 +2179,17 @@ def run_cli():
         print("Commands:")
         print("  version                                Show installed version")
         print("  store <content> [source] [importance]  Store a memory")
-        print("  recall <query> [top_k]                 Search memories")
+        print("  recall <query> [top_k] [--explain] [--json] [--preview]  Search memories")
+        print("    --preview: show up to 150 characters; --json keeps backend content caps")
         print("  media <path|url> [--modality M] [--json]  Remember an image, audio, video or document")
         print("  update <id> <content> [importance]     Update a memory")
         print("  delete <id>                            Delete a memory")
         print("  stats                                  Show statistics")
         print("  sleep                                  Run consolidation")
-        print("  diagnose [--fix] [--dry-run] [--repair-vec-working]  Run diagnostics / optional repairs")
+        print(
+            "  diagnose [--python PATH] [--fix] [--dry-run] [--repair-vec-working]  "
+            "Run diagnostics / optional repairs"
+        )
         print("  doctor [--db PATH|--bank NAME] [--format json|markdown|both]  Read-only report")
         print("  repair --report REPORT.json --select working_memory:ID [--apply]  Narrow doctor-gated repair")
         print("  export [--include-sync-events] [file.json]    Export memories")
@@ -2078,7 +2228,7 @@ def run_cli():
         # machine-readable code, never a traceback (which leaks absolute
         # paths and library internals into logs).
         try:
-            if command not in {"doctor", "repair", "reindex", "backup", "restore"}:
+            if command not in {"doctor", "repair", "reindex", "backup", "restore", "sleep", "consolidate"}:
                 os.makedirs(DATA_DIR, exist_ok=True)
             handler(sys.argv[2:])
         except SystemExit:

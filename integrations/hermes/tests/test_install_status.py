@@ -18,6 +18,16 @@ def _hash_text(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def test_adopt_pm_dry_run_and_extras_require_explicit_choice(tmp_path, monkeypatch, capsys):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("ordinary install/preflight must not run")
+    monkeypatch.setattr(install, "run_install", forbidden)
+    assert install.main(["install", "--core-extras", "none"]) == 1
+    assert "--adopt-pm" in capsys.readouterr().err
+    assert install.main(["install", "--adopt-pm", "--dry-run"]) == 1
+    assert "--python" in capsys.readouterr().err
+
+
 def test_bundled_memory_override_skill_resource_is_discoverable():
     text = install.bundled_skill_text()
 
@@ -153,7 +163,7 @@ def test_status_reports_skill_state(tmp_path, capsys, monkeypatch):
 
     assert rc == 0
     assert "Skill path:" in out
-    assert "Skill:     installed" in out
+    assert "Skill: installed (metadata only)" in out
 
 
 def test_plugin_state_reports_broken_symlink(tmp_path):
@@ -586,58 +596,27 @@ def _fake_python(root: Path, version: str = "Python 3.12.13") -> Path:
     return python
 
 
-def test_status_mismatch_names_interpreters_and_emits_a_runnable_command(
+def test_status_does_not_probe_interpreters_or_recommend_pip(
     tmp_path, monkeypatch, capsys
 ):
-    """#736: status compared interpreter paths but claimed a version mismatch,
-    and printed a bare version number instead of a command to run.
-
-    Two separate venvs over one base interpreter resolve to the same binary,
-    so the check must compare environment roots, not resolved paths.
-    """
-    if sys.platform.startswith("win32"):
-        pytest.skip("POSIX symlink test")
-    base = _fake_python(tmp_path / "base")
-    hermes_venv = tmp_path / "hermes env" / "venv"  # spaces: quoting matters
-    this_venv = tmp_path / "this-env" / "venv"
-    for venv in (hermes_venv, this_venv):
-        (venv / "bin").mkdir(parents=True, exist_ok=True)
-        (venv / "pyvenv.cfg").write_text("home = /base\n", encoding="utf-8")
-        (venv / "bin" / "python").symlink_to(base)
-    hermes_python = hermes_venv / "bin" / "python"
-    this_python = this_venv / "bin" / "python"
-    assert hermes_python.resolve() == this_python.resolve() == base
-
-    monkeypatch.setattr(install, "_find_hermes_python", lambda **kw: hermes_python)
-    monkeypatch.setattr(sys, "executable", str(this_python))
-    monkeypatch.setattr(sys, "prefix", str(this_venv))
-    monkeypatch.setattr(sys, "version", "3.12.13 (fake interpreter for test)")
-    monkeypatch.setattr(
-        install,
-        "plugin_state",
-        lambda hermes_home_path=None: install.PluginState(
-            status="installed",
-            installed=True,
-            target=tmp_path / "plugin",
-            link_target=tmp_path / "plugin-target",
-            mode="symlink",
-            message="ok",
-        ),
-    )
+    """Status metadata no longer probes either runtime or suggests pip upgrades."""
+    target = tmp_path / "plugins/mnemosyne"
+    target.mkdir(parents=True)
+    (target / "__init__.py").write_text("# register_memory_provider\n")
+    def forbidden(*args, **kwargs):
+        raise AssertionError("status must not probe runtimes")
+    for name in ("_find_hermes_python", "check_mnemosyne_core", "_check_wrapper_import"):
+        monkeypatch.setattr(install, name, forbidden)
 
     rc = install.main(["--hermes-home", str(tmp_path), "status"])
 
     out = capsys.readouterr().out
     assert rc == 0
-    assert "Different Python interpreters" in out
+    assert "NOT CHECKED" in out
+    assert "Plugin path:" in out and "Mode: directory" in out
     assert "version MISMATCH" not in out
-    assert f"  This Python: {this_python} (3.12.13)" in out
-    assert f"  Hermes' Python: {hermes_python} (Python 3.12.13)" in out
-    assert (
-        f"→ Run: {shlex.quote(str(hermes_python))} -m pip install -U 'mnemosyne-hermes[all]'"
-        in out
-    )
-    assert "→ Run: 3.12.13" not in out
+    assert "This Python:" not in out and "Hermes' Python:" not in out
+    assert "pip install" not in out and "Core library: OK" not in out
 
 
 def _two_venvs_over_one_base(tmp_path):

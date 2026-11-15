@@ -17,8 +17,10 @@ than a slogan:
 """
 
 import hashlib
+import logging
 import re
 import sqlite3
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -412,6 +414,98 @@ def _schema_and_counts(path: Path):
 
 
 class TestReadOnly:
+    def test_census_read_connection_has_short_timeout_and_rejects_writes(
+        self, fleet_env, monkeypatch
+    ):
+        """Pin the per-file budget without relying on scheduler timing."""
+        bank = _make_bank(fleet_env / "bank.db", [_TWIN + (None,)])
+        before = _file_digest(bank)
+        connect = sqlite3.connect
+        observed = []
+
+        def inspect_connection(*args, **kwargs):
+            conn = connect(*args, **kwargs)
+            try:
+                observed.append(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+                with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                    conn.execute("DELETE FROM conflicts")
+            except BaseException:
+                conn.close()
+                raise
+            return conn
+
+        monkeypatch.setattr(fleet_census.sqlite3, "connect", inspect_connection)
+        report = fleet_census.census(banks=[bank])
+        assert observed == [50]
+        assert report["banks_scanned"] == 1
+        assert report["unreadable"] == []
+        assert report["bound_holds"] is True
+        assert _file_digest(bank) == before
+
+    def test_foreign_exclusive_locks_do_not_delay_the_fleet(self, fleet_env):
+        """Browser databases must not consume the session-end census budget."""
+        bank = _make_bank(fleet_env / "custom" / "bank.db", [_TWIN + (None,)])
+        browser = fleet_env / "browser-chrome-profile"
+        foreign = [browser / f"profile-{i}" / f"cache-{i}.db" for i in range(3)]
+        locks = []
+        for path in foreign:
+            path.parent.mkdir(parents=True)
+            conn = sqlite3.connect(path)
+            conn.execute("PRAGMA journal_mode=DELETE")
+            conn.execute("CREATE TABLE foreign_data (value TEXT)")
+            conn.commit()
+            conn.execute("BEGIN EXCLUSIVE")
+            locks.append(conn)
+        before = {path: _file_digest(path) for path in [bank, *foreign]}
+        try:
+            assert set(foreign).issubset(fleet_census.discover_banks(fleet_env))
+            start = time.monotonic()
+            report = fleet_census.census()
+            elapsed = time.monotonic() - start
+        finally:
+            for conn in locks:
+                conn.rollback()
+                conn.close()
+
+        assert elapsed < 1.0, elapsed
+        assert report["banks_scanned"] == 1
+        assert len(report["unreadable"]) == 3
+        assert {entry["path"] for entry in report["unreadable"]} == {
+            str(path) for path in foreign
+        }
+        assert report["bound_holds"] is False
+        assert fleet_census.census()["bound_holds"] is True
+        assert {path: _file_digest(path) for path in [bank, *foreign]} == before
+
+    def test_locked_real_bank_fails_closed_then_recovers(self, fleet_env):
+        first = _make_bank(fleet_env / "home-a" / "bank.db", [_TWIN + (None,)])
+        second = _make_bank(
+            fleet_env / "unusual-location" / "other.db",
+            [(_TWIN[1], _TWIN[0], None)],
+        )
+        before = {path: _file_digest(path) for path in [first, second]}
+        lock = sqlite3.connect(second)
+        lock.execute("PRAGMA journal_mode=DELETE")
+        lock.execute("BEGIN EXCLUSIVE")
+        try:
+            start = time.monotonic()
+            partial = fleet_census.census()
+            elapsed = time.monotonic() - start
+        finally:
+            lock.rollback()
+            lock.close()
+
+        assert elapsed < 1.0, elapsed
+        assert partial["banks_scanned"] == 1
+        assert partial["unreadable"][0]["path"] == str(second)
+        assert partial["home_home_twin_count"] == 0
+        assert partial["bound_holds"] is False
+        complete = fleet_census.census()
+        assert complete["unreadable"] == []
+        assert complete["banks_scanned"] == 2
+        assert complete["home_home_twin_count"] == 1
+        assert complete["bound_holds"] is False
+        assert {path: _file_digest(path) for path in [first, second]} == before
 
     def test_census_writes_nothing_to_the_banks_it_reads(self, fleet_env):
         _build_fleet(fleet_env, {
@@ -520,16 +614,89 @@ class TestReadOnly:
         assert report["banks_scanned"] == 0
         assert report["unreadable"] == []
 
-    def test_cache_and_backup_dirs_are_pruned(self, fleet_env):
-        _build_fleet(fleet_env, {"home-a": [_TWIN + (None,)]})
+    def test_partial_snapshot_dirs_are_pruned_without_hiding_completed_banks(
+            self, fleet_env, caplog):
+        """Prune partial snapshots while retaining completed and active banks."""
+        productive = _make_bank(
+            fleet_env / "profiles" / "active" / "mnemosyne" / "data" / "mnemosyne.db",
+            [_TWIN + (None,)],
+        )
+        productive_with_partial_dir = _make_bank(
+            fleet_env / "profiles" / "active" / "mnemosyne" / "data.partial" / "mnemosyne.db",
+            [("cf_productive_partial_a", "cf_productive_partial_b", None)],
+        )
+        completed_snapshot = _make_bank(
+            fleet_env / "state-snapshots" / "snapshot-20261028" / "mnemosyne.db",
+            [("cf_completed_a", "cf_completed_b", None)],
+        )
+        completed_snapshot_with_partial_in_name = _make_bank(
+            fleet_env / "state-snapshots" / "snapshot.partial.backup" / "mnemosyne.db",
+            [("cf_completed_partial_a", "cf_completed_partial_b", None)],
+        )
+        partial = (
+            fleet_env / "state-snapshots" /
+            ".20261028-123456-pre-update.123456.partial" / "state.db"
+        )
+        partial.parent.mkdir(parents=True)
+        partial.write_bytes(b"this is not a sqlite file" * 40)
+        profile_partial = (
+            fleet_env / "profiles" / "active" / "state-snapshots" /
+            ".20261028-123456-pre-update.123456.partial" / "state.db"
+        )
+        profile_partial.parent.mkdir(parents=True)
+        profile_partial.write_bytes(b"this is not a sqlite file" * 40)
         for dirname in ("backups", "cache", ".cache"):
             _make_bank(fleet_env / dirname / "old" / "mnemosyne.db", [_TWIN + (None,)])
 
-        report = fleet_census.census()
+        with caplog.at_level(logging.WARNING, logger=fleet_census.__name__):
+            report = fleet_census.census()
 
-        # Had the copies been counted, this would be a 4-bank home↔home twin.
-        assert report["banks_scanned"] == 1
-        assert report["home_home_twin_count"] == 0
+        assert {Path(bank["path"]) for bank in report["banks"]} == {
+            productive,
+            productive_with_partial_dir,
+            completed_snapshot,
+            completed_snapshot_with_partial_in_name,
+        }
+        assert report["unreadable"] == []
+        assert str(partial) not in caplog.text
+        assert str(profile_partial) not in caplog.text
+
+    def test_partial_snapshot_dirs_are_pruned_when_root_is_snapshot_dir(self, tmp_path):
+        """Prune partial snapshots when the walk starts at the snapshot root."""
+        snapshot_root = tmp_path / "state-snapshots"
+        partial = snapshot_root / "pre-update.partial" / "state.db"
+        partial.parent.mkdir(parents=True)
+        partial.write_bytes(b"this is not a sqlite file" * 40)
+
+        assert fleet_census.discover_banks(snapshot_root) == []
+
+    def test_snapshot_ancestor_does_not_hide_live_partial_dir(self, tmp_path):
+        """A snapshot directory above the fleet root does not affect pruning."""
+        root = tmp_path / "state-snapshots" / "fleet"
+        productive = _make_bank(
+            root / "live.partial" / "mnemosyne.db",
+            [("cf_live_partial_a", "cf_live_partial_b", None)],
+        )
+
+        assert fleet_census.discover_banks(root) == [productive]
+
+    @pytest.mark.parametrize(
+        "root_name,alias_name,keep_partial",
+        [("state-snapshots", "snapshot-alias", False), ("fleet", "state-snapshots", True)],
+    )
+    def test_discover_banks_classifies_alias_by_target(
+            self, tmp_path, root_name, alias_name, keep_partial):
+        """Use the target's snapshot status while preserving alias-relative paths."""
+        root = tmp_path / "targets" / root_name
+        completed = _make_bank(root / "complete" / "state.db", [])
+        partial = _make_bank(root / "sample.partial" / "state.db", [])
+        alias = tmp_path / alias_name
+        alias.symlink_to(root, target_is_directory=True)
+        expected = [alias / completed.relative_to(root)]
+        if keep_partial:
+            expected.append(alias / partial.relative_to(root))
+
+        assert fleet_census.discover_banks(alias) == expected
 
 
 # --------------------------------------------------------------------------

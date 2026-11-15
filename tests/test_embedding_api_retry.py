@@ -21,6 +21,13 @@ def _uncredentialed_embedding_client(monkeypatch):
     monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "")
+    # These tests drive the env aliases. A config.yaml anywhere on the runner
+    # (CI runs the suite with MNEMOSYNE_NO_EMBEDDINGS=1, and the first read
+    # seeds that value into the file) would win over every env change below, so
+    # neutralize the config resolver for this file instead of depending on the
+    # machine having no config.
+    monkeypatch.setattr(embeddings, "_cfg", lambda _key, default=None: default)
+    monkeypatch.setattr(embeddings, "_cfg_bool", lambda _key, default=False: default)
 
 
 @pytest.fixture

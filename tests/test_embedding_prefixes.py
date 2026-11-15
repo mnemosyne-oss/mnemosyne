@@ -11,15 +11,29 @@ QUERY_PREFIX = "task: search result | query: "   # trailing space is load-bearin
 DOC_PREFIX = "title: none | text: "
 
 RECORDED = []
+TARGET = "orchard target memory"
+DISTRACTOR = "orchard distractor memory"
+
+def stub_vector(text):
+    # A query embedded with the query prefix lands on TARGET; the same query
+    # embedded with the document prefix lands on DISTRACTOR. Any other text
+    # keeps the flat vector the byte-exact tests were written against.
+    axis = {QUERY_PREFIX + "where is the orchard": 0, DOC_PREFIX + TARGET: 0,
+            DOC_PREFIX + "where is the orchard": 1, DOC_PREFIX + DISTRACTOR: 1}.get(text)
+    if axis is None:
+        return [0.1] * 768
+    vector = [0.0] * 768
+    vector[axis] = 1.0
+    return vector
 
 class StubHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         RECORDED.append(json.loads(body))
-        n = len(json.loads(body)["input"])
+        texts = json.loads(body)["input"]
         resp = json.dumps({"object": "list", "model": "stub",
-                           "data": [{"object": "embedding", "index": i, "embedding": [0.1] * 768}
-                                    for i in range(n)],
+                           "data": [{"object": "embedding", "index": i, "embedding": stub_vector(text)}
+                                    for i, text in enumerate(texts)],
                            "usage": {"prompt_tokens": 1, "total_tokens": 1}}).encode()
         self.send_response(200); self.send_header("Content-Length", str(len(resp)))
         self.send_header("Content-Type", "application/json"); self.end_headers()
@@ -117,3 +131,21 @@ def test_fastembed_path_applies_prefixes(monkeypatch):
     assert fake.received[-1] == [DOC_PREFIX + "local fact"]
     assert emb.embed_query("local query") is not None
     assert fake.received[-1] == [QUERY_PREFIX + "local query"]
+
+def test_polyphonic_recall_embeds_query_with_query_prefix(embeddings_mod, monkeypatch, tmp_path):
+    # Polyphonic recall must embed the query the same way the linear path does,
+    # or prefixed models (E5, EmbeddingGemma) compare a passage-shaped query.
+    from mnemosyne.core.beam import BeamMemory
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+    for voice in ("TEMPORAL", "GRAPH", "FACT"):
+        monkeypatch.setenv(f"MNEMOSYNE_VOICE_{voice}", "0")
+    monkeypatch.delenv("MNEMOSYNE_VOICE_VECTOR", raising=False)
+    beam = BeamMemory(session_id="prefix-session", db_path=tmp_path / "memory.db")
+    target = beam.remember(TARGET, source="user", dedupe=False)
+    beam.remember(DISTRACTOR, source="user", dedupe=False)
+    RECORDED.clear()
+    results = beam.recall("where is the orchard", top_k=1)
+    inputs = [text for request in RECORDED for text in request["input"]]
+    assert QUERY_PREFIX + "where is the orchard" in inputs
+    assert DOC_PREFIX + "where is the orchard" not in inputs
+    assert [r["id"] for r in results] == [target]

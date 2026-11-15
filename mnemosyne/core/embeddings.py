@@ -17,6 +17,8 @@ import urllib.parse
 import urllib.request
 from typing import List, NoReturn, Optional
 from functools import lru_cache
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from mnemosyne.core.user_agent import application_user_agent
 
@@ -25,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 try:
     import numpy as np
-except ImportError:
+except Exception:
     np = None
 
 # --- fastembed (local ONNX) ---
@@ -43,14 +45,146 @@ try:
 except Exception:
     TextEmbedding = None
 
+# Module-level import guard. While True (during module load) a failed dense-stack
+# import does not emit its one-time warning; the warning is deferred to the
+# first post-import attempt (e.g. available() / _ensure_fastembed()) so
+# import-time alias evaluation does not consume it. Reset to False once alias
+# evaluation completes.
+_IMPORTING = True
+
+# Dense-stack import state. _DENSE_STACK_IMPORTED remembers a successful import
+# so later calls skip re-importing; _DENSE_STACK_WARNED ensures a failing import
+# warns at most once (reset on a later success).
+_DENSE_STACK_IMPORTED = np is not None and TextEmbedding is not None
+_DENSE_STACK_WARNED = False
+_DENSE_STACK_RETRY_AT = 0.0
+_DENSE_STACK_BROKEN_BACKOFF = 1.0
+# Guards concurrent first-time imports so two threads cannot both attempt the
+# import (and both emit the warning) when the stack is absent.
+_DENSE_STACK_LOCK = threading.Lock()
+
+
+def _ensure_fastembed() -> bool:
+    """Ensure numpy and fastembed.TextEmbedding are importable, binding the
+    module globals on success.
+
+    Returns True on success (and remembers it so later calls skip re-importing)
+    and False on failure. On failure logs exactly one WARNING naming the failing
+    module ('numpy' or 'fastembed') and the reason; repeated failures do not
+    re-warn. Broken installed packages back off briefly; missing modules remain
+    immediately retryable. A later success resets warning and backoff. Thread-safe.
+    """
+    global np, TextEmbedding, _DENSE_STACK_IMPORTED, _DENSE_STACK_WARNED
+    global _DENSE_STACK_RETRY_AT
+    if _DENSE_STACK_IMPORTED and np is not None and TextEmbedding is not None:
+        return True
+    if _DENSE_STACK_IMPORTED and (np is None or TextEmbedding is None):
+        _DENSE_STACK_IMPORTED = False
+
+    with _DENSE_STACK_LOCK:
+        # Re-check under the lock: another thread may have imported meanwhile.
+        if np is not None and TextEmbedding is not None:
+            _DENSE_STACK_IMPORTED = True
+            return True
+        if time.monotonic() < _DENSE_STACK_RETRY_AT:
+            return False
+
+        try:
+            import numpy as _np
+        except Exception as exc:  # noqa: BLE001
+            # Defer cooldown along with the warning during alias evaluation,
+            # so the first runtime call can report the broken dependency.
+            if not _IMPORTING and not (
+                isinstance(exc, ModuleNotFoundError) and exc.name == "numpy"
+            ):
+                _DENSE_STACK_RETRY_AT = time.monotonic() + _DENSE_STACK_BROKEN_BACKOFF
+            if not _DENSE_STACK_WARNED and not _IMPORTING:
+                logger.warning("could not import numpy: %s", exc)
+                _DENSE_STACK_WARNED = True
+            return False
+        try:
+            from fastembed import TextEmbedding as _TE
+        except Exception as exc:  # noqa: BLE001
+            # Defer cooldown along with the warning during alias evaluation,
+            # so the first runtime call can report the broken dependency.
+            if not _IMPORTING and not (
+                isinstance(exc, ModuleNotFoundError) and exc.name == "fastembed"
+            ):
+                _DENSE_STACK_RETRY_AT = time.monotonic() + _DENSE_STACK_BROKEN_BACKOFF
+            if not _DENSE_STACK_WARNED and not _IMPORTING:
+                logger.warning("could not import fastembed: %s", exc)
+                _DENSE_STACK_WARNED = True
+            return False
+
+        np = _np
+        TextEmbedding = _TE
+        _DENSE_STACK_IMPORTED = True
+        _DENSE_STACK_WARNED = False
+        _DENSE_STACK_RETRY_AT = 0.0
+        # First successful bind: drop any cached failure from embed_query().
+        # _embed_query_cached memoises its result, so a query that ran before
+        # the stack was importable holds a cached None and would keep returning
+        # None even though the model can now load.
+        _cached = globals().get("_embed_query_cached")
+        if _cached is not None:
+            try:
+                _cached.cache_clear()
+            except Exception:  # pragma: no cover - cache_clear is best effort
+                pass
+        return True
+
+
+_API_NUMPY_WARNED = False
+_API_NUMPY_RETRY_AT = 0.0
+_API_NUMPY_ERROR = (
+    "API embeddings require NumPy, which is unavailable or could not be imported. "
+    "Install or repair it in the interpreter running Mnemosyne: python -m pip install numpy."
+)
+
+
+def _ensure_api_numpy() -> bool:
+    """Retry NumPy independently of the optional local FastEmbed backend."""
+    global np, _API_NUMPY_WARNED, _API_NUMPY_RETRY_AT
+    if np is not None:
+        return True
+    with _DENSE_STACK_LOCK:
+        if np is not None:
+            return True
+        if time.monotonic() < _API_NUMPY_RETRY_AT:
+            return False
+        try:
+            import numpy as _np
+        except Exception as exc:
+            if not (isinstance(exc, ModuleNotFoundError) and exc.name == "numpy"):
+                _API_NUMPY_RETRY_AT = time.monotonic() + _DENSE_STACK_BROKEN_BACKOFF
+            if not _API_NUMPY_WARNED:
+                # Import errors may contain private paths; name the dependency,
+                # not the arbitrary exception text or the embedding input.
+                logger.warning("%s", _API_NUMPY_ERROR)
+                _API_NUMPY_WARNED = True
+            return False
+        np = _np
+        _API_NUMPY_WARNED = False
+        _API_NUMPY_RETRY_AT = 0.0
+        return True
+
+
 def _is_fastembed_available() -> bool:
-    """Check if fastembed is available. Evaluates lazily, so a correct
-    sys.path ordering at call time won't be shadowed by an early import."""
-    return np is not None and TextEmbedding is not None
+    """Check if fastembed is available.
+
+    When the ``np``/``TextEmbedding`` globals are empty (e.g. site-packages is
+    absent for the whole process lifetime, as in the gateway venv), re-attempt
+    the import via :func:`_ensure_fastembed` instead of trusting import-time
+    state. Returns True when both are bound.
+    """
+    if np is not None and TextEmbedding is not None:
+        return True
+    return _ensure_fastembed()
 
 # Backward-compatible alias for legacy users who import this constant.
 # Use _is_fastembed_available() in new code — it re-evaluates on each call.
 _FASTEMBED_AVAILABLE = _is_fastembed_available()
+_IMPORTING = False
 # Allow CI / scripted environments to redirect the fastembed cache to a
 # stable path that can be restored by actions/cache. Defaults to
 # <HERMES_HOME>/cache/fastembed, falling back to ~/.hermes/cache/fastembed
@@ -59,20 +193,50 @@ _FASTEMBED_AVAILABLE = _is_fastembed_available()
 # separate ~/.hermes directory when a user relocates HERMES_HOME (e.g. to
 # ~/.config/hermes). Matches the HERMES_HOME handling already used elsewhere
 # in the package (see mcp_tools.py).
-_FASTEMBED_CACHE_DIR = os.environ.get(
-    "MNEMOSYNE_FASTEMBED_CACHE_DIR",
-    os.path.join(
+def _cfg(key, default=None):
+    """Read one config value with the documented config > env > default order."""
+    try:
+        from mnemosyne.core.config import peek as _config_get
+        return _config_get(key, default)
+    except Exception:
+        return default
+
+
+def _cfg_bool(key, default=False):
+    try:
+        from mnemosyne.core.config import peek_bool as _config_get_bool
+        return _config_get_bool(key, default)
+    except Exception:
+        return default
+
+
+def _configured_api_url() -> str:
+    """Configured embedding endpoint, empty when none is set."""
+    value = _cfg("embedding_api_url")
+    if value in (None, ""):
+        value = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
+    return str(value or "").strip()
+
+
+_FASTEMBED_CACHE_DIR = (
+    _cfg("fastembed_cache_dir")
+    or os.environ.get("MNEMOSYNE_FASTEMBED_CACHE_DIR")
+    or os.path.join(
         os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
         "cache",
         "fastembed",
-    ),
+    )
 )
 
 # --- OpenAI-compatible API ---
 # Mnemosyne embedding config is independent of general OpenRouter/OpenAI settings.
 # Embedding models may use local llama.cpp, OpenAI, Anthropic, or any other provider.
-_OPENAI_API_KEY = os.environ.get("MNEMOSYNE_EMBEDDING_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
-_OPENAI_BASE_URL = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
+_OPENAI_API_KEY = (
+    _cfg("embedding_api_key")
+    or os.environ.get("MNEMOSYNE_EMBEDDING_API_KEY")
+    or os.environ.get("OPENAI_API_KEY", "")
+)
+_OPENAI_BASE_URL = _configured_api_url() or "https://openrouter.ai/api/v1"
 
 # --- Model selection ---
 # Normalize a blank (empty or whitespace-only) env var to the default. Such
@@ -81,7 +245,19 @@ _OPENAI_BASE_URL = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openro
 # empty-string, which is unknown and would raise at import under the fail-loud
 # rule even though the user set nothing meaningful. Uses .strip() to mirror the
 # blank handling for MNEMOSYNE_EMBEDDING_DIM in _get_embedding_dim.
-_DEFAULT_MODEL = (os.environ.get("MNEMOSYNE_EMBEDDING_MODEL") or "").strip() or "BAAI/bge-small-en-v1.5"
+_DEFAULT_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+_env_model = (os.environ.get("MNEMOSYNE_EMBEDDING_MODEL") or "").strip()
+_configured_model = str(_cfg("embedding_model") or "").strip()
+# The auto-seeded config carries the default model. Treat that value as the
+# absence of an override so a later env var still works; any other configured
+# model is an explicit choice and wins.
+_DEFAULT_MODEL = (
+    _configured_model
+    if _configured_model and (
+        _configured_model != _DEFAULT_MODEL_NAME or not _env_model
+    )
+    else (_env_model or _DEFAULT_MODEL_NAME)
+)
 _embedding_model = None
 _API_CALL_COUNT = 0
 
@@ -120,7 +296,8 @@ def _is_disabled() -> bool:
     Values are trimmed and case-insensitive: 1/true/yes/on are true;
     0/false/no/off, blank and unset are false. Validate every alias before
     combining them, so a true flag cannot hide a malformed one. Other
-    nonempty values raise ValueError. This is ENV-only, not YAML resolution.
+    nonempty values raise ValueError. The environment aliases are validated
+    here; config.yaml flags are read through the resolver.
     """
     disabled = False
     for name in (
@@ -136,18 +313,23 @@ def _is_disabled() -> bool:
                 f"{name} must be 1/true/yes/on or 0/false/no/off "
                 "(blank or unset also means false)."
             )
-    return disabled
+    return (
+        disabled
+        or _cfg_bool("no_embeddings")
+        or _cfg_bool("skip_embeddings")
+        or _cfg_bool("embeddings_off")
+    )
 
 
 def _is_api_model(model_name: str) -> bool:
     """Check if the model should use the OpenAI-compatible API."""
     if model_name.startswith("openai/") or "text-embedding" in model_name or model_name.startswith("text-embedding"):
         return True
-    # Custom endpoint: if MNEMOSYNE_EMBEDDING_API_URL is set to a non-OpenRouter URL,
+    # Custom endpoint: if the embedding API URL is set to a non-OpenRouter URL,
     # assume the user has their own API server and any model name should route there.
     # The empty default is deliberate here: with no URL configured the model
     # routes locally, unlike _effective_base_url()'s OpenRouter fallback.
-    base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
+    base_url = _configured_api_url()
     if base_url and not _is_openrouter_url(base_url):
         return True
     # Explicit opt-in for non-OpenAI embedding models hosted on OpenRouter
@@ -158,7 +340,9 @@ def _is_api_model(model_name: str) -> bool:
     # users that also have OPENROUTER_API_KEY set for chat. Requiring an explicit
     # env flag keeps local-first behavior the default while giving a clean opt-in
     # for OpenRouter-hosted embedding models.
-    if os.environ.get("MNEMOSYNE_EMBEDDINGS_VIA_API", "").strip().lower() in ("1", "true", "yes", "on"):
+    if _cfg_bool("embeddings_via_api") or os.environ.get(
+        "MNEMOSYNE_EMBEDDINGS_VIA_API", ""
+    ).strip().lower() in ("1", "true", "yes", "on"):
         return True
     return False
 
@@ -201,6 +385,7 @@ def _get_embedding_dim(model_name: str) -> int:
         "text-embedding-3-small": 1536,
         "text-embedding-3-large": 3072,
         # --- Jina ---
+        "jina-embeddings-v4": 2048,
         "jina-embeddings-v5-omni-nano": 768,
         "jina-embeddings-v5-omni-small": 1024,
         # Jina v2 base family (bilingual/monolingual, all 768-dim). Without these
@@ -212,6 +397,30 @@ def _get_embedding_dim(model_name: str) -> int:
         "jinaai/jina-embeddings-v2-base-zh": 768,
         "jinaai/jina-embeddings-v2-base-code": 768,
     }
+    # Explicit config override wins over env and the model table. The
+    # auto-seeded 384 is the default, not an explicit override for a model
+    # that declares another dimension.
+    configured_dim = _cfg("embedding_dim")
+    if isinstance(configured_dim, str):
+        # A blank value (spaces/tab, routine in Compose and CI matrices) means
+        # unset here too, whether it arrived from config.yaml or from the env
+        # fallback that peek() applies.
+        configured_dim = configured_dim.strip()
+    if configured_dim not in (None, ""):
+        try:
+            value = int(configured_dim)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"embedding_dim={configured_dim!r} in config.yaml is not a valid integer"
+            ) from None
+        if value <= 0:
+            raise ValueError(
+                f"embedding_dim={value} in config.yaml must be a positive integer"
+            )
+        # The auto-seeded 384 is the default. Ignore it whenever the model is
+        # not the default model, so the model table (or an env override) decides.
+        if not (value == 384 and model_name != _DEFAULT_MODEL_NAME):
+            return value
     # Explicit override wins. An explicit-but-invalid value is a configuration
     # error -- raise rather than silently fall through to a guess. A set-but-
     # empty value (routine in Docker Compose / .env / CI matrices) is normalized
@@ -417,7 +626,7 @@ def _raise_policy_refusal(refusal_key: str, message: str) -> NoReturn:
 
 
 def _effective_base_url() -> str:
-    return os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
+    return _configured_api_url() or "https://openrouter.ai/api/v1"
 
 
 def _cleartext_refusal_message(base_url: str) -> str:
@@ -498,35 +707,71 @@ class _CredentialedNoRedirect(urllib.request.HTTPRedirectHandler):
         )
 
 
-def _embedding_max_chars() -> int:
-    """Resolve the optional per-input character cap at call time (default:
-    disabled). Set MNEMOSYNE_EMBEDDING_MAX_CHARS for local OpenAI-compatible
-    servers (llama.cpp et al.) whose per-slot context window rejects long
-    inputs with HTTP 400, aborting the whole batch; 0 or negative disables."""
-    raw = os.environ.get("MNEMOSYNE_EMBEDDING_MAX_CHARS", "").strip()
+def _env_cap(name: str) -> int:
+    """An optional integer cap read at call time; unset, blank, 0, negative or
+    invalid (warned) all mean disabled."""
+    raw = os.environ.get(name, "").strip()
     if not raw:
         return 0
     try:
         return int(raw)
     except ValueError:
-        logger.warning(
-            "invalid MNEMOSYNE_EMBEDDING_MAX_CHARS=%r; embedding cap disabled",
-            raw,
-        )
+        logger.warning("invalid %s=%r; embedding cap disabled", name, raw)
         return 0
 
 
-def _cap_for_api(texts: List[str]) -> List[str]:
-    """Cap each text before the API call when MNEMOSYNE_EMBEDDING_MAX_CHARS
-    is set. Off by default: characters are not a token budget, and silent
-    head-truncation can drop retrieval content on endpoints that accept the
-    full text. When enabled, every truncation is logged."""
-    limit = _embedding_max_chars()
-    if limit <= 0:
+def _embedding_max_chars() -> int:
+    """Resolve the optional per-input character cap at call time (default:
+    disabled). Applies to both API and local embedding inputs; 0 or negative
+    disables the cap."""
+    return _env_cap("MNEMOSYNE_EMBEDDING_MAX_CHARS")
+
+
+def _embedding_max_bytes() -> int:
+    """Optional per-input UTF-8 byte cap (MNEMOSYNE_EMBEDDING_MAX_BYTES,
+    default disabled). Characters are not a token budget: some scripts
+    tokenize to several tokens per character, while UTF-8 bytes bound tokens
+    from above for byte-level BPE tokenizers."""
+    return _env_cap("MNEMOSYNE_EMBEDDING_MAX_BYTES")
+
+
+_CAP_SNAPSHOT: ContextVar[Optional[tuple]] = ContextVar("embedding_cap_snapshot", default=None)
+
+
+def _embedding_caps() -> tuple:
+    """Both caps, pinned during an enhanced recall or read from current config."""
+    snapshot = _CAP_SNAPSHOT.get()
+    if snapshot is not None:
+        return snapshot
+    return (_embedding_max_chars(), _embedding_max_bytes())
+
+
+@contextmanager
+def _embedding_cap_snapshot():
+    """Keep cache identity and embedding inputs on one policy for this call.
+
+    Context-local state keeps overlapping recalls independent; reset on every
+    exit so later calls observe configuration changes, including after errors.
+    """
+    token = _CAP_SNAPSHOT.set(_embedding_caps())
+    try:
+        yield
+    finally:
+        _CAP_SNAPSHOT.reset(token)
+
+
+def _cap_for_api(texts: List[str], caps: Optional[tuple] = None) -> List[str]:
+    """Cap each text before an API or local embedding call when MNEMOSYNE_EMBEDDING_MAX_CHARS
+    and/or MNEMOSYNE_EMBEDDING_MAX_BYTES is set. Off by default: characters
+    are not a token budget, and silent head-truncation can drop retrieval
+    content on endpoints that accept the full text. When enabled, every
+    truncation is logged."""
+    limit, byte_limit = _embedding_caps() if caps is None else caps
+    if limit <= 0 and byte_limit <= 0:
         return texts
     capped: List[str] = []
     for text in texts:
-        if len(text) > limit:
+        if 0 < limit < len(text):
             logger.warning(
                 "embedding input truncated: %d -> %d chars (model=%s, cap=MNEMOSYNE_EMBEDDING_MAX_CHARS)",
                 len(text),
@@ -534,6 +779,38 @@ def _cap_for_api(texts: List[str]) -> List[str]:
                 _DEFAULT_MODEL,
             )
             text = text[:limit]
+        if byte_limit > 0:
+            original = text
+            # lone surrogates have no UTF-8 form: with the cap enabled they are
+            # dropped from every input, below the cap too, so the contract does
+            # not depend on whether the cut branch runs
+            raw = text.encode("utf-8", "ignore")
+            text = raw.decode("utf-8")
+            if not raw and original:
+                # nothing but lone surrogates: fail loud instead of sending ""
+                raise _EmbeddingPolicyError(
+                    "an embedding input has no UTF-8-encodable character "
+                    "(only lone surrogates) after MNEMOSYNE_EMBEDDING_MAX_BYTES normalization"
+                )
+            if len(raw) > byte_limit:
+                # a cut inside a multi-byte character drops that character, never emits half of it
+                text = raw[:byte_limit].decode("utf-8", "ignore")
+                logger.warning(
+                    "embedding input truncated: %d -> %d bytes (model=%s, cap=MNEMOSYNE_EMBEDDING_MAX_BYTES=%d)",
+                    len(raw),
+                    len(text.encode("utf-8")),
+                    _DEFAULT_MODEL,
+                    byte_limit,
+                )
+                if not text and original:
+                    # Fail loud before any request: an input the cap would
+                    # reduce to nothing would otherwise be sent as "".
+                    raise _EmbeddingPolicyError(
+                        f"MNEMOSYNE_EMBEDDING_MAX_BYTES={byte_limit} is smaller than the "
+                        f"first character of an embedding input "
+                        f"({len(raw.decode('utf-8', 'ignore')[:1].encode('utf-8'))} UTF-8 bytes); "
+                        "raise the cap or unset it"
+                    )
         capped.append(text)
     return capped
 
@@ -615,11 +892,11 @@ def _ensure_api_vectors(result: Optional[np.ndarray], base_url: str, expected: i
     return result
 
 
-def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
+def _embed_api(texts: List[str], base_url: Optional[str] = None) -> Optional[np.ndarray]:
     """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint)."""
     global _API_CALL_COUNT
     # Require API key for OpenRouter; custom endpoints may not need one.
-    base_url = _effective_base_url()
+    base_url = base_url or _effective_base_url()
     is_custom = not _is_openrouter_url(base_url)
     if not is_custom and not _OPENAI_API_KEY:
         logger.warning(
@@ -634,6 +911,9 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
             "credentialed-cleartext",
             _cleartext_refusal_message(base_url),
         )
+
+    if not _ensure_api_numpy():
+        raise RuntimeError(_API_NUMPY_ERROR)
 
     # Append /embeddings to the path, preserving any query string. A naive
     # string append would push the route into the query value (e.g.
@@ -743,11 +1023,11 @@ def available() -> bool:
         return False
     if _is_api_model(_DEFAULT_MODEL):
         # Custom endpoints (non-OpenRouter) may not require an API key
-        base_url = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "")
+        base_url = _configured_api_url()
         if base_url and not _is_openrouter_url(base_url):
-            return True
-        return bool(_OPENAI_API_KEY)
-    return _FASTEMBED_AVAILABLE
+            return _ensure_api_numpy()
+        return bool(_OPENAI_API_KEY) and _ensure_api_numpy()
+    return _is_fastembed_available()
 
 
 def available_api() -> bool:
@@ -765,22 +1045,50 @@ def embed_query(text: str) -> Optional[np.ndarray]:
         return None
     if not text:
         return None
-    # The effective cap is part of the key: _embed_api reads MNEMOSYNE_EMBEDDING_MAX_CHARS at call time, so a
+    # The effective caps are part of the key: embedding calls read MNEMOSYNE_EMBEDDING_MAX_CHARS / _BYTES at call time, so a
     # vector embedded under one cap must not be served after the cap changes (review #1052).
-    return _embed_query_cached(_get_prefix("query") + text, _embedding_max_chars())
+    # The backend is part of the key too: embeddings_via_api or the API URL can change at runtime,
+    # and a cached local vector must not be compared against API document vectors.
+    api_url = _effective_base_url() if _is_api_model(_DEFAULT_MODEL) else None
+    if api_url is None:
+        # Direct callers never touch available(), so retry the dense-stack
+        # import here. If it still cannot be imported, return WITHOUT consulting
+        # (or populating) the cache: memoising a failure is what let a stale
+        # None outlive recovery. A successful bind also drops any entry cached
+        # by an older revision (see _ensure_fastembed).
+        if not _is_fastembed_available():
+            return None
+    try:
+        return _embed_query_cached(_get_prefix("query") + text, _embedding_caps(), api_url)
+    except _ConfigChangedDuringQuery:
+        return None
+
+
+class _ConfigChangedDuringQuery(Exception):
+    """Raised inside the cached function so lru_cache stores nothing for this call."""
 
 
 @lru_cache(maxsize=512)
-def _embed_query_cached(prefixed: str, _cap: int = 0) -> Optional[np.ndarray]:
-    if _is_api_model(_DEFAULT_MODEL):
-        result = _embed_api([prefixed])
-        _ensure_api_vectors(result, os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1"), 1)
+def _embed_query_cached(
+    prefixed: str, _caps: tuple = (0, 0), api_url: Optional[str] = None
+) -> Optional[np.ndarray]:
+    if api_url is not None:
+        result = _embed_api([prefixed], api_url)
+        _ensure_api_vectors(result, api_url, 1)
         return result[0]
 
     model = _get_model()
-    if model is None or model == "api":
+    # The key was chosen for the local backend, but the loader answers for the config as
+    # it is now. If that moved to the API or to opt-out in between, this call has no local
+    # vector, and caching None would keep serving it after the config moves back. The
+    # import-recovery preflight in embed_query handles missing local dependencies;
+    # a successful later bind clears old cached failures. Asking _is_disabled()
+    # again here would race the same way.
+    if model == "api" or (model is None and _is_fastembed_available()):
+        raise _ConfigChangedDuringQuery
+    if model is None:
         return None
-    vectors = list(model.embed([prefixed]))
+    vectors = list(model.embed(_cap_for_api([prefixed], _caps)))
     if not vectors:
         return None
     return vectors[0].astype(np.float32)
@@ -799,12 +1107,12 @@ def embed(texts: List[str]) -> Optional[np.ndarray]:
 
     if _is_api_model(_DEFAULT_MODEL):
         result = _embed_api(prefixed)
-        return _ensure_api_vectors(result, os.environ.get("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1"), len(prefixed))
+        return _ensure_api_vectors(result, _effective_base_url(), len(prefixed))
 
     model = _get_model()
     if model is None or model == "api":
         return None
-    vectors = list(model.embed(prefixed))
+    vectors = list(model.embed(_cap_for_api(prefixed)))
     return np.stack(vectors).astype(np.float32)
 
 

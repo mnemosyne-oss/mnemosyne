@@ -568,7 +568,8 @@ class TestReviewHardening:
                 self._results = results
             def recall(self, *, query, query_embedding, top_k,
                        default_dense_source_filter=True, source=None, topic=None,
-                       episodic_where=None, episodic_params=()):
+                       episodic_where=None, episodic_params=(),
+                       scope_where=None, scope_params=()):
                 return self._results
 
         engine = _FakeEngine([

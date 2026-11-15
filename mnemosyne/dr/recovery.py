@@ -91,7 +91,7 @@ def _allocate_unique_backup_path(backup_dir: Path, timestamp: str) -> tuple[Path
             continue
 
         try:
-            fd = os.open(str(reservation), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            fd = os.open(str(reservation), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(fd)
         except FileExistsError:
             suffix = f"_{attempt + 1:02d}"
@@ -106,7 +106,7 @@ def _allocate_unique_backup_path(backup_dir: Path, timestamp: str) -> tuple[Path
             continue
 
         try:
-            fd = os.open(str(staged_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            fd = os.open(str(staged_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(fd)
             return final_path, staged_path, reservation
         except BaseException:
@@ -168,7 +168,7 @@ def _flush_and_fsync(handle) -> None:
     os.fsync(handle.fileno())
 
 
-def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
+def create_backup(db_path: Optional[Path] = None, backup_dir: Optional[Path] = None, format: Optional[str] = None) -> Dict:
     """
     Create a compressed backup of the database.
 
@@ -176,6 +176,11 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
     backup directory and backups of any other database go to its own
     ``stores/<stem>-<digest>`` subdirectory there. Backup names carry
     microseconds and are never overwritten.
+
+    By default, backups serialize an online snapshot into a binary SQLite archive
+    (``format='sqlite3'``), preserving FTS5 and vec0 virtual tables (#640).
+    Legacy text SQL dump format is available via ``format='sql'`` or environment
+    variable ``MNEMOSYNE_BACKUP_FORMAT=sql``.
 
     Returns:
         Dict with backup_path, size, checksum, timestamp and source_db
@@ -190,6 +195,16 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
 
     backup_dir.mkdir(parents=True, exist_ok=True)
 
+    raw_format = format if format is not None else os.environ.get("MNEMOSYNE_BACKUP_FORMAT")
+    if raw_format is None:
+        target_format = "sqlite3"
+    else:
+        target_format = raw_format.strip().lower()
+        if target_format not in ("sqlite3", "sql"):
+            raise ValueError(
+                f"Invalid backup format: {raw_format!r}. Expected 'sqlite3' or 'sql'."
+            )
+
     now = datetime.now()
     timestamp = now.strftime("%Y%m%d_%H%M%S")
     backup_path, staged_backup_path, reservation_path = _allocate_unique_backup_path(
@@ -198,39 +213,61 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
     meta_path = backup_path.with_suffix(".gz.json")
     staged_meta_path = staged_backup_path.with_suffix(".gz.json")
 
+    staged_sqlite = None
     try:
-        # Use sqlite3 online backup API instead of shutil.copyfileobj.
-        # sqlite3.backup() is lock-aware (acquires read-lock), includes
-        # uncommitted WAL frames, and is atomic — it won't produce a torn
-        # file if a checkpoint runs partway through. The old copyfileobj
-        # approach only copied the .db file, missed .db-wal frames, and
-        # could produce corrupted backups under concurrent write load.
-        src = sqlite3.connect(str(db_path))
-        try:
-            _load_sqlite_vec(src)
-            dst = sqlite3.connect(":memory:")
+        if target_format == "sqlite3":
+            # Use sqlite3 online backup API to copy into a private temporary file
+            # database, then gzip the resulting SQLite database bytes.
+            # sqlite3.backup() is lock-aware (acquires read-lock), includes
+            # uncommitted WAL frames, is atomic, and preserves FTS5/vec0
+            # virtual tables without iterdump syntax conflicts (#640).
+            staged_sqlite = staged_backup_path.with_suffix(".tmp.db")
+            sqlite_fd = os.open(str(staged_sqlite), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(sqlite_fd)
+            src = sqlite3.connect(str(db_path))
             try:
-                _load_sqlite_vec(dst)
-                src.backup(dst)
-
-                # Serialize the in-memory backup → gzip → disk
-                buf = io.BytesIO()
-                for line in dst.iterdump():
-                    buf.write((line + "\n").encode("utf-8"))
+                _load_sqlite_vec(src)
+                dst = sqlite3.connect(str(staged_sqlite))
+                try:
+                    _load_sqlite_vec(dst)
+                    src.backup(dst)
+                finally:
+                    dst.close()
             finally:
-                dst.close()
-        finally:
-            src.close()
+                src.close()
 
-        dump_bytes = buf.getvalue()
+            with open(staged_sqlite, "rb") as raw_in:
+                dump_bytes = raw_in.read()
+            try:
+                staged_sqlite.unlink()
+            except OSError:
+                pass
+            staged_sqlite = None
+        else:
+            # Legacy text SQL dump format via iterdump()
+            src = sqlite3.connect(str(db_path))
+            try:
+                _load_sqlite_vec(src)
+                dst = sqlite3.connect(":memory:")
+                try:
+                    _load_sqlite_vec(dst)
+                    src.backup(dst)
+                    buf = io.BytesIO()
+                    for line in dst.iterdump():
+                        buf.write((line + "\n").encode("utf-8"))
+                finally:
+                    dst.close()
+            finally:
+                src.close()
+            dump_bytes = buf.getvalue()
+
         with open(staged_backup_path, "wb") as raw_out:
             with gzip.GzipFile(fileobj=raw_out, mode="wb") as f_out:
                 f_out.write(dump_bytes)
             _flush_and_fsync(raw_out)
 
-        # Calculate checksums. ``dump_checksum`` covers the decompressed SQL dump
-        # payload so restore can detect corruption that survives gzip decompression
-        # (the older file-level checksums only covered the compressed container).
+        # Calculate checksums. ``dump_checksum`` covers the decompressed payload
+        # so restore can detect corruption that survives gzip decompression.
         db_checksum = _file_sha256(db_path)[:16]
         backup_checksum = _file_sha256(staged_backup_path)[:16]
         dump_checksum = hashlib.sha256(dump_bytes).hexdigest()
@@ -244,16 +281,31 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
             "backup_checksum": backup_checksum,
             "dump_checksum": dump_checksum,
             "compressed": True,
+            "format": target_format,
             "source_db": str(_resolved(db_path)),
         }
 
-        # Save metadata to staging path then publish both atomically
+        # Save metadata to staging path with mode 0600 then publish both atomically
+        meta_fd = os.open(str(staged_meta_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(meta_fd)
         with open(staged_meta_path, "w") as f:
             json.dump(metadata, f, indent=2)
             _flush_and_fsync(f)
 
+        try:
+            os.chmod(staged_backup_path, 0o600)
+            os.chmod(staged_meta_path, 0o600)
+        except OSError:
+            pass
+
         os.replace(staged_meta_path, meta_path)
         os.replace(staged_backup_path, backup_path)
+        try:
+            os.chmod(backup_path, 0o600)
+            os.chmod(meta_path, 0o600)
+        except OSError:
+            pass
+
         try:
             reservation_path.unlink()
         except OSError:
@@ -266,11 +318,12 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
             **metadata,
         }
     except BaseException:
-        for stale in (staged_backup_path, staged_meta_path, reservation_path):
-            try:
-                stale.unlink()
-            except OSError:
-                pass
+        for stale in (staged_backup_path, staged_meta_path, reservation_path, staged_sqlite):
+            if stale is not None:
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
         raise
 
 
@@ -494,35 +547,68 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
     preserved_existed = db_path.exists()
     try:
         # --- 4. Rebuild into the staged DB and validate ------------------
-        tmp_db = sqlite3.connect(str(staged_path))
-        _load_sqlite_vec(tmp_db)
-        tmp_db.set_authorizer(
-            lambda action, *_args: (
-                sqlite3.SQLITE_DENY
-                if action == sqlite3.SQLITE_ATTACH
-                else sqlite3.SQLITE_OK
-            )
-        )
-        try:
-            tmp_db.executescript(dump_bytes.decode("utf-8"))
-            integrity = tmp_db.execute("PRAGMA integrity_check").fetchone()[0]
-            if integrity != "ok":
-                raise RuntimeError(
-                    f"Staged restore failed integrity_check: {integrity}. "
-                    f"Refusing to replace target."
-                )
-            tmp_db.commit()
+        if dump_bytes.startswith(b"SQLite format 3\x00"):
+            # Binary SQLite restore path (#640): write decompressed SQLite bytes
+            # directly to staged_path, load sqlite-vec, and verify integrity.
+            staged_fd = os.open(str(staged_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(staged_fd)
+            with open(staged_path, "wb") as f_staged:
+                f_staged.write(dump_bytes)
+                _flush_and_fsync(f_staged)
+
+            tmp_db = sqlite3.connect(str(staged_path))
+            _load_sqlite_vec(tmp_db)
             try:
-                tmp_db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.OperationalError:
-                pass
-            tmp_db.close()
-        except Exception:
-            try:
+                integrity = tmp_db.execute("PRAGMA integrity_check").fetchone()[0]
+                if integrity != "ok":
+                    raise RuntimeError(
+                        f"Staged restore failed integrity_check: {integrity}. "
+                        f"Refusing to replace target."
+                    )
+                try:
+                    tmp_db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.OperationalError:
+                    pass
                 tmp_db.close()
             except Exception:
-                pass
-            raise
+                try:
+                    tmp_db.close()
+                except Exception:
+                    pass
+                raise
+        else:
+            # Legacy SQL text dump fallback: replay via executescript
+            staged_fd = os.open(str(staged_path), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(staged_fd)
+            tmp_db = sqlite3.connect(str(staged_path))
+            _load_sqlite_vec(tmp_db)
+            tmp_db.set_authorizer(
+                lambda action, *_args: (
+                    sqlite3.SQLITE_DENY
+                    if action == sqlite3.SQLITE_ATTACH
+                    else sqlite3.SQLITE_OK
+                )
+            )
+            try:
+                tmp_db.executescript(dump_bytes.decode("utf-8"))
+                integrity = tmp_db.execute("PRAGMA integrity_check").fetchone()[0]
+                if integrity != "ok":
+                    raise RuntimeError(
+                        f"Staged restore failed integrity_check: {integrity}. "
+                        f"Refusing to replace target."
+                    )
+                tmp_db.commit()
+                try:
+                    tmp_db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.OperationalError:
+                    pass
+                tmp_db.close()
+            except Exception:
+                try:
+                    tmp_db.close()
+                except Exception:
+                    pass
+                raise
 
         _fsync_path(staged_path)
 

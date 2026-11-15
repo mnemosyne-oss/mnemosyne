@@ -387,12 +387,27 @@ class MnemosyneConfig:
         self._yaml_mtime: float = 0.0
         self._yaml_lock = threading.Lock()
 
-        # Auto-seed config.yaml on first access if it doesn't exist
-        if not self._config_path.exists():
-            self._seed()
-        else:
+        # Reads never create config.yaml. Seeding on first access turned every
+        # read into a write: read-only commands grew a file in the data tree,
+        # and the seed snapshotted the process env into a file that then
+        # outranked later env changes for the rest of the process. Writers
+        # call ensure_seeded() (see cmd_config set/migrate).
+        if self._config_path.exists():
             self._warn_legacy_provider_defaults()
 
+        self._load_yaml()
+
+    def ensure_seeded(self) -> None:
+        """Materialize config.yaml with documented defaults, for writers only.
+
+        Idempotent: an existing file is left untouched. Values come from the
+        current env where set, otherwise the hardcoded defaults, so the file
+        records what is already running instead of overriding it.
+        """
+        if self._config_path.exists():
+            return
+        self._seed()
+        self._yaml_mtime = 0.0
         self._load_yaml()
 
     @classmethod
@@ -817,6 +832,43 @@ def get_config() -> MnemosyneConfig:
 def get(key: str, default: Any = None) -> Any:
     """Shortcut: get a config value from the shared instance."""
     return get_config().get(key, default)
+
+
+def peek(key: str, default: Any = None) -> Any:
+    """Read one config value without creating or seeding config.yaml.
+
+    Same ``config.yaml > env > default`` precedence as :func:`get`, but a
+    missing file is treated as empty instead of being auto-seeded. Read-only
+    callers (module import paths, doctor, diagnostics) must use this: the
+    seeding side effect of :func:`get` creates a data-tree file, which turns
+    a read into a write.
+    """
+    path = _default_config_path()
+    if path.exists():
+        import yaml
+
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            data = {}
+        if isinstance(data, dict) and key in data:
+            return data[key]
+    env_var = ENV_VAR_MAP.get(key)
+    if env_var:
+        val = os.environ.get(env_var)
+        if val is not None:
+            return val
+    return default
+
+
+def peek_bool(key: str, default: bool = False) -> bool:
+    """Boolean variant of :func:`peek`; never seeds config.yaml."""
+    val = peek(key)
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
 
 
 def get_int(key: str, default: int = 0) -> int:

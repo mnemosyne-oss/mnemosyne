@@ -20,6 +20,17 @@ MNEMOSYNE_NO_EMBEDDINGS=1 python -m pytest integrations/hermes/tests/ -v
 The Hermes provider is packaged separately from `mnemosyne-memory`, so its
 editable install is required before running `integrations/hermes/tests/`.
 
+The published minimum-Core compatibility test is an explicit online check:
+it downloads the pinned Core wheel from PyPI, verifies its SHA256, builds the
+current Hermes wheel, and exercises the provider lifecycle. It is skipped in
+normal test runs and runs in a separate CI step on every supported Python version.
+To run it locally:
+
+```bash
+MNEMOSYNE_NO_EMBEDDINGS=1 MNEMOSYNE_TEST_PUBLISHED_CORE=1 python -m pytest \
+  tests/test_hermes_core_release_contract.py::test_published_minimum_core_completes_the_provider_lifecycle -v
+```
+
 ## What You Can Do
 
 **No contribution is too small.**

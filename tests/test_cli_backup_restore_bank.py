@@ -15,6 +15,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -60,8 +61,18 @@ def _labels(path: Path) -> list[str]:
 
 
 def _dump(path) -> str:
-    with gzip.open(path, "rt", encoding="utf-8") as f:
-        return f.read()
+    decompressed = gzip.decompress(Path(path).read_bytes())
+    if decompressed.startswith(b"SQLite format 3\x00"):
+        with tempfile.TemporaryDirectory() as td:
+            db_file = Path(td) / "dump.db"
+            db_file.write_bytes(decompressed)
+            conn = sqlite3.connect(str(db_file))
+            try:
+                lines = list(conn.iterdump())
+                return "\n".join(lines)
+            finally:
+                conn.close()
+    return decompressed.decode("utf-8")
 
 
 def _store_dir(backup_root: Path, db: Path) -> Path:

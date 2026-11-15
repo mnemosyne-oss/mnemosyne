@@ -14,6 +14,7 @@ Now upgraded with BEAM architecture:
 import sqlite3
 import json
 import hashlib
+import functools
 import logging
 import threading
 import tempfile
@@ -35,6 +36,46 @@ from mnemosyne.core.beam import (
     _deferred_commits,
 )
 from mnemosyne.core.journal import journal_mode
+
+
+def _atomic_import(method):
+    """Run one JSON import under a single deferred-commit scope.
+
+    The import crosses BEAM, legacy, triple, annotation, canonical and
+    sync-event writes, and each of them commits. Suppressing those commits
+    until the whole import succeeds makes a later failure leave the target
+    unchanged (#727). Dry runs already import into a disposable clone and are
+    not wrapped.
+    """
+
+    @functools.wraps(method)
+    def wrapper(
+        self,
+        input_path,
+        force=False,
+        dry_run=False,
+        _owned_store_connections=None,
+    ):
+        if dry_run:
+            return method(
+                self,
+                input_path,
+                force=force,
+                dry_run=True,
+                _owned_store_connections=_owned_store_connections,
+            )
+        with _deferred_commits(self.conn, immediate=True):
+            return method(
+                self,
+                input_path,
+                force=force,
+                dry_run=False,
+                _owned_store_connections=_owned_store_connections,
+            )
+
+    return wrapper
+
+
 _thread_local = threading.local()
 
 # Default data directory
@@ -251,6 +292,25 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
     beam_module._thread_local.conn = _thread_local.conn
     beam_module._thread_local.db_path = str(path)
     return _thread_local.conn
+
+
+def close_thread_connection(db_path=None, *, allow_main_thread: bool = False) -> bool:
+    """Close this thread's cached SQLite connection (mnemosyne#1163).
+
+    Thin re-export of
+    :func:`mnemosyne.core.connection_release.close_thread_connection`, which
+    owns the contract, the caches it covers and the close-failure policy.
+
+    The logic lives in that module so the release can be reached without
+    importing this one: importing this module runs the ``init_db()`` below,
+    which opens a connection for the default database and republishes it into
+    ``beam``'s thread-local cache, displacing the handle the caller asked to
+    close. A cold worker that imported this helper therefore left its original
+    handle open.
+    """
+    from mnemosyne.core.connection_release import close_thread_connection as _close
+
+    return _close(db_path, allow_main_thread=allow_main_thread)
 
 
 def _close_dry_run_clone(
@@ -1136,6 +1196,7 @@ class Mnemosyne:
             "sync_events_count": len(export.get("sync_events", [])),
         }
 
+    @_atomic_import
     def import_from_file(
         self,
         input_path: str,
@@ -1310,25 +1371,19 @@ class Mnemosyne:
         stats["legacy"] = l_stats
 
         # Triples (current-truth temporal facts)
-        triples = TripleStore(db_path=self.db_path)
-        if _owned_store_connections is not None:
-            _owned_store_connections.append(triples.conn)
+        triples = TripleStore(db_path=self.db_path, conn=self.conn)
         t_stats = triples.import_all(data.get("triples", []), force=force)
         stats["triples"] = t_stats
 
         # Annotations (post-E6 schema 1.1; absent from 1.0 backups)
-        annotations = AnnotationStore(db_path=self.db_path)
-        if _owned_store_connections is not None:
-            _owned_store_connections.append(annotations.conn)
+        annotations = AnnotationStore(db_path=self.db_path, conn=self.conn)
         a_stats = annotations.import_all(data.get("annotations", []), force=force)
         stats["annotations"] = a_stats
 
         # Canonical facts (schema 1.3). Absent from <=1.2 backups -> get([]) is
         # a no-op, so older exports import unchanged. import_all is idempotent
         # and honors force, matching triples/annotations.
-        canonical = CanonicalStore(db_path=self.db_path)
-        if _owned_store_connections is not None:
-            _owned_store_connections.append(canonical.conn)
+        canonical = CanonicalStore(db_path=self.db_path, conn=self.conn)
         c_stats = canonical.import_all(data.get("canonical_facts", []), force=force)
         stats["canonical"] = c_stats
 
@@ -1399,26 +1454,41 @@ class Mnemosyne:
 # Global instance for module-level convenience functions
 _default_instance = None
 _default_bank = "default"
+# Instance for the most recent per-call ``bank=`` other than the default.
+_per_call_instance = None
 
 
 def _get_default(bank: str = None):
-    """Get or create the default Mnemosyne instance. Supports bank switching."""
-    global _default_instance, _default_bank
-    target_bank = bank or _default_bank or "default"
-    if _default_instance is None or _default_instance.bank != target_bank:
-        _default_bank = target_bank
-        _default_instance = Mnemosyne(bank=target_bank)
-    return _default_instance
+    """Return the module-level Mnemosyne instance for ``bank``.
+
+    Without ``bank`` this is the default instance, on the bank selected by
+    ``set_bank()``. A per-call ``bank`` is served from a second cached
+    instance, so it never becomes the default for later calls.
+    """
+    global _default_instance, _per_call_instance
+    default_bank = _default_bank or "default"
+    target_bank = bank or default_bank
+    if target_bank == default_bank:
+        instance = _default_instance
+        if instance is None or instance.bank != default_bank:
+            instance = _default_instance = Mnemosyne(bank=default_bank)
+        return instance
+    instance = _per_call_instance
+    if instance is None or instance.bank != target_bank:
+        instance = _per_call_instance = Mnemosyne(bank=target_bank)
+    return instance
 
 
 def set_bank(bank: str):
     """
     Switch the global default memory bank.
-    All subsequent module-level calls (remember, recall, etc.) will use this bank.
+    All subsequent module-level calls (remember, recall, etc.) that do not
+    pass ``bank=`` will use this bank.
     """
-    global _default_bank, _default_instance
+    global _default_bank, _default_instance, _per_call_instance
     _default_bank = bank
     _default_instance = None  # Force re-creation on next access
+    _per_call_instance = None
 
 
 def get_bank() -> str:
@@ -1523,6 +1593,6 @@ def scratchpad_read(bank: str = None) -> List[Dict]:
     return _get_default(bank).scratchpad_read()
 
 
-def scratchpad_clear():
+def scratchpad_clear(bank: str = None):
     """Clear scratchpad using the global instance"""
-    return _get_default().scratchpad_clear()
+    return _get_default(bank).scratchpad_clear()

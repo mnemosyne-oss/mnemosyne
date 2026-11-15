@@ -460,6 +460,101 @@ def test_enhanced_associative_cold_and_cached_content_cap(temp_db, monkeypatch, 
         memory.conn.close()
 
 
+@pytest.mark.parametrize("cap", [500, 4000], ids=["default-500", "raised-4000"])
+def test_enhanced_explain_stored_content_cap(temp_db, monkeypatch, cap):
+    """Explain must retain real FTS results, their cap, and diagnostic metadata."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    if cap != 500:
+        monkeypatch.setenv("MNEMOSYNE_RECALL_CONTENT_CAP", str(cap))
+        monkeypatch.setattr(
+            beam_module, "RECALL_CONTENT_CAP",
+            beam_module._env_int("MNEMOSYNE_RECALL_CONTENT_CAP", 500),
+        )
+    assert beam_module.RECALL_CONTENT_CAP == cap
+    query = "quasar observatory"
+    content = query + " notes: " + " ".join(f"detail{n}é星" for n in range(600))
+    assert len(content) > cap
+    memory = BeamMemory(session_id="cap-explain", db_path=temp_db)
+    try:
+        mid = memory.remember(content, source="conversation", dedupe=False)
+        stored = memory.conn.execute(
+            "SELECT * FROM working_memory WHERE id = ?", (mid,),
+        ).fetchone()
+        assert stored is not None
+        assert stored["content"] == content
+        fts_ids = {
+            row["id"] for row in memory.conn.execute(
+                "SELECT id FROM fts_working WHERE fts_working MATCH ?", (query,),
+            )
+        }
+        assert mid in fts_ids, "the stored over-cap row must be a real SQLite FTS hit"
+
+        explained = memory.recall_enhanced(
+            query, top_k=3, explain=True,
+            use_synonyms=False, use_weibull=False, use_mmr=False,
+            use_intent=False, use_associative=False,
+            vec_weight=0.0, fts_weight=1.0, importance_weight=0.0,
+        )
+        assert isinstance(explained, dict)
+        assert set(explained) == {"query", "top_k", "engine", "results", "explain"}
+        assert explained["query"] == query
+        # Existing explain delegation exposes the base recall's doubled top_k.
+        assert explained["top_k"] == 6
+        assert explained["engine"] == "linear"
+        results = explained["results"]
+        assert isinstance(results, list) and results
+        assert [row["id"] for row in results] == [mid]
+        row = results[0]
+        assert len(row["content"]) == cap
+        assert row["content"] == content[:cap]
+        assert row["tier"] == "working"
+        for key in ("source", "timestamp", "importance", "scope", "author_id",
+                    "author_type", "channel_id", "veracity", "recall_count",
+                    "last_recalled"):
+            assert row[key] == stored[key]
+        assert row["fts_score"] > 0
+        assert row["dense_score"] == 0
+
+        trace = explained["explain"]
+        assert isinstance(trace, dict)
+        assert set(trace) == {
+            "filters", "weights", "embedding", "stages", "candidates",
+            "truncation", "vec_mode",
+        }
+        assert trace["filters"] == {}
+        assert trace["weights"] == {
+            "vec": 0.0, "fts": 1.0, "importance": 0.0, "temporal": 0.0,
+        }
+        assert trace["embedding"]["available"] is False
+        assert trace["embedding"]["computed"] is False
+        assert trace["vec_mode"] == "none"
+        assert trace["truncation"] == {"top_k": 6, "dropped_count": 0}
+        primary = next(stage for stage in trace["stages"] if stage["name"] == "wm_primary")
+        assert primary == {
+            "name": "wm_primary", "raw_count": 1, "after_filter_count": 1,
+            "kept_count": 1, "fallback_used": False,
+        }
+        assert len(trace["candidates"]) == 1
+        candidate = trace["candidates"][0]
+        assert candidate == {
+            "id": mid, "tier": "working", "source_path": "wm_fts", "rank": 1,
+            "kept": True, "drop_reason": None, "content_preview": content[:120],
+            "scores": {
+                "keyword": row["keyword_score"], "fts": row["fts_score"],
+                "dense": row["dense_score"], "importance": row["importance"],
+                "recency_decay": row["recency_decay"], "final": row["score"],
+            },
+        }
+        assert not hasattr(memory, "_query_cache"), "explain must bypass the cache"
+        assert memory.conn.execute(
+            "SELECT content FROM working_memory WHERE id = ?", (mid,),
+        ).fetchone()["content"] == content
+    finally:
+        memory.conn.close()
+
+
 @pytest.mark.parametrize("source", ["raw", "consolidated"])
 def test_direct_fact_recall_respects_content_cap(temp_db, monkeypatch, source):
     """The public fact_recall surface must share the recall content bound."""
