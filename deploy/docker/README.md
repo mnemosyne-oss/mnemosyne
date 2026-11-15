@@ -15,7 +15,8 @@ From the repository root:
 umask 077
 cp deploy/docker/.env.example .env
 python3 -c 'import secrets; print(secrets.token_hex(32))'
-# Run that command three times; edit .env and replace ALL three token placeholders.
+# Run that command three times; edit .env and set MNEMOSYNE_MCP_TOKENS to a quoted JSON map
+# containing those three distinct secrets (see the commented example).
 # Set MNEMOSYNE_MCP_ALLOWED_HOSTS to the hostname clients actually send.
 docker compose --env-file .env -p mnemosyne -f docker-compose.yml build
 docker compose --env-file .env -p mnemosyne -f docker-compose.yml up -d
@@ -140,7 +141,47 @@ docker compose --env-file .env -p mnemosyne -f docker-compose.yml start mnemosyn
 docker compose --env-file .env -p mnemosyne-restore -f docker-compose.yml run --rm --no-deps --user 0 --entrypoint tar -v "$PWD/backup:/backup:ro" mnemosyne-mcp -C /data -xpf /backup/mnemosyne-data.tar
 ```
 
-Test the restored project separately on a different port before accepting the backup. Preserve recorded archive ownership when restoring. The current runtime expects UID/GID 10001; root-era archives require the stopped-volume ownership procedure below before starting the service. `/cache` can be rebuilt; including it avoids another model download. For Caddy, stop it and archive its full `/data` and `/config` volumes separately; these include sensitive CA private-key material, so encrypt/protect that backup and do not distribute it to clients.
+Start the restored project on a separate loopback port while the live service stays available. Create this untracked override (Compose 2.24.4+):
+
+```bash
+cat > backup/compose.restore.yml <<'YAML'
+services:
+  mnemosyne-mcp:
+    ports: !override ["127.0.0.1:18080:8080"]
+    environment:
+      MNEMOSYNE_MCP_ALLOWED_HOSTS: "127.0.0.1:18080"
+YAML
+docker compose --env-file .env -p mnemosyne-restore -f docker-compose.yml -f backup/compose.restore.yml up -d
+```
+
+Using one of the configured tokens in the client's private environment, connect an MCP client to `http://127.0.0.1:18080/mcp` with `Authorization: Bearer <token>`. Call `mnemosyne_recall` for a known pre-backup memory and verify its content and author. For example, with the MCP SDK installed (`pip install '.[mcp]'`), set `MNEMOSYNE_RESTORE_TOKEN` privately and run:
+
+```bash
+python3 - <<'PYRESTORE'
+import asyncio, json, os
+import httpx2
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+
+async def main():
+    async with httpx2.AsyncClient(headers={"Authorization": "Bearer " + os.environ["MNEMOSYNE_RESTORE_TOKEN"]}, timeout=180, trust_env=False) as client:
+        async with streamable_http_client("http://127.0.0.1:18080/mcp", http_client=client) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool("mnemosyne_recall", {"query": "copper otter"})
+                assert not result.is_error, result
+                rows = json.loads(result.content[0].text)["results"]
+                assert rows, "Expected a known memory from the backup"
+                print(json.dumps(rows, indent=2))
+asyncio.run(main())
+PYRESTORE
+# Only after verifying the restored contents: remove this disposable restore project.
+docker compose --env-file .env -p mnemosyne-restore -f docker-compose.yml -f backup/compose.restore.yml down -v
+```
+
+Replace `copper otter` with a memory you actually backed up. Keep the live project name `mnemosyne` out of that cleanup command; `down -v` destroys the restore project's disposable volumes. Do not add the LAN/Caddy/proxy overlays to this isolated restore test.
+
+Test the restored project before accepting the backup. Preserve recorded archive ownership when restoring. The current runtime expects UID/GID 10001; root-era archives require the stopped-volume ownership procedure below before starting the service. `/cache` can be rebuilt; including it avoids another model download. For Caddy, stop it and archive its full `/data` and `/config` volumes separately; these include sensitive CA private-key material, so encrypt/protect that backup and do not distribute it to clients.
 
 ### Existing volumes created by root-run images
 
@@ -190,7 +231,7 @@ docker build -t mnemosyne-mcp:pr .
 python -m pytest tests/docker/test_deployment.py --image mnemosyne-mcp:pr -v
 ```
 
-The explicit `--image` run fails if Docker is unavailable. In a normal host-only suite, container tests are skipped; Compose rendering also requires the Compose executable. CI runs native AMD64 and ARM64 jobs. Tests use unique temporary containers, networks and volumes and remove only their own resources.
+The explicit `--image` run fails if Docker, Compose or required MCP/HTTP test dependencies are unavailable, or if a selected test is skipped. In a normal host-only suite, container tests are skipped; Compose rendering also requires the Compose executable. CI runs native AMD64 and ARM64 jobs. Tests use unique temporary containers, networks and volumes and remove only their own resources.
 
 `requirements.lock` contains exact runtime constraints for Python 3.11 on Linux, checked for both architectures. Regenerate intentionally in a clean Python 3.11 environment with current pip using:
 

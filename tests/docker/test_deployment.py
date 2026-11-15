@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import time
 import uuid
+import warnings
 
 import pytest
 
@@ -33,8 +34,37 @@ def wait_for_https(url, context, timeout=15):
     pytest.fail('HTTPS did not become reachable with the configured CA')
 
 
+class DockerCommandError(subprocess.CalledProcessError):
+    def __str__(self):
+        return super().__str__() + "\n" + (self.stderr or self.output or '')
+
+
+def command(cmd, **kwargs):
+    kwargs.setdefault('timeout', 180)
+    result = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    if result.returncode:
+        raise DockerCommandError(result.returncode, result.args, result.stdout, result.stderr)
+    return result.stdout.strip()
+
+
 def docker(*args, **kwargs):
-    return subprocess.run(['docker', *args], check=True, capture_output=True, text=True, **kwargs).stdout.strip()
+    return command(['docker', *args], **kwargs)
+
+
+def cleanup_command(cmd, **kwargs):
+    # A secondary cleanup failure must not replace the primary test failure.
+    import sys
+    failed = sys.exc_info()[0] is not None
+    try:
+        command(cmd, **kwargs)
+    except (subprocess.SubprocessError, OSError) as exc:
+        if not failed:
+            raise
+        warnings.warn(f'Docker cleanup failed: {exc}', RuntimeWarning, stacklevel=2)
+
+
+def cleanup(*args):
+    cleanup_command(['docker', *args])
 
 
 @contextmanager
@@ -44,34 +74,34 @@ def volume():
     try:
         yield name
     finally:
-        docker('volume', 'rm', name)
+        cleanup('volume', 'rm', name)
 
 
 @contextmanager
-def service(image, data, cache):
+def service(image, data, cache, hosts='127.0.0.1:*,localhost:*'):
     name = 'mnemosyne-pr-' + uuid.uuid4().hex
     docker('run', '-d', '--name', name, '-p', '127.0.0.1::8080', '-v', data+':/data', '-v', cache+':/cache',
            '-e', 'MNEMOSYNE_MCP_TOKENS={"hermes":"test-hermes","codex":"test-codex","claude-code":"test-claude"}',
-           '-e', 'MNEMOSYNE_MCP_ALLOWED_HOSTS=127.0.0.1:*,localhost:*', image,
+           '-e', 'MNEMOSYNE_MCP_ALLOWED_HOSTS='+hosts, image,
            '--transport', 'streamable-http', '--host', '0.0.0.0', '--port', '8080')
-    port = docker('port', name, '8080/tcp').rsplit(':', 1)[1]
-    url = f'http://127.0.0.1:{port}/mcp'
     try:
+        port = docker('port', name, '8080/tcp').rsplit(':', 1)[1]
+        url = f'http://127.0.0.1:{port}/mcp'
         for _ in range(120):
             try:
-                if httpx.get(url, timeout=.5).status_code == 401:
+                if httpx.get(url, timeout=.5, trust_env=False).status_code == 401:
                     break
             except httpx.TransportError:
                 pass
             time.sleep(.5)
         else:
-            pytest.fail('Container did not become reachable')
+            pytest.fail('Container did not become reachable:\n' + docker('logs', name))
         yield name, url
     finally:
-        docker('rm', '-f', name)
+        cleanup('rm', '-f', name)
 
 
-async def call(url, token, tool=None, arguments=None, ca=True):
+async def call(url, token, tool=None, arguments=None, ca=True, expect_error=False):
     async with httpx2.AsyncClient(headers={'Authorization':f'Bearer {token}'}, timeout=180, verify=ca, trust_env=False) as client:
         async with streamable_http_client(url, http_client=client) as (read, write):
             async with ClientSession(read, write) as session:
@@ -80,7 +110,7 @@ async def call(url, token, tool=None, arguments=None, ca=True):
                     assert (await session.list_tools()).tools
                     return
                 result = await session.call_tool(tool, arguments or {})
-                assert not result.is_error, result
+                assert result.is_error == expect_error, result
                 return json.loads(result.content[0].text)
 
 
@@ -111,14 +141,54 @@ def test_compose_port_exposure(compose_cmd, overlay, host):
     assert len(ports) == (1 if host else 0)
     if host:
         assert ports[0]['host_ip'] == host
+        assert int(ports[0]['published']) == 8080
+        assert ports[0]['target'] == 8080
     if overlay=='compose.caddy.yml':
-        assert c['services']['caddy']['ports']
+        edge=c['services']['caddy']
+        assert {(p['host_ip'], int(p['published']), p['target']) for p in edge['ports']} == {
+            ('192.0.2.10',80,80), ('192.0.2.10',443,443)}
+        mounts={v['target']:v for v in edge['volumes']}
+        assert mounts['/data']['source']=='caddy-data'
+        assert mounts['/config']['source']=='caddy-config'
+        assert mounts['/etc/caddy/Caddyfile']['read_only']
+        assert Path(mounts['/etc/caddy/Caddyfile']['source']) == ROOT/'deploy/docker/Caddyfile.lan'
+    if overlay=='compose.proxy.yml':
+        networks=c['services']['mnemosyne-mcp']['networks']
+        assert set(networks)=={'default','proxy'}
+        assert c['networks']['proxy']['external']
+        assert c['networks']['proxy']['name']=='test-proxy'
 
 
-@pytest.mark.parametrize('key',['MNEMOSYNE_IMAGE','MNEMOSYNE_MCP_TOKENS','MNEMOSYNE_MCP_ALLOWED_HOSTS'])
-def test_compose_requires_configuration(compose_cmd,key):
-    assert render(compose_cmd,extra={key:''},check=False).returncode != 0
+@pytest.mark.parametrize('overlay,key', [
+    (None,'MNEMOSYNE_IMAGE'), (None,'MNEMOSYNE_MCP_TOKENS'), (None,'MNEMOSYNE_MCP_ALLOWED_HOSTS'),
+    ('compose.lan.yml','MNEMOSYNE_BIND_IP'), ('compose.proxy.yml','MNEMOSYNE_PROXY_NETWORK'),
+    ('compose.caddy.yml','MNEMOSYNE_CADDY_BIND_IP'), ('compose.caddy.yml','MNEMOSYNE_CADDYFILE'),
+    ('compose.caddy.yml','MNEMOSYNE_HOSTNAME')])
+def test_compose_requires_configuration(compose_cmd,overlay,key):
+    result=render(compose_cmd,*([overlay] if overlay else []),extra={key:''},check=False)
+    assert result.returncode != 0
+    assert key in result.stderr
 
+
+
+def test_example_env_cannot_start_with_known_tokens(compose_cmd):
+    env={k:v for k,v in os.environ.items() if not k.startswith('MNEMOSYNE_')}
+    result=subprocess.run(compose_cmd+['--env-file',str(ROOT/'deploy/docker/.env.example'),
+                                      '-f',str(ROOT/'docker-compose.yml'),'config'],
+                          env=env,capture_output=True,text=True,timeout=20)
+    assert result.returncode != 0
+    assert 'MNEMOSYNE_MCP_TOKENS' in result.stderr
+
+
+def test_documented_restore_override_is_isolated(compose_cmd,tmp_path):
+    guide=(ROOT/'deploy/docker/README.md').read_text()
+    yaml=guide.split("cat > backup/compose.restore.yml <<'YAML'\n",1)[1].split('\nYAML',1)[0]
+    override=tmp_path/'restore.yml'
+    override.write_text(yaml)
+    config=render(compose_cmd,str(override))
+    service=config['services']['mnemosyne-mcp']
+    assert [(p['host_ip'],int(p['published']),p['target']) for p in service['ports']]==[('127.0.0.1',18080,8080)]
+    assert service['environment']['MNEMOSYNE_MCP_ALLOWED_HOSTS']=='127.0.0.1:18080'
 
 def test_image_nonroot_version_and_volumes(image):
     assert docker('run','--rm','--entrypoint','id',image,'-u') == '10001'
@@ -132,9 +202,9 @@ def test_image_nonroot_version_and_volumes(image):
 def test_shared_memory_recreation_and_stopped_backup(image):
     with volume() as data, volume() as cache, volume() as backup, volume() as restored:
         with service(image,data,cache) as (name,url):
-            assert httpx.get(url).status_code==401
-            assert httpx.get(url,headers={'Authorization':'Bearer wrong'}).status_code==401
-            assert httpx.get(url,headers={'Authorization':'Bearer test-hermes','Host':'bad.invalid'}).status_code==421
+            assert httpx.get(url,trust_env=False).status_code==401
+            assert httpx.get(url,headers={'Authorization':'Bearer wrong'},trust_env=False).status_code==401
+            assert httpx.get(url,headers={'Authorization':'Bearer test-hermes','Host':'bad.invalid'},trust_env=False).status_code==421
             docker('exec',name,'python','/opt/mnemosyne/healthcheck.py')
             docker('exec',name,'python','/opt/mnemosyne/readiness.py')
             result=asyncio.run(call(url,'test-hermes','mnemosyne_remember',{'content':'Copper otter prefers vanilla tea'}))
@@ -157,59 +227,58 @@ def test_shared_memory_recreation_and_stopped_backup(image):
                 assert any('Copper otter' in r['content'] for r in rows)
 
 
-def test_caddy_internal_https_and_persistent_ca(image, tmp_path):
+def test_caddy_internal_https_and_persistent_ca(image, compose_cmd, tmp_path):
     import ssl
-    caddy_image = 'caddy:2-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0'
-    for file in ['Caddyfile.lan', 'Caddyfile.public']:
-        docker('run','-i','--rm','-e','MNEMOSYNE_HOSTNAME=localhost','--entrypoint','caddy',caddy_image,'validate','--config','-','--adapter','caddyfile', input=(ROOT/'deploy/docker'/file).read_text())
-    network='mnemosyne-pr-'+uuid.uuid4().hex
-    name='mnemosyne-pr-'+uuid.uuid4().hex
-    docker('network','create',network)
+    caddy_image=render(compose_cmd,'compose.caddy.yml')['services']['caddy']['image']
+    for file in ['Caddyfile.lan','Caddyfile.public']:
+        docker('run','-i','--rm','-e','MNEMOSYNE_HOSTNAME=localhost','--entrypoint','caddy',caddy_image,
+               'validate','--config','-','--adapter','caddyfile',input=(ROOT/'deploy/docker'/file).read_text())
+    # Use the actual deployment stack and persistent mounts. Only replace the
+    # edge's host ports to avoid privileged/colliding 80/443 during acceptance.
+    override=tmp_path/'compose.test.yml'
+    override.write_text('services:\n  caddy:\n    ports: !override ["127.0.0.1::443"]\n')
+    env=dict(os.environ,MNEMOSYNE_IMAGE=image,
+             MNEMOSYNE_MCP_TOKENS='{"hermes":"test-hermes","codex":"test-codex"}',
+             MNEMOSYNE_MCP_ALLOWED_HOSTS='localhost:*',MNEMOSYNE_HOSTNAME='localhost',
+             MNEMOSYNE_CADDY_BIND_IP='127.0.0.1',MNEMOSYNE_CADDYFILE=str(ROOT/'deploy/docker/Caddyfile.lan'))
+    cmd=compose_cmd+['-p','mnemosyne-pr-'+uuid.uuid4().hex,'-f',str(ROOT/'docker-compose.yml'),
+                     '-f',str(ROOT/'deploy/docker/compose.caddy.yml'),'-f',str(override)]
+    def compose(*args):
+        return command(cmd+list(args),env=env)
     try:
-        with volume() as data, volume() as cache, volume() as ca, volume() as config:
-            with service(image,data,cache) as (upstream,_):
-                docker('network','connect','--alias','mnemosyne-mcp',network,upstream)
-                docker('create','--name',name,'--network',network,'-p','127.0.0.1::443',
-                       '-e','MNEMOSYNE_HOSTNAME=localhost',
-                       '-v',ca+':/data','-v',config+':/config',caddy_image)
-                docker('cp',str(ROOT/'deploy/docker/Caddyfile.lan'),name+':/etc/caddy/Caddyfile')
-                docker('start',name)
-                try:
-                    port=docker('port',name,'443/tcp').rsplit(':',1)[1]
-                    url=f'https://localhost:{port}/mcp'
-                    root='/data/caddy/pki/authorities/local/root.crt'
-                    for _ in range(60):
-                        try:
-                            docker('cp',name+':'+root,str(tmp_path/'root.crt'))
-                            break
-                        except subprocess.CalledProcessError:
-                            time.sleep(.5)
-                    context=ssl.create_default_context(cafile=str(tmp_path/'root.crt'))
-                    wait_for_https(url, context)
-                    with pytest.raises(httpx.TransportError):
-                        httpx.get(url,trust_env=False)
-                    assert httpx.get(url,headers={'Authorization':'Bearer wrong'},verify=context,trust_env=False).status_code==401
-                    asyncio.run(call(url,'test-hermes',ca=context))
-                    stored=asyncio.run(call(url,'test-hermes','mnemosyne_remember',{'content':'Amber fox shares HTTPS memory'},ca=context))
-                    assert stored['status']=='stored'
-                    rows=asyncio.run(call(url,'test-codex','mnemosyne_recall',{'query':'Amber fox'},ca=context))['results']
-                    assert any('Amber fox' in r['content'] for r in rows)
-                    before=(tmp_path/'root.crt').read_bytes()
-                    docker('rm','-f',name)
-                    docker('create','--name',name,'--network',network,'-p','127.0.0.1::443',
-                           '-e','MNEMOSYNE_HOSTNAME=localhost','-v',ca+':/data','-v',config+':/config',caddy_image)
-                    docker('cp',str(ROOT/'deploy/docker/Caddyfile.lan'),name+':/etc/caddy/Caddyfile')
-                    docker('start',name)
-                    docker('cp',name+':'+root,str(tmp_path/'root-after.crt'))
-                    assert (tmp_path/'root-after.crt').read_bytes()==before
-                    new_port=docker('port',name,'443/tcp').rsplit(':',1)[1]
-                    new_url=f'https://localhost:{new_port}/mcp'
-                    wait_for_https(new_url, context)
-                    asyncio.run(call(new_url,'test-codex',ca=context))
-                finally:
-                    docker('rm','-f',name)
+        compose('up','-d','--no-build')
+        name=compose('ps','-q','caddy')
+        port=docker('port',name,'443/tcp').rsplit(':',1)[1]
+        url=f'https://localhost:{port}/mcp'
+        root='/data/caddy/pki/authorities/local/root.crt'
+        for _ in range(60):
+            try:
+                docker('cp',name+':'+root,str(tmp_path/'root.crt'))
+                break
+            except subprocess.CalledProcessError:
+                time.sleep(.5)
+        else:
+            pytest.fail('Caddy did not create its root CA:\n'+docker('logs',name))
+        context=ssl.create_default_context(cafile=str(tmp_path/'root.crt'))
+        wait_for_https(url,context)
+        with pytest.raises(httpx.ConnectError,match='CERTIFICATE_VERIFY_FAILED'):
+            httpx.get(url,trust_env=False)
+        asyncio.run(call(url,'test-hermes',ca=context))
+        stored=asyncio.run(call(url,'test-hermes','mnemosyne_remember',{'content':'Amber fox shares HTTPS memory'},ca=context))
+        assert stored['status']=='stored'
+        rows=asyncio.run(call(url,'test-codex','mnemosyne_recall',{'query':'Amber fox'},ca=context))['results']
+        assert any('Amber fox' in r['content'] and r['author_id']=='hermes' for r in rows)
+        before=(tmp_path/'root.crt').read_bytes()
+        compose('up','-d','--no-deps','--no-build','--force-recreate','caddy')
+        name=compose('ps','-q','caddy')
+        docker('cp',name+':'+root,str(tmp_path/'root-after.crt'))
+        assert (tmp_path/'root-after.crt').read_bytes()==before
+        new_port=docker('port',name,'443/tcp').rsplit(':',1)[1]
+        new_url=f'https://localhost:{new_port}/mcp'
+        wait_for_https(new_url,context)
+        asyncio.run(call(new_url,'test-codex',ca=context))
     finally:
-        docker('network','rm',network)
+        cleanup_command(cmd+['down','-v','--remove-orphans'],env=env)
 
 
 def test_stdio_compatibility(image):
@@ -225,17 +294,42 @@ def test_stdio_compatibility(image):
 
 
 def test_nonroot_unwritable_mount_fails(image):
-    with volume() as data:
+    with volume() as data, volume() as cache:
         docker('run','--rm','-u','0','-v',data+':/data','--entrypoint','sh',image,'-c','touch /data/root-owned && chown 0:0 /data && chmod 700 /data')
-        result=subprocess.run(['docker','run','--rm','-v',data+':/data','--entrypoint','python',image,'-c','from pathlib import Path; Path("/data/probe").write_text("x")'],capture_output=True,text=True)
-        assert result.returncode!=0
-        assert 'PermissionError' in result.stderr
+        # MCP storage is lazy: exercise the default service's real write path,
+        # rather than inventing a startup-refusal contract or overriding Python.
+        with service(image,data,cache) as (_,url):
+            result=asyncio.run(call(url,'test-hermes','mnemosyne_remember',
+                                   {'content':'Unwritable mount must reject this'},expect_error=True))
+            assert result['status']=='error'
+            assert 'Permission denied' in result['message'] or 'PermissionError' in result['message']
 
 
-@pytest.mark.parametrize('tokens,hosts',[('', 'localhost:*'),('{"a":"x"}', ''),('not-json','localhost:*')])
-def test_container_refuses_invalid_auth_configuration(image,tokens,hosts):
-    result=subprocess.run(['docker','run','--rm','-e','MNEMOSYNE_MCP_TOKENS='+tokens,'-e','MNEMOSYNE_MCP_ALLOWED_HOSTS='+hosts,image,'--transport','streamable-http','--host','0.0.0.0'],capture_output=True,text=True,timeout=20)
-    assert result.returncode != 0
+@pytest.mark.parametrize('tokens,hosts,message',[
+    ('', 'localhost:*', 'is set but empty'),
+    ('{"a":"x"}', '', 'without a Host policy'),
+    ('not-json','localhost:*','is not valid JSON'),
+    ('{}','localhost:*','is empty; add at least one'),
+    ('{"a":""}','localhost:*','contains an empty name or secret'),
+    ('{"a":123}','localhost:*','entries must be JSON strings')])
+def test_container_refuses_invalid_auth_configuration(image,tokens,hosts,message):
+    name='mnemosyne-pr-'+uuid.uuid4().hex
+    try:
+        result=subprocess.run(['docker','run','--rm','--name',name,
+                               '-e','MNEMOSYNE_MCP_TOKENS='+tokens,'-e','MNEMOSYNE_MCP_ALLOWED_HOSTS='+hosts,
+                               image,'--transport','streamable-http','--host','0.0.0.0'],
+                              capture_output=True,text=True,timeout=20)
+        assert result.returncode != 0
+        assert message in result.stderr, result.stderr
+    finally:
+        # --rm may already have removed it; also clean up if the client timed out.
+        subprocess.run(['docker','rm','-f',name],capture_output=True,timeout=20)
+
+
+def test_star_host_is_not_a_hostname_wildcard(image):
+    with volume() as data, volume() as cache, service(image,data,cache,hosts='*') as (_,url):
+        response=httpx.get(url,headers={'Authorization':'Bearer test-hermes'},trust_env=False)
+        assert response.status_code==421
 
 
 def test_compose_token_environment_roundtrip(compose_cmd,image):

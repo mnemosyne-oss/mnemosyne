@@ -36,7 +36,7 @@ jobs:
       - name: Build checked-out source
         run: docker build --build-arg VERSION="$(python -c 'from importlib.metadata import version; print(version("mnemosyne-memory"))')" --build-arg REVISION="$GITHUB_SHA" -t mnemosyne-mcp:pr .
       - name: Verify MCP contract and release gate
-        run: python -m pytest tests/test_docker_shared_mcp.py tests/test_docker_release.py tests/test_mcp_streamable_http.py tests/test_multi_agent_identity.py tests/test_s1_mcp_sse_auth.py -q
+        run: python -m pytest tests/test_docker_shared_mcp.py tests/test_docker_release.py tests/test_docker_acceptance_gates.py tests/test_mcp_streamable_http.py tests/test_multi_agent_identity.py tests/test_s1_mcp_sse_auth.py -q
       - name: Verify image, Compose, local model, persistence and HTTPS
         run: python -m pytest tests/docker/test_deployment.py --image mnemosyne-mcp:pr -v
       - name: Record image size

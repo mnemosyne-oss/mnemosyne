@@ -15,6 +15,17 @@ The Docker changes were transferred to `main` at `81dd2b662772ddc78fcdbb990be9b5
 - The general CI matrix also exercises the helper under Python 3.10. Its healthcheck regression reproduced the unavailable `asyncio.timeout` call, then passed after using the equally bounded `asyncio.wait_for`. The related Python 3.10 selection passed **162 tests**; the Python 3.11 health/release selection passed **10 tests**. Docker keeps Python 3.11 as its image base.
 - Hosted AMD64 exposed a Caddy test startup race: the CA file can exist before the TLS listener is ready. The test now waits at most 15 seconds for a CA-verified HTTPS 401 before checking certificate rejection and MCP access, including after recreation. A real local TLS regression reproduces an early-closed handshake and passes with the bounded wait under Python 3.10 and 3.11; the Python 3.11 TLS/health/release selection passed **11 tests**. This changes test synchronization only.
 
+
+### PR review follow-up
+
+The example token value is now empty, so copying the file cannot enable publicly known tokens. The restore guide includes an isolated loopback-port override, authenticated SDK recall and scoped cleanup. Historical plan statements now match the implemented inference-readiness contract.
+
+Docker acceptance fails on missing Compose/dependencies or skipped tests when explicitly requested. Its tests assert actual bindings/network attachments, required overlay variables, specific authentication errors, default-service write rejection on an unwritable mount and literal `*` Host behavior. Caddy is exercised through the deployed Compose overlay, including its read-only configuration and persistent CA volumes; untrusted TLS must fail with a certificate-verification error. Diagnostics retain Docker stderr/logs and cleanup preserves the primary failure.
+
+The release tests execute the workflow's existing pre-login source/check gates offline against disposable Git histories and a fixture-only `gh` command: lightweight/annotated tags, mismatched versions, unrelated histories and missing/failed/superseded native checks. No release workflow, registry login or image push is invoked. Local review selection: **180 passed on Python 3.11**, with **24 acceptance-gate/release tests passed on Python 3.10**. Hosted results for the follow-up head are tracked in PR #1361.
+
+Two proposed expectations were adjusted to match existing behavior, rather than modifying Core: storage is initialized lazily, so an unwritable mount is checked through a real mutation call; the MCP SDK treats `*` as a literal Host entry, not a global wildcard, so a normal hostname must receive 421. The Python 3.10 healthcheck issue was already fixed before this pass.
+
 The following sections retain the original acceptance and baseline record with its original source revisions.
 
 ## Container checks

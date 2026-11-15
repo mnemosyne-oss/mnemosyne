@@ -22,7 +22,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 @asynccontextmanager
 async def agent(url, token):
-    async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"}, timeout=15) as client:
+    async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"}, timeout=15, trust_env=False) as client:
         async with streamable_http_client(url, http_client=client) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
@@ -52,7 +52,7 @@ def shared_server(tmp_path):
                 if proc.poll() is not None:
                     pytest.fail((tmp_path / "server.log").read_text())
                 try:
-                    if httpx.get(url, timeout=.2).status_code == 401:
+                    if httpx.get(url, timeout=.2, trust_env=False).status_code == 401:
                         break
                 except httpx.TransportError:
                     pass
@@ -85,14 +85,19 @@ def test_agents_share_memory_and_keep_authors(shared_server):
             rows = payload(await c.call_tool("mnemosyne_recall", {"query": "Copper otter"}))["results"]
             assert any("Copper otter" in r["content"] for r in rows)
             result = await c.call_tool("mnemosyne_remember", {"content": "Spoof must not be written", "author_id": "hermes"})
-            assert json.loads(result.content[0].text)["status"] == "error"
+            assert result.is_error
+            error = json.loads(result.content[0].text)
+            assert error["status"] == "error"
+            assert "conflicts with the authenticated" in error["message"]
+            rows = payload(await c.call_tool("mnemosyne_recall", {"query": "Spoof must not be written"}))["results"]
+            assert not any("Spoof must not be written" in row["content"] for row in rows)
     asyncio.run(exercise())
 
 
 def test_http_auth_and_host_gates(shared_server):
-    assert httpx.get(shared_server).status_code == 401
-    assert httpx.get(shared_server, headers={"Authorization": "Bearer wrong"}).status_code == 401
-    response = httpx.get(shared_server, headers={"Authorization": "Bearer test-hermes", "Host": "untrusted.invalid"})
+    assert httpx.get(shared_server, trust_env=False).status_code == 401
+    assert httpx.get(shared_server, headers={"Authorization": "Bearer wrong"}, trust_env=False).status_code == 401
+    response = httpx.get(shared_server, headers={"Authorization": "Bearer test-hermes", "Host": "untrusted.invalid"}, trust_env=False)
     assert response.status_code == 421
 
 
@@ -107,5 +112,6 @@ def test_healthcheck_probes_running_server(shared_server):
     assert result.returncode == 0, result.stderr.decode()
     env['MNEMOSYNE_MCP_TOKENS'] = '{"hermes":"wrong"}'
     assert subprocess.run([sys.executable, str(probe)], env=env, capture_output=True, timeout=15).returncode == 1
+    env['MNEMOSYNE_MCP_TOKENS'] = '{"hermes":"test-hermes"}'
     env['MNEMOSYNE_MCP_HEALTH_PORT'] = '1'
     assert subprocess.run([sys.executable, str(probe)], env=env, capture_output=True, timeout=15).returncode == 1
