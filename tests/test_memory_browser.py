@@ -65,20 +65,34 @@ def test_build_html_escapes_reflected_query():
     assert 'value="&quot;&gt;&lt;img src=x onerror=alert(1)&gt;' in html
 
 
-def test_build_html_escapes_stored_memory_fields():
+@pytest.mark.parametrize(
+    "field, value, expected",
+    [
+        ("id", 'a"b/<c>', 'href="/detail/a%22b%2F%3Cc%3E"'),
+        ("content", '<body>&"\'', '<div class="memory-content">&lt;body&gt;&amp;&quot;&#x27;</div>'),
+        ("source", '<origin>&"\'', '<span>source: &lt;origin&gt;&amp;&quot;&#x27;</span>'),
+        ("timestamp", '<time>&"\'', '<span>&lt;time&gt;&amp;&quot;&#x27;</span>'),
+        ("importance", '<weight>&"\'', '<span>importance: &lt;weight&gt;&amp;&quot;&#x27;</span>'),
+        ("tier", 'kind_<tier>&"\'', '<span class="tag">kind &lt;tier&gt;&amp;&quot;&#x27;</span>'),
+    ],
+)
+def test_build_html_escapes_stored_memory_fields(field, value, expected):
+    """Each field remains visible in its own escaped rendering context."""
     memory = {
-        "id": 'a"b/<c>',
-        "content": XSS,
-        "source": XSS,
-        "timestamp": XSS,
-        "importance": XSS,
-        "tier": XSS,
+        "id": "safe-id",
+        "content": "safe content",
+        "source": "safe-source",
+        "timestamp": "2026-11-15",
+        "importance": 0.5,
+        "tier": "working",
     }
-    html = memory_browser._build_html([memory], source=XSS)
+    memory[field] = value
+    html = memory_browser._build_html([memory], source=str(memory["source"]))
 
-    assert "<img src=x onerror" not in html
-    assert "<script>alert(2)" not in html
-    assert 'href="/detail/a%22b%2F%3Cc%3E"' in html
+    assert value not in html
+    assert expected in html
+    if field == "source":
+        assert '<option value="&lt;origin&gt;&amp;&quot;&#x27;" selected>' in html
 
 
 def test_build_html_sets_script_nonce():
@@ -133,9 +147,18 @@ def test_index_and_detail_escape_and_send_csp(tmp_path, monkeypatch):
     nonce = csp.split("'nonce-", 1)[1].split("'", 1)[0]
     assert f'<script nonce="{nonce}">' in index.text
 
+    second = client.get("/")
+    assert second.status_code == 200
+    second_nonce = second.headers["content-security-policy"].split("'nonce-", 1)[1].split("'", 1)[0]
+    assert second_nonce != nonce
+    assert f'<script nonce="{second_nonce}">' in second.text
+
     detail = client.get("/detail/m1")
     assert detail.status_code == 200
     assert "<img src=x onerror" not in detail.text
+    for response in (index, second, detail):
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["referrer-policy"] == "no-referrer"
 
     monkeypatch.setattr(memory_browser, "get_memory_detail", lambda *_: {"id": "m1"})
     reflected = client.get("/detail/%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E")
@@ -149,3 +172,59 @@ def test_rejects_non_local_host_header(tmp_path, monkeypatch):
 
     response = client.get("/api/search", headers={"host": "attacker.example:8081"})
     assert response.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "configured_host, authority",
+    [
+        ("127.0.0.1", "127.0.0.1:8081"),
+        ("127.0.0.1", "LOCALHOST:8081"),
+        ("::1", "[::1]:8081"),
+        ("memory.internal", "MEMORY.INTERNAL:8081"),
+        ("2001:db8::7", "[2001:db8::7]:8081"),
+        ("2001:DB8::7", "[2001:db8::7]:8081"),
+    ],
+)
+def test_cli_host_accepts_allowed_authority_only(
+    tmp_path, monkeypatch, configured_host, authority
+):
+    """CLI bind hosts allow loopback and explicit authorities, rejecting others."""
+    import sys
+    from types import SimpleNamespace
+
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+    with sqlite3.connect(memory_browser._resolve_db_path("default")) as conn:
+        conn.execute(
+            "CREATE TABLE working_memory (id TEXT, content TEXT, source TEXT, timestamp TEXT, importance REAL)"
+        )
+        conn.execute(
+            "INSERT INTO working_memory VALUES (?, ?, ?, ?, ?)",
+            ("ipv6", "IPv6 authority sentinel", "test", "2026-11-15", 0.5),
+        )
+
+    captured = {}
+
+    def capture_server(app, **kwargs):
+        captured["app"] = app
+        captured["host"] = kwargs["host"]
+
+    monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=capture_server))
+    monkeypatch.setattr(sys, "argv", ["mnemosyne-browser", "--host", configured_host])
+    with pytest.warns(DeprecationWarning, match="mnemosyne-browser is deprecated"):
+        memory_browser.main()
+
+    assert captured["host"] == configured_host
+    with TestClient(captured["app"], base_url=f"http://{authority}") as client:
+        response = client.get("/api/search")
+        assert response.status_code == 200
+        assert [row["content"] for row in response.json()["results"]] == [
+            "IPv6 authority sentinel",
+        ]
+        for foreign in ("[2001:db8::8]:8081", "attacker.example:8081"):
+            rejected = client.get("/api/search", headers={"host": foreign})
+            assert rejected.status_code == 403
+            assert "IPv6 authority sentinel" not in rejected.text
