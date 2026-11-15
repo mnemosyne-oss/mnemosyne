@@ -39,8 +39,9 @@ Opening an active WAL store with SQLite's read-only mode may update reader
 coordination marks in `-shm`. If the last existing connection closes between
 preflight and the read-only open, SQLite can remove and recreate coordination
 sidecars. This normal SQLite read coordination is permitted. The preview never
-issues data mutations or initializes/migrates storage; it opens SQLite read-only
-and does not write database contents or committed WAL data. Concurrent writers
+issues data mutations or initializes/migrates storage. MCP opens a read-only
+SQLite connection; Hermes providers read through their existing connection.
+Neither path writes database contents or committed WAL data. Concurrent writers
 and checkpoints can change those files independently, so this is not a promise
 of byte-for-byte preservation during concurrent database activity.
 
