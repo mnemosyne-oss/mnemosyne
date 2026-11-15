@@ -246,7 +246,7 @@ def test_caddy_internal_https_and_persistent_ca(image, compose_cmd, tmp_path):
     def compose(*args):
         return command(cmd+list(args),env=env)
     try:
-        compose('up','-d','--no-build')
+        compose('up','-d','--no-build','--wait','--wait-timeout','90')
         name=compose('ps','-q','caddy')
         port=docker('port',name,'443/tcp').rsplit(':',1)[1]
         url=f'https://localhost:{port}/mcp'
@@ -315,14 +315,29 @@ def test_nonroot_unwritable_mount_fails(image):
 def test_container_refuses_invalid_auth_configuration(image,tokens,hosts,message):
     name='mnemosyne-pr-'+uuid.uuid4().hex
     try:
-        result=subprocess.run(['docker','run','--rm','--name',name,
+        result=subprocess.run(['docker','run','--rm','--name',name,'--entrypoint','python',
                                '-e','MNEMOSYNE_MCP_TOKENS='+tokens,'-e','MNEMOSYNE_MCP_ALLOWED_HOSTS='+hosts,
-                               image,'--transport','streamable-http','--host','0.0.0.0'],
+                               image,'-m','mnemosyne.mcp_server','--transport','streamable-http','--host','0.0.0.0'],
                               capture_output=True,text=True,timeout=20)
         assert result.returncode != 0
         assert message in result.stderr, result.stderr
     finally:
         # --rm may already have removed it; also clean up if the client timed out.
+        subprocess.run(['docker','rm','-f',name],capture_output=True,timeout=20)
+
+
+
+def test_default_cli_refuses_invalid_auth_without_traceback(image):
+    name='mnemosyne-pr-'+uuid.uuid4().hex
+    try:
+        result=subprocess.run(['docker','run','--rm','--name',name,'-e','MNEMOSYNE_MCP_TOKENS={}',
+                               '-e','MNEMOSYNE_MCP_ALLOWED_HOSTS=localhost:*',image,
+                               '--transport','streamable-http','--host','0.0.0.0'],
+                              capture_output=True,text=True,timeout=20)
+        assert result.returncode==1
+        assert result.stderr.rstrip().endswith('Error: cli_unexpected_failure')
+        assert 'Traceback' not in result.stderr
+    finally:
         subprocess.run(['docker','rm','-f',name],capture_output=True,timeout=20)
 
 
