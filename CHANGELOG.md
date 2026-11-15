@@ -8,6 +8,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 ## [Unreleased]
 
 ### Added
+- **Shared MCP self-hosting with Docker.** Builds the checked-out source with local embeddings as a non-root container, preserves data and model cache in volumes, and provides Streamable HTTP deployment examples for an existing proxy, direct LAN HTTP and optional Caddy HTTPS. Named bearer tokens identify trusted agents sharing one memory; they do not provide tenant isolation. Includes bounded embedding readiness, container acceptance checks, client recipes and a disabled manual image-publication workflow. Compose defaults change from public SSE to loopback-bound Streamable HTTP and require named tokens plus allowed Hosts; existing deployments must update their configuration.
 - **Advisory offline linear BEAM throughput benchmark (#901).** A fixed synthetic workload on a temporary database reports warm per-call latency, sequential throughput, raw samples and environment/revision metadata as JSON, with compatible same-machine baseline comparisons and a documented retention/interpretation policy. No runtime recall changes or CI timing threshold.
 
 ### Fixed

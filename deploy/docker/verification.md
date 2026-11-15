@@ -2,6 +2,18 @@
 
 Date: 2026-11-15. Source baseline: `ec5747a`. No image was pushed and no GitHub workflow was activated or run remotely. This record distinguishes actual runtime checks from configuration validation.
 
+## Current PR preparation on Main 4.1.0
+
+The Docker changes were transferred to `main` at `81dd2b662772ddc78fcdbb990be9b5b3adfbd346` for the local PR candidate. Core runtime, provider implementation and standalone release metadata match that Main revision; unrelated Hermes release-preparation commits are not included. Package discovery only adds the deployment-script exclusion.
+
+- Focused MCP/release/wheel selection: **165 passed** on Python 3.11 with the current dependencies.
+- Current Core 4.1.0 image, runtime candidate `2001a87`: **17 native AMD64 container tests passed on QNAP in 159.13 seconds**.
+- Ruff F/RUF022, actionlint and generated-document/documentation checks passed.
+- Complete current local suite: pending final result.
+- Hosted CI and a new native ARM64 container run for this rebased source have not run. The ARM64/container/client measurements below are historical results from the earlier Core 4.0.0 candidate, not new results for Main 4.1.0.
+
+The following sections retain the original acceptance and baseline record with its original source revisions.
+
 ## Container checks
 
 | Environment | Result |
