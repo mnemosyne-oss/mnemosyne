@@ -156,9 +156,17 @@ def test_doctor_preserves_known_scope_in_json_and_markdown():
     assert {row["scope"] for row in payload["runtime_diagnostics"]["checks"]} == {
         "provider_runtime"
     }
-    assert "provider_runtime" in render_doctor_json(payload)
-    assert "provider_runtime" in render_doctor_markdown(payload)
-    assert "checks_scope" in render_doctor_markdown(payload)
+    artifact = json.loads(render_doctor_json(payload))
+    numpy_check = next(
+        row for row in artifact["runtime_diagnostics"]["checks"]
+        if row["check"] == "numpy"
+    )
+    assert numpy_check["scope"] == "provider_runtime"
+    markdown_row = next(
+        row for row in render_doctor_markdown(payload).splitlines()
+        if row.startswith("- numpy: `")
+    )
+    assert '"scope":"provider_runtime"' in markdown_row
 
 
 def test_mcp_reports_actual_server_role(tmp_path, monkeypatch):
