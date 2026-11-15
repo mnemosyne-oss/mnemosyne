@@ -1,6 +1,6 @@
 # Docker deployment verification
 
-Date: 2026-11-15. Source baseline: `ec5747a`. No image was pushed and no GitHub workflow was activated or run remotely. This record distinguishes actual runtime checks from configuration validation.
+Date: 2026-11-15. Current PR base: `81dd2b6`; historical acceptance baseline: `ec5747a`. No image was pushed and no GitHub workflow was activated or run remotely. This record distinguishes actual runtime checks from configuration validation.
 
 ## Current PR preparation on Main 4.1.0
 
@@ -9,7 +9,8 @@ The Docker changes were transferred to `main` at `81dd2b662772ddc78fcdbb990be9b5
 - Focused MCP/release/wheel selection: **165 passed** on Python 3.11 with the current dependencies.
 - Current Core 4.1.0 image, runtime candidate `2001a87`: **17 native AMD64 container tests passed on QNAP in 159.13 seconds**.
 - Ruff F/RUF022, actionlint and generated-document/documentation checks passed.
-- Complete current local suite: pending final result.
+- Complete local suite on runtime candidate `2001a87`: **9432 passed, 91 skipped, one deprecation warning, seven passed subtests** (525.22 seconds). The earlier 14 failures below belong to the historical source/environment and are not failures of this run.
+- The final ownership-migration follow-up changes documentation/test coverage only. No runtime/build files changed. The expanded native QNAP selection passed **18/18 tests in 181.37 seconds**, including root-owned data/cache migration, preserved content/authorship and access as UID 10001. Without the documented ownership change the new regression failed, as expected.
 - Hosted CI and a new native ARM64 container run for this rebased source have not run. The ARM64/container/client measurements below are historical results from the earlier Core 4.0.0 candidate, not new results for Main 4.1.0.
 
 The following sections retain the original acceptance and baseline record with its original source revisions.

@@ -248,3 +248,41 @@ def test_cold_cache_offline_requires_model_readiness(image):
                               capture_output=True,text=True,timeout=130)
         assert result.returncode == 1
         assert 'not ready' in result.stderr
+
+
+def test_root_owned_legacy_volume_migration_preserves_memory(image):
+    """Old root-run images leave data inaccessible to the new runtime UID."""
+    with volume() as data, volume() as cache:
+        mounts=['-v',data+':/data','-v',cache+':/cache']
+        seed='''
+from pathlib import Path
+from mnemosyne.core.memory import Mnemosyne
+memory = Mnemosyne(session_id="mcp_default", author_id="legacy-root")
+assert memory.remember("Legacy copper otter keeps existing memories", scope="global")
+Path("/cache/legacy-marker").write_text("keep this cache marker")
+'''
+        docker('run','--rm','--user','0',*mounts,'-e','MNEMOSYNE_NO_EMBEDDINGS=1',
+               '--entrypoint','python',image,'-c',seed)
+        docker('run','--rm','--user','0',*mounts,'--entrypoint','sh',image,'-ec',
+               'chown -hR 0:0 /data /cache; chmod 700 /data /cache')
+        denied=subprocess.run(['docker','run','--rm',*mounts,'--entrypoint','python',image,
+                               '-c','from pathlib import Path; Path("/cache/legacy-marker").read_text()'],
+                              capture_output=True,text=True)
+        assert denied.returncode != 0
+        assert 'PermissionError' in denied.stderr
+        # Same scoped operation documented for stopped, dedicated named volumes.
+        docker('run','--rm','--user','0',*mounts,'--entrypoint','sh',image,'-ec',
+               'chown -hR 10001:10001 /data /cache')
+        verify='''
+import os
+from pathlib import Path
+from mnemosyne.core.memory import Mnemosyne
+assert os.getuid() == 10001
+assert os.stat("/data").st_uid == 10001
+assert os.stat("/cache/legacy-marker").st_uid == 10001
+assert Path("/cache/legacy-marker").read_text() == "keep this cache marker"
+rows = Mnemosyne(session_id="mcp_default").recall("Legacy copper otter")
+assert any(row["content"] == "Legacy copper otter keeps existing memories" and row["author_id"] == "legacy-root" for row in rows)
+'''
+        docker('run','--rm',*mounts,'-e','MNEMOSYNE_NO_EMBEDDINGS=1',
+               '--entrypoint','python',image,'-c',verify)

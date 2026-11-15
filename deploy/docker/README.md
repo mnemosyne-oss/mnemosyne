@@ -140,7 +140,36 @@ docker compose --env-file .env -p mnemosyne -f docker-compose.yml start mnemosyn
 docker compose --env-file .env -p mnemosyne-restore -f docker-compose.yml run --rm --no-deps --user 0 --entrypoint tar -v "$PWD/backup:/backup:ro" mnemosyne-mcp -C /data -xpf /backup/mnemosyne-data.tar
 ```
 
-Test the restored project separately on a different port before accepting the backup. Preserve archive ownership (10001) when restoring. `/cache` can be rebuilt; including it avoids another model download. For Caddy, stop it and archive its full `/data` and `/config` volumes separately; these include sensitive CA private-key material, so encrypt/protect that backup and do not distribute it to clients.
+Test the restored project separately on a different port before accepting the backup. Preserve recorded archive ownership when restoring. The current runtime expects UID/GID 10001; root-era archives require the stopped-volume ownership procedure below before starting the service. `/cache` can be rebuilt; including it avoids another model download. For Caddy, stop it and archive its full `/data` and `/config` volumes separately; these include sensitive CA private-key material, so encrypt/protect that backup and do not distribute it to clients.
+
+### Existing volumes created by root-run images
+
+Earlier images ran as root. Image-build ownership settings do not change existing mounts, so those databases and directories may remain owned by UID 0. Before the first non-root start, migrate their ownership while all writers are stopped. This changes filesystem ownership, not the database format; cross-version schema compatibility still needs separate verification.
+
+First identify the old container's Compose project and exact `/data` mount:
+
+```bash
+docker inspect OLD_MNEMOSYNE_CONTAINER --format '{{index .Config.Labels "com.docker.compose.project"}}'
+docker inspect OLD_MNEMOSYNE_CONTAINER --format '{{range .Mounts}}{{println .Destination .Type .Name .Source}}{{end}}'
+```
+
+Retain that project name and its original data volume. Changing the project name creates different volumes and does not move memories. For an old `docker run` installation, mount its exact original data volume into an equivalent one-off maintenance container instead of guessing a Compose project name.
+
+Use the following procedure only for dedicated Mnemosyne named volumes. Verify bind-mount host ownership/NAS ACLs separately; do not recursively change an entire shared NAS directory. Select/build the new image and update the token/Host configuration first. Include the selected network override consistently in these commands.
+
+```bash
+MNEMOSYNE_PROJECT_NAME=your-original-compose-project
+mkdir -p backup
+docker compose --env-file .env -p "$MNEMOSYNE_PROJECT_NAME" -f docker-compose.yml stop mnemosyne-mcp
+# Keep every writer stopped between the backup and ownership change.
+docker compose --env-file .env -p "$MNEMOSYNE_PROJECT_NAME" -f docker-compose.yml run --rm --no-deps --user 0 --entrypoint tar -v "$PWD/backup:/backup" mnemosyne-mcp -C /data -cpf /backup/before-nonroot.tar .
+# Only these dedicated mounted paths are changed; -h avoids following symlinks.
+docker compose --env-file .env -p "$MNEMOSYNE_PROJECT_NAME" -f docker-compose.yml run --rm --no-deps --user 0 --entrypoint sh mnemosyne-mcp -ec 'chown -hR 10001:10001 /data /cache'
+docker compose --env-file .env -p "$MNEMOSYNE_PROJECT_NAME" -f docker-compose.yml up -d --no-deps mnemosyne-mcp
+docker compose --env-file .env -p "$MNEMOSYNE_PROJECT_NAME" -f docker-compose.yml exec -T mnemosyne-mcp python /opt/mnemosyne/readiness.py
+```
+
+Verify that an agent can retrieve a known pre-existing memory, then repeat the cross-agent test. Keep the backup. The regression test simulates root-owned current-format data and confirms retained content/authorship after this ownership change; it does not certify upgrading an older database schema.
 
 Before updating, back up data and record the exact current image digest. Select a fixed new image version or build an exact reviewed release checkout; recreate with the same volumes and network override, then repeat the cross-agent test. Never remove volumes as part of an update. A previous executable may not read a newer database schema; rollback can require restoring the pre-update backup. Cross-version upgrade compatibility is not established by same-version restart tests.
 
