@@ -57,7 +57,7 @@ Agents connect to `http://mnemosyne.home.arpa:8080/mcp`. HTTP sends tokens and m
 
 ### Optional Caddy HTTPS
 
-Use `MNEMOSYNE_HOSTNAME=mnemosyne.home.arpa`, set allowed Hosts to that same name, set `MNEMOSYNE_CADDY_BIND_IP` to the server's LAN IP, and select `MNEMOSYNE_CADDYFILE=./deploy/docker/Caddyfile.lan`. Configure local DNS on each client. Caddy publishes 80/443 on the chosen address; Mnemosyne has no host-published port.
+Use `MNEMOSYNE_HOSTNAME=mnemosyne.home.arpa`, set allowed Hosts to that same name, set `MNEMOSYNE_CADDY_BIND_IP` to the server's LAN IP, and select `MNEMOSYNE_CADDYFILE=./deploy/docker/Caddyfile.lan`. Configure local DNS on each client. Use the DNS hostname in HTTPS URLs: bare-IP clients may omit TLS SNI and fail the handshake with this example. Caddy publishes 80/443 on the chosen address; Mnemosyne has no host-published port.
 
 ```bash
 docker compose --env-file .env -p mnemosyne -f docker-compose.yml -f deploy/docker/compose.caddy.yml up -d
