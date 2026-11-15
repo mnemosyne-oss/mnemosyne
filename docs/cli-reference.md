@@ -15,11 +15,19 @@ mnemosyne --help          # note: use the flag, not `mnemosyne help <cmd>`
 | Command | Usage |
 |---|---|
 | `store`, `remember` | `store <content> [source] [importance]` |
-| `recall`, `search` | `recall <query> [top_k]` |
+| `recall`, `search` | `recall <query> [top_k] [--explain] [--json] [--preview]` |
 | `update`, `edit` | `update <id> <content> [importance]` |
 | `delete`, `forget` | `delete <id>` |
 | `stats` | Working and episodic counts, BEAM tier breakdown |
 | `sleep`, `consolidate` | `sleep [--force] [--all-sessions] [--dry-run]` |
+
+Human-readable `recall` reads the current full text of selected working/episodic
+rows and MEMORIA aggregates, using recall's cross-session setting for stored rows.
+`--preview` shows 150 characters and the full character count when available.
+Unavailable, changed-prefix or unsupported sources remain labelled recall previews
+with unknown full length. `--json` keeps the public backend content cap, including
+when combined with `--preview`; `--explain` adds recall diagnostics. These display
+reads preserve ranking and cached/public payloads and are not historical snapshots.
 
 The three flags on `sleep` are parsed but undocumented in the built-in help. `--force` skips the age threshold, `--all-sessions` consolidates across inactive sessions, `--dry-run` reports without writing.
 
