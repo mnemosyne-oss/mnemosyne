@@ -127,6 +127,9 @@ def test_provider_announces_missing_fastembed_only(monkeypatch, tmp_path, caplog
         with caplog.at_level(logging.WARNING, logger="mnemosyne_hermes"):
             provider.initialize("sess", **{"hermes_home": str(tmp_path), "auto_sleep": False})
             assert "missing fastembed" in caplog.text
+            assert "embedding generation is unavailable" in caplog.text
+            assert "non-vector recall remains available" in caplog.text
+            assert "keyword-only" not in caplog.text
             assert "sqlite_vec" not in caplog.text
             assert "extra importable" in caplog.text
     finally:
@@ -312,3 +315,83 @@ def test_native_index_warning_matches_real_semantic_fallback(
         assert "dense/semantic recall is disabled" not in caplog.text
     finally:
         memory.conn.close()
+
+
+@pytest.mark.parametrize("opt_out", [False, True], ids=["missing-generation", "opt-out"])
+def test_generation_unavailable_retains_real_polyphonic_temporal_recall(
+    monkeypatch, tmp_path, caplog, opt_out
+):
+    """The non-vector consequence must hold through public polyphonic recall."""
+    from mnemosyne.core import beam as beam_module
+    from mnemosyne.core import embeddings
+
+    _engine_capability(monkeypatch, dense=False, vec=False)
+    if opt_out:
+        monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+
+    def forbidden_embedding(*args, **kwargs):
+        pytest.fail("generation-unavailable recall must not request embeddings")
+
+    monkeypatch.setattr(embeddings, "embed", forbidden_embedding)
+    monkeypatch.setattr(embeddings, "embed_query", forbidden_embedding)
+    memory = beam_module.BeamMemory(session_id="non-vector", db_path=tmp_path / "real.db")
+    try:
+        mid = memory.remember(
+            "Cobalt telescope calibration completed recently", source="fact",
+            importance=0.9, extract_entities=False,
+        )
+        other = memory.remember(
+            "Jade weather forecast for next season", source="fact", extract_entities=False,
+        )
+        # An older row must not pass the temporal voice's seven-day window.
+        memory.conn.execute(
+            "UPDATE working_memory SET timestamp = ? WHERE id = ?",
+            ("2000-01-01T00:00:00", other),
+        )
+        memory.conn.commit()
+        results = memory.recall("Cobalt telescope calibration recently", top_k=3)
+        assert [row["id"] for row in results] == [mid]
+        assert other not in [row["id"] for row in results]
+        voices = results[0]["voice_scores"]
+        assert voices["temporal"] > 0
+        assert voices.get("vector", 0) == 0
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="mnemosyne_hermes"):
+            mnemosyne_hermes._announce_embedding_engine_unavailable()
+        assert "non-vector recall remains available" in caplog.text
+        assert "keyword-only" not in caplog.text
+        if opt_out:
+            assert "opt-out env var" in caplog.text
+            assert "extra importable" not in caplog.text
+        else:
+            assert "embedding generation is unavailable" in caplog.text
+    finally:
+        memory.conn.close()
+
+
+def test_diagnostic_exception_releases_reservation_for_retry(monkeypatch, tmp_path, caplog):
+    """A failed diagnostic must not consume the later real outage announcement."""
+    from mnemosyne.core import embeddings
+
+    _engine_capability(monkeypatch, dense=False, vec=False)
+    monkeypatch.setattr(mnemosyne_hermes, "_get_beam_class", lambda: _OkBeam)
+    monkeypatch.setattr(MnemosyneMemoryProvider, "_init_audit_log", lambda self: None)
+
+    def failed_detection():
+        raise RuntimeError("deterministic diagnostic failure")
+
+    monkeypatch.setattr(embeddings, "available", failed_detection)
+    provider = MnemosyneMemoryProvider()
+    try:
+        with caplog.at_level(logging.WARNING, logger="mnemosyne_hermes"):
+            provider.initialize("failed-diagnostic", hermes_home=str(tmp_path), auto_sleep=False)
+            assert not mnemosyne_hermes._EMBEDDING_ENGINE_UNAVAILABLE_LOGGED
+            assert "Mnemosyne: embedding engine" not in caplog.text
+            # Restore only the detector. Do not reset the announcement flag.
+            monkeypatch.setattr(embeddings, "available", lambda: False)
+            provider.initialize("later-outage", hermes_home=str(tmp_path), auto_sleep=False)
+            provider.initialize("repeated-outage", hermes_home=str(tmp_path), auto_sleep=False)
+            assert caplog.text.count("embedding generation is unavailable") == 1
+    finally:
+        provider.shutdown()
