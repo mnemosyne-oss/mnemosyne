@@ -26,7 +26,7 @@ stats = mem.get_stats()
 from mnemosyne import remember, recall, get_stats, forget, update, get_context
 ```
 
-These functions create a default `Mnemosyne` instance and delegate to it. The optional `bank` parameter applies only to these module-level helpers; instance methods use the bank configured on `Mnemosyne(...)`.
+These functions create cached `Mnemosyne` instances and delegate to them. The optional `bank` parameter applies only to these module-level helpers, and only to the call it is passed to; `mnemosyne.core.memory.set_bank()` changes the default bank for later calls. Instance methods use the bank configured on `Mnemosyne(...)`.
 
 | Function | Signature | Description |
 |---|---|---|

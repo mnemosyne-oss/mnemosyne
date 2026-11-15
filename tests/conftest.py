@@ -57,6 +57,7 @@ def _close_cached_connections():
         from mnemosyne.core import memory as _mem_mod
         _mem_mod._default_instance = None
         _mem_mod._default_bank = "default"
+        _mem_mod._per_call_instance = None
     except Exception:
         pass
 
