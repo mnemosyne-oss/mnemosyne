@@ -233,7 +233,7 @@ from mnemosyne.batch_tool import (
     BatchValidationError,
     apply_beam_batch,
     batch_validation_error_payload,
-    dry_run_batch,
+    dry_run_batch as dry_run_batch,
     validate_batch_operations,
 )
 from mnemosyne.hermes_config import read_hermes_config_key
@@ -1250,6 +1250,8 @@ BATCH_SCHEMA = {
     "description": (
         "Apply multiple Mnemosyne memory mutations atomically in one tool call. "
         "Supported v1 actions: remember, update, forget, invalidate. "
+        "dry_run checks current target eligibility without mutations; not_found hides missing/invisible targets. "
+        "It is a snapshot, not ordered simulation or a promise of later apply success. "
         "All operations are validated before mutation; on failure the whole batch rolls back. "
         "Destructive actions require exact memory IDs. Recall/search/canonical/persona/shared-surface operations are not included in v1."
     ),
@@ -2932,6 +2934,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _handle_tool_call_locked(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """Dispatch one tool while the provider-wide Beam lock is held."""
+        if tool_name == "mnemosyne_batch" and bool(args.get("dry_run", False)):
+            if not self.has_tool(tool_name):
+                return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
+            return self._handle_batch(args)
         from mnemosyne.core.filters import write_policy_operation
 
         # Keep the private Beam/session stable for the operation, but hold the
@@ -3182,7 +3188,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps(batch_validation_error_payload(exc))
 
         if bool(args.get("dry_run", False)):
-            return json.dumps(dry_run_batch(normalized))
+            # Older cores may still support apply without target-aware preview.
+            try:
+                from mnemosyne.batch_tool import BatchPreviewTarget, snapshot_preview_batch
+            except ImportError:
+                return json.dumps({"status": "error", "error": "preview_unavailable",
+                                   "validation": "target_eligibility_snapshot"})
+            beam = self._beam
+            target = BatchPreviewTarget(getattr(beam, "conn", None), getattr(beam, "session_id", None)) if beam is not None else None
+            return json.dumps(snapshot_preview_batch(normalized, target=target))
 
         # Write-approval gate: stage each operation individually.
         # PR #926 finding 4: preserve the COMPLETE normalized payload so
