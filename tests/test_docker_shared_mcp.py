@@ -73,8 +73,11 @@ def test_agents_share_memory_and_keep_authors(shared_server):
     async def exercise():
         async with agent(shared_server, "test-hermes") as a, agent(shared_server, "test-codex") as b:
             assert (await a.list_tools()).tools
-            for session, marker in [(a, "Copper otter prefers vanilla tea"), (b, "Silver badger prefers cinnamon coffee")]:
-                assert payload(await session.call_tool("mnemosyne_remember", {"content": marker}))["status"] == "stored"
+            writes = await asyncio.gather(
+                a.call_tool("mnemosyne_remember", {"content": "Copper otter prefers vanilla tea"}),
+                b.call_tool("mnemosyne_remember", {"content": "Silver badger prefers cinnamon coffee"}),
+            )
+            assert all(payload(result)["status"] == "stored" for result in writes)
             for session, query, author in [(b, "Copper otter", "hermes"), (a, "Silver badger", "codex")]:
                 rows = payload(await session.call_tool("mnemosyne_recall", {"query": query}))["results"]
                 assert any(query in r["content"] and r["author_id"] == author for r in rows)

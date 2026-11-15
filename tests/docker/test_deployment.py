@@ -122,6 +122,7 @@ def test_shared_memory_recreation_and_stopped_backup(image):
             assert httpx.get(url,headers={'Authorization':'Bearer wrong'}).status_code==401
             assert httpx.get(url,headers={'Authorization':'Bearer test-hermes','Host':'bad.invalid'}).status_code==421
             docker('exec',name,'python','/opt/mnemosyne/healthcheck.py')
+            docker('exec',name,'python','/opt/mnemosyne/readiness.py')
             result=asyncio.run(call(url,'test-hermes','mnemosyne_remember',{'content':'Copper otter prefers vanilla tea'}))
             assert result['status']=='stored'
             # Prove actual local model inference, not lexical fallback.
@@ -236,3 +237,14 @@ def test_compose_token_environment_roundtrip(compose_cmd,image):
         assert result.returncode==0,result.stderr
     finally:
         subprocess.run(cmd+['down','-v'],env=env,check=True,capture_output=True)
+
+
+
+def test_cold_cache_offline_requires_model_readiness(image):
+    with volume() as cache:
+        result=subprocess.run(['docker','run','--rm','--network','none',
+                               '-e','HF_HUB_OFFLINE=1','-v',cache+':/cache',
+                               '--entrypoint','python',image,'/opt/mnemosyne/readiness.py'],
+                              capture_output=True,text=True,timeout=130)
+        assert result.returncode == 1
+        assert 'not ready' in result.stderr

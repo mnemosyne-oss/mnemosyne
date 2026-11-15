@@ -14,6 +14,7 @@
 !deploy/docker/
 !deploy/docker/requirements.lock
 !deploy/docker/healthcheck.py
+!deploy/docker/readiness.py
 **/__pycache__
 **/*.pyc
 **/.env

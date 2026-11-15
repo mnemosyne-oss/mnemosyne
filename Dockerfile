@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir --only-binary=:all: -c /opt/mnemosyne/requirement
     && useradd --uid 10001 --gid 10001 --home-dir /home/mnemosyne --create-home mnemosyne \
     && mkdir -p /data /cache/fastembed \
     && chown -R 10001:10001 /data /cache
-COPY deploy/docker/healthcheck.py /opt/mnemosyne/healthcheck.py
+COPY deploy/docker/healthcheck.py deploy/docker/readiness.py /opt/mnemosyne/
 USER 10001:10001
 WORKDIR /home/mnemosyne
 VOLUME ["/data", "/cache"]

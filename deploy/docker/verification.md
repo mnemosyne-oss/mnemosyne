@@ -6,15 +6,15 @@ Date: 2026-11-15. Source baseline: `ec5747a`. No image was pushed and no GitHub 
 
 | Environment | Result |
 |---|---|
-| Linux ARM64 Docker Engine 29.5.2 in Colima on Apple Silicon | 16 deployment tests passed, native execution |
-| Linux AMD64 image on the same host | 16 deployment tests passed under emulation; physical AMD64 execution still belongs to native CI |
+| Linux ARM64 Docker Engine 29.5.2 in Colima on Apple Silicon | 17 deployment tests passed, native execution |
+| Linux AMD64 image on the same host | 17 deployment tests passed under emulation; physical AMD64 execution still belongs to native CI |
 | Compose 2.39.4 | Loopback, explicit LAN, existing proxy network and Caddy configurations rendered and checked |
-| Python/MCP host contract | 162 targeted MCP/release tests passed before final review; see subsequent checks in branch history/report |
+| Python/MCP host contract | 165 targeted MCP/release/wheel tests passed, including overlapping authenticated writes |
 | Wheel payload | 3 tests passed after explicitly excluding `deploy*` from package discovery |
 | Documentation | Generated-doc check and documentation verifier passed |
 | Static checks | Ruff F/RUF022 and actionlint 1.7.7 passed |
 
-The 16 deployment tests cover required configuration, port replacement, actual token roundtrip (including `$` and quoting), non-root ownership, source package version, missing/invalid authentication configuration, real local model inference, warm-cache inference with the container network disconnected, clean SIGTERM, shared store/recall, persistence after recreation, stopped-volume backup/restore, stdio initialization, rejected untrusted HTTPS certificates, Caddy config validation and CA persistence after Caddy container replacement. Exit 143 is accepted as normal SIGTERM in addition to 0; forced-kill exit is not accepted.
+The 17 deployment tests cover required configuration, port replacement, actual token roundtrip (including `$` and quoting), non-root ownership, source package version, missing/invalid authentication configuration, real local model inference, bounded empty-cache/offline readiness rejection, warm-cache inference with the container network disconnected, clean SIGTERM, shared store/recall, persistence after recreation, stopped-volume backup/restore, stdio initialization, rejected untrusted HTTPS certificates, Caddy config validation and CA persistence after Caddy container replacement. The separate readiness command requires a nonempty embedding vector; store/recall alone can use keyword fallback. Exit 143 is accepted as normal SIGTERM in addition to 0; forced-kill exit is not accepted.
 
 Observed image sizes from `docker image inspect`: ARM64 126,014,038 bytes; AMD64 129,573,217 bytes. These are engine-reported image sizes, not registry transfer sizes. A warm synthetic-data service used approximately 267 MiB RAM in one snapshot. These are observations for the default model, not capacity guarantees or minimum sizing. Allow additional space for model downloads, growing memories, cache, backups and Docker's own storage.
 

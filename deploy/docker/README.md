@@ -23,7 +23,13 @@ docker compose --env-file .env -p mnemosyne -f docker-compose.yml up -d
 
 This builds the checkout as `mnemosyne-mcp:local`; no published image is required. Keep `.env` private and untracked. Use the same Compose project name, environment file and selected overrides for every later command. Do not paste `docker compose config` output into issues: it contains resolved tokens.
 
-The container runs as UID/GID `10001:10001`. New named volumes receive the correct ownership. A replacement bind mount must already be writable by that UID; change ownership on the dedicated data directory only, not an arbitrary NAS share. Model initialization can take longer than HTTP startup. Docker health checks authenticated MCP initialize/list-tools, not model readiness. Confirm readiness by successfully storing and recalling an ordinary memory; an HTTP-only healthy status is insufficient. Local embedding fallback errors must be investigated before accepting a deployment.
+The container runs as UID/GID `10001:10001`. New named volumes receive the correct ownership. A replacement bind mount must already be writable by that UID; change ownership on the dedicated data directory only, not an arbitrary NAS share. Model initialization can take longer than HTTP startup. Docker health checks authenticated MCP initialize/list-tools, not model readiness. Require a successful explicit inference check before accepting model readiness:
+
+```bash
+docker compose --env-file .env -p mnemosyne -f docker-compose.yml exec -T mnemosyne-mcp python /opt/mnemosyne/readiness.py
+```
+
+Include the selected override in that command. It must print `Embedding inference ready.` and exit zero. It performs a real inference with harmless probe text, permits up to 120 seconds for download/initialization and fails clearly when no vector is produced. Fix network/cache permissions and retry if initialization fails or times out. Then verify store/recall between agents. Ordinary store/recall can succeed through keyword fallback when the model is unavailable, so neither those calls nor Docker's protocol-only health status establish embedding readiness.
 
 ## Choose one network mode
 
