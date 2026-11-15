@@ -31,7 +31,30 @@ from mnemosyne.core.banks import (
     bank_exists_read_only,
     _validate_bank_name,
 )
-from mnemosyne.core.memory import Mnemosyne, set_bank, get_bank, remember, recall, get_stats
+from mnemosyne.core import memory as memory_module
+from mnemosyne.core.memory import (
+    Mnemosyne,
+    get_bank,
+    get_context,
+    recall,
+    remember,
+    scratchpad_clear,
+    scratchpad_read,
+    scratchpad_write,
+    set_bank,
+)
+
+
+def _working_contents(db_path: Path) -> list:
+    """Read working-memory contents straight from a bank's database file."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return [
+            row[0]
+            for row in conn.execute("SELECT content FROM working_memory ORDER BY rowid")
+        ]
+    finally:
+        conn.close()
 
 
 # ============================================================================
@@ -403,6 +426,167 @@ class TestModuleLevelBankSwitching:
         set_bank("test_bank")
         assert get_bank() == "test_bank"
         set_bank(original)  # Restore
+
+    def test_per_call_bank_does_not_become_the_default(self, tmp_path, monkeypatch):
+        """bank= applies to the call it is passed to; later calls stay on the default."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        BankManager(tmp_path).create_bank("work")
+
+        remember("Grocery list: oat milk, coffee beans")
+        recall("sprint review", bank="work")
+        assert get_bank() == "default"
+        remember("Therapist appointment moved to Thursday")
+
+        assert _working_contents(tmp_path / "mnemosyne.db") == [
+            "Grocery list: oat milk, coffee beans",
+            "Therapist appointment moved to Thursday",
+        ]
+        assert _working_contents(tmp_path / "banks" / "work" / "mnemosyne.db") == []
+
+    def test_per_call_bank_does_not_undo_set_bank(self, tmp_path, monkeypatch):
+        """Only set_bank() moves the default, also when the per-call bank is 'default'."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        BankManager(tmp_path).create_bank("work")
+
+        set_bank("work")
+        remember("Passport renewal due in March", bank="default")
+        assert get_bank() == "work"
+        remember("Sprint review moved to Friday")
+
+        assert _working_contents(tmp_path / "mnemosyne.db") == [
+            "Passport renewal due in March",
+        ]
+        assert _working_contents(tmp_path / "banks" / "work" / "mnemosyne.db") == [
+            "Sprint review moved to Friday",
+        ]
+
+    def test_scratchpad_clear_without_bank_clears_the_default_bank(self, tmp_path, monkeypatch):
+        """A scratchpad write to another bank must not redirect a plain clear."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        BankManager(tmp_path).create_bank("work")
+
+        scratchpad_write("default pad note")
+        scratchpad_write("work pad note", bank="work")
+        scratchpad_clear()
+
+        assert [entry["content"] for entry in scratchpad_read()] == []
+        assert [entry["content"] for entry in scratchpad_read(bank="work")] == [
+            "work pad note",
+        ]
+
+    def test_scratchpad_clear_accepts_bank(self, tmp_path, monkeypatch):
+        """scratchpad_clear(bank=...) clears that bank, like write and read."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        BankManager(tmp_path).create_bank("work")
+
+        scratchpad_write("default pad note")
+        scratchpad_write("work pad note", bank="work")
+        scratchpad_clear(bank="work")
+
+        assert [entry["content"] for entry in scratchpad_read(bank="work")] == []
+        assert [entry["content"] for entry in scratchpad_read()] == [
+            "default pad note",
+        ]
+
+    def test_per_call_banks_do_not_share_an_instance(self, tmp_path, monkeypatch):
+        """Each per-call bank is served by an instance of that bank."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        manager = BankManager(tmp_path)
+        manager.create_bank("work")
+        manager.create_bank("personal")
+
+        remember("Sprint review moved to Friday", bank="work")
+        remember("Dentist on the 12th", bank="personal")
+        remember("Retro notes due Monday", bank="work")
+
+        assert _working_contents(tmp_path / "banks" / "work" / "mnemosyne.db") == [
+            "Sprint review moved to Friday",
+            "Retro notes due Monday",
+        ]
+        assert _working_contents(tmp_path / "banks" / "personal" / "mnemosyne.db") == [
+            "Dentist on the 12th",
+        ]
+
+    def test_set_bank_drops_the_cached_per_call_instance(self, tmp_path, monkeypatch):
+        """After set_bank(), a per-call bank is resolved against the current data dir."""
+        first = tmp_path / "first"
+        second = tmp_path / "second"
+        first.mkdir()
+        second.mkdir()
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(first))
+        BankManager(first).create_bank("work")
+        remember("Written before the switch", bank="work")
+
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(second))
+        BankManager(second).create_bank("work")
+        set_bank("default")
+        remember("Written after the switch", bank="work")
+
+        assert _working_contents(first / "banks" / "work" / "mnemosyne.db") == [
+            "Written before the switch",
+        ]
+        assert _working_contents(second / "banks" / "work" / "mnemosyne.db") == [
+            "Written after the switch",
+        ]
+
+    def test_alternating_banks_builds_each_instance_once(self, tmp_path, monkeypatch):
+        """Alternating calls reach the right bank without rebuilding either instance."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        BankManager(tmp_path).create_bank("work")
+        built = []
+        served = []
+
+        class RecordingMnemosyne(Mnemosyne):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                built.append(self.bank)
+
+            def get_context(self, limit=10):
+                served.append(self.bank)
+                return super().get_context(limit)
+
+        monkeypatch.setattr(memory_module, "Mnemosyne", RecordingMnemosyne)
+
+        for _ in range(3):
+            get_context()
+            get_context(bank="work")
+
+        assert served == ["default", "work", "default", "work", "default", "work"]
+        assert built == ["default", "work"]
+
+    @pytest.mark.parametrize(
+        "strategy_env",
+        [
+            {},
+            {"MNEMOSYNE_ENHANCED_RECALL": "1"},
+        ],
+        ids=["linear", "enhanced"],
+    )
+    def test_recall_reads_only_the_bank_it_resolves_to(self, tmp_path, monkeypatch, strategy_env):
+        """Explicit and unqualified recall return the selected bank's memory only."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.delenv("MNEMOSYNE_ENHANCED_RECALL", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_POLYPHONIC_RECALL", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_FACT_RECALL_ENABLED", raising=False)
+        for name, value in strategy_env.items():
+            monkeypatch.setenv(name, value)
+        BankManager(tmp_path).create_bank("work")
+        # Both memories match the query, so a recall that reached the other
+        # bank would return its memory too.
+        grocery = "Weekly plan: grocery list, oat milk and coffee beans"
+        sprint = "Weekly plan: sprint review moved to Friday"
+        remember(grocery)
+        remember(sprint, bank="work")
+
+        def contents(**kwargs):
+            return [result["content"] for result in recall("weekly plan", **kwargs)]
+
+        assert contents(bank="work") == [sprint]
+        assert contents() == [grocery]
+
+        set_bank("work")
+        assert contents() == [sprint]
+        assert contents(bank="default") == [grocery]
 
 
 # ============================================================================
