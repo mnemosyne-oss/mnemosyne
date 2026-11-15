@@ -393,8 +393,8 @@ def test_cli_accepts_equals_form_for_python_option(monkeypatch):
     assert calls[0]["python_executable"] == "provider/python"
 
 
-@pytest.mark.parametrize("args", [["--python"], ["--python="], ["--python", "--fix"]])
-def test_cli_rejects_missing_python_value_before_running_diagnostics(monkeypatch, capsys, args):
+@pytest.mark.parametrize("args", [["--python"], ["--python="], ["--python", ""], ["--python", "--fix"]])
+def test_cli_rejects_missing_or_empty_python_value_before_running_diagnostics(monkeypatch, capsys, args):
     """Invalid target options must fail before diagnosing or installing anything."""
     monkeypatch.setattr(diagnose, "run_diagnostics", lambda **kwargs: pytest.fail("diagnostics ran"))
     monkeypatch.setattr(diagnose, "auto_fix", lambda *args, **kwargs: pytest.fail("repair ran"))

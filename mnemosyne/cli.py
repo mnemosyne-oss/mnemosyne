@@ -467,6 +467,8 @@ def cmd_diagnose(args):
                 i += 1
                 continue
             python_executable, i = _require_value(args, i, "--python", lambda value, _name: value)
+            if not python_executable:
+                _fail("--python requires a value")
         else:
             i += 1
 
