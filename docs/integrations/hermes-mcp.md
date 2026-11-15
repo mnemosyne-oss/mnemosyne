@@ -2,16 +2,19 @@
 
 Mnemosyne is the native memory provider for Hermes Agent. Two integration paths:
 
-## Path 1: MCP (recommended for latest)
+## Shared remote MCP
+
+For a NAS/VPS service shared with Codex and Claude Code, follow the [Docker client setup](../../deploy/docker/README.md#hermes). It uses `mcp_servers`, an HTTP URL, per-agent bearer headers and optional private CA trust. This is separate from the native local memory provider below.
+
+## Path 1: Local MCP
 
 Add to your Hermes `config.yaml`:
 
 ```yaml
-mcp:
-  servers:
-    mnemosyne:
-      command: mnemosyne
-      args: ["mcp"]
+mcp_servers:
+  mnemosyne:
+    command: mnemosyne
+    args: ["mcp"]
 ```
 
 Tools register as native Hermes commands.

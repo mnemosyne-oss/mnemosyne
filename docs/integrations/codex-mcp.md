@@ -1,50 +1,15 @@
-# Mnemosyne + OpenAI Codex CLI
+# Mnemosyne + Codex MCP
 
-Connect Codex CLI to Mnemosyne for long-term memory across coding sessions.
+For shared remote memory, follow the [Docker client setup](../../deploy/docker/README.md#codex). Codex uses TOML configuration with `[mcp_servers.mnemosyne]`, `url` and `bearer_token_env_var` for remote Streamable HTTP; `.codex/mcp.json` is not the configuration used by this recipe.
 
-## Setup
+For local stdio, install `mnemosyne-memory[mcp]` and configure:
 
-1. Install Mnemosyne with MCP support:
-
-```bash
-pip install "mnemosyne-memory[mcp]"
+```toml
+[mcp_servers.mnemosyne]
+command = "mnemosyne"
+args = ["mcp"]
 ```
 
-2. Add to `.codex/mcp.json` in your project root:
+Ask Codex to use the Mnemosyne remember and recall tools. Explicitly select the intended memory bank if organizing separate projects; bank names are not authorization boundaries.
 
-```json
-{
-  "mcpServers": {
-    "mnemosyne": {
-      "command": "mnemosyne",
-      "args": ["mcp"],
-      "env": {}
-    }
-  }
-}
-```
-
-3. Restart Codex CLI. Tools appear automatically.
-
-## Usage
-
-Ask Codex:
-- "Remember my preferred test framework is pytest"
-- "Recall our discussion about migration strategy"
-- "What preferences do you have stored for me?"
-
-## Memory Banks
-
-Codex projects can use separate memory banks to keep context isolated per project:
-
-```json
-{
-  "mcpServers": {
-    "mnemosyne": {
-      "command": "mnemosyne",
-      "args": ["mcp", "--bank", "codex-{{project-name}}"],
-      "env": {}
-    }
-  }
-}
-```
+Source: [official Codex MCP documentation](https://developers.openai.com/codex/mcp/). See the deployment verification record for exact tested versions.

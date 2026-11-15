@@ -11,11 +11,13 @@ import subprocess
 import sys
 import time
 
-import httpx
-import httpx2
+import pytest
+
+httpx = pytest.importorskip("httpx")
+httpx2 = pytest.importorskip("httpx2")
+pytest.importorskip("mcp")
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-import pytest
 
 
 @asynccontextmanager
