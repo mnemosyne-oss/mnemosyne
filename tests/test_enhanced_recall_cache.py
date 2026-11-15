@@ -130,7 +130,7 @@ def test_unreadable_marker_bypasses_enhanced_cache_without_log_spam(
     )
 
 
-@pytest.mark.parametrize("previous_version", [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18])
+@pytest.mark.parametrize("previous_version", [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20])
 def test_cache_version_bump_invalidates_prior_candidate_and_cap_entries(
     enhanced, monkeypatch, tmp_path: Path, previous_version: int
 ):
@@ -147,6 +147,8 @@ def test_cache_version_bump_invalidates_prior_candidate_and_cap_entries(
     Version 16 predates strongest-path and scoped active-seed selection.
     Version 17 predates local input caps and their effective cache policy.
     Version 18 predates Cyrillic ё/е normalization.
+    Version 19 predates the bounded CJK supplement.
+    Version 20 predates Python 3.10 UTC-Z temporal admission.
     The ``v2:`` key prefix stays fixed
     for QueryCache's opaque-key path.
     """

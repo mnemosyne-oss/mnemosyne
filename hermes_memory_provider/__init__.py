@@ -277,6 +277,93 @@ from mnemosyne.core.prefetch import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+# Fail-loud contract for the silent-degradation defect measured in production
+# (2026-10-13): when fastembed is missing, every embedding write is skipped by
+# the `if available():` guard and nothing logs, so a gateway can run for weeks
+# with dense/semantic recall off; when only sqlite_vec is missing, writes still
+# happen and native vector indexing is unavailable; a semantic fallback may remain.
+# The provider announces
+# the degraded state once per process at startup, attributing the cause to the
+# actual capability that is unavailable. Never raises and never changes recall
+# behaviour.
+_EMBEDDING_ENGINE_UNAVAILABLE_LOGGED = False
+_EMBEDDING_ENGINE_UNAVAILABLE_LOCK = threading.Lock()
+
+
+def _announce_embedding_engine_unavailable() -> None:
+    """Warn once per process when the embedding engine is unavailable."""
+    global _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED
+    with _EMBEDDING_ENGINE_UNAVAILABLE_LOCK:
+        if _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED:
+            return
+        # Reserve before the (slow) capability detection so a concurrent call
+        # can neither re-run it nor emit a second warning. Released again below
+        # if there is nothing to announce.
+        _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED = True
+    try:
+        from mnemosyne.core import beam as _beam
+        from mnemosyne.core import embeddings as _embeddings
+
+        if _embeddings._is_disabled():
+            logger.warning(
+                "Mnemosyne: embedding engine disabled by configuration or an opt-out "
+                "environment variable "
+                "(MNEMOSYNE_NO_EMBEDDINGS / MNEMOSYNE_SKIP_EMBEDDINGS / "
+                "MNEMOSYNE_EMBEDDINGS_OFF); embedding generation is disabled; "
+                "non-vector recall remains available."
+            )
+            return
+
+        problems = []
+        hints = []
+        generation_available = _embeddings.available()
+        if not generation_available:
+            if _embeddings._is_api_model(_embeddings._DEFAULT_MODEL):
+                # Current Core checks NumPy separately from local FastEmbed.
+                # Older supported Core may not expose that optional probe.
+                ensure_numpy = getattr(_embeddings, "_ensure_api_numpy", None)
+                if callable(ensure_numpy) and not ensure_numpy():
+                    problems.append("NumPy is unavailable for the embedding API backend")
+                    hints.append("install or repair NumPy in the runtime interpreter")
+                else:
+                    problems.append(
+                        "the configured embedding API backend has no usable "
+                        "credentials"
+                    )
+                    hints.append(
+                        "set MNEMOSYNE_EMBEDDING_API_KEY or OPENAI_API_KEY, or "
+                        "point MNEMOSYNE_EMBEDDING_API_URL at a keyless endpoint"
+                    )
+            else:
+                problems.append("missing fastembed (local embedding generation unavailable)")
+        if not _beam._SQLITE_VEC_AVAILABLE:
+            problems.append("missing sqlite_vec (native vector index unavailable)")
+        if not problems:
+            with _EMBEDDING_ENGINE_UNAVAILABLE_LOCK:
+                _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED = False
+            return
+        if any("fastembed" in p or "sqlite_vec" in p for p in problems):
+            hints.append(
+                "make the embeddings extra importable in "
+                "the runtime interpreter that runs this provider"
+            )
+        consequence = (
+            "semantic fallback may remain available via stored vectors and NumPy"
+            if generation_available
+            else "embedding generation is unavailable; non-vector recall remains available"
+        )
+        logger.warning(
+            "Mnemosyne: embedding engine unavailable (%s); %s. Hint: %s.",
+            " and ".join(problems),
+            consequence,
+            "; ".join(hints),
+        )
+    except Exception:
+        # Announcement only: never block provider startup on diagnostics.
+        with _EMBEDDING_ENGINE_UNAVAILABLE_LOCK:
+            _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED = False
+        return
+
 # ---------------------------------------------------------------------------
 # C13: provider-active flag for memory-context double-injection prevention.
 # ---------------------------------------------------------------------------
@@ -2259,6 +2346,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize Mnemosyne beam for this session."""
+        _announce_embedding_engine_unavailable()
         with self._ensure_beam_access_lock():
             with self._ensure_surface_adapter_lock():
                 self._initialize_locked(session_id, **kwargs)
