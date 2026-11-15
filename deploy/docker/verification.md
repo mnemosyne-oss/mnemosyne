@@ -1,6 +1,6 @@
 # Docker deployment verification
 
-Date: 2026-11-15. Current PR base: `81dd2b6`; historical acceptance baseline: `ec5747a`. No image was pushed and no GitHub workflow was activated or run remotely. This record distinguishes actual runtime checks from configuration validation.
+Date: 2026-11-15. Current PR base: `81dd2b6`; historical acceptance baseline: `ec5747a`. No image has been published. The initial acceptance below ran locally; subsequent hosted checks are tracked in [PR #1361](https://github.com/mnemosyne-oss/mnemosyne/pull/1361). This record distinguishes actual runtime checks from configuration validation.
 
 ## Current PR preparation on Main 4.1.0
 
@@ -11,7 +11,8 @@ The Docker changes were transferred to `main` at `81dd2b662772ddc78fcdbb990be9b5
 - Ruff F/RUF022, actionlint and generated-document/documentation checks passed.
 - Complete local suite on runtime candidate `2001a87`: **9432 passed, 91 skipped, one deprecation warning, seven passed subtests** (525.22 seconds). The earlier 14 failures below belong to the historical source/environment and are not failures of this run.
 - The final ownership-migration follow-up changes documentation/test coverage only. No runtime/build files changed. The expanded native QNAP selection passed **18/18 tests in 181.37 seconds**, including root-owned data/cache migration, preserved content/authorship and access as UID 10001. Without the documented ownership change the new regression failed, as expected.
-- Hosted CI and a new native ARM64 container run for this rebased source have not run. The ARM64/container/client measurements below are historical results from the earlier Core 4.0.0 candidate, not new results for Main 4.1.0.
+- At initial local PR preparation, hosted CI and a new native ARM64 container run had not run. The later hosted Docker checks for head `79b0bab` passed on native AMD64 and ARM64. Latest-head results are tracked in the PR; the older hardware/client measurements below retain their original source revisions.
+- The general CI matrix also exercises the helper under Python 3.10. Its healthcheck regression reproduced the unavailable `asyncio.timeout` call, then passed after using the equally bounded `asyncio.wait_for`. The related Python 3.10 selection passed **162 tests**; the Python 3.11 health/release selection passed **10 tests**. Docker keeps Python 3.11 as its image base.
 
 The following sections retain the original acceptance and baseline record with its original source revisions.
 

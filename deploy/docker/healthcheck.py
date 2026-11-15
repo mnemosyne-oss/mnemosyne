@@ -28,10 +28,7 @@ async def probe() -> None:
 def main() -> int:
     logging.disable(logging.CRITICAL)
     try:
-        async def bounded():
-            async with asyncio.timeout(10):
-                await probe()
-        asyncio.run(bounded())
+        asyncio.run(asyncio.wait_for(probe(), timeout=10))
     except Exception:
         return 1
     return 0
