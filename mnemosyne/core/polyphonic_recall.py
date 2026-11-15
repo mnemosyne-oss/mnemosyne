@@ -1058,7 +1058,11 @@ class PolyphonicRecallEngine:
                 # as if it were `offset` hours older than it is, and the ranking is off by
                 # exactly the host offset. #1094.
                 try:
-                    row_dt = datetime.fromisoformat(row["timestamp"])
+                    stamp = row["timestamp"]
+                    # Python 3.10 does not accept the ISO UTC Z suffix.
+                    if isinstance(stamp, str) and stamp.endswith("Z"):
+                        stamp = stamp[:-1] + "+00:00"
+                    row_dt = datetime.fromisoformat(stamp)
                 except (TypeError, ValueError):
                     continue
                 if row_dt.tzinfo is not None:
