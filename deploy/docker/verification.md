@@ -16,7 +16,7 @@ Date: 2026-11-15. Source baseline: `ec5747a`. No image was pushed and no GitHub 
 
 The 17 deployment tests cover required configuration, port replacement, actual token roundtrip (including `$` and quoting), non-root ownership, source package version, missing/invalid authentication configuration, real local model inference, bounded empty-cache/offline readiness rejection, warm-cache inference with the container network disconnected, clean SIGTERM, shared store/recall, persistence after recreation, stopped-volume backup/restore, stdio initialization, rejected untrusted HTTPS certificates, Caddy config validation and CA persistence after Caddy container replacement. The separate readiness command requires a nonempty embedding vector; store/recall alone can use keyword fallback. Exit 143 is accepted as normal SIGTERM in addition to 0; forced-kill exit is not accepted.
 
-Observed image sizes from `docker image inspect`: ARM64 126,014,038 bytes; AMD64 129,573,217 bytes. These are engine-reported image sizes, not registry transfer sizes. A warm synthetic-data service used approximately 267 MiB RAM in one snapshot. These are observations for the default model, not capacity guarantees or minimum sizing. Allow additional space for model downloads, growing memories, cache, backups and Docker's own storage.
+Observed image sizes from `docker image inspect`: ARM64 126,016,364 bytes; AMD64 129,573,797 bytes. These are engine-reported image sizes, not registry transfer sizes. A warm synthetic-data service used approximately 267 MiB RAM in one snapshot. These are observations for the default model, not capacity guarantees or minimum sizing. Allow additional space for model downloads, growing memories, cache, backups and Docker's own storage.
 
 ## Actual client probes
 
@@ -29,6 +29,10 @@ The same temporary ARM64 service was reached over loopback-only SSH forwards fro
 | Claude Code | 2.1.325, limited print-mode session with only the two memory tools | Store and recall of Codex memories passed | Passed using `NODE_EXTRA_CA_CERTS`; stored author was `claude-code` |
 
 These probes test the clients' real MCP implementations; they do not assert compatibility with every older version, GUI environment inheritance or native Hermes memory-provider behavior. Documentation/API references were checked on the same date.
+
+## Final branch review
+
+A fresh reviewer identified two acceptance gaps: store/recall could falsely imply embedding readiness, and the named-token writes were sequential. Both were corrected in one fix pass. The dedicated readiness command now requires actual inference with a 120-second bound; empty-cache/offline execution fails explicitly. The HTTP contract now issues concurrent writes and verifies both authors. Final deployment runs passed 17/17 on native ARM64 and 17/17 under AMD64 emulation, and 165 targeted host tests passed. No minor findings were deferred.
 
 ## Wider suite and baseline comparison
 
@@ -47,7 +51,7 @@ The other 14 failures were reproduced separately against an unchanged local arch
 - `tests/test_release_gates.py::test_hook_rejects_mismatched_standalone_tag_before_release`
 - Five cases of `tests/test_release_gates.py::test_hook_rejects_invalid_static_project_version`: missing `[project]`, missing version, numeric version, duplicate version fields and conflicting version fields.
 
-The release-hook failures on this Mac include the tests' hard-coded `/usr/bin/bash` path being unavailable. The full suite is therefore **not green** in this environment. Core correctness changes belong in their own review, not in the Docker deployment patch.
+The release-hook failures on this Mac include the tests' hard-coded `/usr/bin/bash` path being unavailable. The final complete run after the review fixes reported **7694 passed, 214 skipped, 14 failed** (399.81 seconds). Its failure set exactly matches the 14 reproduced baseline failures. The full suite is therefore **not green** in this environment. Core correctness changes belong in their own review, not in the Docker deployment patch.
 
 ## Still unverified
 

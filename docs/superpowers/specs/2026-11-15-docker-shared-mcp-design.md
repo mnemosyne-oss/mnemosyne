@@ -1,6 +1,6 @@
 # Docker deployment for shared MCP memory — agreed scope
 
-Status: Scope approved in conversation on 2026-11-15; implementation plan requested. This records that scope, including Claude Code as the intended Claude client. Implementation has not started.
+Status: Scope approved in conversation on 2026-11-15; implementation plan requested. This records that scope, including Claude Code as the intended Claude client. Implementation and verification results are recorded in [the deployment verification report](../../../deploy/docker/verification.md).
 
 ## Intent
 
