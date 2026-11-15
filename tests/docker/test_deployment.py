@@ -19,6 +19,20 @@ from mcp.client.streamable_http import streamable_http_client
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def wait_for_https(url, context, timeout=15):
+    deadline = time.monotonic() + timeout
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            response = httpx.get(url, headers={'Authorization': 'Bearer wrong'},
+                                 verify=context, trust_env=False, timeout=min(1, remaining))
+        except httpx.TransportError:
+            time.sleep(min(.1, max(0, deadline - time.monotonic())))
+        else:
+            assert response.status_code == 401, response.text
+            return response
+    pytest.fail('HTTPS did not become reachable with the configured CA')
+
+
 def docker(*args, **kwargs):
     return subprocess.run(['docker', *args], check=True, capture_output=True, text=True, **kwargs).stdout.strip()
 
@@ -171,6 +185,7 @@ def test_caddy_internal_https_and_persistent_ca(image, tmp_path):
                         except subprocess.CalledProcessError:
                             time.sleep(.5)
                     context=ssl.create_default_context(cafile=str(tmp_path/'root.crt'))
+                    wait_for_https(url, context)
                     with pytest.raises(httpx.TransportError):
                         httpx.get(url,trust_env=False)
                     assert httpx.get(url,headers={'Authorization':'Bearer wrong'},verify=context,trust_env=False).status_code==401
@@ -188,14 +203,9 @@ def test_caddy_internal_https_and_persistent_ca(image, tmp_path):
                     docker('cp',name+':'+root,str(tmp_path/'root-after.crt'))
                     assert (tmp_path/'root-after.crt').read_bytes()==before
                     new_port=docker('port',name,'443/tcp').rsplit(':',1)[1]
-                    for _ in range(30):
-                        try:
-                            asyncio.run(call(f'https://localhost:{new_port}/mcp','test-codex',ca=context))
-                            break
-                        except Exception:
-                            time.sleep(.2)
-                    else:
-                        pytest.fail('Recreated Caddy did not accept original CA')
+                    new_url=f'https://localhost:{new_port}/mcp'
+                    wait_for_https(new_url, context)
+                    asyncio.run(call(new_url,'test-codex',ca=context))
                 finally:
                     docker('rm','-f',name)
     finally:
@@ -286,3 +296,50 @@ assert any(row["content"] == "Legacy copper otter keeps existing memories" and r
 '''
         docker('run','--rm',*mounts,'-e','MNEMOSYNE_NO_EMBEDDINGS=1',
                '--entrypoint','python',image,'-c',verify)
+
+
+def test_https_readiness_handles_early_closed_handshake(tmp_path):
+    """A written CA does not imply that the TLS listener serves requests yet."""
+    import datetime
+    import ipaddress
+    import socket
+    import ssl
+    import threading
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key=ec.generate_private_key(ec.SECP256R1())
+    name=x509.Name([x509.NameAttribute(NameOID.COMMON_NAME,'localhost')])
+    now=datetime.datetime.now(datetime.timezone.utc)
+    cert=(x509.CertificateBuilder().subject_name(name).issuer_name(name)
+          .public_key(key.public_key()).serial_number(x509.random_serial_number())
+          .not_valid_before(now-datetime.timedelta(minutes=1))
+          .not_valid_after(now+datetime.timedelta(hours=1))
+          .add_extension(x509.BasicConstraints(ca=True,path_length=None),critical=True)
+          .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address('127.0.0.1'))]),critical=False)
+          .sign(key,hashes.SHA256()))
+    (tmp_path/'cert.pem').write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    (tmp_path/'key.pem').write_bytes(key.private_bytes(serialization.Encoding.PEM,serialization.PrivateFormat.PKCS8,serialization.NoEncryption()))
+    server_context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(str(tmp_path/'cert.pem'),str(tmp_path/'key.pem'))
+    client_context=ssl.create_default_context(cafile=str(tmp_path/'cert.pem'))
+    errors=[]
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1',0));listener.listen();listener.settimeout(3)
+        port=listener.getsockname()[1]
+        def serve():
+            try:
+                early,_=listener.accept();early.close()
+                connection,_=listener.accept()
+                with server_context.wrap_socket(connection,server_side=True) as tls:
+                    tls.recv(8192)
+                    tls.sendall(b'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+            except Exception as exc:errors.append(exc)
+        thread=threading.Thread(target=serve,daemon=True);thread.start()
+        try:
+            response=wait_for_https(f'https://127.0.0.1:{port}/mcp',client_context,timeout=2)
+            assert response.status_code==401
+        finally:thread.join(timeout=4)
+    assert not errors,errors
