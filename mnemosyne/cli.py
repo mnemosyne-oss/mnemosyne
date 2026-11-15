@@ -169,24 +169,113 @@ def cmd_store(args):
     print(f"Stored: {memory_id}")
 
 
+# Cap applied only under `--preview`, for scanning many hits at once.
+_RECALL_PREVIEW_CHARS = 150
+
+
+def _recall_display_results(memory, query, results):
+    """Expand selected hits for human output without changing recall or its cache.
+
+    Stored rows are read from their selected tier using recall's current
+    cross-session visibility. MEMORIA aggregates are regenerated through their
+    existing reader.
+    An unavailable source or mismatching prefix stays an explicitly labelled
+    recall preview. This is a current read, not a historical content snapshot.
+    """
+    import sqlite3
+    from mnemosyne.core.beam import (
+        RECALL_CONTENT_CAP,
+        _cross_session_enabled,
+        _session_scope_filter,
+        _session_scope_params,
+    )
+
+    # Pair the predicate and binds from one hot-reloadable visibility snapshot.
+    cross_session = _cross_session_enabled()
+    displayed = []
+    aggregate = None
+    for result in results:
+        item = dict(result)
+        content = item.get("content", "")
+        if isinstance(content, str) and len(content) >= RECALL_CONTENT_CAP:
+            full = None
+            tier = item.get("tier")
+            table = {"working": "working_memory", "episodic": "episodic_memory"}.get(tier)
+            try:
+                beam = memory.beam
+                if table:
+                    row = beam.conn.execute(
+                        f"SELECT content FROM {table} WHERE id=? "
+                        f"AND {_session_scope_filter(cross_session=cross_session)}",
+                        (item.get("id"), *_session_scope_params(
+                            beam.session_id, cross_session=cross_session))).fetchone()
+                    full = row[0] if row else None
+                elif tier == "memoria":
+                    if aggregate is None:
+                        aggregate = beam.memoria_retrieve(query, top_k=3)
+                    if item.get("id") == "memoria_" + aggregate.get("source", ""):
+                        full = f"[MEMORIA {aggregate['source']}]\n{aggregate.get('context', '')}"
+            except sqlite3.Error:
+                full = None
+            if isinstance(full, str) and full.startswith(content):
+                item["content"] = full
+            else:
+                item["_cli_incomplete_content"] = True
+        displayed.append(item)
+    return displayed
+
+
+def _print_recall_results(query, results, *, preview=False):
+    """Render recall results for a human reader.
+
+    Content is printed whole by default. A silent 150-char preview ended records
+    in a bare ``...``, which read as the record itself (#685). The cap now lives
+    behind an explicit ``--preview`` for scanning many hits at once, and when it
+    does apply it states how much was withheld instead of ending in an
+    unexplained ellipsis.
+    """
+    print(f"\nResults for: {query}\n")
+    for r in results:
+        content = r.get("content", "")
+        score = r.get("score", 0)
+        print(f"  ID: {r.get('id', '?')}")
+        if preview and len(content) > _RECALL_PREVIEW_CHARS:
+            print(f"  Content: {content[:_RECALL_PREVIEW_CHARS]}")
+            if r.get("_cli_incomplete_content"):
+                print(f"  Content truncated: showing {_RECALL_PREVIEW_CHARS} chars; full length unavailable")
+            else:
+                print(f"  Content truncated: showing {_RECALL_PREVIEW_CHARS} of {len(content)} chars")
+        else:
+            print(f"  Content: {content}")
+            if r.get("_cli_incomplete_content"):
+                print("  Full content unavailable; showing recall preview")
+        print(f"  Score: {score:.3f}")
+        if r.get("entity_match"):
+            print("  [entity match]")
+        print()
+
+
 def cmd_recall(args):
     """Search memories."""
     if not args:
-        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json]")
+        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json] [--preview]")
 
     explain = False
     json_output = False
+    preview = False
     positionals = []
     for arg in args:
         if arg == "--explain":
             explain = True
         elif arg == "--json":
             json_output = True
+        elif arg == "--preview":
+            preview = True
         else:
             positionals.append(arg)
 
     if not positionals:
-        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json]")
+        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json] [--preview]")
     query = positionals[0]
     top_k = _parse_int(positionals[1], "top_k") if len(positionals) > 1 else 5
 
@@ -216,16 +305,7 @@ def cmd_recall(args):
             print(json.dumps({"query": query, "top_k": top_k, "results": results}, ensure_ascii=False, default=str))
         return
 
-    print(f"\nResults for: {query}\n")
-    for r in results:
-        content = r.get("content", "")
-        score = r.get("score", 0)
-        print(f"  ID: {r.get('id', '?')}")
-        print(f"  Content: {content[:150]}{'...' if len(content) > 150 else ''}")
-        print(f"  Score: {score:.3f}")
-        if r.get("entity_match"):
-            print("  [entity match]")
-        print()
+    _print_recall_results(query, _recall_display_results(mem, query, results), preview=preview)
 
 
 def cmd_media(args):
@@ -2072,7 +2152,8 @@ def run_cli():
         print("Commands:")
         print("  version                                Show installed version")
         print("  store <content> [source] [importance]  Store a memory")
-        print("  recall <query> [top_k]                 Search memories")
+        print("  recall <query> [top_k] [--explain] [--json] [--preview]  Search memories")
+        print("    --preview: show up to 150 characters; --json keeps backend content caps")
         print("  media <path|url> [--modality M] [--json]  Remember an image, audio, video or document")
         print("  update <id> <content> [importance]     Update a memory")
         print("  delete <id>                            Delete a memory")

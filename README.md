@@ -162,6 +162,7 @@ mnemosyne mcp --transport streamable-http --port 8080  # Streamable HTTP (native
 # Direct memory ops
 mnemosyne store "User likes dark mode"
 mnemosyne recall "preferences"
+mnemosyne recall "preferences" --preview  # Explicit 150-character display preview
 mnemosyne stats
 mnemosyne sleep                         # Run consolidation
 
@@ -172,6 +173,14 @@ mnemosyne import backup.json
 # Sync (bidirectional memory sync between instances)
 mnemosyne sync --db-path /path/to/mnemosyne.db --remote https://my-vps:8765
 ```
+
+Human-readable `recall` output reads the current full content of selected
+working-memory, episodic-memory and MEMORIA hits. Ranking and scores stay the
+same; public `recall()` results, JSON output and cached payloads retain their
+configured content cap. `--preview` displays 150 characters and the full length
+when available. If a source is unavailable, its prefix has changed, or its hit
+type cannot be expanded, the CLI labels the remaining recall preview and reports
+the full length as unknown. These are current reads, not historical snapshots.
 
 ---
 
