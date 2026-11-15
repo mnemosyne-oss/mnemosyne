@@ -11,6 +11,7 @@ Covers:
 import json
 import sqlite3
 import tempfile
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -1230,6 +1231,278 @@ class TestCleanNoise:
 # ---------------------------------------------------------------------------
 # restore_archived
 # ---------------------------------------------------------------------------
+
+class TestRearchiveIdempotent:
+    """Real SQLite regressions at the archive write boundary (#1235)."""
+
+    TABLES = ("working_memory", "memories", "episodic_memory")
+
+    @staticmethod
+    def bank(tmp_path, table="working_memory", importance=0.83, metadata=None):
+        db_path = tmp_path / "rearchive.db"
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                f"CREATE TABLE {table} (id TEXT PRIMARY KEY, content TEXT, source TEXT, "
+                "timestamp TEXT, session_id TEXT, importance REAL, metadata_json TEXT)"
+            )
+            conn.execute(
+                f"INSERT INTO {table} VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "target",
+                    "ok",
+                    "synthetic",
+                    "2026-01-01",
+                    "synthetic",
+                    importance,
+                    json.dumps(
+                        metadata
+                        if metadata is not None
+                        else {"nested": {"items": [0, False, None]}}
+                    ),
+                ),
+            )
+            conn.commit()
+        return db_path
+
+    @staticmethod
+    def row(db_path, table="working_memory", memory_id="target"):
+        # Read persisted state through a fresh connection, never the writer's.
+        with closing(sqlite3.connect(db_path)) as conn:
+            return conn.execute(
+                f"SELECT importance, metadata_json FROM {table} WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
+
+    @staticmethod
+    def logs(db_path):
+        with closing(sqlite3.connect(db_path)) as conn:
+            return conn.execute(
+                "SELECT * FROM hygiene_audit_log ORDER BY id"
+            ).fetchall()
+
+    @staticmethod
+    def archive(db_path, candidates):
+        return clean_noise(
+            db_path, candidates, action="archive", confirm=True, dry_run=False
+        )
+
+    @pytest.mark.parametrize("table", TABLES)
+    @pytest.mark.parametrize("importance", [0.83, 0.0])
+    def test_public_repeat_archive_preserves_first_transition(
+        self, tmp_path, table, importance
+    ):
+        db_path = self.bank(tmp_path, table, importance)
+        before = self.row(db_path, table)
+        first = self.archive(db_path, audit_noise(db_path, tables=[table]).candidates)
+        assert (first.archived, first.kept, first.log_entries, first.errors) == (
+            1,
+            0,
+            1,
+            [],
+        )
+        archived = self.row(db_path, table)
+        assert archived[0] == 0
+        assert json.loads(archived[1])["_original_importance"] == importance
+        history = self.logs(db_path)
+        assert json.loads(history[0][8]) == json.loads(before[1])
+
+        # Audit intentionally still sees this row. Changed reasons must not
+        # replace the first archive's reason, timestamp, or metadata snapshot.
+        candidates = audit_noise(db_path, tables=[table]).candidates
+        assert len(candidates) == 1
+        candidates[0].noise_reasons = ["different later reason"]
+        repeated = self.archive(db_path, candidates)
+        assert (
+            repeated.archived,
+            repeated.kept,
+            repeated.log_entries,
+            repeated.errors,
+        ) == (0, 1, 0, [])
+        assert self.row(db_path, table) == archived
+        assert self.logs(db_path) == history
+        assert restore_archived(db_path, log_entry_ids=[history[0][0]]) == 1
+        assert self.row(db_path, table) == before
+        assert restore_archived(db_path) == 0
+        assert self.row(db_path, table) == before
+
+    @pytest.mark.parametrize("duplicate_in_call", [False, True])
+    def test_stale_candidates_do_not_need_another_audit(
+        self, tmp_path, duplicate_in_call
+    ):
+        db_path = self.bank(tmp_path)
+        candidates = audit_noise(db_path).candidates
+        if duplicate_in_call:
+            result = self.archive(db_path, candidates * 2)
+            assert (
+                result.archived,
+                result.kept,
+                result.log_entries,
+                result.errors,
+            ) == (1, 1, 1, [])
+        else:
+            assert self.archive(db_path, candidates).archived == 1
+            before = self.row(db_path)
+            history = self.logs(db_path)
+            result = self.archive(db_path, candidates)
+            assert (
+                result.archived,
+                result.kept,
+                result.log_entries,
+                result.errors,
+            ) == (0, 1, 0, [])
+            assert self.row(db_path) == before
+            assert self.logs(db_path) == history
+        assert restore_archived(db_path) == 1
+        assert self.row(db_path)[0] == 0.83
+
+    @pytest.mark.parametrize("table", TABLES)
+    def test_first_archive_reads_current_importance_and_new_cycle_recaptures_it(
+        self, tmp_path, table
+    ):
+        db_path = self.bank(tmp_path, table)
+        candidates = audit_noise(db_path, tables=[table]).candidates
+        for importance in [0.64, 0.0, 0.91]:
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(
+                    f"UPDATE {table} SET importance = ? WHERE id = ?",
+                    (importance, "target"),
+                )
+                conn.commit()
+            result = self.archive(db_path, candidates)
+            assert (result.archived, result.log_entries, result.errors) == (1, 1, [])
+            assert (
+                json.loads(self.row(db_path, table)[1])["_original_importance"]
+                == importance
+            )
+            assert restore_archived(db_path) == 1
+            assert self.row(db_path, table)[0] == importance
+            assert restore_archived(db_path) == 0
+        assert len(self.logs(db_path)) == 3
+
+    def test_flag_then_archive_retains_unrelated_metadata(self, tmp_path):
+        metadata = {"nested": {"archive": [0, False, None]}, "_archived": False}
+        db_path = self.bank(tmp_path, metadata=metadata)
+        candidates = audit_noise(db_path).candidates
+        result = clean_noise(
+            db_path, candidates, action="flag", confirm=True, dry_run=False
+        )
+        assert result.flagged == 1
+        flagged = json.loads(self.row(db_path)[1])
+        assert self.archive(db_path, candidates).archived == 1
+        assert self.archive(db_path, candidates).kept == 1
+        assert restore_archived(db_path) == 1
+        flagged.pop("_archived")
+        assert self.row(db_path) == (0.83, json.dumps(flagged))
+        assert len(self.logs(db_path)) == 2  # flag + first archive, not repeat archive
+
+    @pytest.mark.parametrize("marker", [True, 1, "legacy-truthy"])
+    @pytest.mark.parametrize(
+        "saved", [{}, {"_original_importance": 0}, {"_original_importance": None}]
+    )
+    def test_truthy_archive_marker_preserves_even_incomplete_existing_state(
+        self, tmp_path, marker, saved
+    ):
+        # Use restore's existing bool semantics, not a new marker migration.
+        metadata = {
+            "_archived": marker,
+            "_archived_at": "first",
+            "_archive_reason": ["first"],
+            **saved,
+        }
+        db_path = self.bank(tmp_path, metadata=metadata)
+        before = self.row(db_path)
+        result = self.archive(db_path, audit_noise(db_path).candidates)
+        assert (result.archived, result.kept, result.log_entries, result.errors) == (
+            0,
+            1,
+            0,
+            [],
+        )
+        assert self.row(db_path) == before
+        assert self.logs(db_path) == []
+
+    @pytest.mark.parametrize(
+        "marker", [{}, {"_archived": False}, {"_archived": 0}, {"_archived": ""}]
+    )
+    @pytest.mark.parametrize("saved", [0, 0.72, None])
+    def test_unarchived_saved_value_conflict_fails_without_overwriting(
+        self, tmp_path, marker, saved
+    ):
+        # Key presence, including zero/null, is ambiguous evidence: do not
+        # guess whether it is old archive provenance or an operator's value.
+        db_path = self.bank(
+            tmp_path, metadata={**marker, "_original_importance": saved}
+        )
+        before = self.row(db_path)
+        result = self.archive(db_path, audit_noise(db_path).candidates)
+        assert (result.archived, result.kept, result.log_entries) == (0, 0, 0)
+        assert result.errors == ["hygiene_candidate_failed: working_memory:target"]
+        assert self.row(db_path) == before
+        assert self.logs(db_path) == []
+
+    def test_audit_insert_fault_rolls_back_only_failed_candidate(self, tmp_path):
+        db_path = self.bank(tmp_path)
+        candidates = audit_noise(db_path).candidates
+        assert self.archive(db_path, candidates).archived == 1
+        archived = self.row(db_path)
+        history = self.logs(db_path)
+        with closing(sqlite3.connect(db_path)) as conn:
+            for memory_id in ["bad", "good", "untouched"]:
+                conn.execute(
+                    "INSERT INTO working_memory VALUES (?, 'ok', 'synthetic', '2026-01-01', 'synthetic', .72, '{}')",
+                    (memory_id,),
+                )
+            conn.execute(
+                "CREATE TRIGGER fail_archive_audit BEFORE INSERT ON hygiene_audit_log "
+                "WHEN NEW.memory_id='bad' BEGIN SELECT RAISE(ABORT, 'synthetic fault'); END"
+            )
+            conn.commit()
+        bad_before = self.row(db_path, memory_id="bad")
+        untouched = self.row(db_path, memory_id="untouched")
+        selected = {c.memory_id: c for c in audit_noise(db_path).candidates}
+        result = self.archive(db_path, [selected[k] for k in ["target", "bad", "good"]])
+        assert (result.archived, result.kept, result.log_entries) == (1, 1, 1)
+        assert result.errors == ["hygiene_candidate_failed: working_memory:bad"]
+        assert self.row(db_path) == archived
+        assert self.row(db_path, memory_id="bad") == bad_before
+        assert self.row(db_path, memory_id="untouched") == untouched
+        assert (
+            json.loads(self.row(db_path, memory_id="good")[1])["_original_importance"]
+            == 0.72
+        )
+        assert self.logs(db_path)[:1] == history
+        assert len(self.logs(db_path)) == 2
+
+    def test_two_independent_writers_reuse_pre_archive_candidates(self, tmp_path):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier, Event
+
+        db_path = self.bank(tmp_path)
+        ready, committed = Barrier(2), Event()
+
+        def writer(first):
+            candidates = audit_noise(db_path).candidates
+            ready.wait(timeout=5)
+            if first:
+                try:
+                    return self.archive(db_path, candidates)
+                finally:
+                    committed.set()
+            assert committed.wait(timeout=5)
+            return self.archive(db_path, candidates)
+
+        # Deterministic writer sequence, not an overlapping-lock stress test:
+        # both independently audit before writer 1 commits; writer 2 then acts.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(writer, True)
+            second = pool.submit(writer, False)
+            a, b = first.result(timeout=10), second.result(timeout=10)
+        assert (a.archived, a.errors) == (1, [])
+        assert (b.archived, b.kept, b.log_entries, b.errors) == (0, 1, 0, [])
+        assert len(self.logs(db_path)) == 1
+        assert restore_archived(db_path) == 1
+        assert self.row(db_path)[0] == 0.83
+
 
 class TestRestoreArchived:
     def test_restore_recovers_archived_row(self, temp_db):

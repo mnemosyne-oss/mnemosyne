@@ -72,8 +72,10 @@ class RecallExplainTrace:
     def set_vec_mode(self, mode: str) -> None:
         self.vec_mode = str(mode)
 
-    def set_embedding(self, *, available: bool, computed: bool) -> None:
+    def set_embedding(self, *, available: bool, computed: bool, refusal: Optional[str] = None) -> None:
         self.embedding = {"available": bool(available), "computed": bool(computed)}
+        if refusal:
+            self.embedding["policy_refusal"] = refusal
 
     def add_stage(self, name: str, *, raw_count: int, after_filter_count: int, kept_count: int, fallback_used: bool = False) -> None:
         self.stages.append({

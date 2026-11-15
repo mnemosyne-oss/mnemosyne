@@ -443,19 +443,18 @@ class VeracityConsolidator:
         # transaction once the first thread starts one.
         with self._write_lock:
             cursor = conn.cursor()
-            started_tx = False
-            if not conn.in_transaction:
-                # Let OperationalError propagate. If `database is locked`
-                # fires after busy_timeout, the caller's error handler is
-                # the right place to decide what to do; silent fallthrough
-                # would reintroduce the race we're closing.
-                cursor.execute("BEGIN IMMEDIATE")
-                started_tx = True
+            started_tx = not conn.in_transaction
             try:
+                if started_tx:
+                    # Let OperationalError propagate. If `database is locked`
+                    # fires after busy_timeout, the caller's error handler is
+                    # the right place to decide what to do; silent fallthrough
+                    # would reintroduce the race we're closing.
+                    cursor.execute("BEGIN IMMEDIATE")
                 yield
                 if started_tx:
                     conn.commit()
-            except Exception:
+            except BaseException:
                 if started_tx:
                     try:
                         conn.rollback()
@@ -630,7 +629,14 @@ class VeracityConsolidator:
             # queued pair (this call's and any left by earlier refused
             # attempts) and settle them. Never raises; a pair that
             # cannot settle now stays queued for the next pass.
-            self.retry_pending_conflicts()
+            # Inside a BEAM deferral scope (remember()'s enrichment) the
+            # write lock is still held here, so probe after its commit.
+            conn = self.conn
+            if getattr(conn, "_defer_commit", False):
+                if self.retry_pending_conflicts not in conn._after_commit_hooks:
+                    conn._after_commit_hooks.append(self.retry_pending_conflicts)
+            else:
+                self.retry_pending_conflicts()
 
         return result
 

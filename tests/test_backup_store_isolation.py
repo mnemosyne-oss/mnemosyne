@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sqlite3
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -62,8 +63,18 @@ def _freeze_clock(monkeypatch, *instants):
 
 
 def _dump(path) -> str:
-    with gzip.open(path, "rt", encoding="utf-8") as f:
-        return f.read()
+    decompressed = gzip.decompress(Path(path).read_bytes())
+    if decompressed.startswith(b"SQLite format 3\x00"):
+        with tempfile.TemporaryDirectory() as td:
+            db_file = Path(td) / "dump.db"
+            db_file.write_bytes(decompressed)
+            conn = sqlite3.connect(str(db_file))
+            try:
+                lines = list(conn.iterdump())
+                return "\n".join(lines)
+            finally:
+                conn.close()
+    return decompressed.decode("utf-8")
 
 
 def _store_dir(backup_root: Path, db: Path) -> Path:
@@ -106,7 +117,7 @@ def test_targeted_reindex_backup_stays_out_of_default_backups(monkeypatch, tmp_p
     monkeypatch.setattr(
         beam,
         "reindex_vectors",
-        lambda conn, progress=None: {"model": "fake", "dim": 4},
+        lambda conn, batch_size=64, progress=None: {"model": "fake", "dim": 4},
     )
 
     cli.cmd_reindex(["--db", str(other_db), "--yes"])
@@ -205,7 +216,7 @@ def test_targeted_bank_backups_get_one_directory_per_store(monkeypatch, tmp_path
     monkeypatch.setattr(
         beam,
         "reindex_vectors",
-        lambda conn, progress=None: {"model": "fake", "dim": 4},
+        lambda conn, batch_size=64, progress=None: {"model": "fake", "dim": 4},
     )
 
     cli.cmd_reindex(["--bank", "work", "--yes"])

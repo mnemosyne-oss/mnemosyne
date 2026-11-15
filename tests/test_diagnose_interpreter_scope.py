@@ -51,7 +51,7 @@ def test_every_dep_check_declares_the_interpreter_it_ran_in():
         )
 
 
-@pytest.mark.parametrize("scope", sorted(RUNTIME_SCOPES))
+@pytest.mark.parametrize("scope", sorted(RUNTIME_SCOPES - {"target_interpreter"}))
 def test_scope_is_the_callers_not_hard_coded(scope):
     """The provider path must not be labelled as a CLI result, or vice versa."""
     payload = collect_runtime_diagnostics(scope=scope)
@@ -151,8 +151,8 @@ def test_run_diagnostics_keeps_scope_in_summary_and_log(tmp_path, monkeypatch):
 
     summary = diagnose.run_diagnostics(scope=PROVIDER_RUNTIME_SCOPE)
 
-    assert summary["scope"] == PROVIDER_RUNTIME_SCOPE
-    assert summary["executable"] == Path(sys.executable).name
+    assert summary["runtime_scope"] == PROVIDER_RUNTIME_SCOPE
+    assert summary["runtime_executable"] == Path(sys.executable).name
     runtime_entries = [e for e in summary["entries"] if "scope" in e]
     assert {e["check"] for e in runtime_entries} >= {"checks_scope", "fastembed", "sqlite_vec"}
     assert {e["scope"] for e in runtime_entries} == {PROVIDER_RUNTIME_SCOPE}
@@ -181,7 +181,7 @@ def test_cli_diagnose_labels_its_checks_as_cli(tmp_path, monkeypatch):
     monkeypatch.setattr(diagnose, "run_diagnostics", spy)
     cli.cmd_diagnose([])
 
-    assert seen and seen[0]["scope"] == CLI_INTERPRETER_SCOPE
+    assert seen and seen[0]["runtime_scope"] == CLI_INTERPRETER_SCOPE
 
 
 def test_provider_mnemosyne_diagnose_reports_provider_runtime(tmp_path, monkeypatch):
@@ -200,7 +200,7 @@ def test_provider_mnemosyne_diagnose_reports_provider_runtime(tmp_path, monkeypa
 
     result = json.loads(provider._handle_diagnose({}))
 
-    assert result["scope"] == PROVIDER_RUNTIME_SCOPE
+    assert result["runtime_scope"] == PROVIDER_RUNTIME_SCOPE
     scope_row = next(e for e in result["entries"] if e["check"] == "checks_scope")
     assert scope_row["detail"] == PROVIDER_RUNTIME_SCOPE
     assert {e["scope"] for e in result["entries"] if "scope" in e} == {PROVIDER_RUNTIME_SCOPE}

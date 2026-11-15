@@ -1258,6 +1258,104 @@ class TestWorkingMemory:
         assert future_mid in {r["id"] for r in beam.recall("offset stored future", top_k=10)}
         assert past_mid not in {r["id"] for r in beam.recall("offset stored past", top_k=10)}
 
+    def test_invalidate_rejects_offset_bearing_expiry(self, temp_db):
+        """Review on #1113 (fifth round): the invalidate() active check must
+        judge ``valid_until`` chronologically, like every julianday-based
+        surface. A legacy/imported row can store an offset-bearing expiry
+        (e.g. ``...T18:30:00+07:00`` = 11:30Z, already expired at a 12:00Z
+        now) whose digits still sort AFTER a UTC ``now`` string, so the old
+        lexical ``>`` read the dead target as active and superseded it.
+        """
+        now = datetime.now(timezone.utc)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        target = beam.remember("offset-expired target", source="test", importance=0.9)
+        replacement = beam.remember("healthy replacement", source="test", importance=0.9)
+        # Expired 30 minutes ago, stored at UTC+07:00.
+        stored = (now - timedelta(minutes=30)).astimezone(
+            timezone(timedelta(hours=7))
+        ).isoformat()
+        # Fixture sanity: this value genuinely misleads a lexical filter —
+        # the displayed clock (now-30min+7h) always sorts after now, whether
+        # the date rolled over or not.
+        assert stored > now.isoformat(), (
+            "fixture: the stored value must sort lexically AFTER aware-UTC now")
+        beam.conn.execute(
+            "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+            (stored, target),
+        )
+        beam.conn.commit()
+
+        assert beam.invalidate(target, replacement_id=replacement) is False, (
+            "an expired target must never accept supersession")
+        row = beam.conn.execute(
+            "SELECT superseded_by FROM working_memory WHERE id = ?", (target,)
+        ).fetchone()
+        assert row[0] is None, "the original memory must not be superseded"
+
+    def test_invalidate_rejects_equal_instant(self, temp_db, monkeypatch):
+        """Review on #1113: eligibility is a strict ``>`` — a row whose
+        expiry is exactly ``now`` is expired, not still active.
+
+        The clock is frozen at the stored instant for the invalidation call,
+        so the two operands are the same instant to the microsecond; a
+        ``>=`` regression would accept the supersession and fail here
+        (review on #1142: without freezing, the captured ``at_now`` drifts
+        microseconds ahead of ``invalidate``'s own ``now`` and the equality
+        boundary is not actually pinned).
+        """
+        import datetime as _dt
+
+        frozen = _dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=_dt.timezone.utc)
+
+        class _FrozenDatetime(_dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return frozen if tz is not None else frozen.replace(tzinfo=None)
+
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        target = beam.remember("equal-instant target", source="test", importance=0.9)
+        replacement = beam.remember("healthy replacement", source="test", importance=0.9)
+        beam.conn.execute(
+            "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+            (frozen.isoformat(), target),
+        )
+        beam.conn.commit()
+
+        monkeypatch.setattr(beam_module, "datetime", _FrozenDatetime)
+        assert beam.invalidate(target, replacement_id=replacement) is False
+        row = beam.conn.execute(
+            "SELECT superseded_by FROM working_memory WHERE id = ?", (target,)
+        ).fetchone()
+        assert row[0] is None
+
+    def test_invalidate_accepts_future_offset_bearing_target(self, temp_db):
+        """Review on #1113: the fix must not lose still-valid rows. A future
+        expiry stored at UTC-05:00 sorts lexically BEFORE aware-UTC now
+        (misleading the old check into reading it expired) but is
+        chronologically active, so the invalidation must succeed.
+        """
+        now = datetime.now(timezone.utc)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        target = beam.remember("future-offset target", source="test", importance=0.9)
+        replacement = beam.remember("healthy replacement", source="test", importance=0.9)
+        stored = (now + timedelta(hours=1)).astimezone(
+            timezone(timedelta(hours=-5))
+        ).isoformat()
+        assert stored < now.isoformat(), (
+            "fixture: the stored value must sort lexically BEFORE aware-UTC now")
+        beam.conn.execute(
+            "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+            (stored, target),
+        )
+        beam.conn.commit()
+
+        assert beam.invalidate(target, replacement_id=replacement) is True, (
+            "a chronologically future expiry must stay supersede-able")
+        row = beam.conn.execute(
+            "SELECT superseded_by FROM working_memory WHERE id = ?", (target,)
+        ).fetchone()
+        assert row[0] == replacement
+
     def test_lowercase_t_valid_until_normalized_to_utc(self, temp_db, non_utc_tz):
         """#525: valid_until with a lowercase ``t`` separator is normalized.
 

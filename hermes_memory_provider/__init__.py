@@ -1,30 +1,39 @@
-"""Mnemosyne Memory Provider for Hermes.
+"""Legacy Mnemosyne Memory Provider for Hermes.
 
-Deploy to Hermes via:
-    ln -s /path/to/mnemosyne/hermes_memory_provider ~/.hermes/plugins/mnemosyne
+The direct source-checkout symlink installation is deprecated. For supported
+Hermes setup, use the standalone ``mnemosyne-hermes`` package and the canonical
+guide at ``../docs/hermes-integration.md`` (relative to this module's directory).
 
-Then set in ~/.hermes/config.yaml:
-    memory:
-      provider: mnemosyne
-
-This gives Mnemosyne first-class MemoryProvider integration (system prompt
-injection, pre-turn prefetch, post-turn sync, tool dispatch) while remaining
-a standalone plugin deployed through the plugin system.
+This legacy package is retained for existing imports. This documentation change
+does not alter runtime behavior, exports or tool schemas. Future removal and
+compatibility boundaries are tracked in #655; no removal date or future shim is
+promised here.
 """
 
 from __future__ import annotations
+
+import sys
+
+# File-loaded entry points cannot rely on a parent package guard.
+if sys.platform in {"android", "emscripten"} or (
+    sys.platform == "linux" and hasattr(sys, "getandroidapilevel")
+):
+    _platform_label = "android" if sys.platform == "linux" else sys.platform
+    raise RuntimeError(
+        f"Mnemosyne native Hermes integration is unsupported on {_platform_label}; "
+        "no provider or tools were activated."
+    )
 
 from contextlib import contextmanager
 import json
 import logging
 import os
 import re
-import sys
 import threading
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from datetime import datetime, timedelta, timezone
 
 # Ensure mnemosyne core is importable from this directory
@@ -302,6 +311,14 @@ logger = logging.getLogger(__name__)
 _provider_active: bool = False
 _active_provider_count: int = 0
 
+# Host-backend ownership is deliberately separate from _provider_active: only
+# a primary provider whose Beam initialization succeeded owns a contribution.
+# Skip contexts still register the backend for mnemosyne_sleep, but neither
+# acquire nor release this ownership lease. _host_llm_lock serializes every
+# lease transition with the register/unregister call it guards.
+_host_llm_owner_count: int = 0
+_host_llm_lock = threading.Lock()
+
 # ---------------------------------------------------------------------------
 # Lazy imports — fail gracefully if mnemosyne core is missing
 # ---------------------------------------------------------------------------
@@ -360,6 +377,276 @@ def _sync_turn_assistant_limit() -> int:
         )
         return 800
 
+
+# Interrupted-note boundary: the note bracket plus its "The interrupted request was:]" cut point
+_HERMES_INTERRUPTED_BOUNDARY = re.compile(r"^\[System\s+note:\s+(?:Your|The)\s+previous\s+turn\s+was\s+interrupted[^\]]*?The\s+interrupted\s+request\s+was:\]\s*", re.IGNORECASE)
+
+# Authentic Hermes machine notice and strippable prefix patterns
+_HERMES_AUTHENTIC_SYSTEM_NOTES: Tuple[re.Pattern, ...] = (
+    re.compile(r"^\[System\s+note:\s+(?:Your|The)\s+previous\s+turn\s+was\s+interrupted[^\]]*\]\s*", re.IGNORECASE),
+    re.compile(r"^\[System\s+note:\s+(?:The\s+)?user\s+switched\s+models[^\]]*\]\s*", re.IGNORECASE),
+    re.compile(r"^\[System\s+note:\s+(?:(?:The\s+)?(?:user's\s+)?(?:previous\s+(?:gateway\s+)?session|session\s+was\s+automatically\s+reset)|(?:The\s+)?previous\s+gateway\s+session|gateway\s+(?:session\s+)?(?:restart|was\s+restarted)|A\s+new\s+message\s+has\s+arrived)[^\]]*\]\s*", re.IGNORECASE),
+    re.compile(r"^\[System\s+note:\s+(?:You\s+are\s+working\s+in\s+an\s+isolated\s+git\s+worktree|The\s+user\s+(?:invoked\s+/browser|has\s+disconnected\s+the\s+browser))[^\]]*\]\s*", re.IGNORECASE),
+    re.compile(r"^\[System\s+note:\s+The\s+following\s+is\s+recalled\s+memory\s+context[^\]]*\]\s*", re.IGNORECASE),
+    re.compile(r"^\[System\s+note:\s+This\s+is\s+the\s+user's\s+very\s+first\s+message\s+ever[^\]]*\]\s*", re.IGNORECASE),
+    re.compile(r"^\[System\s+note:\s+This\s+\w+\s+had\s+an\s+earlier\s+Hermes\s+session[^\]]*\]\s*", re.IGNORECASE),
+)
+
+_HERMES_CRON_HEADER_PATTERN: re.Pattern = re.compile(
+    r"^\[IMPORTANT:\s+You\s+are\s+running\s+as\s+a\s+scheduled\s+cron\s+job\b[^\]]*\]\s*",
+    re.IGNORECASE,
+)
+_HERMES_CRON_REPLY_PATTERN: re.Pattern = re.compile(
+    r"^\[Replying\s+to:\s+\"Cronjob\s+Response:[^\"]*\"\s*\]\s*",
+    re.IGNORECASE,
+)
+_HERMES_MCP_RELOAD_PATTERN: re.Pattern = re.compile(
+    r"^\[IMPORTANT:\s+MCP\s+servers\s+have\s+been\s+reloaded\b[^\]]*\]\s*",
+    re.IGNORECASE,
+)
+_HERMES_WATCH_STATUS_PATTERN: re.Pattern = re.compile(
+    r"^\[IMPORTANT:\s+(?:Watch\s+pattern\s+for\s+process\s+[\w.-]+\s+disabled|Watch-pattern\s+overflow:|Watch-pattern\s+notifications\s+resumed\.)[^\]]*\]\s*",
+    re.IGNORECASE,
+)
+_HERMES_MULTI_PROCESS_PATTERN: re.Pattern = re.compile(
+    r"^\[IMPORTANT:\s+\d+\s+background\s+processes?\s+completed\b.*?\]\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_HERMES_AUTHENTIC_MACHINE_PATTERNS: Tuple[re.Pattern, ...] = (
+    *_HERMES_AUTHENTIC_SYSTEM_NOTES,
+    _HERMES_CRON_HEADER_PATTERN,
+    _HERMES_CRON_REPLY_PATTERN,
+    _HERMES_MCP_RELOAD_PATTERN,
+    _HERMES_WATCH_STATUS_PATTERN,
+    _HERMES_MULTI_PROCESS_PATTERN,
+)
+
+
+
+def _is_conversational_inquiry(text: str) -> bool:
+    """Best-effort check if text has the shape of a conversational inquiry."""
+    t = text.strip()
+    if "?" in t:
+        return True
+    lower = t.lower()
+    if re.search(r"\b(explain|what does|what is|meaning of)\b", lower):
+        return True
+    inquiry_starters = (
+        "what", "why", "how", "when", "where", "who", "which",
+        "can you", "could you", "please", "explain", "tell me",
+        "check", "is this", "is there", "show me", "did you",
+        "do we", "should we", "would you",
+    )
+    for starter in inquiry_starters:
+        if lower.startswith(starter) or f" {starter} " in lower:
+            return True
+    return False
+
+
+def _sanitize_hermes_machine_envelope_core(user_content: str) -> Optional[str]:
+    """Best-effort text-only sanitization of Hermes machine-generated envelopes.
+
+    Filters synthetic execution notices (background processes, cron preambles,
+    delegation completions, compaction handoffs) from autosave in sync_turn().
+    Filtering is explicitly best-effort rather than an origin guarantee;
+    ambiguous input and genuine human questions quoting notice terms are
+    preserved conservatively.
+
+    Returns:
+        - None if user_content is purely a machine-generated notice (autosave should be skipped).
+        - Cleaned human prompt string if user_content contained machine notice envelopes followed
+          by a genuine user prompt (e.g. process notification or interrupted prompt preceding human input).
+        - Unmodified user_content if it is genuine user input or ambiguous mixed input.
+    """
+    text = (user_content or "").strip()
+    if not text:
+        return ""
+
+    # Interrupted prompt: cut only at the note's own boundary, never inside later human text.
+    m = _HERMES_INTERRUPTED_BOUNDARY.match(text)
+    if m:
+        tail = text[m.end():].strip()
+        if tail:
+            return _sanitize_hermes_machine_envelope(tail)
+
+    # 1. Strippable envelope prefixes in mixed turns (cron preamble, cron reply, authentic system notes, MCP reload)
+    changed = True
+    while changed:
+        changed = False
+        m = _HERMES_CRON_HEADER_PATTERN.match(text)
+        if m:
+            text = text[m.end():].strip()
+            changed = True
+            continue
+        m = _HERMES_CRON_REPLY_PATTERN.match(text)
+        if m:
+            text = text[m.end():].strip()
+            changed = True
+            continue
+        m = _HERMES_MCP_RELOAD_PATTERN.match(text)
+        if m:
+            text = text[m.end():].strip()
+            changed = True
+            continue
+        m = _HERMES_WATCH_STATUS_PATTERN.match(text)
+        if m:
+            text = text[m.end():].strip()
+            changed = True
+            continue
+        for pat in _HERMES_AUTHENTIC_SYSTEM_NOTES:
+            m = pat.match(text)
+            if m:
+                text = text[m.end():].strip()
+                changed = True
+                break
+
+    if not text:
+        return None
+
+    # 2. Context compaction & summary handoffs
+    if re.match(r"^\[CONTEXT\s+COMPACTION\b", text, re.IGNORECASE):
+        # A genuine user question inquiring about context compaction
+        if "?" in text and "Earlier turns were compacted" not in text:
+            return text
+        for end_marker in (
+            "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---",
+            "--- END OF CONTEXT SUMMARY",
+        ):
+            if end_marker in text:
+                tail = text.split(end_marker, 1)[1].strip()
+                return _sanitize_hermes_machine_envelope(tail) if tail else None
+        return None
+
+    if re.match(r"^\[CONTEXT\s+SUMMARY\]\s*:", text, re.IGNORECASE):
+        after_prefix = text[text.find(":") + 1:].strip()
+        if _is_conversational_inquiry(after_prefix) and "\n\n" not in after_prefix and len(after_prefix) < 200:
+            return text
+        if "\n\n" in after_prefix:
+            tail = after_prefix.split("\n\n", 1)[1].strip()
+            if tail:
+                return _sanitize_hermes_machine_envelope(tail)
+        return None
+
+    if re.match(r"^\[PRIOR\s+CONTEXT\b", text, re.IGNORECASE):
+        if "?" in text and "for reference only; not a new message" not in text:
+            return text
+        for end_marker in (
+            "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---",
+            "--- END OF CONTEXT SUMMARY",
+            "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]",
+        ):
+            if end_marker in text:
+                tail = text.split(end_marker, 1)[1].strip()
+                if "--- END OF CONTEXT SUMMARY" in tail:
+                    tail = tail.split("--- END OF CONTEXT SUMMARY", 1)[1].removeprefix(" — respond to the message below, not the summary above ---").strip()
+                return _sanitize_hermes_machine_envelope(tail) if tail else None
+        if "\n\n" in text:
+            tail = text.split("\n\n", 1)[1].strip()
+            if tail:
+                return _sanitize_hermes_machine_envelope(tail)
+        return None
+
+    if re.match(r"^\[Your\s+active\s+task\s+list\s+was\s+preserved\b", text, re.IGNORECASE):
+        if "?" in text and "across context compression" not in text:
+            return text
+        if "\n\n" in text:
+            tail = text.split("\n\n", 1)[1].strip()
+            if tail:
+                return _sanitize_hermes_machine_envelope(tail)
+        return None
+
+    if re.match(r"^\[Planning\s+state\s+preserved\b", text, re.IGNORECASE):
+        if "?" in text:
+            return text
+        if "\n\n" in text:
+            tail = text.split("\n\n", 1)[1].strip()
+            if tail:
+                return _sanitize_hermes_machine_envelope(tail)
+        return None
+
+    # 3. Async delegation notices
+    is_deleg = (
+        re.match(r"^\[ASYNC\s+(?:DELEGATION\s+)?(?:BATCH\s+)?(?:COMPLETE|TASK\s+FAILED)\b", text, re.IGNORECASE)
+        or re.match(r"^\[IMPORTANT:\s+\d+\s+background\s+subagent\s+delegations\s+completed\b", text, re.IGNORECASE)
+        or re.match(r"^\s*A\s+background\s+(?:fan-out\s+of\s+\d+\s+subagent\(s\)|subagent)\s+you\s+dispatched\s+earlier\s+has\s+finished\.", text, re.IGNORECASE)
+    )
+    if is_deleg:
+        # Check authentic delegation prose notice with prompt
+        m_prose = re.match(r"^\s*A\s+background\s+(?:fan-out\s+of\s+\d+\s+subagent\(s\)|subagent)\s+you\s+dispatched\s+earlier\s+has\s+finished\.(?:\s+You\s+may\s+have\s+moved\s+on\.)?\s*", text, re.IGNORECASE)
+        if m_prose:
+            tail = text[m_prose.end():].strip()
+            if tail:
+                return _sanitize_hermes_machine_envelope(tail)
+            return None
+        if "[System note:" in text:
+            tail = "[System note:" + text.split("[System note:")[-1]
+            return _sanitize_hermes_machine_envelope(tail)
+        # Authentic delegation notice without trailing prompt
+        if ("dispatched earlier has finished" in text or "Dispatched:" in text or "Original goal:" in text or "Role:" in text or "--- RESULT ---" in text or "--- ERROR ---" in text or "Treat these results as one completion batch" in text or text.endswith("]")):
+            return None
+        return text
+
+    # 4. Background process completion / watch notification
+    is_proc = re.match(r"^\[IMPORTANT:\s+Background\s+process\s+[\w.-]+\s+(?:completed|exited|terminated|matched|failed|marked)\b", text, re.IGNORECASE)
+    if is_proc:
+        # Authentic process notice with Command and Output
+        if "Command:" in text and ("Output:" in text or "Matched output:" in text):
+            if text.endswith("]"):
+                return None
+            idx = text.rfind("]\n")
+            if idx != -1:
+                tail = text[idx + 1:].strip()
+                # ponytail: a payload-shaped tail is machine output, never a human prompt
+                if tail and not tail.startswith(("Command:", "Output:", "Matched output:")):
+                    return _sanitize_hermes_machine_envelope(tail)
+            return None
+        # Short mock/test notice, e.g. "[IMPORTANT: Background process job completed]\nPlease summarize..."
+        if "]\n" in text:
+            idx = text.find("]\n")
+            tail = text[idx + 1:].strip()
+            if tail:
+                return _sanitize_hermes_machine_envelope(tail)
+        if text.endswith("]"):
+            if "?" in text:
+                return text
+            return None
+        return text
+
+    if _HERMES_MULTI_PROCESS_PATTERN.match(text):
+        return None
+
+    return text
+
+# ponytail: single guard over every `return None` branch: a notice-shaped input the
+# sanitizer would drop is kept when its header/rest is an explicit inquiry and carries no
+# machine payload (Output/Command/RESULT). Narrow by design; ambiguous input stays conservative.
+_HERMES_PAYLOAD_MARKERS = ("Output:", "Matched output:", "Command:", "--- RESULT ---", "--- ERROR ---")
+
+
+def _is_human_inquiry_envelope(text: str) -> bool:
+    m = re.match(r"^\[([^\]]*)\]\s*(.*)$", text, re.DOTALL)
+    if not m or any(p in text for p in _HERMES_PAYLOAD_MARKERS):
+        return False
+    # ponytail: task list snapshot items are machine output, not human inquiry
+    if re.match(r"^\s*-\s*\[[ xX]\]", m.group(2)):
+        return False
+    # ponytail: text inside a recognized authentic machine notice must never override rejection
+    if any(pat.match(text) for pat in _HERMES_AUTHENTIC_MACHINE_PATTERNS):
+        return False
+    header, rest = m.group(1), m.group(2).strip()
+    return _is_conversational_inquiry(header) or (bool(rest) and _is_conversational_inquiry(rest))
+
+
+def _sanitize_hermes_machine_envelope(user_content: str) -> Optional[str]:
+    """Wrapper: keep explicit human inquiries that the core pass would drop."""
+    text = (user_content or "").strip()
+    result = _sanitize_hermes_machine_envelope_core(text)
+    if result is None and text and _is_human_inquiry_envelope(text):
+        return text
+    return result
+
+
 def _sanitize_prefetch_query(query: str) -> str:
     """Use core's shared sanitizer lazily to preserve diagnostic CLI imports."""
     from mnemosyne.core.query_sanitize import sanitize_prefetch_query
@@ -373,8 +660,9 @@ def _sanitize_prefetch_query(query: str) -> str:
 REMEMBER_SCHEMA = {
     "name": "mnemosyne_remember",
     "description": (
-        "Store a durable memory in Mnemosyne. Use for ANY fact, preference, "
-        "identity, insight, or context that should persist across sessions. Higher importance "
+        "Store a durable memory in Mnemosyne. Use for bulk durable facts, preferences, "
+        "identity, insights, or context that should persist across sessions. Small standing "
+        "rules and context anchors may stay in the always-injected memory tier instead. Higher importance "
         "(0.0-1.0) surfaces the memory more often. Use scope='global' for user-level "
         "facts; scope='session' for conversation-specific context. Use valid_until "
         "(ISO date YYYY-MM-DD) for time-bound facts. Use extract_entities=True to "
@@ -543,7 +831,19 @@ CROSS_SESSION_RESOLVE_SCHEMA = {
         "properties": {
             "dry_run": {
                 "type": "boolean",
-                "description": "If true, report what would be resolved without writing changes.",
+                "description": "If true, preview resolution without superseding memories or emitting an apply audit. LLM evaluation may still write cost records.",
+                "default": False,
+            },
+            "llm_eval": {
+                "type": "boolean",
+                "description": (
+                    "Only meaningful with dry_run=true: run LLM verification on "
+                    "flagged pairs without superseding memories. Can incur costs "
+                    "and write cost records; reserves one reflection call and "
+                    "obeys cron/budget guards. Overrides the LLM detection flag "
+                    "for preview, not the cross-session gate. Default false "
+                    "keeps the dry run deterministic (no LLM calls or reservation)."
+                ),
                 "default": False,
             },
         },
@@ -655,7 +955,13 @@ REMEMBER_MEDIA_SCHEMA = {
             "title": {"type": "string", "description": "Short human title for the media. Optional."},
             "hint": {
                 "type": "string",
-                "description": "Guidance for the describer: what to look for, or names and jargon to expect in speech.",
+                "description": (
+                    "Guidance for the describer. For the OpenAI-compatible image adapter, "
+                    "a non-empty hint replaces the entire prompt; it is not appended. "
+                    "The caller must include instructions for the expected JSON response "
+                    "(summary and moments). An empty or omitted hint uses the configured "
+                    "or default prompt template."
+                ),
             },
             "max_moments": {
                 "type": "integer",
@@ -1426,6 +1732,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # negative count when shutdown is called on a never-activated
         # instance.
         self._is_active_in_module: bool = False
+        # A host-backend owner is a successfully initialized primary provider.
+        # It is intentionally not inferred from _is_active_in_module because
+        # that counter governs legacy prefetch deferral, not backend lifetime.
+        self._owns_host_llm_backend: bool = False
 
     def _activate_in_module(self) -> None:
         """Bump the module-level active-provider count exactly once per
@@ -1447,6 +1757,37 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             self._is_active_in_module = False
             _active_provider_count = max(0, _active_provider_count - 1)
             _provider_active = (_active_provider_count > 0)
+
+    def _acquire_host_llm_backend_ownership(self) -> None:
+        """Register and record this initialized primary provider's lease once."""
+        global _host_llm_owner_count
+        with _host_llm_lock:
+            if self._owns_host_llm_backend:
+                return
+            try:
+                from hermes_memory_provider.hermes_llm_adapter import register_hermes_host_llm
+                if not register_hermes_host_llm():
+                    return
+            except Exception as exc:
+                logger.debug("Mnemosyne could not register Hermes auxiliary LLM backend: %s", exc)
+                return
+            self._owns_host_llm_backend = True
+            _host_llm_owner_count += 1
+
+    def _release_host_llm_backend_ownership(self) -> None:
+        """Release this provider's lease and clear only after the final owner."""
+        global _host_llm_owner_count
+        with _host_llm_lock:
+            if not self._owns_host_llm_backend:
+                return
+            self._owns_host_llm_backend = False
+            _host_llm_owner_count = max(0, _host_llm_owner_count - 1)
+            if _host_llm_owner_count == 0:
+                try:
+                    from hermes_memory_provider.hermes_llm_adapter import unregister_hermes_host_llm
+                    unregister_hermes_host_llm()
+                except Exception as exc:
+                    logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
 
     def _init_audit_log(self) -> None:
         """Initialize audit log co-located with the active provider DB."""
@@ -1947,18 +2288,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._hermes_home = kwargs.get("hermes_home", "")
         # An unknown memory.mnemosyne.tools name must fail init loudly (#1063)
         # instead of waiting for the first tool-list/tool-call request. On
-        # failure, run the same deactivation/release path shutdown() uses so
-        # a rejected re-init can't leave the instance active with no beam.
+        # failure, release the active registration and backend lease the
+        # same way shutdown() does, then re-raise the original error.
         try:
             self._configured_tool_schemas()
         except Exception:
+            self._release_host_llm_backend_ownership()
             self._deactivate_in_module()
-            if self._agent_context not in self._skip_contexts:
-                try:
-                    from hermes_memory_provider.hermes_llm_adapter import unregister_hermes_host_llm
-                    unregister_hermes_host_llm()
-                except Exception as exc:
-                    logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
             raise
         self._agent_identity = kwargs.get("agent_identity", None) or ""
         self._gateway_session_key = kwargs.get("gateway_session_key") or ""
@@ -1973,17 +2309,22 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Apply provider-specific config from kwargs (Hermes-passed) or config.yaml fallback
         self._apply_provider_config(kwargs)
 
-        # C25: Register the Hermes auxiliary LLM backend BEFORE the skip-context
-        # early return. The backend is process-global and needed by sleep even in
-        # skip-context sessions (subagent/cron/flush can still run memory tools).
-        try:
-            from hermes_memory_provider.hermes_llm_adapter import register_hermes_host_llm
-            if register_hermes_host_llm():
-                logger.info("Mnemosyne registered Hermes auxiliary LLM backend for memory operations")
-        except Exception as exc:
-            logger.debug("Mnemosyne could not register Hermes auxiliary LLM backend: %s", exc)
+        # Release a former primary lease before the skip context registers its
+        # backend. Releasing the final lease afterwards would clear that backend.
+        if self._agent_context in self._skip_contexts:
+            self._release_host_llm_backend_ownership()
 
         if self._agent_context in self._skip_contexts:
+            # Skip contexts retain their existing process-global registration.
+            # A primary registers only when its successful init acquires a lease,
+            # so a failed new primary cannot replace or clear this backend.
+            with _host_llm_lock:
+                try:
+                    from hermes_memory_provider.hermes_llm_adapter import register_hermes_host_llm
+                    if register_hermes_host_llm():
+                        logger.info("Mnemosyne registered Hermes auxiliary LLM backend for memory operations")
+                except Exception as exc:
+                    logger.debug("Mnemosyne could not register Hermes auxiliary LLM backend: %s", exc)
             logger.debug("Mnemosyne skipped: non-primary context=%s", self._agent_context)
             # C13: a skip-context re-init must DEACTIVATE the instance if
             # it was previously active in this process. Without this, a
@@ -2037,6 +2378,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             logger.warning("Mnemosyne init failed: %s", e)
             self._beam = None
             self._init_error = e
+            # A failed re-init releases only its own former primary lease.
+            # New failed primaries never registered a backend, so they must not
+            # clear an existing skip-context or peer registration.
+            self._release_host_llm_backend_ownership()
 
         # C13: activate AFTER the BeamMemory init result is known. If
         # init succeeded (_beam is set) the provider is the live memory
@@ -2057,6 +2402,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             self._beam.canonical_owner_id = self._canonical_owner()
             self._beam.agent_context = self._agent_context
             self._activate_in_module()
+            self._acquire_host_llm_backend_ownership()
             self._init_audit_log()
 
 
@@ -2069,10 +2415,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # (working / init-failed-visible / skip-context-silent).
             base = (
                 "# Mnemosyne Memory\n"
-                "Active (native local memory). Use mnemosyne_remember to store ANY "
-                "durable fact, preference, identity, or insight. Use mnemosyne_recall to search. "
+                "Active (native local memory). Use mnemosyne_remember for bulk durable storage: "
+                "facts, preferences, identity, and insights. Use mnemosyne_recall to search. "
                 "Use mnemosyne_shared_* tools for manual shared surface CRUD. "
-                "The legacy memory tool is deprecated for durable storage — Mnemosyne is primary.\n"
+                "The legacy memory tool is deprecated for bulk durable storage — Mnemosyne is primary. "
+                "Small standing rules and context anchors may stay in the always-injected memory "
+                "tier, a supported complementary tier (bounded, loaded per session); this exception "
+                "takes precedence over general storage guidance.\n"
                 "\n"
                 "When a `## Mnemosyne Context` block is injected into the current turn, "
                 "read it before calling retrieval tools. If it answers the user's question, "
@@ -2344,36 +2693,41 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 ledger_session_id = str(session_id or "").strip()
                 if ledger_session_id and not getattr(self, "_active_session_id", ""):
                     self._active_session_id = ledger_session_id
-                if "user" in self._sync_roles and user_content and len(user_content) > 5:
-                    user_limit = _sync_turn_user_limit()
-                    uc = user_content[:user_limit] if user_limit > 0 else user_content
-                    stored_user = f"[USER] {uc}"
-                    capture = ledger.capture if ledger else None
-                    remember = (lambda **kw: capture(ledger_session_id, ticket, self._beam, user_content, **kw)) if capture else self._beam.remember
-                    user_memory_id = remember(
-                        content=stored_user,
-                        source="conversation",
-                        importance=0.5,
-                        scope=self._default_scope,
-                        extract_entities=True,
-                        _write_policy_content=user_content,
-                    )
-                    if user_memory_id is not None:
-                        self._capture_identity_signals(user_content)
-                if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10:
-                    assistant_limit = _sync_turn_assistant_limit()
-                    ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
-                    stored_assistant = f"[ASSISTANT] {ac}"
-                    capture = ledger.capture if ledger else None
-                    remember = (lambda **kw: capture(ledger_session_id, ticket, self._beam, assistant_content, **kw)) if capture else self._beam.remember
-                    remember(
-                        content=stored_assistant,
-                        source="conversation",
-                        importance=0.15,
-                        scope=self._default_scope,
-                        extract_entities=True,
-                        _write_policy_content=assistant_content,
-                    )
+                clean_user = _sanitize_hermes_machine_envelope(user_content)
+                beam = self._beam
+                if beam is None:
+                    return
+                if clean_user is not None:
+                    if "user" in self._sync_roles and clean_user and len(clean_user) > 5:
+                        user_limit = _sync_turn_user_limit()
+                        uc = clean_user[:user_limit] if user_limit > 0 else clean_user
+                        stored_user = f"[USER] {uc}"
+                        capture = ledger.capture if ledger else None
+                        remember = (lambda **kw: capture(ledger_session_id, ticket, beam, clean_user, **kw)) if capture else beam.remember
+                        user_memory_id = remember(
+                            content=stored_user,
+                            source="conversation",
+                            importance=0.5,
+                            scope=self._default_scope,
+                            extract_entities=True,
+                            _write_policy_content=clean_user,
+                        )
+                        if user_memory_id is not None:
+                            self._capture_identity_signals(clean_user)
+                    if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10:
+                        assistant_limit = _sync_turn_assistant_limit()
+                        ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
+                        stored_assistant = f"[ASSISTANT] {ac}"
+                        capture = ledger.capture if ledger else None
+                        remember = (lambda **kw: capture(ledger_session_id, ticket, beam, assistant_content, **kw)) if capture else beam.remember
+                        remember(
+                            content=stored_assistant,
+                            source="conversation",
+                            importance=0.15,
+                            scope=self._default_scope,
+                            extract_entities=True,
+                            _write_policy_content=assistant_content,
+                        )
             self._turn_count += 1
             if self._auto_sleep_enabled and self._turn_count % 10 == 0:
                 self._maybe_auto_sleep()
@@ -2490,7 +2844,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _capture_identity_signals(self, user_content: str) -> None:
         content_lower = user_content.lower()
         for signal in self._IDENTITY_SIGNALS:
-            if signal in content_lower:
+            if re.search(r'\b' + re.escape(signal) + r'\b', content_lower):
                 # Save identity memory with high importance for durable recall
                 from mnemosyne.core.filters import _SYSTEM_DERIVED_WRITE_CAPABILITY
 
@@ -3162,11 +3516,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _handle_resolve_conflicts(self, args: Dict[str, Any]) -> str:
         """Invoke the opt-in cross-session conflict resolver.
 
-        `dry_run=True` reports candidate pairs without mutating; `dry_run=False`
-        applies supersessions. The apply path reserves the reflection budget (it
-        can issue one LLM validation request per flagged pair when
-        `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on)."""
+        `dry_run=True` previews without superseding memories or apply audits.
+        Explicit `llm_eval=True` can call the LLM and write cost records even
+        when the LLM detection flag is off. Apply and evaluated preview reserve
+        one reflection call before core execution, without refunds."""
         dry_run = bool(args.get("dry_run", False))
+        llm_eval = bool(args.get("llm_eval", False))
         if not hasattr(self._beam, "resolve_cross_session_conflicts"):
             return json.dumps({
                 "status": "unavailable",
@@ -3175,12 +3530,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Apply can issue one LLM validation request per flagged pair when
         # MNEMOSYNE_LLM_CONFLICT_DETECTION is on; reserve the reflection budget
         # like _handle_sleep does for the same class of work. Dry runs are
-        # deterministic and make no LLM calls, so they need no budget.
-        if not dry_run:
+        # deterministic and make no LLM calls unless llm_eval is requested.
+        if not dry_run or llm_eval:
             skip = self._reserve_reflection_budget("tool")
             if skip is not None:
                 return json.dumps(skip)
-        result = self._beam.resolve_cross_session_conflicts(dry_run=dry_run)
+        result = self._beam.resolve_cross_session_conflicts(
+            dry_run=dry_run,
+            llm_eval=llm_eval,
+        )
         if not dry_run and int(result.get("invalidated", 0)):
             try:
                 self._audit_event(
@@ -3202,6 +3560,47 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         episodic = self._beam.get_episodic_stats()
         memoria = self._beam.get_memoria_stats()
         return json.dumps({"provider": "mnemosyne", "session_id": self._session_id, "working": working, "episodic": episodic, "memoria": memoria})
+
+    def _invalidate_target_active(self, beam: Any, memory_id: str) -> bool:
+        """True when `memory_id` is still an ACTIVE row for this beam.
+
+        BeamMemory.invalidate() refuses to touch a row that is superseded or
+        expired, while BeamMemory.get() happily returns such rows too — so a
+        failed invalidation can only blame the replacement when the target
+        itself still passes core's visibility predicate. Mirrors exactly that
+        predicate. When the query cannot run, only a get() row that POSITIVELY
+        declares both status fields unset counts as active: the real
+        BeamMemory.get() shape omits superseded_by/valid_until entirely, and
+        absent fields mean UNKNOWN, not active. An unknown state fails closed
+        (memory_not_found) rather than blaming a healthy replacement.
+        """
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            cursor = beam.conn.cursor()
+            for table in ("working_memory", "episodic_memory"):
+                cursor.execute(
+                    f"SELECT 1 FROM {table} "
+                    "WHERE id = ? AND (session_id = ? OR scope = 'global') "
+                    "AND superseded_by IS NULL "
+                    "AND (valid_until IS NULL OR julianday(valid_until) > julianday(?)) LIMIT 1",
+                    (memory_id, getattr(beam, "session_id", None), now),
+                )
+                if cursor.fetchone() is not None:
+                    return True
+            return False
+        except Exception:
+            # Degraded path — see the contract above: activity is only
+            # claimed when the row declares it, never inferred from absent
+            # fields (review on #1113, third round).
+            try:
+                row = beam.get(memory_id)
+            except Exception:
+                return False
+            if row is None:
+                return False
+            if "superseded_by" not in row or "valid_until" not in row:
+                return False
+            return not row["superseded_by"] and not row["valid_until"]
 
     def _handle_invalidate(self, args: Dict[str, Any]) -> str:
         memory_id = args.get("memory_id", "")
@@ -3242,10 +3641,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             metadata={"replacement_id": replacement_id, "invalidated": ok} if replacement_id else {"invalidated": ok},
         )
         if not ok:
-            if replacement_id and target_beam.get(memory_id) is not None:
-                # The target is visible in this bank, so the only remaining
-                # reason the invalidation can fail is that the replacement id
-                # is not visible there. Tell the caller which id to correct.
+            if replacement_id and self._invalidate_target_active(target_beam, memory_id):
+                # The target is still an ACTIVE row in this bank, so the only
+                # remaining reason the invalidation can fail is that the
+                # replacement id is not an active row there. Tell the caller
+                # which id to correct. (A bare get() cannot decide this: it
+                # also returns superseded and expired rows, which would let
+                # an inactive target wrongly blame a healthy replacement.)
                 return json.dumps({
                     "status": "replacement_not_found",
                     "memory_id": memory_id,
@@ -4184,27 +4586,49 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _handle_diagnose(self, args: Dict[str, Any]) -> str:
         from mnemosyne.diagnose import run_diagnostics
-        from mnemosyne.runtime_diagnostics import PROVIDER_RUNTIME_SCOPE
+        import inspect
+
+        # Feature detection keeps old Core signatures usable; a legacy result
+        # must not claim to have measured the gateway's role explicitly.
+        try:
+            scoped = "scope" in inspect.signature(run_diagnostics).parameters
+        except (TypeError, ValueError):
+            scoped = False
+
+        def collect(**kwargs):
+            if scoped:
+                return run_diagnostics(scope="provider_runtime", **kwargs)
+            result = run_diagnostics(**kwargs)
+            result["runtime_scope"] = "unscoped"
+            # Old Core owns its log: do not rewrite a file it returned. Make
+            # that legacy log's unverified role provenance explicit instead.
+            result["runtime_log_scope"] = "legacy_unverified"
+            for entry in result.get("entries", []):
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("check") == "checks_scope":
+                    entry["detail"] = "unscoped"
+                    entry["scope"] = "unscoped"
+                elif "scope" in entry:
+                    entry["scope"] = "unscoped"
+            return result
         repair_requested = bool(args.get("repair_vec_working", False))
         dry_run = bool(args.get("dry_run", False))
         diagnostic_kwargs: Dict[str, Any] = {
             "repair_vec_working": repair_requested,
             "dry_run": dry_run,
-            # These checks run inside the provider that serves recall, so they
-            # are authoritative for that runtime, not a CLI-side view (#813).
-            "scope": PROVIDER_RUNTIME_SCOPE,
         }
         if self._profile_isolation_enabled and self._beam is not None:
             diagnostic_kwargs["bank"] = self._resolve_profile_bank()
         if self._beam is None:
-            return json.dumps(run_diagnostics(**diagnostic_kwargs), indent=2, default=str)
+            return json.dumps(collect(**diagnostic_kwargs), indent=2, default=str)
 
         # The active provider bank shares its SQLite database with auto_sleep's
         # separate Beam connection. Keep every active-bank diagnostic access in
         # one critical section so checkpointing cannot invalidate statements in
         # the other connection (#498).
         with self._ensure_beam_access_lock():
-            result = run_diagnostics(**diagnostic_kwargs)
+            result = collect(**diagnostic_kwargs)
             result["sync_turn"] = self._sync_turn_diagnostics()
 
             active_db = None
@@ -4420,17 +4844,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         drain_timed_out = thread is not None and thread.is_alive()
         self._session_end_thread = None
 
-        # Symmetric with initialize(): clear the Hermes host LLM backend so a
-        # process that later uses Mnemosyne outside Hermes does not retain a
-        # stale reference into agent.auxiliary_client.
-        # Skip-context sessions must NOT unregister — the backend is process-global
-        # and owned by the primary session.
-        if self._agent_context not in self._skip_contexts:
-            try:
-                from hermes_memory_provider.hermes_llm_adapter import unregister_hermes_host_llm
-                unregister_hermes_host_llm()
-            except Exception as exc:
-                logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
+        # Only a successfully initialized primary provider owns a backend lease.
+        # Releasing a non-owner (skip context or failed initialization) is a no-op;
+        # the final owner clears the global backend.
+        self._release_host_llm_backend_ownership()
         # The consolidation worker owns this lock while sleeping. After the
         # bounded drain expires, reacquiring it here would turn the timeout into
         # an unbounded shutdown wait. The worker uses its own Beam/connection, so

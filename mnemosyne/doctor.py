@@ -498,6 +498,7 @@ _RUNTIME_CHECK_NAMES = frozenset(
         "huggingface_hub",
         "ctransformers",
         "embeddings_available",
+        "embedding_policy_refusal",
         "embeddings_model",
         "embeddings_dim",
         "sqlite_vec_available",
@@ -510,6 +511,8 @@ _RUNTIME_STATUSES = frozenset({"OK", "YES", "NO", "MISSING", "OPTIONAL", "ERROR"
 def _safe_runtime_detail(check: str, value: Any) -> str:
     """Keep runtime metadata useful without serializing host-specific paths."""
 
+    if check == "checks_scope":
+        return _safe_runtime_scope(value)
     if check == "python_executable" and isinstance(value, str):
         # Runtime data can originate on a different OS than the Doctor host.
         # Normalize Windows separators before extracting a portable basename.
@@ -519,20 +522,9 @@ def _safe_runtime_detail(check: str, value: Any) -> str:
     return _RUNTIME_ABSOLUTE_PATH.sub("<redacted-path>", detail)
 
 
-_UNSCOPED = "unscoped"
-
-
 def _safe_runtime_scope(value: Any) -> str:
-    """Return a known scope label, never a producer-supplied free-form value.
-
-    The scope is a closed enum. Anything else -- a missing key, a dict or list,
-    an unbounded or unknown string -- becomes ``unscoped`` rather than being
-    serialized into the report or promoted to a scope it never claimed (#813).
-    """
-
-    if isinstance(value, str) and value in RUNTIME_SCOPES:
-        return value
-    return _UNSCOPED
+    """Only preserve known role labels across the untrusted report boundary."""
+    return value if isinstance(value, str) and value in RUNTIME_SCOPES else "unscoped"
 
 
 def _sanitize_runtime_diagnostics(runtime: Any) -> dict[str, Any]:
@@ -553,10 +545,6 @@ def _sanitize_runtime_diagnostics(runtime: Any) -> dict[str, Any]:
             "check": entry["check"],
             "status": entry["status"],
             "detail": _safe_runtime_detail(entry["check"], entry.get("detail", "")),
-            # Carry the scope through the boundary rather than dropping it: a
-            # report that strips it leaves a green dependency result reading as a
-            # statement about whichever runtime serves recall (#813). Only known
-            # scope labels pass; anything else is labelled unscoped.
             "scope": _safe_runtime_scope(entry.get("scope")),
         }
         for entry in runtime["checks"]
@@ -570,8 +558,8 @@ def _sanitize_runtime_diagnostics(runtime: Any) -> dict[str, Any]:
 class RuntimeDiagnosticsAdapter:
     """Expose pure runtime/dependency checks without constructing Mnemosyne."""
 
-    def __init__(self, scope: str = CALLING_INTERPRETER_SCOPE) -> None:
-        # The caller states its interpreter's role; Doctor cannot infer it.
+    def __init__(self, scope: str = CALLING_INTERPRETER_SCOPE):
+        """Name the actual caller role without guessing another runtime."""
         self.scope = scope
 
     def inspect(self) -> AdapterResult:
@@ -1210,15 +1198,13 @@ def build_doctor_report(
 
     The function intentionally does not invoke ``Mnemosyne``, provider setup,
     diagnostics repair, cleanup, reindexing, or embedding work.
-    ``runtime_scope`` names the role of the interpreter running the runtime
-    checks (see ``mnemosyne.runtime_diagnostics.RUNTIME_SCOPES``).
     """
 
     scan_limit = _validate_scan_limit(scan_limit)
     embedding_runtime = _embedding_runtime_status()
     report = DoctorReport(
         bank_name=bank_name,
-        runtime_diagnostics=RuntimeDiagnosticsAdapter(runtime_scope).inspect().metrics,
+        runtime_diagnostics=RuntimeDiagnosticsAdapter(scope=runtime_scope).inspect().metrics,
         embeddings=EmbeddingsStatusAdapter(
             None, scan_limit=scan_limit, runtime=embedding_runtime
         ).inspect().metrics,
@@ -1423,13 +1409,8 @@ def render_doctor_markdown(payload: dict[str, Any]) -> str:
                 if not isinstance(check, dict) or not isinstance(check.get("check"), str):
                     continue
                 detail = safe_preview(check.get("detail", ""), max_length=240)
-                rendered = {"status": check.get("status"), "detail": detail}
-                # Render the scope too: a human reading the markdown report is
-                # exactly the reader #813's report reached, and a scope that only
-                # exists in the JSON payload is no use to them.
-                scope = check.get("scope")
-                if isinstance(scope, str) and scope:
-                    rendered["scope"] = scope
+                rendered = {"status": check.get("status"), "detail": detail,
+                            "scope": _safe_runtime_scope(check.get("scope"))}
                 lines.append(
                     f"- {_markdown_scalar(check['check'])}: "
                     f"`{_compact_json(rendered)}`"
@@ -1638,8 +1619,12 @@ def _degradation_notes(payload: dict[str, Any]) -> list[str]:
 
 
 def _fsync_directory(directory: Path) -> None:
-    """Durably sync a completed output replacement's parent directory."""
+    """Sync a replacement's parent directory where directory handles are supported."""
 
+    # Windows' os.open uses the CRT, which cannot open directories. Staged
+    # files are still flushed/fsynced; directory durability is not provided.
+    if os.name == "nt":
+        return
     descriptor = os.open(directory, os.O_RDONLY)
     try:
         os.fsync(descriptor)

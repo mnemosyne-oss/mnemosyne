@@ -23,6 +23,248 @@ def _source() -> Path:
     return install_mod._resolve_package_dir()
 
 
+def _adoption_fixture(tmp_path):
+    """Synthetic installed artifacts; PM is faked ONLY in unit tests."""
+    _skip_on_windows()
+    import base64
+    import csv
+    import hashlib
+
+    home = tmp_path / "home"
+    site = tmp_path / "prior" / "lib" / "python3.14" / "site-packages"
+    python = site.parents[2] / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.symlink_to(sys.executable)
+    (python.parent.parent / "pyvenv.cfg").write_text("version = 3.14.6\n")
+    for name, version, package, extras in [
+        ("mnemosyne-memory", "3.15.1", "mnemosyne", ["embeddings", "mcp"]),
+        ("mnemosyne-hermes", "0.5.0", "mnemosyne_hermes", ["all", "mcp"]),
+    ]:
+        pkg = site / package
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("# register_memory_provider\n")
+        if package == "mnemosyne_hermes":
+            (pkg / "plugin.yaml").write_text("name: hermes-mnemosyne\nprovides_tools:\n  - mnemosyne_stats\nprovides_hooks:\n  - pre_llm_call\n")
+        info = site / (name.replace("-", "_") + "-" + version + ".dist-info")
+        info.mkdir()
+        (info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+            + "".join(f"Provides-Extra: {extra}\n" for extra in extras)
+        )
+        (info / "WHEEL").write_text("Wheel-Version: 1.0\n")
+        with (info / "RECORD").open("w", newline="") as stream:
+            writer = csv.writer(stream)
+            for path in [*pkg.iterdir(), info / "METADATA", info / "WHEEL"]:
+                data = path.read_bytes()
+                digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("=")
+                writer.writerow([path.relative_to(site).as_posix(), "sha256=" + digest, len(data)])
+            writer.writerow([str((info / "RECORD").relative_to(site)), "", ""])
+    target = home / "plugins" / "mnemosyne"
+    target.parent.mkdir(parents=True)
+    target.symlink_to(site / "mnemosyne_hermes")
+    (home / "config.yaml").write_text("memory:\n  provider: mnemosyne\n")
+    return home, python, site, target
+
+
+def test_adopt_pm_pins_pair_extras_and_stable_binding(tmp_path, monkeypatch):
+    home, python, site, target = _adoption_fixture(tmp_path)
+    calls = []
+    monkeypatch.setattr(install_mod, "_sync_adoption_pm", lambda base, candidate: calls.append(candidate))
+    args = ["--hermes-home", str(home), "install", "--adopt-pm", "--python", str(python),
+            "--core-extras", "embeddings,mcp", "--provider-extras", "mcp"]
+    assert install_mod.main(args) == 0
+    candidate = home / ".mnemosyne-pm" / "mnemosyne"
+    assert calls == [candidate]
+    assert target.resolve() == candidate
+    manifest = yaml.safe_load((candidate / "plugin.yaml").read_text())
+    assert manifest["python_dependencies"] == [
+        "mnemosyne-memory[embeddings,mcp]==3.15.1", "mnemosyne-hermes[mcp]==0.5.0"]
+    assert manifest["name"] == "hermes-mnemosyne"
+    assert manifest["provides_tools"] == ["mnemosyne_stats"]
+    assert manifest["provides_hooks"] == ["pre_llm_call"]
+    assert str(site) not in (candidate / "__init__.py").read_text()
+    before = target.lstat()
+    assert install_mod.main(args) == 0
+    assert target.lstat().st_ino == before.st_ino
+    assert calls == [candidate, candidate]
+
+
+def test_adopt_pm_conflict_unit_preserves_config_and_binding(tmp_path, monkeypatch):
+    home, python, site, target = _adoption_fixture(tmp_path)
+    config = (home / "config.yaml").read_bytes()
+    original = target.readlink()
+    def conflict(*args):
+        raise RuntimeError("unit resolver conflict")
+    monkeypatch.setattr(install_mod, "_sync_adoption_pm", conflict)
+    assert install_mod.main(["--hermes-home", str(home), "install", "--adopt-pm",
+        "--python", str(python), "--core-extras", "none", "--provider-extras", "none"]) == 1
+    assert target.readlink() == original
+    assert (home / "config.yaml").read_bytes() == config
+
+
+@pytest.mark.parametrize("aliased_home", [False, True])
+def test_adopt_pm_home_alias_rerun_and_plan_preserve_binding(tmp_path, monkeypatch, aliased_home):
+    """Real filesystem/idempotence unit control; the PM callback is not native evidence."""
+    home, python, site, target = _adoption_fixture(tmp_path)
+    selected_home = home
+    if aliased_home:
+        selected_home = tmp_path / "home-alias"
+        selected_home.symlink_to(home, target_is_directory=True)
+    calls = []
+    monkeypatch.setattr(install_mod, "_sync_adoption_pm", lambda base, candidate: calls.append(candidate))
+    args = ["--hermes-home", str(selected_home), "install", "--adopt-pm",
+            "--python", str(python), "--core-extras", "embeddings", "--provider-extras", "none"]
+    config = (home / "config.yaml").read_bytes()
+    assert install_mod.main(args) == 0
+    candidate = selected_home / ".mnemosyne-pm/mnemosyne"
+    assert target.resolve() == candidate.resolve()
+    original_stat = target.lstat()
+    original_binding = (original_stat.st_dev, original_stat.st_ino, target.readlink())
+    payload = {p.name: p.read_bytes() for p in candidate.iterdir()}
+    assert install_mod.main(args + ["--dry-run"]) == 0
+    assert len(calls) == 1  # A plan never calls PM.
+    assert install_mod.main(args) == 0
+    assert calls == [candidate, candidate]
+    current_stat = target.lstat()
+    assert (current_stat.st_dev, current_stat.st_ino, target.readlink()) == original_binding
+    assert {p.name: p.read_bytes() for p in candidate.iterdir()} == payload
+    assert (home / "config.yaml").read_bytes() == config
+
+
+def test_adopt_pm_ambiguous_failure_retains_candidate_and_committed_facts(tmp_path, monkeypatch, capsys):
+    home, python, site, target = _adoption_fixture(tmp_path)
+    facts = home / "new-facts.json"
+    original = target.readlink()
+    def commit_then_fail(base, candidate):
+        facts.write_text(str(candidate))
+        raise RuntimeError("connection lost after possible commit")
+    monkeypatch.setattr(install_mod, "_sync_adoption_pm", commit_then_fail)
+    assert install_mod.main(["--hermes-home", str(home), "install", "--adopt-pm",
+        "--python", str(python), "--core-extras", "none", "--provider-extras", "none"]) == 1
+    candidate = home / ".mnemosyne-pm/mnemosyne"
+    assert facts.read_text() == str(candidate)
+    assert (candidate / "plugin.yaml").is_file()
+    assert "mnemosyne-memory==3.15.1" in (candidate / "plugin.yaml").read_text()
+    assert target.readlink() == original
+    error = capsys.readouterr().err
+    assert "selection may have changed" in error and "candidate retained" in error
+
+
+@pytest.mark.parametrize("choices", [[], ["--core-extras", "none"],
+    ["--provider-extras", "none"], ["--core-extras", "unknown", "--provider-extras", "none"],
+    ["--core-extras", "none", "--provider-extras", "unknown"]])
+def test_adopt_pm_missing_or_unknown_extras_are_readonly_refusals(tmp_path, monkeypatch, choices):
+    home, python, site, target = _adoption_fixture(tmp_path)
+    def forbidden(*args):
+        raise AssertionError("extras refusal cannot reach PM")
+    monkeypatch.setattr(install_mod, "_sync_adoption_pm", forbidden)
+    original = target.lstat()
+    config = (home / "config.yaml").read_bytes()
+    assert install_mod.main(["--hermes-home", str(home), "install", "--adopt-pm",
+        "--python", str(python), *choices]) == 1
+    assert target.lstat() == original and (home / "config.yaml").read_bytes() == config
+    assert not (home / ".mnemosyne-pm").exists()
+
+
+def test_adopt_pm_plan_does_not_execute_python_site_or_touch_files(tmp_path, monkeypatch):
+    home, python, site, target = _adoption_fixture(tmp_path)
+    trap = tmp_path / "executed"
+    (site / "surprise.pth").write_text(f"import pathlib; pathlib.Path({str(trap)!r}).touch()\n")
+    def forbidden(*args, **kwargs):
+        raise AssertionError("read-only adoption cannot execute a subprocess")
+    monkeypatch.setattr(install_mod.subprocess, "run", forbidden)
+    original = target.lstat()
+    original_binding = (original.st_dev, original.st_ino, target.readlink())
+    before = (home / "config.yaml").read_bytes()
+    assert install_mod.main(["--hermes-home", str(home), "install", "--adopt-pm", "--dry-run",
+        "--python", str(python), "--core-extras", "none", "--provider-extras", "none"]) == 0
+    current = target.lstat()
+    assert (current.st_dev, current.st_ino, target.readlink()) == original_binding
+    assert (home / "config.yaml").read_bytes() == before
+    assert not (home / ".mnemosyne-pm").exists()
+    assert not trap.exists()
+
+
+def test_adopt_pm_generated_binding_imports_new_not_old_site(tmp_path, monkeypatch):
+    home, python, old_site, target = _adoption_fixture(tmp_path)
+    new_site = tmp_path / "selected-site"
+    new_package = new_site / "mnemosyne_hermes"
+    new_package.mkdir(parents=True)
+    (new_package / "__init__.py").write_text("origin = __file__\n")
+    monkeypatch.setattr(install_mod, "_sync_adoption_pm", lambda *args: None)
+    assert install_mod.main(["--hermes-home", str(home), "install", "--adopt-pm",
+        "--python", str(python), "--core-extras", "none", "--provider-extras", "none"]) == 0
+    code = "import sys,runpy; sys.path.insert(0,sys.argv[1]); print(runpy.run_path(sys.argv[2])['origin'])"
+    result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", code,
+        str(new_site), str(target / "__init__.py")], capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == str(new_package / "__init__.py")
+    assert str(old_site) not in result.stdout
+
+
+def test_adopt_pm_postcommit_swap_failure_is_explicit_partial(tmp_path, monkeypatch, capsys):
+    home, python, site, target = _adoption_fixture(tmp_path)
+    facts = home / "facts-unit.json"
+    monkeypatch.setattr(install_mod, "_sync_adoption_pm", lambda *args: facts.write_text("new selection"))
+    def fail(*args):
+        raise OSError("unit binding denied")
+    monkeypatch.setattr(install_mod, "_replace_plugin_target_with_staged", fail)
+    original = target.readlink()
+    assert install_mod.main(["--hermes-home", str(home), "install", "--adopt-pm",
+        "--python", str(python), "--core-extras", "none", "--provider-extras", "none"]) == 1
+    assert facts.read_text() == "new selection"
+    assert target.readlink() == original
+    assert "PARTIAL" in capsys.readouterr().err
+
+
+def test_adopt_pm_revalidates_candidate_after_commit(tmp_path, monkeypatch, capsys):
+    home, python, site, target = _adoption_fixture(tmp_path)
+    original = target.readlink()
+    def change_candidate(base, candidate):
+        (candidate / "__init__.py").write_text("# changed during PM operation\n")
+    monkeypatch.setattr(install_mod, "_sync_adoption_pm", change_candidate)
+    assert install_mod.main(["--hermes-home", str(home), "install", "--adopt-pm",
+        "--python", str(python), "--core-extras", "none", "--provider-extras", "none"]) == 1
+    assert target.readlink() == original
+    assert "PARTIAL" in capsys.readouterr().err
+
+
+def test_adopt_pm_refuses_direct_old_profile_binding(tmp_path):
+    home, python, site, target = _adoption_fixture(tmp_path)
+    link = home / "profiles" / "child" / "plugins" / "mnemosyne"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(site / "mnemosyne_hermes")
+    original = target.readlink()
+    assert install_mod.main(["--hermes-home", str(home), "install", "--adopt-pm", "--dry-run",
+        "--python", str(python), "--core-extras", "none", "--provider-extras", "none"]) == 1
+    assert target.readlink() == original
+    assert link.readlink() == site / "mnemosyne_hermes"
+
+
+@pytest.mark.parametrize("change", ["modified", "foreign", "external", "direct-url"])
+def test_adopt_pm_refuses_unproven_or_external_target(tmp_path, change):
+    home, python, site, target = _adoption_fixture(tmp_path)
+    if change == "modified":
+        (site / "mnemosyne_hermes" / "__init__.py").write_text("# modified register_memory_provider\n")
+    elif change == "foreign":
+        target.unlink()
+        foreign = tmp_path / "foreign"
+        foreign.mkdir()
+        (foreign / "__init__.py").write_text("# MnemosyneMemoryProvider register_memory_provider\n")
+        (foreign / "plugin.yaml").write_text("name: hermes-mnemosyne\n")
+        target.symlink_to(foreign)
+    elif change == "external":
+        target.unlink()
+        target.mkdir()
+        (target / "mnemosyne-wrapper.json").write_text('{"schema_version":1,"package":"mnemosyne_hermes"}')
+        (target / "__init__.py").write_text("# register_memory_provider\n")
+    else:
+        (site / "mnemosyne_hermes-0.5.0.dist-info" / "direct_url.json").write_text('{}')
+    before = target.readlink() if target.is_symlink() else (target / "__init__.py").read_bytes()
+    assert install_mod.main(["--hermes-home", str(home), "install", "--adopt-pm", "--force",
+        "--python", str(python), "--core-extras", "none", "--provider-extras", "none"]) == 1
+    assert (target.readlink() if target.is_symlink() else (target / "__init__.py").read_bytes()) == before
+
+
 def _isolate_hermes_python_sources(tmp_path, monkeypatch):
     """Patch fallback interpreter sources so tests only see the mocked hermes launcher."""
     monkeypatch.setattr(install_mod, "hermes_home", lambda: tmp_path / "no_hermes_home")

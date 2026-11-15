@@ -6,66 +6,145 @@ capabilities without importing the mutable ``mnemosyne.diagnose`` command.
 """
 
 import importlib.metadata
+import json
+import os
 import platform
+import shutil
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
-# Dependency and capability checks run in whichever interpreter called us. Naming
-# that interpreter's role is what keeps a green CLI result from being read as a
-# statement about the runtime serving recall (#813). The caller knows its role;
-# this module does not, so the scope is passed in rather than assumed.
-CALLING_INTERPRETER_SCOPE = "calling_interpreter"  # role not stated by the caller
-CLI_INTERPRETER_SCOPE = "cli_interpreter"  # a standalone ``mnemosyne`` CLI process
-PROVIDER_RUNTIME_SCOPE = "provider_runtime"  # inside the Hermes provider serving recall
-MCP_SERVER_SCOPE = "mcp_server"  # inside the MCP server serving recall
-RUNTIME_SCOPES = frozenset(
-    {
-        CALLING_INTERPRETER_SCOPE,
-        CLI_INTERPRETER_SCOPE,
-        PROVIDER_RUNTIME_SCOPE,
-        MCP_SERVER_SCOPE,
-    }
-)
+CALLING_INTERPRETER_SCOPE = "calling_interpreter"
+CLI_INTERPRETER_SCOPE = "cli_interpreter"
+PROVIDER_RUNTIME_SCOPE = "provider_runtime"
+MCP_SERVER_SCOPE = "mcp_server"
+RUNTIME_SCOPES = frozenset({CALLING_INTERPRETER_SCOPE, CLI_INTERPRETER_SCOPE,
+                          PROVIDER_RUNTIME_SCOPE, MCP_SERVER_SCOPE, "target_interpreter"})
 
 
-def collect_runtime_diagnostics(*, scope: str = CALLING_INTERPRETER_SCOPE) -> dict[str, Any]:
+def resolve_python_executable(python_executable: str) -> str:
+    """Resolve PATH names as subprocesses do while preserving explicit paths."""
+    expanded = os.path.expanduser(python_executable)
+    if os.path.dirname(expanded):
+        return os.path.abspath(expanded)
+    return shutil.which(expanded) or expanded
+
+
+def _collect_target_runtime_diagnostics(python_executable: str) -> dict[str, Any]:
+    """Collect a selected interpreter's checks in an isolated subprocess.
+
+    Validate the JSON response before exposing it to diagnostic consumers.
+    A failed launch, timeout, or invalid response reports an unavailable target
+    without falling back to the caller's interpreter or revealing its path.
+    """
+    executable = resolve_python_executable(python_executable)
+    display_name = Path(executable).name or "python"
+    script = (
+        "import json; "
+        "from mnemosyne.runtime_diagnostics import collect_runtime_diagnostics; "
+        "print('MNEMOSYNE_DIAGNOSTICS=' + json.dumps(collect_runtime_diagnostics()))"
+    )
+    try:
+        result = subprocess.run(
+            [executable, "-I", "-c", script],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+
+    payload = None
+    if result is not None and result.returncode == 0:
+        for line in reversed(result.stdout.splitlines()):
+            if line.startswith("MNEMOSYNE_DIAGNOSTICS="):
+                try:
+                    payload = json.loads(line.partition("=")[2])
+                except json.JSONDecodeError:
+                    pass
+                break
+
+    required_keys = {"category", "check", "status", "detail"}
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("checks"), list)
+        or not all(
+            isinstance(check, dict) and required_keys <= check.keys()
+            for check in payload["checks"]
+        )
+        or not all(
+            any(check["check"] == name for check in payload["checks"])
+            for name in ("embeddings_available", "sqlite_vec_available")
+        )
+    ):
+        return {
+            "status": "unavailable",
+            "checks": [
+                {
+                    "category": "runtime",
+                    "check": "target_interpreter",
+                    "status": "ERROR",
+                    "detail": "selected interpreter could not run Mnemosyne diagnostics",
+                    "scope": "target_interpreter",
+                }
+            ],
+            "scope": "target_interpreter",
+            "executable": display_name,
+            "unavailable": True,
+        }
+
+    executable_check = next(
+        (
+            check
+            for check in payload["checks"]
+            if isinstance(check, dict) and check.get("check") == "python_executable"
+        ),
+        {},
+    )
+    executable_name = str(executable_check.get("detail") or display_name)
+    executable_name = executable_name.replace("\\", "/").rsplit("/", 1)[-1]
+    payload["scope"] = "target_interpreter"
+    payload["executable"] = executable_name
+    for check in payload["checks"]:
+        check["scope"] = "target_interpreter"
+        if check["check"] == "checks_scope":
+            check["detail"] = "target_interpreter"
+    return payload
+
+
+def collect_runtime_diagnostics(
+    python_executable: str | None = None, *, scope: str = CALLING_INTERPRETER_SCOPE,
+) -> dict[str, Any]:
     """Run pure runtime, dependency, and capability checks without a provider.
 
-    ``scope`` names the role of the interpreter running the checks and must be
-    one of ``RUNTIME_SCOPES``. Only an in-provider caller may claim
-    ``provider_runtime``; that result is authoritative for the runtime serving
-    recall, while a ``cli_interpreter`` result is not.
+    By default, inspect the current interpreter. When ``python_executable`` is
+    supplied, resolve PATH names or explicit paths and run checks there with
+    Python's isolated mode. An unavailable target never falls back to the
+    current interpreter.
 
-    Every dependency check below imports into *this* process. When the CLI lives
-    in a different interpreter from the one serving recall -- the normal outcome
-    of a pipx install beside a Hermes venv -- a green result here says nothing
-    about that runtime, and reporting it unqualified is how a degraded vector
-    stack stayed invisible (#813). So the payload declares the scope it actually
-    measured. Guessing a runtime interpreter from HERMES_HOME would only move the
-    misleading report somewhere else, so nothing here tries.
+    ``scope`` names the local caller's role; it does not discover or authenticate
+    a provider runtime. An explicitly selected target always overrides that role.
     """
 
-    if scope not in RUNTIME_SCOPES:
-        raise ValueError(f"unknown runtime diagnostics scope: {scope!r}")
+    if not isinstance(scope, str) or scope not in RUNTIME_SCOPES - {"target_interpreter"}:
+        raise ValueError("unknown local runtime diagnostics scope")
+    if python_executable is not None:
+        return _collect_target_runtime_diagnostics(python_executable)
 
     checks: list[dict[str, str]] = []
 
     def add(category: str, check: str, status: str, detail: str = "") -> None:
-        entry = {"category": category, "check": check, "status": status, "detail": detail}
-        # Every check in this module imports into the calling interpreter, so all
-        # of them carry the scope. Stamping it at the source means a new check
-        # cannot be added without it (#813).
-        entry["scope"] = scope
-        checks.append(entry)
+        checks.append({"category": category, "check": check, "status": status, "detail": detail, "scope": scope})
 
     add("env", "python_version", "OK", sys.version.split()[0])
     add("env", "platform", "OK", platform.platform())
     # Report only the executable name: an absolute interpreter path can reveal
     # a user's home directory or virtual-environment layout in diagnostics.
-    executable = Path(sys.executable).name
-    add("env", "python_executable", "OK", executable)
+    add("env", "python_executable", "OK", Path(sys.executable).name)
     add("env", "checks_scope", "OK", scope)
 
     try:
@@ -104,6 +183,11 @@ def collect_runtime_diagnostics(*, scope: str = CALLING_INTERPRETER_SCOPE) -> di
         from mnemosyne.core import embeddings as _embeddings
 
         add("core", "embeddings_available", "YES" if _embeddings.available() else "NO")
+        # available() reports env/key presence, so it stays YES while every
+        # credentialed call is being refused; surface the refusal itself.
+        refusal = _embeddings.policy_refusal_message()
+        if refusal:
+            add("core", "embedding_policy_refusal", "ERROR", refusal)
         add("core", "embeddings_model", "OK", _embeddings._DEFAULT_MODEL)
         # Surface the resolved dimension so operators can confirm their
         # MNEMOSYNE_EMBEDDING_DIM / model-table resolution via the doctor,
@@ -133,8 +217,8 @@ def collect_runtime_diagnostics(*, scope: str = CALLING_INTERPRETER_SCOPE) -> di
         if _SQLITE_VEC_AVAILABLE and not vec_can_load:
             add("core", "sqlite_vec_warning", "NO", "extension loading unavailable")
     except Exception:
-        add("core", "sqlite_vec", "ERROR", "sqlite-vec capability unavailable")
+        add("core", "sqlite_vec_available", "ERROR", "sqlite-vec capability unavailable")
 
     statuses = {entry["status"] for entry in checks}
     overall = "unavailable" if "ERROR" in statuses else "warning" if statuses & {"MISSING", "NO"} else "ok"
-    return {"status": overall, "checks": checks, "scope": scope, "executable": executable}
+    return {"status": overall, "checks": checks, "scope": scope, "executable": Path(sys.executable).name}
