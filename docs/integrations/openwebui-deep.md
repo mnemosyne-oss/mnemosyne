@@ -76,6 +76,13 @@ This imports all existing chat history into Mnemosyne without starting the daemo
 
 > **Deprecated:** `mnemosyne-browser` will be removed in a future release. Use `mnemosyne recall` for search and `mnemosyne stats` for statistics. The ID-based HTML detail view (`/detail/MEMORY_ID`) has no direct CLI replacement yet.
 
+When replacing a browser configured with `--bank work`, select the same bank for both CLI commands. Without `MNEMOSYNE_BANK`, they use the `default` bank:
+
+```bash
+MNEMOSYNE_BANK=work mnemosyne recall "preferences"
+MNEMOSYNE_BANK=work mnemosyne stats
+```
+
 Browse, search, and inspect all your Mnemosyne memories through a web UI.
 
 ```bash
