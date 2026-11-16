@@ -22,8 +22,12 @@ ENV HOME=/home/mnemosyne \
     MNEMOSYNE_FASTEMBED_CACHE_DIR=/cache/fastembed
 COPY deploy/docker/requirements.lock /opt/mnemosyne/requirements.lock
 COPY --from=builder /wheels/ /wheels/
-RUN pip install --no-cache-dir --only-binary=:all: -c /opt/mnemosyne/requirements.lock /wheels/*.whl \
-    && pip install --no-cache-dir --only-binary=:all: -c /opt/mnemosyne/requirements.lock 'mnemosyne-memory[mcp,embeddings]' \
+# Install the locally built wheel together with its extras, so no Mnemosyne
+# code is ever resolved from PyPI.
+RUN set -eu \
+    && set -- /wheels/mnemosyne_memory-*.whl \
+    && [ "$#" -eq 1 ] && [ -f "$1" ] \
+    && pip install --no-cache-dir --only-binary=:all: -c /opt/mnemosyne/requirements.lock "$1[mcp,embeddings]" \
     && rm -rf /wheels \
     && groupadd --gid 10001 mnemosyne \
     && useradd --uid 10001 --gid 10001 --home-dir /home/mnemosyne --create-home mnemosyne \

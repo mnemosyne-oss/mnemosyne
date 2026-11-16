@@ -30,7 +30,6 @@ jobs:
           git check-ref-format "refs/tags/$RELEASE_TAG"
           git show "refs/tags/$RELEASE_TAG:mnemosyne/__init__.py" > /tmp/release-version.py
           python deploy/docker/validate_release.py "$RELEASE_TAG" --version-file /tmp/release-version.py > /tmp/release.json
-          git check-ref-format "refs/tags/$RELEASE_TAG"
           RELEASE_SHA=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
           git merge-base --is-ancestor "$RELEASE_SHA" HEAD
           cp deploy/docker/validate_release.py /tmp/validate-docker-release.py

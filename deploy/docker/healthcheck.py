@@ -4,6 +4,9 @@ import json
 import logging
 import os
 
+# httpx2 is the HTTP client the mcp SDK's Streamable HTTP transport expects.
+# It arrives transitively with mcp and is pinned in requirements.lock; revisit
+# this import when upgrading mcp.
 import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
