@@ -9,6 +9,7 @@ from email import policy
 from email.parser import BytesParser
 from pathlib import Path
 
+from packaging.requirements import Requirement
 import yaml
 
 
@@ -134,6 +135,7 @@ def _manifest_version_from_wheel(archive: zipfile.ZipFile, path: str) -> str:
 
 
 def test_all_plugin_manifests_have_an_explicit_version_contract():
+    """Each manifest follows its owning Core, standalone or catalog project."""
     core_version = _assignment_version(ROOT / "mnemosyne" / "__init__.py")
     hermes_root = ROOT / "integrations" / "hermes"
     hermes_version = _assignment_version(
@@ -143,13 +145,28 @@ def test_all_plugin_manifests_have_an_explicit_version_contract():
         ROOT / "hermes_memory_provider" / "plugin.yaml": core_version,
         hermes_root / "plugin.yaml": hermes_version,
         hermes_root / "src" / "mnemosyne_hermes" / "plugin.yaml": hermes_version,
-        # Hermes plugin-catalog wrapper: same plugin, same version as the package it pins.
-        ROOT / "integrations" / "hermes-catalog" / "plugin.yaml": hermes_version,
+        # The catalog wrapper is promoted separately from the standalone package.
+        ROOT / "integrations" / "hermes-catalog" / "plugin.yaml": _project_version(
+            ROOT / "integrations" / "hermes-catalog" / "pyproject.toml"
+        ),
     }
 
     assert _source_manifest_paths() == set(expected_versions)
     for manifest_path, expected_version in expected_versions.items():
         assert _manifest_version(manifest_path) == expected_version
+
+
+def test_catalog_provider_range_admits_the_prepared_standalone_release():
+    """A separately versioned wrapper must still resolve the prepared provider."""
+    project = (ROOT / "integrations" / "hermes-catalog" / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+    specs = re.findall(r'^\s*"(mnemosyne-hermes[^"\n]+)"', project, re.MULTILINE)
+    assert len(specs) == 1
+    requirement = Requirement(specs[0])
+    provider_version = _project_version(ROOT / "integrations" / "hermes" / "pyproject.toml")
+    assert provider_version in requirement.specifier
+    assert "0.8.0" not in requirement.specifier
 
 
 def test_package_metadata_uses_the_same_version_contract():

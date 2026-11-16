@@ -484,6 +484,8 @@ class TestToolHandlers:
     def test_handle_batch_wrapper_update_forget_invalidate_and_scope(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("MNEMOSYNE_DEFAULT_SCOPE", raising=False)
+        monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION", "0")
 
         stored = handle_tool_call("mnemosyne_batch", {
             "operations": [
@@ -520,7 +522,10 @@ class TestToolHandlers:
             "SELECT scope FROM working_memory WHERE id = ?",
             (ids[3],),
         ).fetchone()
-        assert extract_scope[0] == "session"
+        assert extract_scope[0] == "global"
+        cli_reader = _create_instance(session_id="cli_distinct_session", bank="default")
+        hits = cli_reader.recall("mcp extract target", top_k=5)
+        assert ids[3] in [h.get("id") for h in hits]
 
 
     def test_handle_batch_failure_rolls_back(self, tmp_path, monkeypatch):
@@ -942,6 +947,8 @@ class TestToolHandlers:
                 db_path = "test.db"
 
         class _Result:
+            errors = []
+
             def to_dict(self):
                 return {"cleaned": 1}
 

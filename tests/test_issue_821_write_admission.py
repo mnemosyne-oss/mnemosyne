@@ -105,6 +105,19 @@ elif os.environ["POLICY_SOURCE"] == "initialize_empty_string":
     init_kwargs.update(ignore_patterns="", write_classifier="off")
 provider.initialize("issue-821", **init_kwargs)
 assert provider._beam is not None
+
+# The stricter canonical-write contract fails closed when the active
+# profile cannot be resolved at all; a real Hermes deployment always can.
+# In this bare subprocess, stand in for the host with the same answer the
+# provider itself is bound to, so the guard sees a concordant owner and the
+# assertions exercise what they name: the write-admission policy.
+if "hermes_cli.profiles" not in sys.modules:
+    _cli = types.ModuleType("hermes_cli")
+    _profiles = types.ModuleType("hermes_cli.profiles")
+    _profiles.get_active_profile_name = lambda: provider._canonical_owner()
+    _cli.profiles = _profiles
+    sys.modules.setdefault("hermes_cli", _cli)
+    sys.modules.setdefault("hermes_cli.profiles", _profiles)
 marker = os.environ.get("CONTENT") or (
     "ISSUE821 I feel like a private gateway sentinel"
     if os.environ["GATEWAY"] == "sync_identity"

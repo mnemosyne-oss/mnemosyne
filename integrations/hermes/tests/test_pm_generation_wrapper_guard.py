@@ -50,10 +50,17 @@ def test_new_and_existing_pm_wrapper_reregistration_and_status(tmp_path, monkeyp
     install.install_plugin(hermes_home_path=home, mode="wrapper", python=python, force=True)
     assert "replaceable Hermes PM generation" in capsys.readouterr().err
     assert manifest.is_file()
-    monkeypatch.setattr(install, "_find_hermes_python", lambda **kw: None)
-    monkeypatch.setattr(install, "check_mnemosyne_core", lambda: True)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("status must only read wrapper metadata")
+    for name in ("_find_hermes_python", "check_mnemosyne_core", "_check_wrapper_import", "_site_packages_for_python"):
+        monkeypatch.setattr(install, name, forbidden)
+    monkeypatch.setattr(install.subprocess, "run", forbidden)
+    monkeypatch.setattr(install.subprocess, "Popen", forbidden)
     assert install.main(["--hermes-home", str(home), "status"]) == 0
-    assert "replaceable Hermes PM generation" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "replaceable Hermes PM generation" in out
+    assert "Ownership: external" in out
+    assert "Runtime/provider function/hooks/autosave: NOT CHECKED" in out
 
 
 def test_dry_run_warning_without_writes_and_side_venv_silence(tmp_path, monkeypatch, capsys):
@@ -69,10 +76,17 @@ def test_dry_run_warning_without_writes_and_side_venv_silence(tmp_path, monkeypa
     assert not install.plugin_target_dir(home).exists()
     install.install_plugin(hermes_home_path=home, mode="wrapper", python=side)
     assert "replaceable Hermes PM generation" not in capsys.readouterr().err
-    monkeypatch.setattr(install, "_find_hermes_python", lambda **kw: None)
-    monkeypatch.setattr(install, "check_mnemosyne_core", lambda: True)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("status must only read wrapper metadata")
+    for name in ("_find_hermes_python", "check_mnemosyne_core", "_check_wrapper_import", "_site_packages_for_python"):
+        monkeypatch.setattr(install, name, forbidden)
+    monkeypatch.setattr(install.subprocess, "run", forbidden)
+    monkeypatch.setattr(install.subprocess, "Popen", forbidden)
     assert install.main(["--hermes-home", str(home), "status"]) == 0
-    assert "replaceable Hermes PM generation" not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "replaceable Hermes PM generation" not in out
+    assert "Ownership: external" in out
+    assert "Runtime/provider function/hooks/autosave: NOT CHECKED" in out
 
 
 def test_upgrade_reregisters_existing_pm_wrapper_without_rejection(tmp_path, monkeypatch, capsys):

@@ -283,7 +283,13 @@ REMEMBER_MEDIA_SCHEMA = {
             "title": {"type": "string", "description": "Short human title for the media. Optional."},
             "hint": {
                 "type": "string",
-                "description": "Guidance for the describer: what to look for, or names and jargon to expect in speech.",
+                "description": (
+                    "Guidance for the describer. For the OpenAI-compatible image adapter, "
+                    "a non-empty hint replaces the entire prompt; it is not appended. "
+                    "The caller must include instructions for the expected JSON response "
+                    "(summary and moments). An empty or omitted hint uses the configured "
+                    "or default prompt template."
+                ),
             },
             "max_moments": {
                 "type": "integer",
@@ -512,6 +518,8 @@ BATCH_SCHEMA = {
     "description": (
         "Apply multiple Mnemosyne memory mutations atomically in one tool call. "
         "Supported v1 actions: remember, update, forget, invalidate. "
+        "dry_run checks current target eligibility without mutations; not_found hides missing/invisible targets. "
+        "It is a snapshot, not ordered simulation or a promise of later apply success. "
         "All operations are validated before mutation; on failure the whole batch rolls back. "
         "Destructive actions require exact memory IDs. Recall/search/canonical/persona/shared-surface operations are not included in v1."
     ),
@@ -898,6 +906,11 @@ HYGIENE_CLEAN_SCHEMA = {
                 "enum": ["delete", "archive", "flag", "keep"],
                 "description": "Override action for all candidates. If 'keep', uses each candidate's suggested_action.",
                 "default": "keep",
+            },
+            "force": {
+                "type": "boolean",
+                "description": "Allow explicit delete override when some candidates are not suggested for deletion. Does not replace confirm.",
+                "default": False,
             },
             "confirm": {
                 "type": "boolean",

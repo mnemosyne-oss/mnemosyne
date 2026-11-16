@@ -10,8 +10,10 @@ session `invalidate` + recall filtering) is real and non-vacuous.
 
 from __future__ import annotations
 
+import os
 import tempfile
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -532,3 +534,121 @@ def test_invalidate_preserves_existing_successor(temp_db, disable_llm):
         "SELECT superseded_by FROM working_memory WHERE id = ?", (old,)
     ).fetchone()
     assert row[0] == other, "existing successor must be preserved"
+
+
+def test_resolver_scan_judges_offset_expiry_chronologically(temp_db, monkeypatch, disable_llm):
+    """Review on #1113 (fifth round): the resolver's candidate scan must use
+    the same julianday eligibility as every other surface. A legacy row
+    storing an offset-bearing expiry that is already past (18:30+07:00 =
+    11:30Z at a 12:00Z-class now) sorts lexically AFTER a UTC now string,
+    so the old text comparison scanned the dead row as a live candidate and
+    could supersede it; a still-future offset value that sorts lexically
+    BEFORE now must stay scannable.
+    """
+    monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+    A = BeamMemory(session_id="tR", db_path=temp_db)
+    dead = A.remember("[USER] stale global fact", source="conversation",
+                      importance=0.7, scope="global")
+    alive = A.remember("[USER] live global fact", source="conversation",
+                       importance=0.7, scope="global")
+    # Control row: keeps the source group at >=2 members once the dead row is
+    # filtered, so _detect_conflicts actually runs and the capture below is
+    # non-vacuous (a group of one is skipped before the detector is called).
+    control = A.remember("[USER] control global fact", source="conversation",
+                         importance=0.7, scope="global")
+    now = datetime.now(timezone.utc)
+    dead_stored = (now - timedelta(minutes=30)).astimezone(
+        timezone(timedelta(hours=7))).isoformat()
+    alive_stored = (now + timedelta(hours=1)).astimezone(
+        timezone(timedelta(hours=-5))).isoformat()
+    # Fixture sanity: both values mislead a lexical comparison in opposite
+    # directions, so a text-compare scan gets BOTH verdicts wrong.
+    assert dead_stored > now.isoformat()
+    assert alive_stored < now.isoformat()
+    A.conn.execute("UPDATE working_memory SET valid_until = ? WHERE id = ?",
+                   (dead_stored, dead))
+    A.conn.execute("UPDATE working_memory SET valid_until = ? WHERE id = ?",
+                   (alive_stored, alive))
+    A.conn.commit()
+
+    scanned_ids = set()
+
+    def _capture(items, similarity_threshold=0.88, min_gap_hours=1.0):
+        scanned_ids.update(i["id"] for i in items)
+        return []
+
+    A._detect_conflicts = _capture
+    res = A.resolve_cross_session_conflicts(dry_run=True)
+    assert res["status"] == "dry_run"
+    assert res["rows_scanned"] == 2, (
+        "only the two live rows may enter the candidate scan")
+    assert scanned_ids, "capture must have run (control keeps the group non-vacuous)"
+    assert dead not in scanned_ids, (
+        "an expired row must never enter the candidate scan")
+    assert alive in scanned_ids, (
+        "a chronologically future expiry must stay scannable")
+    assert control in scanned_ids
+
+
+def test_resolver_scan_uses_utc_now_under_non_utc_host(temp_db, monkeypatch, disable_llm):
+    """The scan's ``now`` operand must be aware UTC on any host. Under a
+    far-west host clock a row that expired 30 minutes ago in UTC could sit
+    inside the host's naive-local offset window and scan as active; the
+    julianday comparison against aware-UTC now excludes it everywhere.
+    """
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset() unavailable on this platform")
+    original = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    try:
+        time.tzset()
+        # The fixture is only meaningful if the host clock really moved west
+        # of UTC — on a UTC-parked environment (e.g. missing tzdata, where
+        # tzset() silently keeps UTC) the old naive-local comparison would
+        # pass untested, so skip rather than claim a green (review on #1142).
+        host_offset = datetime.now().astimezone().utcoffset()
+        if host_offset is None or host_offset >= timedelta(0):
+            pytest.skip(
+                f"TZ=America/Los_Angeles did not take effect (offset {host_offset}); "
+                "this test needs a west-of-UTC host clock to be non-vacuous")
+        monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
+        A = BeamMemory(session_id="tW", db_path=temp_db)
+        expired = A.remember("[USER] recently expired global", source="conversation",
+                             importance=0.7, scope="global")
+        # Two live control rows: the source group stays at >=2 members even
+        # after correct filtering, so the detector runs and the capture
+        # below observes real candidate sets either way.
+        ctl1 = A.remember("[USER] still-live global one", source="conversation",
+                          importance=0.7, scope="global")
+        ctl2 = A.remember("[USER] still-live global two", source="conversation",
+                          importance=0.7, scope="global")
+        past_naive = (datetime.now(timezone.utc) - timedelta(minutes=30)
+                      ).replace(tzinfo=None).isoformat()
+        A.conn.execute("UPDATE working_memory SET valid_until = ? WHERE id = ?",
+                       (past_naive, expired))
+        A.conn.commit()
+
+        scanned_ids = set()
+
+        def _capture(items, similarity_threshold=0.88, min_gap_hours=1.0):
+            scanned_ids.update(i["id"] for i in items)
+            return []
+
+        A._detect_conflicts = _capture
+        res = A.resolve_cross_session_conflicts(dry_run=True)
+        assert res["status"] == "dry_run"
+        # Pre-fix, the host-local naive now (~7h behind UTC under
+        # America/Los_Angeles) read the UTC-expired row as live: rows_scanned
+        # was 3 and the expired id reached the detector's items. The UTC now
+        # must scan only the two live controls.
+        assert res["rows_scanned"] == 2, (
+            "only the live control rows may enter the candidate scan")
+        assert scanned_ids == {ctl1, ctl2}, (
+            "a UTC-expired row must not scan as a live candidate on a "
+            "west-of-UTC host")
+    finally:
+        if original is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", original)
+        time.tzset()
