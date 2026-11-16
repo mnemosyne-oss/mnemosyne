@@ -87,10 +87,15 @@ def test_reclaim_utc_fixture_pins_stale_boundary(temp_db, utc_boundary_clock):
         "VALUES (?, ?, 'conversation', '2030-06-01T00:00:00', 'boundary', ?, ?)",
         [(mid, mid, claim.isoformat(), claim.isoformat()) for mid, claim in claims.items()])
     beam.conn.execute(
-        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, summary_of) "
+        # Pin completion evidence too: SQLite CURRENT_TIMESTAMP does not use
+        # utc_boundary_clock, while reclaim compares created_at with the claim.
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, summary_of, created_at) "
         "VALUES ('summary', 'retained summary', 'sleep_consolidation', "
-        "'2030-06-15T12:00:00', 'boundary', 'referenced')")
+        "'2030-06-15T12:00:00', 'boundary', 'referenced', '2030-06-15T12:00:00')")
     beam.conn.commit()
+    assert beam.conn.execute(
+        "SELECT created_at FROM episodic_memory WHERE id = 'summary'"
+    ).fetchone()[0] == now.isoformat()
 
     result = beam.reclaim_orphans(stale_after_seconds=3600)
     assert result["candidate_ids"] == ["stale"]
