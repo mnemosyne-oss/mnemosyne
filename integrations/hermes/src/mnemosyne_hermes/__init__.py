@@ -3482,6 +3482,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
         except ValueError as exc:
             return json.dumps({"error": str(exc)})
+        if tool_name == "mnemosyne_batch" and bool(args.get("dry_run", False)):
+            # A preview may inspect an active Beam, never initialize or retry one.
+            with self._ensure_beam_access_lock():
+                return self._handle_batch(args)
         if tool_name == "mnemosyne_sleep" and self._reflect_disabled_for_cron and (self._agent_context or "").strip().lower() == "cron":
             return json.dumps(self._reflection_skip_response("reflect_disabled_for_cron", "tool"))
         try:
@@ -3748,7 +3752,21 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps(batch_validation_error_payload(exc))
 
         if bool(args.get("dry_run", False)):
-            return json.dumps(dry_run_batch(normalized))
+            beam = self._beam
+            if beam is None:
+                return json.dumps({
+                    "status": "error", "error": "preview_unavailable",
+                    "validation": "target_eligibility_snapshot",
+                    "reason_code": getattr(self, "_unavailable_reason_code", "never_initialized"),
+                })
+            # Older cores may still support apply without target-aware preview.
+            try:
+                from mnemosyne.batch_tool import BatchPreviewTarget, snapshot_preview_batch
+            except ImportError:
+                return json.dumps({"status": "error", "error": "preview_unavailable",
+                                   "validation": "target_eligibility_snapshot"})
+            target = BatchPreviewTarget(getattr(beam, "conn", None), getattr(beam, "session_id", None))
+            return json.dumps(snapshot_preview_batch(normalized, target=target))
 
         # Write-approval gate: stage each operation to pending when enabled.
         # validate_batch_operations() normalizes each op to
