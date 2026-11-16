@@ -21,7 +21,10 @@ correcting its configuration.
 The endpoint is limited to scheme, hostname and optional port. Userinfo, path,
 query, fragment and credential values are omitted. No memory text is logged.
 The message does not load a model, infer a vector, contact an endpoint, open
-SQLite, or create configuration. It describes configuration, not readiness or
+SQLite, or create configuration. This no-network guarantee applies to the
+diagnostic message. SQLite and local lexical retrieval do not need network
+access; normal API-backed embedding operations can contact their configured
+endpoint. It describes configuration, not readiness or
 reachability. Existing unavailable-engine warnings and transport refusals
 remain separate and retain their warning budgets.
 

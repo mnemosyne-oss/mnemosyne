@@ -45,12 +45,17 @@ def test_configuration_announcement_is_once_read_only_and_redacted(monkeypatch, 
 
 def test_loaded_values_and_config_file_location_survive_late_environment_changes(tmp_path):
     config=tmp_path/"config.yaml"
-    config.write_text("embedding_model: BAAI/bge-m3\nembedding_dim: 1024\nembedding_api_key: yaml-secret\nembedding_api_url: https://old.example.test/v1\n")
+    original_config="embedding_model: BAAI/bge-m3\nembedding_dim: 1024\nembedding_api_key: yaml-secret\nembedding_api_url: https://old.example.test/v1\n"
+    config.write_text(original_config)
     env=dict(os.environ, MNEMOSYNE_DATA_DIR=str(tmp_path), MNEMOSYNE_NO_EMBEDDINGS="0", MNEMOSYNE_EMBEDDING_MODEL="BAAI/bge-small-en-v1.5", MNEMOSYNE_EMBEDDING_DIM="384")
     script="""import logging,os,io,json
 from mnemosyne.core import embeddings as e
 os.environ['MNEMOSYNE_EMBEDDING_MODEL']='BAAI/bge-large-en-v1.5'
 os.environ['MNEMOSYNE_EMBEDDING_DIM']='768'
+os.environ['MNEMOSYNE_EMBEDDING_API_KEY']=''
+os.environ['OPENAI_API_KEY']=''
+os.environ['HERMES_HOME']=os.path.join(os.environ.pop('MNEMOSYNE_DATA_DIR'),'late-home')
+os.environ['MNEMOSYNE_EMBEDDING_API_URL']='https://new.example.test/v1'
 stream=io.StringIO();handler=logging.StreamHandler(stream);e.logger.addHandler(handler);e.logger.setLevel(logging.INFO)
 e.announce_runtime_configuration()
 print(json.dumps({'log':stream.getvalue()}))
@@ -60,9 +65,10 @@ print(json.dumps({'log':stream.getvalue()}))
     assert "model=BAAI/bge-m3" in text and "dimension=1024" in text
     assert "config_file_at_import=MNEMOSYNE_DATA_DIR/config.yaml" in text
     assert "config_file_present_at_import=True" in text
-    assert "endpoint=https://old.example.test" in text
+    assert "endpoint=https://new.example.test" in text
+    assert "credentials_present=True" in text
     assert "yaml-secret" not in text
-    assert config.read_text().startswith("embedding_model: BAAI/bge-m3")
+    assert config.read_text() == original_config
 
 
 @pytest.mark.parametrize("package", ["hermes_memory_provider", "mnemosyne_hermes"])
