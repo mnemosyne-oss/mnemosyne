@@ -86,9 +86,19 @@ def _claim_completed_sql(alias: str) -> str:
     A summary that merely references the row id is not enough: a row can be
     summarized, refreshed by remember() (which clears both markers) and claimed
     again, leaving an older summary that names the same id. Completion evidence
-    is a summary written at or after the current claim stamp. ``created_at`` is
-    second-granular, so a summary written in the same second as the claim counts
-    as complete -- the safe direction (never a second summary).
+    is a summary written at or after the current claim stamp. The contract is
+    deliberately conservative and second-granular:
+
+    - ``created_at`` is compared at second resolution, so a summary written in
+      the same second as the claim counts as complete (the safe direction --
+      never a second summary).
+    - A summary with ``created_at`` NULL also counts as complete.
+
+    Consequence: a row summarized and refreshed within the same second and then
+    re-claimed, whose new claim is later interrupted, is not auto-recovered --
+    the earlier same-second summary still names it, and a second summary is
+    never written. Making completion evidence identify the claim (a claim id on
+    the summary row) is the only fix and is out of scope here.
     """
     return (
         "EXISTS (SELECT 1 FROM episodic_memory em "

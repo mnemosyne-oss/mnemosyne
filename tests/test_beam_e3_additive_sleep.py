@@ -991,6 +991,32 @@ class TestE3AdditiveSleep:
             "(never a second summary)"
         )
 
+    def test_same_second_summary_and_later_claim_block_recovery(self, temp_db):
+        """A summary at .100000 and a later interrupted claim at .900000 of the
+        SAME second: second-granular comparison treats them as simultaneous, so
+        the summary completes the claim and recovery candidates are 0 (the safe
+        direction -- never a second summary)."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s1", n=1)
+        base = (datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+                - timedelta(hours=2))
+        summary_at = (base + timedelta(microseconds=100000)).isoformat()
+        claim_at = (base + timedelta(microseconds=900000)).isoformat()
+        self._claim(temp_db, ids, claim_at)
+        c = sqlite3.connect(str(temp_db))
+        c.execute(
+            "INSERT INTO episodic_memory (id, content, source, summary_of, created_at) "
+            "VALUES (?, ?, 'sleep_consolidation', ?, ?)",
+            ("em-same-second", "summary text", ids[0], summary_at),
+        )
+        c.commit()
+        c.close()
+        res = beam.reclaim_orphans(stale_after_seconds=1, dry_run=True)
+        assert res["candidates"] == 0, (
+            "a same-second summary (written before the claim but truncated to "
+            "the same second) must count as completion -- never a second summary"
+        )
+
     def test_large_backlog_recovers_without_touching_the_bind_limit(self, temp_db, monkeypatch):
         """Same 1000-row recovery scenario as the two bind-limit tests, but
         without lowering SQLITE_LIMIT_VARIABLE_NUMBER: covers interpreters
