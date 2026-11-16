@@ -20,6 +20,7 @@ experiment.
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -847,13 +848,15 @@ class TestE3AdditiveSleep:
 
     def test_paused_holder_cannot_write_a_second_summary(self, temp_db, monkeypatch):
         """A pauses after claiming, B recovers and summarizes, A resumes: A must
-        write nothing and must not clear B's claim marker."""
+        write nothing and must not clear B's claim marker. A and B run on
+        SEPARATE SQLite connections (B in its own thread, which gets its own
+        thread-local connection) so the ownership check is exercised across
+        connections, not just on one shared connection."""
         monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
         a = BeamMemory(session_id="s1", db_path=temp_db)
-        b = BeamMemory(session_id="s1", db_path=temp_db)
         _seed_old_wm(temp_db, "s1", n=1)
         real = BeamMemory.consolidate_to_episodic
-        state = {"paused": False}
+        state = {"paused": False, "b_out": None}
 
         def a_pauses_then_b_runs(self_, *args, **kw):
             if self_ is a and not state["paused"]:
@@ -863,7 +866,16 @@ class TestE3AdditiveSleep:
                 c = sqlite3.connect(str(temp_db))
                 c.execute("UPDATE working_memory SET consolidated_at=?, consolidation_claimed_at=?", (old, old))
                 c.commit(); c.close()
-                b.sleep_all_sessions(dry_run=False)  # B recovers + summarizes
+                # B runs in its own thread, so its BeamMemory gets its own
+                # thread-local SQLite connection — a genuinely separate
+                # connection from A's.
+                def _b_recovers():
+                    b = BeamMemory(session_id="s1", db_path=temp_db)
+                    state["b_out"] = b.sleep_all_sessions(dry_run=False)  # B recovers + summarizes
+                t = threading.Thread(target=_b_recovers)
+                t.start(); t.join()
+                assert state["b_out"]["reclaimed_orphans"] == 1
+                assert state["b_out"]["items_consolidated"] == 1
             return real(self_, *args, **kw)
 
         monkeypatch.setattr(BeamMemory, "consolidate_to_episodic", a_pauses_then_b_runs)
