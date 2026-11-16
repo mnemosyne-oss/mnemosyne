@@ -1139,6 +1139,7 @@ def _handle_diagnose(arguments: Dict[str, Any]) -> Dict[str, Any]:
         repair_vec_working=bool(arguments.get("repair_vec_working", False)),
         dry_run=bool(arguments.get("dry_run", False)),
         bank=bank,
+        scope="mcp_server",
     )
     db_path = None
     try:

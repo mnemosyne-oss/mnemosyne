@@ -5083,6 +5083,32 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _handle_diagnose(self, args: Dict[str, Any]) -> str:
         from mnemosyne.diagnose import run_diagnostics
+        import inspect
+
+        # Feature detection keeps old Core signatures usable; a legacy result
+        # must not claim to have measured the gateway's role explicitly.
+        try:
+            scoped = "scope" in inspect.signature(run_diagnostics).parameters
+        except (TypeError, ValueError):
+            scoped = False
+
+        def collect(**kwargs):
+            if scoped:
+                return run_diagnostics(scope="provider_runtime", **kwargs)
+            result = run_diagnostics(**kwargs)
+            result["runtime_scope"] = "unscoped"
+            # Old Core owns its log: do not rewrite a file it returned. Make
+            # that legacy log's unverified role provenance explicit instead.
+            result["runtime_log_scope"] = "legacy_unverified"
+            for entry in result.get("entries", []):
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("check") == "checks_scope":
+                    entry["detail"] = "unscoped"
+                    entry["scope"] = "unscoped"
+                elif "scope" in entry:
+                    entry["scope"] = "unscoped"
+            return result
         repair_requested = bool(args.get("repair_vec_working", False))
         dry_run = bool(args.get("dry_run", False))
         diagnostic_kwargs: Dict[str, Any] = {
@@ -5092,12 +5118,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if self._profile_isolation_enabled and self._beam is not None:
             diagnostic_kwargs["bank"] = self._resolve_profile_bank()
         if self._beam is None:
-            return json.dumps(run_diagnostics(**diagnostic_kwargs), indent=2, default=str)
+            return json.dumps(collect(**diagnostic_kwargs), indent=2, default=str)
 
         # The active provider bank shares its SQLite database with auto_sleep.
         # Serialize the complete active-bank diagnostic operation (#498).
         with self._ensure_beam_access_lock():
-            result = run_diagnostics(**diagnostic_kwargs)
+            result = collect(**diagnostic_kwargs)
             result["sync_turn"] = self._sync_turn_diagnostics()
 
             active_db = None
