@@ -4476,9 +4476,9 @@ def _backfill_vec_working_from_memory_embeddings(conn: sqlite3.Connection) -> in
         WHERE vw.rowid IS NULL
     """).fetchall()
     inserted = 0
-    for row in rows:
-        embedding = json.loads(row["embedding_json"])
-        _vec_table_insert(conn, "vec_working", int(row["rowid"]), embedding)
+    for _wm_id, wm_rowid, embedding_json in rows:
+        embedding = json.loads(embedding_json)
+        _vec_table_insert(conn, "vec_working", int(wm_rowid), embedding)
         inserted += 1
     return inserted
 

@@ -3544,3 +3544,42 @@ def test_remember_warns_when_embed_returns_wrong_count(temp_db, monkeypatch, cap
     assert "content for count mismatch check" not in msg, (
         f"WARNING log leaked memory content: {msg!r}"
     )
+
+
+def test_repair_vec_working_accepts_plain_sqlite_connection(temp_db):
+    """repair_vec_working must not depend on sqlite3.Row row_factory."""
+    pytest.importorskip("numpy")
+    sqlite_vec = pytest.importorskip("sqlite_vec")
+
+    beam = BeamMemory(session_id="repair-plain-conn", db_path=temp_db)
+    _require_vec_working(beam.conn)
+
+    now = datetime.now().isoformat()
+    beam.conn.execute(
+        """
+        INSERT INTO working_memory
+            (id, content, source, timestamp, session_id, scope, importance)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("plain-conn-1", "needs vec backfill", "chat", now, "repair-plain-conn", "session", 0.5),
+    )
+    beam.conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        ("plain-conn-1", beam_module._embeddings.serialize(_unit_embedding()), "test"),
+    )
+    beam.conn.commit()
+
+    # Plain connection: no row_factory, so rows are tuples.
+    conn = sqlite3.connect(str(temp_db))
+    try:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        assert conn.row_factory is None
+
+        result = beam_module.repair_vec_working(conn)
+
+        assert result.get("status") != "error", result.get("error")
+        assert result["inserted"] == 1
+        assert result["after"]["missing_vec_working_rows"] == 0
+    finally:
+        conn.close()
