@@ -7,6 +7,14 @@ onnxruntime has two upper bounds, chosen per platform (#1108):
   wheels after 1.23.2, so a plain ``<1.29`` resolves to a version with no
   wheel at all and ``uv sync`` exits 2
 
+The macOS x86_64 bound is further scoped to ``python_version < '3.14'``
+(#1317): no cp314 macOS x86_64 wheel exists for any release, so on that fork
+the requirement can never resolve and only fails the whole extras install
+with it. fastembed, which requires onnxruntime unconditionally on
+``python_full_version >= '3.14'``, is excluded on the same fork, leaving
+``sqlite-vec`` as the only embeddings requirement there — the same
+platform-marks-where-wheels-exist rule the original split applied.
+
 Both forms have to be declared together: one of the two markers is false on any
 given host, so a single requirement can only ever apply to half the platforms.
 """
@@ -19,10 +27,14 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-# The unconditional cap everywhere except macOS x86_64, and the narrow one that platform gets.
+# The unconditional cap everywhere except macOS x86_64, and the narrow one that
+# platform gets on Pythons that still have wheels for it (cp314 does not).
 ONNXRUNTIME_DEFAULT = "onnxruntime>=1.21.0,<1.29; sys_platform != 'darwin' or platform_machine != 'x86_64'"
-ONNXRUNTIME_MACOS_INTEL = "onnxruntime>=1.21.0,<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'"
+ONNXRUNTIME_MACOS_INTEL = "onnxruntime>=1.21.0,<1.24; python_version < '3.14' and sys_platform == 'darwin' and platform_machine == 'x86_64'"
 ONNXRUNTIME_REQUIREMENTS = (ONNXRUNTIME_DEFAULT, ONNXRUNTIME_MACOS_INTEL)
+# fastembed needs onnxruntime on every Python it supports, so it gets the same
+# carve-out on the fork where no cp314 wheel can ever resolve.
+FASTEMBED_REQUIREMENT = "fastembed>=0.3.0; python_version < '3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64'"
 EXPECTED_EXTRAS = {"embeddings", "all"}
 
 
@@ -84,6 +96,9 @@ def test_embedding_extras_bound_onnxruntime_below_1_29():
             # would otherwise slip past the per-string count above.
             declared_onnxruntime = {r for r in declared if r.startswith("onnxruntime")}
             assert declared_onnxruntime == set(ONNXRUNTIME_REQUIREMENTS), (extra, declared)
+            # fastembed gets the same carve-out: it requires onnxruntime
+            # unconditionally on Python >= 3.14, so it cannot stay either.
+            assert declared.count(FASTEMBED_REQUIREMENT) == 1, (extra, declared)
 
         extras_with_requirement = {
             extra
@@ -94,10 +109,13 @@ def test_embedding_extras_bound_onnxruntime_below_1_29():
 
 
 def test_the_two_markers_partition_every_platform():
-    """One marker is always true and the other always false — that is what makes it work.
+    """One marker applies per environment — zero on the fork that has no wheels at all.
 
     A single unconditional requirement cannot express this: on macOS x86_64 the narrower
-    ceiling is the only one that resolves, and everywhere else it is the wider one.
+    ceiling is the only one that resolves, and everywhere else it is the wider one. On
+    macOS x86_64 with Python >= 3.14 neither applies, because no cp314 wheel exists for
+    that platform at any version, so the fork must declare nothing rather than pin an
+    unresolvable one (#1317).
     """
     from packaging.markers import Marker
 
@@ -111,15 +129,32 @@ def test_the_two_markers_partition_every_platform():
         {"sys_platform": "linux", "platform_machine": "aarch64"},
         {"sys_platform": "win32", "platform_machine": "AMD64"},
     ]
-    for environment in platforms:
-        assert universal.evaluate(environment) != macos_intel.evaluate(environment), environment
+    for python_version in ("3.10", "3.13", "3.14"):
+        for platform in platforms:
+            environment = {**platform, "python_version": python_version}
+            applying = universal.evaluate(environment) + macos_intel.evaluate(environment)
+            expected = (
+                0
+                if platform == platforms[0] and python_version >= "3.14"
+                else 1
+            )
+            assert applying == expected, (environment, applying)
 
-    # The narrower bound is only ever active on the platform that needs it.
-    assert macos_intel.evaluate(
-        {"sys_platform": "darwin", "platform_machine": "x86_64"}
+    # The narrower bound is only ever active on the platform that needs it,
+    # and only while that platform still has wheels to reach for.
+    for python_version in ("3.10", "3.13"):
+        assert macos_intel.evaluate(
+            {"sys_platform": "darwin", "platform_machine": "x86_64",
+             "python_version": python_version}
+        )
+    assert not macos_intel.evaluate(
+        {"sys_platform": "darwin", "platform_machine": "x86_64",
+         "python_version": "3.14"}
     )
-    for environment in platforms[1:]:
-        assert not macos_intel.evaluate(environment), environment
+    for python_version in ("3.10", "3.14"):
+        for platform in platforms[1:]:
+            environment = {**platform, "python_version": python_version}
+            assert not macos_intel.evaluate(environment), environment
 
 
 def test_only_macos_intel_gets_the_narrow_bound():
@@ -166,7 +201,7 @@ def test_swapped_bounds_would_still_break_an_intel_mac():
     from packaging.version import Version
 
     versions_without_an_x86_wheel = ("1.24.0", "1.25.0", "1.26.0", "1.27.0", "1.28.0")
-    env = {"sys_platform": "darwin", "platform_machine": "x86_64"}
+    env = {"sys_platform": "darwin", "platform_machine": "x86_64", "python_version": "3.10"}
     swapped_applies = "onnxruntime>=1.21.0,<1.29; sys_platform == 'darwin' and platform_machine == 'x86_64'"
 
     def admits_uninstallable(requirement: str) -> list[str]:
@@ -199,17 +234,30 @@ def test_nothing_applicable_on_macos_intel_lacks_a_wheel():
     MACOS_INTEL = {"sys_platform": "darwin", "platform_machine": "x86_64"}
     LINUX = {"sys_platform": "linux", "platform_machine": "x86_64"}
 
-    def admits_unwheeled(environment):
+    def applying(environment):
         parsed = [Requirement(r) for r in _shipped_onnxruntime_requirements()]
-        applying = [r for r in parsed if Marker(str(r.marker)).evaluate(environment)]
-        assert len(applying) == 1, [str(r) for r in applying]
-        return [v for v in UNWHEELED if applying[0].specifier.contains(Version(v))]
+        return [r for r in parsed if Marker(str(r.marker)).evaluate(environment)]
 
-    assert admits_unwheeled(MACOS_INTEL) == []
+    def admits_unwheeled(environment):
+        applying_reqs = applying(environment)
+        assert len(applying_reqs) == 1, [str(r) for r in applying_reqs]
+        return [v for v in UNWHEELED if applying_reqs[0].specifier.contains(Version(v))]
 
-    # And nothing else is capped for a platform that has no problem: Linux still reaches
-    # 1.28, so this is a split, not a blanket downgrade.
-    assert admits_unwheeled(LINUX) == list(UNWHEELED)
+    for python_version in ("3.10", "3.13"):
+        environment = {**MACOS_INTEL, "python_version": python_version}
+        assert admits_unwheeled(environment) == [], environment
+
+    # On 3.14 nothing can ever apply there — no cp314 macOS x86_64 wheel exists
+    # for any release — so the fork must declare no requirement rather than an
+    # unresolvable one, or every extras install on it fails (#1317).
+    assert applying({**MACOS_INTEL, "python_version": "3.14"}) == []
+
+    # And nothing else is capped for a platform that has no problem: Linux
+    # still reaches 1.28 on 3.13 and on 3.14 alike, where the same wheels
+    # already carry cp314 tags — so this is a split, not a blanket downgrade.
+    for python_version in ("3.13", "3.14"):
+        environment = {**LINUX, "python_version": python_version}
+        assert admits_unwheeled(environment) == list(UNWHEELED), environment
 
 
 def test_swapping_the_bounds_would_reintroduce_the_defect():
@@ -225,7 +273,7 @@ def test_swapping_the_bounds_would_reintroduce_the_defect():
     from packaging.version import Version
 
     UNWHEELED = ("1.24.0", "1.25.0", "1.26.0", "1.27.0", "1.28.0")
-    MACOS_INTEL = {"sys_platform": "darwin", "platform_machine": "x86_64"}
+    MACOS_INTEL = {"sys_platform": "darwin", "platform_machine": "x86_64", "python_version": "3.10"}
     narrow = f"onnxruntime>=1.21.0,<1.24; {ONNXRUNTIME_MACOS_INTEL.split(';', 1)[1]}"
     wide = f"onnxruntime>=1.21.0,<1.29; {ONNXRUNTIME_MACOS_INTEL.split(';', 1)[1]}"
 
@@ -235,6 +283,40 @@ def test_swapping_the_bounds_would_reintroduce_the_defect():
     assert Marker(str(Requirement(narrow).marker)).evaluate(MACOS_INTEL)
     assert admits(narrow) == []
     assert admits(wide) == list(UNWHEELED)
+
+
+def test_python_314_macos_intel_declares_no_unresolvable_requirement():
+    """The extras resolve on the one fork that can never have a wheel.
+
+    No onnxruntime release ships a cp314 macOS x86_64 wheel, and fastembed
+    requires onnxruntime unconditionally on Python >= 3.14, so any of those
+    requirements still applying there fails the whole extras resolution,
+    which is what #1317 reports. On that fork the declared set must be empty
+    of both; sqlite-vec still applies, so the extra resolves to the parts
+    that can exist there.
+    """
+    from packaging.markers import Marker
+    from packaging.requirements import Requirement
+
+    env = {"sys_platform": "darwin", "platform_machine": "x86_64",
+           "python_version": "3.14"}
+    for optional_dependencies in (
+        _pyproject_optional_dependencies(),
+        _setup_py_optional_dependencies(),
+    ):
+        for extra in EXPECTED_EXTRAS:
+            applying = [
+                requirement
+                for requirement in optional_dependencies[extra]
+                if (marker := Requirement(requirement).marker) is None
+                or Marker(str(marker)).evaluate(env)
+            ]
+            blocked = [
+                r for r in applying
+                if r.startswith(("onnxruntime", "fastembed"))
+            ]
+            assert blocked == [], (extra, applying)
+            assert any(r.startswith("sqlite-vec") for r in applying), (extra, applying)
 
 
 if __name__ == "__main__":

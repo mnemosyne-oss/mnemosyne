@@ -69,8 +69,8 @@ setup(
     extras_require={
         "llm": ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20"],
         "embeddings": [
-            "fastembed>=0.3.0",
-            "onnxruntime>=1.21.0,<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+            "fastembed>=0.3.0; python_version < '3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64'",
+            "onnxruntime>=1.21.0,<1.24; python_version < '3.14' and sys_platform == 'darwin' and platform_machine == 'x86_64'",
             "onnxruntime>=1.21.0,<1.29; sys_platform != 'darwin' or platform_machine != 'x86_64'",
             "sqlite-vec>=0.1.9,<0.1.10",
         ],
@@ -78,7 +78,7 @@ setup(
         "openclaw": ["openclaw>=0.1.0; python_version >= '3.10'"],
         "media": ["pypdfium2>=4.30", "pillow>=10"],
         "test": ["pytest>=7.0"],
-        "all": ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20", "fastembed>=0.3.0", "onnxruntime>=1.21.0,<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'", "onnxruntime>=1.21.0,<1.29; sys_platform != 'darwin' or platform_machine != 'x86_64'", "sqlite-vec>=0.1.9,<0.1.10", "mcp>=2.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'"],
+        "all": ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20", "fastembed>=0.3.0; python_version < '3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64'", "onnxruntime>=1.21.0,<1.24; python_version < '3.14' and sys_platform == 'darwin' and platform_machine == 'x86_64'", "onnxruntime>=1.21.0,<1.29; sys_platform != 'darwin' or platform_machine != 'x86_64'", "sqlite-vec>=0.1.9,<0.1.10", "mcp>=2.0.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'"],
         "dev": ["pytest>=7.0", "build", "twine"],
     },
     entry_points={
