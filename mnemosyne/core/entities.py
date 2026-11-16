@@ -150,8 +150,8 @@ _POSITION_FILTER_ENV = "MNEMOSYNE_ENTITY_POSITION_FILTER"
 # the first word of a stored turn: a speaker prefix such as `[USER] ` or
 # `[ASSISTANT] `, a bracketed uppercase word opening its line and followed by
 # a space, counts as a sentence start. Only that shape does: a bracket
-# closing mid-sentence is skipped like any closer, and the name after it
-# extracts.
+# closing mid-sentence is skipped like any closer; it does not by itself
+# create a sentence boundary.
 _SENTENCE_TERMINATORS = frozenset(".!?:;\u2026\n\r")
 _TRAILING_CLOSERS = frozenset("\"')]}*\u2019\u201d")
 _SPEAKER_PREFIX = re.compile(r'\[[A-Z]+\]')
@@ -162,8 +162,8 @@ _NAME_PREFIX_ABBREVIATION = re.compile(r"\b(?:Dr|Mr|Mrs|Ms|Prof|St)\.\Z", re.IGN
 # A contraction stem is not a name: an apostrophe is a word boundary, so
 # "Don't" matched "Don" and "Haven't" matched "Haven". A single word followed
 # by an apostrophe and an unambiguous contraction tail is rejected. The 's
-# tail is ambiguous ("Let's", "Alice's") and goes to the name: a possessive
-# is the one form a name takes in a sentence about the person.
+# tail is ambiguous ("Let's", "Alice's") and is not rejected as a contraction
+# stem. The other position checks can still reject a possessive.
 _CONTRACTION_TAIL = re.compile(r"['\u2019](?:t|ll|re|ve|d|m)\b", re.IGNORECASE)
 
 # The word opening a quoted phrase is capitalized by position, like a
@@ -171,8 +171,8 @@ _CONTRACTION_TAIL = re.compile(r"['\u2019](?:t|ll|re|ve|d|m)\b", re.IGNORECASE)
 # calls"), the first word of quoted speech ('Still us.'). Only the phrase
 # shape is dropped, an opening quote right before the word and a lowercase
 # word right after it. A quoted name standing alone ('Alice'), a quoted
-# possessive ("Alice's notes") and a quoted list (['Alice', 'Maya']) keep
-# their names.
+# possessive ("Alice's notes") and a quoted list (['Alice', 'Maya']) are not
+# rejected by this quoted-phrase check.
 _OPENING_QUOTES = frozenset("\"'\u201c\u2018")
 _LOWERCASE_FOLLOWER = re.compile(r'[ \t]+[a-z]')
 
@@ -360,9 +360,9 @@ def extract_entities_regex(text: str) -> List[str]:
             if len(words) == 1 and entity.isupper():
                 continue
             # Opt-in: drop a single capitalized word capitalized by position.
-            # This position rule does not reject mid-sentence names. Other
-            # extraction filters and longer-name merging still apply. Multi-word
-            # sequences and @/# prefixes use other patterns, which skip this.
+            # Apply the three position checks only to this fallback pattern.
+            # Multi-word sequences and @/# prefixes use other patterns, which
+            # skip this check. Other filters and longer-name merging still apply.
             if (
                 position_filter
                 and pattern is _SINGLE_CAP_WORD
