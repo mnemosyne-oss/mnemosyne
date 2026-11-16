@@ -365,3 +365,25 @@ class TestOverlappingCategoriesReachStorageOnce:
         pos_contents = [str(r.get("content", "")) for r in pos_recalled]
         pos_matched = [c for c in pos_contents if "POS system goes live" in c]
         assert len(pos_matched) == 1, pos_contents
+
+
+@pytest.mark.parametrize("text, name", [
+    ("I met Dr. Smith yesterday.", "Smith"),
+    ("I met Mr. Jones yesterday.", "Jones"),
+    ("I met Mrs. Patel yesterday.", "Patel"),
+    ("I visited St. Louis yesterday.", "Louis"),
+    ("I met Prof. Weber yesterday.", "Weber"),
+])
+def test_position_filter_keeps_prefixed_name_in_mentions(tmp_path, monkeypatch, text, name):
+    """A name after a title must reach persisted mentions, not just regex output."""
+    from mnemosyne.core.annotations import AnnotationStore
+
+    monkeypatch.setenv("MNEMOSYNE_ENTITY_POSITION_FILTER", "1")
+    db_path = tmp_path / "prefixed-name.db"
+    memory = Mnemosyne(session_id="prefixed-name", db_path=db_path)
+    memory.remember(text, source="user", extract_entities=True)
+    values = {
+        row["value"]
+        for row in AnnotationStore(db_path=db_path).query_by_kind("mentions", filter_noise=False)
+    }
+    assert name in values

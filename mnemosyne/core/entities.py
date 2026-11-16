@@ -155,6 +155,9 @@ _POSITION_FILTER_ENV = "MNEMOSYNE_ENTITY_POSITION_FILTER"
 _SENTENCE_TERMINATORS = frozenset(".!?:;\u2026\n\r")
 _TRAILING_CLOSERS = frozenset("\"')]}*\u2019\u201d")
 _SPEAKER_PREFIX = re.compile(r'\[[A-Z]+\]')
+# A dot after these bounded name prefixes does not start a new sentence.
+# Keep this small: it is not general abbreviation or sentence segmentation.
+_NAME_PREFIX_ABBREVIATION = re.compile(r"\b(?:Dr|Mr|Mrs|Ms|Prof|St)\.\Z", re.IGNORECASE)
 
 # A contraction stem is not a name: an apostrophe is a word boundary, so
 # "Don't" matched "Don" and "Haven't" matched "Haven". A single word followed
@@ -187,6 +190,13 @@ def _is_sentence_initial(text: str, pos: int) -> bool:
             if _SPEAKER_PREFIX.fullmatch(text, line_start, i + 1):
                 return True
         i -= 1
+    if (
+        i >= 0
+        and text[i] == "."
+        and not text[i + 1:pos].strip(" \t")
+        and _NAME_PREFIX_ABBREVIATION.search(text, max(0, i - 4), i + 1)
+    ):
+        return False
     return i < 0 or text[i] in _SENTENCE_TERMINATORS
 
 

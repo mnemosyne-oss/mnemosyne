@@ -213,6 +213,44 @@ class TestPositionFilter(unittest.TestCase):
                 ["Maya", "Release"],
             )
 
+    def test_name_after_known_abbreviation_is_retained(self):
+        """The opt-in rule must not treat a name prefix's dot as a sentence end."""
+        cases = [
+            ("I met Dr. Smith yesterday.", ["Dr", "Smith"]),
+            ("I met Mr. Jones yesterday.", ["Jones", "Mr"]),
+            ("I met Mrs. Patel yesterday.", ["Mrs", "Patel"]),
+            ("I visited St. Louis yesterday.", ["Louis", "St"]),
+            ("I met Prof. Weber yesterday.", ["Prof", "Weber"]),
+            ("I met Ms. Chen yesterday.", ["Chen", "Ms"]),
+            ("Dr. Smith arrived.", ["Smith"]),
+            ("I met dr. Smith yesterday.", ["Smith"]),
+            ("I met DR. Smith yesterday.", ["Smith"]),
+            ("I met Dr.\tSmith yesterday.", ["Dr", "Smith"]),
+        ]
+        with self._on():
+            for text, expected in cases:
+                with self.subTest(text=text):
+                    self.assertEqual(extract_entities_regex(text), expected)
+
+    def test_abbreviation_exception_does_not_cross_sentence_boundaries(self):
+        """An unknown word, newline or closing quote must keep the position drop."""
+        cases = [
+            ("I met Alex. Maya waved.", ["Alex"]),
+            ("I met OtherDr. Maya waved.", ["OtherDr"]),
+            ("I met Dr.. Maya waved.", ["Dr"]),
+            ("I met Dr.J. Maya waved.", ["Dr"]),
+            ("I met Dr.\nMaya waved.", ["Dr"]),
+            ("I met Dr.\r\nMaya waved.", ["Dr"]),
+            ("I met Dr. \nMaya waved.", ["Dr"]),
+            ("The tag was 'Dr.' Maya waved.", ["Dr"]),
+            ("I met Dr! Maya waved.", ["Dr"]),
+            ("I met Dr? Maya waved.", ["Dr"]),
+        ]
+        with self._on():
+            for text, expected in cases:
+                with self.subTest(text=text):
+                    self.assertEqual(extract_entities_regex(text), expected)
+
     def test_sentence_opening_name_is_lost(self):
         # The accepted cost: a single-word name that only ever opens a
         # sentence does not extract from that text.
