@@ -39,8 +39,10 @@ bank directories) is deliberate: bank files live in several layouts — a
 data dir's ``banks/<name>/``, a profile's own storage, a dedicated
 surface directory — and the census must see the same set the measurement
 it maintains a bound for was taken over. The walk is pruned of
-cache/backup/build directories, so its cost tracks the number of bank
-files, not the size of the tree.
+cache/backup/build directories but can still visit unrelated directories
+and SQLite files. Each SQLite lock wait is bounded to 50 ms; this is not
+a deadline for the complete walk or census. Unreadable candidates make
+the reported bound unmeasured rather than silently confirming it.
 
 Identity, not labels. Twins are keyed by ABSOLUTE PATH; the ``label``
 field exists only so a human can read the report. This is not cosmetic:
