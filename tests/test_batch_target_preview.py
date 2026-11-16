@@ -294,6 +294,7 @@ def test_provider_preview_with_old_core_does_not_claim_syntax_is_target_checked(
 
     module = importlib.import_module(package)
     provider = module.MnemosyneMemoryProvider()
+    provider._beam = object()
     monkeypatch.delattr(batch_tool, "snapshot_preview_batch")
     result = json.loads(
         provider._handle_batch(
@@ -383,7 +384,10 @@ def test_public_preview_never_initializes_or_captures_write_policy(
         )
     )
     assert touched == []
-    assert result == batch_tool.preview_unavailable()
+    expected = batch_tool.preview_unavailable()
+    if package == "mnemosyne_hermes":
+        expected["reason_code"] = "never_initialized"
+    assert result == expected
 
 
 def test_mcp_closed_wal_preview_does_not_create_sidecars(tmp_path, monkeypatch):
@@ -569,3 +573,55 @@ def test_mcp_preview_last_connection_close_only_recreates_reader_coordination(
             ).fetchone()[0]
             == "The temporary project meeting is on Friday afternoon."
         )
+
+
+@pytest.mark.parametrize("context", ["subagent", "cron"])
+@pytest.mark.parametrize("was_live", [False, True], ids=["direct-skip", "live-reinit"])
+def test_public_skip_preview_preserves_lifecycle_reason_without_initialization(
+    tmp_path, monkeypatch, context, was_live
+):
+    """Preview preserves real lifecycle diagnostics without reviving a skipped Beam."""
+    import importlib
+
+    module = importlib.import_module("mnemosyne_hermes")
+    provider = module.MnemosyneMemoryProvider()
+    try:
+        if was_live:
+            provider.initialize(
+                "primary", hermes_home=str(tmp_path), profile_isolation=False,
+                agent_context="primary", auto_sleep=False,
+            )
+            assert provider._beam is not None
+        provider.initialize(
+            "skipped", hermes_home=str(tmp_path), profile_isolation=False,
+            agent_context=context, auto_sleep=False,
+        )
+        assert provider._beam is None
+        expected = "reset_by_reinit" if was_live else "skipped_context"
+        memory_result = json.loads(
+            provider.handle_tool_call("mnemosyne_recall", {"query": "marker"})
+        )
+        assert memory_result["reason_code"] == expected
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("a skipped preview must not initialize, open SQLite, or capture a write")
+
+        for name in (
+            "_maybe_retry_init", "_ensure_initialized_for_tools",
+            "_resolve_effective_write_policy", "_audit_event",
+        ):
+            if hasattr(provider, name):
+                monkeypatch.setattr(provider, name, forbidden)
+        monkeypatch.setattr(module, "_get_beam_class", forbidden)
+        import sqlite3
+        monkeypatch.setattr(sqlite3, "connect", forbidden)
+
+        result = json.loads(provider.handle_tool_call("mnemosyne_batch", {
+            "dry_run": True,
+            "operations": [{"action": "forget", "memory_id": "marker"}],
+        }))
+        assert result == {**batch_tool.preview_unavailable(), "reason_code": expected}
+        assert provider._beam is None
+        assert provider._unavailable_reason_code == expected
+    finally:
+        provider.shutdown()

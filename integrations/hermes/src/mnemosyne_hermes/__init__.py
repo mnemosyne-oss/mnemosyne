@@ -3752,14 +3752,20 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps(batch_validation_error_payload(exc))
 
         if bool(args.get("dry_run", False)):
+            beam = self._beam
+            if beam is None:
+                return json.dumps({
+                    "status": "error", "error": "preview_unavailable",
+                    "validation": "target_eligibility_snapshot",
+                    "reason_code": getattr(self, "_unavailable_reason_code", "never_initialized"),
+                })
             # Older cores may still support apply without target-aware preview.
             try:
                 from mnemosyne.batch_tool import BatchPreviewTarget, snapshot_preview_batch
             except ImportError:
                 return json.dumps({"status": "error", "error": "preview_unavailable",
                                    "validation": "target_eligibility_snapshot"})
-            beam = self._beam
-            target = BatchPreviewTarget(getattr(beam, "conn", None), getattr(beam, "session_id", None)) if beam is not None else None
+            target = BatchPreviewTarget(getattr(beam, "conn", None), getattr(beam, "session_id", None))
             return json.dumps(snapshot_preview_batch(normalized, target=target))
 
         # Write-approval gate: stage each operation to pending when enabled.
