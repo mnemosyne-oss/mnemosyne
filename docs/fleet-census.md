@@ -4,8 +4,11 @@ The sleep-time census discovers nonempty `*.db` candidates below the fleet
 root. A candidate is counted as a bank only if it can be read and contains a
 `conflicts` table. Cache, backup and package/build directories on the fixed
 skip list are pruned. Directories ending in `.partial` are also pruned when
-the selected root resolves to a directory named `state-snapshots` (including
-through an alias), or a directory below the root is named `state-snapshots`.
+they are inside a snapshot tree: the selected root resolves to a directory
+named `state-snapshots` (including through an alias), or a `state-snapshots`
+directory below the root is an ancestor of the `.partial` directory.
+A sibling path such as `/fleet/active/data.partial` remains discoverable even
+when `/fleet/state-snapshots` exists.
 A selected root such as `/fleet/state-snapshots/run` does not prune its
 `.partial` children. Discovery otherwise remains layout-independent: a real
 bank does not have to be named `mnemosyne.db` or live in a standard directory.
