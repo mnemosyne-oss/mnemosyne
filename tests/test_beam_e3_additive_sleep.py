@@ -916,6 +916,57 @@ class TestE3AdditiveSleep:
             f"auto-sleep gate; got {n}"
         )
 
+    def test_auto_sleep_gate_ignores_a_sibling_sessions_orphan(self, temp_db):
+        """The auto-sleep gate is session-scoped: a stale orphan in a SIBLING
+        session must not count toward this session's eligibility (#687)."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s2", n=1)  # sibling session
+        self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                  - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        assert beam._count_unconsolidated_before(cutoff) == 0
+
+    def test_auto_sleep_gate_counts_this_sessions_orphan(self, temp_db):
+        """A stale orphan in THIS session must count toward the auto-sleep
+        gate, so an orphan backlog can't hide behind eligible == 0."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s1", n=1)
+        self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                  - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        assert beam._count_unconsolidated_before(cutoff) == 1
+
+    @pytest.mark.parametrize("scenario", ["own_orphan", "sibling_orphan", "completed_row"])
+    def test_auto_sleep_gate_and_dry_run_selection_agree(self, temp_db, monkeypatch, scenario):
+        """The gate count and sleep(dry_run=True) selection must agree: count
+        > 0 exactly when the dry run selects at least one row, in every
+        scenario (own orphan, sibling orphan, already-completed row)."""
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        if scenario == "own_orphan":
+            ids = _seed_old_wm(temp_db, "s1", n=1)
+            self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        elif scenario == "sibling_orphan":
+            ids = _seed_old_wm(temp_db, "s2", n=1)
+            self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        else:  # completed_row: summarize, then leave a stale re-claim
+            ids = _seed_old_wm(temp_db, "s1", n=1)
+            beam.sleep(dry_run=False)
+            self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                  - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        count = beam._count_unconsolidated_before(cutoff)
+        res = beam.sleep(dry_run=True)
+        selected = res.get("items_consolidated", 0)
+        assert (count > 0) == (selected >= 1), (
+            f"gate count {count} and dry-run selection {selected} disagree "
+            f"for scenario {scenario}"
+        )
+        if scenario == "own_orphan":
+            assert count == 1 and selected == 1
+        else:
+            assert count == 0 and selected == 0
+
     def test_summary_without_timestamp_counts_as_claim_completion(self, temp_db):
         """Pin the documented trade-off in _claim_completed_sql: a summary
         with NULL created_at is treated as completing the claim it names

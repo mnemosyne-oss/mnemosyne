@@ -8073,10 +8073,14 @@ class BeamMemory:
         is eligible — avoids unnecessary database work on always-on agents
         with longer TTLs after a prior auto-sleep already consolidated everything.
 
-        Uses the same _SLEEP_ELIGIBLE_SQL predicate as sleep() and
-        sleep_all_sessions() selection (see the invariant above
-        _SQL_PLACEABLE_TS): rows whose stale claim is recoverable count as
-        eligible, so the gate never hides an orphan backlog from auto-sleep.
+        Mirrors sleep()'s selection exactly: the same _SLEEP_ELIGIBLE_SQL
+        predicate (so a stale claim that sleep() would recover still counts,
+        and the gate never hides an orphan backlog) and the same session scope
+        (``COALESCE(session_id, 'default') = self.session_id``), so a sibling
+        session's orphan does not trigger this session's auto-sleep (#687).
+        This method is private and is only ever called from the auto-sleep
+        snapshot on a session-bound BeamMemory, so the session scope is
+        consistent with its only consumers.
         """
         cursor = self.conn.cursor()
         cursor.execute(
@@ -8084,8 +8088,9 @@ class BeamMemory:
             f"WHERE {_SQL_CHRONO_TS} < ? "
             f"AND {_SQL_PLACEABLE_TS} "
             f"AND {_SLEEP_ELIGIBLE_SQL} "
-            f"AND (pinned IS NULL OR pinned = 0)",
-            (cutoff, _orphan_cutoff()),
+            f"AND (pinned IS NULL OR pinned = 0) "
+            f"AND COALESCE(session_id, 'default') = ?",
+            (cutoff, _orphan_cutoff(), self.session_id),
         )
         return cursor.fetchone()[0]
 
