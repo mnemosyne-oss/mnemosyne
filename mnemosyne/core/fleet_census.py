@@ -39,8 +39,8 @@ bank directories) is deliberate: bank files live in several layouts — a
 data dir's ``banks/<name>/``, a profile's own storage, a dedicated
 surface directory — and the census must see the same set the measurement
 it maintains a bound for was taken over. The walk is pruned of
-cache/backup/build directories but can still visit unrelated directories
-and SQLite files. Connections configure a 50 ms SQLite busy timeout for
+the fixed skip set below, including cache and backups, but can still visit
+build and unrelated directories and SQLite files. Connections configure a 50 ms SQLite busy timeout for
 busy-handler sleep; separate statements may wait separately. This is not
 a strict wall-clock deadline or an aggregate connection/census budget.
 Unreadable discovered candidates make the reported bound unmeasured.
@@ -105,10 +105,10 @@ def census_enabled() -> bool:
         return True
     return raw.strip().lower() not in _FALSY
 
-#: Directories that never hold a live bank. Pruned during the walk so the
-#: census stays cheap enough to run on every sleep pass. Mirrors the skip
-#: list the acceptance measurement used (``backups``, ``cache``,
-#: ``.cache``) plus package/build trees that cannot contain a bank.
+#: Directory names excluded from discovery to reduce traversal. Mirrors
+#: the acceptance measurement skip list (``backups``, ``cache``, ``.cache``)
+#: plus the package and metadata directory names listed here. ``build`` is
+#: not included; candidates below it are still inspected.
 _SKIP_DIR_NAMES = frozenset({
     "backups",
     "cache",

@@ -2,8 +2,9 @@
 
 The sleep-time census discovers nonempty `*.db` candidates below the fleet
 root. A candidate is counted as a bank only if it can be read and contains a
-`conflicts` table. Cache, backup and package/build directories on the fixed
-skip list are pruned. Directories ending in `.partial` are also pruned when
+`conflicts` table. The fixed skip list prunes directories named `backups`,
+`cache`, `.cache`, `__pycache__`, `node_modules`, `.git` or `site-packages`.
+A directory named `build` is not on that list and is still searched. Directories ending in `.partial` are also pruned when
 they are inside a snapshot tree: the selected root resolves to a directory
 named `state-snapshots` (including through an alias), or a `state-snapshots`
 directory below the root is an ancestor of the `.partial` directory.
