@@ -13552,24 +13552,27 @@ class BeamMemory:
                     lines = compression_plugin.compress_lines(lines)
 
                 chunks = local_llm.chunk_memories_by_budget(lines, source=source)
-                if chunks:
+                if chunks and sum(len(chunk) for chunk in chunks) == len(lines):
                     invalid_reasoning = False
                     if len(chunks) == 1:
                         # All memories fit in one prompt.
                         summary = local_llm._summarize_memories(chunks[0], source=source)
                         invalid_reasoning = local_llm._is_invalid_reasoning_output(summary)
                     else:
-                        # Multi-chunk: any malformed trace invalidates the
-                        # complete LLM result instead of silently dropping it.
+                        # Every chunk must succeed; otherwise fall back over
+                        # the complete lines list instead of publishing a subset.
                         chunk_summaries = []
+                        incomplete_summary = False
                         for chunk in chunks:
                             chunk_summary = local_llm._summarize_memories(chunk, source=source)
                             if local_llm._is_invalid_reasoning_output(chunk_summary):
                                 invalid_reasoning = True
                                 break
-                            if chunk_summary:
-                                chunk_summaries.append(chunk_summary)
-                        if not invalid_reasoning and chunk_summaries:
+                            if not chunk_summary:
+                                incomplete_summary = True
+                                break
+                            chunk_summaries.append(chunk_summary)
+                        if not invalid_reasoning and not incomplete_summary and chunk_summaries:
                             # Second-pass: summarize the chunk summaries.
                             if len(chunk_summaries) == 1:
                                 summary = chunk_summaries[0]
@@ -13579,9 +13582,8 @@ class BeamMemory:
                                     source=f"{source} (consolidated)",
                                 )
                                 invalid_reasoning = local_llm._is_invalid_reasoning_output(summary)
-                                # Preserve the existing non-reasoning fallback.
-                                if not invalid_reasoning and not summary:
-                                    summary = " | ".join(chunk_summaries)
+                                # A failed merge leaves summary unset: the
+                                # complete-input AAAK fallback below owns recovery.
                     if invalid_reasoning:
                         logger.warning(
                             "sleep: malformed reasoning trace for source=%r (items=%d) "
