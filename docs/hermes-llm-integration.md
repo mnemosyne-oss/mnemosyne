@@ -149,3 +149,20 @@ set_host_llm_backend(MyAgentBackend())
 
 This mirrors the pattern Hermes uses today and avoids per-agent forks of
 Mnemosyne core.
+
+
+### Consolidation output completeness
+
+Consolidation removes only recognized summary headers or an exact known
+instruction echo. Factual sentences beginning with words such as “The following
+memories confirm …” remain intact, including prices, dates and factual bullets.
+This sanitation is confined to summary calls and does not filter fact-extraction
+output or change provider prefetch admission.
+
+An empty sanitized host response tries the existing local fallback, without
+sending the memories to a separate remote URL after a host attempt. If any
+input was omitted by chunk budgeting, any chunk remains unusable, or the final
+merge of chunk summaries fails, the summary API returns no LLM summary. The
+caller then uses its existing complete-input fallback rather than publishing
+one successful chunk as the summary of the whole input. No retry budget or
+backend-routing policy is added by this correction.
