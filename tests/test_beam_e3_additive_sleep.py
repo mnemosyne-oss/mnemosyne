@@ -791,7 +791,7 @@ class TestE3AdditiveSleep:
     # --- review findings on automatic orphan recovery (#1322) -----------------
 
     @staticmethod
-    def _claim(db_path, ids, stamp, summarized=False):
+    def _claim(db_path, ids, stamp):
         conn = sqlite3.connect(str(db_path))
         try:
             conn.executemany(
@@ -899,6 +899,69 @@ class TestE3AdditiveSleep:
         c.close()
         assert claim == newer, "the previous holder cleared a newer claim marker"
 
+    def test_stale_claimed_rows_count_toward_the_auto_sleep_gate(self, temp_db):
+        """A crashed sleep leaves a claimed row (consolidated_at set, no
+        summary completing the claim). sleep() recovers that row, so the
+        auto-sleep eligibility count must include it: excluding it made
+        _maybe_auto_sleep() skip the pass and the orphan backlog was never
+        recovered automatically."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s1", n=1)
+        self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                  - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        n = beam._count_unconsolidated_before(cutoff)
+        assert n == 1, (
+            "a stale-claimed recoverable row must count toward the "
+            f"auto-sleep gate; got {n}"
+        )
+
+    def test_summary_without_timestamp_counts_as_claim_completion(self, temp_db):
+        """Pin the documented trade-off in _claim_completed_sql: a summary
+        with NULL created_at is treated as completing the claim it names
+        (the safe direction -- never a second summary), so it blocks
+        recovery of a later interrupted claim on the same row. If this
+        test ever needs changing, completion evidence must first carry
+        the claim identity."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s1", n=1)
+        self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        c = sqlite3.connect(str(temp_db))
+        c.execute(
+            "INSERT INTO episodic_memory (id, content, source, summary_of, created_at) "
+            "VALUES (?, ?, 'sleep_consolidation', ?, NULL)",
+            ("em-1", "summary text", ids[0]),
+        )
+        c.commit()
+        c.close()
+        res = beam.reclaim_orphans(stale_after_seconds=1, dry_run=True)
+        assert res["candidates"] == 0, (
+            "a NULL-timestamp summary must count as claim completion "
+            "(never a second summary)"
+        )
+
+    def test_large_backlog_recovers_without_touching_the_bind_limit(self, temp_db, monkeypatch):
+        """Same 1000-row recovery scenario as the two bind-limit tests, but
+        without lowering SQLITE_LIMIT_VARIABLE_NUMBER: covers interpreters
+        where Connection.setlimit does not exist (Python 3.10) and proves
+        batching recovers every row under the default limit."""
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s1", n=1000)
+        self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        res = beam.sleep_all_sessions(dry_run=False)
+        assert res["reclaimed_orphans"] == 1000 and res["items_consolidated"] == 1000
+        assert res["errors"] == 0
+
+    @pytest.mark.skipif(
+        not hasattr(sqlite3.Connection, "setlimit"),
+        reason=(
+            "needs sqlite3.Connection.setlimit, which exists only on Python "
+            "3.11+; skipped by capability check on 3.10, where the same "
+            "recovery path is covered by "
+            "test_large_backlog_recovers_without_touching_the_bind_limit"
+        ),
+    )
     def test_large_orphan_backlog_is_not_blocked_by_the_bind_limit(self, temp_db, monkeypatch):
         """999 stale ids + the cutoff exceeded a 999-variable limit: the pass
         returned no_op / 0 / 0 errors and left every claim untouched."""
@@ -913,6 +976,15 @@ class TestE3AdditiveSleep:
             "SELECT COUNT(*) FROM working_memory WHERE consolidated_at IS NOT NULL").fetchone()[0]
         assert remaining == 0
 
+    @pytest.mark.skipif(
+        not hasattr(sqlite3.Connection, "setlimit"),
+        reason=(
+            "needs sqlite3.Connection.setlimit, which exists only on Python "
+            "3.11+; skipped by capability check on 3.10, where the same "
+            "recovery path is covered by "
+            "test_large_backlog_recovers_without_touching_the_bind_limit"
+        ),
+    )
     def test_sleep_recovers_a_large_backlog_under_the_bind_limit(self, temp_db, monkeypatch):
         monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
         beam = BeamMemory(session_id="s1", db_path=temp_db)
@@ -956,8 +1028,8 @@ class TestE3AdditiveSleep:
 
     def test_reclamation_failure_is_reported_not_hidden(self, temp_db, monkeypatch):
         """A recovery failure (e.g. 'database is locked') used to be logged only:
-        the pass returned errors=0. The same failure injected into both the old
-        reclaim call and the new in-sleep claim step must surface as an error."""
+        the pass returned errors=0. Injected into the in-sleep claim step, the
+        same failure must surface as an error."""
         monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         ids = _seed_old_wm(temp_db, "s1", n=1)
@@ -966,8 +1038,7 @@ class TestE3AdditiveSleep:
         def busy(self_, *a, **k):
             raise sqlite3.OperationalError("database is locked")
 
-        monkeypatch.setattr(BeamMemory, "reclaim_orphans", busy)
-        monkeypatch.setattr(BeamMemory, "_claim_sleep_rows", busy, raising=False)
+        monkeypatch.setattr(BeamMemory, "_claim_sleep_rows", busy)
         res = beam.sleep_all_sessions(dry_run=False)
         assert res["errors"] == 1, res
         assert res["error_details"][0]["session_id"] == "s1"

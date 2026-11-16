@@ -8071,15 +8071,21 @@ class BeamMemory:
         """Count working memories eligible for consolidation before cutoff.
         Used by _maybe_auto_sleep() to skip full sleep passes when nothing
         is eligible — avoids unnecessary database work on always-on agents
-        with longer TTLs after a prior auto-sleep already consolidated everything."""
+        with longer TTLs after a prior auto-sleep already consolidated everything.
+
+        Uses the same _SLEEP_ELIGIBLE_SQL predicate as sleep() and
+        sleep_all_sessions() selection (see the invariant above
+        _SQL_PLACEABLE_TS): rows whose stale claim is recoverable count as
+        eligible, so the gate never hides an orphan backlog from auto-sleep.
+        """
         cursor = self.conn.cursor()
         cursor.execute(
             f"SELECT COUNT(*) FROM working_memory "
             f"WHERE {_SQL_CHRONO_TS} < ? "
             f"AND {_SQL_PLACEABLE_TS} "
-            f"AND consolidated_at IS NULL "
+            f"AND {_SLEEP_ELIGIBLE_SQL} "
             f"AND (pinned IS NULL OR pinned = 0)",
-            (cutoff,),
+            (cutoff, _orphan_cutoff()),
         )
         return cursor.fetchone()[0]
 
