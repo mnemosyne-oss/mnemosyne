@@ -662,6 +662,70 @@ class TestE3AdditiveSleep:
         assert rows["wm1"] is None
         assert rows["wm10"] == stale_claim
 
+    def test_takeover_rechecks_completion_after_selection(self, temp_db, monkeypatch):
+        """A commits after B selects its stale claim but before B's CAS."""
+        holder, recovery, stale = self._late_completion_claim(temp_db)
+        original_claim = recovery._claim_sleep_rows
+        selected = []
+
+        def complete_then_claim(rows, stamp):
+            selected.extend(row["id"] for row in rows)
+            self._complete_stale_claim(holder, stale)
+            return original_claim(rows, stamp)
+
+        monkeypatch.setattr(recovery, "_claim_sleep_rows", complete_then_claim)
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        recovery.sleep(force=True)
+        assert selected == ["late-completion"]
+        assert recovery.conn.execute(
+            "SELECT COUNT(*) FROM episodic_memory WHERE summary_of = 'late-completion'"
+        ).fetchone()[0] == 1
+        assert recovery.conn.execute(
+            "SELECT consolidation_claimed_at FROM working_memory WHERE id = 'late-completion'"
+        ).fetchone()[0] == stale
+
+    @staticmethod
+    def _late_completion_claim(temp_db):
+        holder = BeamMemory(session_id="s1", db_path=temp_db)
+        recovery = BeamMemory(session_id="s1", db_path=temp_db)
+        old_ts = (_naive_utc_now() - timedelta(hours=200)).isoformat()
+        stale = (_naive_utc_now() - timedelta(hours=2)).isoformat()
+        holder.conn.execute(
+            """INSERT INTO working_memory
+            (id, content, source, timestamp, session_id, consolidated_at, consolidation_claimed_at)
+            VALUES ('late-completion', 'original', 'conversation', ?, 's1', ?, ?)""",
+            (old_ts, stale, stale),
+        )
+        holder.conn.commit()
+        return holder, recovery, stale
+
+    @staticmethod
+    def _complete_stale_claim(holder, stale):
+        errors = []
+
+        def complete():
+            try:
+                writer = BeamMemory(session_id="s1", db_path=holder.db_path)
+                assert writer.conn is not holder.conn
+                summary_id = writer.consolidate_to_episodic(
+                    "holder summary", ["late-completion"], _claim_stamp=stale,
+                )
+                assert summary_id is not None
+                assert not writer.conn.in_transaction
+                # Completion and marker cleanup are separate transactions.
+                assert writer.conn.execute(
+                    "SELECT consolidation_claimed_at FROM working_memory WHERE id = 'late-completion'"
+                ).fetchone()[0] == stale
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=complete)
+        worker.start()
+        worker.join(timeout=30)
+        assert not worker.is_alive(), "summary writer did not finish"
+        if errors:
+            raise errors[0]
+
     def test_reclaim_orphans_respects_stale_threshold(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         old_ts = (datetime.now() - timedelta(hours=200)).isoformat()

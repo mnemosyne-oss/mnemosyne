@@ -8532,7 +8532,8 @@ class BeamMemory:
         if orphans:
             cursor.executemany(
                 "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? "
-                "WHERE id = ? AND consolidated_at = ? AND consolidation_claimed_at = ?",
+                "WHERE id = ? AND consolidated_at = ? AND consolidation_claimed_at = ? "
+                f"AND NOT {_claim_completed_sql('working_memory')}",
                 orphans,
             )
             changed += cursor.rowcount
