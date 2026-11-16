@@ -387,3 +387,24 @@ def test_position_filter_keeps_prefixed_name_in_mentions(tmp_path, monkeypatch, 
         for row in AnnotationStore(db_path=db_path).query_by_kind("mentions", filter_noise=False)
     }
     assert name in values
+
+
+@pytest.mark.parametrize("text, expected", [
+    ('Read the "Guarded  canonical calls" section first.', set()),
+    ('Read the "Guarded\tcanonical calls" section first.', set()),
+    ('“Honestly, I told Maya.”', {"Maya"}),
+    ('I met “Maya” yesterday.', {"Maya"}),
+])
+def test_position_filter_quote_boundaries_reach_mentions(tmp_path, monkeypatch, text, expected):
+    """Quote punctuation and spacing must have the same effects in persisted mentions."""
+    from mnemosyne.core.annotations import AnnotationStore
+
+    monkeypatch.setenv("MNEMOSYNE_ENTITY_POSITION_FILTER", "1")
+    db_path = tmp_path / "quote-boundary.db"
+    memory = Mnemosyne(session_id="quote-boundary", db_path=db_path)
+    memory.remember(text, source="user", extract_entities=True)
+    values = {
+        row["value"]
+        for row in AnnotationStore(db_path=db_path).query_by_kind("mentions", filter_noise=False)
+    }
+    assert values == expected

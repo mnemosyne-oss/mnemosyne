@@ -287,6 +287,46 @@ class TestPositionFilter(unittest.TestCase):
                 extract_entities_regex("I love Maya's cooking."), ["Maya"]
             )
 
+    def test_quoted_phrase_accepts_horizontal_whitespace(self):
+        """Extra spaces or tabs must not turn a quoted heading into a name."""
+        cases = [
+            'Read the "Guarded  canonical calls" section first.',
+            'Read the "Guarded\tcanonical calls" section first.',
+            'Read the “Guarded \t canonical calls” section first.',
+        ]
+        with self._on():
+            for text in cases:
+                with self.subTest(text=text):
+                    self.assertEqual(extract_entities_regex(text), [])
+
+    def test_curly_quoted_sentence_openers_match_straight_quotes(self):
+        """Opening typographic quotes must not hide a sentence boundary."""
+        cases = [
+            '“Honestly, we went out.”',
+            '‘Honestly, we went out.’',
+            '[USER] “Honestly, I told Maya.”',
+            '*I smile.* “Guess it works.”',
+        ]
+        expected = [[], [], ["Maya"], []]
+        with self._on():
+            for text, names in zip(cases, expected):
+                with self.subTest(text=text):
+                    self.assertEqual(extract_entities_regex(text), names)
+
+    def test_quote_whitespace_changes_preserve_names_and_line_boundaries(self):
+        """Quoted names, possessives and lists remain separate from headings."""
+        cases = [
+            ('I met “Maya” yesterday.', ["Maya"]),
+            ('I filed “Maya’s notes” yesterday.', ["Maya"]),
+            ('I met “Alice”, “Maya” and “Priya” yesterday.', ["Alice", "Maya", "Priya"]),
+            ('I read "Maya\narrived today" twice.', ["Maya"]),
+            ('I met “Maya,” yesterday.', ["Maya"]),
+        ]
+        with self._on():
+            for text, expected in cases:
+                with self.subTest(text=text):
+                    self.assertEqual(extract_entities_regex(text), expected)
+
     def test_word_opening_a_quoted_phrase_is_dropped(self):
         with self._on():
             # Title case of a quoted heading.

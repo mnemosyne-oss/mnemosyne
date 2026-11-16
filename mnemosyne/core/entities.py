@@ -174,7 +174,7 @@ _CONTRACTION_TAIL = re.compile(r"['\u2019](?:t|ll|re|ve|d|m)\b", re.IGNORECASE)
 # possessive ("Alice's notes") and a quoted list (['Alice', 'Maya']) keep
 # their names.
 _OPENING_QUOTES = frozenset("\"'\u201c\u2018")
-_LOWERCASE_FOLLOWER = re.compile(r' [a-z]')
+_LOWERCASE_FOLLOWER = re.compile(r'[ \t]+[a-z]')
 
 
 def _position_filter_enabled() -> bool:
@@ -184,7 +184,9 @@ def _position_filter_enabled() -> bool:
 
 def _is_sentence_initial(text: str, pos: int) -> bool:
     i = pos - 1
-    while i >= 0 and (text[i] in " \t" or text[i] in _TRAILING_CLOSERS):
+    while i >= 0 and (
+        text[i] in " \t" or text[i] in _TRAILING_CLOSERS or text[i] in _OPENING_QUOTES
+    ):
         if text[i] == "]" and text[i + 1] in " \t":
             line_start = max(text.rfind("\n", 0, i), text.rfind("\r", 0, i)) + 1
             if _SPEAKER_PREFIX.fullmatch(text, line_start, i + 1):
@@ -358,9 +360,9 @@ def extract_entities_regex(text: str) -> List[str]:
             if len(words) == 1 and entity.isupper():
                 continue
             # Opt-in: drop a single capitalized word capitalized by position.
-            # A name still extracts from any mid-sentence occurrence, from a
-            # multi-word sequence, or with an @/# prefix (those come from the
-            # other patterns, which skip this).
+            # This position rule does not reject mid-sentence names. Other
+            # extraction filters and longer-name merging still apply. Multi-word
+            # sequences and @/# prefixes use other patterns, which skip this.
             if (
                 position_filter
                 and pattern is _SINGLE_CAP_WORD
