@@ -40,9 +40,13 @@ data dir's ``banks/<name>/``, a profile's own storage, a dedicated
 surface directory — and the census must see the same set the measurement
 it maintains a bound for was taken over. The walk is pruned of
 cache/backup/build directories but can still visit unrelated directories
-and SQLite files. Each SQLite lock wait is bounded to 50 ms; this is not
-a deadline for the complete walk or census. Unreadable candidates make
-the reported bound unmeasured rather than silently confirming it.
+and SQLite files. Connections configure a 50 ms SQLite busy timeout for
+busy-handler sleep; separate statements may wait separately. This is not
+a strict wall-clock deadline or an aggregate connection/census budget.
+Unreadable discovered candidates make the reported bound unmeasured.
+Pruned directories, unlistable directories and failed metadata reads can
+exclude candidates without entering the unreadable list, so a holding
+bound does not prove complete coverage of the selected root.
 
 Identity, not labels. Twins are keyed by ABSOLUTE PATH; the ``label``
 field exists only so a human can read the report. This is not cosmetic:
