@@ -281,6 +281,14 @@ _EMBEDDING_ENGINE_UNAVAILABLE_LOCK = threading.Lock()
 def _announce_embedding_engine_unavailable() -> None:
     """Warn once per process when the embedding engine is unavailable."""
     global _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED
+    # Older supported Core releases may not expose configuration diagnostics.
+    try:
+        from mnemosyne.core import embeddings as _startup_embeddings
+        announce = getattr(_startup_embeddings, "announce_runtime_configuration", None)
+        if callable(announce):
+            announce()
+    except Exception:
+        pass  # Diagnostic-only: never consume or suppress the warning below.
     with _EMBEDDING_ENGINE_UNAVAILABLE_LOCK:
         if _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED:
             return
