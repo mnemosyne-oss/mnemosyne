@@ -105,7 +105,8 @@ def census_enabled() -> bool:
         return True
     return raw.strip().lower() not in _FALSY
 
-#: Directory names excluded from discovery to reduce traversal. Mirrors
+#: Child directory names pruned below the selected root to reduce traversal.
+#: The root itself is not excluded by name. Mirrors
 #: the acceptance measurement skip list (``backups``, ``cache``, ``.cache``)
 #: plus the package and metadata directory names listed here. ``build`` is
 #: not included; candidates below it are still inspected.
