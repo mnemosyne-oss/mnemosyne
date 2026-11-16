@@ -3,9 +3,11 @@
 The sleep-time census discovers nonempty `*.db` candidates below the fleet
 root. A candidate is counted as a bank only if it can be read and contains a
 `conflicts` table. Cache, backup and package/build directories on the fixed
-skip list are pruned. Within `state-snapshots`, directories ending in
-`.partial` are also pruned, including when the selected root resolves to a
-`state-snapshots` directory through an alias. Discovery otherwise remains layout-independent: a real
+skip list are pruned. Directories ending in `.partial` are also pruned when
+the selected root resolves to a directory named `state-snapshots` (including
+through an alias), or a directory below the root is named `state-snapshots`.
+A selected root such as `/fleet/state-snapshots/run` does not prune its
+`.partial` children. Discovery otherwise remains layout-independent: a real
 bank does not have to be named `mnemosyne.db` or live in a standard directory.
 
 On current source, each SQLite connection is opened read-only with a 50 ms
@@ -22,10 +24,13 @@ unreadable candidate cannot safely be classified as foreign: it is reported
 under `unreadable` and makes `bound_holds` false. Once the lock is released,
 the next census can classify it and measure the fleet again. Do not interpret
 an incomplete census as proof that no cross-bank twins exist. Discovery itself
-can silently skip unlistable directories and candidates whose file metadata
-cannot be read; these are not recorded under `unreadable`. Together with the
+does not descend into directory symlinks below the root, and can silently skip
+unlistable directories and candidates whose file metadata cannot be read; these are not recorded under `unreadable`. Together with the
 pruned directories, this means `bound_holds=true` describes the discovered,
 readable banks, not proof of complete coverage below the selected root.
+Banks are read sequentially through separate connections, without a shared
+fleet-wide snapshot. Concurrent writes can therefore change the bound between
+observations or before the census finishes.
 
 `MNEMOSYNE_FLEET_ROOT` explicitly selects the census root. Narrow it only when
 that directory contains the complete intended fleet; otherwise the resulting
