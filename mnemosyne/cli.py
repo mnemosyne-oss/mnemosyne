@@ -642,6 +642,7 @@ def cmd_doctor(args):
             db_path,
             scan_limit=scan_limit,
             candidate_limit=sample_limit if include_candidates else 0,
+            runtime_scope="cli_interpreter",
         )
         payload = doctor_report_payload(report, include_candidates=include_candidates)
         json_text = render_doctor_json(payload)

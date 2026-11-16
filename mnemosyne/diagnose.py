@@ -162,6 +162,7 @@ def run_diagnostics(
     bank: str | None = None,
     python_executable: str | None = None,
     db_path: Path | None = None,
+    scope: str = "cli_interpreter",
 ) -> dict:
     """
     Run full diagnostic scan and write PII-safe log.
@@ -178,6 +179,8 @@ def run_diagnostics(
         python_executable: Optional explicit interpreter used for runtime checks.
         db_path: Optional database path selected by a host CLI. When supplied,
             it takes precedence over ambient data-dir overrides.
+        scope: Role of this interpreter when checks run locally. Explicit
+            python_executable checks remain target_interpreter regardless.
     """
     log_path = _log_path()
     if python_executable is not None:
@@ -199,8 +202,8 @@ def run_diagnostics(
 
     # --- Pure runtime/dependency/capability checks (no provider construction) ---
     if python_executable is None:
-        runtime = collect_runtime_diagnostics()
-        runtime_scope = "cli_interpreter"
+        runtime = collect_runtime_diagnostics(scope=scope)
+        runtime_scope = scope
         runtime_executable = Path(sys.executable).name
     else:
         runtime = collect_runtime_diagnostics(python_executable)
@@ -209,8 +212,9 @@ def run_diagnostics(
     for check in runtime["checks"]:
         entry = log(check["category"], check["check"], check["status"], check["detail"])
         entry["scope"] = runtime_scope
-    log("env", "checks_scope", "OK", runtime_scope)
-    log("env", "checks_executable", "OK", runtime_executable)
+    if not any(check["check"] == "checks_scope" for check in runtime["checks"]):
+        log("env", "checks_scope", "OK", runtime_scope)["scope"] = runtime_scope
+    log("env", "checks_executable", "OK", runtime_executable)["scope"] = runtime_scope
 
     # --- Database state ---
     try:

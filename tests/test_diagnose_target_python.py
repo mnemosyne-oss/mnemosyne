@@ -588,5 +588,6 @@ def test_target_probe_timeout_reports_unavailable_without_fallback(monkeypatch, 
     assert result["checks"] == [{
         "category": "runtime", "check": "target_interpreter", "status": "ERROR",
         "detail": "selected interpreter could not run Mnemosyne diagnostics",
+        "scope": "target_interpreter",
     }]
     assert str(tmp_path) not in json.dumps(result)

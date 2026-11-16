@@ -16,6 +16,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
+CALLING_INTERPRETER_SCOPE = "calling_interpreter"
+CLI_INTERPRETER_SCOPE = "cli_interpreter"
+PROVIDER_RUNTIME_SCOPE = "provider_runtime"
+MCP_SERVER_SCOPE = "mcp_server"
+RUNTIME_SCOPES = frozenset({CALLING_INTERPRETER_SCOPE, CLI_INTERPRETER_SCOPE,
+                          PROVIDER_RUNTIME_SCOPE, MCP_SERVER_SCOPE, "target_interpreter"})
+
 
 def resolve_python_executable(python_executable: str) -> str:
     """Resolve PATH names as subprocesses do while preserving explicit paths."""
@@ -82,6 +89,7 @@ def _collect_target_runtime_diagnostics(python_executable: str) -> dict[str, Any
                     "check": "target_interpreter",
                     "status": "ERROR",
                     "detail": "selected interpreter could not run Mnemosyne diagnostics",
+                    "scope": "target_interpreter",
                 }
             ],
             "scope": "target_interpreter",
@@ -101,31 +109,43 @@ def _collect_target_runtime_diagnostics(python_executable: str) -> dict[str, Any
     executable_name = executable_name.replace("\\", "/").rsplit("/", 1)[-1]
     payload["scope"] = "target_interpreter"
     payload["executable"] = executable_name
+    for check in payload["checks"]:
+        check["scope"] = "target_interpreter"
+        if check["check"] == "checks_scope":
+            check["detail"] = "target_interpreter"
     return payload
 
 
-def collect_runtime_diagnostics(python_executable: str | None = None) -> dict[str, Any]:
+def collect_runtime_diagnostics(
+    python_executable: str | None = None, *, scope: str = CALLING_INTERPRETER_SCOPE,
+) -> dict[str, Any]:
     """Run pure runtime, dependency, and capability checks without a provider.
 
     By default, inspect the current interpreter. When ``python_executable`` is
     supplied, resolve PATH names or explicit paths and run checks there with
     Python's isolated mode. An unavailable target never falls back to the
     current interpreter.
+
+    ``scope`` names the local caller's role; it does not discover or authenticate
+    a provider runtime. An explicitly selected target always overrides that role.
     """
 
+    if not isinstance(scope, str) or scope not in RUNTIME_SCOPES - {"target_interpreter"}:
+        raise ValueError("unknown local runtime diagnostics scope")
     if python_executable is not None:
         return _collect_target_runtime_diagnostics(python_executable)
 
     checks: list[dict[str, str]] = []
 
     def add(category: str, check: str, status: str, detail: str = "") -> None:
-        checks.append({"category": category, "check": check, "status": status, "detail": detail})
+        checks.append({"category": category, "check": check, "status": status, "detail": detail, "scope": scope})
 
     add("env", "python_version", "OK", sys.version.split()[0])
     add("env", "platform", "OK", platform.platform())
     # Report only the executable name: an absolute interpreter path can reveal
     # a user's home directory or virtual-environment layout in diagnostics.
     add("env", "python_executable", "OK", Path(sys.executable).name)
+    add("env", "checks_scope", "OK", scope)
 
     try:
         import mnemosyne
@@ -201,4 +221,4 @@ def collect_runtime_diagnostics(python_executable: str | None = None) -> dict[st
 
     statuses = {entry["status"] for entry in checks}
     overall = "unavailable" if "ERROR" in statuses else "warning" if statuses & {"MISSING", "NO"} else "ok"
-    return {"status": overall, "checks": checks}
+    return {"status": overall, "checks": checks, "scope": scope, "executable": Path(sys.executable).name}
