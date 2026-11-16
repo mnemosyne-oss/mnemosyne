@@ -684,6 +684,54 @@ class TestE3AdditiveSleep:
             "SELECT consolidation_claimed_at FROM working_memory WHERE id = 'late-completion'"
         ).fetchone()[0] == stale
 
+    def test_reclaim_rechecks_completion_after_selection(self, temp_db):
+        """A commits on a separate connection after the candidate fetch."""
+        holder, recovery, stale = self._late_completion_claim(temp_db)
+        real_connection = recovery.conn
+        test = self
+        selected = []
+
+        class CursorProxy:
+            def __init__(self, cursor):
+                self.cursor = cursor
+                self.orphan_query = False
+
+            def execute(self, sql, params=()):
+                self.orphan_query = "SELECT wm.id, wm.consolidation_claimed_at AS claim" in sql
+                self.cursor.execute(sql, params)
+                return self
+
+            def fetchall(self):
+                rows = self.cursor.fetchall()
+                if self.orphan_query:
+                    selected.extend(row["id"] for row in rows)
+                    test._complete_stale_claim(holder, stale)
+                return rows
+
+            def __getattr__(self, name):
+                return getattr(self.cursor, name)
+
+        class ConnectionProxy:
+            def cursor(self):
+                return CursorProxy(real_connection.cursor())
+
+            def __getattr__(self, name):
+                return getattr(real_connection, name)
+
+        recovery.conn = ConnectionProxy()
+        try:
+            result = recovery.reclaim_orphans(stale_after_seconds=1)
+        finally:
+            recovery.conn = real_connection
+        assert selected == ["late-completion"]
+        assert result["reclaimed"] == 0
+        assert real_connection.execute(
+            "SELECT consolidated_at, consolidation_claimed_at FROM working_memory WHERE id = 'late-completion'"
+        ).fetchone()[:] == (stale, stale)
+        assert real_connection.execute(
+            "SELECT COUNT(*) FROM episodic_memory WHERE summary_of = 'late-completion'"
+        ).fetchone()[0] == 1
+
     @staticmethod
     def _late_completion_claim(temp_db):
         holder = BeamMemory(session_id="s1", db_path=temp_db)

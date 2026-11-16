@@ -13271,13 +13271,14 @@ class BeamMemory:
         # three regardless of how many candidates there are, so SQLite's
         # variable limit cannot make a large backlog silently unrecoverable.
         cursor.executemany(
-            """
+            f"""
             UPDATE working_memory
             SET consolidated_at = NULL,
                 consolidation_claimed_at = NULL
             WHERE id = ?
               AND consolidated_at IS NOT NULL
               AND consolidation_claimed_at = ?
+              AND NOT {_claim_completed_sql('working_memory')}
             """,
             [(row["id"], row["claim"]) for row in _orphan_rows],
         )
