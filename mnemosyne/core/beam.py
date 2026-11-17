@@ -1285,9 +1285,41 @@ def _episodic_recall_where(
 
 
 # Vector compression: float32 | int8 | bit
-VEC_TYPE = os.environ.get("MNEMOSYNE_VEC_TYPE", "int8").lower()
-if VEC_TYPE not in ("float32", "int8", "bit"):
-    VEC_TYPE = "float32"
+_VALID_VEC_TYPES = ("float32", "int8", "bit")
+
+
+def _resolve_vec_type() -> str:
+    """Resolve the vector compression type (config.yaml > env > default).
+
+    Upstream read ``MNEMOSYNE_VEC_TYPE`` only, so a ``vec_type`` written to
+    config.yaml (``mnemosyne config set vec_type``, ``mnemosyne profile
+    apply``) never reached the vector tables. ``peek`` applies the config
+    layer's documented precedence without creating the file. An unset or
+    blank value resolves to the ``int8`` default; an invalid value falls
+    back to ``float32`` with a warning, matching the historical behavior.
+    """
+    raw = None
+    try:
+        from mnemosyne.core.config import peek
+        raw = peek("vec_type", None)
+    except Exception:
+        raw = None
+    if raw is None or not str(raw).strip():
+        # Blank counts as unset: fall through to the environment, then to
+        # the default.
+        raw = os.environ.get("MNEMOSYNE_VEC_TYPE")
+    if raw is None or not str(raw).strip():
+        return "int8"
+    value = str(raw).strip().lower()
+    if value in _VALID_VEC_TYPES:
+        return value
+    logger.warning("Ignoring invalid vec_type %r; using float32.", raw)
+    return "float32"
+
+
+# Resolved at import, like the upstream snapshot: the vector tables are
+# created with this type, and changing it later still needs a reindex.
+VEC_TYPE = _resolve_vec_type()
 
 
 def _get_connection(db_path: Path = None) -> sqlite3.Connection:

@@ -7,6 +7,10 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`vec_type` is now read from `config.yaml` as well as the environment.** `mnemosyne/core/beam.py` read `MNEMOSYNE_VEC_TYPE` only, so a `vec_type` written to config.yaml (`mnemosyne config set vec_type`, `mnemosyne profile apply`) never reached the vector tables. The value now follows the config layer's documented precedence (`config.yaml > env > default`), resolved at import like before; changing the type of existing vector tables still requires the usual restart plus `mnemosyne reindex`.
+
 ### Added
 - **Advisory offline linear BEAM throughput benchmark (#901).** A fixed synthetic workload on a temporary database reports warm per-call latency, sequential throughput, raw samples and environment/revision metadata as JSON, with compatible same-machine baseline comparisons and a documented retention/interpretation policy. No runtime recall changes or CI timing threshold.
 
