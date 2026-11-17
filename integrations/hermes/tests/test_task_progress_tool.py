@@ -2,10 +2,38 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from mnemosyne_hermes import MnemosyneMemoryProvider
+
+_BOUND = {"profile": "profile_a"}
+
+
+@pytest.fixture(autouse=True)
+def _align_turn_profile(monkeypatch):
+    try:
+        import hermes_constants as _consts
+        monkeypatch.setattr(_consts, "get_hermes_home", lambda: None)
+    except Exception:
+        pass
+    try:
+        import hermes_cli.profiles as _prof
+    except Exception:
+        _prof = None
+    if _prof is None:
+        import sys as _sys
+        import types as _types
+        _cli = _types.ModuleType("hermes_cli")
+        _prof = _types.ModuleType("hermes_cli.profiles")
+        _prof.get_active_profile_name = lambda: _BOUND["profile"]
+        _cli.profiles = _prof
+        monkeypatch.setitem(_sys.modules, "hermes_cli", _cli)
+        monkeypatch.setitem(_sys.modules, "hermes_cli.profiles", _prof)
+    monkeypatch.setattr(_prof, "get_active_profile_name", lambda: _BOUND["profile"])
 
 
 def _provider(tmp_path, profile: str = "profile_a") -> MnemosyneMemoryProvider:
+    _BOUND["profile"] = profile
     provider = MnemosyneMemoryProvider()
     provider.initialize(
         "session-1",

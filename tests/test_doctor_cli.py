@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import os
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import stat
+import types
 
 import pytest
 
@@ -74,6 +77,83 @@ def _tree_snapshot(path: Path) -> tuple[bool, tuple[str, ...]]:
     if not path.exists():
         return False, ()
     return True, tuple(sorted(item.relative_to(path).as_posix() for item in path.rglob("*")))
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("mode", ["default", "both", "json-out", "markdown-out", "json-stdout", "markdown-stdout"])
+def test_doctor_run_cli_windows_directory_sync_capability(tmp_path, monkeypatch, capsys, existing, mode):
+    """Exercise the public CLI, real writer and SQLite under the NT capability."""
+    db_path = tmp_path / "fixture.db"
+    expected_count = _create_fixture_db(db_path)
+    before_hash = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    targets = [tmp_path / "mnemosyne-doctor.json", tmp_path / "mnemosyne-doctor.md"]
+    originals = [b"old json\n", b"old markdown\n"]
+    if existing:
+        for target, original in zip(targets, originals):
+            target.write_bytes(original)
+    events = []
+
+    def unsupported_directory_open(path, flags, *args, **kwargs):
+        if Path(path).is_dir():
+            events.append("directory-open")
+            raise PermissionError(errno.EACCES, "Windows directory open unsupported")
+        return os.open(path, flags, *args, **kwargs)
+
+    def fsync(descriptor):
+        assert stat.S_ISREG(os.fstat(descriptor).st_mode)
+        assert os.fstat(descriptor).st_size > 0
+        events.append("file-fsync")
+        return os.fsync(descriptor)
+
+    simulated_os = types.SimpleNamespace(**vars(os))
+    simulated_os.name = "nt"
+    simulated_os.open = unsupported_directory_open
+    simulated_os.fsync = fsync
+    monkeypatch.setattr(doctor, "os", simulated_os)
+    monkeypatch.chdir(tmp_path)
+    args = ["mnemosyne", "doctor", "--db", str(db_path)]
+    if mode == "both":
+        args += ["--format", "both"]
+    elif mode.endswith("-out"):
+        output_format = mode.removesuffix("-out")
+        target = targets[output_format == "markdown"]
+        args += ["--format", output_format, "--" + mode, str(target)]
+    elif mode.endswith("-stdout"):
+        args += ["--format", mode.removesuffix("-stdout"), "--all"]
+    monkeypatch.setattr(sys, "argv", args)
+    # run_cli's actual entry-point contract is no argv parameter.
+    cli.run_cli()
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    selected = {
+        "default": {0, 1}, "both": {0, 1}, "json-out": {0}, "markdown-out": {1},
+        "json-stdout": set(), "markdown-stdout": set(),
+    }[mode]
+    assert events == ["file-fsync"] * len(selected)
+    for index, target in enumerate(targets):
+        if index in selected:
+            text = target.read_text(encoding="utf-8")
+            if index == 0:
+                assert json.loads(text)["execution"] == {"dry_run": True, "query_only": True, "read_only": True}
+            else:
+                assert "# Mnemosyne Doctor Report" in text
+            assert FIXTURE_SECRET not in text
+            assert FIXTURE_ORDINARY_MEMORY not in text
+        elif existing:
+            assert target.read_bytes() == originals[index]
+        else:
+            assert not target.exists()
+    if mode.endswith("-stdout"):
+        assert FIXTURE_SECRET not in captured.out
+        assert FIXTURE_ORDINARY_MEMORY not in captured.out
+    if mode == "json-stdout":
+        assert json.loads(captured.out)["execution"]["read_only"] is True
+    elif mode == "markdown-stdout":
+        assert "# Mnemosyne Doctor Report" in captured.out
+    assert set(tmp_path.iterdir()) == {db_path} | {p for p in targets if p.exists()}
+    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before_hash
+    with sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == expected_count
 
 
 def test_doctor_cli_writes_safe_both_reports_without_mutating_db(tmp_path):

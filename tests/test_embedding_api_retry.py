@@ -3,6 +3,7 @@
 import io
 import json
 import logging
+import threading
 import urllib.error
 from unittest.mock import patch
 
@@ -20,6 +21,13 @@ def _uncredentialed_embedding_client(monkeypatch):
     monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "")
+    # These tests drive the env aliases. A config.yaml anywhere on the runner
+    # (CI runs the suite with MNEMOSYNE_NO_EMBEDDINGS=1, and the first read
+    # seeds that value into the file) would win over every env change below, so
+    # neutralize the config resolver for this file instead of depending on the
+    # machine having no config.
+    monkeypatch.setattr(embeddings, "_cfg", lambda _key, default=None: default)
+    monkeypatch.setattr(embeddings, "_cfg_bool", lambda _key, default=False: default)
 
 
 @pytest.fixture
@@ -48,6 +56,17 @@ class Response:
 
     def read(self):
         return self.body.read()
+
+
+class StubOpener:
+    """Stands in for the opener a key-bearing embed builds, so the
+    credentialed recovery path can be exercised without network."""
+
+    def __init__(self, response):
+        self._response = response
+
+    def open(self, req, timeout=None):
+        return self._response
 
 
 def test_embed_api_retries_transient_network_failures(monkeypatch):
@@ -498,7 +517,7 @@ def test_hindsight_import_continues_without_vector_when_embedding_raises(monkeyp
 # ---------------------------------------------------------------------------
 
 def test_credentialed_cleartext_policy_error_redacts_url(monkeypatch, caplog):
-    # _EmbeddingPolicyError interpolated the raw endpoint URL, so userinfo and
+    # EmbeddingPolicyError interpolated the raw endpoint URL, so userinfo and
     # query secrets could reach the exception text and the fail-soft consumer
     # logs. Both must carry only the redacted endpoint.
     monkeypatch.setenv(
@@ -507,13 +526,15 @@ def test_credentialed_cleartext_policy_error_redacts_url(monkeypatch, caplog):
     )
     monkeypatch.setenv("MNEMOSYNE_EMBEDDINGS_VIA_API", "1")
     monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_LAST_POLICY_REFUSAL", None)
 
     def _no_request(*args, **kwargs):
         raise AssertionError("no request may be attempted for a cleartext credentialed endpoint")
 
     monkeypatch.setattr(embeddings.urllib.request, "urlopen", _no_request)
     with caplog.at_level(logging.WARNING, logger="mnemosyne.core.embeddings"):
-        with pytest.raises(embeddings._EmbeddingPolicyError) as excinfo:
+        with pytest.raises(embeddings.EmbeddingPolicyError) as excinfo:
             embeddings._embed_api(["private memory content"])
 
     message = str(excinfo.value)
@@ -524,11 +545,13 @@ def test_credentialed_cleartext_policy_error_redacts_url(monkeypatch, caplog):
         assert leaked not in caplog.text
 
 
-def test_credentialed_redirect_policy_error_redacts_target_url():
+def test_credentialed_redirect_policy_error_redacts_target_url(monkeypatch):
     # The redirect refusal echoed the raw Location target, which can carry
     # userinfo or query secrets. It must be redacted before formatting.
     import urllib.request
 
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_LAST_POLICY_REFUSAL", None)
     handler = embeddings._CredentialedNoRedirect()
     request = urllib.request.Request(
         "https://configured.example/v1/embeddings",
@@ -536,7 +559,7 @@ def test_credentialed_redirect_policy_error_redacts_target_url():
     )
     newurl = "http://user:password@attacker.example/embed?token=secret"
 
-    with pytest.raises(embeddings._EmbeddingPolicyError) as excinfo:
+    with pytest.raises(embeddings.EmbeddingPolicyError) as excinfo:
         handler.redirect_request(request, None, 302, "Found", {"Location": newurl}, newurl)
 
     message = str(excinfo.value)
@@ -544,6 +567,223 @@ def test_credentialed_redirect_policy_error_redacts_target_url():
     assert "http://attacker.example/embed" in message
     assert "user:password" not in message
     assert "token=secret" not in message
+
+
+def test_policy_refusal_announces_loudly_once(monkeypatch, caplog):
+    # The fail-loud contract must survive the broad except blocks up the
+    # stack (beam et al. degrade any embedding failure to keyword-only
+    # recall): the refusal logs at ERROR once per refusal kind per process,
+    # then still raises for callers that listen; the status surface keeps
+    # the latest refused endpoint.
+    _api_env(monkeypatch, base_url="http://example.test/v1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_LAST_POLICY_REFUSAL", None)
+
+    with caplog.at_level(logging.ERROR, logger="mnemosyne.core.embeddings"):
+        with pytest.raises(embeddings.EmbeddingPolicyError):
+            embeddings._embed_api(["private memory content"])
+        # A different cleartext endpoint is the same refusal KIND: the
+        # announcement stays once, while the status keeps the latest message.
+        monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "http://other.example/v1")
+        with pytest.raises(embeddings.EmbeddingPolicyError):
+            embeddings._embed_api(["private memory content"])
+
+    assert "other.example" in embeddings.policy_refusal_message()
+    assert caplog.text.count("policy refusal") == 1
+
+
+def test_policy_refusal_state_resets_after_successful_embed(monkeypatch):
+    # _embed_api re-reads the environment per call, so a configuration fixed
+    # mid-process must stop reporting the stale refusal on the status surface.
+    # The recovery runs credentialed (the realistic shape: the key stays and
+    # the URL becomes https), through the opener path a key-bearing embed
+    # actually takes; a garbage response must NOT clear the refusal, only a
+    # validated one may.
+    _api_env(monkeypatch, base_url="http://example.test/v1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_LAST_POLICY_REFUSAL", None)
+
+    with pytest.raises(embeddings.EmbeddingPolicyError):
+        embeddings._embed_api(["anything"])
+    assert embeddings.policy_refusal_message() is not None
+
+    _api_env(monkeypatch, base_url="https://example.test/v1")
+
+    garbage = {"data": [{"embedding": [float("nan")]}]}
+    with patch("urllib.request.build_opener", return_value=StubOpener(Response(garbage))):
+        with pytest.raises(RuntimeError, match="non-finite"):
+            embeddings.embed(["anything"])
+    # The cleartext kind is superseded by the healthy static gate, so the
+    # preserved refusal is asserted on the recorded state itself.
+    assert embeddings._LAST_POLICY_REFUSAL is not None
+
+    data = {"data": [{"embedding": [0.1, 0.2]}]}
+    with patch("urllib.request.build_opener", return_value=StubOpener(Response(data))):
+        vectors = embeddings.embed(["anything"])
+
+    assert vectors is not None and vectors.shape[0] == 1
+    assert embeddings._LAST_POLICY_REFUSAL is None
+    assert embeddings.policy_refusal_message() is None
+
+
+def test_policy_refusal_failed_emit_releases_the_claim(monkeypatch):
+    # A failed announcement must not consume the refusal kind: the next
+    # refusal of the same kind retries the ERROR log instead of staying
+    # silent for the process lifetime.
+    _api_env(monkeypatch, base_url="http://example.test/v1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_LAST_POLICY_REFUSAL", None)
+    attempts = []
+
+    def _flaky_error(fmt, *args):
+        attempts.append("attempt")
+        if len(attempts) == 1:
+            raise OSError("handler broke")
+        attempts[-1] = "ok"
+
+    monkeypatch.setattr(embeddings.logger, "error", _flaky_error)
+    with pytest.raises(embeddings.EmbeddingPolicyError):
+        embeddings._embed_api(["x"])
+    with pytest.raises(embeddings.EmbeddingPolicyError):
+        embeddings._embed_api(["x"])
+
+    assert attempts == ["attempt", "ok"]
+
+
+def test_policy_refusal_derived_statically_without_embed_call(monkeypatch):
+    # doctor and diagnose never embed, so the refusal must be derivable from
+    # configuration alone for their status surfaces to report it; the private
+    # name from released tags keeps working as an alias of the public one.
+    _api_env(monkeypatch, base_url="http://example.test/v1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_LAST_POLICY_REFUSAL", None)
+
+    message = embeddings.policy_refusal_message()
+    assert message is not None
+    assert "http://example.test/v1" in message
+    assert embeddings._EmbeddingPolicyError is embeddings.EmbeddingPolicyError
+
+    _api_env(monkeypatch, base_url="https://example.test/v1")
+    assert embeddings.policy_refusal_message() is None
+
+
+def test_policy_refusal_snapshot_survives_concurrent_clears(monkeypatch):
+    # Regression (review 5480062367): the None check and the tuple unpack
+    # used two reads of _LAST_POLICY_REFUSAL, so a concurrent validated
+    # embed clearing the refusal in between raised TypeError inside a
+    # status read, breaking recall(..., explain=True) with it.
+    _api_env(monkeypatch, base_url="https://example.test/v1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_DEFAULT_MODEL", "openai/text-embedding-3-small")
+    # Seeded through monkeypatch so teardown restores the pre-test value
+    # even though the churner thread writes the global directly.
+    monkeypatch.setattr(
+        embeddings, "_LAST_POLICY_REFUSAL", ("credentialed-redirect", "redirect to attacker.example")
+    )
+
+    stop = threading.Event()
+
+    def _churn():
+        while not stop.is_set():
+            embeddings._LAST_POLICY_REFUSAL = None
+            embeddings._LAST_POLICY_REFUSAL = ("credentialed-redirect", "redirect to attacker.example")
+
+    churner = threading.Thread(target=_churn)
+    churner.start()
+    try:
+        for _ in range(500):
+            message = embeddings.policy_refusal_message()
+            assert message is None or "attacker.example" in message
+    finally:
+        stop.set()
+        churner.join()
+
+
+def test_policy_refusal_silent_when_embeddings_disabled(monkeypatch):
+    # Regression (review 5480062367): with embeddings disabled there is no
+    # active embedding route, so a stale redirect refusal must stop being
+    # reported as ERROR; a malformed flag value keeps the no-throw contract.
+    _api_env(monkeypatch, base_url="https://example.test/v1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_DEFAULT_MODEL", "openai/text-embedding-3-small")
+    monkeypatch.setattr(
+        embeddings, "_LAST_POLICY_REFUSAL", ("credentialed-redirect", "redirect to attacker.example")
+    )
+
+    assert "attacker.example" in embeddings.policy_refusal_message()
+
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    assert embeddings.policy_refusal_message() is None
+
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "maybe")
+    assert embeddings.policy_refusal_message() is None
+
+    monkeypatch.delenv("MNEMOSYNE_NO_EMBEDDINGS", raising=False)
+    assert "attacker.example" in embeddings.policy_refusal_message()
+
+
+def test_policy_refusal_reports_redirect_kind_while_api_route_active(monkeypatch):
+    # A credentialed-redirect refusal has no static signal: it is reported
+    # while the API route stays active, cleared by a validated embed, and
+    # dropped entirely once the configuration can no longer refuse anything.
+    # The refusal is raised through the real handler, not by seeding state,
+    # so the test fails if the raise funnel stops recording the kind.
+    _api_env(monkeypatch, base_url="https://example.test/v1")
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "secret-key")
+    monkeypatch.setattr(embeddings, "_ANNOUNCED_POLICY_REFUSALS", set())
+    monkeypatch.setattr(embeddings, "_LAST_POLICY_REFUSAL", None)
+    monkeypatch.setattr(embeddings, "_DEFAULT_MODEL", "openai/text-embedding-3-small")
+
+    import urllib.request
+
+    handler = embeddings._CredentialedNoRedirect()
+    request = urllib.request.Request(
+        "https://example.test/v1/embeddings",
+        headers={"Authorization": "Bearer secret"},
+    )
+
+    def _refuse_redirect():
+        with pytest.raises(embeddings.EmbeddingPolicyError):
+            handler.redirect_request(
+                request, None, 302, "Found", {}, "https://attacker.example/embed"
+            )
+
+    _refuse_redirect()
+    assert "attacker.example" in embeddings.policy_refusal_message()
+
+    # An invalid response must NOT clear the recorded refusal; the redirect
+    # kind is what the accessor reports, so both sides of the contract are
+    # asserted through it. The credentialed opener path is stubbed, matching
+    # the key-bearing shape that raised the refusal in the first place.
+    garbage = {"data": [{"embedding": [float("nan")]}]}
+    with patch("urllib.request.build_opener", return_value=StubOpener(Response(garbage))):
+        with pytest.raises(RuntimeError, match="non-finite"):
+            embeddings.embed(["anything"])
+    assert "attacker.example" in embeddings.policy_refusal_message()
+
+    data = {"data": [{"embedding": [0.1, 0.2]}]}
+    with patch("urllib.request.build_opener", return_value=StubOpener(Response(data))):
+        vectors = embeddings.embed(["anything"])
+    assert vectors is not None and vectors.shape[0] == 1
+    assert embeddings._LAST_POLICY_REFUSAL is None
+    assert embeddings.policy_refusal_message() is None
+
+    _refuse_redirect()
+    assert "attacker.example" in embeddings.policy_refusal_message()
+
+    # Leaving the API route (local model, opt-in flag and URL dropped) drops
+    # the redirect report: the stale refusal must not be reported against a
+    # configuration that can no longer refuse it.
+    monkeypatch.setattr(embeddings, "_DEFAULT_MODEL", "BAAI/bge-small-en-v1.5")
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDINGS_VIA_API", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_URL", raising=False)
+    assert embeddings.policy_refusal_message() is None
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])

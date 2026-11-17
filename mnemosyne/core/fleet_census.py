@@ -39,8 +39,14 @@ bank directories) is deliberate: bank files live in several layouts — a
 data dir's ``banks/<name>/``, a profile's own storage, a dedicated
 surface directory — and the census must see the same set the measurement
 it maintains a bound for was taken over. The walk is pruned of
-cache/backup/build directories, so its cost tracks the number of bank
-files, not the size of the tree.
+the fixed skip set below, including cache and backups, but can still visit
+build and unrelated directories and SQLite files. Connections configure a 50 ms SQLite busy timeout for
+busy-handler sleep; separate statements may wait separately. This is not
+a strict wall-clock deadline or an aggregate connection/census budget.
+Unreadable discovered candidates make the reported bound unmeasured.
+Pruned directories, unlistable directories and failed metadata reads can
+exclude candidates without entering the unreadable list, so a holding
+bound does not prove complete coverage of the selected root.
 
 Identity, not labels. Twins are keyed by ABSOLUTE PATH; the ``label``
 field exists only so a human can read the report. This is not cosmetic:
@@ -99,10 +105,11 @@ def census_enabled() -> bool:
         return True
     return raw.strip().lower() not in _FALSY
 
-#: Directories that never hold a live bank. Pruned during the walk so the
-#: census stays cheap enough to run on every sleep pass. Mirrors the skip
-#: list the acceptance measurement used (``backups``, ``cache``,
-#: ``.cache``) plus package/build trees that cannot contain a bank.
+#: Child directory names pruned below the selected root to reduce traversal.
+#: The root itself is not excluded by name. Mirrors
+#: the acceptance measurement skip list (``backups``, ``cache``, ``.cache``)
+#: plus the package and metadata directory names listed here. ``build`` is
+#: not included; candidates below it are still inspected.
 _SKIP_DIR_NAMES = frozenset({
     "backups",
     "cache",
@@ -161,13 +168,22 @@ def discover_banks(root: Path) -> List[Path]:
 
     Candidates still have to prove they hold a ``conflicts`` table when
     read; this only spares the reader a connect on obviously-empty files.
+    Snapshot pruning uses the resolved root name, while returned paths
+    preserve the caller's root spelling.
     """
     root = Path(root)
     candidates: List[Path] = []
     if not root.is_dir():
         return candidates
+    root_is_snapshot_tree = root.resolve().name == "state-snapshots"
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIR_NAMES)
+        relative_parts = Path(dirpath).relative_to(root).parts
+        in_snapshot_tree = root_is_snapshot_tree or "state-snapshots" in relative_parts
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in _SKIP_DIR_NAMES
+            and (not in_snapshot_tree or not d.endswith(".partial"))
+        )
         for filename in sorted(filenames):
             if not filename.endswith(".db"):
                 continue
@@ -186,6 +202,11 @@ def _norm_pair(a: str, b: str) -> tuple:
     return (a, b) if a <= b else (b, a)
 
 
+# A foreign SQLite lock must not consume the session-end sleep budget.
+# An unreadable candidate is reported and makes the measured bound fail closed.
+_CENSUS_READ_TIMEOUT = 0.05
+
+
 def _read_bank(bank: Path) -> Optional[Dict[str, Any]]:
     """Read one bank's conflict rows.
 
@@ -195,7 +216,9 @@ def _read_bank(bank: Path) -> Optional[Dict[str, Any]]:
     of aborting the census. The connection is opened ``mode=ro`` — a
     read-only URI that SQLite refuses to write through.
     """
-    connection = sqlite3.connect(f"{bank.as_uri()}?mode=ro", uri=True)
+    connection = sqlite3.connect(
+        f"{bank.as_uri()}?mode=ro", uri=True, timeout=_CENSUS_READ_TIMEOUT
+    )
     try:
         if not connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conflicts'"

@@ -1625,6 +1625,10 @@ class SyncEngine:
                 self.conn.execute(
                     "DELETE FROM memory_embeddings WHERE memory_id = ?", (event.memory_id,)
                 )
+                from mnemosyne.core.beam import BeamMemory
+
+                BeamMemory._delete_derived_memory_rows(self.conn, event.memory_id)
+                BeamMemory._delete_orphaned_legacy_mirror(self.conn, event.memory_id)
             self._state_set(event.memory_id, "", "DELETE", event.event_id, event.timestamp)
             return
 
