@@ -869,8 +869,7 @@ class MediaStore:
 
         ``provider`` and ``provider_model`` are written only when given, unless
         ``replace_provenance`` is true: then both columns take the values passed,
-        and ``None`` clears them. ``remember_media`` uses that so the asset's
-        provenance always names the description behind its current status.
+        and ``None`` clears them.
         """
         status_norm = str(status or "").strip().lower()
         if status_norm not in UNDERSTANDING_STATUSES:
@@ -893,6 +892,30 @@ class MediaStore:
         )
         self.conn.commit()
         return cursor.rowcount > 0
+
+    def _finalize_described_asset(self, asset_id: str, status: str) -> None:
+        """Set status and summarize the provenance of the retained moments."""
+        # One statement keeps the provenance read and status update together.
+        # A scalar subquery with no result assigns NULL to both columns.
+        self.conn.execute(
+            """
+            UPDATE media_assets
+            SET understanding_status = ?,
+                (provider, provider_model) = (
+                    SELECT MIN(provider), MIN(provider_model)
+                    FROM (
+                        SELECT DISTINCT provider, provider_model
+                        FROM media_moments
+                        WHERE media_moments.asset_id = media_assets.asset_id
+                        LIMIT 2
+                    )
+                    HAVING COUNT(*) = 1
+                )
+            WHERE asset_id = ?
+            """,
+            (status, asset_id),
+        )
+        self.conn.commit()
 
     # ------------------------------------------------------------------
     # Moments
@@ -1486,17 +1509,11 @@ def remember_media(
     finally:
         # A constraint error mid-loop must not strand the asset at 'pending' --
         # nothing retries that state, and doctor would not flag it either.
-        # Provenance follows the status: only a description that produced
-        # moments names a provider, and every other outcome clears what an
-        # earlier ingest of the same asset left behind.
-        described = status in ("ok", "partial")
         try:
-            store.set_understanding_status(
-                asset_id, status,
-                provider=getattr(result, "provider", None) if described else None,
-                provider_model=getattr(result, "model", None) if described else None,
-                replace_provenance=True,
-            )
+            if status in ("ok", "partial"):
+                store._finalize_described_asset(asset_id, status)
+            else:
+                store.set_understanding_status(asset_id, status, replace_provenance=True)
         except Exception:
             logger.info("media: could not finalize status for %s", asset_id, exc_info=True)
 

@@ -450,6 +450,41 @@ def test_a_partial_ingest_records_provenance_on_the_asset(beam, tmp_path, enable
     assert (moments[0]["provider"], moments[0]["provider_model"]) == ("stub", "stub/model")
 
 
+@pytest.mark.parametrize("add_new_span", [False, True], ids=["duplicate", "mixed"])
+def test_reingest_attributes_only_retained_moments(beam, tmp_path, enabled, add_new_span):
+    ref = str(_png_file(tmp_path))
+    _provider(DescribeResult(provider="first", model="first/model", moments=[
+        DescribedMoment(kind="caption", text="Original caption"),
+    ]))
+    first = remember_media(beam, ref=ref)
+    assert _asset_provenance(beam, first.asset_id) == ("ok", "first", "first/model")
+
+    second_moments = [DescribedMoment(kind="caption", text="Replacement caption")]
+    if add_new_span:
+        second_moments.append(
+            DescribedMoment(kind="ocr", text="New text", bbox=[0.1, 0.2, 0.3, 0.4])
+        )
+    _provider(DescribeResult(provider="second", model="second/model", moments=second_moments))
+    second = remember_media(beam, ref=ref)
+
+    assert second.asset_id == first.asset_id
+    moments = {row["kind"]: row for row in beam.media.get_moments(first.asset_id)}
+    caption = moments["caption"]
+    assert caption["text"] == "Original caption"
+    assert caption["memory_id"] == first.memory_ids[0]
+    assert (caption["provider"], caption["provider_model"]) == ("first", "first/model")
+    if add_new_span:
+        assert set(moments) == {"caption", "ocr"}
+        assert (moments["ocr"]["provider"], moments["ocr"]["provider_model"]) == (
+            "second", "second/model"
+        )
+        expected = ("ok", None, None)
+    else:
+        assert set(moments) == {"caption"}
+        expected = ("ok", "first", "first/model")
+    assert _asset_provenance(beam, first.asset_id) == expected
+
+
 @pytest.mark.parametrize("second,status", [
     (DescribeResult(provider="stub", model="stub/model", refused=True), "refused"),
     (DescribeResult(provider="stub", model="stub/model"), "unavailable"),
