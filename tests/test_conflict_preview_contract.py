@@ -85,6 +85,13 @@ def test_default_preview_never_calls_model_or_logs_costs(preview_beam, monkeypat
 @pytest.mark.parametrize("response, confirmed, costs", [
     pytest.param(None, 0, 0, id="unavailable"),
     pytest.param(("not JSON", 10, 5), 0, 0, id="malformed"),
+    pytest.param((json.dumps({"is_conflict": "false", "confidence": 0.8}), 10, 5),
+                 0, 0, id="string-verdict"),
+    pytest.param((json.dumps({"is_conflict": True, "confidence": 2.0}), 10, 5),
+                 0, 0, id="out-of-range-confidence"),
+    pytest.param((json.dumps({"is_conflict": True, "confidence": 0.8,
+                             "correct_fact": 123}), 10, 5),
+                 0, 0, id="non-string-correct-fact"),
     pytest.param((json.dumps({"is_conflict": False, "confidence": 0.8}), 10, 5),
                  0, 1, id="negative"),
     pytest.param((json.dumps({"is_conflict": True, "confidence": 0.8}), 10, 5),
