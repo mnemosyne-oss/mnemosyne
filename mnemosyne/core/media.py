@@ -896,20 +896,20 @@ class MediaStore:
     def _finalize_described_asset(self, asset_id: str, status: str) -> None:
         """Set status and summarize the provenance of the retained moments."""
         # One statement keeps the provenance read and status update together.
-        # A scalar subquery with no result assigns NULL to both columns.
+        # Conditional aggregates support SQLite versions before 3.39.
         self.conn.execute(
             """
             UPDATE media_assets
             SET understanding_status = ?,
                 (provider, provider_model) = (
-                    SELECT MIN(provider), MIN(provider_model)
+                    SELECT CASE WHEN COUNT(*) = 1 THEN MIN(provider) END,
+                           CASE WHEN COUNT(*) = 1 THEN MIN(provider_model) END
                     FROM (
                         SELECT DISTINCT provider, provider_model
                         FROM media_moments
                         WHERE media_moments.asset_id = media_assets.asset_id
                         LIMIT 2
                     )
-                    HAVING COUNT(*) = 1
                 )
             WHERE asset_id = ?
             """,

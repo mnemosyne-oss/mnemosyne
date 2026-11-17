@@ -450,21 +450,41 @@ def test_a_partial_ingest_records_provenance_on_the_asset(beam, tmp_path, enable
     assert (moments[0]["provider"], moments[0]["provider_model"]) == ("stub", "stub/model")
 
 
-@pytest.mark.parametrize("add_new_span", [False, True], ids=["duplicate", "mixed"])
-def test_reingest_attributes_only_retained_moments(beam, tmp_path, enabled, add_new_span):
+@pytest.mark.parametrize(
+    "first_pair,second_pair,add_new_span",
+    [
+        (("first", "first/model"), ("second", "second/model"), False),
+        (("first", "first/model"), ("second", "second/model"), True),
+        (("first", "first/model"), ("first", "other/model"), True),
+        (("first", "shared/model"), ("second", "shared/model"), True),
+        ((None, "shared/model"), ("second", "shared/model"), True),
+        (("first", None), ("first", "second/model"), True),
+        ((None, None), ("second", "second/model"), True),
+        (("first", None), ("first", None), True),
+    ],
+    ids=[
+        "duplicate", "mixed", "model-only-change", "provider-only-change",
+        "unknown-provider", "unknown-model", "unknown-pair", "shared-unknown-model",
+    ],
+)
+def test_reingest_attributes_only_retained_moments(
+    beam, tmp_path, enabled, first_pair, second_pair, add_new_span,
+):
     ref = str(_png_file(tmp_path))
-    _provider(DescribeResult(provider="first", model="first/model", moments=[
+    _provider(DescribeResult(provider=first_pair[0], model=first_pair[1], moments=[
         DescribedMoment(kind="caption", text="Original caption"),
     ]))
     first = remember_media(beam, ref=ref)
-    assert _asset_provenance(beam, first.asset_id) == ("ok", "first", "first/model")
+    assert _asset_provenance(beam, first.asset_id) == ("ok", *first_pair)
 
     second_moments = [DescribedMoment(kind="caption", text="Replacement caption")]
     if add_new_span:
         second_moments.append(
             DescribedMoment(kind="ocr", text="New text", bbox=[0.1, 0.2, 0.3, 0.4])
         )
-    _provider(DescribeResult(provider="second", model="second/model", moments=second_moments))
+    _provider(DescribeResult(
+        provider=second_pair[0], model=second_pair[1], moments=second_moments,
+    ))
     second = remember_media(beam, ref=ref)
 
     assert second.asset_id == first.asset_id
@@ -472,17 +492,16 @@ def test_reingest_attributes_only_retained_moments(beam, tmp_path, enabled, add_
     caption = moments["caption"]
     assert caption["text"] == "Original caption"
     assert caption["memory_id"] == first.memory_ids[0]
-    assert (caption["provider"], caption["provider_model"]) == ("first", "first/model")
+    assert (caption["provider"], caption["provider_model"]) == first_pair
+    expected = first_pair
     if add_new_span:
         assert set(moments) == {"caption", "ocr"}
-        assert (moments["ocr"]["provider"], moments["ocr"]["provider_model"]) == (
-            "second", "second/model"
-        )
-        expected = ("ok", None, None)
+        assert (moments["ocr"]["provider"], moments["ocr"]["provider_model"]) == second_pair
+        if first_pair != second_pair:
+            expected = (None, None)
     else:
         assert set(moments) == {"caption"}
-        expected = ("ok", "first", "first/model")
-    assert _asset_provenance(beam, first.asset_id) == expected
+    assert _asset_provenance(beam, first.asset_id) == ("ok", *expected)
 
 
 @pytest.mark.parametrize("second,status", [

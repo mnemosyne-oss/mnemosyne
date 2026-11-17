@@ -139,7 +139,9 @@ CREATE TABLE IF NOT EXISTS media_assets (
 
 `understanding_status` is one of `pending | ok | partial | unavailable | refused`. `unavailable` is rung 4 of the RFC 0002 §3.3 degradation ladder and is a success state.
 
-On `ok` and `partial`, the asset records the provider/model pair only if all retained moments agree on that pair. Fields omitted by the provider stay NULL. Both asset columns are NULL if there are no retained moments or if the retained moments disagree. Re-ingesting a duplicate span does not change its stored provenance. For mixed assets, consult the individual moments. On `unavailable` and `refused`, both asset columns are NULL.
+When `remember_media()` finalizes an ingest as `ok` or `partial`, the asset records the provider/model pair only if all retained moments agree on that pair. Fields omitted by the provider stay NULL. Both asset columns are NULL if there are no retained moments or if the retained moments disagree. Re-ingesting a duplicate span does not change its stored provenance. For mixed assets, consult the individual moments. When `remember_media()` finalizes as `unavailable` or `refused`, it clears both asset columns.
+
+Direct calls to `MediaStore.set_understanding_status()` preserve existing values for omitted provenance fields by default. With `replace_provenance=True`, both fields take the supplied values, and an omitted value clears its column.
 
 `archive_locator` is the opaque handle described in RFC 0004 §2. Mnemosyne never parses it.
 
