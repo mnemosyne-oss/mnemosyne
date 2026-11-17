@@ -139,7 +139,7 @@ CREATE TABLE IF NOT EXISTS media_assets (
 
 `understanding_status` is one of `pending | ok | partial | unavailable | refused`. `unavailable` is rung 4 of the RFC 0002 §3.3 degradation ladder and is a success state.
 
-`provider` and `provider_model` on the asset name the description behind its current `understanding_status`. `remember_media()` writes them together with the final status: on `ok` and `partial` they carry the provider and model of the description that set that status, and on `unavailable` and `refused` both are NULL, so an asset never names a provider that did not describe it.
+`provider` and `provider_model` on the asset name the description behind its current `understanding_status`. `remember_media()` writes them together with the final status: on `ok` and `partial` each column records the corresponding value supplied by the description, or NULL if that value was omitted. On `unavailable` and `refused` both are NULL.
 
 `archive_locator` is the opaque handle described in RFC 0004 §2. Mnemosyne never parses it.
 

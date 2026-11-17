@@ -445,6 +445,9 @@ def test_a_partial_ingest_records_provenance_on_the_asset(beam, tmp_path, enable
     result = remember_media(beam, ref=str(_png_file(tmp_path)))
 
     assert _asset_provenance(beam, result.asset_id) == ("partial", "stub", "stub/model")
+    moments = beam.media.get_moments(result.asset_id)
+    assert len(moments) == 1
+    assert (moments[0]["provider"], moments[0]["provider_model"]) == ("stub", "stub/model")
 
 
 @pytest.mark.parametrize("second,status", [
@@ -472,19 +475,31 @@ def test_no_provider_leaves_no_provenance_on_the_asset(beam, tmp_path):
     assert _asset_provenance(beam, result.asset_id) == ("unavailable", None, None)
 
 
-def test_a_failed_ingest_leaves_no_provenance_on_the_asset(beam, tmp_path, enabled, monkeypatch):
+@pytest.mark.parametrize("reingest", [False, True], ids=["first-ingest", "reingest"])
+def test_a_failed_ingest_leaves_no_provenance_on_the_asset(
+    beam, tmp_path, enabled, monkeypatch, reingest,
+):
+    ref = str(_png_file(tmp_path))
     _provider(_CAPTION)
-    monkeypatch.setattr(
-        media, "_bind_moment_memories",
-        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("constraint error")),
-    )
-    with pytest.raises(RuntimeError):
-        remember_media(beam, ref=str(_png_file(tmp_path)))
+    if reingest:
+        first = remember_media(beam, ref=ref)
+        assert _asset_provenance(beam, first.asset_id) == ("ok", "stub", "stub/model")
+
+    def fail_binding(*args, **kwargs):
+        raise RuntimeError("constraint error")
+
+    monkeypatch.setattr(media, "_bind_moment_memories", fail_binding)
+    with pytest.raises(RuntimeError, match="constraint error"):
+        remember_media(beam, ref=ref)
 
     rows = beam.conn.execute(
-        "SELECT understanding_status, provider, provider_model FROM media_assets"
+        "SELECT asset_id, understanding_status, provider, provider_model FROM media_assets"
     ).fetchall()
-    assert [tuple(r) for r in rows] == [("unavailable", None, None)]
+    assert len(rows) == 1
+    asset_id, status, provider, model = rows[0]
+    if reingest:
+        assert asset_id == first.asset_id
+    assert (status, provider, model) == ("unavailable", None, None)
 
 
 def test_status_is_never_left_pending(beam, tmp_path, enabled, monkeypatch):
