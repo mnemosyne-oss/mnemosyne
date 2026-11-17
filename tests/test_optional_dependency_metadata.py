@@ -20,7 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 # The unconditional cap everywhere except macOS x86_64, and the narrow one that platform gets.
-ONNXRUNTIME_DEFAULT = "onnxruntime>=1.21.0,<1.29; sys_platform != 'darwin' or platform_machine != 'x86_64'"
+ONNXRUNTIME_DEFAULT = "onnxruntime>=1.21.0,!=1.29.*,!=1.30.*; sys_platform != 'darwin' or platform_machine != 'x86_64'"
 ONNXRUNTIME_MACOS_INTEL = "onnxruntime>=1.21.0,<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'"
 ONNXRUNTIME_REQUIREMENTS = (ONNXRUNTIME_DEFAULT, ONNXRUNTIME_MACOS_INTEL)
 EXPECTED_EXTRAS = {"embeddings", "all"}
