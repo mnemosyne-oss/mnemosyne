@@ -261,9 +261,104 @@ except Exception as _persona_import_exc:  # pragma: no cover - graceful import f
         def _with_persona_block(self, base: str) -> str:
             return base
 
-__version__ = "0.7.7"
+__version__ = "0.7.8"
 
 logger = logging.getLogger(__name__)
+
+# Fail-loud contract for the silent-degradation defect measured in production
+# (2026-10-13): when fastembed is missing, every embedding write is skipped by
+# the `if available():` guard and nothing logs, so a gateway can run for weeks
+# with dense/semantic recall off; when only sqlite_vec is missing, writes still
+# happen and native vector indexing is unavailable; a semantic fallback may remain.
+# The provider announces
+# the degraded state once per process at startup, attributing the cause to the
+# actual capability that is unavailable. Never raises and never changes recall
+# behaviour.
+_EMBEDDING_ENGINE_UNAVAILABLE_LOGGED = False
+_EMBEDDING_ENGINE_UNAVAILABLE_LOCK = threading.Lock()
+
+
+def _announce_embedding_engine_unavailable() -> None:
+    """Warn once per process when the embedding engine is unavailable."""
+    global _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED
+    # Older supported Core releases may not expose configuration diagnostics.
+    try:
+        from mnemosyne.core import embeddings as _startup_embeddings
+        announce = getattr(_startup_embeddings, "announce_runtime_configuration", None)
+        if callable(announce):
+            announce()
+    except Exception:
+        pass  # Diagnostic-only: never consume or suppress the warning below.
+    with _EMBEDDING_ENGINE_UNAVAILABLE_LOCK:
+        if _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED:
+            return
+        # Reserve before the (slow) capability detection so a concurrent call
+        # can neither re-run it nor emit a second warning. Released again below
+        # if there is nothing to announce.
+        _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED = True
+    try:
+        from mnemosyne.core import beam as _beam
+        from mnemosyne.core import embeddings as _embeddings
+
+        if _embeddings._is_disabled():
+            logger.warning(
+                "Mnemosyne: embedding engine disabled by configuration or an opt-out "
+                "environment variable "
+                "(MNEMOSYNE_NO_EMBEDDINGS / MNEMOSYNE_SKIP_EMBEDDINGS / "
+                "MNEMOSYNE_EMBEDDINGS_OFF); embedding generation is disabled; "
+                "non-vector recall remains available."
+            )
+            return
+
+        problems = []
+        hints = []
+        generation_available = _embeddings.available()
+        if not generation_available:
+            if _embeddings._is_api_model(_embeddings._DEFAULT_MODEL):
+                # Current Core checks NumPy separately from local FastEmbed.
+                # Older supported Core may not expose that optional probe.
+                ensure_numpy = getattr(_embeddings, "_ensure_api_numpy", None)
+                if callable(ensure_numpy) and not ensure_numpy():
+                    problems.append("NumPy is unavailable for the embedding API backend")
+                    hints.append("install or repair NumPy in the runtime interpreter")
+                else:
+                    problems.append(
+                        "the configured embedding API backend has no usable "
+                        "credentials"
+                    )
+                    hints.append(
+                        "set MNEMOSYNE_EMBEDDING_API_KEY or OPENAI_API_KEY, or "
+                        "point MNEMOSYNE_EMBEDDING_API_URL at a keyless endpoint"
+                    )
+            else:
+                problems.append("missing fastembed (local embedding generation unavailable)")
+        if not _beam._SQLITE_VEC_AVAILABLE:
+            problems.append("missing sqlite_vec (native vector index unavailable)")
+        if not problems:
+            with _EMBEDDING_ENGINE_UNAVAILABLE_LOCK:
+                _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED = False
+            return
+        if any("fastembed" in p or "sqlite_vec" in p for p in problems):
+            hints.append(
+                "make the embeddings extra importable in "
+                "the runtime interpreter that runs this provider"
+            )
+        consequence = (
+            "semantic fallback may remain available via stored vectors and NumPy"
+            if generation_available
+            else "embedding generation is unavailable; non-vector recall remains available"
+        )
+        logger.warning(
+            "Mnemosyne: embedding engine unavailable (%s); %s. Hint: %s.",
+            " and ".join(problems),
+            consequence,
+            "; ".join(hints),
+        )
+    except Exception:
+        # Announcement only: never block provider startup on diagnostics.
+        with _EMBEDDING_ENGINE_UNAVAILABLE_LOCK:
+            _EMBEDDING_ENGINE_UNAVAILABLE_LOGGED = False
+        return
 
 # ---------------------------------------------------------------------------
 # C13: provider-active flag for multi-instance tracking.
@@ -2557,6 +2652,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize Mnemosyne beam for this session."""
+        _announce_embedding_engine_unavailable()
         with self._ensure_beam_access_lock():
             with self._ensure_surface_adapter_lock():
                 previous_ambient = self.__dict__.get("_ambient_key", "default")
@@ -3479,6 +3575,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
         except ValueError as exc:
             return json.dumps({"error": str(exc)})
+        if tool_name == "mnemosyne_batch" and bool(args.get("dry_run", False)):
+            # A preview may inspect an active Beam, never initialize or retry one.
+            with self._ensure_beam_access_lock():
+                return self._handle_batch(args)
         if tool_name == "mnemosyne_sleep" and self._reflect_disabled_for_cron and (self._agent_context or "").strip().lower() == "cron":
             return json.dumps(self._reflection_skip_response("reflect_disabled_for_cron", "tool"))
         try:
@@ -3745,7 +3845,21 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps(batch_validation_error_payload(exc))
 
         if bool(args.get("dry_run", False)):
-            return json.dumps(dry_run_batch(normalized))
+            beam = self._beam
+            if beam is None:
+                return json.dumps({
+                    "status": "error", "error": "preview_unavailable",
+                    "validation": "target_eligibility_snapshot",
+                    "reason_code": getattr(self, "_unavailable_reason_code", "never_initialized"),
+                })
+            # Older cores may still support apply without target-aware preview.
+            try:
+                from mnemosyne.batch_tool import BatchPreviewTarget, snapshot_preview_batch
+            except ImportError:
+                return json.dumps({"status": "error", "error": "preview_unavailable",
+                                   "validation": "target_eligibility_snapshot"})
+            target = BatchPreviewTarget(getattr(beam, "conn", None), getattr(beam, "session_id", None))
+            return json.dumps(snapshot_preview_batch(normalized, target=target))
 
         # Write-approval gate: stage each operation to pending when enabled.
         # validate_batch_operations() normalizes each op to
@@ -5080,6 +5194,32 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _handle_diagnose(self, args: Dict[str, Any]) -> str:
         from mnemosyne.diagnose import run_diagnostics
+        import inspect
+
+        # Feature detection keeps old Core signatures usable; a legacy result
+        # must not claim to have measured the gateway's role explicitly.
+        try:
+            scoped = "scope" in inspect.signature(run_diagnostics).parameters
+        except (TypeError, ValueError):
+            scoped = False
+
+        def collect(**kwargs):
+            if scoped:
+                return run_diagnostics(scope="provider_runtime", **kwargs)
+            result = run_diagnostics(**kwargs)
+            result["runtime_scope"] = "unscoped"
+            # Old Core owns its log: do not rewrite a file it returned. Make
+            # that legacy log's unverified role provenance explicit instead.
+            result["runtime_log_scope"] = "legacy_unverified"
+            for entry in result.get("entries", []):
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("check") == "checks_scope":
+                    entry["detail"] = "unscoped"
+                    entry["scope"] = "unscoped"
+                elif "scope" in entry:
+                    entry["scope"] = "unscoped"
+            return result
         repair_requested = bool(args.get("repair_vec_working", False))
         dry_run = bool(args.get("dry_run", False))
         diagnostic_kwargs: Dict[str, Any] = {
@@ -5089,12 +5229,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if self._profile_isolation_enabled and self._beam is not None:
             diagnostic_kwargs["bank"] = self._resolve_profile_bank()
         if self._beam is None:
-            return json.dumps(run_diagnostics(**diagnostic_kwargs), indent=2, default=str)
+            return json.dumps(collect(**diagnostic_kwargs), indent=2, default=str)
 
         # The active provider bank shares its SQLite database with auto_sleep.
         # Serialize the complete active-bank diagnostic operation (#498).
         with self._ensure_beam_access_lock():
-            result = run_diagnostics(**diagnostic_kwargs)
+            result = collect(**diagnostic_kwargs)
             result["sync_turn"] = self._sync_turn_diagnostics()
 
             active_db = None

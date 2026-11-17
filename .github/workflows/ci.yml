@@ -219,6 +219,13 @@ jobs:
       - name: Run core tests
         run: pytest tests/ -v --tb=short --timeout=900 --timeout-method=thread
 
+      - name: Check published minimum Core compatibility (online)
+        env:
+          MNEMOSYNE_TEST_PUBLISHED_CORE: "1"
+        run: >-
+          pytest tests/test_hermes_core_release_contract.py::test_published_minimum_core_completes_the_provider_lifecycle
+          -v --tb=short --timeout=900 --timeout-method=thread
+
       - name: Run Hermes integration tests
         run: pytest integrations/hermes/tests/ -v --tb=short --timeout=900 --timeout-method=thread
 

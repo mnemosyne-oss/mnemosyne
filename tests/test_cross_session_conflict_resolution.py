@@ -177,8 +177,8 @@ def test_sleep_retirement_guard_excludes_superseded(temp_db, monkeypatch, disabl
 
 
 def test_dry_run_reports_and_does_not_mutate(temp_db, monkeypatch, disable_llm):
-    """Dry run — the default reporting mode of the tool — lists candidates with
-    zero mutation (and, being deterministic, no LLM calls)."""
+    """Default dry run reports aggregate candidate counts without superseding
+    memories or calling the LLM; it does not list individual pairs."""
     monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
     A = BeamMemory(session_id="tA", db_path=temp_db)
     B = BeamMemory(session_id="tB", db_path=temp_db)
@@ -199,10 +199,10 @@ def test_dry_run_reports_and_does_not_mutate(temp_db, monkeypatch, disable_llm):
 
 
 def test_dry_run_llm_eval_switches_llm_without_mutating(temp_db, monkeypatch, disable_llm):
-    """`llm_eval=True` makes a dry run run the LLM gate (previewing exactly what
-    an apply would confirm/decline) while still not mutating. The default dry
-    run stays deterministic (no LLM calls). This closes the dry-run/apply
-    parity gap under LLM detection without changing the deterministic default."""
+    """`llm_eval=True` invokes the validator and reports aggregate preview counts
+    without superseding memories. Validation can record costs; a later apply
+    may observe different state or model responses. The default dry run makes
+    no LLM calls."""
     monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
     import mnemosyne.core.llm_conflict_detector as lcd
     monkeypatch.setattr(lcd, "LLM_CONFLICT_DETECTION_ENABLED", True)
@@ -226,7 +226,7 @@ def test_dry_run_llm_eval_switches_llm_without_mutating(temp_db, monkeypatch, di
     assert res["llm_validations"] == 0 and len(calls) == 0
     assert res["conflicts_resolved"] == 1
 
-    # dry run + llm_eval: LLM consulted (confirms) but nothing mutates
+    # evaluated preview: confirmation counted without superseding memory
     confirmed = C.resolve_cross_session_conflicts(dry_run=True, llm_eval=True)
     assert confirmed["llm_validations"] >= 1
     assert confirmed["conflicts_resolved"] == 1
@@ -235,7 +235,7 @@ def test_dry_run_llm_eval_switches_llm_without_mutating(temp_db, monkeypatch, di
         "SELECT superseded_by FROM working_memory WHERE id = ?", (blue,)).fetchone()
     assert row[0] is None, "llm_eval dry run must not supersede"
 
-    # dry run + llm_eval where the LLM declines: leaks the apply-time veto
+    # evaluated preview with a controlled negative validator result
     C2 = BeamMemory(session_id="tC2", db_path=temp_db)
     C2._detect_conflicts = _stub_detect_pair(blue, green)
     monkeypatch.setattr(lcd, "validate_conflict_pair",

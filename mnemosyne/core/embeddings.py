@@ -17,6 +17,8 @@ import urllib.parse
 import urllib.request
 from typing import List, NoReturn, Optional
 from functools import lru_cache
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from mnemosyne.core.user_agent import application_user_agent
 
@@ -720,9 +722,8 @@ def _env_cap(name: str) -> int:
 
 def _embedding_max_chars() -> int:
     """Resolve the optional per-input character cap at call time (default:
-    disabled). Set MNEMOSYNE_EMBEDDING_MAX_CHARS for local OpenAI-compatible
-    servers (llama.cpp et al.) whose per-slot context window rejects long
-    inputs with HTTP 400, aborting the whole batch; 0 or negative disables."""
+    disabled). Applies to both API and local embedding inputs; 0 or negative
+    disables the cap."""
     return _env_cap("MNEMOSYNE_EMBEDDING_MAX_CHARS")
 
 
@@ -734,18 +735,38 @@ def _embedding_max_bytes() -> int:
     return _env_cap("MNEMOSYNE_EMBEDDING_MAX_BYTES")
 
 
+_CAP_SNAPSHOT: ContextVar[Optional[tuple]] = ContextVar("embedding_cap_snapshot", default=None)
+
+
 def _embedding_caps() -> tuple:
-    """Both caps, as one cache key part for embed_query."""
+    """Both caps, pinned during an enhanced recall or read from current config."""
+    snapshot = _CAP_SNAPSHOT.get()
+    if snapshot is not None:
+        return snapshot
     return (_embedding_max_chars(), _embedding_max_bytes())
 
 
-def _cap_for_api(texts: List[str]) -> List[str]:
-    """Cap each text before the API call when MNEMOSYNE_EMBEDDING_MAX_CHARS
+@contextmanager
+def _embedding_cap_snapshot():
+    """Keep cache identity and embedding inputs on one policy for this call.
+
+    Context-local state keeps overlapping recalls independent; reset on every
+    exit so later calls observe configuration changes, including after errors.
+    """
+    token = _CAP_SNAPSHOT.set(_embedding_caps())
+    try:
+        yield
+    finally:
+        _CAP_SNAPSHOT.reset(token)
+
+
+def _cap_for_api(texts: List[str], caps: Optional[tuple] = None) -> List[str]:
+    """Cap each text before an API or local embedding call when MNEMOSYNE_EMBEDDING_MAX_CHARS
     and/or MNEMOSYNE_EMBEDDING_MAX_BYTES is set. Off by default: characters
     are not a token budget, and silent head-truncation can drop retrieval
     content on endpoints that accept the full text. When enabled, every
     truncation is logged."""
-    limit, byte_limit = _embedding_max_chars(), _embedding_max_bytes()
+    limit, byte_limit = _embedding_caps() if caps is None else caps
     if limit <= 0 and byte_limit <= 0:
         return texts
     capped: List[str] = []
@@ -1024,7 +1045,7 @@ def embed_query(text: str) -> Optional[np.ndarray]:
         return None
     if not text:
         return None
-    # The effective caps are part of the key: _embed_api reads MNEMOSYNE_EMBEDDING_MAX_CHARS / _BYTES at call time, so a
+    # The effective caps are part of the key: embedding calls read MNEMOSYNE_EMBEDDING_MAX_CHARS / _BYTES at call time, so a
     # vector embedded under one cap must not be served after the cap changes (review #1052).
     # The backend is part of the key too: embeddings_via_api or the API URL can change at runtime,
     # and a cached local vector must not be compared against API document vectors.
@@ -1067,7 +1088,7 @@ def _embed_query_cached(
         raise _ConfigChangedDuringQuery
     if model is None:
         return None
-    vectors = list(model.embed([prefixed]))
+    vectors = list(model.embed(_cap_for_api([prefixed], _caps)))
     if not vectors:
         return None
     return vectors[0].astype(np.float32)
@@ -1091,7 +1112,7 @@ def embed(texts: List[str]) -> Optional[np.ndarray]:
     model = _get_model()
     if model is None or model == "api":
         return None
-    vectors = list(model.embed(prefixed))
+    vectors = list(model.embed(_cap_for_api(prefixed)))
     return np.stack(vectors).astype(np.float32)
 
 
@@ -1103,3 +1124,71 @@ def serialize(vec: np.ndarray) -> str:
 # Export dimension for other modules
 EMBEDDING_DIM = _get_embedding_dim(_DEFAULT_MODEL)
 _DEFAULT_MODEL = _DEFAULT_MODEL  # Re-export for beam.py
+
+
+# Configuration diagnostics are independent of the unavailable-engine warning.
+# Report import-time settings as loaded, not as though a later env edit reloaded them.
+_RUNTIME_CONFIGURATION_ANNOUNCED = False
+_RUNTIME_CONFIGURATION_LOCK = threading.Lock()
+try:
+    from mnemosyne.core.config import _default_config_path
+    _CONFIG_FILE_PRESENT_AT_IMPORT = _default_config_path().is_file()
+    _CONFIG_FILE_AT_IMPORT = (
+        "MNEMOSYNE_DATA_DIR/config.yaml" if os.environ.get("MNEMOSYNE_DATA_DIR")
+        else "HERMES_HOME/mnemosyne/config.yaml" if os.environ.get("HERMES_HOME")
+        else "~/.hermes/mnemosyne/config.yaml"
+    )
+except Exception:
+    _CONFIG_FILE_PRESENT_AT_IMPORT = None
+    _CONFIG_FILE_AT_IMPORT = "unknown"
+
+
+def _safe_api_origin(url: str) -> str:
+    """Log only an endpoint's origin, never userinfo, path, query or fragment."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if not parsed.hostname or parsed.scheme not in ("http", "https"):
+            return "<invalid-url>"
+        host = parsed.hostname
+        if ":" in host:
+            host = f"[{host}]"
+        port = parsed.port
+        authority = f"{host}:{port}" if port is not None else host
+        return urllib.parse.urlunsplit((parsed.scheme, authority, "", "", ""))
+    except ValueError:
+        return "<invalid-url>"
+
+
+def announce_runtime_configuration() -> None:
+    """Describe loaded embedding settings once, without testing backend health.
+
+    Model, dimension, credentials and the config-file locator are import-time
+    observations. Backend routing and endpoint resolution remain call-time.
+    File presence does not identify which individual values were explicitly
+    configured or seeded. INFO logging never changes transport or precedence.
+    """
+    global _RUNTIME_CONFIGURATION_ANNOUNCED
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    with _RUNTIME_CONFIGURATION_LOCK:
+        if _RUNTIME_CONFIGURATION_ANNOUNCED:
+            return
+        _RUNTIME_CONFIGURATION_ANNOUNCED = True
+    try:
+        backend = "disabled" if _is_disabled() else (
+            "api" if _is_api_model(_DEFAULT_MODEL) else "local"
+        )
+        endpoint = _safe_api_origin(_effective_base_url()) if backend == "api" else "none"
+        model = str(_DEFAULT_MODEL).replace("\r", " ").replace("\n", " ")[:192]
+        logger.info(
+            "Embedding runtime configuration: backend=%s model=%s dimension=%s "
+            "endpoint=%s credentials_present=%s "
+            "config_file_at_import=%s config_file_present_at_import=%s "
+            "model_dim_credentials=import-time endpoint_resolution=call-time; "
+            "configuration only, not a backend health check",
+            backend, model, EMBEDDING_DIM, endpoint, bool(_OPENAI_API_KEY),
+            _CONFIG_FILE_AT_IMPORT, _CONFIG_FILE_PRESENT_AT_IMPORT,
+        )
+    except Exception:
+        with _RUNTIME_CONFIGURATION_LOCK:
+            _RUNTIME_CONFIGURATION_ANNOUNCED = False

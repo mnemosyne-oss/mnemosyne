@@ -628,6 +628,51 @@ def _clean_output(text: str, *, preserve_bullets: bool = False):
     return text.strip()
 
 
+_CONSOLIDATION_META_RE = re.compile(
+    r"^(?:memories:[ \t]*|summary:[ \t]*|memorandum:[ \t]*|"
+    r"the following (?:memories|text|notes) are concise and brief[.!?:]\s*|"
+    r"here (?:is|are) (?:a |the )?summary[.!?:]\s*|"
+    r"the following (?:memories|text|notes)\s*$)",
+    re.IGNORECASE,
+)
+_CONSOLIDATION_ENUM_RE = re.compile(r"^\s*(?:\d{1,2}[.)]|[-*•])\s+")
+_CONSOLIDATION_INSTRUCTION = (
+    "Distill the following memories into 1-3 concise sentences of plain fact. "
+    "Preserve names, numbers, dates, decisions, preferences, and outcomes. "
+    "Do not address the reader. Do not describe what you are doing. "
+    "Do not restate these instructions. Do not number the sentences. "
+    "Output only the distilled fact."
+)
+_CONSOLIDATION_INSTRUCTION_RE = re.compile(
+    r"^" + r"\s+".join(re.escape(word) for word in _CONSOLIDATION_INSTRUCTION.split()) + r"\s*",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_consolidation_output(text):
+    """Remove recognized consolidation headers while retaining factual sentences.
+
+    In particular, a sentence beginning 'The following memories confirm ...'
+    is not a header. Never scan through arbitrary text to its first decimal
+    point or punctuation mark. Enumeration is stripped only before a known
+    header, leaving factual bullet lists intact.
+    """
+    if not isinstance(text, str):
+        return text
+    cleaned = text.strip()
+    for _ in range(3):
+        before = cleaned
+        candidate = _CONSOLIDATION_ENUM_RE.sub("", cleaned, count=1)
+        if _CONSOLIDATION_META_RE.match(candidate) or _CONSOLIDATION_INSTRUCTION_RE.match(candidate):
+            cleaned = candidate
+        match = _CONSOLIDATION_INSTRUCTION_RE.match(cleaned) or _CONSOLIDATION_META_RE.match(cleaned)
+        if match:
+            cleaned = cleaned[match.end():].lstrip()
+        if cleaned == before:
+            break
+    return cleaned
+
+
 def _estimate_tokens(text: str) -> int:
     """Rough token count: ~4 chars per token for English, with safety margin."""
     return max(1, len(text) // 4)
@@ -975,6 +1020,8 @@ def _summarize_memories(
     # Chunk large memory lists to stay within context window limits.
     # chunk_memories_by_budget() respects LLM_N_CTX and safety margins.
     chunks = chunk_memories_by_budget(memories, source=source)
+    if sum(len(chunk) for chunk in chunks) != len(memories):
+        return None  # Caller must encode all input, including oversized items.
 
     def _summarize_chunk(chunk_memories: List[str], chunk_source: str = ""):
         """Summarize a single chunk of memories via the fallback chain."""
@@ -987,13 +1034,17 @@ def _summarize_memories(
             if _is_invalid_reasoning_output(text):
                 return _INVALID_REASONING_OUTPUT
             if text:
-                return text
+                cleaned = _sanitize_consolidation_output(text)
+                if cleaned:
+                    return cleaned
             raw = _call_local_llm(prompt)
             if raw:
                 cleaned = _clean_output(raw)
                 if _is_invalid_reasoning_output(cleaned):
                     return _INVALID_REASONING_OUTPUT
-                return cleaned if cleaned else None
+                cleaned = _sanitize_consolidation_output(cleaned)
+                if cleaned:
+                    return cleaned
             return None
 
         # 1. Remote API (skip if MNEMOSYNE_FORCE_LOCAL=1 or remote call fails).
@@ -1003,7 +1054,9 @@ def _summarize_memories(
                 cleaned = _clean_output(raw, preserve_bullets=True)
                 if _is_invalid_reasoning_output(cleaned):
                     return _INVALID_REASONING_OUTPUT
-                return cleaned if cleaned else None
+                cleaned = _sanitize_consolidation_output(cleaned)
+                if cleaned:
+                    return cleaned
 
         # 2. Local LLM (llama-cpp-python or ctransformers fallback).
         raw = _call_local_llm(prompt)
@@ -1011,7 +1064,7 @@ def _summarize_memories(
             cleaned = _clean_output(raw)
             if _is_invalid_reasoning_output(cleaned):
                 return _INVALID_REASONING_OUTPUT
-            return cleaned if cleaned else None
+            return _sanitize_consolidation_output(cleaned) or None
         return None
 
     # Summarize each chunk individually.
@@ -1020,8 +1073,9 @@ def _summarize_memories(
         summary = _summarize_chunk(chunk, chunk_source=source)
         if _is_invalid_reasoning_output(summary):
             return _INVALID_REASONING_OUTPUT
-        if summary:
-            chunk_summaries.append(summary)
+        if not summary:
+            return None  # Never publish a subset of the input as a complete summary.
+        chunk_summaries.append(summary)
 
     if not chunk_summaries:
         return None
@@ -1031,7 +1085,7 @@ def _summarize_memories(
         final = _summarize_chunk(chunk_summaries, chunk_source=f"{source} [chunked {len(chunks)} parts]")
         if _is_invalid_reasoning_output(final):
             return _INVALID_REASONING_OUTPUT
-        return final if final else chunk_summaries[0]
+        return final if final else None
 
     return chunk_summaries[0]
 
