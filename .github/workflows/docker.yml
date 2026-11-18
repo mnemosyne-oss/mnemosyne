@@ -1,0 +1,43 @@
+name: Docker checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker-compose.yml
+      - deploy/docker/**
+      - mnemosyne/**
+      - hermes_memory_provider/**
+      - pyproject.toml
+      - setup.py
+      - tests/docker/**
+      - tests/test_docker_*.py
+      - .github/workflows/docker*.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  container:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - name: Install host test tools
+        run: pip install -e '.[test,mcp]' -c deploy/docker/requirements.lock
+      - name: Build checked-out source
+        run: docker build --build-arg VERSION="$(python -c 'from importlib.metadata import version; print(version("mnemosyne-memory"))')" --build-arg REVISION="$GITHUB_SHA" -t mnemosyne-mcp:pr .
+      - name: Verify MCP contract and release gate
+        run: python -m pytest tests/test_docker_shared_mcp.py tests/test_docker_release.py tests/test_docker_acceptance_gates.py tests/test_mcp_streamable_http.py tests/test_multi_agent_identity.py tests/test_s1_mcp_sse_auth.py -q
+      - name: Verify image, Compose, local model, persistence and HTTPS
+        run: python -m pytest tests/docker/test_deployment.py --image mnemosyne-mcp:pr -v
+      - name: Record image size
+        run: docker image inspect mnemosyne-mcp:pr --format 'Image bytes={{.Size}} architecture={{.Architecture}}' >> "$GITHUB_STEP_SUMMARY"

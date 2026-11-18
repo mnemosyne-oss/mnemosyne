@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10"
 resolution-markers = [
     "(python_full_version >= '3.14' and platform_machine != 'x86_64') or (python_full_version >= '3.14' and sys_platform != 'darwin')",
@@ -414,50 +414,15 @@ wheels = [
 
 [[package]]
 name = "fastembed"
-version = "0.7.4"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
-]
-dependencies = [
-    { name = "huggingface-hub" },
-    { name = "loguru" },
-    { name = "mmh3" },
-    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" } },
-    { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple" } },
-    { name = "pillow", version = "11.3.0", source = { registry = "https://pypi.org/simple" } },
-    { name = "py-rust-stemmers" },
-    { name = "requests" },
-    { name = "tokenizers" },
-    { name = "tqdm" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/4c/c2/9c708680de1b54480161e0505f9d6d3d8eb47a1dc1a1f7f3c5106ba355d2/fastembed-0.7.4.tar.gz", hash = "sha256:8b8a4ea860ca295002f4754e8f5820a636e1065a9444959e18d5988d7f27093b", size = 68807, upload-time = "2025-12-05T12:08:10.447Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/10/3b/8da01492bc8b69184257d0c951bf0e77aec8ce110f06d8ce16c6ed9084f7/fastembed-0.7.4-py3-none-any.whl", hash = "sha256:79250a775f70bd6addb0e054204df042b5029ecae501e40e5bbd08e75844ad83", size = 108491, upload-time = "2025-12-05T12:08:09.059Z" },
-]
-
-[[package]]
-name = "fastembed"
 version = "0.8.0"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "(python_full_version >= '3.14' and platform_machine != 'x86_64') or (python_full_version >= '3.14' and sys_platform != 'darwin')",
-    "(python_full_version == '3.13.*' and platform_machine != 'x86_64') or (python_full_version == '3.13.*' and sys_platform != 'darwin')",
-    "python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
-    "(python_full_version == '3.12.*' and platform_machine != 'x86_64') or (python_full_version == '3.12.*' and sys_platform != 'darwin')",
-    "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
-    "(python_full_version == '3.11.*' and platform_machine != 'x86_64') or (python_full_version == '3.11.*' and sys_platform != 'darwin')",
-    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
-    "(python_full_version < '3.11' and platform_machine != 'x86_64') or (python_full_version < '3.11' and sys_platform != 'darwin')",
-    "python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
-]
 dependencies = [
     { name = "huggingface-hub" },
     { name = "loguru" },
     { name = "mmh3" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and python_full_version < '3.14') or (python_full_version >= '3.11' and platform_machine != 'x86_64') or (python_full_version >= '3.11' and sys_platform != 'darwin')" },
-    { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and platform_machine != 'x86_64') or (python_full_version < '3.11' and sys_platform != 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin')" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and python_full_version < '3.14') or (python_full_version >= '3.14' and platform_machine != 'x86_64') or (python_full_version >= '3.14' and sys_platform != 'darwin')" },
+    { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (platform_machine == 'x86_64' and sys_platform == 'darwin')" },
     { name = "onnxruntime", version = "1.25.1", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and platform_machine != 'x86_64') or (python_full_version >= '3.11' and sys_platform != 'darwin')" },
     { name = "pillow", version = "12.2.0", source = { registry = "https://pypi.org/simple" } },
     { name = "py-rust-stemmers" },
@@ -1077,12 +1042,11 @@ all = [
     { name = "anyio" },
     { name = "cryptography" },
     { name = "ctransformers" },
-    { name = "fastembed", version = "0.7.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin'" },
-    { name = "fastembed", version = "0.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14' or platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "fastembed", marker = "python_full_version < '3.14' or platform_machine != 'x86_64' or sys_platform != 'darwin'" },
     { name = "huggingface-hub" },
     { name = "llama-cpp-python" },
     { name = "mcp" },
-    { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and platform_machine != 'x86_64') or (python_full_version < '3.11' and sys_platform != 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin')" },
+    { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (python_full_version >= '3.11' and python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin')" },
     { name = "onnxruntime", version = "1.25.1", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and platform_machine != 'x86_64') or (python_full_version >= '3.11' and sys_platform != 'darwin')" },
     { name = "sqlite-vec" },
 ]
@@ -1095,9 +1059,8 @@ dev = [
     { name = "twine" },
 ]
 embeddings = [
-    { name = "fastembed", version = "0.7.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin'" },
-    { name = "fastembed", version = "0.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14' or platform_machine != 'x86_64' or sys_platform != 'darwin'" },
-    { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and platform_machine != 'x86_64') or (python_full_version < '3.11' and sys_platform != 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin')" },
+    { name = "fastembed", marker = "python_full_version < '3.14' or platform_machine != 'x86_64' or sys_platform != 'darwin'" },
+    { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (python_full_version >= '3.11' and python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin')" },
     { name = "onnxruntime", version = "1.25.1", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and platform_machine != 'x86_64') or (python_full_version >= '3.11' and sys_platform != 'darwin')" },
     { name = "sqlite-vec" },
 ]
@@ -1139,8 +1102,8 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'sync'", specifier = ">=41.0" },
     { name = "ctransformers", marker = "extra == 'all'", specifier = ">=0.2.27" },
     { name = "ctransformers", marker = "extra == 'llm'", specifier = ">=0.2.27" },
-    { name = "fastembed", marker = "extra == 'all'", specifier = ">=0.3.0" },
-    { name = "fastembed", marker = "extra == 'embeddings'", specifier = ">=0.3.0" },
+    { name = "fastembed", marker = "(python_full_version < '3.14' and extra == 'all') or (platform_machine != 'x86_64' and extra == 'all') or (sys_platform != 'darwin' and extra == 'all')", specifier = ">=0.3.0" },
+    { name = "fastembed", marker = "(python_full_version < '3.14' and extra == 'embeddings') or (platform_machine != 'x86_64' and extra == 'embeddings') or (sys_platform != 'darwin' and extra == 'embeddings')", specifier = ">=0.3.0" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'test'", specifier = ">=0.27" },
     { name = "huggingface-hub", marker = "extra == 'all'", specifier = ">=0.20" },
@@ -1149,8 +1112,8 @@ requires-dist = [
     { name = "llama-cpp-python", marker = "extra == 'llm'", specifier = ">=0.2.0" },
     { name = "mcp", marker = "python_full_version >= '3.10' and extra == 'all'", specifier = ">=2.0.0,!=2.1.0" },
     { name = "mcp", marker = "python_full_version >= '3.10' and extra == 'mcp'", specifier = ">=2.0.0,!=2.1.0" },
-    { name = "onnxruntime", marker = "platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'all'", specifier = ">=1.21.0,<1.24" },
-    { name = "onnxruntime", marker = "platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'embeddings'", specifier = ">=1.21.0,<1.24" },
+    { name = "onnxruntime", marker = "python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'all'", specifier = ">=1.21.0,<1.24" },
+    { name = "onnxruntime", marker = "python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'embeddings'", specifier = ">=1.21.0,<1.24" },
     { name = "onnxruntime", marker = "(platform_machine != 'x86_64' and extra == 'all') or (sys_platform != 'darwin' and extra == 'all')" },
     { name = "onnxruntime", marker = "(platform_machine != 'x86_64' and extra == 'embeddings') or (sys_platform != 'darwin' and extra == 'embeddings')" },
     { name = "openclaw", marker = "python_full_version >= '3.10' and extra == 'openclaw'", specifier = ">=0.1.0" },
@@ -1381,7 +1344,6 @@ name = "onnxruntime"
 version = "1.23.2"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.13.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.12.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
     "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
@@ -1391,8 +1353,8 @@ resolution-markers = [
 dependencies = [
     { name = "coloredlogs" },
     { name = "flatbuffers" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or python_full_version >= '3.14'" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' and python_full_version < '3.14' and platform_machine == 'x86_64' and sys_platform == 'darwin'" },
     { name = "packaging" },
     { name = "protobuf" },
     { name = "sympy" },
