@@ -540,3 +540,7 @@ Copyright (c) 2026 Abdias J
 <p align="center">
   <em>"The faintest ink is more powerful than the strongest memory." -- Hermes Trismegistus</em>
 </p>
+
+## Docker self-hosting
+
+For shared MCP memory on a NAS or VPS, see the [Docker deployment guide](deploy/docker/README.md), including direct LAN HTTP, existing reverse proxies and optional Caddy HTTPS. See its verification record for tested platforms and clients.

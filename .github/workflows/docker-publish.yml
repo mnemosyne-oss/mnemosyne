@@ -1,0 +1,82 @@
+# Prepared only. Disabled until release-owner configuration is complete.
+name: Publish Docker image (manual)
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing core release tag (vMAJOR.MINOR.PATCH or prerelease)
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  publish:
+    if: vars.MNEMOSYNE_DOCKER_PUBLISH_ENABLED == 'true' && github.ref == 'refs/heads/main'
+    environment: docker-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      checks: read
+      packages: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+      - name: Resolve trusted release source
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          git show "refs/tags/$RELEASE_TAG:mnemosyne/__init__.py" > /tmp/release-version.py
+          python deploy/docker/validate_release.py "$RELEASE_TAG" --version-file /tmp/release-version.py > /tmp/release.json
+          RELEASE_SHA=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
+          git merge-base --is-ancestor "$RELEASE_SHA" HEAD
+          cp deploy/docker/validate_release.py /tmp/validate-docker-release.py
+          git checkout --detach "$RELEASE_SHA"
+          python /tmp/validate-docker-release.py "$RELEASE_TAG" > /tmp/release.json
+          python - <<'PY'
+          import json, os, subprocess
+          release = json.load(open('/tmp/release.json'))
+          sha = subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()
+          image = 'ghcr.io/mnemosyne-oss/mnemosyne-mcp'
+          tags = [image+':'+release['version'], image+':sha-'+sha]
+          if release['stable']:
+              tags.append(image+':latest')
+          with open(os.environ['GITHUB_ENV'], 'a') as out:
+              out.write('RELEASE_VERSION='+release['version']+'\n')
+              out.write('RELEASE_SHA='+sha+'\n')
+              out.write('IMAGE_TAGS='+','.join(tags)+'\n')
+          PY
+      - name: Require successful native container checks on release source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_SHA/check-runs?per_page=100" > /tmp/docker-checks.json
+          python - <<'PYCHECK'
+          import json
+          checks=json.load(open('/tmp/docker-checks.json'))['check_runs']
+          for name in ['container (ubuntu-24.04)', 'container (ubuntu-24.04-arm)']:
+              matches=[c for c in checks if c['name']==name and c['app']['slug']=='github-actions']
+              latest=max(matches,key=lambda c:c['id']) if matches else None
+              if latest is None or latest['conclusion']!='success':
+                  raise SystemExit('Missing successful release-source check: '+name)
+          PYCHECK
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE_TAGS }}
+          build-args: |
+            VERSION=${{ env.RELEASE_VERSION }}
+            REVISION=${{ env.RELEASE_SHA }}
+          provenance: true
+          sbom: true
