@@ -93,7 +93,7 @@ mnemosyne-browser = "mnemosyne.integrations.memory_browser:main"
 mnemosyne-auto-save = "mnemosyne.integrations.auto_save_openwebui:main"
 
 [tool.setuptools.packages.find]
-exclude = ["tests*", "benchmark*", "_benchmarks*", "scripts*", "docs*", "assets*", "examples*", "integrations*"]
+exclude = ["tests*", "benchmark*", "_benchmarks*", "scripts*", "docs*", "assets*", "examples*", "integrations*", "deploy*"]
 
 [tool.setuptools.package-data]
 hermes_memory_provider = ["plugin.yaml"]

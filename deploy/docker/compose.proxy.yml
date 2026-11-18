@@ -1,0 +1,8 @@
+services:
+  mnemosyne-mcp:
+    ports: !override []
+    networks: [default, proxy]
+networks:
+  proxy:
+    external: true
+    name: ${MNEMOSYNE_PROXY_NETWORK:?set an existing proxy network}

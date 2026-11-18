@@ -1,0 +1,4 @@
+services:
+  mnemosyne-mcp:
+    ports: !override
+      - "${MNEMOSYNE_BIND_IP:?set the server LAN address}:8080:8080"
