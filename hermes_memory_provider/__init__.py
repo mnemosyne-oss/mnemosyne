@@ -4345,7 +4345,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                                 payload.get("veracity"), context="mnemosyne_apply_pending"
                             ),
                             _write_policy=policy,
-                            **self._write_identity_kwargs(),
                         )
                         if memory_id is None:
                             failed.append({"id": pid, "error": "filtered"})
