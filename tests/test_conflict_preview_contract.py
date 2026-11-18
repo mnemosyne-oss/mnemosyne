@@ -61,6 +61,7 @@ def _assert_aggregate(result):
     assert set(result) == {
         "status", "pairs_flagged", "conflicts_resolved", "invalidated",
         "rows_scanned", "llm_validations", "llm_cap_reached", "candidates_truncated",
+        "skipped_cached",
     }
 
 
