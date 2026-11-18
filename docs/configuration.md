@@ -16,6 +16,16 @@ API embedding endpoints require NumPy in the Mnemosyne interpreter, independentl
 
 > **Privacy:** embeddings go to a remote API whenever `MNEMOSYNE_EMBEDDING_API_URL` points at a custom (non-OpenRouter) endpoint, the model name is API-shaped (`openai/*`, `text-embedding*`), or `MNEMOSYNE_EMBEDDINGS_VIA_API` is truthy (the last two are what route on the OpenRouter default; no custom URL set means the OpenRouter default); that service receives the text of your memories and of your recall queries for vectorization. For privacy-sensitive or local-first deployments prefer local embeddings (the `[embeddings]` / `[all]` install profiles).
 
+On Apple Silicon, the `embeddings` and `all` extras require ONNX Runtime
+1.21.0 or newer. Published ONNX Runtime 1.21.0 wheels for CPython 3.10–3.13
+are tagged for macOS 13.0. The inspected CPython 3.11 wheel declares macOS
+**13.3** as the ARM64 runtime minimum in its native libraries, so a resolver
+can accept the wheel on systems older than its binaries support. macOS 12
+has no compatible published ONNX Runtime wheel at this floor. For CPython
+3.14, the available Apple Silicon ONNX Runtime wheels are tagged for macOS
+14.0 or later. Check the deployment target for the ONNX Runtime wheel
+selected for your Python version. [Published ONNX Runtime 1.21.0 wheels](https://pypi.org/project/onnxruntime/1.21.0/#files)
+
 For local FastEmbed inference, importing Mnemosyne sets the process-wide
 `ORT_DISABLE_TELEMETRY` default to `1`. A value set explicitly, including `0`
 to allow ONNX Runtime telemetry, takes precedence. If the host initializes
