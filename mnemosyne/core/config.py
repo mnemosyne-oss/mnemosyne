@@ -365,6 +365,26 @@ def _default_config_path() -> Path:
     return Path.home() / ".hermes" / "mnemosyne" / "config.yaml"
 
 
+def _flatten_yaml(data: Dict, prefix: str = "") -> Dict[str, Any]:
+    """Flatten nested YAML into dot-separated keys.
+
+    Example: {memory: {mnemosyne: {wm_max_items: 5000}}}
+    → {"memory.mnemosyne.wm_max_items": 5000}
+    Also extracts the leaf key: {"wm_max_items": 5000}
+    """
+    flat = {}
+    for key, val in data.items():
+        full_key = f"{prefix}.{key}" if prefix else key
+        if isinstance(val, dict):
+            flat.update(_flatten_yaml(val, full_key))
+        else:
+            flat[full_key] = val
+            # Also store the leaf key (last segment)
+            leaf = key
+            flat.setdefault(leaf, val)
+    return flat
+
+
 @dataclass(frozen=True)
 class BeamRuntimeConfig:
     """Typed runtime settings consumed by Beam on each configuration lookup."""
@@ -538,7 +558,7 @@ class MnemosyneConfig:
                     data = yaml.safe_load(f) or {}
                 # Flatten nested YAML into dot-separated keys, but most
                 # Mnemosyne config is flat key: value. Support both.
-                self._yaml_cache = self._flatten_yaml(data)
+                self._yaml_cache = _flatten_yaml(data)
                 self._yaml_mtime = mtime
                 logger.debug("Loaded config from %s (%d keys)",
                              self._config_path, len(self._yaml_cache))
@@ -546,25 +566,6 @@ class MnemosyneConfig:
                 logger.warning("Failed to load config.yaml: %s", e)
                 self._yaml_cache = {}
                 self._yaml_mtime = 0.0
-
-    def _flatten_yaml(self, data: Dict, prefix: str = "") -> Dict[str, Any]:
-        """Flatten nested YAML into dot-separated keys.
-
-        Example: {memory: {mnemosyne: {wm_max_items: 5000}}}
-        → {"memory.mnemosyne.wm_max_items": 5000}
-        Also extracts the leaf key: {"wm_max_items": 5000}
-        """
-        flat = {}
-        for key, val in data.items():
-            full_key = f"{prefix}.{key}" if prefix else key
-            if isinstance(val, dict):
-                flat.update(self._flatten_yaml(val, full_key))
-            else:
-                flat[full_key] = val
-                # Also store the leaf key (last segment)
-                leaf = key
-                flat.setdefault(leaf, val)
-        return flat
 
     def _maybe_reload(self) -> None:
         """Re-read config.yaml if it changed on disk since last load.
@@ -837,11 +838,9 @@ def get(key: str, default: Any = None) -> Any:
 def peek(key: str, default: Any = None) -> Any:
     """Read one config value without creating or seeding config.yaml.
 
-    Same ``config.yaml > env > default`` precedence as :func:`get`, but a
-    missing file is treated as empty instead of being auto-seeded. Read-only
-    callers (module import paths, doctor, diagnostics) must use this: the
-    seeding side effect of :func:`get` creates a data-tree file, which turns
-    a read into a write.
+    Uses the same YAML key resolution and ``config.yaml > env > default``
+    precedence as :func:`get`. Suitable for import-time lookups because it
+    reads the file directly without initializing the shared config instance.
     """
     path = _default_config_path()
     try:
@@ -855,10 +854,11 @@ def peek(key: str, default: Any = None) -> Any:
 
         try:
             data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            values = _flatten_yaml(data) if isinstance(data, dict) else {}
         except Exception:
-            data = {}
-        if isinstance(data, dict) and key in data:
-            return data[key]
+            values = {}
+        if key in values:
+            return values[key]
     env_var = ENV_VAR_MAP.get(key)
     if env_var:
         val = os.environ.get(env_var)

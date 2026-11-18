@@ -69,6 +69,61 @@ def test_vec_type_yaml_beats_env(tmp_path: Path):
     )
 
 
+@pytest.mark.parametrize(
+    ("yaml_text", "expected"),
+    [
+        ("memory:\n  mnemosyne:\n    vec_type: bit\n", "bit"),
+        ("vec_type: bit\nmemory:\n  mnemosyne:\n    vec_type: int8\n", "int8"),
+    ],
+    ids=["nested-yaml", "duplicate-leaf"],
+)
+def test_nested_vec_type_uses_the_same_keys_as_get(tmp_path, yaml_text, expected):
+    """Startup and runtime configuration agree when nested YAML competes with env."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    config = data_dir / "config.yaml"
+    config.write_text(yaml_text)
+    before = config.stat().st_mtime_ns
+
+    code = (
+        "from mnemosyne.core.beam import VEC_TYPE; "
+        "from mnemosyne.core.config import get, peek; "
+        "print(VEC_TYPE, peek('vec_type'), get('vec_type'))"
+    )
+    values = _vec_type_in_subprocess(
+        tmp_path,
+        {"MNEMOSYNE_DATA_DIR": str(data_dir), "MNEMOSYNE_VEC_TYPE": "float32"},
+        code=code,
+    )
+    assert values.split() == [expected] * 3
+    assert list(data_dir.iterdir()) == [config]
+    assert config.read_text() == yaml_text
+    assert config.stat().st_mtime_ns == before
+
+
+def test_vec_type_default_without_yaml_leaves_data_dir_absent(tmp_path):
+    """Import keeps the int8 default and does not seed a missing config."""
+    data_dir = tmp_path / "missing-data"
+    assert _vec_type_in_subprocess(
+        tmp_path, {"MNEMOSYNE_DATA_DIR": str(data_dir)}
+    ) == "int8"
+    assert not data_dir.exists()
+
+
+def test_vec_type_env_fallback_with_unrelated_yaml(tmp_path):
+    """An unrelated YAML key leaves the env value in effect."""
+    config = tmp_path / "config.yaml"
+    yaml_text = "# retain this file\nwm_max_items: 150\n"
+    config.write_text(yaml_text)
+    before = config.stat().st_mtime_ns
+    assert _vec_type_in_subprocess(
+        tmp_path, {"MNEMOSYNE_DATA_DIR": str(tmp_path), "MNEMOSYNE_VEC_TYPE": "bit"}
+    ) == "bit"
+    assert list(tmp_path.iterdir()) == [config]
+    assert config.read_text() == yaml_text
+    assert config.stat().st_mtime_ns == before
+
+
 def test_vec_type_env_still_applies_without_yaml(tmp_path: Path):
     """The env var keeps working when config.yaml does not set the key."""
     data_dir = tmp_path / "data"
