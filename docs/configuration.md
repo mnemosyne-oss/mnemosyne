@@ -16,6 +16,12 @@ API embedding endpoints require NumPy in the Mnemosyne interpreter, independentl
 
 > **Privacy:** embeddings go to a remote API whenever `MNEMOSYNE_EMBEDDING_API_URL` points at a custom (non-OpenRouter) endpoint, the model name is API-shaped (`openai/*`, `text-embedding*`), or `MNEMOSYNE_EMBEDDINGS_VIA_API` is truthy (the last two are what route on the OpenRouter default; no custom URL set means the OpenRouter default); that service receives the text of your memories and of your recall queries for vectorization. For privacy-sensitive or local-first deployments prefer local embeddings (the `[embeddings]` / `[all]` install profiles).
 
+For local FastEmbed inference, importing Mnemosyne sets the process-wide
+`ORT_DISABLE_TELEMETRY` default to `1`. A value set explicitly, including `0`
+to allow ONNX Runtime telemetry, takes precedence. If the host initializes
+ONNX Runtime before importing Mnemosyne, set the desired value before that
+initialization because changing it later does not affect the initialized runtime.
+
 Changing either input cap changes future query and document embeddings only.
 Existing stored document vectors are not regenerated. [Reindex the affected
 bank](cli-reference.md#health-and-repair) after changing caps when consistent
