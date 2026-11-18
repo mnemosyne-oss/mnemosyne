@@ -124,6 +124,43 @@ def test_vec_type_env_fallback_with_unrelated_yaml(tmp_path):
     assert config.stat().st_mtime_ns == before
 
 
+def test_vec_type_malformed_yaml_falls_back(tmp_path: Path):
+    """Malformed YAML reads as empty; env and the default still apply."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "config.yaml").write_text("vec_type: [\n")
+    env = {"MNEMOSYNE_DATA_DIR": str(data_dir)}
+    assert (
+        _vec_type_in_subprocess(tmp_path, {**env, "MNEMOSYNE_VEC_TYPE": "bit"})
+        == "bit"
+    )
+    assert _vec_type_in_subprocess(tmp_path, env) == "int8"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits cannot deny the owner on Windows")
+def test_vec_type_unreadable_yaml_falls_back(tmp_path: Path):
+    """A config.yaml that exists but cannot be read falls back the same way.
+
+    stat() needs execute permission on the parent, not read on the file, so
+    exists() succeeds and the read_text PermissionError is the path covered
+    here on every Python version.
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    config = data_dir / "config.yaml"
+    config.write_text("vec_type: bit\n")
+    config.chmod(0)
+    env = {"MNEMOSYNE_DATA_DIR": str(data_dir)}
+    try:
+        assert (
+            _vec_type_in_subprocess(tmp_path, {**env, "MNEMOSYNE_VEC_TYPE": "bit"})
+            == "bit"
+        )
+        assert _vec_type_in_subprocess(tmp_path, env) == "int8"
+    finally:
+        config.chmod(0o600)
+
+
 def test_vec_type_env_still_applies_without_yaml(tmp_path: Path):
     """The env var keeps working when config.yaml does not set the key."""
     data_dir = tmp_path / "data"
