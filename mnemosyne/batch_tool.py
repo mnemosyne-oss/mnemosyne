@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
+from datetime import datetime, timezone
+from uuid import uuid4
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -86,11 +89,110 @@ _VALIDATORS: dict[str, Callable[[dict[str, Any], int, str], None]] = {
 
 
 def dry_run_batch(normalized: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return the compatible syntax-only preview, without inspecting a store."""
     return {
         "status": "dry_run",
         "operations_count": len(normalized),
         "results": [_dry_run_result(op) for op in normalized],
     }
+
+
+@dataclass(frozen=True)
+class BatchPreviewTarget:
+    """An already selected store/session and its mutation adapter semantics."""
+
+    conn: Any
+    session_id: str
+    adapter: str = "beam"
+
+
+def preview_unavailable() -> dict[str, Any]:
+    """Fail closed without exposing database paths, contents or SQL errors."""
+    return {"status": "error", "error": "preview_unavailable",
+            "validation": "target_eligibility_snapshot"}
+
+
+def snapshot_preview_batch(
+    normalized: list[dict[str, Any]], *, target: BatchPreviewTarget | None,
+) -> dict[str, Any]:
+    """Inspect target eligibility in one read snapshot, never simulate writes.
+
+    No mutator, initializer, audit hook, approval or embedding work runs here.
+    Each operation sees the same current state, not effects of preceding ones.
+    Eligibility is not a promise of policy admission or later apply success.
+    Caller-owned transactions remain owned by the caller.
+    """
+    if (target is None or target.adapter not in {"beam", "wrapper"}
+            or not isinstance(target.session_id, str) or not target.session_id):
+        return preview_unavailable()
+    conn = target.conn
+    savepoint = "batch_preview_" + uuid4().hex
+    started = False
+    try:
+        conn.execute(f"SAVEPOINT {savepoint}")
+        started = True
+        required = {
+            "working_memory": {"id", "session_id", "scope", "valid_until", "superseded_by"},
+            "episodic_memory": {"id", "session_id", "scope", "valid_until", "superseded_by"},
+        }
+        if target.adapter == "wrapper":
+            required["memories"] = {"id", "session_id"}
+        for table, columns in required.items():
+            actual = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if not columns <= actual:
+                raise ValueError("incompatible preview target")
+        now = datetime.now(timezone.utc).isoformat()
+
+        def visible(table, memory_id, *, active=False):
+            predicate = "id=? AND (session_id=? OR scope='global')"
+            params = [memory_id, target.session_id]
+            if active:
+                predicate += " AND superseded_by IS NULL AND (valid_until IS NULL OR julianday(valid_until)>julianday(?))"
+                params.append(now)
+            return conn.execute(f"SELECT 1 FROM {table} WHERE {predicate} LIMIT 1", params).fetchone() is not None
+
+        results = []
+        for op in normalized:
+            result = _dry_run_result(op)
+            action = op["action"]
+            if action == "remember":
+                results.append(result)
+                continue
+            memory_id = str(op["payload"]["memory_id"]).strip()
+            result["memory_id"] = memory_id
+            replacement = op["payload"].get("replacement_id") or None
+            active = action == "invalidate" and bool(replacement)
+            working = visible("working_memory", memory_id, active=active)
+            if action == "update":
+                eligible = working
+                if not eligible and target.adapter == "wrapper":
+                    eligible = conn.execute(
+                        "SELECT 1 FROM memories WHERE id=? AND session_id=? LIMIT 1",
+                        (memory_id, target.session_id),
+                    ).fetchone() is not None
+            else:
+                eligible = working or visible("episodic_memory", memory_id, active=active)
+            if active:
+                eligible = eligible and replacement != memory_id and (
+                    visible("working_memory", replacement, active=True)
+                    or visible("episodic_memory", replacement, active=True)
+                )
+            if not eligible:
+                result["status"] = "not_found"
+            results.append(result)
+        conn.execute(f"RELEASE {savepoint}")
+        started = False
+        return {"status": "dry_run", "validation": "target_eligibility_snapshot",
+                "operations_count": len(normalized), "results": results}
+    except (sqlite3.Error, ValueError, TypeError, AttributeError):
+        return preview_unavailable()
+    finally:
+        if started:
+            try:
+                conn.execute(f"ROLLBACK TO {savepoint}")
+                conn.execute(f"RELEASE {savepoint}")
+            except sqlite3.Error:
+                pass
 
 
 def _safe_batch_context(index: Any, action: Any) -> tuple[int | None, str | None]:

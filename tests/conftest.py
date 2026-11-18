@@ -20,6 +20,29 @@ os.environ.pop("MNEMOSYNE_RECALL_CONTENT_CAP", None)
 
 import pytest
 
+# File loading keeps this shared harness independent of the repository's
+# plugin __init__.py, even when the checkout itself is named "mnemosyne".
+import runpy
+from pathlib import Path
+
+_isolation = runpy.run_path(str(Path(__file__).with_name("_config_isolation.py")))
+pytest_configure = _isolation["pytest_configure"]
+_isolated_mnemosyne_config = _isolation["_isolated_mnemosyne_config"]
+
+
+@pytest.fixture(autouse=True)
+def _clear_extraction_cache():
+    """Extraction memo is process-global; isolate every test from it.
+
+    The memo in mnemosyne.core.extraction is keyed on content, so one
+    test's extraction would otherwise satisfy a later test's identical
+    content and the second test would never reach the LLM boundary.
+    """
+    from mnemosyne.core.extraction import _EXTRACT_CACHE
+    _EXTRACT_CACHE.clear()
+    yield
+    _EXTRACT_CACHE.clear()
+
 
 def _close_cached_connections():
     """Close and reset thread-local SQLite connection caches in both modules."""
@@ -48,6 +71,7 @@ def _close_cached_connections():
         from mnemosyne.core import memory as _mem_mod
         _mem_mod._default_instance = None
         _mem_mod._default_bank = "default"
+        _mem_mod._per_call_instance = None
     except Exception:
         pass
 
@@ -108,7 +132,7 @@ def _close_cached_connections():
 
 
 @pytest.fixture
-def _before_connection_reset():
+def _before_connection_reset(_isolated_mnemosyne_config):
     """Overridable hook for setup that must precede connection imports."""
 
 

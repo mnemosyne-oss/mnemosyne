@@ -60,6 +60,63 @@ def _recall_id_batches(conn, ids, reserved=0):
         yield distinct[start:start + size]
 
 
+class _SleepClaimLost(Exception):
+    """sleep() no longer owns the claim on rows it was about to summarize."""
+
+
+# A claim older than this is a candidate for recovery. The age is only a
+# trigger: the recovery itself hands the claim over with a compare-and-swap on
+# the exact stamp it observed, and every claim holder re-checks that stamp at
+# its summary-write and claim-clear boundaries, so a slow-but-alive holder
+# loses ownership cleanly instead of racing the new one.
+_ORPHAN_STALE_AFTER_S = 3600
+
+
+def _orphan_cutoff() -> str:
+    """Naive-UTC ISO cutoff: claims older than this may be recovered."""
+    return (
+        datetime.now(timezone.utc).replace(tzinfo=None)
+        - timedelta(seconds=_ORPHAN_STALE_AFTER_S)
+    ).isoformat()
+
+
+def _claim_completed_sql(alias: str) -> str:
+    """SQL predicate: a summary completed THIS claim of working row ``alias``.
+
+    A summary that merely references the row id is not enough: a row can be
+    summarized, refreshed by remember() (which clears both markers) and claimed
+    again, leaving an older summary that names the same id. Completion evidence
+    is a summary written at or after the current claim stamp. The contract is
+    deliberately conservative and second-granular:
+
+    - ``created_at`` is compared at second resolution, so a summary written in
+      the same second as the claim counts as complete (the safe direction --
+      never a second summary).
+    - A summary with ``created_at`` NULL also counts as complete.
+
+    Consequence: a row summarized and refreshed within the same second and then
+    re-claimed, whose new claim is later interrupted, is not auto-recovered --
+    the earlier same-second summary still names it, and a second summary is
+    never written. Making completion evidence identify the claim (a claim id on
+    the summary row) is the only fix and is out of scope here.
+    """
+    return (
+        "EXISTS (SELECT 1 FROM episodic_memory em "
+        f"WHERE instr(',' || COALESCE(em.summary_of, '') || ',', ',' || {alias}.id || ',') > 0 "
+        "AND (em.created_at IS NULL "
+        f"OR datetime(em.created_at) >= datetime({alias}.consolidation_claimed_at)))"
+    )
+
+
+# Rows sleep() may take: never-consolidated rows, plus rows whose claim is
+# stale and has no summary completing it. One bind parameter: the orphan cutoff.
+_SLEEP_ELIGIBLE_SQL = (
+    "(consolidated_at IS NULL OR ("
+    "consolidation_claimed_at IS NOT NULL AND consolidation_claimed_at < ? "
+    f"AND NOT {_claim_completed_sql('working_memory')}))"
+)
+
+
 def _select_recall_rows_by_ids(conn, sql, ids, params=(), *, key="id"):
     """Load an IN lookup without dropping filters or truncating its candidates.
 
@@ -1189,6 +1246,10 @@ def _polyphonic_scope_where(
     channel_id: Optional[str] = None,
     veracity: Optional[str] = None,
     memory_type: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    source: Optional[str] = None,
+    topic: Optional[str] = None,
 ) -> Tuple[str, List[Any]]:
     """Scope predicate the polyphonic voices apply before their own limits.
 
@@ -1196,8 +1257,9 @@ def _polyphonic_scope_where(
     keeps rows whose session_id is NULL (import writes NULL when an export
     carries one), so those rows are let through here too. The exact author,
     channel, veracity and memory_type filters match the post-filter's
-    equality checks. The date filters stay post-filter only: the post-filter
-    and SQL disagree on date-only timestamps.
+    equality checks. Date comparisons use the post-filter's string bounds,
+    including date-only timestamps and its empty-string treatment of NULL.
+    Source and topic are separate exact matches, just like the post-filter.
     """
     clause, params = _recall_scope_where(
         session_id=session_id, cross_session=cross_session,
@@ -1208,10 +1270,17 @@ def _polyphonic_scope_where(
     clauses = [clause]
     for column, value in (("author_id", author_id), ("author_type", author_type),
                           ("channel_id", channel_id), ("veracity", veracity),
-                          ("memory_type", memory_type)):
+                          ("memory_type", memory_type), ("source", source),
+                          ("source", topic)):
         if value:
             clauses.append(f"{column} = ?")
             params.append(value)
+    if from_date:
+        clauses.append("COALESCE(timestamp, '') >= ?")
+        params.append(from_date)
+    if to_date:
+        clauses.append("COALESCE(timestamp, '') <= ?")
+        params.append(f"{to_date}T23:59:59")
     return " AND ".join(clauses), params
 
 
@@ -3079,7 +3148,20 @@ def _recency_decay(timestamp_str: str, halflife_hours: float = RECENCY_HALFLIFE_
     try:
         ts = _parse_iso_datetime_utc(timestamp_str)
         age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
-        return math.exp(-age_hours / halflife_hours)
+        # A stored timestamp can never be in the future, so the age cannot be negative and the
+        # factor cannot exceed 1.0. It can nonetheless *compute* above 1.0: pre-round-4 producers
+        # stamped naive LOCAL wall time (see the producer-contract note above
+        # ``_parse_iso_datetime_utc``), and those rows are read as UTC, which shifts them by the
+        # host offset — on a host with a POSITIVE offset that places them `utcoffset` hours in the
+        # future (measured 1.055 at UTC+9). A negative offset does not produce a bonus; it makes
+        # the row read older and is penalised twice. decay feeds the score as a multiplier, so
+        # >1.0 silently *rewards* a row for being misdated.
+        #
+        # Clamp the AGE, not the result: `math.exp` overflows to OverflowError once the exponent
+        # passes ~709, and a far-future timestamp would then fall into the handler below and
+        # report the neutral 0.5 instead of 1.0. max(age, 0) saturates exactly at 1.0 and cannot
+        # overflow, for any halflife.
+        return math.exp(-max(age_hours, 0.0) / halflife_hours)
     except Exception:
         return 0.5
 
@@ -4451,9 +4533,9 @@ def _backfill_vec_working_from_memory_embeddings(conn: sqlite3.Connection) -> in
         WHERE vw.rowid IS NULL
     """).fetchall()
     inserted = 0
-    for row in rows:
-        embedding = json.loads(row["embedding_json"])
-        _vec_table_insert(conn, "vec_working", int(row["rowid"]), embedding)
+    for _wm_id, wm_rowid, embedding_json in rows:
+        embedding = json.loads(embedding_json)
+        _vec_table_insert(conn, "vec_working", int(wm_rowid), embedding)
         inserted += 1
     return inserted
 
@@ -4676,6 +4758,34 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     if batch_size <= 0:
         raise ValueError("batch_size must be a positive integer")
 
+
+    # Standalone callers may pass a bare sqlite3.connect() connection whose
+    # default row_factory yields plain tuples; the row reads below index by
+    # column name, so the rebuild runs on a sqlite3.Row connection and the
+    # caller's own factory is restored for progress callbacks and on every
+    # exit path afterwards. Callbacks may query this same connection.
+    _caller_row_factory = getattr(conn, "row_factory", None)
+    _caller_progress = progress
+    if _caller_progress is not None:
+        def progress(*args):
+            conn.row_factory = _caller_row_factory
+            try:
+                return _caller_progress(*args)
+            finally:
+                conn.row_factory = sqlite3.Row
+
+    conn.row_factory = sqlite3.Row
+    try:
+        return _reindex_vectors_impl(conn, batch_size=batch_size, dry_run=dry_run,
+                                     progress=progress)
+    finally:
+        try:
+            conn.row_factory = _caller_row_factory
+        except (AttributeError, sqlite3.ProgrammingError):
+            pass
+
+
+def _reindex_vectors_impl(conn, *, batch_size, dry_run, progress):
     target_dim = int(_embeddings.EMBEDDING_DIM)
     vec_type = _effective_vec_type(conn)
     vec_ok = _vec_available(conn)
@@ -5545,23 +5655,29 @@ def _ngrams(s: str, n: int = 3) -> set:
     return {s[i:i + n] for i in range(len(s) - n + 1)}
 
 
+def _normalize_cyrillic_text(text: str) -> str:
+    """Fold case and optional Russian ё spelling for fallback matching only."""
+    return text.lower().replace("ё", "е")
+
+
 def _cyrillic_score(query: str, content: str, n: int = 3) -> float:
     """Trigram Jaccard score in [0, 1] for Russian/Cyrillic recall.
 
     For each query word, find the best-matching content word by Jaccard
     similarity of their character n-gram sets. Return the mean across
     query words. Words shorter than 3 characters are ignored to avoid
-    noisy matches on stop words and punctuation.
+    noisy matches on stop words and punctuation. Case and ё/е spelling
+    are folded before extracting n-grams; stored content is unchanged.
 
     N-gram sets are computed once per unique word and cached in a dict
     to avoid redundant recomputation when the same content word is
     compared against multiple query words.
     """
     q_words = [
-        w for w in re.findall(r"[а-яёa-z0-9]+", query.lower()) if len(w) >= 3
+        w for w in re.findall(r"[а-яёa-z0-9]+", _normalize_cyrillic_text(query)) if len(w) >= 3
     ]
     c_words = [
-        w for w in re.findall(r"[а-яёa-z0-9]+", content.lower()) if len(w) >= 3
+        w for w in re.findall(r"[а-яёa-z0-9]+", _normalize_cyrillic_text(content)) if len(w) >= 3
     ]
     if not q_words or not c_words:
         return 0.0
@@ -5599,8 +5715,10 @@ def _cyrillic_like_search(
     receive comparable scores regardless of which surface form appears
     in the stored text.
 
-    The candidate-generation LIMIT is ``k * 5`` to keep the Python-side
-    scoring bounded; this matches the CJK fallback's behaviour.
+    Python scoring is bounded to ``k * 5`` candidates. Original-prefix
+    matches get half the pool first, and folded-only matches get the
+    remaining slots. Extra original-prefix matches fill any space left.
+    Both groups use a stable identifier order.
     """
     if not _has_cyrillic(query):
         return []
@@ -5611,10 +5729,17 @@ def _cyrillic_like_search(
 
     # SQLite's default LOWER() and LIKE are ASCII-only, so they cannot
     # case-fold Cyrillic letters (Т ≠ т, Ё ≠ ё). Register a Python
-    # UDF on the connection that performs a real Unicode lower(). It
-    # is safe to register the same name multiple times — SQLite will
-    # overwrite the previous function with the same name and arity.
-    conn.create_function("_py_lower", 1, lambda s: s.lower() if isinstance(s, str) else s)
+    # UDF for Unicode case-folding and ё/е normalization, matching the
+    # scorer. Without the spelling fold here, candidates are lost before
+    # re-ranking. Re-registering the same name and arity is safe.
+    conn.create_function(
+        "_py_cyrillic_normalize", 1,
+        lambda s: _normalize_cyrillic_text(s) if isinstance(s, str) else s,
+    )
+    conn.create_function(
+        "_py_cyrillic_lower", 1,
+        lambda s: s.lower() if isinstance(s, str) else s,
+    )
 
     # Use a 4-character prefix for LIKE matching. Query words and
     # stored content are inflected forms of the same lemma (тёмная
@@ -5622,23 +5747,42 @@ def _cyrillic_like_search(
     # over-selector that still prunes the candidate set down to a
     # trigram-scoring-sized slice.
     q_words = [
-        w for w in re.findall(r"[а-яёa-z0-9]+", query.lower()) if len(w) >= 4
+        w for w in re.findall(r"[а-яёa-z0-9]+", _normalize_cyrillic_text(query)) if len(w) >= 4
     ]
     if not q_words:
         return []
 
-    conditions = " OR ".join(
-        ["_py_lower(content) LIKE ? ESCAPE '\\'"] * len(q_words)
+    original_words = [
+        w for w in re.findall(r"[а-яёa-z0-9]+", query.lower()) if len(w) >= 4
+    ]
+    budget = k * 5
+    if budget <= 0:
+        return []
+    original_conditions = " OR ".join(
+        ["_py_cyrillic_lower(content) LIKE ? ESCAPE '\\'"] * len(original_words)
     )
-    params = [f"%{w[:4].lower()}%" for w in q_words]
+    folded_conditions = " OR ".join(
+        ["_py_cyrillic_normalize(content) LIKE ? ESCAPE '\\'"] * len(q_words)
+    )
+    original_params = [f"%{w[:4]}%" for w in original_words]
+    folded_params = [f"%{w[:4]}%" for w in q_words]
     try:
-        all_rows = conn.execute(
-            f"SELECT {id_col}, content FROM {table} WHERE {conditions} LIMIT ?",
-            params + [k * 5],
+        original_rows = conn.execute(
+            f"SELECT {id_col}, content FROM {table} WHERE {original_conditions}"
+            f" ORDER BY {id_col} LIMIT ?",
+            original_params + [budget],
+        ).fetchall()
+        original_count = min(len(original_rows), budget // 2)
+        variant_rows = conn.execute(
+            f"SELECT {id_col}, content FROM {table} WHERE ({folded_conditions})"
+            f" AND NOT ({original_conditions}) ORDER BY {id_col} LIMIT ?",
+            folded_params + original_params + [budget - original_count],
         ).fetchall()
     except Exception:
         return []
 
+    remaining = budget - len(variant_rows)
+    all_rows = original_rows[:original_count] + variant_rows + original_rows[original_count:remaining]
     if not all_rows:
         return []
 
@@ -5788,7 +5932,124 @@ def _fts_search(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]
     return rows
 
 
-def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> List[Dict]:
+_CJK_SUPPLEMENT_CAP = 16
+_CJK_SUPPLEMENT_RAW_LIMIT = 257
+_CJK_SUPPLEMENT_HEAD_ROWS = 384
+_CJK_SUPPLEMENT_TAIL_ROWS = 128
+_CJK_SUPPLEMENT_MAX_PAIRS = 32
+_CJK_SUPPLEMENT_MAX_RUNS = 4
+
+
+def _cjk_supplement_seen_ids(conn, query, rows, k, terms):
+    """Return all raw FTS IDs, or decline a saturated raw pool."""
+    seen = {row["id"] for row in rows}
+    precise_terms = _fts_precise_terms(query) if len(rows) < k else None
+    if precise_terms is not None and (not precise_terms or precise_terms == terms):
+        return seen
+    raw = conn.execute(
+        "SELECT id FROM fts_working WHERE fts_working MATCH ? LIMIT ?",
+        (" OR ".join(terms), _CJK_SUPPLEMENT_RAW_LIMIT),
+    ).fetchall()
+    if len(raw) == _CJK_SUPPLEMENT_RAW_LIMIT:
+        return None
+    seen.update(row["id"] for row in raw)
+    return seen
+
+
+def _cjk_supplement_candidates(conn, groups, where_sql=None, where_params=()):
+    """Fetch bounded pair matches passing the caller's working-memory filters."""
+    sql_groups = sorted(groups, key=len)
+    predicate = " AND ".join(
+        "(" + " OR ".join("instr(content, ?)" for _ in group) + ")"
+        for group in sql_groups
+    )
+    patterns = tuple(pair for group in sql_groups for pair in group)
+    visibility = f" AND ({where_sql})" if where_sql else ""
+    params = (*patterns, *where_params) if where_sql else patterns
+    getlimit = getattr(conn, "getlimit", None)
+    limit = getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) if callable(getlimit) else 999
+    filter_pairs_in_python = len(params) > limit
+    if filter_pairs_in_python:
+        # Keep visibility in SQL and evaluate only the pair predicate locally.
+        # The rowid windows still bound this fallback to at most 512 rows.
+        predicate = "1"
+        params = params[len(patterns):]
+    rows = conn.execute(
+        "WITH bounds AS (SELECT coalesce((SELECT rowid FROM working_memory"
+        f" ORDER BY rowid LIMIT 1 OFFSET {_CJK_SUPPLEMENT_HEAD_ROWS - 1}),"
+        "9223372036854775807) AS head,"
+        " (SELECT rowid FROM working_memory ORDER BY rowid DESC LIMIT 1"
+        f" OFFSET {_CJK_SUPPLEMENT_TAIL_ROWS - 1}) AS tail)"
+        " SELECT rowid,id,content FROM working_memory"
+        " WHERE (rowid <= (SELECT head FROM bounds) OR rowid >= (SELECT tail FROM bounds))"
+        f" AND {predicate}{visibility}",
+        params,
+    ).fetchall()
+    if filter_pairs_in_python:
+        return [
+            row for row in rows
+            if row["content"] is not None
+            and all(any(pair in row["content"] for pair in group) for group in sql_groups)
+        ]
+    return rows
+
+
+def _supplement_cjk_working(conn, query, rows, k, terms, *, where_sql=None, where_params=()):
+    """Recover strong CJK rows outside a nonempty FTS pool, with bounded work."""
+    cap = min(k, _CJK_SUPPLEMENT_CAP)
+    if cap <= 0 or not rows or not _has_cjk(query):
+        return rows
+    groups = [
+        tuple(dict.fromkeys(run[i:i + 2] for i in range(len(run) - 1)))
+        for run in re.findall(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+", query)
+        if len(run) >= 2
+    ]
+    anchors = tuple(dict.fromkeys(anchor for group in groups for anchor in group))
+    if (not anchors or len(anchors) > _CJK_SUPPLEMENT_MAX_PAIRS
+            or len(groups) > _CJK_SUPPLEMENT_MAX_RUNS):
+        return rows
+
+    # A shared pair can identify the topic without supporting a second
+    # requested fact. Require an independent pair where that run has one.
+    groups = [
+        tuple(pair for pair in group if sum(pair in other for other in groups) == 1) or group
+        for group in groups
+    ]
+    try:
+        seen = _cjk_supplement_seen_ids(conn, query, rows, k, terms)
+        if seen is None:
+            return rows
+        candidates = _cjk_supplement_candidates(conn, groups, where_sql, where_params)
+    except sqlite3.OperationalError:
+        return rows
+
+    tokens = _recall_tokens(query)
+    prepared = _prepare_lexical_query(tokens, query.lower())
+    floor = _minimum_recall_relevance(tokens)
+    evidence = 1 if len(anchors) <= 2 else 2
+    scored = []
+    for row in candidates:
+        content = row["content"]
+        mid = row["id"]
+        if mid in seen:
+            continue
+        seen.add(mid)
+        if sum(anchor in content for anchor in anchors) < evidence:
+            continue
+        score = _lexical_relevance_for_query(prepared, content)
+        if score > 0 and score >= floor:
+            scored.append((score, row["rowid"], mid))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return rows + [
+        {"id": mid, "rank": None, "cjk_supplement": True}
+        for _, _, mid in scored[:cap]
+    ]
+
+
+def _fts_search_working(
+    conn: sqlite3.Connection, query: str, k: int = 20,
+    *, where_sql: Optional[str] = None, where_params: Tuple[Any, ...] = (),
+) -> List[Dict]:
     """Search FTS5 working memory and return ids with ranks."""
     terms = _fts_query_terms(query)
     if not terms:
@@ -5802,7 +6063,9 @@ def _fts_search_working(conn: sqlite3.Connection, query: str, k: int = 20) -> Li
         return _cjk_like_search(conn, query, k=k, working=True)
     if not rows and _has_cyrillic(query):
         return _cyrillic_like_search(conn, query, k=k, working=True)
-    return rows
+    return _supplement_cjk_working(
+        conn, query, rows, k, terms, where_sql=where_sql, where_params=where_params,
+    )
 
 
 def _wm_vec_search(conn: sqlite3.Connection, query_embedding, k: int = 20,
@@ -6079,6 +6342,38 @@ def _cross_session_max_llm_validations() -> int:
     except ValueError:
         return _CROSS_SESSION_MAX_LLM_VALIDATIONS
 
+_CROSS_SESSION_VERDICT_TTL_DAYS_DEFAULT = 30
+
+
+def _csverdict_content_sig(older_content: str, newer_content: str) -> str:
+    """Stable signature of a pair's content snapshots.
+
+    A cached verdict is only trustworthy for the exact contents it was
+    recorded against: any content change of either memory (e.g.
+    ``update_working`` keeps the id) makes the verdict stale. The pair is
+    JSON-encoded as a two-element array so the encoding is length-
+    delimited: no delimiter byte sequence can collide across the two
+    contents (a "\n---\n" embedded in one memory cannot make a
+    different pair hash to the same signature).
+    """
+    return hashlib.sha256(
+        json.dumps([older_content, newer_content], separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _cross_session_verdict_ttl_days() -> int:
+    """TTL (days) for cached cross-session LLM reject verdicts.
+
+    Override with ``MNEMOSYNE_CROSS_SESSION_VERDICT_TTL_DAYS`` (default 30).
+    A cached reject is re-adjudicated once its TTL elapses, so context
+    drift is eventually revisited.
+    """
+    raw = os.environ.get("MNEMOSYNE_CROSS_SESSION_VERDICT_TTL_DAYS", "").strip()
+    try:
+        return max(1, int(raw)) if raw else _CROSS_SESSION_VERDICT_TTL_DAYS_DEFAULT
+    except ValueError:
+        return _CROSS_SESSION_VERDICT_TTL_DAYS_DEFAULT
+
 
 class BeamMemory:
     """
@@ -6338,6 +6633,8 @@ class BeamMemory:
                  trust_tier: str = None,
                  memory_type: str = None,
                  dedupe: bool = True,
+                 author_id: str = None,
+                 author_type: str = None,
                  _write_kind: object = "public",
                  _write_policy=None,
                  _write_policy_content: Optional[str] = None) -> Optional[str]:
@@ -6361,6 +6658,11 @@ class BeamMemory:
                 and store as triples. Default False.
             veracity: Confidence level -- 'stated', 'inferred', 'tool', 'imported', 'unknown'.
                 Non-canonical labels are clamped to 'unknown' with a WARNING
+            author_id: Per-write author identity. When provided, overrides
+                self.author_id for THIS write only (issue #914). The instance
+                read identity (self.author_id, used by recall author-scoping)
+                is never mutated. None falls back to self.author_id.
+            author_type: Per-write author type, same override semantics.
                 (mirrors the C12.b clamp at the hermes_memory_provider boundary).
             memory_type: Optional explicit MemoryType value (e.g. 'artifact').
                 Overrides the content classifier entirely -- the classifier is
@@ -6437,6 +6739,12 @@ class BeamMemory:
         # content does not say. An unrecognized label degrades to
         # classification rather than to NULL.
         memory_type = _clamp_memory_type(memory_type)
+        # --- Per-write author identity (issue #914) ---
+        # Resolve once: per-write args override the instance identity for
+        # THIS write only. self.author_id (read identity, consulted by
+        # recall author-scoping) is never mutated.
+        _write_author_id = author_id if author_id is not None else self.author_id
+        _write_author_type = author_type if author_type is not None else self.author_type
         if memory_type is None and classify_memory is not None:
             try:
                 result = classify_memory(content)
@@ -6489,7 +6797,7 @@ class BeamMemory:
                     WHERE id = ? AND session_id = ?
                 """, (importance, datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), source,
                       valid_until, scope,
-                      self.author_id, self.author_type, self.channel_id,
+                      _write_author_id, _write_author_type, self.channel_id,
                       memory_type,
                       veracity, veracity,
                       trust_tier,
@@ -6505,7 +6813,7 @@ class BeamMemory:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (memory_id, content, source, timestamp, self.session_id, importance,
                       json.dumps(metadata or {}), valid_until, scope,
-                      self.author_id, self.author_type, self.channel_id, veracity, memory_type, trust_tier))
+                      _write_author_id, _write_author_type, self.channel_id, veracity, memory_type, trust_tier))
 
         if existing_id:
             # Cache failures must not turn a committed dedup update into a retry.
@@ -7107,8 +7415,11 @@ class BeamMemory:
                     ).fetchall()
                     for match in related:
                         rid = match["memory_id"]
+                        # Unary + leaves only idx_edges_source for the planner. The type can
+                        # dominate the table and the target can be a hub, but the source is
+                        # the memory being linked, which has far fewer edges than a busy target.
                         existing = self.episodic_graph.conn.execute(
-                            "SELECT 1 FROM graph_edges WHERE source = ? AND target = ? AND edge_type = 'references'",
+                            "SELECT 1 FROM graph_edges WHERE source = ? AND +target = ? AND +edge_type = 'references'",
                             (memory_id, rid)
                         ).fetchone()
                         if existing:
@@ -7570,20 +7881,22 @@ class BeamMemory:
         from `vec_episodes` (rowid-keyed, used when sqlite-vec is present) so
         conflict detection works uniformly over both working and episodic rows.
         Returns {memory_id: np.ndarray} for ids with a usable embedding.
+        All three ID/rowid lookups respect the live SQLite parameter limit,
+        with the existing conservative fallback when limit APIs are absent.
         """
-        cursor = self.conn.cursor()
         emb_map: Dict[str, np.ndarray] = {}
         if not memory_ids:
             return emb_map
 
-        ph = ",".join("?" * len(memory_ids))
         try:
-            cursor.execute(
-                f"SELECT memory_id, embedding_json FROM memory_embeddings "
-                f"WHERE memory_id IN ({ph})",
+            rows = _select_recall_rows_by_ids(
+                self.conn,
+                "SELECT memory_id, embedding_json FROM memory_embeddings "
+                "WHERE memory_id IN ({placeholders})",
                 memory_ids,
+                key="memory_id",
             )
-            for row in cursor.fetchall():
+            for row in rows:
                 try:
                     emb_map[row["memory_id"]] = np.array(
                         json.loads(row["embedding_json"]), dtype=np.float32
@@ -7599,20 +7912,21 @@ class BeamMemory:
             # quantized (float32/int8/bit) — decode per the stored vector type.
             vec_type = _effective_vec_type(self.conn, "vec_episodes")
             try:
-                mph = ", ".join("?" * len(missing))
-                cursor.execute(
-                    f"SELECT id, rowid FROM episodic_memory WHERE id IN ({mph})",
+                rows = _select_recall_rows_by_ids(
+                    self.conn,
+                    "SELECT id, rowid FROM episodic_memory WHERE id IN ({placeholders})",
                     missing,
                 )
-                rowid_by_id = {r["id"]: r["rowid"] for r in cursor.fetchall()}
+                rowid_by_id = {r["id"]: r["rowid"] for r in rows}
                 if rowid_by_id:
-                    rph = ", ".join("?" * len(rowid_by_id))
-                    cursor.execute(
-                        f"SELECT rowid, embedding FROM vec_episodes WHERE rowid IN ({rph})",
+                    rows = _select_recall_rows_by_ids(
+                        self.conn,
+                        "SELECT rowid, embedding FROM vec_episodes WHERE rowid IN ({placeholders})",
                         list(rowid_by_id.values()),
+                        key="rowid",
                     )
                     id_by_rid = {rid: mid for mid, rid in rowid_by_id.items()}
-                    for r in cursor.fetchall():
+                    for r in rows:
                         try:
                             vec = _decode_sqlite_vec_binary(r["embedding"], vec_type)
                             emb_map[id_by_rid[r["rowid"]]] = vec
@@ -7812,15 +8126,26 @@ class BeamMemory:
         """Count working memories eligible for consolidation before cutoff.
         Used by _maybe_auto_sleep() to skip full sleep passes when nothing
         is eligible — avoids unnecessary database work on always-on agents
-        with longer TTLs after a prior auto-sleep already consolidated everything."""
+        with longer TTLs after a prior auto-sleep already consolidated everything.
+
+        Mirrors sleep()'s selection exactly: the same _SLEEP_ELIGIBLE_SQL
+        predicate (so a stale claim that sleep() would recover still counts,
+        and the gate never hides an orphan backlog) and the same session scope
+        (``COALESCE(session_id, 'default') = self.session_id``), so a sibling
+        session's orphan does not trigger this session's auto-sleep (#687).
+        This method is private and is only ever called from the auto-sleep
+        snapshot on a session-bound BeamMemory, so the session scope is
+        consistent with its only consumers.
+        """
         cursor = self.conn.cursor()
         cursor.execute(
             f"SELECT COUNT(*) FROM working_memory "
             f"WHERE {_SQL_CHRONO_TS} < ? "
             f"AND {_SQL_PLACEABLE_TS} "
-            f"AND consolidated_at IS NULL "
-            f"AND (pinned IS NULL OR pinned = 0)",
-            (cutoff,),
+            f"AND {_SLEEP_ELIGIBLE_SQL} "
+            f"AND (pinned IS NULL OR pinned = 0) "
+            f"AND COALESCE(session_id, 'default') = ?",
+            (cutoff, _orphan_cutoff(), self.session_id),
         )
         return cursor.fetchone()[0]
 
@@ -8202,6 +8527,74 @@ class BeamMemory:
     # ------------------------------------------------------------------
     # Episodic Memory
     # ------------------------------------------------------------------
+    def _require_sleep_claim(self, ids, stamp: str) -> None:
+        """Raise _SleepClaimLost unless every id still holds claim ``stamp``.
+
+        Takes the write lock first so the check and the caller's following
+        write are one atomic step: nothing can re-stamp a claim in between.
+        """
+        if not self.conn.in_transaction:
+            self.conn.execute("BEGIN IMMEDIATE")
+        wanted = list(dict.fromkeys(ids))
+        owned = 0
+        for chunk in _recall_id_batches(self.conn, wanted, 1):
+            placeholders = ",".join("?" * len(chunk))
+            owned += self.conn.execute(
+                f"SELECT COUNT(*) FROM working_memory WHERE id IN ({placeholders}) "
+                "AND consolidation_claimed_at = ?",
+                (*chunk, stamp),
+            ).fetchone()[0]
+        if owned != len(wanted):
+            raise _SleepClaimLost(
+                f"{len(wanted) - owned} of {len(wanted)} rows no longer carry claim {stamp}"
+            )
+
+    def _claim_sleep_rows(self, rows, stamp: str) -> set:
+        """Take ownership of ``rows`` for one sleep pass; return the ids won.
+
+        Fresh rows are claimed only while ``consolidated_at`` is still NULL.
+        A recovered orphan is taken over by compare-and-swap on the exact claim
+        it was read with, so the swap fails if its holder finished, refreshed it
+        or another pass recovered it first. ``consolidated_at`` is never NULL
+        during the swap, which keeps the row exempt from trim for the whole
+        recovery. Every statement honours the connection's live bind limit.
+        """
+        cursor = self.conn.cursor()
+        fresh = [r["id"] for r in rows if r["_prev_consolidated"] is None]
+        orphans = [
+            (stamp, stamp, r["id"], r["_prev_consolidated"], r["_prev_claim"])
+            for r in rows if r["_prev_consolidated"] is not None
+        ]
+        changed = 0
+        for chunk in _recall_id_batches(self.conn, fresh, 2):
+            placeholders = ",".join("?" * len(chunk))
+            cursor.execute(
+                "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? "
+                f"WHERE id IN ({placeholders}) AND consolidated_at IS NULL",
+                (stamp, stamp, *chunk),
+            )
+            changed += cursor.rowcount
+        if orphans:
+            cursor.executemany(
+                "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? "
+                "WHERE id = ? AND consolidated_at = ? AND consolidation_claimed_at = ? "
+                f"AND NOT {_claim_completed_sql('working_memory')}",
+                orphans,
+            )
+            changed += cursor.rowcount
+        if changed == len(rows):
+            return {r["id"] for r in rows}
+        owned = set()
+        for chunk in _recall_id_batches(self.conn, [r["id"] for r in rows], 1):
+            placeholders = ",".join("?" * len(chunk))
+            cursor.execute(
+                f"SELECT id FROM working_memory WHERE id IN ({placeholders}) "
+                "AND consolidation_claimed_at = ?",
+                (*chunk, stamp),
+            )
+            owned.update(r["id"] for r in cursor.fetchall())
+        return owned
+
     def consolidate_to_episodic(self, summary: str, source_wm_ids: List[str],
                                 source: str = "consolidation", importance: float = 0.6,
                                 metadata: Dict = None, valid_until: str = None,
@@ -8213,9 +8606,15 @@ class BeamMemory:
                                 event_date_precision: 'Optional[str]' = None,
                                 emit_event: bool = True,
                                 _write_kind: object = "public",
-                                _write_policy=None) -> Optional[str]:
+                                _write_policy=None,
+                                _claim_stamp: Optional[str] = None) -> Optional[str]:
         """
         Store a consolidated summary into episodic_memory with optional embedding.
+
+        ``_claim_stamp`` is private to sleep(): when set, every id in
+        ``source_wm_ids`` must still carry that exact sleep claim when the
+        INSERT runs, checked under the same write lock. A holder whose claim was
+        recovered by another pass raises ``_SleepClaimLost`` and writes nothing.
 
         Post-insert field overrides (applied atomically before the committing
         vector write; never manufacture fields the caller did not supply):
@@ -8390,6 +8789,8 @@ class BeamMemory:
         # this method opened the transaction itself.
         _owned_txn = not self.conn.in_transaction
         with _guarded_transaction(self.conn):
+            if _claim_stamp is not None:
+                self._require_sleep_claim(source_wm_ids, _claim_stamp)
             cursor.execute("""
                 INSERT INTO episodic_memory
                 (id, content, source, timestamp, session_id, importance, metadata_json, summary_of, valid_until, scope,
@@ -9955,17 +10356,6 @@ class BeamMemory:
         # row. Overfetch by excluded ROWS bounds all possible FTS dropouts.
         _excluded_wm_ids = resolve_exclusions(self.conn, exclude_captures)
         _echo_overfetch = len(_excluded_wm_ids)
-        try:
-            wm_fts = _fts_search_working(
-                self.conn, query, k=max(top_k * 3, 50) + _echo_overfetch
-            )
-        except Exception:
-            wm_fts = []
-        _wm_fts_raw_count = len(wm_fts)
-
-        wm_ids = {r["id"] for r in wm_fts}
-        wm_ranks = {r["id"]: r["rank"] for r in wm_fts}
-
         # Build temporal/filter clause for working memory before vector search
         # so _wm_vec_search can push the same recall filters into SQL instead
         # of scanning broad memory_embeddings rows and filtering later.
@@ -10020,6 +10410,19 @@ class BeamMemory:
             wm_params.append(channel_id)
         
         wm_where = " AND ".join(wm_where_clauses)
+
+        try:
+            wm_fts = _fts_search_working(
+                self.conn, query, k=max(top_k * 3, 50) + _echo_overfetch,
+                where_sql=wm_where, where_params=tuple(wm_params),
+            )
+        except Exception:
+            wm_fts = []
+        _wm_fts_raw_count = len(wm_fts)
+
+        wm_ids = {r["id"] for r in wm_fts}
+        wm_ranks = {r["id"]: r["rank"] for r in wm_fts if not r.get("cjk_supplement")}
+        cjk_supplement_ids = wm_ids - wm_ranks.keys()
 
         # Vector pool isolation (#696): raw dialog capture (source='conversation',
         # source='honcho_message') stays fully FTS-reachable but is excluded from
@@ -10167,17 +10570,15 @@ class BeamMemory:
                 if temporal_weight > 0.0:
                     t_boost = _temporal_boost(row["timestamp"], parsed_query_time, th_halflife)
                     score *= (1.0 + temporal_weight * t_boost)
-                # [C4] Per-row tier attribution. Credit FTS for any
-                # row in wm_ranks (overlap with vec credited to FTS
-                # so the union sum stays consistent). Vec-only rows
-                # (in wm_vec_sims but not wm_ranks) credit wm_vec.
+                # [C4] The primary lexical tier counts both ranked FTS
+                # and CJK supplements. Lexical/vector overlaps count once.
                 # Rows reached via the fallback branch (wm_ids empty)
                 # credit wm_fallback. Each row credits exactly one
                 # tier so `wm_fts + wm_vec + wm_fallback` = total
                 # kept WM rows for this call.
                 if _wm_fallback_used:
                     _wm_fallback_kept += 1
-                elif wm_ranks and row["id"] in wm_ranks:
+                elif row["id"] in wm_ranks or row["id"] in cjk_supplement_ids:
                     _wm_fts_kept += 1
                 elif row["id"] in wm_vec_sims:
                     _wm_vec_kept += 1
@@ -11180,7 +11581,15 @@ class BeamMemory:
     # so entries cached under an older digest are not reused. Part of the
     # hashed payload; the opaque key keeps the "v2:" prefix because QueryCache's
     # opaque-path recognition (_OPAQUE_V2_KEY_RE) keys off that prefix.
-    _ENHANCED_RECALL_CACHE_VERSION = 16
+    # 16: clamp future-dated recency ages before exponentiation.
+    # 17: strongest eligible graph traversal and scoped active-seed selection.
+    # 18: local embedding input caps and effective cap policy in cache keys.
+    # 19: Cyrillic ё/е folding in fallback candidates and scores.
+    # 20: Bounded CJK supplement for linear working-memory recall.
+    # 21: UTC-Z timestamps remain temporally eligible on Python 3.10.
+    # 22: polyphonic voices return the requested top_k.
+    # Recheck the actual predecessor before each semantic integration.
+    _ENHANCED_RECALL_CACHE_VERSION = 22
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.
@@ -11290,6 +11699,7 @@ class BeamMemory:
             "recall_kwargs": canonicalize(effective_recall_kwargs),
             "resolved": {
                 "weights": resolved_weights,
+                "embedding_input_caps": tuple(max(0, cap) for cap in _embeddings._embedding_caps()),
                 "temporal_halflife": temporal_halflife,
                 "recency_halflife": RECENCY_HALFLIFE_HOURS,
                 "veracity_weights": {
@@ -11350,6 +11760,7 @@ class BeamMemory:
         # recognition keys off that exact prefix.
         return "v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
+    @_embeddings._embedding_cap_snapshot()
     def recall_enhanced(self, query: str, top_k: int = 40, *,
                         use_cache: bool = True,
                         use_weibull: bool = True,
@@ -11855,6 +12266,7 @@ class BeamMemory:
             session_id=self.session_id, cross_session=cross_session,
             author_id=author_id, author_type=author_type, channel_id=channel_id,
             veracity=veracity, memory_type=memory_type,
+            from_date=from_date, to_date=to_date, source=source, topic=topic,
         )
         try:
             polyphonic_results = engine.recall(
@@ -12823,14 +13235,23 @@ class BeamMemory:
         stale_after_seconds: int = 3600,
         limit: int = 1000,
     ) -> Dict:
-        """Clear stale sleep claims that have no episodic summary.
+        """Clear stale sleep claims that no episodic summary completed.
+
+        This is the manual maintenance entry point. sleep() performs the same
+        recovery automatically, but without ever clearing ``consolidated_at``
+        (which would end the row's trim exemption); prefer it. Clearing the
+        marker here makes the row trim-eligible again until the next sleep, so
+        run this only when sleep() cannot be (for example to inspect with
+        ``dry_run=True``).
 
         sleep() claims working rows by setting ``consolidated_at`` before it
         writes the episodic summary. A process crash in that narrow window can
         leave rows permanently skipped by later sleep() runs. This maintenance
         helper finds old claims whose id does not appear in any
-        ``episodic_memory.summary_of`` CSV token and clears the marker so a
-        later sleep pass can summarize them.
+        ``episodic_memory.summary_of`` CSV token written at or after the claim
+        and clears the marker so a later sleep pass can summarize them. A
+        summary of an EARLIER claim of the same row does not count as
+        completion.
         """
         # Clamp to a finite, overflow-safe window (round-7 R7-I): inf/nan
         # or 10**12 would otherwise escape as OverflowError/ValueError from
@@ -12852,23 +13273,19 @@ class BeamMemory:
             }
 
         cursor = self.conn.cursor()
-        orphan_query = """
-            SELECT wm.id
+        orphan_query = f"""
+            SELECT wm.id, wm.consolidation_claimed_at AS claim
             FROM working_memory wm
             WHERE wm.consolidated_at IS NOT NULL
               AND wm.consolidation_claimed_at IS NOT NULL
               AND wm.consolidation_claimed_at < ?
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM episodic_memory em
-                  WHERE instr(',' || COALESCE(em.summary_of, '') || ',',
-                              ',' || wm.id || ',') > 0
-              )
+              AND NOT {_claim_completed_sql('wm')}
             ORDER BY wm.consolidated_at ASC
             LIMIT ?
         """
         cursor.execute(orphan_query, (cutoff, limit))
-        candidate_ids = [row["id"] for row in cursor.fetchall()]
+        _orphan_rows = cursor.fetchall()
+        candidate_ids = [row["id"] for row in _orphan_rows]
         if not candidate_ids:
             return {
                 "status": "dry_run" if dry_run else "no_op",
@@ -12889,24 +13306,22 @@ class BeamMemory:
                 "candidate_ids": candidate_ids,
             }
 
-        placeholders = ",".join("?" * len(candidate_ids))
-        cursor.execute(
+        # Compare-and-swap on the exact claim each row was read with, so a
+        # holder that finished (or a pass that already recovered the row) is
+        # never overwritten. One statement per row keeps the bind count at
+        # three regardless of how many candidates there are, so SQLite's
+        # variable limit cannot make a large backlog silently unrecoverable.
+        cursor.executemany(
             f"""
             UPDATE working_memory
             SET consolidated_at = NULL,
                 consolidation_claimed_at = NULL
-            WHERE id IN ({placeholders})
+            WHERE id = ?
               AND consolidated_at IS NOT NULL
-              AND consolidation_claimed_at IS NOT NULL
-              AND consolidation_claimed_at < ?
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM episodic_memory em
-                  WHERE instr(',' || COALESCE(em.summary_of, '') || ',',
-                              ',' || working_memory.id || ',') > 0
-              )
+              AND consolidation_claimed_at = ?
+              AND NOT {_claim_completed_sql('working_memory')}
             """,
-            (*candidate_ids, cutoff),
+            [(row["id"], row["claim"]) for row in _orphan_rows],
         )
         reclaimed = cursor.rowcount
         self.conn.commit()
@@ -13001,6 +13416,15 @@ class BeamMemory:
         bound. ``_fleet_census=False`` is a private opt-out for
         sleep_all_sessions, which runs this method once per session and
         therefore takes the census once for the whole pass instead of N times.
+
+        Conflict-ledger drain (additive): a non-dry-run sleep also runs the
+        veracity consolidator's documented conflict pass once
+        (``run_consolidation_pass``), bounded by the same
+        MNEMOSYNE_CONFLICT_PAIR_BUDGET / MNEMOSYNE_CONFLICT_TIME_BUDGET_S
+        limits as LLM conflict validation and recorded under
+        ``veracity_conflict_pass`` in the result. Best-effort: a pass
+        failure is logged and never fails the sleep; dry runs skip it
+        (the pass writes).
         """
         from mnemosyne.core.aaak import encode as aaak_encode
         from mnemosyne.core import local_llm
@@ -13039,7 +13463,9 @@ class BeamMemory:
         # earliest, the same degradation contract as the Python side in
         # _row_sort_key.
         cursor.execute(f"""
-            SELECT id, content, source, timestamp, importance, metadata_json, scope, valid_until, veracity, event_date, event_date_precision, superseded_by
+            SELECT id, content, source, timestamp, importance, metadata_json, scope, valid_until, veracity, event_date, event_date_precision, superseded_by,
+                   consolidated_at AS _prev_consolidated,
+                   consolidation_claimed_at AS _prev_claim
             FROM working_memory
             WHERE COALESCE(session_id, 'default') = ?
               AND {_SQL_CHRONO_TS} < ?
@@ -13050,12 +13476,12 @@ class BeamMemory:
               -- behind them never consolidate. The Python filter below
               -- stays as a second validation gate.
               AND {_SQL_PLACEABLE_TS}
-              AND consolidated_at IS NULL
+              AND {_SLEEP_ELIGIBLE_SQL}
               AND (pinned IS NULL OR pinned = 0)
               AND superseded_by IS NULL
             ORDER BY {_SQL_CHRONO_TS} ASC
             LIMIT {SLEEP_BATCH_SIZE}
-        """, (self.session_id, cutoff))
+        """, (self.session_id, cutoff, _orphan_cutoff()))
         rows = cursor.fetchall()
         # Skip rows whose timestamp cannot actually be placed on the
         # timeline (round-6 F3a): consolidating an all-bad group stamped
@@ -13128,29 +13554,17 @@ class BeamMemory:
         #     consolidated_at if needed.
         # The dry_run branch skips the claim entirely so it stays
         # side-effect-free.
+        recovered_orphans = 0
+        claim_stamp = None
         if not dry_run:
             now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
-            ids_to_claim = [row["id"] for row in rows]
-            placeholders = ",".join("?" * len(ids_to_claim))
-            cursor.execute(
-                f"UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? "
-                f"WHERE id IN ({placeholders}) AND consolidated_at IS NULL",
-                (now_iso, now_iso, *ids_to_claim),
-            )
-            claimed_ids = set()
-            if cursor.rowcount == len(ids_to_claim):
-                # Fast path: we got all of them.
-                claimed_ids = set(ids_to_claim)
-            else:
-                # Slow path: at least one row was claimed concurrently
-                # by another sleep. Re-read which ones we actually own
-                # so we only summarize those.
-                cursor.execute(
-                    f"SELECT id FROM working_memory "
-                    f"WHERE id IN ({placeholders}) AND consolidated_at = ?",
-                    (*ids_to_claim, now_iso),
-                )
-                claimed_ids = {r["id"] for r in cursor.fetchall()}
+            claim_stamp = now_iso
+            # Fresh rows are claimed while consolidated_at is NULL; a stale
+            # orphan is taken over by compare-and-swap on the claim it was read
+            # with, so it never leaves the trim exemption and a holder that is
+            # merely slow loses the swap instead of racing us. Both honour the
+            # connection's live bind limit.
+            claimed_ids = self._claim_sleep_rows(rows, claim_stamp)
 
             if not claimed_ids:
                 # Lost the race entirely. Close the connection, then still
@@ -13164,6 +13578,10 @@ class BeamMemory:
                 }, _fleet_census)
 
             # Filter rows to only those we successfully claimed.
+            recovered_orphans = sum(
+                1 for r in rows
+                if r["id"] in claimed_ids and r["_prev_consolidated"] is not None
+            )
             rows = [r for r in rows if r["id"] in claimed_ids]
             self.conn.commit()
             # The claim flips consolidated_at on live working rows, which
@@ -13178,6 +13596,7 @@ class BeamMemory:
 
         consolidated_ids = []
         summaries_created = 0
+        claims_lost = 0
         llm_used_count = 0
         conflicts_resolved = 0
         conflicts_detected_only = 0
@@ -13236,7 +13655,7 @@ class BeamMemory:
                             continue
                         conflict_calls += 1
                         try:
-                            is_conflict, confidence, correct_fact = validate_conflict_pair(
+                            is_conflict, confidence, correct_fact, _status = validate_conflict_pair(
                                 content_map.get(older_id, ""),
                                 content_map.get(newer_id, ""),
                                 session_id=self.session_id,
@@ -13325,24 +13744,27 @@ class BeamMemory:
                     lines = compression_plugin.compress_lines(lines)
 
                 chunks = local_llm.chunk_memories_by_budget(lines, source=source)
-                if chunks:
+                if chunks and sum(len(chunk) for chunk in chunks) == len(lines):
                     invalid_reasoning = False
                     if len(chunks) == 1:
                         # All memories fit in one prompt.
                         summary = local_llm._summarize_memories(chunks[0], source=source)
                         invalid_reasoning = local_llm._is_invalid_reasoning_output(summary)
                     else:
-                        # Multi-chunk: any malformed trace invalidates the
-                        # complete LLM result instead of silently dropping it.
+                        # Every chunk must succeed; otherwise fall back over
+                        # the complete lines list instead of publishing a subset.
                         chunk_summaries = []
+                        incomplete_summary = False
                         for chunk in chunks:
                             chunk_summary = local_llm._summarize_memories(chunk, source=source)
                             if local_llm._is_invalid_reasoning_output(chunk_summary):
                                 invalid_reasoning = True
                                 break
-                            if chunk_summary:
-                                chunk_summaries.append(chunk_summary)
-                        if not invalid_reasoning and chunk_summaries:
+                            if not chunk_summary:
+                                incomplete_summary = True
+                                break
+                            chunk_summaries.append(chunk_summary)
+                        if not invalid_reasoning and not incomplete_summary and chunk_summaries:
                             # Second-pass: summarize the chunk summaries.
                             if len(chunk_summaries) == 1:
                                 summary = chunk_summaries[0]
@@ -13352,9 +13774,8 @@ class BeamMemory:
                                     source=f"{source} (consolidated)",
                                 )
                                 invalid_reasoning = local_llm._is_invalid_reasoning_output(summary)
-                                # Preserve the existing non-reasoning fallback.
-                                if not invalid_reasoning and not summary:
-                                    summary = " | ".join(chunk_summaries)
+                                # A failed merge leaves summary unset: the
+                                # complete-input AAAK fallback below owns recovery.
                     if invalid_reasoning:
                         logger.warning(
                             "sleep: malformed reasoning trace for source=%r (items=%d) "
@@ -13492,25 +13913,37 @@ class BeamMemory:
                     _agg_event_date_precision = "unknown"
                 if sleep_write_policy is None:
                     sleep_write_policy = current_write_policy()
-                self.consolidate_to_episodic(
-                    summary=summary,
-                    source_wm_ids=ids,
-                    source="sleep_consolidation",
-                    event_timestamp=_event_ts,
-                    event_date=_agg_event_date,
-                    event_date_precision=_agg_event_date_precision,
-                    importance=0.6,
-                    scope=aggregated_scope,
-                    valid_until=aggregated_valid_until,
-                    veracity=aggregated_veracity,
-                    _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
-                    _write_policy=sleep_write_policy,
-                    metadata={
-                        "original_count": len(items),
-                        "source": source,
-                        "llm_used": llm_succeeded
-                    }
-                )
+                try:
+                    self.consolidate_to_episodic(
+                        summary=summary,
+                        source_wm_ids=ids,
+                        source="sleep_consolidation",
+                        event_timestamp=_event_ts,
+                        event_date=_agg_event_date,
+                        event_date_precision=_agg_event_date_precision,
+                        importance=0.6,
+                        scope=aggregated_scope,
+                        valid_until=aggregated_valid_until,
+                        veracity=aggregated_veracity,
+                        _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
+                        _write_policy=sleep_write_policy,
+                        _claim_stamp=claim_stamp,
+                        metadata={
+                            "original_count": len(items),
+                            "source": source,
+                            "llm_used": llm_succeeded
+                        }
+                    )
+                except _SleepClaimLost:
+                    # Another pass recovered this claim while we were
+                    # summarizing. It owns the rows now: write nothing and
+                    # leave its claim marker alone.
+                    logger.warning(
+                        "sleep: claim %s on %d row(s) was recovered by another "
+                        "pass; discarding this summary", claim_stamp, len(ids),
+                    )
+                    claims_lost += 1
+                    continue
                 if proposals:
                     from mnemosyne.core import model_refresh
                     proposal_ts = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
@@ -13549,12 +13982,14 @@ class BeamMemory:
                         if model_refresh.maybe_auto_apply_model_refresh_proposal(self, proposal_id, owner_id=model_refresh_owner_id):
                             model_refresh_applied += 1
                     self.conn.commit()
-                group_placeholders = ",".join("?" * len(ids))
-                cursor.execute(
-                    f"UPDATE working_memory SET consolidation_claimed_at = NULL "
-                    f"WHERE id IN ({group_placeholders})",
-                    tuple(ids),
-                )
+                for _chunk in _recall_id_batches(self.conn, ids, 1):
+                    group_placeholders = ",".join("?" * len(_chunk))
+                    cursor.execute(
+                        f"UPDATE working_memory SET consolidation_claimed_at = NULL "
+                        f"WHERE id IN ({group_placeholders}) "
+                        f"AND consolidation_claimed_at = ?",
+                        (*_chunk, claim_stamp),
+                    )
                 # Commit the claim-clear NOW. Leaving this UPDATE uncommitted
                 # opened an implicit write transaction that stayed open across
                 # the NEXT group's LLM calls (validate_conflict_pair /
@@ -13586,6 +14021,28 @@ class BeamMemory:
                 " skipped this sleep", pairs_skipped_budget,
             )
 
+        # Conflict-ledger drain (the documented sleep retry hook, PR
+        # #1082 review): run the veracity consolidator's conflict pass
+        # once so pairs left queued by a refused probe are re-probed and
+        # obvious conflicts among consolidated facts resolve here.
+        # Bounded by the same pair/time budgets as LLM conflict
+        # validation; best-effort -- a resolution failure must never
+        # fail the sleep. Dry runs skip it: the pass writes.
+        veracity_conflict_pass = None
+        if not dry_run and self.veracity_consolidator is not None:
+            try:
+                resolutions = self.veracity_consolidator.run_consolidation_pass(
+                    pair_budget=_CONFLICT_PAIR_BUDGET,
+                    time_budget_s=_CONFLICT_TIME_BUDGET_S,
+                )
+                veracity_conflict_pass = {"resolutions": resolutions}
+            except Exception as exc:
+                logger.warning(
+                    "veracity conflict pass failed (%s); sleep result unaffected",
+                    type(exc).__name__,
+                )
+                veracity_conflict_pass = {"error": type(exc).__name__}
+
         # Run tiered degradation after consolidation
         degrade_result = self.degrade_episodic(dry_run=dry_run)
         if not dry_run:
@@ -13607,7 +14064,10 @@ class BeamMemory:
             "llm_used": llm_used_count,
             "method": method,
             "consolidated_ids": consolidated_ids,
+            "recovered_orphans": recovered_orphans,
+            "claims_lost": claims_lost,
             "degradation": degrade_result,
+            "veracity_conflict_pass": veracity_conflict_pass,
             "model_refresh": {
                 "proposals": model_refresh_proposals,
                 "applied": model_refresh_applied,
@@ -13626,6 +14086,12 @@ class BeamMemory:
         When force=True, skips the age cutoff and consolidates all
         non-consolidated working memories across all sessions immediately.
         """
+        # Claims a crashed sleep() left behind (consolidated_at set, no summary
+        # completing that claim) are recovered inside sleep() itself, per
+        # session, by compare-and-swap on the claim they were read with. The
+        # row keeps its trim exemption throughout and is re-summarized in the
+        # same pass, so there is no window between "released" and "summarized".
+        reclaimed_orphans = 0
         cursor = self.conn.cursor()
         _cutoff_raw = (
             datetime.now(timezone.utc)
@@ -13641,11 +14107,11 @@ class BeamMemory:
             FROM working_memory
             WHERE {_SQL_CHRONO_TS} < ?
               AND {_SQL_PLACEABLE_TS}
-              AND consolidated_at IS NULL
+              AND {_SLEEP_ELIGIBLE_SQL}
               AND (pinned IS NULL OR pinned = 0)
             GROUP BY session_id
             ORDER BY MIN({_SQL_CHRONO_TS}) ASC
-        """, (cutoff,))
+        """, (cutoff, _orphan_cutoff()))
         session_rows = cursor.fetchall()
         if not session_rows:
             return self._attach_fleet_conflict_census({
@@ -13654,6 +14120,7 @@ class BeamMemory:
                 "conflicts_resolved": 0,
                 "conflicts_detected_only": 0,
                 "sessions_scanned": 0,
+                "reclaimed_orphans": reclaimed_orphans,
                 "sessions_consolidated": 0,
                 "items_consolidated": 0,
                 "summaries_created": 0,
@@ -13701,6 +14168,7 @@ class BeamMemory:
                 result = dict(result)
                 result["session_id"] = session_id
                 result["eligible"] = row["eligible"] if hasattr(row, "keys") else row[1]
+                reclaimed_orphans += int(result.get("recovered_orphans", 0) or 0)
                 session_results.append(result)
 
                 if result.get("status") in ("consolidated", "dry_run"):
@@ -13730,6 +14198,7 @@ class BeamMemory:
         result = {
             "status": "dry_run" if dry_run else ("consolidated" if items_consolidated else "no_op"),
             "sessions_scanned": len(session_rows),
+            "reclaimed_orphans": reclaimed_orphans,
             "sessions_consolidated": sessions_consolidated,
             "items_consolidated": items_consolidated,
             "summaries_created": summaries_created,
@@ -13771,10 +14240,15 @@ class BeamMemory:
         Confirmation is LLM-backed via `validate_conflict_pair` only when
         `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on *and* this is an explicit apply
         (`dry_run=False`). A dry run is deterministic by default (no LLM calls,
-        no mutation), but can opt into the same LLM vetting — still without
-        mutating — by passing `llm_eval=True`, so the reported parity with an
-        apply (which pairs the LLM would confirm vs. reject) can be tested
-        first. A dry run without `llm_eval` only reports detector candidates.
+        no memory supersession). Passing `llm_eval=True` invokes LLM vetting
+        and can write cost records, but still never supersedes memories. Both
+        modes return aggregate counters, not pair identities, similarity scores
+        or individual verdicts. `pairs_flagged` counts detector pairs;
+        `conflicts_resolved` counts the pairs this preview would supersede;
+        `llm_validations` counts validator invocations, including attempts with
+        no usable response. Zero confirmations do not by themselves establish
+        successful negative model verdicts. A later apply can observe different
+        database state or model responses.
         `min_gap_hours` relaxes the intra-conversation back-to-back heuristic
         for independent threads (default 0).
 
@@ -13790,6 +14264,33 @@ class BeamMemory:
         remaining candidate pairs pending for a later explicit run — this bounds
         network round-trips that a provider tool performs while its shared Beam
         access lock is held.
+
+        Rejected (LLM-declined) pairs are persisted with a TTL in a local
+        `cross_session_verdict_cache` table, so later runs skip already
+        adjudicated pairs without re-issuing the LLM call (each run re-scans
+        the whole queue, and without this the same rejected pairs burned an
+        LLM validation on every run). Only VALID negative verdicts are
+        cached: a validation failure (provider unavailable, invalid response
+        type, malformed JSON) is a distinct status and is never persisted, so
+        the next run retries the validation. Each verdict is bound to the
+        content snapshots of both memories (a `content_sig`): if either
+        memory is later edited (e.g. `update_working` keeps the id), the
+        verdict is deleted and the pair re-adjudicated. The TTL —
+        `MNEMOSYNE_CROSS_SESSION_VERDICT_TTL_DAYS`, default 30 days — bounds
+        how long a verdict is trusted, so context drift is eventually
+        re-adjudicated. Skipped pairs are counted in the result payload as
+        `skipped_cached`. Cache reads never create schema (a missing table
+        reads as an empty cache), cache writes only happen on an explicit
+        apply, and they are queued during the run and flushed once after
+        every LLM validation call has finished — so a cache write never
+        holds the writer lock across a validation call and a dry run (incl.
+        `llm_eval`) stays read-only. The flush runs on a dedicated fresh
+        connection and self-commits — it is derived, best-effort state that
+        deliberately does not share the caller's transaction, because a
+        resolver connection whose WAL snapshot predates a concurrent writer's
+        commit fails instantly (SQLITE_BUSY_SNAPSHOT) on its first write.
+        The cache is best-effort: any cache failure degrades to
+        the normal always-LLM behavior.
 
         This is phase one of the cross-session resolution work: candidate
         reporting (`dry_run=True`) and explicit apply (`dry_run=False`). An
@@ -13807,7 +14308,7 @@ class BeamMemory:
                            "(set MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION=1)",
                 "rows_scanned": 0, "pairs_flagged": 0,
                 "conflicts_resolved": 0, "invalidated": 0,
-                "llm_validations": 0, "llm_cap_reached": False,
+                "llm_validations": 0, "skipped_cached": 0, "llm_cap_reached": False,
                 "candidates_truncated": False,
             }
 
@@ -13858,11 +14359,14 @@ class BeamMemory:
         if scan_error is not None:
             # A bank query failed: abort before any resolution so we never
             # mutate on a partial cross-bank scan, and surface the failure.
+            # Report skipped_cached=0 so the result shape matches the other
+            # paths (no cache was consulted or skipped on this abort).
             return {
                 "status": "failed",
                 "message": f"could not scan bank {scan_error[0]}: {scan_error[1]}",
                 "rows_scanned": len(rows),
                 "pairs_flagged": 0, "conflicts_resolved": 0, "invalidated": 0,
+                "skipped_cached": 0,
                 "llm_validations": 0, "llm_cap_reached": False,
                 "candidates_truncated": truncated,
             }
@@ -13892,6 +14396,25 @@ class BeamMemory:
         invalidated = 0
         llm_validations = 0
         llm_cap_reached = False
+        # Negative cache of LLM 'reject' verdicts so repeated runs don't
+        # re-burn the same already-adjudicated pairs forever (each sleep
+        # re-flags the queue; without this the same first ~20 pairs in
+        # sorted order spent an LLM call every run with the cap always
+        # reached). Best-effort: any cache failure degrades to the normal
+        # always-LLM path.
+        cached_rejects = {}
+        try:
+            cached_rejects = self._csverdict_cached_rejects()
+        except Exception:
+            cached_rejects = {}
+        skipped_cached = 0
+        # Rejects queued during the LLM loop; flushed once, after EVERY
+        # validate_conflict_pair call in this run has finished, so a cache
+        # write never holds the writer lock across a later validation call.
+        # Stale verdicts (content changed since the verdict) are queued for
+        # deletion in the same flush.
+        pending_verdicts = []
+        stale_verdicts = []
         # IDs superseded, or used as a replacement/target, during THIS run.
         # Rows are SELECTed once, so in-memory state is authoritative here.
         # The sets guard chained detector pairs such as (A,B),(B,C): without
@@ -13926,16 +14449,41 @@ class BeamMemory:
                 confirmed = True
                 # LLM confirmation runs on an explicit apply when the env flag
                 # is on; a dry run is deterministic by default but can opt into
-                # the same LLM vetting (no mutation) via llm_eval=True, so the
-                # reported parity with an apply can be tested first.
+                # LLM vetting via llm_eval=True. The preview reports aggregate
+                # counts without superseding memory; validation can log costs.
                 run_llm = LLM_CONFLICT_DETECTION_ENABLED and not dry_run
                 if dry_run and llm_eval:
                     run_llm = True
+                older_content = content_map.get(older_id, "")
+                newer_content = content_map.get(newer_id, "")
+                pair_sig = _csverdict_content_sig(older_content, newer_content)
+                cache_hit = cached_rejects.get((older_id, newer_id))
+                if cache_hit is not None:
+                    _conf, _expires_at, _cached_sig = cache_hit
+                    if _cached_sig != pair_sig:
+                        # Either memory's content changed since the verdict
+                        # was recorded (e.g. update_working keeps the id),
+                        # or the row predates the content_sig column and
+                        # carries no signature: the verdict is stale —
+                        # queue the row for deletion and fall through to
+                        # re-adjudicate the pair.
+                        cached_rejects.pop((older_id, newer_id))
+                        stale_verdicts.append((older_id, newer_id))
+                    else:
+                        # This (older,newer) pair was already LLM-adjudicated
+                        # as a non-contradiction for the SAME content and is
+                        # still within its TTL — skip the LLM call entirely.
+                        # Checked outside `if run_llm:` so a plain dry run
+                        # reports the same cache skips as an apply (dry-run
+                        # == apply parity).
+                        cached_rejects.pop((older_id, newer_id))
+                        skipped_cached += 1
+                        continue
                 if run_llm:
                     if llm_validations >= max_llm_validations:
                         llm_cap_reached = True
                         break
-                    is_conflict, _, _ = validate_conflict_pair(
+                    is_conflict, confidence, _, verdict_status = validate_conflict_pair(
                         content_map.get(older_id, ""),
                         content_map.get(newer_id, ""),
                         session_id=self.session_id,
@@ -13943,11 +14491,23 @@ class BeamMemory:
                     )
                     llm_validations += 1
                     confirmed = is_conflict
+                    if not is_conflict and not dry_run and verdict_status == "valid":
+                        # Queue the reject so later runs skip this pair.
+                        # A validation FAILURE (verdict_status == "failed":
+                        # unavailable response, invalid type, malformed
+                        # JSON) is NOT a negative verdict — it is left
+                        # uncached so the next run retries the validation.
+                        # Only on a real apply: a dry run (incl. llm_eval)
+                        # must stay read-only, so it reports cache hits but
+                        # never pre-warms the table. The TTL bounds staleness.
+                        pending_verdicts.append(
+                            (older_id, newer_id, confidence,
+                             older_content, newer_content))
                 if not confirmed:
                     continue
-                # Track chained pairs in BOTH dry-run and apply so a dry run
-                # reports exactly what an apply would do. A dry run only
-                # simulates the supersession (it never calls invalidate()).
+                # Track chained pairs in both modes using the same simulation
+                # rules. A preview never calls invalidate(); a later apply may
+                # observe different state or validation responses.
                 mutated = dry_run
                 if not dry_run and self.invalidate(older_id, replacement_id=newer_id):
                     invalidated += 1
@@ -13959,6 +14519,30 @@ class BeamMemory:
                     # dry run, that would be): an invalidate() that returned
                     # False is not a resolved conflict.
                     conflicts_resolved += 1
+
+        # Flush the queued verdicts after every LLM validation call in this
+        # run has completed, so the cache never holds the writer lock across
+        # a validate_conflict_pair call. A dry run (incl. llm_eval) stays
+        # read-only: it reports cache hits but never writes.
+        #
+        # When the connection carries a caller-owned transaction, the flush
+        # is queued through the connection's after-commit hook machinery: it
+        # runs only AFTER the caller has committed (the writer lock must be
+        # released before the flush's dedicated connection writes), and a
+        # rollback drops it — the best-effort cache must not outlive the
+        # rolled-back mutation, and a dropped flush simply degrades the next
+        # run to re-validation. With no open transaction there is no lock to
+        # wait out, so the flush runs immediately on its own connection.
+        if not dry_run and (pending_verdicts or stale_verdicts):
+            if self.conn.in_transaction:
+                self.conn._after_commit_hooks.append(
+                    lambda: self._csverdict_flush(pending_verdicts, stale_verdicts))
+            else:
+                try:
+                    self._csverdict_flush(pending_verdicts, stale_verdicts)
+                except Exception:
+                    logger.debug(
+                        "cross-session verdict cache flush skipped", exc_info=True)
 
         if dry_run:
             status = "dry_run"
@@ -13976,9 +14560,148 @@ class BeamMemory:
             "invalidated": invalidated,
             "rows_scanned": len(rows),
             "llm_validations": llm_validations,
+            "skipped_cached": skipped_cached,
             "llm_cap_reached": llm_cap_reached,
             "candidates_truncated": truncated,
         }
+
+    # ------------------------------------------------------------------
+    # Cross-session LLM reject negative-cache
+    # ------------------------------------------------------------------
+    _CSVERDICT_TABLE = "cross_session_verdict_cache"
+
+    def _csverdict_table_readable(self) -> bool:
+        """Return True only if the verdict-cache table exists WITH the
+        content_sig column. Pure read: never creates or alters schema, so a
+        dry run cannot mutate the database. An absent or legacy table reads
+        as an empty cache (the apply-time writer creates/migrates it).
+        """
+        try:
+            exists = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (self._CSVERDICT_TABLE,),
+            ).fetchone()
+            if not exists:
+                return False
+            cols = {r[1] for r in self.conn.execute(
+                f"PRAGMA table_info({self._CSVERDICT_TABLE})")}
+            return "content_sig" in cols
+        except Exception:
+            return False
+
+    def _csverdict_ensure_schema(self, conn: "sqlite3.Connection" = None) -> None:
+        """Apply-time writer: create the verdict-cache table if absent,
+        or migrate a legacy (pre-content_sig) table in place. Only the
+        flush path calls this — reads never create schema. ``conn``
+        defaults to ``self.conn``; the flush passes its dedicated
+        connection (see ``_csverdict_flush``).
+        """
+        conn = conn if conn is not None else self.conn
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (self._CSVERDICT_TABLE,),
+            ).fetchone()
+        except Exception:
+            exists = None
+        if not exists:
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {self._CSVERDICT_TABLE} ("
+                " older_id TEXT NOT NULL, newer_id TEXT NOT NULL, "
+                " content_sig TEXT, "
+                " verdict TEXT NOT NULL, confidence REAL, "
+                " decided_at TEXT NOT NULL, expires_at TEXT NOT NULL, "
+                " PRIMARY KEY (older_id, newer_id))"
+            )
+            return
+        cols = {r[1] for r in conn.execute(
+            f"PRAGMA table_info({self._CSVERDICT_TABLE})")}
+        if "content_sig" not in cols:
+            # Legacy shape from before content binding: add the column.
+            # Rows without a signature read as stale and are re-adjudicated.
+            conn.execute(
+                f"ALTER TABLE {self._CSVERDICT_TABLE} "
+                "ADD COLUMN content_sig TEXT")
+
+    def _csverdict_cached_rejects(self) -> Dict[tuple, tuple]:
+        """Return {(older_id, newer_id): (confidence, expires_at,
+        content_sig)} for non-expired cached reject verdicts. Empty dict if
+        the table is absent (or legacy) or on any error — callers treat
+        that as no-cache. Never creates schema: a missing table reads as an
+        empty cache, so a dry run stays read-only.
+        """
+        if not self._csverdict_table_readable():
+            return {}
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            f"SELECT older_id, newer_id, confidence, expires_at, content_sig "
+            f"FROM {self._CSVERDICT_TABLE} WHERE verdict = 'reject'"
+        )
+        out: Dict[tuple, tuple] = {}
+        for older_id, newer_id, conf, expires_at, sig in cursor.fetchall():
+            if expires_at and expires_at < now_iso:
+                continue
+            out[(older_id, newer_id)] = (conf, expires_at, sig)
+        return out
+
+    def _csverdict_flush(self, pending: list, stale: list) -> None:
+        """Persist queued rejects (and delete stale rows) in one batch.
+
+        Runs on a dedicated fresh connection, not ``self.conn``. The
+        resolver's connection opened a WAL read snapshot when it loaded
+        the memories at the start of the run, and in WAL mode any
+        connection whose snapshot predates a concurrent writer's commit
+        fails INSTANTLY (SQLITE_BUSY_SNAPSHOT — no busy-timeout wait)
+        when it makes its first write. That is exactly the concurrent
+        scenario this cache must survive: another session writing while
+        the apply validates. A fresh connection takes a fresh snapshot,
+        applies the standard busy timeout, and commits the batch itself.
+
+        The cache is derived, best-effort state, so it deliberately does
+        NOT share the caller's transaction: a rolled-back invalidate
+        still leaves a valid reject verdict, and a failed flush simply
+        degrades the next run to re-validation. It is invoked either
+        directly (no open transaction on the connection, so no writer lock
+        to wait out) or through an after-commit hook (a caller-owned
+        transaction is still open, so the caller's commit must land first);
+        in neither case does it commit the caller's transaction.
+        Stale deletions run first so a pair that is both stale and
+        re-rejected this run ends up with its NEW verdict.
+        """
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(str(self.db_path), timeout=5.0)
+        try:
+            self._csverdict_ensure_schema(conn)
+            now = datetime.now(timezone.utc)
+            expires = now + timedelta(days=_cross_session_verdict_ttl_days())
+            now_iso = now.isoformat()
+            expires_iso = expires.isoformat()
+
+            for older_id, newer_id in stale:
+                conn.execute(
+                    f"DELETE FROM {self._CSVERDICT_TABLE} "
+                    "WHERE older_id = ? AND newer_id = ?",
+                    (older_id, newer_id),
+                )
+            for older_id, newer_id, conf, older_c, newer_c in pending:
+                sig = _csverdict_content_sig(older_c, newer_c)
+                conn.execute(
+                    f"INSERT INTO {self._CSVERDICT_TABLE} "
+                    "(older_id, newer_id, content_sig, verdict, confidence, "
+                    " decided_at, expires_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(older_id, newer_id) DO UPDATE SET "
+                    "content_sig=excluded.content_sig, "
+                    "verdict=excluded.verdict, confidence=excluded.confidence, "
+                    "decided_at=excluded.decided_at, expires_at=excluded.expires_at",
+                    (older_id, newer_id, sig, "reject", conf,
+                     now_iso, expires_iso),
+                )
+            conn.commit()
+        finally:
+            conn.close()
 
     def get_consolidation_log(self, limit: int = 10) -> List[Dict]:
         cursor = self.conn.cursor()
