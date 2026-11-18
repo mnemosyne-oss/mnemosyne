@@ -451,15 +451,39 @@ def cmd_sleep(args):
 
 
 def cmd_diagnose(args):
-    """Run PII-safe diagnostics. Use --fix to auto-install missing dependencies."""
+    """Run PII-safe diagnostics. Use --python to select the runtime interpreter."""
     fix_mode = "--fix" in args
     dry_run = "--dry-run" in args
     repair_vec_working = "--repair-vec-working" in args
+    python_executable = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--python" or args[i].startswith("--python="):
+            if args[i].startswith("--python="):
+                value = args[i].partition("=")[2]
+                if not value:
+                    _fail("--python requires a value")
+                python_executable = value
+                i += 1
+                continue
+            python_executable, i = _require_value(args, i, "--python", lambda value, _name: value)
+            if not python_executable:
+                _fail("--python requires a value")
+        else:
+            i += 1
 
     try:
         from mnemosyne.diagnose import run_diagnostics, auto_fix
-        result = run_diagnostics(repair_vec_working=repair_vec_working, dry_run=dry_run)
+        diagnose_args = {"repair_vec_working": repair_vec_working, "dry_run": dry_run}
+        if python_executable is not None:
+            diagnose_args["python_executable"] = python_executable
+        result = run_diagnostics(**diagnose_args)
         print("\nMnemosyne Diagnostics\n")
+        print(
+            "  Runtime checks: "
+            f"{result.get('runtime_scope', 'cli_interpreter')} "
+            f"({result.get('runtime_executable', 'unknown')})"
+        )
         print(f"  Checks passed: {result.get('checks_passed', 0)}/{result.get('checks_total', 0)}")
         if result.get("key_findings"):
             print("\n  Key findings:")
@@ -483,7 +507,10 @@ def cmd_diagnose(args):
 
         if fix_mode or (dry_run and not repair_vec_working):
             print("\n--- Auto-fix ---")
-            fix_result = auto_fix(result.get("entries", []), dry_run=dry_run)
+            fix_args = {"dry_run": dry_run}
+            if python_executable is not None:
+                fix_args["python_executable"] = python_executable
+            fix_result = auto_fix(result.get("entries", []), **fix_args)
             if fix_result["fixed"]:
                 for item in fix_result["fixed"]:
                     if dry_run:
@@ -615,6 +642,7 @@ def cmd_doctor(args):
             db_path,
             scan_limit=scan_limit,
             candidate_limit=sample_limit if include_candidates else 0,
+            runtime_scope="cli_interpreter",
         )
         payload = doctor_report_payload(report, include_candidates=include_candidates)
         json_text = render_doctor_json(payload)
@@ -1328,13 +1356,18 @@ def cmd_restore(args):
 def cmd_verify(args):
     """Verify database integrity."""
     from mnemosyne.dr.recovery import verify_integrity
-    db_path = Path(args[0]) if args else None
+    db_args = [a for a in args if a != "--quick"]
+    db_path = Path(db_args[0]) if db_args else None
     quick = "--quick" in args
     try:
         if quick:
             import sqlite3
+            from mnemosyne.dr.recovery import _sqlite_ro_uri
             db = db_path or Path(DATA_DIR) / "mnemosyne.db"
-            conn = sqlite3.connect(str(db))
+            if not db.is_file():
+                print(f"Error: verify_failed — database not found: {db}")
+                sys.exit(1)
+            conn = sqlite3.connect(_sqlite_ro_uri(db), uri=True)
             cursor = conn.cursor()
             cursor.execute("PRAGMA quick_check")
             result = cursor.fetchone()
@@ -1345,7 +1378,11 @@ def cmd_verify(args):
         if ok:
             print("Database integrity check passed")
         else:
-            print("Database is corrupt. Run 'mnemosyne restore' from a backup.")
+            print(
+                "Database is corrupt. Run 'mnemosyne restore' from a backup. "
+                "If restore refuses WAL sidecar files, see docs/cli-reference.md, "
+                "'Restoring a WAL store'."
+            )
             raise SystemExit(1)
     except Exception:
         _fail("verify_failed", exit_code=1)
@@ -2159,7 +2196,10 @@ def run_cli():
         print("  delete <id>                            Delete a memory")
         print("  stats                                  Show statistics")
         print("  sleep                                  Run consolidation")
-        print("  diagnose [--fix] [--dry-run] [--repair-vec-working]  Run diagnostics / optional repairs")
+        print(
+            "  diagnose [--python PATH] [--fix] [--dry-run] [--repair-vec-working]  "
+            "Run diagnostics / optional repairs"
+        )
         print("  doctor [--db PATH|--bank NAME] [--format json|markdown|both]  Read-only report")
         print("  repair --report REPORT.json --select working_memory:ID [--apply]  Narrow doctor-gated repair")
         print("  export [--include-sync-events] [file.json]    Export memories")

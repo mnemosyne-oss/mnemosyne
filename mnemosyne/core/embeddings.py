@@ -1124,3 +1124,71 @@ def serialize(vec: np.ndarray) -> str:
 # Export dimension for other modules
 EMBEDDING_DIM = _get_embedding_dim(_DEFAULT_MODEL)
 _DEFAULT_MODEL = _DEFAULT_MODEL  # Re-export for beam.py
+
+
+# Configuration diagnostics are independent of the unavailable-engine warning.
+# Report import-time settings as loaded, not as though a later env edit reloaded them.
+_RUNTIME_CONFIGURATION_ANNOUNCED = False
+_RUNTIME_CONFIGURATION_LOCK = threading.Lock()
+try:
+    from mnemosyne.core.config import _default_config_path
+    _CONFIG_FILE_PRESENT_AT_IMPORT = _default_config_path().is_file()
+    _CONFIG_FILE_AT_IMPORT = (
+        "MNEMOSYNE_DATA_DIR/config.yaml" if os.environ.get("MNEMOSYNE_DATA_DIR")
+        else "HERMES_HOME/mnemosyne/config.yaml" if os.environ.get("HERMES_HOME")
+        else "~/.hermes/mnemosyne/config.yaml"
+    )
+except Exception:
+    _CONFIG_FILE_PRESENT_AT_IMPORT = None
+    _CONFIG_FILE_AT_IMPORT = "unknown"
+
+
+def _safe_api_origin(url: str) -> str:
+    """Log only an endpoint's origin, never userinfo, path, query or fragment."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if not parsed.hostname or parsed.scheme not in ("http", "https"):
+            return "<invalid-url>"
+        host = parsed.hostname
+        if ":" in host:
+            host = f"[{host}]"
+        port = parsed.port
+        authority = f"{host}:{port}" if port is not None else host
+        return urllib.parse.urlunsplit((parsed.scheme, authority, "", "", ""))
+    except ValueError:
+        return "<invalid-url>"
+
+
+def announce_runtime_configuration() -> None:
+    """Describe loaded embedding settings once, without testing backend health.
+
+    Model, dimension, credentials and the config-file locator are import-time
+    observations. Backend routing and endpoint resolution remain call-time.
+    File presence does not identify which individual values were explicitly
+    configured or seeded. INFO logging never changes transport or precedence.
+    """
+    global _RUNTIME_CONFIGURATION_ANNOUNCED
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    with _RUNTIME_CONFIGURATION_LOCK:
+        if _RUNTIME_CONFIGURATION_ANNOUNCED:
+            return
+        _RUNTIME_CONFIGURATION_ANNOUNCED = True
+    try:
+        backend = "disabled" if _is_disabled() else (
+            "api" if _is_api_model(_DEFAULT_MODEL) else "local"
+        )
+        endpoint = _safe_api_origin(_effective_base_url()) if backend == "api" else "none"
+        model = str(_DEFAULT_MODEL).replace("\r", " ").replace("\n", " ")[:192]
+        logger.info(
+            "Embedding runtime configuration: backend=%s model=%s dimension=%s "
+            "endpoint=%s credentials_present=%s "
+            "config_file_at_import=%s config_file_present_at_import=%s "
+            "model_dim_credentials=import-time endpoint_resolution=call-time; "
+            "configuration only, not a backend health check",
+            backend, model, EMBEDDING_DIM, endpoint, bool(_OPENAI_API_KEY),
+            _CONFIG_FILE_AT_IMPORT, _CONFIG_FILE_PRESENT_AT_IMPORT,
+        )
+    except Exception:
+        with _RUNTIME_CONFIGURATION_LOCK:
+            _RUNTIME_CONFIGURATION_ANNOUNCED = False

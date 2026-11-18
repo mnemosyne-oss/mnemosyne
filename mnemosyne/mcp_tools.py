@@ -42,9 +42,12 @@ from mnemosyne.core.beam import (
 from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
 from mnemosyne.batch_tool import (
     BatchValidationError,
+    BatchPreviewTarget,
     apply_beam_batch,
     batch_validation_error_payload,
     dry_run_batch,
+    snapshot_preview_batch,
+    preview_unavailable,
     validate_batch_operations,
 )
 
@@ -357,7 +360,35 @@ def _handle_batch(arguments: Dict[str, Any]) -> Dict[str, Any]:
         return batch_validation_error_payload(exc)
 
     if bool(arguments.get("dry_run", False)):
-        return dry_run_batch(normalized)
+        from mnemosyne.core.banks import get_bank_db_path_read_only
+        from mnemosyne.runtime_context import get_request_token_name
+
+        try:
+            bank = _resolve_bank(arguments)
+            token = get_request_token_name()
+            if token and arguments.get("author_id") and arguments["author_id"] != token:
+                return preview_unavailable()
+            path = get_bank_db_path_read_only(bank)
+            if not path.is_file():
+                return preview_unavailable()
+            # Conservatively reject WAL stores already missing sidecars. This
+            # preflight is not a lifetime lock: a concurrent last-connection
+            # close can remove them, and SQLite may recreate reader coordination
+            # at the read-only open. Database/user-data writes remain prohibited.
+            with path.open("rb") as file:
+                header = file.read(20)
+            if header[18:20] == b"\x02\x02":
+                if not all(Path(str(path) + suffix).is_file() for suffix in ("-wal", "-shm")):
+                    return preview_unavailable()
+            conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+            try:
+                return snapshot_preview_batch(normalized, target=BatchPreviewTarget(
+                    conn, f"mcp_{bank}", adapter="wrapper",
+                ))
+            finally:
+                conn.close()
+        except (OSError, ValueError, sqlite3.Error):
+            return preview_unavailable()
 
     bank = _resolve_bank(arguments)
     mem = _create_instance(
@@ -1139,6 +1170,7 @@ def _handle_diagnose(arguments: Dict[str, Any]) -> Dict[str, Any]:
         repair_vec_working=bool(arguments.get("repair_vec_working", False)),
         dry_run=bool(arguments.get("dry_run", False)),
         bank=bank,
+        scope="mcp_server",
     )
     db_path = None
     try:

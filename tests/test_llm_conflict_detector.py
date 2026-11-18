@@ -23,10 +23,11 @@ def test_llm_conflict_detector_gating(temp_db):
     """Test that LLM conflict validation returns false by default if env is false or fails."""
     # Ensure gating is off by default in testing unless explicitly patched
     with patch("mnemosyne.core.llm_conflict_detector.LLM_CONFLICT_DETECTION_ENABLED", False):
-        is_conflict, conf, correct = validate_conflict_pair(
+        is_conflict, conf, correct, status = validate_conflict_pair(
             "Event is on May 29th", "Actually the event is June 5th", "session_123", temp_db
         )
         assert is_conflict is False
+        assert status == "failed"
 
 
 @patch("mnemosyne.core.llm_conflict_detector._call_conflict_llm_with_retry")
@@ -44,10 +45,11 @@ def test_llm_conflict_detector_success(mock_call, temp_db):
     )
 
     with patch("mnemosyne.core.llm_conflict_detector.LLM_CONFLICT_DETECTION_ENABLED", True):
-        is_conflict, conf, correct = validate_conflict_pair(
+        is_conflict, conf, correct, status = validate_conflict_pair(
             "Event is on May 29th", "Actually the event is June 5th", "session_123", temp_db
         )
         assert is_conflict is True
+        assert status == "valid"
         assert conf == 0.95
         assert correct == "The event is on June 5th"
 
