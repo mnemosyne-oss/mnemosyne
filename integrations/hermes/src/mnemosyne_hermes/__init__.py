@@ -4942,7 +4942,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             metadata=p.get("metadata"),
                             veracity=clamp_veracity(p.get("veracity"), context="apply_pending"),
                             _write_policy=policy,
-                            **self._write_identity_kwargs(),
                         )
                         if mid is None:
                             failed.append({"id": pid, "error": "filtered"})
