@@ -10,9 +10,13 @@ Example:
     >>> results = recall("user preferences")
 """
 
-__version__ = "4.1.0"
+__version__ = "4.2.0"
 __author__ = "Abdias J"
 __license__ = "MIT"
+
+import os
+
+os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
 
 # Lazy imports to allow mnemosyne.install to run without heavy deps
 # (e.g. numpy is not yet installed during first-time setup)

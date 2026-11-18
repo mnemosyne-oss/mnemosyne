@@ -76,7 +76,7 @@ def assert_validation(mem, older, newer):
 def test_three_rows_one_successful_replacement(beam, monkeypatch, failed_first):
     older, first, second = add_rows(beam)
     monkeypatch.setattr(beam, "_detect_conflicts", lambda rows: [(older, first), (older, second)])
-    validate = Mock(return_value=(True, 0.97, "corrected"))
+    validate = Mock(return_value=(True, 0.97, "corrected", "valid"))
     monkeypatch.setattr(lcd, "validate_conflict_pair", validate)
     real_invalidate = beam.invalidate
     invalidations = []
@@ -99,7 +99,7 @@ def test_success_tracking_survives_source_boundary(beam, monkeypatch):
     add_rows(beam, "notes", count=2)
     candidates = iter([[(older, first)], [(older, second)]])
     monkeypatch.setattr(beam, "_detect_conflicts", lambda rows: next(candidates))
-    validate = Mock(return_value=(True, 0.97, "corrected"))
+    validate = Mock(return_value=(True, 0.97, "corrected", "valid"))
     monkeypatch.setattr(lcd, "validate_conflict_pair", validate)
     assert_counts(beam.sleep(force=True), 1, 1)
     assert_validation(beam, older, first)
@@ -107,7 +107,7 @@ def test_success_tracking_survives_source_boundary(beam, monkeypatch):
 
 
 @pytest.mark.parametrize("verdict", [
-    (False, 0.9, None), ("false", 0.9, "wrong"), None,
+    (False, 0.9, None, "valid"), ("false", 0.9, "wrong", "valid"), None,
     ValueError("fake-local-test-key"),
 ])
 def test_every_unsuccessful_call_is_detected_only(beam, monkeypatch, caplog, verdict):
@@ -136,7 +136,7 @@ def test_budgets_span_all_source_groups(beam, monkeypatch, budget_kind):
         assert kwargs["deadline"] == 101.0
         if budget_kind == "time":
             now[0] = 101.0
-        return False, 0.0, None
+        return False, 0.0, None, "failed"
 
     call = Mock(side_effect=validate)
     monkeypatch.setattr(lcd, "validate_conflict_pair", call)
@@ -161,7 +161,7 @@ def test_actual_all_session_aggregate(beam, monkeypatch):
     add_rows(beam, count=2)
     add_rows(beam, count=2, session="other")
     monkeypatch.setattr(BeamMemory, "_detect_conflicts", lambda self, rows: [(rows[0]["id"], rows[1]["id"])])
-    call = Mock(side_effect=[(True, 0.97, "corrected"), (False, 0.8, None)])
+    call = Mock(side_effect=[(True, 0.97, "corrected", "valid"), (False, 0.8, None, "valid")])
     monkeypatch.setattr(lcd, "validate_conflict_pair", call)
     result = beam.sleep_all_sessions(force=True)
     assert result["errors"] == 0
@@ -200,7 +200,7 @@ def test_unsafe_endpoint_rejected_before_validation(beam, monkeypatch, endpoint)
     older, newer = add_rows(beam, count=2)
     monkeypatch.setattr(beam, "_detect_conflicts", lambda rows: [(older, newer)])
     monkeypatch.setattr(lcd, "CONFLICT_LLM_BASE_URL", endpoint)
-    call = Mock(return_value=(True, 0.97, "corrected"))
+    call = Mock(return_value=(True, 0.97, "corrected", "valid"))
     monkeypatch.setattr(lcd, "validate_conflict_pair", call)
     assert_counts(beam.sleep(force=True), 0, 1)
     call.assert_not_called()
@@ -280,7 +280,7 @@ def test_redirects_never_replay_credentials(monkeypatch, backend, code, target, 
 ])
 def test_malformed_json_types_abstain(monkeypatch, value):
     monkeypatch.setattr(lcd, "_call_conflict_llm_with_retry", lambda *args, **kwargs: (json.dumps(value), 10, 10))
-    assert lcd.validate_conflict_pair("old", "new", "session") == (False, 0.0, None)
+    assert lcd.validate_conflict_pair("old", "new", "session") == (False, 0.0, None, "failed")
 
 
 @pytest.mark.parametrize("raw,expected", [(None, (20, 300.0)), ("", (20, 300.0)),
@@ -383,7 +383,7 @@ def test_budget_warning_totals_all_source_groups(beam, monkeypatch, caplog, api,
 
     monkeypatch.setattr(beam, "_detect_conflicts", detect)
     monkeypatch.setattr(beam_module, "_CONFLICT_PAIR_BUDGET", budget)
-    validate = Mock(return_value=(False, 0.9, None))
+    validate = Mock(return_value=(False, 0.9, None, "valid"))
     monkeypatch.setattr(lcd, "validate_conflict_pair", validate)
     result = getattr(beam, api)(force=True)
     assert len(pairs) == 6

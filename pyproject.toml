@@ -54,9 +54,9 @@ classifiers = [
 [project.optional-dependencies]
 llm = ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.20"]
 embeddings = [
-    "fastembed>=0.3.0",
-    "onnxruntime>=1.21.0,<1.29; sys_platform != 'darwin' or platform_machine != 'x86_64'",
-    "onnxruntime>=1.21.0,<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "fastembed>=0.3.0; python_version < '3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "onnxruntime; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "onnxruntime>=1.21.0,<1.24; python_version < '3.14' and sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "sqlite-vec>=0.1.9,<0.1.10",
 ]
 mcp = ["mcp>=2.0.0,!=2.1.0; python_version >= '3.10'", "anyio>=4.0; python_version >= '3.10'"]
@@ -69,9 +69,9 @@ all = [
     "ctransformers>=0.2.27",
     "llama-cpp-python>=0.2.0",
     "huggingface-hub>=0.20",
-    "fastembed>=0.3.0",
-    "onnxruntime>=1.21.0,<1.29; sys_platform != 'darwin' or platform_machine != 'x86_64'",
-    "onnxruntime>=1.21.0,<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "fastembed>=0.3.0; python_version < '3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "onnxruntime; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "onnxruntime>=1.21.0,<1.24; python_version < '3.14' and sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "sqlite-vec>=0.1.9,<0.1.10",
     "mcp>=2.0.0,!=2.1.0; python_version >= '3.10'",
     "anyio>=4.0; python_version >= '3.10'",
@@ -93,7 +93,7 @@ mnemosyne-browser = "mnemosyne.integrations.memory_browser:main"
 mnemosyne-auto-save = "mnemosyne.integrations.auto_save_openwebui:main"
 
 [tool.setuptools.packages.find]
-exclude = ["tests*", "benchmark*", "_benchmarks*", "scripts*", "docs*", "assets*", "examples*", "integrations*"]
+exclude = ["tests*", "benchmark*", "_benchmarks*", "scripts*", "docs*", "assets*", "examples*", "integrations*", "deploy*"]
 
 [tool.setuptools.package-data]
 hermes_memory_provider = ["plugin.yaml"]

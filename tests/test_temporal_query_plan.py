@@ -87,7 +87,7 @@ def test_plan_is_read_from_the_production_statement():
     sql = _shipped_sql()
     assert "julianday(timestamp) > julianday(?)" in sql, sql
     assert "ORDER BY julianday(timestamp) DESC" in sql, sql
-    assert "LIMIT 20" in sql, sql
+    assert "LIMIT ?" in sql, sql
 
 
 def test_shipped_query_plan_is_pinned(engine):
@@ -99,7 +99,7 @@ def test_shipped_query_plan_is_pinned(engine):
     """
     sql = _shipped_sql()
     conn = sqlite3.connect(str(engine.db_path))
-    plan = " ".join(row[3] for row in conn.execute(f"EXPLAIN QUERY PLAN {sql}", (_cutoff(),)))
+    plan = " ".join(row[3] for row in conn.execute(f"EXPLAIN QUERY PLAN {sql}", (_cutoff(), 20)))
     conn.close()
     assert "idx_wm_timestamp" not in plan, (
         "the shipped query now uses idx_wm_timestamp — an expression index was added, so "
@@ -114,7 +114,7 @@ def test_shipped_query_stays_within_the_accepted_budget(engine):
     samples = []
     for _ in range(20):
         start = time.perf_counter()
-        conn.execute(sql, (_cutoff(),)).fetchall()
+        conn.execute(sql, (_cutoff(), 20)).fetchall()
         samples.append((time.perf_counter() - start) * 1000)
     conn.close()
     samples.sort()
@@ -126,7 +126,7 @@ def test_instant_ordering_holds_on_the_real_reader(tmp_path):
     """The behaviour the scan buys, through `_temporal_voice` itself.
 
     09:00-05:00 is 14:00 UTC and 12:00+02:00 is 10:00 UTC. As TEXT the second sorts first;
-    with julianday() the first does, which is what decides admission before LIMIT 20.
+    with julianday() the first does, which is what decides admission before the LIMIT.
 
     A small dedicated table, not the 50k fixture: the point is the ordering, and reusing the
     budget fixture would put 50k rows between these two and the top of the result.

@@ -66,7 +66,7 @@ def test_diagnose_without_active_beam_keeps_base_diagnostics(monkeypatch):
 
     result = json.loads(provider._handle_diagnose({}))
 
-    assert result == {"checks_total": 1, "key_findings": ["base finding"]}
+    assert result == {"checks_total": 1, "key_findings": ["base finding"], "runtime_scope": "unscoped", "runtime_log_scope": "legacy_unverified"}
 
 
 def test_diagnose_reports_count_error_without_failing(tmp_path, monkeypatch):

@@ -1,0 +1,6 @@
+{
+    admin off
+}
+{$MNEMOSYNE_HOSTNAME} {
+    reverse_proxy mnemosyne-mcp:8080
+}

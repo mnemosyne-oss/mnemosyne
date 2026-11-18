@@ -1,0 +1,19 @@
+services:
+  mnemosyne-mcp:
+    ports: !override []
+  caddy:
+    image: caddy:2-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
+    restart: unless-stopped
+    ports:
+      - "${MNEMOSYNE_CADDY_BIND_IP:?set the LAN or public bind address}:80:80"
+      - "${MNEMOSYNE_CADDY_BIND_IP:?set the LAN or public bind address}:443:443"
+    environment:
+      MNEMOSYNE_HOSTNAME: ${MNEMOSYNE_HOSTNAME:?set the HTTPS hostname}
+    volumes:
+      - ${MNEMOSYNE_CADDYFILE:?select ./deploy/docker/Caddyfile.lan or Caddyfile.public}:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [mnemosyne-mcp]
+volumes:
+  caddy-data:
+  caddy-config:

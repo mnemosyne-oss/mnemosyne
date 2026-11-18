@@ -680,6 +680,20 @@ class TestReadOnly:
 
         assert fleet_census.discover_banks(root) == [productive]
 
+    def test_directory_symlink_is_not_walked_or_reported_unreadable(self, tmp_path):
+        """A linked directory is outside discovery, but its bank remains readable."""
+        root = tmp_path / "fleet"
+        root.mkdir()
+        bank = _make_bank(tmp_path / "external" / "bank.db", [])
+        (root / "linked-bank").symlink_to(bank.parent, target_is_directory=True)
+
+        assert fleet_census.discover_banks(root) == []
+        report = fleet_census.census(root=root)
+        assert report["banks_scanned"] == 0
+        assert report["unreadable"] == []
+        assert report["bound_holds"] is True
+        assert fleet_census.census(root=root, banks=[bank])["banks_scanned"] == 1
+
     @pytest.mark.parametrize(
         "root_name,alias_name,keep_partial",
         [("state-snapshots", "snapshot-alias", False), ("fleet", "state-snapshots", True)],

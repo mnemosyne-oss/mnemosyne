@@ -1,8 +1,8 @@
 ---
 title: "Configuration"
-version: 4.1.0
+version: 4.2.0
 config_key_count: 117
-env_only_count: 52
+env_only_count: 53
 generated_at: "auto"
 ---
 
@@ -24,7 +24,7 @@ Keys marked **restart** are read once at startup. Changing them at runtime warns
 and does not take effect until the process restarts.
 
 There are **117 configuration keys**. A further
-**52 environment variables** are read directly from the
+**53 environment variables** are read directly from the
 environment and are **not** settable in `config.yaml`; they are listed separately below.
 
 ---
@@ -182,7 +182,7 @@ This list is derived by scanning the package for `os.environ.get("MNEMOSYNE_..."
 
 ---
 
-## Environment-only variables (52)
+## Environment-only variables (53)
 
 These are read with `os.environ` at their point of use and bypass
 `MnemosyneConfig` entirely. They cannot be set in `config.yaml`.
@@ -204,6 +204,7 @@ These are read with `os.environ` at their point of use and bypass
 | `MNEMOSYNE_EMBEDDING_DOC_PREFIX` | Prefix prepended verbatim to every document before embedding. Unset or empty by default, preserving the original text. When `MNEMOSYNE_EMBEDDING_API_URL` is configured with a remote endpoint, prefixed text may be sent to that embedding API; privacy-sensitive deployments should remain local-first by using local embeddings or a locally hosted endpoint. |
 | `MNEMOSYNE_EMBEDDING_QUERY_PREFIX` | Prefix prepended verbatim to every retrieval query before embedding. Unset or empty by default, preserving the original text. When `MNEMOSYNE_EMBEDDING_API_URL` is configured with a remote endpoint, prefixed text may be sent to that embedding API; privacy-sensitive deployments should remain local-first by using local embeddings or a locally hosted endpoint. |
 | `MNEMOSYNE_EMBEDDING_THREADS` | Thread count for local ONNX embedding inference. |
+| `MNEMOSYNE_ENTITY_POSITION_FILTER` | Set to `1`, `true`, `yes` or `on` (case-insensitive, ignoring surrounding whitespace) to enable the position check for fallback single-capitalized-word candidates. It rejects words following a position boundary, contraction stems (`Don` in `Don't`), and words opening quoted phrases followed by an ASCII lowercase letter after horizontal spaces/tabs. Position boundaries are the start of text, `.`, `!`, `?`, `:`, `;`, `…`, LF (`\n`) and CR (`\r`), plus a bracketed uppercase speaker label such as `[USER]` at the start of a line followed by a space or tab. Names after a colon or semicolon can therefore be filtered even when they are not grammatical sentence openers. Horizontal spaces/tabs are accepted before the lowercase follower. Opening curly quotes are handled like straight quotes when checking these position boundaries. The period in `Dr.`, `Mr.`, `Mrs.`, `Ms.`, `Prof.` or `St.` is not a sentence boundary when only spaces/tabs separate it from the following name; real line breaks remain boundaries. Within the fallback pattern, a candidate bypasses the position check only when none of those three conditions matches. Possessive tails are exempt from the contraction-stem check only; position checks can still reject them. Multi-word name patterns, `@mentions` and `#hashtags` skip this check; other extraction filters and longer-name merging still apply. Default OFF, read per call. When enabled, a subject name occurring only at the start of a short fact (`Jane is an architect.`) can be lost. |
 | `MNEMOSYNE_EXTRACTION_MODEL` | Model used by the cloud extraction client. |
 | `MNEMOSYNE_EXTRACTION_PROMPT` | Override the fact extraction prompt. |
 | `MNEMOSYNE_FACT_BONUS` | A/B toggle for the fact match bonus in episodic scoring. |

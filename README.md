@@ -162,8 +162,10 @@ mnemosyne mcp --transport streamable-http --port 8080  # Streamable HTTP (native
 # Direct memory ops
 mnemosyne store "User likes dark mode"
 mnemosyne recall "preferences"
+mnemosyne recall "preferences" --preview  # Explicit 150-character display preview
 mnemosyne stats
 mnemosyne sleep                         # Run consolidation
+mnemosyne diagnose --python /path/to/python  # Check a specific runtime interpreter
 
 # Export / import
 mnemosyne export backup.json
@@ -172,6 +174,14 @@ mnemosyne import backup.json
 # Sync (bidirectional memory sync between instances)
 mnemosyne sync --db-path /path/to/mnemosyne.db --remote https://my-vps:8765
 ```
+
+Human-readable `recall` output reads the current full content of selected
+working-memory, episodic-memory and MEMORIA hits. Ranking and scores stay the
+same; public `recall()` results, JSON output and cached payloads retain their
+configured content cap. `--preview` displays 150 characters and the full length
+when available. If a source is unavailable, its prefix has changed, or its hit
+type cannot be expanded, the CLI labels the remaining recall preview and reports
+the full length as unknown. These are current reads, not historical snapshots.
 
 ---
 
@@ -223,6 +233,13 @@ work_mem.remember("Sprint review on Friday")
 ```
 
 ### Advanced: BEAM Direct Access
+
+Direct reads with `beam.get(memory_id)`, `Mnemosyne.get()`, and MCP
+`mnemosyne_get` include the stored `channel_id` and `trust_tier` for working
+and episodic memories. These fields may be `None` in rows without recorded values.
+JSON export/import preserves both fields, including explicit `None` values.
+Older exports without these keys retain the import defaults (`channel_id=None`,
+`trust_tier="STATED"`).
 
 When consolidation uses an OpenAI-compatible LLM endpoint (`MNEMOSYNE_LLM_BASE_URL`),
 Markdown bullet facts in its summaries are preserved. Prompt/token cleanup and
@@ -523,3 +540,7 @@ Copyright (c) 2026 Abdias J
 <p align="center">
   <em>"The faintest ink is more powerful than the strongest memory." -- Hermes Trismegistus</em>
 </p>
+
+## Docker self-hosting
+
+For shared MCP memory on a NAS or VPS, see the [Docker deployment guide](deploy/docker/README.md), including direct LAN HTTP, existing reverse proxies and optional Caddy HTTPS. See its verification record for tested platforms and clients.

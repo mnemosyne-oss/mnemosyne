@@ -131,6 +131,23 @@ def test_aware_row_ages_the_same_as_naive(db, non_utc_tz):
     assert abs(naive_age - (1 / 24)) < 0.01, naive_age
 
 
+@pytest.mark.parametrize("suffix", ["", "+00:00", "Z"], ids=["naive", "offset", "zulu"])
+@pytest.mark.parametrize("non_utc_tz", ["UTC0", "NYT5", "JST-9"], indirect=True)
+def test_utc_timestamp_forms_remain_recallable(db, non_utc_tz, suffix):
+    """UTC Z rows must survive Python 3.10 parsing without rewriting storage."""
+    instant = datetime.now(timezone.utc) - timedelta(hours=1)
+    stamp = instant.replace(tzinfo=None).isoformat() + suffix
+    _stamp(db, "utc-form", stamp)
+
+    results = _temporal(db)
+
+    assert [row.memory_id for row in results] == ["utc-form"]
+    assert results[0].metadata["age_days"] == pytest.approx(1 / 24, abs=0.001)
+    assert results[0].score == pytest.approx(0.994065, abs=0.0001)
+    with sqlite3.connect(str(db)) as conn:
+        assert conn.execute("SELECT timestamp FROM working_memory").fetchone()[0] == stamp
+
+
 def test_offset_never_ages_a_row_backwards(db, non_utc_tz):
     """A row must never read as younger than it is, in either direction."""
     _insert(db, "fresh", age_hours=1)

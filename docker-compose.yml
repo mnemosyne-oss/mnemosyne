@@ -1,16 +1,26 @@
-version: "3.9"
+# Docker Compose >=2.24.4. See deploy/docker/README.md.
 services:
   mnemosyne-mcp:
-    image: ghcr.io/mnemosyne-oss/mnemosyne-mcp:latest
-    build: .
+    image: ${MNEMOSYNE_IMAGE:?set a fixed image version or local build tag}
+    build:
+      context: .
+      args:
+        VERSION: ${MNEMOSYNE_VERSION:-dev}
+        REVISION: ${MNEMOSYNE_REVISION:-unknown}
+    restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - mnemosyne-data:/data
+      - mnemosyne-cache:/cache
     environment:
-      - MNEMOSYNE_DATA_DIR=/data
-      - MNEMOSYNE_MCP_TOKEN=${MNEMOSYNE_MCP_TOKEN:-}
-    command: ["--transport", "sse", "--host", "0.0.0.0", "--port", "8080"]
-
+      MNEMOSYNE_DATA_DIR: /data
+      MNEMOSYNE_FASTEMBED_CACHE_DIR: /cache/fastembed
+      MNEMOSYNE_MCP_TOKENS: ${MNEMOSYNE_MCP_TOKENS:?set named agent tokens}
+      MNEMOSYNE_MCP_ALLOWED_HOSTS: ${MNEMOSYNE_MCP_ALLOWED_HOSTS:?set exact client hostname}
+      MNEMOSYNE_MCP_BANK: default
+      MNEMOSYNE_DEFAULT_SCOPE: global
+    command: ["--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8080"]
 volumes:
   mnemosyne-data:
+  mnemosyne-cache:
