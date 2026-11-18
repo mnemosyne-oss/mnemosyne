@@ -76,6 +76,60 @@ class _NoConflictRedirects(HTTPRedirectHandler):
         return None
 
 
+def _reject_json_constant(_value: str) -> None:
+    """Reject non-standard JSON numeric constants before transport selection."""
+    raise ValueError("Non-standard JSON number")
+
+
+def _finite_json_float(text: str) -> float:
+    """Parse JSON decimals while refusing overflow to a nonfinite float."""
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError("Nonfinite JSON number")
+    return value
+
+
+def _conflict_request_options() -> dict:
+    """Use explicit provider options, retaining the conflict-check default."""
+    raw_tokens = os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "").strip()
+    max_tokens = 512
+    if raw_tokens:
+        try:
+            max_tokens = int(raw_tokens)
+            if max_tokens <= 0:
+                raise ValueError
+        except ValueError:
+            logger.warning("Conflict detection: invalid MNEMOSYNE_LLM_MAX_TOKENS; using 512.")
+            max_tokens = 512
+    options = {"max_tokens": max_tokens}
+    body_variable = "MNEMOSYNE_LLM_EXTRA_BODY"
+    raw_body = os.environ.get("MNEMOSYNE_CONFLICT_LLM_EXTRA_BODY")
+    if raw_body is None:
+        raw_body = os.environ.get("MNEMOSYNE_LLM_EXTRA_BODY", "")
+    else:
+        body_variable = "MNEMOSYNE_CONFLICT_LLM_EXTRA_BODY"
+    raw_body = raw_body.strip()
+    if not raw_body:
+        return options
+    try:
+        extra = json.loads(
+            raw_body,
+            parse_constant=_reject_json_constant,
+            parse_float=_finite_json_float,
+        )
+    except ValueError:
+        logger.warning("Conflict detection: invalid %s; ignoring it.", body_variable)
+        return options
+    if not isinstance(extra, dict):
+        logger.warning("Conflict detection: %s must be an object; ignoring it.", body_variable)
+        return options
+    reserved = {"messages", "model", "stream"}
+    if reserved.intersection(extra):
+        logger.warning("Conflict detection: reserved fields in %s were ignored.", body_variable)
+    options.update({key: value for key, value in extra.items() if key not in reserved})
+    return options
+
+
 def _call_conflict_llm_with_retry(
     prompt: str, *, deadline: Optional[float] = None,
 ) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
@@ -110,6 +164,8 @@ def _call_conflict_llm_with_retry(
         "temperature": 0.0,
         "response_format": {"type": "json_object"} if "gemini" in CONFLICT_LLM_MODEL.lower() or "gpt" in CONFLICT_LLM_MODEL.lower() else None
     }
+
+    payload.update(_conflict_request_options())
 
     max_retries = 2
     backoff_factor = 2.0
