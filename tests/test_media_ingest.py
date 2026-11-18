@@ -421,6 +421,141 @@ def test_a_backend_that_does_not_serve_the_modality_is_not_called(beam, tmp_path
     assert result.status == "unavailable"
 
 
+def _asset_provenance(beam, asset_id):
+    row = beam.media.get_asset(asset_id)
+    return row["understanding_status"], row["provider"], row["provider_model"]
+
+
+def test_a_successful_ingest_records_provenance_on_the_asset(beam, tmp_path, enabled):
+    _provider(_CAPTION)
+    result = remember_media(beam, ref=str(_png_file(tmp_path)))
+
+    assert _asset_provenance(beam, result.asset_id) == ("ok", "stub", "stub/model")
+    moments = beam.media.get_moments(result.asset_id)
+    assert {(m["provider"], m["provider_model"]) for m in moments} == {
+        ("stub", "stub/model")
+    }
+
+
+def test_a_partial_ingest_records_provenance_on_the_asset(beam, tmp_path, enabled):
+    _provider(DescribeResult(provider="stub", model="stub/model", moments=[
+        DescribedMoment(kind="caption", text="good"),
+        DescribedMoment(kind="caption", text=""),
+    ]))
+    result = remember_media(beam, ref=str(_png_file(tmp_path)))
+
+    assert _asset_provenance(beam, result.asset_id) == ("partial", "stub", "stub/model")
+    moments = beam.media.get_moments(result.asset_id)
+    assert len(moments) == 1
+    assert (moments[0]["provider"], moments[0]["provider_model"]) == ("stub", "stub/model")
+
+
+@pytest.mark.parametrize(
+    "first_pair,second_pair,add_new_span",
+    [
+        (("first", "first/model"), ("second", "second/model"), False),
+        (("first", "first/model"), ("second", "second/model"), True),
+        (("first", "first/model"), ("first", "other/model"), True),
+        (("first", "shared/model"), ("second", "shared/model"), True),
+        ((None, "shared/model"), ("second", "shared/model"), True),
+        (("first", None), ("first", "second/model"), True),
+        ((None, None), ("second", "second/model"), True),
+        (("first", None), ("first", None), True),
+    ],
+    ids=[
+        "duplicate", "mixed", "model-only-change", "provider-only-change",
+        "unknown-provider", "unknown-model", "unknown-pair", "shared-unknown-model",
+    ],
+)
+def test_reingest_attributes_only_retained_moments(
+    beam, tmp_path, enabled, first_pair, second_pair, add_new_span,
+):
+    ref = str(_png_file(tmp_path))
+    _provider(DescribeResult(provider=first_pair[0], model=first_pair[1], moments=[
+        DescribedMoment(kind="caption", text="Original caption"),
+    ]))
+    first = remember_media(beam, ref=ref)
+    assert _asset_provenance(beam, first.asset_id) == ("ok", *first_pair)
+
+    second_moments = [DescribedMoment(kind="caption", text="Replacement caption")]
+    if add_new_span:
+        second_moments.append(
+            DescribedMoment(kind="ocr", text="New text", bbox=[0.1, 0.2, 0.3, 0.4])
+        )
+    _provider(DescribeResult(
+        provider=second_pair[0], model=second_pair[1], moments=second_moments,
+    ))
+    second = remember_media(beam, ref=ref)
+
+    assert second.asset_id == first.asset_id
+    moments = {row["kind"]: row for row in beam.media.get_moments(first.asset_id)}
+    caption = moments["caption"]
+    assert caption["text"] == "Original caption"
+    assert caption["memory_id"] == first.memory_ids[0]
+    assert (caption["provider"], caption["provider_model"]) == first_pair
+    expected = first_pair
+    if add_new_span:
+        assert set(moments) == {"caption", "ocr"}
+        assert (moments["ocr"]["provider"], moments["ocr"]["provider_model"]) == second_pair
+        if first_pair != second_pair:
+            expected = (None, None)
+    else:
+        assert set(moments) == {"caption"}
+    assert _asset_provenance(beam, first.asset_id) == ("ok", *expected)
+
+
+@pytest.mark.parametrize("second,status", [
+    (DescribeResult(provider="stub", model="stub/model", refused=True), "refused"),
+    (DescribeResult(provider="stub", model="stub/model"), "unavailable"),
+    (None, "unavailable"),
+])
+def test_an_unsuccessful_ingest_leaves_no_provenance_on_the_asset(
+    beam, tmp_path, enabled, second, status,
+):
+    ref = str(_png_file(tmp_path))
+    _provider(_CAPTION)
+    first = remember_media(beam, ref=ref)
+    assert _asset_provenance(beam, first.asset_id) == ("ok", "stub", "stub/model")
+
+    _provider(second)
+    again = remember_media(beam, ref=ref)
+
+    assert again.asset_id == first.asset_id
+    assert _asset_provenance(beam, again.asset_id) == (status, None, None)
+
+
+def test_no_provider_leaves_no_provenance_on_the_asset(beam, tmp_path):
+    result = remember_media(beam, ref=str(_png_file(tmp_path)))
+    assert _asset_provenance(beam, result.asset_id) == ("unavailable", None, None)
+
+
+@pytest.mark.parametrize("reingest", [False, True], ids=["first-ingest", "reingest"])
+def test_a_failed_ingest_leaves_no_provenance_on_the_asset(
+    beam, tmp_path, enabled, monkeypatch, reingest,
+):
+    ref = str(_png_file(tmp_path))
+    _provider(_CAPTION)
+    if reingest:
+        first = remember_media(beam, ref=ref)
+        assert _asset_provenance(beam, first.asset_id) == ("ok", "stub", "stub/model")
+
+    def fail_binding(*args, **kwargs):
+        raise RuntimeError("constraint error")
+
+    monkeypatch.setattr(media, "_bind_moment_memories", fail_binding)
+    with pytest.raises(RuntimeError, match="constraint error"):
+        remember_media(beam, ref=ref)
+
+    rows = beam.conn.execute(
+        "SELECT asset_id, understanding_status, provider, provider_model FROM media_assets"
+    ).fetchall()
+    assert len(rows) == 1
+    asset_id, status, provider, model = rows[0]
+    if reingest:
+        assert asset_id == first.asset_id
+    assert (status, provider, model) == ("unavailable", None, None)
+
+
 def test_status_is_never_left_pending(beam, tmp_path, enabled, monkeypatch):
     """The `finally` exists because nothing retries a stranded `pending`, and
     doctor would not flag it either."""
@@ -580,6 +715,14 @@ def test_ingest_through_the_real_openai_compat_adapter(beam, tmp_path, monkeypat
 
         assert result.status == "ok"
         assert len(result.memory_ids) == 1
+
+        asset = beam.media.get_asset(result.asset_id)
+        moments = beam.media.get_moments(result.asset_id)
+        assert asset["provider_model"] == "some/vision-model"
+        assert asset["provider"] is not None
+        assert {(m["provider"], m["provider_model"]) for m in moments} == {
+            (asset["provider"], asset["provider_model"])
+        }
 
         # The bytes went out as a data part, since a local path is not fetchable
         # by the provider -- this is the DescribeRequest.fetch path, live.

@@ -19,7 +19,9 @@ from datetime import datetime
 from typing import List, Dict
 from pathlib import Path
 
+from mnemosyne.core.filters import _RESTORE_WRITE_CAPABILITY
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
+from mnemosyne.core.user_agent import application_user_agent
 
 
 class LettaImporter(BaseImporter):
@@ -133,7 +135,7 @@ class LettaImporter(BaseImporter):
         import urllib.request
 
         base = self.base_url or "https://api.letta.com"
-        headers = {}
+        headers = {"User-Agent": application_user_agent()}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         headers["Content-Type"] = "application/json"
@@ -287,7 +289,11 @@ class LettaImporter(BaseImporter):
                         metadata=meta,
                         valid_until=mem_dict.get("valid_until"),
                         scope=mem_dict.get("scope", "session"),
+                        _write_kind=_RESTORE_WRITE_CAPABILITY,
                     )
+                    if mid is None:
+                        result.skipped += 1
+                        continue
                     if author_id or author_type or chan:
                         try:
                             mnemosyne.beam.conn.execute("""

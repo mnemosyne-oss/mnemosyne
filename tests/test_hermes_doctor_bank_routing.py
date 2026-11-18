@@ -7,16 +7,10 @@ Related: #362, #373.
 """
 
 import json
-import os
 import sqlite3
 import sys
 import types
-from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-import pytest
-
-from mnemosyne_hermes.cli import _resolve_cli_bank
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +48,7 @@ def _create_minimal_schema(conn):
         "author_id TEXT, author_type TEXT, channel_id TEXT, trust_tier TEXT,"
         "validator TEXT, validated_at TEXT, validation_count INTEGER,"
         "event_date TEXT, event_date_precision TEXT, temporal_tags TEXT,"
-        "corrected_by TEXT, event_date_end TEXT)"
+        "corrected_by INTEGER, event_date_end TEXT)"
     )
 
 

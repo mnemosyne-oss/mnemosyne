@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from hermes_memory_provider import MnemosyneMemoryProvider
 from mnemosyne.core.beam import BeamMemory
 
@@ -158,6 +160,42 @@ def test_batch_failure_rolls_back_earlier_update(tmp_path):
     assert result["failed_index"] == 1
     assert result["action"] == "forget"
     assert provider._beam.get(memory_id)["content"] == "before update"
+
+
+@pytest.mark.parametrize("rejected_action", ["remember", "update"])
+def test_batch_policy_rejection_rolls_back_all_operations(
+    tmp_path, rejected_action
+):
+    from mnemosyne.batch_tool import apply_beam_batch, validate_batch_operations
+    from mnemosyne.core.filters import WritePolicySnapshot
+
+    beam = _beam(tmp_path)
+    target_id = beam.remember("unchanged update target")
+    rejected = {
+        "action": rejected_action,
+        "content": "ISSUE821 rejected batch content",
+    }
+    if rejected_action == "update":
+        rejected["memory_id"] = target_id
+    normalized = validate_batch_operations([
+        {"action": "remember", "content": "must roll back"},
+        rejected,
+    ])
+
+    result = apply_beam_batch(
+        beam,
+        normalized,
+        write_policy=WritePolicySnapshot((r"^ISSUE821",), "strict"),
+    )
+
+    assert result == {
+        "status": "error",
+        "error": "batch_failed",
+        "failed_index": 1,
+        "action": rejected_action,
+    }
+    assert _count_matching(beam, "must roll back") == 0
+    assert beam.get(target_id)["content"] == "unchanged update target"
 
 
 def test_batch_audit_events_emit_only_after_successful_commit(tmp_path):

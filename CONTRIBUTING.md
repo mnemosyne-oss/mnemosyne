@@ -5,7 +5,7 @@ Mnemosyne is a personal project that grew into something useful. If you're here,
 ## Getting Started
 
 ```bash
-git clone https://github.com/AxDSan/mnemosyne.git
+git clone https://github.com/mnemosyne-oss/mnemosyne.git
 cd mnemosyne
 
 # Core tests (matches the CI default and avoids embedding-model downloads)
@@ -19,6 +19,17 @@ MNEMOSYNE_NO_EMBEDDINGS=1 python -m pytest integrations/hermes/tests/ -v
 
 The Hermes provider is packaged separately from `mnemosyne-memory`, so its
 editable install is required before running `integrations/hermes/tests/`.
+
+The published minimum-Core compatibility test is an explicit online check:
+it downloads the pinned Core wheel from PyPI, verifies its SHA256, builds the
+current Hermes wheel, and exercises the provider lifecycle. It is skipped in
+normal test runs and runs in a separate CI step on every supported Python version.
+To run it locally:
+
+```bash
+MNEMOSYNE_NO_EMBEDDINGS=1 MNEMOSYNE_TEST_PUBLISHED_CORE=1 python -m pytest \
+  tests/test_hermes_core_release_contract.py::test_published_minimum_core_completes_the_provider_lifecycle -v
+```
 
 ## What You Can Do
 
@@ -51,9 +62,9 @@ Releases are fully automated via GitHub Actions:
    git tag -a v1.X.Y -m "Release v1.X.Y"
    git push origin v1.X.Y
    ```
-4. The [release workflow](https://github.com/AxDSan/mnemosyne/actions/workflows/release.yml) handles the rest:
+4. The [release workflow](https://github.com/mnemosyne-oss/mnemosyne/actions/workflows/release.yml) handles the rest:
    - Builds wheel + sdist
-   - Creates a [GitHub Release](https://github.com/AxDSan/mnemosyne/releases) with auto-generated notes
+   - Creates a [GitHub Release](https://github.com/mnemosyne-oss/mnemosyne/releases) with auto-generated notes
    - Publishes to [PyPI](https://pypi.org/project/mnemosyne-memory/) via trusted publishing (OIDC)
 
 No manual uploads. No API tokens.
@@ -107,7 +118,7 @@ These are not mandates — just directions where help would be valuable:
 
 ## Community
 
-- **Issues & bugs:** [GitHub Issues](https://github.com/AxDSan/mnemosyne/issues)
+- **Issues & bugs:** [GitHub Issues](https://github.com/mnemosyne-oss/mnemosyne/issues)
 - **Feature ideas & questions:** [Join our Discord](https://discord.gg/nousresearch) or open an issue
 
 ## Contributor License Agreement (CLA)

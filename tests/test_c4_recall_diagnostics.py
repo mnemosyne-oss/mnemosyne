@@ -663,7 +663,7 @@ class TestPolyphonicFallbackDiagnostics:
             def __getattr__(self, name):
                 return getattr(self._real, name)
 
-        fake_rows = [{"rowid": em_rowid, "distance": 0.0}]
+        fake_rows = [(em_rowid, 0.0, target_vec.tobytes())]
         fake_conn = _FakeVecConnection(beam.conn, fake_rows)
 
         # Force the sqlite-vec branch without the extension loaded.
@@ -671,7 +671,7 @@ class TestPolyphonicFallbackDiagnostics:
             "mnemosyne.core.beam._vec_available", lambda conn: True
         )
         monkeypatch.setattr(
-            "mnemosyne.core.beam._effective_vec_type", lambda conn: "f32"
+            "mnemosyne.core.beam._vec_table_type_strict", lambda conn: "float32"
         )
 
         engine = PolyphonicRecallEngine(db_path=temp_db, conn=fake_conn)
@@ -751,6 +751,10 @@ class TestPolyphonicFallbackDiagnostics:
         monkeypatch.setattr(
             "mnemosyne.core.embeddings.embed",
             lambda texts: np.ones((len(texts), 384), dtype=np.float32),
+        )
+        monkeypatch.setattr(
+            "mnemosyne.core.embeddings.embed_query",
+            lambda text: np.ones(384, dtype=np.float32),
         )
         beam = BeamMemory(session_id="poly-e2e", db_path=temp_db)
         beam.remember("Alice prefers Vim", source="pref", importance=0.7)
@@ -833,6 +837,10 @@ class TestPolyphonicFallbackDiagnostics:
         monkeypatch.setattr(
             "mnemosyne.core.embeddings.embed",
             lambda texts: np.ones((len(texts), 384), dtype=np.float32),
+        )
+        monkeypatch.setattr(
+            "mnemosyne.core.embeddings.embed_query",
+            lambda text: np.ones(384, dtype=np.float32),
         )
         results = beam.recall("Alice", top_k=10)
         snap = get_recall_diagnostics()

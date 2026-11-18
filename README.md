@@ -19,23 +19,6 @@
 
 </div>
 
-<div align="center">
-
-### Proudly sponsored by
-
-<a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=mnemosyne">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/partners/atlas-cloud-white.png">
-    <img src="assets/partners/atlas-cloud-black.png" alt="Atlas Cloud" width="240">
-  </picture>
-</a>
-
-**Compute Partner** &nbsp;·&nbsp; inference credits powering the nightly recall benchmarks, multi-model parity tests, and provider coverage in the Hermes plugin.
-
-[Partner with Mnemosyne](https://mnemosyne.site/partners)
-
-</div>
-
 ---
 
 **Mnemosyne** is a universal, Hermes-first memory layer that works with any agent framework (Claude Code, Cursor, Codex, OpenWebUI, OpenClaw, or your own custom agent). One `pip install`, one SQLite database. No external services required.
@@ -129,20 +112,13 @@ results = recall("user preferences")
 
 ## Benchmarks
 
-Mnemosyne scores competitively on the two major memory benchmarks, **LongMemEval** (ICLR 2025) and **BEAM** (ICLR 2026), both in one SQLite file with no cloud dependency.
+Mnemosyne is measured on **BEAM** (ICLR 2026), in one SQLite file with no cloud dependency. A **LongMemEval** (ICLR 2025) run is pending.
 
 > **Read the version labels.** These are point-in-time results, not a claim about the current build. The BEAM numbers were measured on **v3.0.0 (May 2026)** and predate polyphonic recall, enhanced recall, SHMR, and the persona tier. They have not been re-run since. Re-running BEAM and LongMemEval on the current tree is tracked as an open task.
 
-### LongMemEval (retrieval), measured April 2026
+### LongMemEval
 
-| System | Score | Notes |
-|--------|-------|-------|
-| **Mnemosyne (dense)** | **98.9% Recall@All@5** | Apr 2026, bge-small-en-v1.5, 100 instances |
-| Mempalace | 96.6% Recall@5 | AAAK + Palace architecture |
-| Backboard | 93.4% | Independent assessment |
-| Hindsight | 91.4% | Vectorize.io |
-
-Note that Mnemosyne's row is Recall@All@5 while Mempalace's is Recall@5; the metrics are not identical and the ordering should not be read as a strict ranking.
+A 98.9% Recall@All@5 figure from an April 2026 run was listed here until September 2026. No methodology or run log for it exists in any of the project repositories, so it has been withdrawn until LongMemEval is re-run on the current tree with a published, reproducible setup (#584).
 
 ### BEAM (end-to-end QA), measured on v3.0.0
 
@@ -186,8 +162,10 @@ mnemosyne mcp --transport streamable-http --port 8080  # Streamable HTTP (native
 # Direct memory ops
 mnemosyne store "User likes dark mode"
 mnemosyne recall "preferences"
+mnemosyne recall "preferences" --preview  # Explicit 150-character display preview
 mnemosyne stats
 mnemosyne sleep                         # Run consolidation
+mnemosyne diagnose --python /path/to/python  # Check a specific runtime interpreter
 
 # Export / import
 mnemosyne export backup.json
@@ -196,6 +174,14 @@ mnemosyne import backup.json
 # Sync (bidirectional memory sync between instances)
 mnemosyne sync --db-path /path/to/mnemosyne.db --remote https://my-vps:8765
 ```
+
+Human-readable `recall` output reads the current full content of selected
+working-memory, episodic-memory and MEMORIA hits. Ranking and scores stay the
+same; public `recall()` results, JSON output and cached payloads retain their
+configured content cap. `--preview` displays 150 characters and the full length
+when available. If a source is unavailable, its prefix has changed, or its hit
+type cannot be expanded, the CLI labels the remaining recall preview and reports
+the full length as unknown. These are current reads, not historical snapshots.
 
 ---
 
@@ -231,9 +217,10 @@ remember("Met with Abdias about the v2 release",
 remember("User said they prefer Python for backend work",
          extract=True)
 
-# Temporal triples (knowledge graph)
+# Temporal triples (knowledge graph), scoped to a bank so it shares the
+# bank's MCP tools instead of writing a standalone triples.db.
 from mnemosyne.core.triples import TripleStore
-kg = TripleStore()
+kg = TripleStore.for_bank("default")
 kg.add("Maya", "assigned_to", "auth-migration",
        valid_from="2026-01-15")
 kg.query("Maya", as_of="2026-02-01")
@@ -246,6 +233,10 @@ work_mem.remember("Sprint review on Friday")
 ```
 
 ### Advanced: BEAM Direct Access
+
+When consolidation uses an OpenAI-compatible LLM endpoint (`MNEMOSYNE_LLM_BASE_URL`),
+Markdown bullet facts in its summaries are preserved. Prompt/token cleanup and
+reasoning safeguards still apply; local GGUF bullet-echo cleanup is unchanged.
 
 ```python
 from mnemosyne.core.beam import BeamMemory
@@ -322,7 +313,7 @@ results = beam.recall("editor preferences", top_k=5)
 
 | Feature | Mnemosyne | Detail |
 |---------|-----------|--------|
-| **Local-first by default** | ✅ | No data ever leaves your machine unless you enable sync |
+| **Local-first by default** | ✅ | No data ever leaves your machine unless you enable sync or use remote embedding or LLM services; remote embeddings (a custom non-OpenRouter `MNEMOSYNE_EMBEDDING_API_URL`, an API-shaped model, or `MNEMOSYNE_EMBEDDINGS_VIA_API`) send the text of your memories and recall queries for vectorization, to the OpenRouter endpoint when no custom URL is set |
 | **No telemetry** | ✅ | Zero tracking, zero analytics, zero cloud dependency |
 | **Optional sync** | ✅ | Bidirectional delta sync between desktop and VPS |
 | **Client-side encryption (sync)** | ✅ | Authenticated encryption via Fernet (AES-128-CBC) or PyNaCl SecretBox (XSalsa20-Poly1305). Key never leaves your machine. |
@@ -353,14 +344,20 @@ When client-side encryption is enabled, the remote sync server sees **only metad
 | `MNEMOSYNE_WM_MAX_ITEMS` | `10000` | Working memory limit |
 | `MNEMOSYNE_RECENCY_HALFLIFE` | `168` | Decay halflife in hours |
 | `MNEMOSYNE_CONTEXT_INCLUDE_CONSOLIDATED` | *(unset)* | Include consolidated working-memory rows in `get_context()` prompt injection. Default: excluded. Truthy values: `1`, `true`, `yes`, `on`. Does not affect `recall()`. |
-| `MNEMOSYNE_EMBEDDING_API_URL` | `${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}` | Preferred name for custom embedding API endpoint (OpenAI-compatible). Falls back to `OPENROUTER_BASE_URL`. |
-| `MNEMOSYNE_EMBEDDING_API_KEY` | `${OPENROUTER_API_KEY:-${OPENAI_API_KEY:-}}` | Preferred name for embedding API key. Falls back to `OPENROUTER_API_KEY`, then `OPENAI_API_KEY`. |
+| `MNEMOSYNE_EMBEDDING_API_URL` | `https://openrouter.ai/api/v1` | Custom embedding API endpoint (OpenAI-compatible). When unset, the OpenRouter default is used directly; there is no `OPENROUTER_BASE_URL` fallback. Credentialed endpoints must use HTTPS: the client refuses to send `Authorization` over a non-HTTPS URL. |
+| `MNEMOSYNE_EMBEDDING_API_KEY` | `${OPENAI_API_KEY:-}` | Embedding API key. Falls back to `OPENAI_API_KEY`; there is no `OPENROUTER_API_KEY` fallback (set `MNEMOSYNE_EMBEDDING_API_KEY` explicitly if your chat key differs). |
 | `MNEMOSYNE_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model. Low-resource multilingual: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`; larger FastEmbed E5 option: `intfloat/multilingual-e5-large`; `BAAI/bge-m3` is another multilingual option. |
 | `MNEMOSYNE_EMBEDDING_DIM` | *(unset)* | Optional embedding dimension override (positive integer); takes precedence over the built-in model table. Blank/whitespace-only is treated as unset. |
 
 Full reference: [docs/configuration.md](docs/configuration.md)
 
 ### Language Support
+
+The Russian lexical fallback folds case and `ё`/`е` spelling when selecting
+candidates and scoring inflections (for example, `свеклы` can match `Свёкла`).
+Stored text is preserved. The fallback still averages scores over query words
+and uses the normal lexical admission gate; this does not guarantee admission
+for multi-word paraphrases or cross-language queries.
 
 Default embeddings are English-optimized (`bge-small-en-v1.5`). For **non-English or multilingual** recall, swap the model:
 
@@ -383,6 +380,19 @@ See [docs/configuration.md#custom-embedding-models](docs/configuration.md#custom
 
 When used with Hermes Agent, Mnemosyne exposes provider tools for the memory lifecycle, lifecycle hooks for automatic context injection, and MCP support.
 
+The packaged `hermes mnemosyne` CLI uses the provider's database under `HERMES_HOME/mnemosyne/data`, even when `MNEMOSYNE_DATA_DIR` points elsewhere. Profile-isolated commands select the active profile bank below that root; `doctor` reports its selected database. Standalone Core commands still honor `MNEMOSYNE_DATA_DIR`, and the packaged CLI uses the Core resolver when `HERMES_HOME` is unset. Existing stores are not moved or merged.
+
+`mnemosyne_resolve_conflicts` remains gated off by default. Its `dry_run`
+argument defaults to `false` (apply): use `dry_run=true` for deterministic
+preview, with no LLM calls or reflection reservation. Explicit
+`dry_run=true,llm_eval=true` previews LLM verdicts without superseding memories
+or emitting an apply audit, but can incur costs, write cost records and consume
+one reflection invocation. Evaluated previews now obey exhausted/cron guards
+instead of bypassing them. Both concrete Hermes provider copies expose these
+default-false arguments during migration; no core/MCP schema expansion is
+implied. See the [provider resolver contract](integrations/hermes/README.md#configuration)
+for gates, conservative reservation and cost-logging limits.
+
 > **For the full Hermes setup guide, see [docs/hermes-integration.md](docs/hermes-integration.md).** That is the canonical, most up-to-date reference.
 
 ### Install profile comparison
@@ -394,18 +404,15 @@ When used with Hermes Agent, Mnemosyne exposes provider tools for the memory lif
 | `mnemosyne-memory[all]` | Full-featured -- local embeddings + local LLM consolidation | ~1.5 GB | Adds `sentence-transformers` + local LLM deps (`ctransformers`). Maximum capability. |
 | `mnemosyne-hermes` | Hermes Agent users -- always pair with one of the above | Same as base | Wraps core library with plugin manifest + entry points; degrades instead of exiting on core init errors. Run `hermes config set memory.provider mnemosyne` after install. |
 
+API embeddings require NumPy in the interpreter running Mnemosyne. For an API-only installation, use `python -m pip install mnemosyne-memory numpy` (or add `numpy` alongside `mnemosyne-memory[mcp]`). FastEmbed and a local model are not required. Missing or broken NumPy is reported before any embedding request; after installing or repairing it, calls can retry without restarting.
+
 **Hardware guidance:** Core alone runs on a Raspberry Pi 4 (4 GB) with ~300 MB free for LLM. `[embeddings]` needs at least 2 GB free RAM. `[all]` recommends 8 GB+.
 
-**Install (Hermes users):**
-```bash
-source ~/.hermes/hermes-agent/venv/bin/activate
-python -m ensurepip --upgrade
-python -m pip install --upgrade pip
-python -m pip install mnemosyne-hermes
-mkdir -p ~/.hermes/plugins/mnemosyne
-ln -sfn "$(~/.hermes/hermes-agent/venv/bin/python -c 'import pathlib, mnemosyne_hermes; print(pathlib.Path(mnemosyne_hermes.__file__).resolve().parent)')"/* ~/.hermes/plugins/mnemosyne/
-hermes config set memory.provider mnemosyne
-```
+For optional per-input character and UTF-8 byte limits on both local and API embeddings, see [embedding input caps](docs/configuration.md#custom-embedding-endpoint). These caps default to off and do not guarantee a local inference memory ceiling.
+
+> **Privacy note on remote embedding endpoints.** Embeddings go to a remote API whenever `MNEMOSYNE_EMBEDDING_API_URL` points at a custom (non-OpenRouter) endpoint, the model name is API-shaped (`openai/*`, `text-embedding*`), or `MNEMOSYNE_EMBEDDINGS_VIA_API` is truthy; on the OpenRouter default (or an OpenRouter URL) the last two are what route, and with no URL set the OpenRouter default is used. That service receives the text of your memories and of your recall queries (working-memory content, summaries, annotations, and search queries) for vectorization. For privacy-sensitive or local-first deployments prefer a local-embedding profile (`[embeddings]` or `[all]`); use a remote endpoint only when you accept that the embedding provider sees your content.
+
+**Install (Hermes users):** Select the active Hermes home and runtime interpreter using the [Hermes integration guide](docs/hermes-integration.md). Follow the package-installation, installer and provider-status commands for your chosen route in that guide; persistent wrappers install the packages into a separate side environment. POSIX symlink mode links the package directory; native Windows, persistent wrappers and legacy recovery use their selected interpreter or route-specific executable. Do not link individual package files. Set `memory.provider` to `mnemosyne`, then check `hermes memory status` for the same home. Existing per-file plugin directories require the [ownership-checked recovery](docs/hermes-integration.md#recover-a-legacy-per-file-plugin-directory) before installation.
 
 After installing, verify the provider in the active Hermes profile and start a new session or restart the gateway:
 
@@ -415,7 +422,7 @@ hermes memory status
 
 Do **not** use `hermes tools disable memory`: that disables the memory toolset, including provider tools. In current Hermes versions, built-in memory and an external provider are separate mechanisms; `hermes memory off` disables the external provider only. Keep existing built-in memory as a rollback/reference point during a transition and confirm the active provider with `hermes memory status`.
 
-See [docs/hermes-integration.md](docs/hermes-integration.md) for the full setup guide.
+See [docs/hermes-integration.md](docs/hermes-integration.md) for the full setup guide. For multiple Hermes profiles, agent teams, or group chats (Telegram, SimpleX, etc.), see [Multiple Profiles, Agent Teams, and Group Chats](docs/hermes-integration.md#multiple-profiles-agent-teams-and-group-chats).
 
 ### Tool discovery
 
@@ -431,9 +438,13 @@ Mnemosyne exposes memory, knowledge-graph, multi-agent-surface, working-note, an
 
 ```bash
 export HERMES_HOME=/opt/data  # Replace with the active Hermes home
-"$HERMES_HOME/.mnemosyne/venv/bin/python" -m pip install --upgrade 'mnemosyne-memory[embeddings]' mnemosyne-hermes
+VENV="$HERMES_HOME/.mnemosyne/venv"
+"$VENV/bin/python" -m pip install --upgrade 'mnemosyne-memory[embeddings]' mnemosyne-hermes
+"$VENV/bin/mnemosyne-hermes" install --mode wrapper --force --python "$VENV/bin/python"
 hermes gateway restart
 ```
+
+The forced install regenerates the wrapper plugin files and does not modify the Mnemosyne database.
 
 For a direct or source install, use `pip install --upgrade mnemosyne-hermes && hermes gateway restart` or `git pull && pip install --upgrade integrations/hermes && hermes gateway restart` (source).
 
@@ -476,36 +487,23 @@ mnemosyne sync-status --remote https://my-vps:8765
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
-Full docs: [`docs/`](docs/README.md) . Changelog: [`CHANGELOG.md`](CHANGELOG.md) . Releases: [GitHub Releases](https://github.com/AxDSan/mnemosyne/releases) . Integrations: [docs/integrations/](docs/integrations/README.md)
+Full docs: [`docs/`](docs/README.md) . Changelog: [`CHANGELOG.md`](CHANGELOG.md) . Releases: [GitHub Releases](https://github.com/mnemosyne-oss/mnemosyne/releases) . Integrations: [docs/integrations/](docs/integrations/README.md)
 
 ---
 
 ## Sponsors
 
-Mnemosyne development is supported by companies providing compute credits (LLM, embedding, GPU), hosting, and developer tooling. See the full list and sponsorship policy at **[mnemosyne.site/partners](https://mnemosyne.site/partners)**.
+Mnemosyne development is supported by paid sponsorships and by companies providing compute credits (LLM, embedding, GPU), hosting, and developer tooling. See the full list, tiers and sponsorship policy at **[mnemosyne.site/partners](https://mnemosyne.site/en/partners)**.
 
 ### Compute Partners
 
-<div align="center">
+The Compute Partner position is currently open. It is held by one inference provider at a time, whose credits run the nightly recall benchmarks and multi-model parity tests, in exchange for the top placement in this README, the partners page and a dedicated documentation page.
 
-<a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=mnemosyne">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/partners/atlas-cloud-white.png">
-    <img src="assets/partners/atlas-cloud-black.png" alt="Atlas Cloud" width="280">
-  </picture>
-</a>
-
-</div>
-
-**[Atlas Cloud](https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=mnemosyne)** -- a full-modal AI inference platform: one API for 300+ curated LLM, image, and video models, so you connect once instead of maintaining a vendor integration per modality. Their OpenAI-compatible endpoint works with Mnemosyne and the Hermes plugin out of the box.
-
-Atlas Cloud provides inference credits used for nightly recall benchmarks, multi-model parity tests, and OpenAI-compatible provider coverage. Budget-friendly API access is available through their [coding plan](https://www.atlascloud.ai/console/coding-plan?utm_source=github&utm_medium=link&utm_campaign=mnemosyne).
-
-*Sponsored. Compute Partners are disclosed material connections under FTC Endorsement Guides (16 CFR Part 255). Sponsors have no editorial control over benchmark methodology or results.*
+*Compute Partners are disclosed material connections under FTC Endorsement Guides (16 CFR Part 255). Sponsors have no editorial control over benchmark methodology or results.*
 
 ### Partner with us
 
-If your company runs an OSS credits program and wants to partner, open an issue tagged `sponsorship` or email `sponsors@mnemosyne.site`.
+Sponsorship is paid, in cash or in credits, and every placement is disclosed. To ask about the Compute Partner position or a Sponsor slot, email `sponsors@mnemosyne.site` or open an issue tagged `sponsorship`.
 
 ---
 
@@ -513,7 +511,7 @@ If your company runs an OSS credits program and wants to partner, open an issue 
 
 <div align="center">
 
-**Discord:** [Join the Mnemosyne community](https://discord.gg/nousresearch) . **Issues:** [GitHub Issues](https://github.com/AxDSan/mnemosyne/issues)
+**Discord:** [Join the Mnemosyne community](https://discord.gg/nousresearch) . **Issues:** [GitHub Issues](https://github.com/mnemosyne-oss/mnemosyne/issues)
 
 <a href="https://github.com/sponsors/AxDSan"><img src="https://img.shields.io/badge/%F0%9F%92%96_GitHub_Sponsors-30363D?style=for-the-badge&logo=github&logoColor=white" alt="GitHub Sponsors"/></a>
 <a href="https://ko-fi.com/axdsan"><img src="https://img.shields.io/badge/%E2%98%95_Ko-fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white" alt="Ko-fi"/></a>

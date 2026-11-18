@@ -32,11 +32,13 @@ import os
 import threading
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+_SURFACE_ID = "shared-surface-v1"
+_SURFACE_SESSION_ID = "hermes_shared_surface"
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +187,27 @@ class SyncAdapter:
         try:
             from mnemosyne.core.sync import SyncEngine, SyncEncryption
 
+            beam = getattr(self._beam, "beam", self._beam)
+            session_id = getattr(beam, "session_id", None)
+            if session_id != _SURFACE_SESSION_ID:
+                raise ValueError(
+                    "sync requires the dedicated global shared surface; "
+                    f"expected session {_SURFACE_SESSION_ID!r}"
+                )
+            # SQLite IS NOT is null-safe, so NULL scope/session values are invalid.
+            existing_rows, invalid_rows = beam.conn.execute(
+                """SELECT COUNT(*), COALESCE(SUM(
+                       CASE WHEN scope IS NOT 'global' OR session_id IS NOT ? THEN 1 ELSE 0 END
+                   ), 0)
+                   FROM working_memory""",
+                (_SURFACE_SESSION_ID,),
+            ).fetchone()
+            if invalid_rows:
+                raise ValueError(
+                    "sync requires a dedicated global shared surface; "
+                    "found private or foreign-session rows"
+                )
+
             encryption = None
             if self.encrypt_enabled and self.encryption_key:
                 encryption = SyncEncryption.from_config(key_source=self.encryption_key)
@@ -199,6 +222,10 @@ class SyncAdapter:
             self._engine = SyncEngine(
                 beam_instance=self._beam,
                 encryption=encryption,
+                surface_only=True,
+                surface_id=_SURFACE_ID,
+                initialize_surface=True,
+                claim_existing_surface=bool(existing_rows),
             )
             logger.info(
                 "SyncAdapter initialized: device=%s, remote=%s, encrypt=%s",
@@ -259,6 +286,13 @@ class SyncAdapter:
 
     # --- Push --------------------------------------------------------------
 
+    def _pull_cursor(self, remote: Optional[str] = None) -> str:
+        """Return the cursor persisted by SyncEngine for this pull remote."""
+        remote_url = (remote or self.remote).rstrip("/")
+        if not remote_url:
+            return ""
+        return str(self._engine._meta_get(f"last_pull_cursor_{remote_url}") or "")
+
     def _handle_push(self) -> str:
         if not self.remote:
             return json.dumps({
@@ -266,34 +300,30 @@ class SyncAdapter:
                 "error": "No remote configured. Set MNEMOSYNE_SYNC_REMOTE env var.",
             })
 
-        # Last cursor from sync_meta
-        cursor = self._engine._meta_get("last_sync_cursor") or ""
-        changes = self._engine.pull_changes(since_cursor=cursor or None, limit=500)
+        result = self._engine.sync_with(
+            self.remote,
+            mode="push",
+            api_key=self.auth_token or None,
+        )
+        if result.get("errors"):
+            return json.dumps({"status": "error", "error": "; ".join(result["errors"])})
 
-        events = changes.get("events", [])
-        if not events:
+        push = result.get("push") or {}
+        accepted = push.get("accepted", 0)
+        cursor = ""
+        discovered = push.get("discovered") or {}
+        if not accepted and not any(discovered.values()) and not push.get("batches"):
             return json.dumps({
                 "status": "ok",
                 "pushed": 0,
                 "message": "No local changes to push.",
             })
 
-        # Push to remote
-        result = self._http_post("/sync/push", {"events": events})
-        if result.get("status") != "ok":
-            return json.dumps(result)
-
-        accepted = result.get("accepted", 0)
-        cursor = result.get("next_cursor") or changes.get("next_cursor") or ""
-
-        if cursor:
-            self._engine._meta_set("last_sync_cursor", cursor)
-
         return json.dumps({
             "status": "ok",
             "pushed": accepted,
-            "duplicates": result.get("duplicates", 0),
-            "conflicts": result.get("conflicts", 0),
+            "duplicates": push.get("duplicates", 0),
+            "conflicts": push.get("conflicts", 0),
             "next_cursor": cursor[:30] + "..." if len(cursor) > 30 else cursor,
         })
 
@@ -306,33 +336,32 @@ class SyncAdapter:
                 "error": "No remote configured. Set MNEMOSYNE_SYNC_REMOTE env var.",
             })
 
-        cursor = self._engine._meta_get("last_sync_cursor") or ""
-        result = self._http_post("/sync/pull", {"since_token": cursor or None})
+        result = self._engine.sync_with(
+            self.remote,
+            mode="pull",
+            api_key=self.auth_token or None,
+        )
+        if result.get("errors"):
+            return json.dumps({"status": "error", "error": "; ".join(result["errors"])})
 
-        if result.get("status") != "ok":
-            return json.dumps(result)
-
-        incoming = result.get("events", [])
-        if not incoming:
+        pull = result.get("pull") or {}
+        cursor = self._pull_cursor(result.get("remote"))
+        if (
+            not pull.get("accepted")
+            and not pull.get("events_fetched")
+            and not pull.get("batches")
+        ):
             return json.dumps({
                 "status": "ok",
                 "pulled": 0,
                 "message": "No remote changes to pull.",
             })
 
-        # Apply locally
-        push_result = self._engine.push_changes(incoming)
-        accepted = push_result.get("accepted", 0)
-        cursor = result.get("next_cursor") or ""
-
-        if cursor:
-            self._engine._meta_set("last_sync_cursor", cursor)
-
         return json.dumps({
             "status": "ok",
-            "pulled": accepted,
-            "duplicates": push_result.get("duplicates", 0),
-            "conflicts": push_result.get("conflicts", 0),
+            "pulled": pull.get("accepted", 0),
+            "duplicates": pull.get("duplicates", 0),
+            "conflicts": pull.get("conflicts", 0),
             "next_cursor": cursor[:30] + "..." if len(cursor) > 30 else cursor,
         })
 
@@ -343,7 +372,7 @@ class SyncAdapter:
         if not engine:
             return json.dumps({"status": "error", "error": "No engine"})
 
-        cursor = engine._meta_get("last_sync_cursor") or ""
+        cursor = self._pull_cursor()
         device_id = getattr(engine, "device_id", "unknown")
 
         # Count local events

@@ -15,6 +15,7 @@ from typing import Optional, Tuple
 from pathlib import Path
 
 from mnemosyne.core.cost_log import log_cost
+from mnemosyne.core.user_agent import application_user_agent
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +96,10 @@ def _call_conflict_llm_with_retry(
         has_httpx = False
 
     url = f"{CONFLICT_LLM_BASE_URL}/chat/completions"
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": application_user_agent(),
+    }
     if CONFLICT_LLM_API_KEY:
         headers["Authorization"] = f"Bearer {CONFLICT_LLM_API_KEY}"
 
@@ -175,12 +179,18 @@ def validate_conflict_pair(
     session_id: str,
     db_path: Optional[Path] = None,
     *, deadline: Optional[float] = None,
-) -> Tuple[bool, float, Optional[str]]:
+) -> Tuple[bool, float, Optional[str], str]:
     """
     Use an LLM to validate if older_content is contradicted/superseded by newer_content.
     
     Returns:
-        Tuple[is_conflict (bool), confidence (float), correct_fact (str)]
+        Tuple[is_conflict (bool), confidence (float), correct_fact (str),
+        status (str)]. ``status`` is ``"valid"`` only when a verdict was
+        actually parsed from the provider response; every other outcome
+        (unavailable response, invalid response type, malformed JSON,
+        exception) is ``status="failed"`` — a validation failure that
+        callers must not treat as a negative verdict (e.g. persist it in a
+        reject cache), and which a later run may retry.
     """
     prompt = f"""You are an advanced agentic memory consolidation engine. Your task is to analyze two memories and determine if they represent a factual contradiction or a conflict (where the newer memory corrects, updates, or overrides the older one).
 
@@ -202,11 +212,11 @@ You must respond ONLY with a valid JSON object matching this schema:
 """
     result = _call_conflict_llm_with_retry(prompt, deadline=deadline)
     if not result:
-        return False, 0.0, None
+        return False, 0.0, None, "failed"
 
     raw_response, actual_prompt_tokens, actual_completion_tokens = result
     if not isinstance(raw_response, str):
-        return False, 0.0, None
+        return False, 0.0, None, "failed"
 
     # Strip markdown code blocks if any
     clean_json = raw_response.strip()
@@ -255,8 +265,8 @@ You must respond ONLY with a valid JSON object matching this schema:
         except Exception as log_exc:
             logger.debug("Failed to record conflict cost (%s)", type(log_exc).__name__)
 
-        return is_conflict, confidence, correct_fact
+        return is_conflict, confidence, correct_fact, "valid"
     except Exception as exc:
         logger.warning("Conflict detection: failed to parse LLM JSON output (%s)", type(exc).__name__)
-        return False, 0.0, None
+        return False, 0.0, None, "failed"
 

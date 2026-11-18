@@ -14,6 +14,8 @@ import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
+from mnemosyne.core.filters import _SYSTEM_DERIVED_WRITE_CAPABILITY
+
 
 DEFAULT_MODEL_CATEGORIES: Set[str] = {
     "model:user",
@@ -219,17 +221,12 @@ def infer_model_update_proposals(
         attempted_host = False
         raw = None
 
-    if local_llm._is_invalid_reasoning_output(raw):
-        return []
-
     if raw is None and not attempted_host:
         try:
             raw = local_llm._call_remote_llm(prompt, temperature=0.1)
         except Exception:
             raw = None
-    if isinstance(raw, str):
-        raw = local_llm._sanitize_reasoning_output(raw)
-    if not isinstance(raw, str) or not raw or local_llm._is_invalid_reasoning_output(raw):
+    if not raw:
         return []
     return parse_model_update_proposals(raw, allowed_categories=allowed)
 
@@ -253,9 +250,19 @@ def auto_apply_enabled() -> bool:
     This defaults ON because model refresh is a sleep-time automation, not a
     human approval queue. Operators can disable it as an emergency brake with
     MNEMOSYNE_SLEEP_MODEL_REFRESH_AUTO_APPLY=false.
-    """
 
-    return _env_bool("MNEMOSYNE_SLEEP_MODEL_REFRESH_AUTO_APPLY", True)
+    Resolved through the central hot-reload config (config.yaml > env > default)
+    so a maintenance operation observes one consistent value at its boundary.
+    When verified Dream mode is active (``dream_active``), auto-apply is forced
+    off: Dream owns canonical mutations and the sleep path must not race it by
+    applying model-refresh proposals directly.
+    """
+    from mnemosyne.core.config import get_config
+
+    config = get_config()
+    if config.get_bool("dream_active", False):
+        return False
+    return config.get_bool("sleep_model_refresh_auto_apply", True)
 
 
 def auto_apply_min_confidence() -> float:
@@ -398,6 +405,7 @@ def apply_model_refresh_proposal(
         metadata["body"],
         source="sleep_model_refresh",
         confidence=coerce_confidence(metadata.get("confidence"), 0.5),
+        _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
     )
     metadata["status"] = "applied"
     metadata["applied_by"] = validator or "system"

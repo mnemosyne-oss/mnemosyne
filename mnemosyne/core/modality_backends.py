@@ -231,6 +231,14 @@ def call_modality_describe(request: DescribeRequest) -> Optional[DescribeResult]
 
     backend = get_modality_backend(request.modality)
     if backend is None:
+        # The documented setup is configuration only: MNEMOSYNE_MODALITY_*
+        # (or config.yaml) and nothing else. Registration is deferred to here,
+        # the first describe after the operator opted in, so importing a
+        # module still never arms an outbound path. Explicit registrations
+        # win: this only runs when nothing serves the modality.
+        _autoregister_configured_backends()
+        backend = get_modality_backend(request.modality)
+    if backend is None:
         return None
 
     try:
@@ -243,3 +251,40 @@ def call_modality_describe(request: DescribeRequest) -> Optional[DescribeResult]
             getattr(backend, "name", "?"), request.modality, exc_info=True,
         )
         return None
+
+
+def _autoregister_configured_backends() -> None:
+    """Register the built-in adapter as the default when it is configured.
+
+    Called only behind the ``modality_enabled`` gate, and only when no backend
+    serves the requested modality. A host that registered its own default is
+    left alone.
+    """
+    if get_modality_backend("document") is None:
+        # Documents are read locally: no endpoint, no model, nothing sent.
+        try:
+            from mnemosyne.core.modality_documents import LocalDocumentBackend
+            set_modality_backend(LocalDocumentBackend(), frozenset({"document"}))
+        except Exception:
+            logger.info("modality: local document backend unavailable", exc_info=True)
+    try:
+        from mnemosyne.core.modality_openai_compat import is_configured, register_if_configured
+    except Exception:
+        logger.info("modality: built-in adapter unavailable", exc_info=True)
+        return
+    if not is_configured():
+        return
+    if get_modality_backend("video") is None:
+        # Frames to the vision model and the soundtrack to transcription, via
+        # the same endpoint; needs ffmpeg, and says so when it is missing.
+        try:
+            from mnemosyne.core.modality_video import VideoFrameBackend
+            set_modality_backend(VideoFrameBackend(), frozenset({"video"}))
+        except Exception:
+            logger.info("modality: video backend unavailable", exc_info=True)
+    if _default is None:
+        try:
+            register_if_configured()
+        except Exception:
+            logger.info("modality: built-in adapter registration failed", exc_info=True)
+

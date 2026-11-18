@@ -14,6 +14,7 @@ Now upgraded with BEAM architecture:
 import sqlite3
 import json
 import hashlib
+import functools
 import logging
 import threading
 import tempfile
@@ -28,8 +29,53 @@ logger = logging.getLogger(__name__)
 from mnemosyne.core import embeddings as _embeddings
 from mnemosyne.core import beam as beam_module
 from mnemosyne.core._connection_gc import collect_connection_cycles
-from mnemosyne.core.beam import BeamMemory, _BeamConnection, _deferred_commits, init_beam
+from mnemosyne.core.beam import (
+    BeamMemory,
+    MemoryTransactionStateError,
+    _BeamConnection,
+    _deferred_commits,
+)
 from mnemosyne.core.journal import journal_mode
+
+
+def _atomic_import(method):
+    """Run one JSON import under a single deferred-commit scope.
+
+    The import crosses BEAM, legacy, triple, annotation, canonical and
+    sync-event writes, and each of them commits. Suppressing those commits
+    until the whole import succeeds makes a later failure leave the target
+    unchanged (#727). Dry runs already import into a disposable clone and are
+    not wrapped.
+    """
+
+    @functools.wraps(method)
+    def wrapper(
+        self,
+        input_path,
+        force=False,
+        dry_run=False,
+        _owned_store_connections=None,
+    ):
+        if dry_run:
+            return method(
+                self,
+                input_path,
+                force=force,
+                dry_run=True,
+                _owned_store_connections=_owned_store_connections,
+            )
+        with _deferred_commits(self.conn, immediate=True):
+            return method(
+                self,
+                input_path,
+                force=force,
+                dry_run=False,
+                _owned_store_connections=_owned_store_connections,
+            )
+
+    return wrapper
+
+
 _thread_local = threading.local()
 
 # Default data directory
@@ -207,7 +253,7 @@ def _default_db_path() -> Path:
 
 def _get_connection(db_path = None) -> sqlite3.Connection:
     """Get thread-local database connection"""
-    path = Path(db_path) if db_path else _default_db_path()
+    path = (Path(db_path) if db_path else _default_db_path()).expanduser().resolve()
     needs_reconnect = (
         not hasattr(_thread_local, "conn")
         or _thread_local.conn is None
@@ -246,6 +292,25 @@ def _get_connection(db_path = None) -> sqlite3.Connection:
     beam_module._thread_local.conn = _thread_local.conn
     beam_module._thread_local.db_path = str(path)
     return _thread_local.conn
+
+
+def close_thread_connection(db_path=None, *, allow_main_thread: bool = False) -> bool:
+    """Close this thread's cached SQLite connection (mnemosyne#1163).
+
+    Thin re-export of
+    :func:`mnemosyne.core.connection_release.close_thread_connection`, which
+    owns the contract, the caches it covers and the close-failure policy.
+
+    The logic lives in that module so the release can be reached without
+    importing this one: importing this module runs the ``init_db()`` below,
+    which opens a connection for the default database and republishes it into
+    ``beam``'s thread-local cache, displacing the handle the caller asked to
+    close. A cold worker that imported this helper therefore left its original
+    handle open.
+    """
+    from mnemosyne.core.connection_release import close_thread_connection as _close
+
+    return _close(db_path, allow_main_thread=allow_main_thread)
 
 
 def _close_dry_run_clone(
@@ -294,7 +359,12 @@ def _close_dry_run_clone(
 
 
 def init_db(db_path: Path = None):
-    """Initialize legacy database schema + BEAM schema"""
+    """Initialize legacy and BEAM schemas under the same path lock."""
+    with beam_module._schema_init_lock(db_path if db_path is not None else _default_db_path()) as path:
+        _init_db_locked(path)
+
+
+def _init_db_locked(db_path):
     conn = _get_connection(db_path)
     cursor = conn.cursor()
 
@@ -329,8 +399,8 @@ def init_db(db_path: Path = None):
 
     conn.commit()
 
-    # Initialize BEAM schema on same DB
-    init_beam(db_path)
+    # Already inside the shared schema lock.
+    beam_module._init_beam_locked(db_path)
 
 
 # Initialize on module load
@@ -373,8 +443,8 @@ class Mnemosyne:
         else:
             self.db_path = _default_db_path()
 
-        self.conn = _get_connection(self.db_path)
         init_db(self.db_path)
+        self.conn = _get_connection(self.db_path)
 
         # Phase 8: Streaming + Patterns + Plugins (lazy init)
         self._stream = None
@@ -536,7 +606,8 @@ class Mnemosyne:
                  veracity: str = "unknown",
                  trust_tier: str = None,
                  memory_type: str = None,
-                 dedupe: bool = True) -> str:
+                 dedupe: bool = True,
+                 _write_kind: object = "public") -> Optional[str]:
         """
         Store a memory directly to SQLite.
         Writes to both BEAM working_memory and legacy memories table.
@@ -566,15 +637,12 @@ class Mnemosyne:
         write and control its id -- media ingest, importers -- should call
         BeamMemory.remember directly rather than going through here.
         """
-        # --- Core-level write filter (issues #406, #428) ---
-        # Placed here so ALL entry points (Hermes provider, MCP server, SDK,
-        # CLI) benefit, not just the Hermes plugin layer.  The provider's
-        # own _should_filter remains as an additional pre-filter for
-        # conversation sync; this is the catch-all at the root.
-        from mnemosyne.core.filters import should_remember
-        should_write, _decision = should_remember(content)
-        if not should_write:
-            logger.debug("Memory write filtered: %s", _decision.reason)
+        from mnemosyne.core.filters import admit_memory_write, current_write_policy
+
+        policy = current_write_policy()
+        if not admit_memory_write(
+            content, write_kind=_write_kind, policy=policy
+        )[0]:
             return None
 
         # BEAM write first (generates its own ID). Extract flags are passed
@@ -609,7 +677,7 @@ class Mnemosyne:
             if durations:
                 metadata["_durations"] = durations
 
-        with _deferred_commits(self.conn):
+        with _deferred_commits(self.conn, immediate=True):
             memory_id = self.beam.remember(
                 _content, source=source,
                 importance=importance, metadata=metadata,
@@ -619,7 +687,12 @@ class Mnemosyne:
                 trust_tier=trust_tier,
                 memory_type=memory_type,
                 dedupe=dedupe,
+                _write_kind=_write_kind,
+                _write_policy=policy,
+                _write_policy_content=content,
             )
+            if memory_id is None:
+                return None
             timestamp = datetime.now().isoformat()
 
             # Legacy dual-write with same ID (INSERT OR REPLACE for dedup safety)
@@ -634,7 +707,14 @@ class Mnemosyne:
 
             # Legacy embedding store
             if _embeddings.available():
-                vec = _embeddings.embed([_content])
+                try:
+                    vec = _embeddings.embed([_content])
+                except Exception as exc:
+                    logger.warning(
+                        "legacy embedding storage failed for %s (%s): %s",
+                        memory_id, type(exc).__name__, exc,
+                    )
+                    vec = None
                 if vec is not None:
                     cursor.execute("""
                         INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model)
@@ -718,6 +798,28 @@ class Mnemosyne:
             except Exception:
                 pass
 
+    def _emit_after_commit(self, event_type: str, memory_id: str, **kwargs) -> None:
+        """Emit now, or defer until the caller's transaction commits (see #963).
+
+        When this call owns the transaction it is already committed by the
+        time this runs, so emit immediately (historical behavior). When a
+        caller-owned transaction is still open, emitting now would fire
+        before the caller's commit — a phantom event if they roll back —
+        so queue an after-commit hook on the connection instead. The hook
+        fires on the next real commit and is discarded unseen on rollback,
+        including a ROLLBACK TO a savepoint taken before the hook was
+        queued (the connection mirrors savepoint scope; see #963). On a
+        non-BEAM connection (no hook support) fall back to immediate
+        emission.
+        """
+        conn = self.conn
+        if isinstance(conn, _BeamConnection) and conn.in_transaction:
+            conn._after_commit_hooks.append(
+                lambda: self._emit_wrapper(event_type, memory_id, **kwargs)
+            )
+        else:
+            self._emit_wrapper(event_type, memory_id, **kwargs)
+
     def get_context(self, limit: int = 10) -> List[Dict]:
         """
         Get recent memories from current session for context injection.
@@ -792,8 +894,9 @@ class Mnemosyne:
         return self.beam.get(memory_id)
 
     def forget(self, memory_id: str) -> bool:
-        """Delete a memory by ID from legacy table and working_memory."""
-        with _deferred_commits(self.conn):
+        """Delete a memory by ID from legacy, working, or episodic storage."""
+        emit_invalidation = True
+        with _deferred_commits(self.conn, immediate=True):
             cursor = self.conn.cursor()
             # Authorize from the authoritative BEAM row before deleting either
             # representation. A global row may be removed cross-session, but
@@ -814,13 +917,16 @@ class Mnemosyne:
                     (memory_id, self.session_id),
                 ).fetchone()
                 if legacy_owner is None:
-                    return False
-                cursor.execute(
-                    "DELETE FROM memories WHERE id = ? AND session_id = ?",
-                    (memory_id, self.session_id),
-                )
-                self.conn.commit()
-                result = False
+                    result = self.beam.forget_episodic(memory_id)
+                    emit_invalidation = result
+                else:
+                    cursor.execute(
+                        "DELETE FROM memories WHERE id = ? AND session_id = ?",
+                        (memory_id, self.session_id),
+                    )
+                    self.conn.commit()
+                    result = self.beam.forget_episodic(memory_id)
+                    emit_invalidation = result
             else:
                 cursor.execute(
                     "DELETE FROM memories WHERE id = ? AND session_id = ?",
@@ -828,12 +934,24 @@ class Mnemosyne:
                 )
                 self.conn.commit()
                 result = self.beam.forget_working(memory_id)
-        self._emit_wrapper("MEMORY_INVALIDATED", memory_id)
+        # Emit after _deferred_commits finalizes, and defer past a
+        # caller-owned transaction. A missing/unauthorized episodic row must
+        # not publish a successful invalidation.
+        if emit_invalidation:
+            self._emit_after_commit("MEMORY_INVALIDATED", memory_id)
         return result
 
     def update(self, memory_id: str, content: str = None,
-               importance: float = None) -> bool:
+               importance: float = None) -> Optional[bool]:
         """Update an existing memory in legacy table and BEAM."""
+        policy = None
+        if content is not None:
+            from mnemosyne.core.filters import admit_memory_write, current_write_policy
+
+            policy = current_write_policy()
+            if not admit_memory_write(content, policy=policy)[0]:
+                return None
+
         cursor = self.conn.cursor()
 
         updates = []
@@ -850,19 +968,56 @@ class Mnemosyne:
         if not updates:
             return False
 
-        params.extend([memory_id, self.session_id])
-        with _deferred_commits(self.conn):
-            cursor.execute(
-                f"UPDATE memories SET {', '.join(updates)} WHERE id = ? AND session_id = ?",
-                params
+        # A caller-owned transaction can roll back after this method returns,
+        # but the wrapper cannot defer MEMORY_UPDATED until that outer commit.
+        # Fail before either mirror is touched when streaming makes the update
+        # observable. Without streaming, the existing savepoint path remains
+        # available to callers and batch adapters.
+        if self._stream is not None and self.conn.in_transaction:
+            raise MemoryTransactionStateError(
+                "Mnemosyne.update(): streaming is active while a caller-owned"
+                " transaction is open; commit before updating."
             )
+
+        with _deferred_commits(self.conn):
+            # Authorize from the authoritative BEAM working row. Global rows
+            # may be updated cross-session; session-scoped rows remain private.
+            owner = cursor.execute(
+                """
+                SELECT session_id FROM working_memory
+                WHERE id = ? AND (session_id = ? OR scope = 'global')
+                """,
+                (memory_id, self.session_id),
+            ).fetchone()
+            if owner is None:
+                # Preserve owner-only updates for old legacy-only rows without
+                # letting their fallback authorize a foreign working-memory row.
+                params.extend([memory_id, self.session_id])
+                legacy_where = "id = ? AND session_id = ?"
+            else:
+                # The legacy mirror has no scope; update it by the BEAM row's
+                # owning session after BEAM has authorized the operation.
+                params.extend([memory_id, owner["session_id"]])
+                legacy_where = "id = ? AND session_id = ?"
+
+            cursor.execute(
+                f"UPDATE memories SET {', '.join(updates)} WHERE {legacy_where}",
+                params,
+            )
+            legacy_updated = cursor.rowcount > 0
             self.conn.commit()
+            beam_updated = self.beam.update_working(
+                memory_id,
+                content=content,
+                importance=importance,
+                _write_policy=policy,
+            )
+            updated = legacy_updated or beam_updated
 
-            # Sync BEAM working_memory
-            self.beam.update_working(memory_id, content=content, importance=importance)
-
+        if not updated:
+            return False
         self._emit_wrapper("MEMORY_UPDATED", memory_id, content=content, importance=importance)
-        return cursor.rowcount > 0
+        return True
 
     def invalidate(self, memory_id: str, replacement_id: str = None) -> bool:
         """Mark a memory as expired or superseded. Delegates to BEAM."""
@@ -901,7 +1056,7 @@ class Mnemosyne:
             limit=limit,
         )
 
-    def scratchpad_write(self, content: str) -> str:
+    def scratchpad_write(self, content: str) -> Optional[str]:
         """Write to scratchpad."""
         return self.beam.scratchpad_write(content)
 
@@ -1041,6 +1196,7 @@ class Mnemosyne:
             "sync_events_count": len(export.get("sync_events", [])),
         }
 
+    @_atomic_import
     def import_from_file(
         self,
         input_path: str,
@@ -1215,25 +1371,19 @@ class Mnemosyne:
         stats["legacy"] = l_stats
 
         # Triples (current-truth temporal facts)
-        triples = TripleStore(db_path=self.db_path)
-        if _owned_store_connections is not None:
-            _owned_store_connections.append(triples.conn)
+        triples = TripleStore(db_path=self.db_path, conn=self.conn)
         t_stats = triples.import_all(data.get("triples", []), force=force)
         stats["triples"] = t_stats
 
         # Annotations (post-E6 schema 1.1; absent from 1.0 backups)
-        annotations = AnnotationStore(db_path=self.db_path)
-        if _owned_store_connections is not None:
-            _owned_store_connections.append(annotations.conn)
+        annotations = AnnotationStore(db_path=self.db_path, conn=self.conn)
         a_stats = annotations.import_all(data.get("annotations", []), force=force)
         stats["annotations"] = a_stats
 
         # Canonical facts (schema 1.3). Absent from <=1.2 backups -> get([]) is
         # a no-op, so older exports import unchanged. import_all is idempotent
         # and honors force, matching triples/annotations.
-        canonical = CanonicalStore(db_path=self.db_path)
-        if _owned_store_connections is not None:
-            _owned_store_connections.append(canonical.conn)
+        canonical = CanonicalStore(db_path=self.db_path, conn=self.conn)
         c_stats = canonical.import_all(data.get("canonical_facts", []), force=force)
         stats["canonical"] = c_stats
 
@@ -1304,26 +1454,41 @@ class Mnemosyne:
 # Global instance for module-level convenience functions
 _default_instance = None
 _default_bank = "default"
+# Instance for the most recent per-call ``bank=`` other than the default.
+_per_call_instance = None
 
 
 def _get_default(bank: str = None):
-    """Get or create the default Mnemosyne instance. Supports bank switching."""
-    global _default_instance, _default_bank
-    target_bank = bank or _default_bank or "default"
-    if _default_instance is None or _default_instance.bank != target_bank:
-        _default_bank = target_bank
-        _default_instance = Mnemosyne(bank=target_bank)
-    return _default_instance
+    """Return the module-level Mnemosyne instance for ``bank``.
+
+    Without ``bank`` this is the default instance, on the bank selected by
+    ``set_bank()``. A per-call ``bank`` is served from a second cached
+    instance, so it never becomes the default for later calls.
+    """
+    global _default_instance, _per_call_instance
+    default_bank = _default_bank or "default"
+    target_bank = bank or default_bank
+    if target_bank == default_bank:
+        instance = _default_instance
+        if instance is None or instance.bank != default_bank:
+            instance = _default_instance = Mnemosyne(bank=default_bank)
+        return instance
+    instance = _per_call_instance
+    if instance is None or instance.bank != target_bank:
+        instance = _per_call_instance = Mnemosyne(bank=target_bank)
+    return instance
 
 
 def set_bank(bank: str):
     """
     Switch the global default memory bank.
-    All subsequent module-level calls (remember, recall, etc.) will use this bank.
+    All subsequent module-level calls (remember, recall, etc.) that do not
+    pass ``bank=`` will use this bank.
     """
-    global _default_bank, _default_instance
+    global _default_bank, _default_instance, _per_call_instance
     _default_bank = bank
     _default_instance = None  # Force re-creation on next access
+    _per_call_instance = None
 
 
 def get_bank() -> str:
@@ -1338,7 +1503,7 @@ def remember(content: str, source: str = "conversation",
              extract_entities: bool = False,
              extract: bool = False, bank: str = None,
              trust_tier: str = None,
-             veracity: str = "unknown") -> str:
+             veracity: str = "unknown") -> Optional[str]:
     """Store a memory using the global instance"""
     return _get_default(bank).remember(content, source, importance, metadata,
                                        scope=scope, valid_until=valid_until,
@@ -1393,7 +1558,7 @@ def get(memory_id: str, bank: str = None) -> Optional[Dict]:
     return _get_default(bank).get(memory_id)
 
 
-def update(memory_id: str, content: str = None, importance: float = None, bank: str = None) -> bool:
+def update(memory_id: str, content: str = None, importance: float = None, bank: str = None) -> Optional[bool]:
     """Update memory using the global instance"""
     return _get_default(bank).update(memory_id, content, importance)
 
@@ -1418,7 +1583,7 @@ def reclaim_orphans(dry_run: bool = False, stale_after_seconds: int = 3600,
     )
 
 
-def scratchpad_write(content: str, bank: str = None) -> str:
+def scratchpad_write(content: str, bank: str = None) -> Optional[str]:
     """Write to scratchpad using the global instance"""
     return _get_default(bank).scratchpad_write(content)
 
@@ -1428,6 +1593,6 @@ def scratchpad_read(bank: str = None) -> List[Dict]:
     return _get_default(bank).scratchpad_read()
 
 
-def scratchpad_clear():
+def scratchpad_clear(bank: str = None):
     """Clear scratchpad using the global instance"""
-    return _get_default().scratchpad_clear()
+    return _get_default(bank).scratchpad_clear()

@@ -19,8 +19,10 @@ def beam(tmp_path: Path) -> BeamMemory:
 
 def _seed_children(beam: BeamMemory, memory_id: str) -> None:
     """Add child records that the MCP delete handler must remove."""
+    # OR REPLACE so the fixture is idempotent: with embeddings enabled, remember()
+    # has already written this row, and memory_embeddings.memory_id is a PRIMARY KEY.
     beam.conn.execute(
-        "INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)",
+        "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)",
         (memory_id, "[0.1, 0.2]"),
     )
     beam.conn.execute(
@@ -28,6 +30,10 @@ def _seed_children(beam: BeamMemory, memory_id: str) -> None:
         "(memory_id, kind, value, source, confidence, created_at) "
         "VALUES (?, 'fact', 'test annotation', 'test', 1.0, CURRENT_TIMESTAMP)",
         (memory_id,),
+    )
+    beam.conn.execute(
+        "INSERT INTO gists (id, text, memory_id) VALUES (?, ?, ?)",
+        (f"gist-{memory_id}", "test gist", memory_id),
     )
     beam.conn.commit()
 
@@ -55,17 +61,20 @@ def test_mcp_validate_delete_cascades_only_target_children(beam: BeamMemory):
     _seed_children(beam, keep_id)
     _seed_children(beam, delete_id)
     keep_annotation_count = _count(beam, "annotations", keep_id)
+    keep_gist_count = _count(beam, "gists", keep_id)
 
     result = _validate_delete(beam, delete_id)
 
     assert result["status"] == "validation_delete"
     assert _count(beam, "memory_embeddings", delete_id) == 0
     assert _count(beam, "annotations", delete_id) == 0
+    assert _count(beam, "gists", delete_id) == 0
     assert beam.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE id = ?", (delete_id,)
     ).fetchone()[0] == 0
     assert _count(beam, "memory_embeddings", keep_id) == 1
     assert _count(beam, "annotations", keep_id) == keep_annotation_count
+    assert _count(beam, "gists", keep_id) == keep_gist_count
     assert beam.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE id = ?", (keep_id,)
     ).fetchone()[0] == 1
@@ -76,6 +85,7 @@ def test_mcp_validate_delete_rolls_back_on_child_failure(beam: BeamMemory):
     memory_id = beam.remember("must survive failed delete", source="test", importance=0.5)
     _seed_children(beam, memory_id)
     annotation_count = _count(beam, "annotations", memory_id)
+    gist_count = _count(beam, "gists", memory_id)
     beam.conn.execute(
         "CREATE TRIGGER fail_annotation_delete "
         "BEFORE DELETE ON annotations "
@@ -90,6 +100,7 @@ def test_mcp_validate_delete_rolls_back_on_child_failure(beam: BeamMemory):
     assert not beam.conn.in_transaction
     assert _count(beam, "memory_embeddings", memory_id) == 1
     assert _count(beam, "annotations", memory_id) == annotation_count
+    assert _count(beam, "gists", memory_id) == gist_count
     assert beam.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
     ).fetchone()[0] == 1
@@ -165,3 +176,63 @@ def test_mcp_validate_delete_handles_missing_vec_working(beam: BeamMemory):
     assert beam.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
     ).fetchone()[0] == 0
+
+
+def test_mcp_validate_delete_handles_missing_gists_table(beam: BeamMemory):
+    """The optional gists table may be absent on older databases."""
+    memory_id = beam.remember("delete without gists", source="test", importance=0.5)
+    _seed_children(beam, memory_id)
+    beam.conn.execute("DROP TABLE gists")
+    beam.conn.commit()
+
+    result = _validate_delete(beam, memory_id)
+
+    assert result["status"] == "validation_delete"
+    assert beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
+    ).fetchone()[0] == 0
+
+
+def test_mcp_validate_delete_refuses_a_foreign_session_private_memory(tmp_path: Path):
+    """A private memory from another session is invisible, so nothing is deleted.
+
+    forget_working already refuses this; the validate(delete) cascade must too,
+    and must decide before removing any support row.
+    """
+    owner = BeamMemory(session_id="owner", db_path=tmp_path / "foreign.db")
+    memory_id = owner.remember("private to owner", source="test", importance=0.5)
+    _seed_children(owner, memory_id)
+    assert owner.conn.execute(
+        "SELECT scope FROM working_memory WHERE id = ?", (memory_id,)
+    ).fetchone()[0] == "session"
+    before = {
+        table: _count(owner, table, memory_id)
+        for table in ("memory_embeddings", "annotations", "gists")
+    }
+
+    foreign = BeamMemory(session_id="foreign", db_path=tmp_path / "foreign.db")
+    result = _validate_delete(foreign, memory_id)
+
+    assert result["error"] == "memory_not_found"
+    assert owner.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (memory_id,)
+    ).fetchone()[0] == 1
+    for table, count in before.items():
+        assert _count(owner, table, memory_id) == count, f"{table} was touched"
+
+
+def test_mcp_validate_delete_allows_a_global_memory_from_another_session(tmp_path: Path):
+    """Global scope stays deletable cross-session, as forget_working allows."""
+    owner = BeamMemory(session_id="owner", db_path=tmp_path / "global.db")
+    memory_id = owner.remember("global memory", source="test", importance=0.5)
+    owner.conn.execute(
+        "UPDATE working_memory SET scope = 'global' WHERE id = ?", (memory_id,)
+    )
+    owner.conn.commit()
+    _seed_children(owner, memory_id)
+
+    foreign = BeamMemory(session_id="foreign", db_path=tmp_path / "global.db")
+    result = _validate_delete(foreign, memory_id)
+
+    assert result["status"] == "validation_delete"
+    assert _count(owner, "gists", memory_id) == 0

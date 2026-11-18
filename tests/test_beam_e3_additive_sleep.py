@@ -17,14 +17,118 @@ This blocks experiment Arm B (ADD-only ingest) of the BEAM-recovery
 experiment.
 """
 
+import os
 import sqlite3
 import tempfile
-from datetime import datetime, timedelta
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from mnemosyne.core.beam import BeamMemory
+
+
+def _naive_utc_now():
+    """Naive-UTC "now", the shape reclaim_orphans() and the working-memory
+    TTL trim build their cutoffs in. Fixtures compared against those
+    cutoffs must use it; datetime.now() shifts them by the host offset."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+@pytest.fixture(params=["UTC", "Asia/Tokyo", "America/Los_Angeles"])
+def utc_boundary_clock(request, monkeypatch):
+    """Exercise real host offsets while fixing the UTC instant for boundaries."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("host timezone switching requires tzset")
+    import mnemosyne.core.beam as beam_module
+
+    previous = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", request.param)
+    time.tzset()
+    instant = datetime(2030, 6, 15, 12, tzinfo=timezone.utc)
+
+    class FixedClock(datetime):
+        """Preserve datetime.now's local-vs-aware behavior at one fixed instant."""
+
+        @classmethod
+        def now(cls, tz=None):
+            return (instant.astimezone(tz) if tz is not None
+                    else instant.astimezone().replace(tzinfo=None))
+
+    monkeypatch.setattr(beam_module, "datetime", FixedClock)
+    monkeypatch.setitem(_naive_utc_now.__globals__, "datetime", FixedClock)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+
+
+def test_reclaim_utc_fixture_pins_stale_boundary(temp_db, utc_boundary_clock):
+    """A local-wall-clock fixture would reclaim the wrong boundary rows."""
+    now = _naive_utc_now()
+    assert now == datetime(2030, 6, 15, 12)
+    assert now.tzinfo is None
+    beam = BeamMemory(session_id="boundary", db_path=temp_db)
+    claims = {
+        "stale": now - timedelta(hours=1, seconds=1),
+        "exact": now - timedelta(hours=1),
+        "fresh": now - timedelta(hours=1) + timedelta(seconds=1),
+        "referenced": now - timedelta(hours=1, seconds=1),
+    }
+    beam.conn.executemany(
+        "INSERT INTO working_memory "
+        "(id, content, source, timestamp, session_id, consolidated_at, consolidation_claimed_at) "
+        "VALUES (?, ?, 'conversation', '2030-06-01T00:00:00', 'boundary', ?, ?)",
+        [(mid, mid, claim.isoformat(), claim.isoformat()) for mid, claim in claims.items()])
+    beam.conn.execute(
+        # Pin completion evidence too: SQLite CURRENT_TIMESTAMP does not use
+        # utc_boundary_clock, while reclaim compares created_at with the claim.
+        "INSERT INTO episodic_memory (id, content, source, timestamp, session_id, summary_of, created_at) "
+        "VALUES ('summary', 'retained summary', 'sleep_consolidation', "
+        "'2030-06-15T12:00:00', 'boundary', 'referenced', '2030-06-15T12:00:00')")
+    beam.conn.commit()
+    assert beam.conn.execute(
+        "SELECT created_at FROM episodic_memory WHERE id = 'summary'"
+    ).fetchone()[0] == now.isoformat()
+
+    result = beam.reclaim_orphans(stale_after_seconds=3600)
+    assert result["candidate_ids"] == ["stale"]
+    assert result["reclaimed"] == 1
+    with sqlite3.connect(temp_db) as reader:
+        rows = dict(reader.execute("SELECT id, consolidation_claimed_at FROM working_memory"))
+    assert rows["stale"] is None
+    assert all(rows[mid] == claims[mid].isoformat() for mid in ("exact", "fresh", "referenced"))
+
+
+def test_trim_utc_fixture_pins_ttl_and_preservation(temp_db, utc_boundary_clock, monkeypatch):
+    """TTL deletes only expired unprotected rows in the active session."""
+    import mnemosyne.core.beam as beam_module
+
+    monkeypatch.setattr(beam_module, "WORKING_MEMORY_TTL_HOURS", 24)
+    monkeypatch.setattr(beam_module, "WORKING_MEMORY_MAX_ITEMS", 100)
+    beam = BeamMemory(session_id="boundary", db_path=temp_db)
+    cutoff = _naive_utc_now() - timedelta(hours=24)
+    beam.conn.executemany(
+        "INSERT INTO working_memory "
+        "(id, content, source, timestamp, session_id, consolidated_at, pinned) "
+        "VALUES (?, ?, 'conversation', ?, ?, ?, ?)",
+        [("stale", "stale", (cutoff - timedelta(seconds=1)).isoformat(), "boundary", None, 0),
+         ("exact", "exact", cutoff.isoformat(), "boundary", None, 0),
+         ("fresh", "fresh", (cutoff + timedelta(seconds=1)).isoformat(), "boundary", None, 0),
+         ("consolidated", "original", "2030-06-01T00:00:00", "boundary", "2030-06-14", 0),
+         ("pinned", "pinned", "2030-06-01T00:00:00", "boundary", None, 1),
+         ("peer", "peer", "2030-06-01T00:00:00", "other-session", None, 0)])
+    beam.conn.commit()
+    beam._trim_working_memory()
+    with sqlite3.connect(temp_db) as reader:
+        remaining = {row[0] for row in reader.execute("SELECT id FROM working_memory")}
+    assert remaining == {"exact", "fresh", "consolidated", "pinned", "peer"}
 
 
 @pytest.fixture
@@ -75,6 +179,12 @@ def _seed_old_wm(db_path, session_id, n, ts_offset_hours=200):
     conn.commit()
     conn.close()
     return [r[0] for r in rows]
+
+
+def _utc_naive_iso(hours_ago: float) -> str:
+    """Claim timestamp in the same clock sleep() writes (naive UTC), so the
+    staleness check is independent of the machine's local timezone."""
+    return (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours_ago)).isoformat()
 
 
 class TestE3AdditiveSleep:
@@ -295,7 +405,13 @@ class TestE3AdditiveSleep:
         beam.sleep(dry_run=False)
 
         rows = _consolidated_rows(temp_db, "s1")
-        now = datetime.now()
+        # The writers stamp UTC with the tzinfo stripped
+        # (datetime.now(timezone.utc).replace(tzinfo=None).isoformat()), so the
+        # comparison has to be UTC too. datetime.now() is local wall clock: on any
+        # host that is not UTC the two differ by exactly the offset, and the
+        # assertion reads that as a corrupt marker rather than a clock mismatch.
+        # This is the test half of #1094; the polyphonic reader was the production half.
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         for row_id, consolidated_at in rows:
             parsed = datetime.fromisoformat(consolidated_at)
             # Within 60s of NOW (generous for CI clock skew).
@@ -371,7 +487,7 @@ class TestE3AdditiveSleep:
 
         # Backdate the row past the trim cutoff (= WORKING_MEMORY_TTL_HOURS).
         very_old = (
-            datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS + 5)
+            _naive_utc_now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS + 5)
         ).isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.execute(
@@ -443,10 +559,62 @@ class TestE3AdditiveSleep:
             f"claim failed. result_a={result_a}, result_b={result_b}"
         )
 
+    def test_sleep_all_sessions_reclaims_stale_orphan_claims_first(self, temp_db):
+        """A crash between sleep()'s claim and its episodic insert leaves rows
+        with consolidated_at set and no summary. The maintenance pass must
+        reclaim them so they are summarized instead of skipped forever."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        _seed_old_wm(temp_db, "s1", n=2)
+        stale_claim = _utc_naive_iso(hours_ago=2)
+        conn = sqlite3.connect(str(temp_db))
+        conn.execute(
+            "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ?",
+            (stale_claim, stale_claim),
+        )
+        conn.commit()
+        conn.close()
+
+        result = beam.sleep_all_sessions(dry_run=False)
+
+        assert result["reclaimed_orphans"] == 2
+        assert result["items_consolidated"] == 2
+        conn = sqlite3.connect(str(temp_db))
+        try:
+            summary_of = conn.execute(
+                "SELECT summary_of FROM episodic_memory"
+            ).fetchall()
+        finally:
+            conn.close()
+        covered = {i for (s,) in summary_of for i in (s or "").split(",") if i}
+        assert {"e3-s1-0", "e3-s1-1"} <= covered
+
+    def test_sleep_all_sessions_dry_run_does_not_reclaim(self, temp_db):
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        _seed_old_wm(temp_db, "s1", n=1)
+        stale_claim = _utc_naive_iso(hours_ago=2)
+        conn = sqlite3.connect(str(temp_db))
+        conn.execute(
+            "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ?",
+            (stale_claim, stale_claim),
+        )
+        conn.commit()
+        conn.close()
+
+        result = beam.sleep_all_sessions(dry_run=True)
+
+        assert _consolidated_rows(temp_db, "s1")[0][1] == stale_claim
+        conn = sqlite3.connect(str(temp_db))
+        try:
+            claim = conn.execute("SELECT consolidation_claimed_at FROM working_memory").fetchone()[0]
+        finally:
+            conn.close()
+        assert claim == stale_claim, "dry run cleared the claim marker"
+        assert result["reclaimed_orphans"] == 0
+
     def test_reclaim_orphans_clears_stale_claim_without_summary(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         _seed_old_wm(temp_db, "s1", n=1)
-        stale_claim = (datetime.now() - timedelta(hours=2)).isoformat()
+        stale_claim = (_naive_utc_now() - timedelta(hours=2)).isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.execute(
             "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? WHERE id = ?",
@@ -465,7 +633,7 @@ class TestE3AdditiveSleep:
     def test_reclaim_orphans_preserves_referenced_claims_and_avoids_partial_matches(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
-        stale_claim = (datetime.now() - timedelta(hours=2)).isoformat()
+        stale_claim = (_naive_utc_now() - timedelta(hours=2)).isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.executemany(
             """
@@ -494,11 +662,123 @@ class TestE3AdditiveSleep:
         assert rows["wm1"] is None
         assert rows["wm10"] == stale_claim
 
+    def test_takeover_rechecks_completion_after_selection(self, temp_db, monkeypatch):
+        """A commits after B selects its stale claim but before B's CAS."""
+        holder, recovery, stale = self._late_completion_claim(temp_db)
+        original_claim = recovery._claim_sleep_rows
+        selected = []
+
+        def complete_then_claim(rows, stamp):
+            selected.extend(row["id"] for row in rows)
+            self._complete_stale_claim(holder, stale)
+            return original_claim(rows, stamp)
+
+        monkeypatch.setattr(recovery, "_claim_sleep_rows", complete_then_claim)
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        recovery.sleep(force=True)
+        assert selected == ["late-completion"]
+        assert recovery.conn.execute(
+            "SELECT COUNT(*) FROM episodic_memory WHERE summary_of = 'late-completion'"
+        ).fetchone()[0] == 1
+        assert recovery.conn.execute(
+            "SELECT consolidation_claimed_at FROM working_memory WHERE id = 'late-completion'"
+        ).fetchone()[0] == stale
+
+    def test_reclaim_rechecks_completion_after_selection(self, temp_db):
+        """A commits on a separate connection after the candidate fetch."""
+        holder, recovery, stale = self._late_completion_claim(temp_db)
+        real_connection = recovery.conn
+        test = self
+        selected = []
+
+        class CursorProxy:
+            def __init__(self, cursor):
+                self.cursor = cursor
+                self.orphan_query = False
+
+            def execute(self, sql, params=()):
+                self.orphan_query = "SELECT wm.id, wm.consolidation_claimed_at AS claim" in sql
+                self.cursor.execute(sql, params)
+                return self
+
+            def fetchall(self):
+                rows = self.cursor.fetchall()
+                if self.orphan_query:
+                    selected.extend(row["id"] for row in rows)
+                    test._complete_stale_claim(holder, stale)
+                return rows
+
+            def __getattr__(self, name):
+                return getattr(self.cursor, name)
+
+        class ConnectionProxy:
+            def cursor(self):
+                return CursorProxy(real_connection.cursor())
+
+            def __getattr__(self, name):
+                return getattr(real_connection, name)
+
+        recovery.conn = ConnectionProxy()
+        try:
+            result = recovery.reclaim_orphans(stale_after_seconds=1)
+        finally:
+            recovery.conn = real_connection
+        assert selected == ["late-completion"]
+        assert result["reclaimed"] == 0
+        assert real_connection.execute(
+            "SELECT consolidated_at, consolidation_claimed_at FROM working_memory WHERE id = 'late-completion'"
+        ).fetchone()[:] == (stale, stale)
+        assert real_connection.execute(
+            "SELECT COUNT(*) FROM episodic_memory WHERE summary_of = 'late-completion'"
+        ).fetchone()[0] == 1
+
+    @staticmethod
+    def _late_completion_claim(temp_db):
+        holder = BeamMemory(session_id="s1", db_path=temp_db)
+        recovery = BeamMemory(session_id="s1", db_path=temp_db)
+        old_ts = (_naive_utc_now() - timedelta(hours=200)).isoformat()
+        stale = (_naive_utc_now() - timedelta(hours=2)).isoformat()
+        holder.conn.execute(
+            """INSERT INTO working_memory
+            (id, content, source, timestamp, session_id, consolidated_at, consolidation_claimed_at)
+            VALUES ('late-completion', 'original', 'conversation', ?, 's1', ?, ?)""",
+            (old_ts, stale, stale),
+        )
+        holder.conn.commit()
+        return holder, recovery, stale
+
+    @staticmethod
+    def _complete_stale_claim(holder, stale):
+        errors = []
+
+        def complete():
+            try:
+                writer = BeamMemory(session_id="s1", db_path=holder.db_path)
+                assert writer.conn is not holder.conn
+                summary_id = writer.consolidate_to_episodic(
+                    "holder summary", ["late-completion"], _claim_stamp=stale,
+                )
+                assert summary_id is not None
+                assert not writer.conn.in_transaction
+                # Completion and marker cleanup are separate transactions.
+                assert writer.conn.execute(
+                    "SELECT consolidation_claimed_at FROM working_memory WHERE id = 'late-completion'"
+                ).fetchone()[0] == stale
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=complete)
+        worker.start()
+        worker.join(timeout=30)
+        assert not worker.is_alive(), "summary writer did not finish"
+        if errors:
+            raise errors[0]
+
     def test_reclaim_orphans_respects_stale_threshold(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         old_ts = (datetime.now() - timedelta(hours=200)).isoformat()
-        stale_claim = (datetime.now() - timedelta(hours=2)).isoformat()
-        fresh_claim = datetime.now().isoformat()
+        stale_claim = (_naive_utc_now() - timedelta(hours=2)).isoformat()
+        fresh_claim = _naive_utc_now().isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.executemany(
             """
@@ -523,7 +803,7 @@ class TestE3AdditiveSleep:
     def test_reclaim_orphans_dry_run_writes_nothing(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         _seed_old_wm(temp_db, "s1", n=1)
-        stale_claim = (datetime.now() - timedelta(hours=2)).isoformat()
+        stale_claim = (_naive_utc_now() - timedelta(hours=2)).isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.execute(
             "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? WHERE id = ?",
@@ -542,7 +822,7 @@ class TestE3AdditiveSleep:
     def test_reclaim_orphans_ignores_legacy_backfill_without_claim_marker(self, temp_db):
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         _seed_old_wm(temp_db, "s1", n=1)
-        stale_backfill = (datetime.now() - timedelta(hours=2)).isoformat()
+        stale_backfill = _utc_naive_iso(hours_ago=2)
         conn = sqlite3.connect(str(temp_db))
         conn.execute(
             "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = NULL WHERE id = ?",
@@ -600,7 +880,7 @@ class TestE3AdditiveSleep:
         )
         beam = BeamMemory(session_id="maintenance", db_path=temp_db)
         _seed_old_wm(temp_db, "s1", n=1)
-        stale_claim = (datetime.now() - timedelta(hours=2)).isoformat()
+        stale_claim = (_naive_utc_now() - timedelta(hours=2)).isoformat()
         conn = sqlite3.connect(str(temp_db))
         conn.execute(
             "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = ? WHERE id = ?",
@@ -625,6 +905,349 @@ class TestE3AdditiveSleep:
         assert summary_of == "e3-s1-0"
         assert final[0] is not None
         assert final[1] is None
+
+    # --- review findings on automatic orphan recovery (#1322) -----------------
+
+    @staticmethod
+    def _claim(db_path, ids, stamp):
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.executemany(
+                "UPDATE working_memory SET consolidated_at = ?, "
+                "consolidation_claimed_at = ? WHERE id = ?",
+                [(stamp, stamp, i) for i in ids],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _summaries(db_path):
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return [r[0] for r in conn.execute(
+                "SELECT summary_of FROM episodic_memory WHERE source = 'sleep_consolidation'")]
+        finally:
+            conn.close()
+
+    def test_recovery_never_exposes_the_row_to_trim(self, temp_db, monkeypatch):
+        """Reclaim used to NULL consolidated_at, ending the trim exemption: a
+        remember() landing right after the reclaim commit deleted the 200h-old
+        original before any summary existed. A trim run just before each
+        session's sleep stands in for that remember()."""
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s1", n=1)
+        self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        real_sleep = BeamMemory.sleep
+
+        def trim_then_sleep(self_, *a, **k):
+            self_._trim_working_memory()
+            return real_sleep(self_, *a, **k)
+
+        monkeypatch.setattr(BeamMemory, "sleep", trim_then_sleep)
+        beam.sleep_all_sessions(dry_run=False)
+        assert _wm_count(temp_db, "s1") == 1, "trim deleted the original during recovery"
+        assert self._summaries(temp_db) == [ids[0]]
+
+    def test_recovery_beyond_one_sleep_batch_protects_every_row(self, temp_db, monkeypatch):
+        """With a batch of 2, 3 recovered rows used to leave 1 unprotected and
+        unsummarized for the next remember() to trim."""
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        monkeypatch.setattr("mnemosyne.core.beam.SLEEP_BATCH_SIZE", 2)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s1", n=3)
+        self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        beam.sleep_all_sessions(dry_run=False)
+        beam._trim_working_memory()  # what the next remember() would run
+        assert _wm_count(temp_db, "s1") == 3, "an unsummarized recovered row was trimmed"
+        assert all(r[1] is not None for r in _consolidated_rows(temp_db, "s1"))
+
+    def test_paused_holder_cannot_write_a_second_summary(self, temp_db, monkeypatch):
+        """A pauses after claiming, B recovers and summarizes, A resumes: A must
+        write nothing and must not clear B's claim marker. A and B run on
+        SEPARATE SQLite connections (B in its own thread, which gets its own
+        thread-local connection) so the ownership check is exercised across
+        connections, not just on one shared connection."""
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        a = BeamMemory(session_id="s1", db_path=temp_db)
+        _seed_old_wm(temp_db, "s1", n=1)
+        real = BeamMemory.consolidate_to_episodic
+        state = {"paused": False, "b_out": None}
+
+        def a_pauses_then_b_runs(self_, *args, **kw):
+            if self_ is a and not state["paused"]:
+                state["paused"] = True
+                # while A is "paused", its claim ages past the stale window
+                old = _utc_naive_iso(hours_ago=2)
+                c = sqlite3.connect(str(temp_db))
+                c.execute("UPDATE working_memory SET consolidated_at=?, consolidation_claimed_at=?", (old, old))
+                c.commit(); c.close()
+                # B runs in its own thread, so its BeamMemory gets its own
+                # thread-local SQLite connection — a genuinely separate
+                # connection from A's.
+                def _b_recovers():
+                    b = BeamMemory(session_id="s1", db_path=temp_db)
+                    state["b_out"] = b.sleep_all_sessions(dry_run=False)  # B recovers + summarizes
+                t = threading.Thread(target=_b_recovers)
+                t.start(); t.join()
+                assert state["b_out"]["reclaimed_orphans"] == 1
+                assert state["b_out"]["items_consolidated"] == 1
+            return real(self_, *args, **kw)
+
+        monkeypatch.setattr(BeamMemory, "consolidate_to_episodic", a_pauses_then_b_runs)
+        res = a.sleep(dry_run=False)
+        assert self._summaries(temp_db) == ["e3-s1-0"], "two summaries for one original"
+        assert res["claims_lost"] == 1 and res["summaries_created"] == 0
+        assert _consolidated_rows(temp_db, "s1")[0][1] is not None
+        c = sqlite3.connect(str(temp_db))
+        claim = c.execute("SELECT consolidation_claimed_at FROM working_memory").fetchone()[0]
+        c.close()
+        assert claim is None, "B's finished row should carry no claim marker"
+
+    def test_stale_holder_cannot_clear_a_newer_claim_marker(self, temp_db, monkeypatch):
+        """A finishes its summary, but B re-claimed the row first: A's claim-clear
+        must not erase B's marker."""
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        _seed_old_wm(temp_db, "s1", n=1)
+        newer = "2999-01-01T00:00:00"
+        real = BeamMemory.consolidate_to_episodic
+
+        def write_then_get_reclaimed(self_, *a, **k):
+            out = real(self_, *a, **k)
+            c = sqlite3.connect(str(temp_db))
+            c.execute("UPDATE working_memory SET consolidation_claimed_at = ?", (newer,))
+            c.commit(); c.close()
+            return out
+
+        monkeypatch.setattr(BeamMemory, "consolidate_to_episodic", write_then_get_reclaimed)
+        beam.sleep(dry_run=False)
+        c = sqlite3.connect(str(temp_db))
+        claim = c.execute("SELECT consolidation_claimed_at FROM working_memory").fetchone()[0]
+        c.close()
+        assert claim == newer, "the previous holder cleared a newer claim marker"
+
+    def test_stale_claimed_rows_count_toward_the_auto_sleep_gate(self, temp_db):
+        """A crashed sleep leaves a claimed row (consolidated_at set, no
+        summary completing the claim). sleep() recovers that row, so the
+        auto-sleep eligibility count must include it: excluding it made
+        _maybe_auto_sleep() skip the pass and the orphan backlog was never
+        recovered automatically."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s1", n=1)
+        self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                  - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        n = beam._count_unconsolidated_before(cutoff)
+        assert n == 1, (
+            "a stale-claimed recoverable row must count toward the "
+            f"auto-sleep gate; got {n}"
+        )
+
+    def test_auto_sleep_gate_ignores_a_sibling_sessions_orphan(self, temp_db):
+        """The auto-sleep gate is session-scoped: a stale orphan in a SIBLING
+        session must not count toward this session's eligibility (#687)."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s2", n=1)  # sibling session
+        self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                  - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        assert beam._count_unconsolidated_before(cutoff) == 0
+
+    def test_auto_sleep_gate_counts_this_sessions_orphan(self, temp_db):
+        """A stale orphan in THIS session must count toward the auto-sleep
+        gate, so an orphan backlog can't hide behind eligible == 0."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s1", n=1)
+        self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                  - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        assert beam._count_unconsolidated_before(cutoff) == 1
+
+    @pytest.mark.parametrize("scenario", ["own_orphan", "sibling_orphan", "completed_row"])
+    def test_auto_sleep_gate_and_dry_run_selection_agree(self, temp_db, monkeypatch, scenario):
+        """The gate count and sleep(dry_run=True) selection must agree: count
+        > 0 exactly when the dry run selects at least one row, in every
+        scenario (own orphan, sibling orphan, already-completed row)."""
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        if scenario == "own_orphan":
+            ids = _seed_old_wm(temp_db, "s1", n=1)
+            self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        elif scenario == "sibling_orphan":
+            ids = _seed_old_wm(temp_db, "s2", n=1)
+            self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        else:  # completed_row: summarize, then leave a stale re-claim
+            ids = _seed_old_wm(temp_db, "s1", n=1)
+            beam.sleep(dry_run=False)
+            self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+                  - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        count = beam._count_unconsolidated_before(cutoff)
+        res = beam.sleep(dry_run=True)
+        selected = res.get("items_consolidated", 0)
+        assert (count > 0) == (selected >= 1), (
+            f"gate count {count} and dry-run selection {selected} disagree "
+            f"for scenario {scenario}"
+        )
+        if scenario == "own_orphan":
+            assert count == 1 and selected == 1
+        else:
+            assert count == 0 and selected == 0
+
+    def test_summary_without_timestamp_counts_as_claim_completion(self, temp_db):
+        """Pin the documented trade-off in _claim_completed_sql: a summary
+        with NULL created_at is treated as completing the claim it names
+        (the safe direction -- never a second summary), so it blocks
+        recovery of a later interrupted claim on the same row. If this
+        test ever needs changing, completion evidence must first carry
+        the claim identity."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s1", n=1)
+        self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        c = sqlite3.connect(str(temp_db))
+        c.execute(
+            "INSERT INTO episodic_memory (id, content, source, summary_of, created_at) "
+            "VALUES (?, ?, 'sleep_consolidation', ?, NULL)",
+            ("em-1", "summary text", ids[0]),
+        )
+        c.commit()
+        c.close()
+        res = beam.reclaim_orphans(stale_after_seconds=1, dry_run=True)
+        assert res["candidates"] == 0, (
+            "a NULL-timestamp summary must count as claim completion "
+            "(never a second summary)"
+        )
+
+    def test_same_second_summary_and_later_claim_block_recovery(self, temp_db):
+        """A summary at .100000 and a later interrupted claim at .900000 of the
+        SAME second: second-granular comparison treats them as simultaneous, so
+        the summary completes the claim and recovery candidates are 0 (the safe
+        direction -- never a second summary)."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s1", n=1)
+        base = (datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+                - timedelta(hours=2))
+        summary_at = (base + timedelta(microseconds=100000)).isoformat()
+        claim_at = (base + timedelta(microseconds=900000)).isoformat()
+        self._claim(temp_db, ids, claim_at)
+        c = sqlite3.connect(str(temp_db))
+        c.execute(
+            "INSERT INTO episodic_memory (id, content, source, summary_of, created_at) "
+            "VALUES (?, ?, 'sleep_consolidation', ?, ?)",
+            ("em-same-second", "summary text", ids[0], summary_at),
+        )
+        c.commit()
+        c.close()
+        res = beam.reclaim_orphans(stale_after_seconds=1, dry_run=True)
+        assert res["candidates"] == 0, (
+            "a same-second summary (written before the claim but truncated to "
+            "the same second) must count as completion -- never a second summary"
+        )
+
+    def test_large_backlog_recovers_without_touching_the_bind_limit(self, temp_db, monkeypatch):
+        """Same 1000-row recovery scenario as the two bind-limit tests, but
+        without lowering SQLITE_LIMIT_VARIABLE_NUMBER: covers interpreters
+        where Connection.setlimit does not exist (Python 3.10) and proves
+        batching recovers every row under the default limit."""
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s1", n=1000)
+        self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        res = beam.sleep_all_sessions(dry_run=False)
+        assert res["reclaimed_orphans"] == 1000 and res["items_consolidated"] == 1000
+        assert res["errors"] == 0
+
+    @pytest.mark.skipif(
+        not hasattr(sqlite3.Connection, "setlimit"),
+        reason=(
+            "needs sqlite3.Connection.setlimit, which exists only on Python "
+            "3.11+; skipped by capability check on 3.10, where the same "
+            "recovery path is covered by "
+            "test_large_backlog_recovers_without_touching_the_bind_limit"
+        ),
+    )
+    def test_large_orphan_backlog_is_not_blocked_by_the_bind_limit(self, temp_db, monkeypatch):
+        """999 stale ids + the cutoff exceeded a 999-variable limit: the pass
+        returned no_op / 0 / 0 errors and left every claim untouched."""
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s1", n=1000)
+        self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        beam.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        res = beam.reclaim_orphans(stale_after_seconds=1, limit=1000)
+        assert res["reclaimed"] == 1000 and res["candidates"] == 1000
+        remaining = sqlite3.connect(str(temp_db)).execute(
+            "SELECT COUNT(*) FROM working_memory WHERE consolidated_at IS NOT NULL").fetchone()[0]
+        assert remaining == 0
+
+    @pytest.mark.skipif(
+        not hasattr(sqlite3.Connection, "setlimit"),
+        reason=(
+            "needs sqlite3.Connection.setlimit, which exists only on Python "
+            "3.11+; skipped by capability check on 3.10, where the same "
+            "recovery path is covered by "
+            "test_large_backlog_recovers_without_touching_the_bind_limit"
+        ),
+    )
+    def test_sleep_recovers_a_large_backlog_under_the_bind_limit(self, temp_db, monkeypatch):
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s1", n=1000)
+        self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+        beam.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        res = beam.sleep_all_sessions(dry_run=False)
+        assert res["reclaimed_orphans"] == 1000 and res["items_consolidated"] == 1000
+        assert res["errors"] == 0
+
+    def test_historical_summary_does_not_block_recovery_of_the_latest_claim(self, temp_db, monkeypatch):
+        """sleep -> remember() refresh (clears markers) -> second sleep claims and
+        crashes: the first summary names the same id but did not complete this claim."""
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s1", n=1)
+        beam.sleep(dry_run=False)
+        assert self._summaries(temp_db) == [ids[0]]
+        # refresh: markers cleared, row eligible again; summary row predates the new claim
+        new_claim = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2))
+        c = sqlite3.connect(str(temp_db))
+        c.execute("UPDATE episodic_memory SET created_at = ?", ((new_claim - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S"),))
+        c.execute("UPDATE working_memory SET consolidated_at=?, consolidation_claimed_at=?", (new_claim.isoformat(),) * 2)
+        c.commit(); c.close()
+        res = beam.reclaim_orphans(stale_after_seconds=1, dry_run=True)
+        assert res["candidates"] == 1, "an earlier claim's summary blocked recovery"
+        out = beam.sleep_all_sessions(dry_run=False)
+        assert out["reclaimed_orphans"] == 1 and out["items_consolidated"] == 1
+        assert len(self._summaries(temp_db)) == 2
+
+    def test_completed_claim_is_not_recovered(self, temp_db):
+        """A summary written after the claim completes it: never re-summarize."""
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        _seed_old_wm(temp_db, "s1", n=1)
+        beam.sleep(dry_run=False)
+        stamp = _utc_naive_iso(hours_ago=2)
+        c = sqlite3.connect(str(temp_db))
+        c.execute("UPDATE working_memory SET consolidated_at=?, consolidation_claimed_at=?", (stamp, stamp))
+        c.commit(); c.close()
+        assert beam.reclaim_orphans(stale_after_seconds=1, dry_run=True)["candidates"] == 0
+
+    def test_reclamation_failure_is_reported_not_hidden(self, temp_db, monkeypatch):
+        """A recovery failure (e.g. 'database is locked') used to be logged only:
+        the pass returned errors=0. Injected into the in-sleep claim step, the
+        same failure must surface as an error."""
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        ids = _seed_old_wm(temp_db, "s1", n=1)
+        self._claim(temp_db, ids, _utc_naive_iso(hours_ago=2))
+
+        def busy(self_, *a, **k):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(BeamMemory, "_claim_sleep_rows", busy)
+        res = beam.sleep_all_sessions(dry_run=False)
+        assert res["errors"] == 1, res
+        assert res["error_details"][0]["session_id"] == "s1"
 
     def test_export_import_preserves_consolidated_at(self, temp_db):
         """Backup round-trip must preserve consolidated_at so the

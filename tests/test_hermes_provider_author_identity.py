@@ -15,10 +15,8 @@ the actual write path end to end.
 """
 
 import json
-import os
 from pathlib import Path
 
-import pytest
 
 from hermes_memory_provider import MnemosyneMemoryProvider
 

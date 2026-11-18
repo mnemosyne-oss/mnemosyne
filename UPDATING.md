@@ -309,7 +309,7 @@ Not recommended for shared/multi-app systems.
 **Solution 4: Source install with editable mode**
 
 ```bash
-git clone https://github.com/AxDSan/mnemosyne.git
+git clone https://github.com/mnemosyne-oss/mnemosyne.git
 cd mnemosyne
 pip install -e . --break-system-packages
 ```
@@ -945,7 +945,7 @@ hermes memory status
 PyPI does not serve individual files at browsable URLs. The file is
 available at the GitHub repo:
 
-  https://github.com/AxDSan/mnemosyne/blob/main/UPDATING.md
+  https://github.com/mnemosyne-oss/mnemosyne/blob/main/UPDATING.md
 
 ### Option B: Source install (`pip install -e .`)
 
@@ -1153,7 +1153,7 @@ hermes mnemosyne import --input ~/backup.json
 PyPI does not serve individual package files at browsable URLs.
 The correct URL for the latest version is:
 
-  https://github.com/AxDSan/mnemosyne/blob/main/UPDATING.md
+  https://github.com/mnemosyne-oss/mnemosyne/blob/main/UPDATING.md
 
 The file IS included in the sdist and wheel — `pip show -f
 mnemosyne-memory` will confirm it ships.

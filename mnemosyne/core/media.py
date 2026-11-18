@@ -862,9 +862,15 @@ class MediaStore:
         *,
         provider: Optional[str] = None,
         provider_model: Optional[str] = None,
+        replace_provenance: bool = False,
     ) -> bool:
         """Move an asset along the degradation ladder. Returns whether a row
-        was updated."""
+        was updated.
+
+        ``provider`` and ``provider_model`` are written only when given, unless
+        ``replace_provenance`` is true: then both columns take the values passed,
+        and ``None`` clears them.
+        """
         status_norm = str(status or "").strip().lower()
         if status_norm not in UNDERSTANDING_STATUSES:
             raise ValueError(
@@ -873,10 +879,10 @@ class MediaStore:
             )
         assignments = ["understanding_status = ?"]
         params: List[Any] = [status_norm]
-        if provider is not None:
+        if provider is not None or replace_provenance:
             assignments.append("provider = ?")
             params.append(provider)
-        if provider_model is not None:
+        if provider_model is not None or replace_provenance:
             assignments.append("provider_model = ?")
             params.append(provider_model)
         params.append(asset_id)
@@ -886,6 +892,30 @@ class MediaStore:
         )
         self.conn.commit()
         return cursor.rowcount > 0
+
+    def _finalize_described_asset(self, asset_id: str, status: str) -> None:
+        """Set status and summarize the provenance of the retained moments."""
+        # One statement keeps the provenance read and status update together.
+        # Conditional aggregates support SQLite versions before 3.39.
+        self.conn.execute(
+            """
+            UPDATE media_assets
+            SET understanding_status = ?,
+                (provider, provider_model) = (
+                    SELECT CASE WHEN COUNT(*) = 1 THEN MIN(provider) END,
+                           CASE WHEN COUNT(*) = 1 THEN MIN(provider_model) END
+                    FROM (
+                        SELECT DISTINCT provider, provider_model
+                        FROM media_moments
+                        WHERE media_moments.asset_id = media_assets.asset_id
+                        LIMIT 2
+                    )
+                )
+            WHERE asset_id = ?
+            """,
+            (status, asset_id),
+        )
+        self.conn.commit()
 
     # ------------------------------------------------------------------
     # Moments
@@ -1144,9 +1174,10 @@ class MediaIngestResult:
     """
 
     asset_id: str
-    #: The always-written reference memory. Present even when no provider ran.
+    #: The reference memory for an admitted asset. Present even when no provider ran.
     anchor_memory_id: Optional[str] = None
-    #: One of media.UNDERSTANDING_STATUSES.
+    #: One of media.UNDERSTANDING_STATUSES, or ``filtered`` when admission
+    #: rejects the caller's reference before an asset exists.
     status: str = "pending"
     moment_ids: List[str] = field(default_factory=list)
     #: Memory rows created for moments, in the same order.
@@ -1317,6 +1348,8 @@ def remember_media(
     captured_at: Optional[str] = None,
     captured_at_precision: str = "unknown",
     metadata: Optional[Dict[str, Any]] = None,
+    _write_kind: object = "public",
+    _write_policy=None,
 ) -> MediaIngestResult:
     """Register a piece of media and, if a provider is configured, describe it.
 
@@ -1328,20 +1361,22 @@ def remember_media(
     The order of operations is the design, and each step is placed where it is
     for a stated reason:
 
-    1. Normalize the reference. ``data:`` becomes ``blob://`` here, before
+    1. Admit the raw caller reference. A rejection returns before any blob or
+       database write.
+    2. Normalize the reference. ``data:`` becomes ``blob://`` here, before
        storage (see :func:`normalize_media_input`).
-    2. Infer the modality.
-    3. Upsert the asset as ``pending`` **and commit**, so a process killed
+    3. Infer the modality.
+    4. Upsert the asset as ``pending`` **and commit**, so a process killed
        mid-ingest leaves a retryable state rather than one nothing can be in.
-    4. Write the anchor memory row **before the provider gate**, so rung 4 of
+    5. Write the anchor memory row **before the provider gate**, so rung 4 of
        the degradation ladder gives the user strictly more than they had. With
        no provider configured this function still succeeds and still leaves
        something recallable.
-    5. Ask the provider, if and only if the operator has opted in.
-    6. Per moment: **the moment row first**, then the memory row, then the bind.
+    6. Ask the provider, if and only if the operator has opted in.
+    7. Per moment: **the moment row first**, then the memory row, then the bind.
        A crash between them leaves a recoverable unbound moment that ``doctor``
        counts; the reverse order leaks a memory row nothing can trace back.
-    7. Set the final status in a ``finally``, so a constraint error mid-loop
+    8. Set the final status in a ``finally``, so a constraint error mid-loop
        cannot strand the asset at ``pending``.
 
     Two rules keep the reference out of ``content``: ``ref`` is always a
@@ -1349,6 +1384,22 @@ def remember_media(
     (``"Referenced image: photo.png"``), with the full reference living only in
     ``media_assets.ref_value``.
     """
+    # Admit the caller's raw reference before data-URI normalization can write
+    # a blob, and keep every derived write on this operation's immutable policy
+    # snapshot. Internal exemptions require an opaque in-process capability;
+    # caller-supplied strings such as "restore" cannot bypass admission.
+    from mnemosyne.core.filters import admit_memory_write, current_write_policy
+
+    write_policy = _write_policy or current_write_policy()
+    if any(
+        not admit_memory_write(
+            value, write_kind=_write_kind, policy=write_policy
+        )[0]
+        for value in (ref, title)
+        if value
+    ):
+        return MediaIngestResult(asset_id="", status="filtered")
+
     store = getattr(beam, "media", None)
     if store is None:
         store = MediaStore(db_path=getattr(beam, "db_path", None),
@@ -1385,11 +1436,13 @@ def remember_media(
     moment_ids: List[str] = []
     memory_ids: List[str] = []
     status = "unavailable"
+    result = None
 
     try:
         anchor_memory_id = _ensure_anchor_memory(
             beam, store, asset_id, ref_kind_norm, ref_value, modality_norm,
             title=title, source=source, importance=importance, scope=scope,
+            write_kind=_write_kind, write_policy=write_policy,
         )
 
         result = _describe(
@@ -1414,8 +1467,25 @@ def remember_media(
         if skipped:
             warnings.append(f"{skipped} provider moment(s) dropped as unwritable")
 
+        from mnemosyne.core.filters import admit_memory_write
+
+        admitted_drafts = [
+            draft
+            for draft in drafts
+            if admit_memory_write(
+                draft.text, write_kind=_write_kind, policy=write_policy
+            )[0]
+        ]
+        filtered = len(drafts) - len(admitted_drafts)
+        if filtered:
+            skipped += filtered
+            warnings.append(
+                f"{filtered} provider moment(s) dropped by write policy"
+            )
+        drafts = admitted_drafts
+
         if not drafts:
-            status = "partial" if result.summary else "unavailable"
+            status = "unavailable"
             return MediaIngestResult(
                 asset_id=asset_id, anchor_memory_id=anchor_memory_id,
                 status=status, warnings=warnings,
@@ -1427,6 +1497,7 @@ def remember_media(
             beam, store, asset_id, drafts, moment_ids,
             source=source, importance=importance, scope=scope,
             provider=result.provider, model=result.model,
+            write_kind=_write_kind, write_policy=write_policy,
         )
         status = "partial" if skipped else "ok"
 
@@ -1439,7 +1510,10 @@ def remember_media(
         # A constraint error mid-loop must not strand the asset at 'pending' --
         # nothing retries that state, and doctor would not flag it either.
         try:
-            store.set_understanding_status(asset_id, status)
+            if status in ("ok", "partial"):
+                store._finalize_described_asset(asset_id, status)
+            else:
+                store.set_understanding_status(asset_id, status, replace_provenance=True)
         except Exception:
             logger.info("media: could not finalize status for %s", asset_id, exc_info=True)
 
@@ -1447,7 +1521,7 @@ def remember_media(
 def _ensure_anchor_memory(
     beam, store: MediaStore, asset_id: str, ref_kind: str, ref_value: str,
     modality: str, *, title: Optional[str], source: str, importance: float,
-    scope: str,
+    scope: str, write_kind: object, write_policy,
 ) -> Optional[str]:
     """Write (or reuse) the reference memory for an asset.
 
@@ -1469,6 +1543,7 @@ def _ensure_anchor_memory(
         beam, content, source=source, importance=importance, scope=scope,
         metadata={"media": {"asset_id": asset_id, "modality": modality,
                             "ref_kind": ref_kind, "role": "anchor"}},
+        write_kind=write_kind, write_policy=write_policy,
     )
     if memory_id and isinstance(meta, dict):
         meta["anchor_memory_id"] = memory_id
@@ -1485,7 +1560,7 @@ def _ensure_anchor_memory(
 
 def _remember_text(
     beam, content: str, *, source: str, importance: float, scope: str,
-    metadata: Dict[str, Any],
+    metadata: Dict[str, Any], write_kind: object, write_policy,
 ) -> Optional[str]:
     """Write one memory row for media.
 
@@ -1502,15 +1577,20 @@ def _remember_text(
     moment row bound to nothing.
     """
     try:
-        return beam.remember(
-            content,
-            source=source,
-            importance=importance,
-            metadata=metadata,
-            scope=scope,
-            memory_type="artifact",
-            dedupe=False,
-        )
+        from mnemosyne.core.filters import write_policy_operation
+
+        with write_policy_operation(write_policy):
+            return beam.remember(
+                content,
+                source=source,
+                importance=importance,
+                metadata=metadata,
+                scope=scope,
+                memory_type="artifact",
+                dedupe=False,
+                _write_kind=write_kind,
+                _write_policy=write_policy,
+            )
     except Exception:
         logger.info("media: memory write failed", exc_info=True)
         return None
@@ -1645,7 +1725,7 @@ def _span_kind_for(item, modality: str) -> str:
 def _bind_moment_memories(
     beam, store: MediaStore, asset_id: str, drafts: List[MomentDraft],
     moment_ids: List[str], *, source: str, importance: float, scope: str,
-    provider: Optional[str], model: Optional[str],
+    provider: Optional[str], model: Optional[str], write_kind: object, write_policy,
 ) -> List[str]:
     """Write a memory row per *newly unbound* moment and bind it.
 
@@ -1668,6 +1748,7 @@ def _bind_moment_memories(
                 "kind": draft.kind, "span_kind": draft.span_kind,
                 "provider": provider, "provider_model": model,
             }},
+            write_kind=write_kind, write_policy=write_policy,
         )
         if memory_id is None:
             continue

@@ -390,7 +390,7 @@ def chart_sota_card():
                 fontsize=9, color="#CBD5E1", fontfamily="monospace")
 
     # Footer
-    ax.text(0.5, 0.05, "github.com/AxDSan/mnemosyne  •  mnemosyne.site", 
+    ax.text(0.5, 0.05, "github.com/mnemosyne-oss/mnemosyne  •  mnemosyne.site", 
             ha="center", transform=ax.transAxes,
             fontsize=9, color="#64748B", fontstyle="italic")
 

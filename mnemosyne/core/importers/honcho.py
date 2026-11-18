@@ -16,7 +16,9 @@ import json
 from datetime import datetime
 from typing import List, Dict
 
+from mnemosyne.core.filters import _RESTORE_WRITE_CAPABILITY
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
+from mnemosyne.core.user_agent import application_user_agent
 
 
 class HonchoImporter(BaseImporter):
@@ -141,9 +143,10 @@ class HonchoImporter(BaseImporter):
         # but depends on server configuration
         base = "http://localhost:8000"
         all_items = []
+        headers = {"User-Agent": application_user_agent()}
 
         # Try listing peers
-        req = urllib.request.Request(f"{base}/peers")
+        req = urllib.request.Request(f"{base}/peers", headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 peers = json.loads(resp.read().decode())
@@ -153,7 +156,7 @@ class HonchoImporter(BaseImporter):
         for peer in peers:
             peer_id = peer.get("peer_id", "")
             # Try to get sessions
-            req = urllib.request.Request(f"{base}/peers/{peer_id}/sessions")
+            req = urllib.request.Request(f"{base}/peers/{peer_id}/sessions", headers=headers)
             try:
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     sessions = json.loads(resp.read().decode())
@@ -162,7 +165,7 @@ class HonchoImporter(BaseImporter):
 
             for session in sessions:
                 sid = session.get("session_id", "")
-                req = urllib.request.Request(f"{base}/sessions/{sid}/messages")
+                req = urllib.request.Request(f"{base}/sessions/{sid}/messages", headers=headers)
                 try:
                     with urllib.request.urlopen(req, timeout=10) as resp:
                         messages = json.loads(resp.read().decode())
@@ -259,7 +262,11 @@ class HonchoImporter(BaseImporter):
                         metadata=meta,
                         valid_until=mem_dict.get("valid_until"),
                         scope=mem_dict.get("scope", "session"),
+                        _write_kind=_RESTORE_WRITE_CAPABILITY,
                     )
+                    if mid is None:
+                        result.skipped += 1
+                        continue
                     if author_id or author_type or chan:
                         try:
                             mnemosyne.beam.conn.execute("""

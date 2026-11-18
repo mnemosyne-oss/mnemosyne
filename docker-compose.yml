@@ -1,7 +1,7 @@
 version: "3.9"
 services:
   mnemosyne-mcp:
-    image: ghcr.io/axdsan/mnemosyne-mcp:latest
+    image: ghcr.io/mnemosyne-oss/mnemosyne-mcp:latest
     build: .
     ports:
       - "8080:8080"

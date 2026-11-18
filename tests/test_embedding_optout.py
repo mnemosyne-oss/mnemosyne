@@ -11,7 +11,6 @@ paths, returning None cleanly without raising.
 """
 from __future__ import annotations
 
-import os
 import json
 import urllib.error
 
@@ -22,7 +21,11 @@ from mnemosyne.core import embeddings
 
 @pytest.fixture(autouse=True)
 def _clean_embedding_env(monkeypatch):
-    """Make sure no embedding-related env var leaks between tests."""
+    """Make sure no embedding-related env var leaks between tests. The module
+    global is blanked too: _embed_api reads _OPENAI_API_KEY (captured at
+    import), so a shell-exported key would otherwise flip tests onto the
+    credentialed transport, bypass their urlopen patches, and attempt real
+    credentialed network egress."""
     for key in (
         "MNEMOSYNE_NO_EMBEDDINGS",
         "MNEMOSYNE_SKIP_EMBEDDINGS",
@@ -31,6 +34,7 @@ def _clean_embedding_env(monkeypatch):
         "MNEMOSYNE_EMBEDDING_API_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "")
     yield
 
 

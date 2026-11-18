@@ -132,14 +132,15 @@ def test_same_id_episodic_twin_keeps_own_content_tier_and_score(beam, monkeypatc
     from mnemosyne.core import embeddings
     monkeypatch.setattr(embeddings, "available", lambda: True)
     monkeypatch.setattr(embeddings, "embed", lambda _: np.array([[1.0, 0.0, 0.0]], dtype=np.float32))
+    monkeypatch.setattr(embeddings, "embed_query", lambda _: np.array([1.0, 0.0, 0.0], dtype=np.float32))
     engine = beam._get_polyphonic_engine()
     # Establish the actual episodic vector signal, without a temporal WM boost.
-    only_episode = engine._vector_voice(np.array([1.0, 0.0, 0.0]), source="conversation",
+    only_episode = engine._vector_voice(np.array([1.0, 0.0, 0.0]), source=None,
                                        excluded_wm_ids={proof.memory_id})
     assert len(only_episode) == 1
     assert only_episode[0].metadata["embedding_tier"] == "episodic"
     filtered = engine.recall("recent orchard", np.array([1.0, 0.0, 0.0]),
-                             source="conversation", exclude_captures=snapshot(proof))
+                             source=None, exclude_captures=snapshot(proof))
     assert len(filtered) == 1
     assert filtered[0].content == summary
     assert filtered[0].metadata["embedding_tier"] == "episodic"
@@ -161,6 +162,7 @@ def test_ineligible_episodic_twin_never_rescues_working_content(beam, monkeypatc
     from mnemosyne.core import embeddings
     monkeypatch.setattr(embeddings, "available", lambda: True)
     monkeypatch.setattr(embeddings, "embed", lambda _: np.array([[1.0, 0.0, 0.0]], dtype=np.float32))
+    monkeypatch.setattr(embeddings, "embed_query", lambda _: np.array([1.0, 0.0, 0.0], dtype=np.float32))
     assert recall(beam, snapshot(proof)) == []
 
 

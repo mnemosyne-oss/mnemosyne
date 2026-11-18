@@ -9,12 +9,14 @@ from __future__ import annotations
 
 
 class FakeBeam:
+    # Simulates a beam with author identity set; prefetch must IGNORE it
+    # (CWE-200: a non-empty author_id would widen recall to (1=1)).
     author_id = "test-author"
 
     def __init__(self, content: str):
         self.content = content
 
-    def recall(self, query, top_k, temporal_weight, temporal_halflife, author_id):
+    def recall(self, query, top_k, temporal_weight, temporal_halflife):
         return [
             {
                 "content": self.content,

@@ -10,9 +10,13 @@ Example:
     >>> results = recall("user preferences")
 """
 
-__version__ = "4.0.0b1"
+__version__ = "4.1.0"
 __author__ = "Abdias J"
 __license__ = "MIT"
+
+import os
+
+os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
 
 # Lazy imports to allow mnemosyne.install to run without heavy deps
 # (e.g. numpy is not yet installed during first-time setup)
@@ -25,6 +29,7 @@ _lazy_exports = {
     "get": (".core.memory", "get"),
     "forget": (".core.memory", "forget"),
     "update": (".core.memory", "update"),
+    "close_thread_connection": (".core.connection_release", "close_thread_connection"),
     "reclaim_orphans": (".core.memory", "reclaim_orphans"),
     "SyncEngine": (".core.sync", "SyncEngine"),
     "SyncEvent": (".core.sync", "SyncEvent"),
@@ -35,6 +40,7 @@ _lazy_exports = {
 
 
 def __getattr__(name: str):
+    """Lazily resolve public package exports to keep import-time dependencies optional."""
     if name in _lazy_exports:
         mod_path, attr_name = _lazy_exports[name]
         mod = __import__(f"mnemosyne{mod_path}", fromlist=[attr_name])

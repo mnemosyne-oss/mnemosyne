@@ -49,6 +49,31 @@ Design
   read of the single current row; cheaper than hybrid vector search for a
   known-key identity read.
 
+Timestamps & the tombstone contract
+-----------------------------------
+A row is *current* iff ``valid_until IS NULL``; any non-NULL value means
+retired, whatever date it holds. ``recall`` / ``list`` / ``search`` /
+``model_card`` use exactly that test and ``history`` keeps superseded rows
+version-ordered with their raw stamps — there is intentionally no as-of /
+point-in-time reader over this table.
+
+On current main the native writer mints every stamp (``valid_from``,
+``valid_until``, and SQLite's ``created_at``) as naive-UTC ``YYYY-MM-DD
+HH:MM:SS``, so a row written start-to-finish by this generation shares one
+clock and one format regardless of the host timezone. That does **not** hold
+across the stored corpus: rows carrying a stamp from an earlier writer
+generation, and values supplied explicitly to ``import_all``, are stored
+verbatim and are *not* normalized. A retirement performed now therefore stamps
+a UTC ``valid_until`` beside an older ``valid_from`` that may use a different
+clock or separator.
+
+Treat stored timestamps as data, not a comparable timeline: raw string or
+cross-column comparison can invert (``'T'`` sorts above ``' '``), the shape of a
+stamp is not evidence of which writer or host timezone produced it, and
+shape-only normalization (``T``→space, strip a trailing ``Z``) repairs format
+but cannot recover an unknown historical local offset. The point documented here
+is per-generation stamp provenance, not a promise that rows stop being mixed.
+
 This complements, not replaces, episodic memory and the TripleStore: relational
 facts still belong in triples; free-text identity cards get a deduped
 authoritative slot here.
@@ -56,7 +81,7 @@ authoritative slot here.
 
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -72,9 +97,19 @@ def _default_db_path() -> Path:
 
 
 def _now() -> str:
-    """ISO timestamp used for valid_from / valid_until. Second precision is
-    enough for an identity store and keeps history rows human-readable."""
-    return datetime.now().isoformat(timespec="seconds")
+    """UTC timestamp used for valid_from / valid_until (#1062).
+
+    Rendered as naive-UTC ``YYYY-MM-DD HH:MM:SS``, the exact shape SQLite's
+    ``CURRENT_TIMESTAMP`` writes to ``created_at``, so every stamp *this writer*
+    mints shares one clock and one format regardless of the host timezone (the
+    same discipline #525 established for ``working_memory``). It does not
+    rewrite stamps an earlier writer generation already stored, nor values a
+    caller passed explicitly to ``import_all`` — those keep their own format, so
+    a retirement now can leave a UTC ``valid_until`` beside a legacy
+    ``valid_from`` on the same row (see the module docstring). Second precision
+    is enough for an identity store and keeps history rows human-readable.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _get_conn(db_path: Optional[Path] = None) -> sqlite3.Connection:
@@ -141,6 +176,13 @@ def _init_canonical_with_conn(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_canonical_owner_category "
         "ON canonical_facts(owner_id, category)"
     )
+    # Writer provenance (2026-09-20 incident): owner_id answers "whose fact",
+    # never "who wrote me". Stamp writer identity at write time; idempotent
+    # ALTER so pre-existing tables acquire the columns on next init.
+    _cols = {r[1] for r in cursor.execute("PRAGMA table_info(canonical_facts)")}
+    for _add in ("writer_id", "writer_home"):
+        if _add not in _cols:
+            cursor.execute("ALTER TABLE canonical_facts ADD COLUMN %s TEXT" % _add)
 
     conn.commit()
 
@@ -201,7 +243,10 @@ class CanonicalStore:
         body: str,
         source: str = "",
         confidence: float = 1.0,
-    ) -> Dict:
+        _write_kind: object = "public",
+        writer_id: str = "",
+        writer_home: str = "",
+    ) -> Optional[Dict]:
         """Upsert the canonical value for ``(owner_id, category, name)``.
 
         - If the slot is empty, insert version 1.
@@ -212,6 +257,8 @@ class CanonicalStore:
 
         Returns the resulting current row as a dict, with an added
         ``status`` key: ``"created"``, ``"unchanged"``, or ``"updated"``.
+        Returns ``None`` when the current write policy rejects ``body``;
+        policy rejection does not modify the canonical slot or its history.
 
         Raises ``ValueError`` if owner_id / category / name / body is empty —
         the slot key and value must all be non-blank for the uniqueness
@@ -221,6 +268,11 @@ class CanonicalStore:
             raise ValueError("owner_id, category, and name are required")
         if not body or not body.strip():
             raise ValueError("body is required and cannot be blank")
+
+        from mnemosyne.core.filters import admit_memory_write
+
+        if not admit_memory_write(body, write_kind=_write_kind)[0]:
+            return None
 
         cursor = self.conn.cursor()
         # BEGIN IMMEDIATE so the read-current + supersede + insert sequence is
@@ -267,10 +319,11 @@ class CanonicalStore:
                 """
                 INSERT INTO canonical_facts
                     (owner_id, category, name, body, source, confidence,
-                     version, valid_from, valid_until)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                     version, valid_from, valid_until, writer_id, writer_home)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
                 """,
-                (owner_id, category, name, body, source, confidence, version, now),
+                (owner_id, category, name, body, source, confidence, version, now,
+                 writer_id or "", writer_home or ""),
             )
             new_id = cursor.lastrowid
             self.conn.commit()
@@ -419,7 +472,8 @@ class CanonicalStore:
         rows = self.conn.execute(
             """
             SELECT id, owner_id, category, name, body, source, confidence,
-                   version, valid_from, valid_until, created_at
+                   version, valid_from, valid_until, created_at,
+                   writer_id, writer_home
             FROM canonical_facts
             ORDER BY id
             """
@@ -434,8 +488,11 @@ class CanonicalStore:
         - **No id collision**: insert with the imported ``id``
           (``stats["inserted"]``).
         - **Id collision + identical content**: skip (``stats["skipped"]``).
-        - **Id collision + different content**: insert with a fresh
-          auto-assigned id (``stats["imported_renumbered"]``).
+        - **Id collision + different content**: insert with a fresh auto-assigned id (``stats["imported_renumbered"]``).
+          "Content" includes ``writer_id`` — the same bytes re-attributed to
+          a different writer are not the same fact and are never silently
+          skipped; blank/absent writer compares equal to ``"imported"``.
+          ``writer_home`` is store-local and never compared.
         - **No id supplied**: insert with a fresh id (``stats["inserted"]``).
         - ``force=True``: on id collision, overwrite
           (``stats["overwritten"]``).
@@ -452,14 +509,24 @@ class CanonicalStore:
 
         _CONTENT_FIELDS = ("owner_id", "category", "name", "body", "source",
                            "confidence", "version", "valid_from", "valid_until",
-                           "created_at")
-        _INSERT_DEFAULTS = {"source": "imported", "confidence": 1.0, "version": 1}
+                           "created_at", "writer_id")
+        _INSERT_DEFAULTS = {"source": "imported", "confidence": 1.0, "version": 1,
+                            "writer_id": "imported"}
 
         def _normalized(item):
-            return {
+            out = {
                 f: item.get(f) if item.get(f) is not None else _INSERT_DEFAULTS.get(f)
                 for f in _CONTENT_FIELDS
             }
+            # The blank writer (legacy pre-provenance rows) and an absent
+            # writer key are the same statement of fact: unknown authorship,
+            # which INSERT records as "imported". Compare on that identity so
+            # legacy exports round-trip as equal, while an EXPLICIT writer
+            # that differs from the stored one is a provenance divergence —
+            # never a silent skip (writer_home is store-local and excluded).
+            if not out.get("writer_id"):
+                out["writer_id"] = "imported"
+            return out
 
         seen_ids = set()
         for item in rows:
@@ -472,23 +539,38 @@ class CanonicalStore:
                     )
                 seen_ids.add(row_id)
 
-        cursor.execute("BEGIN IMMEDIATE")
+        owns_transaction = not self.conn.in_transaction
+        savepoint = None
+        if owns_transaction:
+            cursor.execute("BEGIN IMMEDIATE")
+        else:
+            savepoint = (
+                self.conn._next_savepoint_name("import_canonical")
+                if hasattr(self.conn, "_next_savepoint_name")
+                else "mnemosyne_import_canonical"
+            )
+            cursor.execute(f"SAVEPOINT {savepoint}")
         try:
             existing = cursor.execute(
                 "SELECT id, owner_id, category, name, body, source, confidence, "
-                "version, valid_from, valid_until, created_at FROM canonical_facts"
+                "version, valid_from, valid_until, created_at, writer_id, "
+                "writer_home FROM canonical_facts"
             ).fetchall()
-            existing_snapshot = {
-                r[0]: dict(zip(_CONTENT_FIELDS, r[1:])) for r in existing
-            }
+            existing_snapshot = {}
+            for r in existing:
+                snap = dict(zip(_CONTENT_FIELDS, r[1:]))
+                if not snap.get("writer_id"):
+                    snap["writer_id"] = "imported"
+                existing_snapshot[r[0]] = snap
 
             def _insert_with_id(item, row_id):
                 cursor.execute(
                     """
                     INSERT INTO canonical_facts
                         (id, owner_id, category, name, body, source, confidence,
-                         version, valid_from, valid_until, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         version, valid_from, valid_until, created_at,
+                         writer_id, writer_home)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         row_id, item.get("owner_id"), item.get("category"),
@@ -497,6 +579,11 @@ class CanonicalStore:
                         item.get("confidence", 1.0), item.get("version", 1),
                         item.get("valid_from") or _now(), item.get("valid_until"),
                         item.get("created_at"),
+                        # P3b (2026-09-20 ruling): writer_id is portable
+                        # authorship and survives the round-trip ("imported"
+                        # for pre-P3 rows); writer_home is store-local —
+                        # "which home wrote this row HERE" re-stamps here.
+                        item.get("writer_id") or "imported", str(self.db_path),
                     ),
                 )
 
@@ -505,8 +592,9 @@ class CanonicalStore:
                     """
                     INSERT INTO canonical_facts
                         (owner_id, category, name, body, source, confidence,
-                         version, valid_from, valid_until, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         version, valid_from, valid_until, created_at,
+                         writer_id, writer_home)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         item.get("owner_id"), item.get("category"),
@@ -515,6 +603,7 @@ class CanonicalStore:
                         item.get("confidence", 1.0), item.get("version", 1),
                         item.get("valid_from") or _now(), item.get("valid_until"),
                         item.get("created_at"),
+                        item.get("writer_id") or "imported", str(self.db_path),
                     ),
                 )
 
@@ -562,9 +651,16 @@ class CanonicalStore:
                 except sqlite3.IntegrityError:
                     stats["skipped"] += 1
 
-            self.conn.commit()
+            if owns_transaction:
+                self.conn.commit()
+            else:
+                cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
         except Exception:
-            self.conn.rollback()
+            if owns_transaction:
+                self.conn.rollback()
+            else:
+                cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
         return stats
 
@@ -581,11 +677,19 @@ def remember_canonical(
     source: str = "",
     confidence: float = 1.0,
     db_path: Optional[Path] = None,
-) -> Dict:
+) -> Optional[Dict]:
     """Upsert a canonical fact without instantiating CanonicalStore manually."""
-    store = CanonicalStore(db_path=db_path)
-    return store.remember(owner_id, category, name, body,
-                          source=source, confidence=confidence)
+    from mnemosyne.core.filters import admit_memory_write, write_policy_operation
+
+    # Admission must precede CanonicalStore construction: initializing a store
+    # creates the parent directory, database file, and schema. Keep that same
+    # immutable snapshot active for the store's defensive admission check.
+    with write_policy_operation() as policy:
+        if not admit_memory_write(body, policy=policy)[0]:
+            return None
+        store = CanonicalStore(db_path=db_path)
+        return store.remember(owner_id, category, name, body,
+                              source=source, confidence=confidence)
 
 
 def recall_canonical(

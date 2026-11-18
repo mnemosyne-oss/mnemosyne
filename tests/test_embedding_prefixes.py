@@ -11,15 +11,29 @@ QUERY_PREFIX = "task: search result | query: "   # trailing space is load-bearin
 DOC_PREFIX = "title: none | text: "
 
 RECORDED = []
+TARGET = "orchard target memory"
+DISTRACTOR = "orchard distractor memory"
+
+def stub_vector(text):
+    # A query embedded with the query prefix lands on TARGET; the same query
+    # embedded with the document prefix lands on DISTRACTOR. Any other text
+    # keeps the flat vector the byte-exact tests were written against.
+    axis = {QUERY_PREFIX + "where is the orchard": 0, DOC_PREFIX + TARGET: 0,
+            DOC_PREFIX + "where is the orchard": 1, DOC_PREFIX + DISTRACTOR: 1}.get(text)
+    if axis is None:
+        return [0.1] * 768
+    vector = [0.0] * 768
+    vector[axis] = 1.0
+    return vector
 
 class StubHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         RECORDED.append(json.loads(body))
-        n = len(json.loads(body)["input"])
+        texts = json.loads(body)["input"]
         resp = json.dumps({"object": "list", "model": "stub",
-                           "data": [{"object": "embedding", "index": i, "embedding": [0.1] * 768}
-                                    for i in range(n)],
+                           "data": [{"object": "embedding", "index": i, "embedding": stub_vector(text)}
+                                    for i, text in enumerate(texts)],
                            "usage": {"prompt_tokens": 1, "total_tokens": 1}}).encode()
         self.send_response(200); self.send_header("Content-Length", str(len(resp)))
         self.send_header("Content-Type", "application/json"); self.end_headers()
@@ -28,6 +42,10 @@ class StubHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def embeddings_mod(monkeypatch):
+    # This loopback stub must exercise enabled API dispatch, not inherit CI's
+    # global opt-out now that public API calls respect the same guard as local.
+    for flag in ("MNEMOSYNE_NO_EMBEDDINGS", "MNEMOSYNE_SKIP_EMBEDDINGS", "MNEMOSYNE_EMBEDDINGS_OFF"):
+        monkeypatch.delenv(flag, raising=False)
     server = HTTPServer(("127.0.0.1", 0), StubHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_port}/v1"
@@ -36,13 +54,29 @@ def embeddings_mod(monkeypatch):
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_DIM", "768")
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_QUERY_PREFIX", QUERY_PREFIX)
     monkeypatch.setenv("MNEMOSYNE_EMBEDDING_DOC_PREFIX", DOC_PREFIX)
+    # The fake endpoint is plain http: strip any shell-exported embedding key
+    # BEFORE the reload below, which re-reads it (the client refuses
+    # credentialed non-HTTPS endpoints).
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    # The reload below re-reads _DEFAULT_MODEL from the patched env (model
+    # "embeddinggemma-300m-q4"); restore the original afterward so later
+    # tests in the same session see the true default instead of this
+    # fixture's model.
     RECORDED.clear()
     from mnemosyne.core import embeddings
     # Reload ONLY because upstream reads the API URL/model at module import time.
     # The PREFIXES are read at call time by the patch, so no reload is ever
     # needed for prefix changes (see test_unset_prefixes_unchanged).
+    _orig_default_model = embeddings._DEFAULT_MODEL
+    _orig_api_key = embeddings._OPENAI_API_KEY
     importlib.reload(embeddings)
     yield embeddings
+    # The reload re-reads both module globals from the (patched, key-stripped)
+    # env; restore the originals so later tests in the session see the true
+    # default model and the real credential state, not this fixture's.
+    embeddings._DEFAULT_MODEL = _orig_default_model
+    embeddings._OPENAI_API_KEY = _orig_api_key
     server.shutdown()
 
 def test_query_prefix_byte_exact(embeddings_mod):
@@ -97,3 +131,21 @@ def test_fastembed_path_applies_prefixes(monkeypatch):
     assert fake.received[-1] == [DOC_PREFIX + "local fact"]
     assert emb.embed_query("local query") is not None
     assert fake.received[-1] == [QUERY_PREFIX + "local query"]
+
+def test_polyphonic_recall_embeds_query_with_query_prefix(embeddings_mod, monkeypatch, tmp_path):
+    # Polyphonic recall must embed the query the same way the linear path does,
+    # or prefixed models (E5, EmbeddingGemma) compare a passage-shaped query.
+    from mnemosyne.core.beam import BeamMemory
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+    for voice in ("TEMPORAL", "GRAPH", "FACT"):
+        monkeypatch.setenv(f"MNEMOSYNE_VOICE_{voice}", "0")
+    monkeypatch.delenv("MNEMOSYNE_VOICE_VECTOR", raising=False)
+    beam = BeamMemory(session_id="prefix-session", db_path=tmp_path / "memory.db")
+    target = beam.remember(TARGET, source="user", dedupe=False)
+    beam.remember(DISTRACTOR, source="user", dedupe=False)
+    RECORDED.clear()
+    results = beam.recall("where is the orchard", top_k=1)
+    inputs = [text for request in RECORDED for text in request["input"]]
+    assert QUERY_PREFIX + "where is the orchard" in inputs
+    assert DOC_PREFIX + "where is the orchard" not in inputs
+    assert [r["id"] for r in results] == [target]

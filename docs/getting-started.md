@@ -30,7 +30,7 @@ pip install mnemosyne-memory[all]
 ### From Source (for contributors)
 
 ```bash
-git clone https://github.com/AxDSan/mnemosyne.git
+git clone https://github.com/mnemosyne-oss/mnemosyne.git
 cd mnemosyne
 pip install -e ".[all,dev]"
 ```

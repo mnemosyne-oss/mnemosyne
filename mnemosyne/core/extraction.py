@@ -19,9 +19,13 @@ Extraction uses temperature=0.0 (deterministic) so re-ingesting the same
 content does not create near-duplicate facts in the facts table.
 """
 
+import ast
 import logging
 import os
-from typing import List
+import re
+from typing import List, Tuple
+
+import collections
 
 logger = logging.getLogger(__name__)
 
@@ -29,35 +33,55 @@ logger = logging.getLogger(__name__)
 from mnemosyne.core import local_llm
 
 # --- Config ------------------------------------------------------------------
+# The default template is a WORKED example, not a schema skeleton. A skeleton
+# under-determines the output shape for small local models: Qwen2.5-1.5B asked
+# for a five-key payload returned subject/predicate/object objects inside
+# `facts` and left `kg` empty, because an empty example never shows which
+# container each kind of item belongs in. A filled example pins it (measured on
+# Qwen2.5-1.5B: facts came back as sentences and kg as proper SPO objects).
+DEFAULT_EXTRACTION_PROMPT = """You are an expert structured memory extractor for Mnemosyne v3.0+ MEMORIA tables.
+The user message below may be in English, German, Russian, or another language.
+First detect the language, then extract ONLY high-signal, long-term relevant items.
+Categories to extract (return valid JSON only, no extra text):
+- facts: persistent user metrics, states, knowledge, or personal data, each written
+  as a PLAIN SENTENCE. A fact is never a subject/predicate/object object.
+  (Examples: 'my name is X', 'I work at Y', 'server runs on port 8080')
+  (Russian: 'меня зовут', 'работаю в', 'использую', 'мой пароль', 'живу в')
+- instructions: rules or commands directed at me the agent
+  (Examples: 'always use tabs', 'never delete logs', 'call me boss')
+  (Russian: 'всегда', 'никогда', 'не забудь', 'нужно', 'должен', 'обязательно')
+- preferences: likes, dislikes, and their evolution
+  (Examples: 'I like dark mode', 'I prefer Python over Go')
+  (Russian: 'нравится', 'люблю', 'терпеть не могу', 'предпочитаю', 'я за')
+- timelines: real events with dates/times
+  (Examples: 'release on 2024-12-01', 'meeting next Tuesday')
+  (Russian: 'встреча', 'релиз', 'запланировано на', 'дедлайн', крайний срок)
+- kg: knowledge-graph triples in subject-predicate-object form. EVERY triple goes
+  here, as an object with exactly the keys 'subject', 'predicate' and 'object' —
+  never as a sentence, and never in the facts array.
+  (Examples: 'user prefers vim', 'project uses fastapi')
+
+Rules:
+- Only extract persistent, non-transient content. Ignore weather, one-off chat, system text.
+- Use semantic understanding — do NOT rely on English keywords.
+- Preserve original casing and language.
+- If nothing qualifies, return empty arrays.
+
+Worked example — user message: 'Ada's laptop is called HAL-9000 and it runs NixOS.'
+{"facts": ["Ada's laptop is called HAL-9000.", "Ada's laptop runs NixOS."],
+ "instructions": [], "preferences": [], "timelines": [],
+ "kg": [{"subject": "Ada", "predicate": "has_laptop", "object": "HAL-9000"},
+        {"subject": "HAL-9000", "predicate": "runs", "object": "NixOS"}]}
+
+Return JSON in this exact format:
+{"facts": [], "instructions": [], "preferences": [], "timelines": [], "kg": []}
+
+User message: {text}
+
+Extraction:"""
+
 EXTRACTION_PROMPT_TEMPLATE = os.environ.get(
-    "MNEMOSYNE_EXTRACTION_PROMPT",
-    "You are an expert structured memory extractor for Mnemosyne v3.0+ MEMORIA tables.\n"
-    "The user message below may be in English, German, Russian, or another language.\n"
-    "First detect the language, then extract ONLY high-signal, long-term relevant items.\n"
-    "Categories to extract (return valid JSON only, no extra text):\n"
-    "- facts: persistent user metrics, states, knowledge, or personal data\n"
-    "  (Examples: 'my name is X', 'I work at Y', 'server runs on port 8080')\n"
-    "  (Russian: 'меня зовут', 'работаю в', 'использую', 'мой пароль', 'живу в')\n"
-    "- instructions: rules or commands directed at me the agent\n"
-    "  (Examples: 'always use tabs', 'never delete logs', 'call me boss')\n"
-    "  (Russian: 'всегда', 'никогда', 'не забудь', 'нужно', 'должен', 'обязательно')\n"
-    "- preferences: likes, dislikes, and their evolution\n"
-    "  (Examples: 'I like dark mode', 'I prefer Python over Go')\n"
-    "  (Russian: 'нравится', 'люблю', 'терпеть не могу', 'предпочитаю', 'я за')\n"
-    "- timelines: real events with dates/times\n"
-    "  (Examples: 'release on 2024-12-01', 'meeting next Tuesday')\n"
-    "  (Russian: 'встреча', 'релиз', 'запланировано на', 'дедлайн', крайний срок)\n"
-    "- kg: knowledge-graph triples in subject-predicate-object form\n"
-    "  (Examples: 'user prefers vim', 'project uses fastapi')\n\n"
-    "Rules:\n"
-    "- Only extract persistent, non-transient content. Ignore weather, one-off chat, system text.\n"
-    "- Use semantic understanding — do NOT rely on English keywords.\n"
-    "- Preserve original casing and language.\n"
-    "- If nothing qualifies, return empty arrays.\n\n"
-    "Return JSON in this exact format:\n"
-    '{"facts": [], "instructions": [], "preferences": [], "timelines": [], "kg": []}\n\n'
-    "User message: {text}\n\n"
-    "Extraction:"
+    "MNEMOSYNE_EXTRACTION_PROMPT", DEFAULT_EXTRACTION_PROMPT
 )
 
 
@@ -65,6 +89,83 @@ def _build_extraction_prompt(text: str, detected_lang: str = 'en') -> str:
     """Build the extraction prompt with the user text and language context."""
     prompt = EXTRACTION_PROMPT_TEMPLATE.replace("{text}", text).replace("{lang}", detected_lang)
     return prompt
+
+
+_SPO_KEYS = ("subject", "predicate", "object")
+
+
+def _spo_dict(item):
+    """Return the mapping an SPO-shaped item carries, or None.
+
+    A dict is returned as-is. A STRING is read as the repr of a dict -- which
+    is what a stray SPO object looks like once something upstream has run
+    ``str()`` over it -- and recovered with ``literal_eval`` rather than
+    whitespace-split, so the mapping it encodes is what comes back.
+
+    Key names are matched case-insensitively in both branches, so a repr using
+    'Subject'/'Predicate'/'Object' is recognised exactly like the dict it
+    stands for.
+    """
+    if isinstance(item, dict):
+        return item
+    if isinstance(item, str):
+        text = item.strip()
+        if not text.startswith("{"):
+            return None
+        # Cheap reject before literal_eval, and case-insensitive: the key
+        # names may be capitalised, and a repr that mentions none of them
+        # cannot be an SPO object.
+        lowered = text.lower()
+        if not all(key in lowered for key in _SPO_KEYS):
+            return None
+        try:
+            recovered = ast.literal_eval(text)
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            return None
+        return recovered if isinstance(recovered, dict) else None
+    return None
+
+
+def _spo_fields(item):
+    """Return ``(subject, predicate, object)`` for an UNAMBIGUOUS SPO item.
+
+    Returns None when the item is not clearly a triple. Two shapes qualify: a
+    dict carrying all three keys (any casing), and a STRING that is a repr of
+    such a dict — which is what a stray object looks like once something
+    upstream has run ``str()`` over it. The repr is read with ``literal_eval``
+    rather than whitespace-split, so ``"{'subject': 'a', ...}"`` recovers
+    ``('a', ...)`` instead of inventing a triple from its punctuation.
+
+    A 3-element list is deliberately NOT accepted here: ``["a","b","c"]`` inside
+    a flat category is indistinguishable from a list of three short facts, and
+    guessing wrong would both invent a triple and delete facts. A plain sentence
+    never qualifies, because a fabricated SPO split is worse than no triple.
+    """
+    data = _spo_dict(item)
+    if data is None:
+        return None
+    fields = {str(key).lower(): value for key, value in data.items()}
+    subject = fields.get("subject")
+    predicate = fields.get("predicate")
+    obj = fields.get("object")
+    if subject and predicate and obj:
+        return (str(subject), str(predicate), str(obj))
+    return None
+
+
+def _has_spo_keys(item) -> bool:
+    """True when the item carries all three SPO keys, whatever their values.
+
+    Key presence is independent of value validity. A dict with an empty or
+    null field is still a misfiled triple: it must not be stored as an
+    ordinary fact string, even though :func:`_spo_fields` refuses to read a
+    triple out of it and it therefore never reaches the KG.
+    """
+    data = _spo_dict(item)
+    if data is None:
+        return False
+    keys = {str(key).lower() for key in data}
+    return all(key in keys for key in _SPO_KEYS)
 
 
 def _parse_facts(raw_output: str) -> List[str]:
@@ -85,13 +186,55 @@ def _parse_facts(raw_output: str) -> List[str]:
         try:
             parsed = _json.loads(raw_clean)
             if isinstance(parsed, dict):
-                # Collect all extracted items across categories
+                # Collect all extracted items across categories.
+                # The categories overlap by design — "always use tabs" is both a
+                # fact and an instruction, and a dated statement is both a fact
+                # and a timeline — so a model that files one statement under
+                # every category it belongs to is behaving correctly. Without a
+                # dedupe here that correctness is punished: the same string is
+                # returned once per category and stored once per copy.
                 all_items = []
+                seen = set()
+                saw_supported_category = False
                 for category in ('facts', 'instructions', 'preferences', 'timelines'):
-                    items = parsed.get(category, [])
+                    if category not in parsed:
+                        continue
+                    # Presence decides, not usability. A document that parsed as
+                    # a dict and names a supported category is complete, not
+                    # partial, so `"facts": null` or a bare string means "no
+                    # facts" rather than "try the streaming recovery regex".
+                    saw_supported_category = True
+                    items = parsed.get(category)
                     if isinstance(items, list):
-                        all_items.extend(str(item) for item in items if item)
-                if all_items:
+                        for item in items:
+                            if not item:
+                                continue
+                            # A misfiled triple is not a fact. Stringifying it
+                            # here is what put "{'subject': 'Melissa', ...}"
+                            # rows in the facts table while the real triple was
+                            # lost: drop it, so _parse_kg_triples can recover it
+                            # into the KG instead of storing a repr as knowledge.
+                            #
+                            # Key presence decides here, not value validity: a
+                            # triple-shaped dict with an empty or null field is
+                            # misfiled too, and must not become a fact string.
+                            if _has_spo_keys(item):
+                                continue
+                            text = str(item)
+                            key = text.strip().casefold()
+                            if not key or key in seen:
+                                continue
+                            seen.add(key)
+                            all_items.append(text)
+                # Answered by presence, not by yield: a payload that supplies a
+                # supported category and no usable entries means "nothing to
+                # extract", so return that. Falling through would hand the raw
+                # text to the partial-JSON regex, which matches any quoted run
+                # of ten or more characters — including the schema's own key
+                # names, making "instructions" and "preferences" stored facts.
+                # No supported category still falls through, which keeps the
+                # malformed/unsupported and kg-only paths intact.
+                if saw_supported_category:
                     return all_items
         except (_json.JSONDecodeError, Exception):
             pass
@@ -121,6 +264,176 @@ def _parse_facts(raw_output: str) -> List[str]:
     return cleaned[:5]  # Cap at 5 facts
 
 
+# --- KG triple parsing / validation ------------------------------------------
+#
+# The extraction prompt asks the LLM for a "kg" category of subject-predicate-
+# object triples, but `_parse_facts` iterates only
+# ('facts', 'instructions', 'preferences', 'timelines') and silently drops
+# every triple the model returns. `_parse_kg_triples` recovers that category
+# from the same JSON payload; `validate_kg_triples` gates what may reach the
+# TripleStore.
+
+
+def _parse_kg_triples(raw_output: str) -> List[Tuple[str, str, str]]:
+    """Extract (subject, predicate, object) triples from LLM output.
+
+    Only the well-formed JSON branch is honoured: kg items must come from the
+    parsed JSON payload, each item either a "subject predicate object" string,
+    a [s, p, o] 3-list, or a dict with subject/predicate/object keys. Anything
+    else degrades to no triples — we never guess an SPO split out of prose,
+    because a fabricated split is worse than none.
+    """
+    if not raw_output or raw_output.strip().upper() == "NO_FACTS":
+        return []
+
+    import json as _json
+    raw_clean = raw_output.strip()
+    if raw_clean.startswith("```"):
+        raw_clean = (
+            raw_clean.split("```\n")[-1]
+            if "```\n" in raw_clean
+            else raw_clean.removeprefix("```json").removesuffix("```").strip()
+        )
+    if not raw_clean.startswith("{"):
+        return []
+    try:
+        parsed = _json.loads(raw_clean)
+    except Exception:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    # The intended category first, preserving every shape it already accepted:
+    # an SPO dict (any key casing), a [s, p, o] list, or a "subject predicate
+    # object" string.
+    parsed_triples: List[Tuple[str, str, str]] = []
+    items = parsed.get("kg", [])
+    if isinstance(items, list):
+        for item in items:
+            fields = _spo_fields(item)
+            if fields:
+                parsed_triples.append(fields)
+            elif (
+                isinstance(item, (list, tuple))
+                and len(item) == 3
+                and not any(field is None for field in item)
+            ):
+                parsed_triples.append((str(item[0]), str(item[1]), str(item[2])))
+            elif isinstance(item, str) and item.strip():
+                parts = item.strip().split(None, 2)
+                if len(parts) == 3:
+                    parsed_triples.append((parts[0], parts[1], parts[2]))
+
+    # Recovery: small local models sometimes file their SPO dictionaries under a
+    # flat fact category and leave `kg` empty (observed with the bundled
+    # Qwen2.5-1.5B), which silently starved the triples table. Recover the
+    # unambiguous shapes from every other list. Prose and bare three-item lists
+    # are still never split into a triple: a fabricated SPO is worse than none.
+    for category, category_items in parsed.items():
+        if category == "kg" or not isinstance(category_items, list):
+            continue
+        for item in category_items:
+            fields = _spo_fields(item)
+            if fields:
+                parsed_triples.append(fields)
+    return parsed_triples
+
+
+# Validation caps for LLM-proposed KG triples before they reach TripleStore.
+KG_MAX_SUBJECT_CHARS = 120
+KG_MAX_PREDICATE_CHARS = 60
+KG_MAX_OBJECT_CHARS = 300
+
+# Hedge / conversational-filler openings that mark a proposed triple as
+# chat debris rather than durable knowledge (same hit class the regex
+# prototype stored as junk decisions). Trailing space-or-end match keeps
+# "Wellington" etc. Includes the #848 review examples ("you said", "let me").
+_KG_FILLER_PREFIXES = (
+    "what ", "whats ", "what's ", "whether ", "maybe ", "perhaps ",
+    "probably ", "possibly ", "i think ", "i guess ", "i mean ",
+    "it seems ", "not sure ", "kinda ", "sorta ", "well ",
+    "you said ", "let me ", "let me check ",
+)
+
+
+def _kg_normalize_field(value) -> str:
+    """Coerce to str, collapse whitespace runs, strip wrapping quotes."""
+    if value is None:
+        return ""
+    collapsed = re.sub(r"\s+", " ", str(value)).strip()
+    return collapsed.strip("\"'`").strip()
+
+
+def _kg_word_safe_truncate(text: str, limit: int) -> str:
+    """Cut to <= limit chars without ending mid-word when avoidable.
+
+    Returns "" when no clean cut exists (single token longer than limit);
+    callers treat "" as a rejection.
+    """
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    if " " in head:
+        return head.rsplit(" ", 1)[0].rstrip(",;:")
+    return ""
+
+
+def validate_kg_triples(triples) -> List[Tuple[str, str, str]]:
+    """Filter/normalize LLM-proposed (subject, predicate, object) triples.
+
+    Gates, in order:
+    - every field must be a non-empty string after whitespace normalization;
+    - conversational-filler openings are rejected on subject and object;
+    - length caps: subject <= 120, predicate <= 60, object <= 300 chars.
+      Over-long objects are cut at a word boundary (never mid-word); a field
+      with no clean cut is rejected outright;
+    - predicates are lowercased with whitespace/hyphens folded to underscores
+      (collapse runs, trim boundary underscores), enforcing snake_case;
+    - within-batch duplicates (case-insensitive) are dropped.
+    """
+    validated: List[Tuple[str, str, str]] = []
+    seen = set()
+    for triple in triples or []:
+        try:
+            raw_subject, raw_predicate, raw_object = triple
+        except (TypeError, ValueError):
+            continue
+        subject = _kg_normalize_field(raw_subject)
+        predicate = _kg_normalize_field(raw_predicate)
+        obj = _kg_normalize_field(raw_object)
+        if not subject or not predicate or not obj:
+            continue
+
+        low_subject, low_object = subject.lower(), obj.lower()
+
+        def _is_filler(text: str) -> bool:
+            for pfx in _KG_FILLER_PREFIXES:
+                stem = pfx.rstrip()
+                if text == stem or text.startswith(stem + " "):
+                    return True
+            return False
+
+        if _is_filler(low_subject) or _is_filler(low_object):
+            continue
+
+        subject = _kg_word_safe_truncate(subject, KG_MAX_SUBJECT_CHARS)
+        predicate = _kg_word_safe_truncate(predicate, KG_MAX_PREDICATE_CHARS)
+        obj = _kg_word_safe_truncate(obj, KG_MAX_OBJECT_CHARS)
+        if not subject or not predicate or not obj:
+            continue
+
+        predicate = re.sub(r"[\s\-]+", "_", predicate.lower())
+        predicate = re.sub(r"_+", "_", predicate).strip("_")
+        if not predicate:
+            continue
+
+        key = (subject.lower(), predicate, obj.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        validated.append((subject, predicate, obj))
+    return validated
+
+
 def _call_local_extraction_llm(llm, prompt: str) -> str:
     """Run deterministic local extraction for the loaded local LLM backend.
 
@@ -148,15 +461,23 @@ def _call_local_extraction_llm(llm, prompt: str) -> str:
     )
 
 
-def extract_facts(text: str) -> List[str]:
+def _extract_facts_impl(text: str) -> Tuple[List[str], List[Tuple[str, str, str]], bool]:
     """
+    Core LLM tier chain shared by :func:`extract_facts` and
+    :func:`extract_facts_with_triples`.
+
     Extract structured facts from raw text using LLM.
 
     Args:
         text: Raw memory content to extract facts from
 
     Returns:
-        List of extracted fact strings (0-5 items). Empty list if LLM unavailable.
+        (facts, kg_triples, ok) -- facts holds the extracted fact strings
+        (0-5 items), kg_triples the validated triples, and ok is True only
+        when the tier chain finished without an error. A failed extraction
+        (LLM unavailable, raising, or a malformed reasoning trace) reports
+        ok=False so the caller can retry that content later instead of
+        memoizing the failure.
 
     Notes:
         - The host backend (Hermes auxiliary client) is consulted first when
@@ -181,14 +502,14 @@ def extract_facts(text: str) -> List[str]:
     if not text or not text.strip():
         # Caller passed nothing — this isn't a failure, just no work.
         # Don't record_call: this isn't really an extraction attempt.
-        return []
+        return [], [], False
 
     if not local_llm.llm_available():
         diag.record_failure(
             "local", reason="llm_unavailable_at_call_site",
         )
         diag.record_call(succeeded=False, all_empty=False)
-        return []
+        return [], [], False
 
     prompt = _build_extraction_prompt(text)
 
@@ -216,24 +537,26 @@ def extract_facts(text: str) -> List[str]:
             "extract_facts: host LLM adapter raised: %s",
             diagnostics_safe_for_log(e),
         )
-        return []
+        return [], [], False
 
     if attempted:
         diag.record_attempt("host")
         if local_llm._is_invalid_reasoning_output(host_text):
             diag.record_failure("host", reason="malformed_reasoning_trace")
             diag.record_call(succeeded=False)
-            return []
+            return [], [], False
         if host_text:
             facts = _parse_facts(host_text)
-            if facts:
+            kg_triples = validate_kg_triples(_parse_kg_triples(host_text))
+            if facts or kg_triples:
                 diag.record_success("host", fact_count=len(facts))
                 diag.record_call(succeeded=True)
-                return facts
+                return facts, kg_triples, True
             diag.record_no_output("host")
         else:
             diag.record_no_output("host")
-        # Host attempted but produced no facts. Skip remote per A3; try local.
+        # Host attempted but produced no usable output. Skip remote per A3;
+        # try local.
         diag.record_attempt("local")
         try:
             llm = local_llm._load_llm()
@@ -244,23 +567,36 @@ def extract_facts(text: str) -> List[str]:
                 diagnostics_safe_for_log(e),
             )
             diag.record_call(succeeded=False)
-            return []
+            return [], [], False
         if llm is not None:
             try:
                 raw_output = _call_local_extraction_llm(llm, prompt)
                 cleaned_output = local_llm._clean_output(raw_output)
                 if local_llm._is_invalid_reasoning_output(cleaned_output):
-                    diag.record_failure("local", reason="malformed_reasoning_trace")
+                    diag.record_failure(
+                        "local", reason="malformed_reasoning_trace")
                     diag.record_call(succeeded=False)
-                    return []
+                    return [], [], False
+                if not cleaned_output.strip():
+                    # A blank response is a FAILED attempt, not an empty
+                    # result. The model produced nothing, so there is
+                    # nothing to memoize: caching it would make this
+                    # content permanently unextractable even after the
+                    # model recovers. A valid JSON response whose arrays
+                    # are empty IS a real result and stays cacheable.
+                    diag.record_no_output("local")
+                    diag.record_call(succeeded=False, all_empty=True)
+                    return [], [], False
                 facts = _parse_facts(cleaned_output)
-                if facts:
+                kg_triples = validate_kg_triples(
+                    _parse_kg_triples(cleaned_output))
+                if facts or kg_triples:
                     diag.record_success("local", fact_count=len(facts))
                     diag.record_call(succeeded=True)
                 else:
                     diag.record_no_output("local")
                     diag.record_call(succeeded=False, all_empty=True)
-                return facts
+                return facts, kg_triples, True
             except Exception as e:
                 diag.record_failure("local", exc=e, reason="ctransformers_raised")
                 logger.warning(
@@ -268,10 +604,10 @@ def extract_facts(text: str) -> List[str]:
                     diagnostics_safe_for_log(e),
                 )
                 diag.record_call(succeeded=False)
-                return []
+                return [], [], False
         diag.record_failure("local", reason="model_not_loaded")
         diag.record_call(succeeded=False, all_empty=True)
-        return []
+        return [], [], False
 
     # 1. Remote LLM. Pass temperature=0.0 so the C2 determinism contract
     # holds even on the standalone remote path (where extract_facts shares
@@ -288,16 +624,18 @@ def extract_facts(text: str) -> List[str]:
             )
             raw_output = ""
         if raw_output:
-            cleaned_output = local_llm._clean_output(raw_output)
-            if local_llm._is_invalid_reasoning_output(cleaned_output):
-                diag.record_failure("remote", reason="malformed_reasoning_trace")
+            remote_clean = local_llm._clean_output(raw_output)
+            if local_llm._is_invalid_reasoning_output(remote_clean):
+                diag.record_failure(
+                    "remote", reason="malformed_reasoning_trace")
                 diag.record_call(succeeded=False)
-                return []
-            facts = _parse_facts(cleaned_output)
-            if facts:
+                return [], [], False
+            facts = _parse_facts(remote_clean)
+            kg_triples = validate_kg_triples(_parse_kg_triples(remote_clean))
+            if facts or kg_triples:
                 diag.record_success("remote", fact_count=len(facts))
                 diag.record_call(succeeded=True)
-                return facts
+                return facts, kg_triples, True
             diag.record_no_output("remote")
         else:
             diag.record_no_output("remote")
@@ -313,23 +651,31 @@ def extract_facts(text: str) -> List[str]:
             diagnostics_safe_for_log(e),
         )
         diag.record_call(succeeded=False)
-        return []
+        return [], [], False
     if llm is not None:
         try:
             raw_output = _call_local_extraction_llm(llm, prompt)
-            cleaned_output = local_llm._clean_output(raw_output)
-            if local_llm._is_invalid_reasoning_output(cleaned_output):
+            local_clean = local_llm._clean_output(raw_output)
+            if local_llm._is_invalid_reasoning_output(local_clean):
                 diag.record_failure("local", reason="malformed_reasoning_trace")
                 diag.record_call(succeeded=False)
-                return []
-            facts = _parse_facts(cleaned_output)
-            if facts:
+                return [], [], False
+            if not local_clean.strip():
+                # Blank response == failed attempt, not an empty result.
+                # Not memoizable; see the host-fallback path above.
+                diag.record_no_output("local")
+                diag.record_call(succeeded=False, all_empty=True)
+                return [], [], False
+            facts = _parse_facts(local_clean)
+            kg_triples = validate_kg_triples(_parse_kg_triples(local_clean))
+            if facts or kg_triples:
                 diag.record_success("local", fact_count=len(facts))
                 diag.record_call(succeeded=True)
+                return facts, kg_triples, True
             else:
                 diag.record_no_output("local")
                 diag.record_call(succeeded=False, all_empty=True)
-            return facts
+            return facts, kg_triples, True
         except Exception as e:
             diag.record_failure("local", exc=e, reason="ctransformers_raised")
             logger.warning(
@@ -337,11 +683,124 @@ def extract_facts(text: str) -> List[str]:
                 diagnostics_safe_for_log(e),
             )
             diag.record_call(succeeded=False)
-            return []
+            return [], [], False
 
     diag.record_failure("local", reason="model_not_loaded")
     diag.record_call(succeeded=False, all_empty=True)
-    return []
+    return [], [], False
+
+
+def extract_facts(text: str) -> List[str]:
+    """
+    Extract structured fact strings from raw text using LLM.
+
+    Thin wrapper over :func:`_extract_facts_impl` that drops the KG-triple
+    half of the payload. Returns 0-5 fact strings; [] when no tier yields
+    usable output.
+    """
+    facts, _kg_triples = extract_facts_with_triples(text)
+    return facts
+
+
+def extract_facts_with_triples(
+    text: str,
+) -> Tuple[List[str], List[Tuple[str, str, str]]]:
+    """
+    Like :func:`extract_facts`, but also returns KG triples.
+
+    The extraction prompt asks the model for a "kg" category of
+    subject-predicate-object triples alongside the flat fact categories;
+    this is the only accessor that surfaces them instead of discarding.
+    Triples are already passed through :func:`validate_kg_triples`.
+
+    Returns:
+        (facts, triples) — facts matches extract_facts() exactly; triples is
+        a list of validated (subject, predicate, object) tuples (possibly []).
+    """
+    cached = _EXTRACT_CACHE.get(text)
+    if cached is not None:
+        return cached
+    facts, kg_triples, ok = _extract_facts_impl(text)
+    if ok:
+        # Only a completed extraction is memoized. Caching a FAILURE would
+        # make the content permanently unextractable: the same text would keep
+        # returning the cached empty result even after the LLM came back, so a
+        # transient outage would silently drop those facts for the life of
+        # the process.
+        _EXTRACT_CACHE.put(text, (facts, kg_triples))
+    return facts, kg_triples
+
+
+class _ExtractResultCache:
+    """Tiny content-keyed memo shared by the extraction accessors.
+
+    BeamMemory's fact path and KG-triple path both need the results of one
+    extraction pass over the same content. Memoizing on exact content keeps
+    a single LLM call per remember() while letting each consumer keep its
+    own seam (extract_facts_safe stays independently mockable for hosts
+    that only want facts).
+    """
+
+    def __init__(self, maxsize: int = 32) -> None:
+        self._maxsize = maxsize
+        self._store: "collections.OrderedDict[str, tuple]" = (
+            collections.OrderedDict()
+        )
+
+    def get(self, text):
+        result = self._store.get(text)
+        if result is not None:
+            self._store.move_to_end(text)
+        # Hand back fresh lists. The accessors pass these straight to their
+        # callers, and a caller that clears or appends to a returned list
+        # must not be able to reach the cached value.
+        if result is None:
+            return None
+        facts, kg_triples = result
+        return list(facts), list(kg_triples)
+
+    def put(self, text, result) -> None:
+        # Copy at the boundary. The accessors hand the very lists they get
+        # back to their callers, and a caller that clears or appends to a
+        # returned list would otherwise mutate the CACHED list: a later
+        # extraction of the same text would return the mutated value
+        # without ever calling the model.
+        facts, kg_triples = result
+        self._store[text] = (list(facts), list(kg_triples))
+        self._store.move_to_end(text)
+        while len(self._store) > self._maxsize:
+            self._store.popitem(last=False)
+
+    def clear(self) -> None:
+        """Clear cached results (also useful for deterministic test isolation)."""
+        self._store.clear()
+
+
+_EXTRACT_CACHE = _ExtractResultCache()
+
+
+def extract_triples_for_beam(text: str) -> List[Tuple[str, str, str]]:
+    """Best-effort KG-triple accessor mirroring extract_facts_safe.
+
+    Shares the same LLM pass as extract_facts_safe via the content cache;
+    never raises. Kept as a separate seam so the facts path can stay
+    exactly as upstream tests and hosts patch it.
+    """
+    try:
+        _facts, kg_triples = extract_facts_with_triples(text)
+        return kg_triples
+    except Exception as e:
+        from mnemosyne.extraction.diagnostics import get_diagnostics, _safe_for_log
+        diag = get_diagnostics()
+        diag.record_failure(
+            "wrapper", exc=e, reason="outer_wrapper_caught"
+        )
+        diag.record_call(succeeded=False)
+        logger.warning(
+            "extract_triples_for_beam: extraction raised: %s",
+            _safe_for_log(e),
+        )
+        return []
 
 
 def extract_facts_safe(text: str) -> List[str]:

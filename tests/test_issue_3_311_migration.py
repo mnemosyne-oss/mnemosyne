@@ -175,6 +175,7 @@ def test_migration_noop_when_database_does_not_exist(tmp_path):
         "added": 0,
         "tables_added": [],
         "tables_already_present": [],
+        "columns_added": [],
         "indices_added": 0,
     }
     assert not db_path.exists()

@@ -7,7 +7,41 @@ between tests, and that default-disable the local LLM so tests don't
 make real CPU inference calls when a model is available on disk.
 """
 
+import os
+import sys
+
+# Scrub deployment env BEFORE any test module imports mnemosyne.core.beam:
+# the module-level RECALL_CONTENT_CAP constant resolves at
+# first import, so a deployment-exported value baked in during collection
+# (alphabetical order controls which file imports first) would otherwise make
+# default-behavior tests environment-dependent. Tests that want custom values
+# set them explicitly on the resolved module attributes.
+os.environ.pop("MNEMOSYNE_RECALL_CONTENT_CAP", None)
+
 import pytest
+
+# File loading keeps this shared harness independent of the repository's
+# plugin __init__.py, even when the checkout itself is named "mnemosyne".
+import runpy
+from pathlib import Path
+
+_isolation = runpy.run_path(str(Path(__file__).with_name("_config_isolation.py")))
+pytest_configure = _isolation["pytest_configure"]
+_isolated_mnemosyne_config = _isolation["_isolated_mnemosyne_config"]
+
+
+@pytest.fixture(autouse=True)
+def _clear_extraction_cache():
+    """Extraction memo is process-global; isolate every test from it.
+
+    The memo in mnemosyne.core.extraction is keyed on content, so one
+    test's extraction would otherwise satisfy a later test's identical
+    content and the second test would never reach the LLM boundary.
+    """
+    from mnemosyne.core.extraction import _EXTRACT_CACHE
+    _EXTRACT_CACHE.clear()
+    yield
+    _EXTRACT_CACHE.clear()
 
 
 def _close_cached_connections():
@@ -37,6 +71,7 @@ def _close_cached_connections():
         from mnemosyne.core import memory as _mem_mod
         _mem_mod._default_instance = None
         _mem_mod._default_bank = "default"
+        _mem_mod._per_call_instance = None
     except Exception:
         pass
 
@@ -69,6 +104,13 @@ def _close_cached_connections():
     except Exception:
         pass
 
+    # The root Hermes provider keeps a process-global lease count for that
+    # registry (#1119). Many provider tests initialize without shutdown, so a
+    # leaked lease would stop a later final owner from clearing the backend.
+    _root_provider = sys.modules.get("hermes_memory_provider")
+    if _root_provider is not None and hasattr(_root_provider, "_host_llm_owner_count"):
+        _root_provider._host_llm_owner_count = 0
+
     # Same reasoning for the modality registry, which is also a process-global.
     # This reset ships in the PR that introduces the registry: a later one is
     # one bled-through global away from a flaky matrix, and the symptom would be
@@ -89,8 +131,13 @@ def _close_cached_connections():
         pass
 
 
+@pytest.fixture
+def _before_connection_reset(_isolated_mnemosyne_config):
+    """Overridable hook for setup that must precede connection imports."""
+
+
 @pytest.fixture(autouse=True)
-def _reset_thread_local_connections():
+def _reset_thread_local_connections(_before_connection_reset):
     """
     Auto-use fixture that resets thread-local SQLite connection caches
     before and after every test. This prevents connection leakage between

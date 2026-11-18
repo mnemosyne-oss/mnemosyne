@@ -87,7 +87,7 @@ server {
 }
 ```
 
-**Docker Compose:** Copy [deploy/sync/docker-compose.yml](https://github.com/AxDSan/mnemosyne/blob/main/deploy/sync/docker-compose.yml) and the Caddyfile. Edit the domain. `docker compose up -d`.
+**Docker Compose:** Copy [deploy/sync/docker-compose.yml](https://github.com/mnemosyne-oss/mnemosyne/blob/main/deploy/sync/docker-compose.yml) and the Caddyfile. Edit the domain. `docker compose up -d`.
 
 **Fly.io:** `fly launch --copy-config` then `fly deploy`.
 

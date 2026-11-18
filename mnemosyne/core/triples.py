@@ -84,36 +84,51 @@ def _get_conn(db_path = None) -> sqlite3.Connection:
     return conn
 
 
+def _ensure_triples_schema(conn: sqlite3.Connection) -> None:
+    """Create the triples schema on an existing connection."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS triples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            object TEXT NOT NULL,
+            valid_from TEXT NOT NULL,
+            valid_until TEXT,
+            source TEXT,
+            confidence REAL DEFAULT 1.0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_predicate ON triples(predicate)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_valid_from ON triples(valid_from)")
+
+
 def init_triples(db_path: Path = None):
     conn = _get_conn(db_path)
     try:
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS triples (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                subject TEXT NOT NULL,
-                predicate TEXT NOT NULL,
-                object TEXT NOT NULL,
-                valid_from TEXT NOT NULL,
-                valid_until TEXT,
-                source TEXT,
-                confidence REAL DEFAULT 1.0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_subject ON triples(subject)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_predicate ON triples(predicate)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_object ON triples(object)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_triples_valid_from ON triples(valid_from)")
-
+        _ensure_triples_schema(conn)
         conn.commit()
     finally:
         try:
             conn.close()
         except Exception:
             pass
+
+
+def _admit_triple_fields(
+    subject: str, predicate: str, object: str, *, policy=None
+) -> bool:
+    """Apply one write-policy snapshot to every persisted triple text field."""
+    from mnemosyne.core.filters import admit_memory_write, current_write_policy
+
+    policy = policy or current_write_policy()
+    return all(
+        admit_memory_write(value, policy=policy)[0]
+        for value in (subject, predicate, object)
+    )
 
 
 class TripleStore:
@@ -138,17 +153,46 @@ class TripleStore:
         >>> ann = AnnotationStore()
         >>> ann.add("mem-1", "mentions", "Alice")
         >>> ann.add("mem-1", "mentions", "Bob")  # both preserved
+
+    Bare ``TripleStore()`` is a standalone store: it always resolves to its
+    own ``triples.db`` (see module docstring), never to a bank's
+    ``mnemosyne.db``. The MCP ``mnemosyne_triple_add``/``mnemosyne_triple_query``
+    tools read and write a *different* file, the calling bank's own
+    ``mnemosyne.db``, so triples written through the bare constructor are
+    invisible to them and vice versa (#548). Use `TripleStore.for_bank()` to
+    get the store instance that matches what a given bank's MCP tools see.
     """
-    
-    def __init__(self, db_path: Path = None):
+
+    def __init__(self, db_path: Path = None, conn: sqlite3.Connection = None):
         self.db_path = Path(db_path) if db_path else _resolve_default_db()
-        init_triples(self.db_path)
-        self.conn = _get_conn(self.db_path)
-    
+        if conn is not None:
+            # Share a caller-owned connection so a multi-store import can run
+            # under one transaction (#727). The caller owns its lifetime.
+            self.conn = conn
+            _ensure_triples_schema(conn)
+        else:
+            init_triples(self.db_path)
+            self.conn = _get_conn(self.db_path)
+
+    @classmethod
+    def for_bank(cls, bank: str = "default") -> "TripleStore":
+        """Return a TripleStore backed by the given bank's own mnemosyne.db.
+
+        Mirrors the resolution `Mnemosyne(bank=...)` and the MCP
+        `triple_add`/`triple_query` handlers already use
+        (`BankManager().get_bank_db_path(bank)`), so triples added here are
+        the same ones those tools read and write. This does not change the
+        bare `TripleStore()` default, and it does not move, merge, or migrate
+        any existing `triples.db` file.
+        """
+        from mnemosyne.core.banks import BankManager
+
+        return cls(db_path=BankManager().get_bank_db_path(bank))
+
     def add(self, subject: str, predicate: str, object: str,
             valid_from: str = None, source: str = "inferred",
             confidence: float = 1.0, valid_until: str = None,
-            supersede: bool = True) -> int:
+            supersede: bool = True, *, _write_policy=None) -> int | None:
         """
         Add a temporal triple.
 
@@ -159,7 +203,15 @@ class TripleStore:
         multiple simultaneous values for one predicate (multi-valued facts,
         e.g. ('user','speaks','English') + ('user','speaks','Spanish')).
         valid_until: optional explicit expiry date (ISO YYYY-MM-DD) for the row.
+
+        Returns the inserted row id, or ``None`` when write policy rejects a
+        persisted text field.
         """
+        if not _admit_triple_fields(
+            subject, predicate, object, policy=_write_policy
+        ):
+            return None
+
         valid_from = valid_from or datetime.now().isoformat()[:10]
 
         cursor = self.conn.cursor()
@@ -319,13 +371,24 @@ class TripleStore:
             DeprecationWarning,
             stacklevel=2,
         )
-        from mnemosyne.core.annotations import AnnotationStore, filter_facts
+        from mnemosyne.core.annotations import (
+            AnnotationStore,
+            _admit_annotation_values,
+            filter_facts,
+        )
+        from mnemosyne.core.filters import write_policy_operation
+
         kept = filter_facts(facts)
         if not kept:
             return 0
-        store = AnnotationStore(db_path=self.db_path)
-        store.add_many(memory_id, "fact", kept, source=source, confidence=confidence)
-        return len(kept)
+        with write_policy_operation():
+            admitted = _admit_annotation_values(kept)
+            if not admitted:
+                return 0
+            store = AnnotationStore(db_path=self.db_path)
+            return store.add_many(
+                memory_id, "fact", admitted, source=source, confidence=confidence
+            )
 
     def export_all(self) -> List[Dict]:
         """Export all triples to a list of dictionaries."""
@@ -412,7 +475,17 @@ class TripleStore:
         # transaction starts on the first DML, leaving SELECT in
         # autocommit -- another writer could change state between
         # snapshot and insert.
-        cursor.execute("BEGIN IMMEDIATE")
+        owns_transaction = not self.conn.in_transaction
+        savepoint = None
+        if owns_transaction:
+            cursor.execute("BEGIN IMMEDIATE")
+        else:
+            savepoint = (
+                self.conn._next_savepoint_name("import_triples")
+                if hasattr(self.conn, "_next_savepoint_name")
+                else "mnemosyne_import_triples"
+            )
+            cursor.execute(f"SAVEPOINT {savepoint}")
         try:
             cursor.execute(
                 "SELECT id, subject, predicate, object, valid_from, valid_until, "
@@ -497,12 +570,18 @@ class TripleStore:
                 except sqlite3.IntegrityError:
                     stats["skipped"] += 1
 
-            self.conn.commit()
+            if owns_transaction:
+                self.conn.commit()
+            else:
+                cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
         except Exception:
-            # Roll back partial inserts so a mid-stream failure doesn't
-            # leave the connection in a state where a later commit
-            # could accidentally persist orphans (codex review #4).
-            self.conn.rollback()
+            # Roll back only this import's writes: an enclosing import
+            # transaction (#727) must survive to roll back everything.
+            if owns_transaction:
+                self.conn.rollback()
+            else:
+                cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
         return stats
 
@@ -514,16 +593,26 @@ class TripleStore:
 def add_triple(subject: str, predicate: str, object: str,
                valid_from: str = None, source: str = "inferred",
                confidence: float = 1.0, db_path: Path = None,
-               valid_until: str = None, supersede: bool = True) -> int:
+               valid_until: str = None, supersede: bool = True) -> int | None:
     """
     Add a temporal triple without instantiating TripleStore manually.
     Optional db_path aligns with BEAM memory database when used from Hermes.
     valid_until/supersede passthrough (see TripleStore.add).
     """
-    store = TripleStore(db_path=db_path)
-    return store.add(subject, predicate, object,
-                     valid_from=valid_from, source=source, confidence=confidence,
-                     valid_until=valid_until, supersede=supersede)
+    from mnemosyne.core.filters import current_write_policy, write_policy_operation
+
+    with write_policy_operation():
+        policy = current_write_policy()
+        if not _admit_triple_fields(subject, predicate, object, policy=policy):
+            return None
+
+        store = TripleStore(db_path=db_path)
+        return store.add(
+            subject, predicate, object,
+            valid_from=valid_from, source=source, confidence=confidence,
+            valid_until=valid_until, supersede=supersede,
+            _write_policy=policy,
+        )
 
 
 def end_triple(subject: str, predicate: str, object: str = None,

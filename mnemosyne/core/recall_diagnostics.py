@@ -65,9 +65,17 @@ class RecallExplainTrace:
         self.stages: List[Dict[str, Any]] = []
         self.candidates: List[Dict[str, Any]] = []
         self.truncated_count = 0
+        # Record which vector path actually ran for this query,
+        # per-store, not the module env constant.
+        self.vec_mode: str = "none"
 
-    def set_embedding(self, *, available: bool, computed: bool) -> None:
+    def set_vec_mode(self, mode: str) -> None:
+        self.vec_mode = str(mode)
+
+    def set_embedding(self, *, available: bool, computed: bool, refusal: Optional[str] = None) -> None:
         self.embedding = {"available": bool(available), "computed": bool(computed)}
+        if refusal:
+            self.embedding["policy_refusal"] = refusal
 
     def add_stage(self, name: str, *, raw_count: int, after_filter_count: int, kept_count: int, fallback_used: bool = False) -> None:
         self.stages.append({
@@ -127,6 +135,7 @@ class RecallExplainTrace:
             "stages": self.stages,
             "candidates": self.candidates,
             "truncation": {"top_k": self.top_k, "dropped_count": self.truncated_count},
+            "vec_mode": self.vec_mode,
         }
 
 
