@@ -11,6 +11,7 @@ Tests:
 import sys
 import os
 import unittest
+from unittest import mock
 
 # Add mnemosyne to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -162,6 +163,201 @@ class TestRegexEntityExtraction(unittest.TestCase):
         self.assertIn("Awesome", result)  # from #Awesome
         self.assertIn("support", result)  # from @support
         self.assertIn("New York", result)
+
+
+class TestPositionFilter(unittest.TestCase):
+    """MNEMOSYNE_ENTITY_POSITION_FILTER: opt-in drop of single capitalized
+    words capitalized by position rather than as names."""
+
+    def _on(self):
+        return mock.patch.dict(os.environ, {"MNEMOSYNE_ENTITY_POSITION_FILTER": "1"})
+
+    def test_off_by_default_keeps_sentence_initial_subjects(self):
+        # Positive control for the default: a fact that opens with its
+        # subject keeps the name.
+        with mock.patch.dict(os.environ):
+            os.environ.pop("MNEMOSYNE_ENTITY_POSITION_FILTER", None)
+            self.assertEqual(
+                extract_entities_regex("Jane is an architect. Jane uses AutoCAD daily."),
+                ["AutoCAD", "Jane"],
+            )
+            self.assertEqual(extract_entities_regex("Maya went home."), ["Maya"])
+
+    def test_falsy_values_leave_it_off(self):
+        for value in ("", "0", "false", "off", "no"):
+            with mock.patch.dict(
+                os.environ, {"MNEMOSYNE_ENTITY_POSITION_FILTER": value}
+            ):
+                self.assertEqual(extract_entities_regex("Maya went home."), ["Maya"])
+
+    def test_truthy_values_turn_it_on(self):
+        for value in ("1", "true", "YES", " on "):
+            with mock.patch.dict(
+                os.environ, {"MNEMOSYNE_ENTITY_POSITION_FILTER": value}
+            ):
+                self.assertEqual(extract_entities_regex("Maya went home."), [])
+
+    def test_sentence_initial_word_is_dropped(self):
+        with self._on():
+            self.assertEqual(
+                extract_entities_regex(
+                    "Honestly we went out. Guess it works. Sounds good."
+                ),
+                [],
+            )
+            self.assertEqual(extract_entities_regex("I told Maya about it."), ["Maya"])
+            # Multi-word names, @mentions and hashtags are untouched.
+            self.assertEqual(extract_entities_regex("New York is loud."), ["New York"])
+            self.assertEqual(
+                extract_entities_regex("Ping @Maya about #Release."),
+                ["Maya", "Release"],
+            )
+
+    def test_name_after_known_abbreviation_is_retained(self):
+        """The opt-in rule must not treat a name prefix's dot as a sentence end."""
+        cases = [
+            ("I met Dr. Smith yesterday.", ["Dr", "Smith"]),
+            ("I met Mr. Jones yesterday.", ["Jones", "Mr"]),
+            ("I met Mrs. Patel yesterday.", ["Mrs", "Patel"]),
+            ("I visited St. Louis yesterday.", ["Louis", "St"]),
+            ("I met Prof. Weber yesterday.", ["Prof", "Weber"]),
+            ("I met Ms. Chen yesterday.", ["Chen", "Ms"]),
+            ("Dr. Smith arrived.", ["Smith"]),
+            ("I met dr. Smith yesterday.", ["Smith"]),
+            ("I met DR. Smith yesterday.", ["Smith"]),
+            ("I met Dr.\tSmith yesterday.", ["Dr", "Smith"]),
+        ]
+        with self._on():
+            for text, expected in cases:
+                with self.subTest(text=text):
+                    self.assertEqual(extract_entities_regex(text), expected)
+
+    def test_abbreviation_exception_does_not_cross_sentence_boundaries(self):
+        """An unknown word, newline or closing quote must keep the position drop."""
+        cases = [
+            ("I met Alex. Maya waved.", ["Alex"]),
+            ("I met OtherDr. Maya waved.", ["OtherDr"]),
+            ("I met Dr.. Maya waved.", ["Dr"]),
+            ("I met Dr.J. Maya waved.", ["Dr"]),
+            ("I met Dr.\nMaya waved.", ["Dr"]),
+            ("I met Dr.\r\nMaya waved.", ["Dr"]),
+            ("I met Dr. \nMaya waved.", ["Dr"]),
+            ("The tag was 'Dr.' Maya waved.", ["Dr"]),
+            ("I met Dr! Maya waved.", ["Dr"]),
+            ("I met Dr? Maya waved.", ["Dr"]),
+        ]
+        with self._on():
+            for text, expected in cases:
+                with self.subTest(text=text):
+                    self.assertEqual(extract_entities_regex(text), expected)
+
+    def test_sentence_opening_name_is_lost(self):
+        # The accepted cost: a single-word name that only ever opens a
+        # sentence does not extract from that text.
+        with self._on():
+            self.assertEqual(extract_entities_regex("Maya went home."), [])
+            self.assertEqual(
+                extract_entities_regex("Maya went home. We all miss Maya."), ["Maya"]
+            )
+
+    def test_speaker_prefix_is_a_sentence_start(self):
+        with self._on():
+            self.assertEqual(extract_entities_regex("[USER] Guess I did that."), [])
+            self.assertEqual(
+                extract_entities_regex("[USER] I told Maya about it."), ["Maya"]
+            )
+            # A bracket closing mid-sentence is not a speaker prefix.
+            self.assertEqual(
+                extract_entities_regex("[USER] She said [note] Maya was late."),
+                ["Maya"],
+            )
+
+    def test_closed_emphasis_span_is_a_sentence_start(self):
+        with self._on():
+            self.assertEqual(
+                extract_entities_regex("*I smile.* Guess it works."), []
+            )
+
+    def test_contraction_stem_is_dropped(self):
+        with self._on():
+            self.assertEqual(extract_entities_regex("[ASSISTANT] Don't worry."), [])
+            self.assertEqual(extract_entities_regex("and then Haven't we all."), [])
+            # A possessive keeps its name.
+            self.assertEqual(
+                extract_entities_regex("I love Maya's cooking."), ["Maya"]
+            )
+
+    def test_quoted_phrase_accepts_horizontal_whitespace(self):
+        """Extra spaces or tabs must not turn a quoted heading into a name."""
+        cases = [
+            'Read the "Guarded  canonical calls" section first.',
+            'Read the "Guarded\tcanonical calls" section first.',
+            'Read the “Guarded \t canonical calls” section first.',
+        ]
+        with self._on():
+            for text in cases:
+                with self.subTest(text=text):
+                    self.assertEqual(extract_entities_regex(text), [])
+
+    def test_curly_quoted_sentence_openers_match_straight_quotes(self):
+        """Opening typographic quotes must not hide a sentence boundary."""
+        cases = [
+            '“Honestly, we went out.”',
+            '‘Honestly, we went out.’',
+            '[USER] “Honestly, I told Maya.”',
+            '*I smile.* “Guess it works.”',
+        ]
+        expected = [[], [], ["Maya"], []]
+        with self._on():
+            for text, names in zip(cases, expected):
+                with self.subTest(text=text):
+                    self.assertEqual(extract_entities_regex(text), names)
+
+    def test_quote_whitespace_changes_preserve_names_and_line_boundaries(self):
+        """Quoted names, possessives and lists remain separate from headings."""
+        cases = [
+            ('I met “Maya” yesterday.', ["Maya"]),
+            ('I filed “Maya’s notes” yesterday.', ["Maya"]),
+            ('I met “Alice”, “Maya” and “Priya” yesterday.', ["Alice", "Maya", "Priya"]),
+            ('I read "Maya\narrived today" twice.', ["Maya"]),
+            ('I met “Maya,” yesterday.', ["Maya"]),
+        ]
+        with self._on():
+            for text, expected in cases:
+                with self.subTest(text=text):
+                    self.assertEqual(extract_entities_regex(text), expected)
+
+    def test_word_opening_a_quoted_phrase_is_dropped(self):
+        with self._on():
+            # Title case of a quoted heading.
+            self.assertEqual(
+                extract_entities_regex(
+                    'Read the "Guarded canonical calls" section first.'
+                ),
+                [],
+            )
+            self.assertEqual(
+                extract_entities_regex('the word "Python" appears twice.'),
+                ["Python"],
+            )
+            # A quoted name alone, a quoted possessive and a quoted list keep
+            # their names; a name later in the quote does too.
+            self.assertEqual(
+                extract_entities_regex(
+                    "he named the boat 'Alice' and filed \"Maya's notes\" "
+                    "under ['Bob', 'Priya']."
+                ),
+                ["Alice", "Bob", "Maya", "Priya"],
+            )
+            self.assertEqual(
+                extract_entities_regex('The sign read "ask Maya first" twice.'),
+                ["Maya"],
+            )
+            # Accepted cost: a name opening a quoted phrase is lost from
+            # that text.
+            self.assertEqual(
+                extract_entities_regex('The sign read "Maya was here" twice.'), []
+            )
 
 
 class TestFindSimilarEntities(unittest.TestCase):
