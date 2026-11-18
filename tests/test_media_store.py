@@ -125,6 +125,22 @@ def test_understanding_status_transitions(store):
         store.set_understanding_status(a.asset_id, "vibes")
 
 
+def test_understanding_status_can_replace_provenance(store):
+    a = _asset(store)
+    store.set_understanding_status(
+        a.asset_id, "ok", provider="openai_compat", provider_model="qwen-vl"
+    )
+    store.set_understanding_status(a.asset_id, "unavailable")
+    row = store.get_asset(a.asset_id)
+    assert (row["provider"], row["provider_model"]) == ("openai_compat", "qwen-vl")
+
+    store.set_understanding_status(a.asset_id, "refused", replace_provenance=True)
+    row = store.get_asset(a.asset_id)
+    assert (row["understanding_status"], row["provider"], row["provider_model"]) == (
+        "refused", None, None
+    )
+
+
 def test_unavailable_is_a_success_state_not_an_error(store):
     """Rung 4 of the RFC 0002 §3.3 degradation ladder: the asset is registered
     and recallable by reference even though nothing described it."""
