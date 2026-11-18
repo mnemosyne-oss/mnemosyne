@@ -255,6 +255,56 @@ VALIDATE_SCHEMA = {
     },
 }
 
+REMEMBER_MEDIA_SCHEMA = {
+    "name": "mnemosyne_remember_media",
+    "description": (
+        "Remember a piece of media: an image, audio clip, video or document. It is "
+        "registered by reference and, when media understanding is enabled, turned into "
+        "located text memories (captions, timed transcript lines, timed video shots, "
+        "document passages by page) that mnemosyne_recall finds like any other memory. "
+        "Pass an https:// URL, a data: URI, a blob:// reference, or an absolute local "
+        "path inside MNEMOSYNE_MEDIA_ALLOWED_PATHS. Status 'unavailable' is a success: "
+        "the media was registered but nothing described it (no model configured, or "
+        "understanding is off)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "ref": {
+                "type": "string",
+                "description": "https:// URL, data: URI, blob://sha256/... reference, or an absolute local path inside MNEMOSYNE_MEDIA_ALLOWED_PATHS.",
+            },
+            "modality": {
+                "type": "string",
+                "enum": ["image", "video", "audio", "document"],
+                "description": "Override the modality inferred from the extension or mime type.",
+            },
+            "mime": {"type": "string", "description": "Media type, e.g. image/png. Optional."},
+            "title": {"type": "string", "description": "Short human title for the media. Optional."},
+            "hint": {
+                "type": "string",
+                "description": (
+                    "Guidance for the describer. For the OpenAI-compatible image adapter, "
+                    "a non-empty hint replaces the entire prompt; it is not appended. "
+                    "The caller must include instructions for the expected JSON response "
+                    "(summary and moments). An empty or omitted hint uses the configured "
+                    "or default prompt template."
+                ),
+            },
+            "max_moments": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Cap on memories created from this media. Default from MNEMOSYNE_MODALITY_MAX_MOMENTS.",
+            },
+            "importance": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5},
+            "scope": {"type": "string", "enum": ["session", "global"], "description": "Defaults to the configured scope."},
+        },
+        "required": ["ref"],
+    },
+}
+
+
 GET_SCHEMA = {
     "name": "mnemosyne_get",
     "description": (
@@ -468,6 +518,8 @@ BATCH_SCHEMA = {
     "description": (
         "Apply multiple Mnemosyne memory mutations atomically in one tool call. "
         "Supported v1 actions: remember, update, forget, invalidate. "
+        "dry_run checks current target eligibility without mutations; not_found hides missing/invisible targets. "
+        "It is a snapshot, not ordered simulation or a promise of later apply success. "
         "All operations are validated before mutation; on failure the whole batch rolls back. "
         "Destructive actions require exact memory IDs. Recall/search/canonical/persona/shared-surface operations are not included in v1."
     ),
@@ -855,6 +907,11 @@ HYGIENE_CLEAN_SCHEMA = {
                 "description": "Override action for all candidates. If 'keep', uses each candidate's suggested_action.",
                 "default": "keep",
             },
+            "force": {
+                "type": "boolean",
+                "description": "Allow explicit delete override when some candidates are not suggested for deletion. Does not replace confirm.",
+                "default": False,
+            },
             "confirm": {
                 "type": "boolean",
                 "description": "Must be true for any modification. If false, performs dry-run only.",
@@ -882,6 +939,7 @@ ALL_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     SYNC_PUSH_SCHEMA, SYNC_PULL_SCHEMA, SYNC_STATUS_SCHEMA,
     PERSONA_PROMOTE_SCHEMA, PERSONA_DEMOTE_SCHEMA, PERSONA_LIST_SCHEMA, PERSONA_REINFORCE_SCHEMA,
     HYGIENE_AUDIT_SCHEMA, HYGIENE_CLEAN_SCHEMA,
+    REMEMBER_MEDIA_SCHEMA,
 ]
 
 

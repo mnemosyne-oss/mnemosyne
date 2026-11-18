@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.abc
 import json
 import sys
 import threading
@@ -24,7 +25,15 @@ def _drop_modules(prefix: str) -> None:
 
 
 def _import_module(package: str, import_root: Path):
-    _drop_modules(package)
+    # Swap the whole top-level package, not only a dotted target: importing
+    # ``pkg.sub`` imports ``pkg`` and binds ``sub`` as an attribute of it, so a
+    # partial restore leaves the saved parent pointing at the temporary module.
+    top_level = package.partition(".")[0]
+    saved_package_modules = {
+        name: module for name, module in sys.modules.items()
+        if name == top_level or name.startswith(f"{top_level}.")
+    }
+    _drop_modules(top_level)
     saved_mnemosyne_modules = {
         name: module for name, module in sys.modules.items()
         if name == "mnemosyne" or name.startswith("mnemosyne.")
@@ -47,6 +56,8 @@ def _import_module(package: str, import_root: Path):
             if name == "mnemosyne" or name.startswith("mnemosyne."):
                 sys.modules.pop(name, None)
         sys.modules.update(saved_mnemosyne_modules)
+        _drop_modules(top_level)
+        sys.modules.update(saved_package_modules)
 
 
 @pytest.fixture(scope="module")
@@ -74,9 +85,115 @@ def _config_schema(module):
     return {entry["key"]: entry for entry in provider.get_config_schema()}
 
 
+def test_import_module_restores_prior_package_identity():
+    """_import_module must not leave an unrelated caller bound to a stale module.
+
+    Regression for #981: a module pre-imported outside this helper kept
+    pointing at its own module object both before and after _import_module
+    swapped mnemosyne_hermes in and out of sys.modules.
+    """
+    import mnemosyne_hermes as pre_import
+    import mnemosyne_hermes.cli as pre_cli
+
+    before = sys.modules["mnemosyne_hermes"]
+    _import_module("mnemosyne_hermes", INTEGRATION_SRC)
+    after = sys.modules["mnemosyne_hermes"]
+
+    assert after is before
+    assert pre_import is sys.modules["mnemosyne_hermes"]
+    assert pre_cli is sys.modules["mnemosyne_hermes.cli"]
+
+
+def _module_tree(prefix: str) -> dict:
+    return {
+        name: module for name, module in sys.modules.items()
+        if name == prefix or name.startswith(f"{prefix}.")
+    }
+
+
+class _FailImport(importlib.abc.MetaPathFinder):
+    def __init__(self, fullname: str):
+        self.fullname = fullname
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == self.fullname:
+            raise ModuleNotFoundError(f"blocked test import: {fullname}")
+        return None
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+@pytest.mark.parametrize("prior", ["pre_imported", "absent"])
+@pytest.mark.parametrize(
+    ("package", "import_root"),
+    [
+        ("hermes_memory_provider", PROJECT_ROOT),
+        ("hermes_memory_provider.sync_adapter", PROJECT_ROOT),
+        ("mnemosyne_hermes", INTEGRATION_SRC),
+        ("mnemosyne_hermes.sync_adapter", INTEGRATION_SRC),
+    ],
+)
+def test_import_module_restores_package_tree_and_parent_bindings(package, import_root, prior, outcome):
+    """_import_module leaves sys.modules and parent attributes as it found them.
+
+    Importing ``pkg.sub`` binds ``sub`` on the parent package, so restoring
+    only the ``sys.modules`` entries left the saved parent's attribute pointing
+    at the temporary submodule.
+    """
+    top_level = package.partition(".")[0]
+    outer_tree = _module_tree(top_level)
+    outer_mnemosyne = _module_tree("mnemosyne")
+    _drop_modules(top_level)
+    try:
+        if prior == "pre_imported":
+            paths = [str(import_root), str(PROJECT_ROOT)]
+            sys.path[:0] = paths
+            try:
+                importlib.import_module(package)
+            finally:
+                del sys.path[:len(paths)]
+        before = _module_tree(top_level)
+        before_mnemosyne = _module_tree("mnemosyne")
+        parent_bindings = {
+            name: getattr(sys.modules[name.rpartition(".")[0]], name.rpartition(".")[2], None)
+            for name in before if "." in name
+        }
+
+        if outcome == "success":
+            fresh = _import_module(package, import_root)
+            assert fresh is not before.get(package)
+            assert Path(fresh.__file__).is_relative_to(import_root)
+        else:
+            finder = _FailImport(package)
+            sys.meta_path.insert(0, finder)
+            try:
+                with pytest.raises(ModuleNotFoundError, match="blocked test import"):
+                    _import_module(package, import_root)
+            finally:
+                sys.meta_path.remove(finder)
+
+        after = _module_tree(top_level)
+        assert after.keys() == before.keys()
+        assert all(after[name] is before[name] for name in before)
+        for name, module in parent_bindings.items():
+            parent, _, child = name.rpartition(".")
+            assert getattr(sys.modules[parent], child, None) is module
+            assert module is sys.modules[name]
+        assert _module_tree("mnemosyne").keys() == before_mnemosyne.keys()
+        assert all(sys.modules[name] is module for name, module in before_mnemosyne.items())
+    finally:
+        _drop_modules(top_level)
+        sys.modules.update(outer_tree)
+        _drop_modules("mnemosyne")
+        sys.modules.update(outer_mnemosyne)
+
+
 def _write_mnemosyne_config(hermes_home: Path, tools) -> None:
     if tools is None:
         body = "memory:\n  provider: mnemosyne\n  mnemosyne: {}\n"
+    elif isinstance(tools, str):
+        # A quoted scalar, e.g. the serialized sentinel "None"/"null" from
+        # issue #1021, distinct from the YAML null keyword and from `[]`.
+        body = f'memory:\n  provider: mnemosyne\n  mnemosyne:\n    tools: "{tools}"\n'
     elif not tools:
         body = "memory:\n  provider: mnemosyne\n  mnemosyne:\n    tools: []\n"
     else:
@@ -167,7 +284,7 @@ def test_graph_link_write_admission_provider_parity(
 PROVIDER_TOOL_NAMES = [
     "mnemosyne_remember", "mnemosyne_recall", "mnemosyne_shared_remember",
     "mnemosyne_shared_recall", "mnemosyne_shared_forget", "mnemosyne_shared_stats",
-    "mnemosyne_sleep", "mnemosyne_stats", "mnemosyne_invalidate", "mnemosyne_validate",
+    "mnemosyne_sleep", "mnemosyne_resolve_conflicts", "mnemosyne_stats", "mnemosyne_invalidate", "mnemosyne_validate",
     "mnemosyne_get", "mnemosyne_triple_add", "mnemosyne_triple_query",
     "mnemosyne_triple_end", "mnemosyne_remember_canonical",
     "mnemosyne_recall_canonical", "mnemosyne_forget_canonical",
@@ -179,6 +296,7 @@ PROVIDER_TOOL_NAMES = [
     "mnemosyne_graph_query", "mnemosyne_graph_link", "mnemosyne_sync_push",
     "mnemosyne_sync_pull", "mnemosyne_sync_status", "mnemosyne_persona_promote",
     "mnemosyne_persona_demote", "mnemosyne_persona_list", "mnemosyne_persona_reinforce",
+    "mnemosyne_remember_media",
 ]
 
 
@@ -447,7 +565,21 @@ def test_provider_config_defaults_match(provider_modules):
     root_config = _config_schema(provider_modules["hermes_memory_provider"])
     integration_config = _config_schema(provider_modules["mnemosyne_hermes"])
 
-    assert _json_stable(root_config) == _json_stable(integration_config)
+    root_sync_roles = root_config["sync_roles"].copy()
+    integration_sync_roles = integration_config["sync_roles"].copy()
+    sync_roles_description = integration_sync_roles.pop("description")
+    root_sync_roles.pop("description")
+    root_without_sync_roles = root_config.copy()
+    integration_without_sync_roles = integration_config.copy()
+    root_without_sync_roles.pop("sync_roles")
+    integration_without_sync_roles.pop("sync_roles")
+
+    assert _json_stable(root_without_sync_roles) == _json_stable(integration_without_sync_roles)
+    assert _json_stable(root_sync_roles) == _json_stable(integration_sync_roles)
+    assert "stringified YAML/JSON lists are not parsed" in sync_roles_description
+    assert "no valid roles disable it and log one warning" in sync_roles_description
+    assert "initialize() kwarg > Hermes memory.mnemosyne config" in sync_roles_description
+
     assert root_config["auto_sleep"]["default"] is True
     assert root_config["sync_roles"]["default"] == ["user"]
     assert root_config["default_scope"]["choices"] == ["session", "global"]
@@ -719,6 +851,14 @@ def test_uninitialized_primary_tool_call_diverges_by_provider(
         (["mnemosyne_remember", "mnemosyne_recall"], ["mnemosyne_remember", "mnemosyne_recall"], False),
         ([], [], False),
         (["mnemosyne_not_real"], None, True),
+        # issue #1021: a serialized "None"/"null" (any case) or empty
+        # string must resolve the same as real None, not as an unknown
+        # tool name or an empty allowlist.
+        ("None", PROVIDER_TOOL_NAMES, False),
+        ("null", PROVIDER_TOOL_NAMES, False),
+        ("NoNe", PROVIDER_TOOL_NAMES, False),
+        ("  nUlL  ", PROVIDER_TOOL_NAMES, False),
+        ("", PROVIDER_TOOL_NAMES, False),
     ],
 )
 def test_tool_whitelist_without_yaml_matches_pyyaml(
@@ -851,6 +991,73 @@ def test_tool_whitelist_unknown_name_fails_loudly(tmp_path, provider_modules):
         provider = _provider_for_config(module, tmp_path)
         with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
             provider.get_tool_schemas()
+
+
+def test_tool_whitelist_unknown_name_fails_at_initialize(tmp_path, provider_modules):
+    """issue #1063: initialize() itself must reject a bad allowlist.
+
+    Before this, an unknown tool name passed construction cleanly and only
+    raised once something called get_tool_schemas()/handle_tool_call, i.e. at
+    the first tool-list or tool-call request. hermes_home is not known until
+    initialize() binds it, so the check has to live there, not in __init__.
+    """
+    _write_mnemosyne_config(tmp_path, ["mnemosyne_remember", "mnemosyne_not_real"])
+
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+            provider.initialize("bad-tools", hermes_home=str(tmp_path), agent_context="primary")
+        assert provider._beam is None
+
+        # A skip-context init (subagent/cron/...) binds hermes_home the same
+        # way and must fail just as loudly, not only the primary path.
+        with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+            provider.initialize("bad-tools-subagent", hermes_home=str(tmp_path), agent_context="subagent")
+
+    # Config-reload behavior is unchanged: correcting the file and
+    # initializing again must succeed and see the fix, not a cached failure.
+    _write_mnemosyne_config(tmp_path, ["mnemosyne_remember"])
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize("good-tools", hermes_home=str(tmp_path), agent_context="primary")
+        try:
+            assert _schema_names(provider) == ["mnemosyne_remember"]
+        finally:
+            provider.shutdown()
+
+
+def test_tool_whitelist_unknown_name_on_reinit_releases_active_state(tmp_path, provider_modules):
+    """issue #1073 (CodeRabbit): a re-init that fails tool validation must not
+    leave a previously active instance registered as module-active, or
+    holding the host-LLM backend lease, once its beam has been cleared.
+
+    Asserts the per-instance flags rather than the module-global counters:
+    other tests in this file share these same module-scoped provider
+    modules and some leave a provider initialized without shutting it
+    down, so the global count is not a clean signal here.
+    """
+    from mnemosyne.core.llm_backends import get_host_llm_backend, set_host_llm_backend
+
+    for module in provider_modules.values():
+        _write_mnemosyne_config(tmp_path, ["mnemosyne_remember"])
+        provider = module.MnemosyneMemoryProvider()
+        try:
+            provider.initialize("healthy", hermes_home=str(tmp_path), agent_context="primary")
+            assert provider._beam is not None
+            assert provider._is_active_in_module is True
+            assert get_host_llm_backend() is not None
+            assert provider._owns_host_llm_backend is True
+
+            _write_mnemosyne_config(tmp_path, ["mnemosyne_remember", "mnemosyne_not_real"])
+            with pytest.raises(ValueError, match="Unknown Mnemosyne tool.*mnemosyne_not_real"):
+                provider.initialize("reinit-bad-tools", hermes_home=str(tmp_path), agent_context="primary")
+
+            assert provider._beam is None
+            assert provider._is_active_in_module is False
+            assert provider._owns_host_llm_backend is False
+        finally:
+            provider.shutdown()
+            set_host_llm_backend(None)
 
 
 def test_config_reader_tolerates_null_and_non_mapping_levels(tmp_path):
@@ -2103,24 +2310,28 @@ def test_packaged_provider_import_survives_missing_core_helpers():
 
     finder = _BlockCoreHelperImports()
     saved = {name: module for name, module in sys.modules.items() if name in blocked}
+    saved_mnemosyne_hermes = {
+        name: module for name, module in sys.modules.items()
+        if name == "mnemosyne_hermes" or name.startswith("mnemosyne_hermes.")
+    }
     for name in blocked:
         sys.modules.pop(name, None)
     _drop_modules("mnemosyne_hermes")
     sys.path.insert(0, str(INTEGRATION_SRC))
     sys.meta_path.insert(0, finder)
     try:
-        module = importlib.import_module("mnemosyne_hermes")
-    finally:
-        sys.meta_path.remove(finder)
         try:
-            sys.path.remove(str(INTEGRATION_SRC))
-        except ValueError:
-            pass
-        for name in blocked:
-            sys.modules.pop(name, None)
-        sys.modules.update(saved)
+            module = importlib.import_module("mnemosyne_hermes")
+        finally:
+            sys.meta_path.remove(finder)
+            try:
+                sys.path.remove(str(INTEGRATION_SRC))
+            except ValueError:
+                pass
+            for name in blocked:
+                sys.modules.pop(name, None)
+            sys.modules.update(saved)
 
-    try:
         assert module.read_hermes_config_key(None, "tools") is None
         with pytest.raises(module.BatchValidationError):
             module.validate_batch_operations([])
@@ -2128,7 +2339,7 @@ def test_packaged_provider_import_survives_missing_core_helpers():
         assert provider._with_persona_block("base") == "base"
     finally:
         _drop_modules("mnemosyne_hermes")
-        _import_module("mnemosyne_hermes", INTEGRATION_SRC)
+        sys.modules.update(saved_mnemosyne_hermes)
 
 
 def _save_mnemosyne_modules():

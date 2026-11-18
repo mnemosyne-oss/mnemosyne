@@ -154,7 +154,15 @@ def test_standalone_hermes_wheel_keeps_plugin_manifest(tmp_path):
         )
         metadata_version = _metadata_version_from_wheel(archive, members)
         entry_points = _entry_points_from_wheel(archive, members)
+        private_loader = archive.read("_mnemosyne_hermes_cli.py")
+        metadata_path = next(path for path in members if path.endswith(".dist-info/METADATA"))
+        metadata = email.parser.BytesParser().parsebytes(archive.read(metadata_path))
 
+    assert metadata["Name"] == "mnemosyne-hermes"
+    assert "_mnemosyne_hermes_cli.py" in members
+    assert private_loader == (
+        ROOT / "integrations/hermes/src/_mnemosyne_hermes_cli.py"
+    ).read_bytes()
     assert "mnemosyne_hermes/_verbatim_compat.py" in members
     assert "mnemosyne_hermes/plugin.yaml" in members
     assert manifest_version == runtime_version
@@ -166,7 +174,7 @@ def test_standalone_hermes_wheel_keeps_plugin_manifest(tmp_path):
         entry_points["hermes_agent.memory_providers"]["mnemosyne"] == "mnemosyne_hermes"
     )
     assert entry_points["console_scripts"]["mnemosyne-hermes"] == (
-        "mnemosyne_hermes.install:main"
+        "_mnemosyne_hermes_cli:main"
     )
 
 

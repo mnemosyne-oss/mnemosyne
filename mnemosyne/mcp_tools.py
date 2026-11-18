@@ -12,6 +12,7 @@ All imports are guarded — this module loads safely even if mcp is not installe
 """
 
 from typing import TYPE_CHECKING, Dict, Any, List, TypeAlias
+import copy
 import json
 import logging
 import math  # noqa: F401
@@ -41,9 +42,12 @@ from mnemosyne.core.beam import (
 from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
 from mnemosyne.batch_tool import (
     BatchValidationError,
+    BatchPreviewTarget,
     apply_beam_batch,
     batch_validation_error_payload,
     dry_run_batch,
+    snapshot_preview_batch,
+    preview_unavailable,
     validate_batch_operations,
 )
 
@@ -77,7 +81,7 @@ def __getattr__(name: str) -> Any:
 
 TOOLS: List[Dict[str, Any]] = []
 for _s in ALL_TOOL_SCHEMAS:
-    _t = dict(_s)
+    _t = copy.deepcopy(_s)
     # ``mcp`` SDK 2.x renamed the wire field on ``Tool`` from the camelCase
     # ``inputSchema`` (1.x) to the snake_case ``input_schema``. The
     # canonical Python-side key matches the model field. Pydantic still
@@ -87,6 +91,17 @@ for _s in ALL_TOOL_SCHEMAS:
         _t["input_schema"] = _t.pop("inputSchema")
     elif "parameters" in _t:
         _t["input_schema"] = _t.pop("parameters")
+    if _t.get("name") == "mnemosyne_remember":
+        # Remove static scope default for the MCP surface so clients do not
+        # materialize 'session', allowing server-side _resolve_default_scope()
+        # to apply (#653).
+        _props = _t.get("input_schema", {}).get("properties", {})
+        if "scope" in _props:
+            _props["scope"].pop("default", None)
+            _props["scope"]["description"] = (
+                "'session' or 'global'. Default is resolved server-side from "
+                "MNEMOSYNE_DEFAULT_SCOPE, falling back to 'global'."
+            )
     TOOLS.append(_t)
 
 # ---------------------------------------------------------------------------
@@ -233,13 +248,14 @@ def _resolve_bank(arguments: Dict[str, Any]) -> str:
 def _resolve_default_scope() -> str:
     """Resolve default scope for remember() calls.
     
-    Precedence: MNEMOSYNE_DEFAULT_SCOPE env var, falling back to 'session'.
+    Precedence: MNEMOSYNE_DEFAULT_SCOPE env var, falling back to 'global'.
     Only 'session' and 'global' are accepted; unrecognized values fall through
     to the hardcoded default."""
     raw = os.environ.get("MNEMOSYNE_DEFAULT_SCOPE", "").strip().lower()
     if raw in ("session", "global"):
         return raw
-    return "session"
+    # ponytail: default to 'global' so MCP writes are visible to CLI/Hermes/SDK readers (#653)
+    return "global"
 
 
 def _serialize(obj):
@@ -344,7 +360,35 @@ def _handle_batch(arguments: Dict[str, Any]) -> Dict[str, Any]:
         return batch_validation_error_payload(exc)
 
     if bool(arguments.get("dry_run", False)):
-        return dry_run_batch(normalized)
+        from mnemosyne.core.banks import get_bank_db_path_read_only
+        from mnemosyne.runtime_context import get_request_token_name
+
+        try:
+            bank = _resolve_bank(arguments)
+            token = get_request_token_name()
+            if token and arguments.get("author_id") and arguments["author_id"] != token:
+                return preview_unavailable()
+            path = get_bank_db_path_read_only(bank)
+            if not path.is_file():
+                return preview_unavailable()
+            # Conservatively reject WAL stores already missing sidecars. This
+            # preflight is not a lifetime lock: a concurrent last-connection
+            # close can remove them, and SQLite may recreate reader coordination
+            # at the read-only open. Database/user-data writes remain prohibited.
+            with path.open("rb") as file:
+                header = file.read(20)
+            if header[18:20] == b"\x02\x02":
+                if not all(Path(str(path) + suffix).is_file() for suffix in ("-wal", "-shm")):
+                    return preview_unavailable()
+            conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+            try:
+                return snapshot_preview_batch(normalized, target=BatchPreviewTarget(
+                    conn, f"mcp_{bank}", adapter="wrapper",
+                ))
+            finally:
+                conn.close()
+        except (OSError, ValueError, sqlite3.Error):
+            return preview_unavailable()
 
     bank = _resolve_bank(arguments)
     mem = _create_instance(
@@ -675,6 +719,8 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
                 if gists_table is not None:
                     conn.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
                 conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
+                target_beam._delete_derived_memory_rows(conn, memory_id)
+                target_beam._delete_orphaned_legacy_mirror(conn, memory_id)
             elif action == "update":
                 conn.execute(
                     "UPDATE working_memory SET content = ?, validator = ?, "
@@ -725,6 +771,27 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
             "store=... instead. The alias is removed in 5.0."
         )
     return result
+
+
+def _handle_remember_media(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_remember_media tool call.
+
+    Validation and the tool-surface guards (allowed local paths, no internal
+    URLs, bounded inline payloads) live in ``core.media_tool`` so MCP and both
+    Hermes providers enforce the same rules.
+    """
+    from mnemosyne.core.media_tool import remember_media_tool
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(
+        author_id=arguments.get("author_id"),
+        author_type=arguments.get("author_type"),
+        channel_id=arguments.get("channel_id"),
+        bank=bank,
+    )
+    payload = remember_media_tool(mem.beam, arguments, default_scope=_resolve_default_scope())
+    payload["bank"] = bank
+    return payload
 
 
 def _handle_get(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -1103,6 +1170,7 @@ def _handle_diagnose(arguments: Dict[str, Any]) -> Dict[str, Any]:
         repair_vec_working=bool(arguments.get("repair_vec_working", False)),
         dry_run=bool(arguments.get("dry_run", False)),
         bank=bank,
+        scope="mcp_server",
     )
     db_path = None
     try:
@@ -1218,7 +1286,14 @@ def _handle_hygiene_audit(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_hygiene_clean tool call."""
-    from mnemosyne.core.hygiene import NoiseCandidate, clean_noise, validate_hygiene_candidate
+    from mnemosyne.core.hygiene import NoiseCandidate, clean_noise, validate_delete_override, validate_hygiene_candidate
+
+    force = arguments.get("force", False)
+    if type(force) is not bool:
+        return {"error": "force must be a boolean"}
+    confirm = arguments.get("confirm", False)
+    if type(confirm) is not bool:
+        return {"error": "confirm must be a boolean"}
 
     candidates_json = arguments.get("candidates_json", "[]")
     try:
@@ -1251,12 +1326,14 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
             )
         )
 
+    action = arguments.get("action", "keep")
+    override_error = validate_delete_override(candidates, action, force)
+    if override_error:
+        return {"error": override_error}
+
     bank = _resolve_bank(arguments)
     mem = _create_instance(bank=bank)
     db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
-
-    action = arguments.get("action", "keep")
-    confirm = arguments.get("confirm", False)
     dry_run = not confirm
 
     result = clean_noise(
@@ -1265,9 +1342,10 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
         action=action,
         confirm=confirm,
         dry_run=dry_run,
+        force=force,
     )
     return {
-        "status": "dry_run" if dry_run else "applied",
+        "status": "failed" if result.errors else ("dry_run" if dry_run else "applied"),
         "result": result.to_dict(),
         "bank": bank,
     }
@@ -1290,6 +1368,7 @@ _TOOL_HANDLERS = {
     "mnemosyne_invalidate": _handle_invalidate,
     "mnemosyne_validate": _handle_validate,
     "mnemosyne_get": _handle_get,
+    "mnemosyne_remember_media": _handle_remember_media,
     "mnemosyne_triple_add": _handle_triple_add,
     "mnemosyne_triple_query": _handle_triple_query,
     "mnemosyne_remember_canonical": _handle_remember_canonical,

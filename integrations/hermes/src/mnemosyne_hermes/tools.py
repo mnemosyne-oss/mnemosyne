@@ -21,8 +21,9 @@ from .persona_tools import (
 REMEMBER_SCHEMA = {
     "name": "mnemosyne_remember",
     "description": (
-        "Store a durable memory in Mnemosyne. Use for ANY fact, preference, "
-        "identity, insight, or context that should persist across sessions. Higher importance "
+        "Store a durable memory in Mnemosyne. Use for bulk durable facts, preferences, "
+        "identity, insights, or context that should persist across sessions. Small standing "
+        "rules and context anchors may stay in the always-injected memory tier instead. Higher importance "
         "(0.0-1.0) surfaces the memory more often. Use scope='global' for user-level "
         "facts; scope='session' for conversation-specific context. Use valid_until "
         "(ISO date YYYY-MM-DD) for time-bound facts. Use extract_entities=True to "
@@ -182,6 +183,38 @@ SLEEP_SCHEMA = {
     },
 }
 
+CROSS_SESSION_RESOLVE_SCHEMA = {
+    "name": "mnemosyne_resolve_conflicts",
+    "description": (
+        "Resolve factual contradictions among global-scope memories across "
+        "sessions. Marks the stale (older) copy superseded so recall and "
+        "prefetch stop presenting the outdated and current versions together, "
+        "while preserving history. Requires MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION=1."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "dry_run": {
+                "type": "boolean",
+                "description": "If true, preview resolution without superseding memories or emitting an apply audit. LLM evaluation may still write cost records.",
+                "default": False,
+            },
+            "llm_eval": {
+                "type": "boolean",
+                "description": (
+                    "Only meaningful with dry_run=true: run LLM verification on "
+                    "flagged pairs without superseding memories. Can incur costs "
+                    "and write cost records; reserves one reflection call and "
+                    "obeys cron/budget guards. Overrides the LLM detection flag "
+                    "for preview, not the cross-session gate. Default false "
+                    "keeps the dry run deterministic (no LLM calls or reservation)."
+                ),
+                "default": False,
+            },
+        },
+    },
+}
+
 STATS_SCHEMA = {
     "name": "mnemosyne_stats",
     "description": "Return Mnemosyne memory statistics: working count, episodic count, BEAM tiers.",
@@ -202,6 +235,7 @@ INVALIDATE_SCHEMA = {
         "properties": {
             "memory_id": {"type": "string", "description": "ID of memory to invalidate."},
             "replacement_id": {"type": "string", "description": "Optional new memory that replaces this one.", "default": ""},
+            "bank": {"type": "string", "enum": ["private", "surface"], "description": "Which store holds the memory: 'private' (this profile's own memory) or 'surface' (the shared cross-agent surface DB). Default 'private'; ids beginning with 'sf_' auto-route to surface.", "default": "private"},
         },
         "required": ["memory_id"],
     },
@@ -257,6 +291,56 @@ VALIDATE_SCHEMA = {
         "required": ["memory_id", "action"],
     },
 }
+
+REMEMBER_MEDIA_SCHEMA = {
+    "name": "mnemosyne_remember_media",
+    "description": (
+        "Remember a piece of media: an image, audio clip, video or document. It is "
+        "registered by reference and, when media understanding is enabled, turned into "
+        "located text memories (captions, timed transcript lines, timed video shots, "
+        "document passages by page) that mnemosyne_recall finds like any other memory. "
+        "Pass an https:// URL, a data: URI, a blob:// reference, or an absolute local "
+        "path inside MNEMOSYNE_MEDIA_ALLOWED_PATHS. Status 'unavailable' is a success: "
+        "the media was registered but nothing described it (no model configured, or "
+        "understanding is off)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "ref": {
+                "type": "string",
+                "description": "https:// URL, data: URI, blob://sha256/... reference, or an absolute local path inside MNEMOSYNE_MEDIA_ALLOWED_PATHS.",
+            },
+            "modality": {
+                "type": "string",
+                "enum": ["image", "video", "audio", "document"],
+                "description": "Override the modality inferred from the extension or mime type.",
+            },
+            "mime": {"type": "string", "description": "Media type, e.g. image/png. Optional."},
+            "title": {"type": "string", "description": "Short human title for the media. Optional."},
+            "hint": {
+                "type": "string",
+                "description": (
+                    "Guidance for the describer. For the OpenAI-compatible image adapter, "
+                    "a non-empty hint replaces the entire prompt; it is not appended. "
+                    "The caller must include instructions for the expected JSON response "
+                    "(summary and moments). An empty or omitted hint uses the configured "
+                    "or default prompt template."
+                ),
+            },
+            "max_moments": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Cap on memories created from this media. Default from MNEMOSYNE_MODALITY_MAX_MOMENTS.",
+            },
+            "importance": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5},
+            "scope": {"type": "string", "enum": ["session", "global"], "description": "Defaults to the configured scope."},
+        },
+        "required": ["ref"],
+    },
+}
+
 
 GET_SCHEMA = {
     "name": "mnemosyne_get",
@@ -510,6 +594,8 @@ BATCH_SCHEMA = {
     "description": (
         "Apply multiple Mnemosyne memory mutations atomically in one tool call. "
         "Supported v1 actions: remember, update, forget, invalidate. "
+        "dry_run checks current target eligibility without mutations; not_found hides missing/invisible targets. "
+        "It is a snapshot, not ordered simulation or a promise of later apply success. "
         "All operations are validated before mutation; on failure the whole batch rolls back. "
         "Destructive actions require exact memory IDs. Recall/search/canonical/persona/shared-surface operations are not included in v1."
     ),
@@ -808,7 +894,7 @@ APPLY_PENDING_SCHEMA = {
 
 ALL_TOOL_SCHEMAS = [
     REMEMBER_SCHEMA, RECALL_SCHEMA, SHARED_REMEMBER_SCHEMA, SHARED_RECALL_SCHEMA,
-    SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, STATS_SCHEMA,
+    SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA, SLEEP_SCHEMA, CROSS_SESSION_RESOLVE_SCHEMA, STATS_SCHEMA,
     INVALIDATE_SCHEMA, VALIDATE_SCHEMA, GET_SCHEMA, TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA,
     TRIPLE_END_SCHEMA,
     REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA, FORGET_CANONICAL_SCHEMA, APPLY_PENDING_SCHEMA, MODEL_CARD_SCHEMA,
@@ -819,4 +905,5 @@ ALL_TOOL_SCHEMAS = [
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,
     SYNC_PUSH_SCHEMA, SYNC_PULL_SCHEMA, SYNC_STATUS_SCHEMA,
     PERSONA_PROMOTE_SCHEMA, PERSONA_DEMOTE_SCHEMA, PERSONA_LIST_SCHEMA, PERSONA_REINFORCE_SCHEMA,
+    REMEMBER_MEDIA_SCHEMA,
 ]  # noqa: E501

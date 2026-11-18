@@ -8,9 +8,21 @@ Mnemosyne is designed to work with zero configuration. All settings have sensibl
 |---|---|---|
 | `MNEMOSYNE_EMBEDDING_API_URL` | `https://openrouter.ai/api/v1` | Custom embedding API endpoint. When unset, the OpenRouter default is used directly; there is no `OPENROUTER_BASE_URL` fallback. Credentialed endpoints must use HTTPS: the client refuses to send `Authorization` over a non-HTTPS URL. |
 | `MNEMOSYNE_EMBEDDING_API_KEY` | `${OPENAI_API_KEY:-}` | Embedding API key. Falls back to `OPENAI_API_KEY`; there is no `OPENROUTER_API_KEY` fallback (set `MNEMOSYNE_EMBEDDING_API_KEY` explicitly if your chat key differs). |
+| `MNEMOSYNE_EMBEDDING_MAX_CHARS` | unset (disabled) | Optional per-input **character** (not token) cap on text sent to the API embedding endpoint or local fastembed. The cap counts the complete prefixed input and keeps its head; every truncation is logged with lengths, never content. Off by default; `0` or a negative value also disables it. Characters do not guarantee a token or memory budget. On small OpenAI-compatible server slots, an oversized request can abort a `reindex` batch with HTTP 400; this cap is an opt-in input limit, not a retry. |
+| `MNEMOSYNE_EMBEDDING_MAX_BYTES` | unset (disabled) | Optional per-input **UTF-8 byte** cap on API and local fastembed inputs, applied after `MNEMOSYNE_EMBEDDING_MAX_CHARS`. It counts the complete prefixed input. The cut never splits a character, lone surrogates are dropped, and truncations are logged without input content. An input the cap would reduce to nothing raises an error rather than sending an empty request. `0`, a negative value, a blank value or an unparsable value disables it; an unparsable value is logged. UTF-8 bytes bound the input itself for byte-level BPE tokenizers but not tokens added by an endpoint or ONNX memory use. |
 | `MNEMOSYNE_JOURNAL_MODE` | `wal` | SQLite journal mode for store connections (the sync client reuses the beam connection, so it inherits the mode too). Valid: `delete`, `truncate`, `persist`, `memory`, `wal`, `off`; the value is trimmed and lower-cased, unset or blank falls back to `wal`, and non-blank invalid values warn and fall back to `wal`. Only `wal` persists in the database file; other modes are per-connection and revert to SQLite's default (`delete`) on reopen, so each connection re-applies the mode. `memory` and `off` remove disk-backed rollback protection and can corrupt the database after a crash. See README for the virtiofs motivation. |
 
+API embedding endpoints require NumPy in the Mnemosyne interpreter, independently of FastEmbed. Install it with `python -m pip install numpy`. If it cannot be imported, diagnostics report embeddings unavailable and direct embedding calls raise a dependency error before sending input. A later successful import restores API embeddings without a restart.
+
 > **Privacy:** embeddings go to a remote API whenever `MNEMOSYNE_EMBEDDING_API_URL` points at a custom (non-OpenRouter) endpoint, the model name is API-shaped (`openai/*`, `text-embedding*`), or `MNEMOSYNE_EMBEDDINGS_VIA_API` is truthy (the last two are what route on the OpenRouter default; no custom URL set means the OpenRouter default); that service receives the text of your memories and of your recall queries for vectorization. For privacy-sensitive or local-first deployments prefer local embeddings (the `[embeddings]` / `[all]` install profiles).
+
+Changing either input cap changes future query and document embeddings only.
+Existing stored document vectors are not regenerated. [Reindex the affected
+bank](cli-reference.md#health-and-repair) after changing caps when consistent
+query/document input policy is needed.
+Enhanced recall snapshots both effective caps for the whole request, including
+its cache key and embedding inputs. Changes during a request take effect on the
+next request, so a result cannot be cached under a different cap policy.
 
 ## Data Directory
 
@@ -306,14 +318,20 @@ See [Health and repair](cli-reference.md#health-and-repair) for the `reindex` co
 | `MNEMOSYNE_LLM_N_CTX` | `2048` | Context window size for the local model |
 | `MNEMOSYNE_LLM_MAX_TOKENS` | `2048` | Maximum output tokens per summary |
 | `MNEMOSYNE_LLM_N_THREADS` | `4` | CPU threads for local inference |
-| `MNEMOSYNE_LLM_REPO` | `openbmb/MiniCPM5-1B-GGUF` | HuggingFace repo for GGUF model |
-| `MNEMOSYNE_LLM_FILE` | `MiniCPM5-1B-Q4_K_M.gguf` | GGUF filename |
+| `MNEMOSYNE_LLM_REPO` | `openbmb/MiniCPM5-1B-GGUF` | HuggingFace repo the local GGUF is fetched from. Selects the source only, and works alone by pairing with the default filename. |
+| `MNEMOSYNE_LLM_FILE` | `MiniCPM5-1B-Q4_K_M.gguf` | GGUF filename to load. Selects the artifact only, and works alone by fetching from the default repo. |
 | `MNEMOSYNE_MODEL_CACHE_DIR` | `~/.hermes/mnemosyne/models` | Directory the GGUF model is cached in |
 | `MNEMOSYNE_SLEEP_PROMPT` | *(built-in)* | Optional sleep/consolidation prompt override. Supports `{source}`, `{memories}`, and `{memory_count}` placeholders for language-specific summaries. |
 
 `MNEMOSYNE_LLM_ENABLED=false` disables all LLM-backed consolidation, including Hermes host routing and configured remote endpoints; Mnemosyne then uses its AAAK/no-LLM fallback. The generated [configuration reference](api/configuration.mdx) records the current distinction between this environment gate and the separately declared `config.yaml` key.
 
 When the gate is enabled and neither a usable host backend nor a configured remote endpoint succeeds, Mnemosyne falls back to the local GGUF model. The default `MiniCPM5-1B-Q4_K_M.gguf` model is approximately 656 MB and is cached in `~/.hermes/mnemosyne/models`, or in `MNEMOSYNE_MODEL_CACHE_DIR` when that is set. `sleep()` is synchronous, so the first uncached local fallback can block while it downloads the model from Hugging Face. To avoid a download, set `MNEMOSYNE_LLM_ENABLED=false` for AAAK-only consolidation or pre-cache the GGUF model; a cached local fallback does not require network access.
+
+`MNEMOSYNE_LLM_FILE` and `MNEMOSYNE_LLM_REPO` are resolved as a pair on every call rather than when the module is imported, so a value set later in the process still applies. Each variable works alone: FILE names the artifact, REPO names where to fetch it. If the selected file is already in the cache it is used without any network access; a miss is fetched from REPO when that is set, and from the default repo otherwise. Setting REPO alone downloads the default filename. A blank value counts as unset. Per-call resolution never replaces a model that has already been loaded, and a failed download logs a warning naming the resolved repo, the resolved filename, and the variable to change.
+
+Cache entries are keyed by the pair, not by the filename alone, because two repositories can ship the same filename. The shipped repository keeps the historical flat location, `<cache dir>/<file>`, so existing caches keep working untouched; any other repository is stored under `<cache dir>/.repositories/<sha256 of the repo id>/<file>`. A file cached for one repository therefore cannot satisfy a selection pointing at a different one, and switching repository downloads that repository's artifact once.
+
+A filename containing a parent-directory component is rejected, with an error naming the variable, because it would escape the cache root and could reach another repository's cached artifact. An absolute filename is used exactly as given: it names one specific file, the cache root does not apply to it, and REPO is not consulted. Because an absolute path cannot be fetched by name, a missing one is rejected rather than downloaded.
 
 ### Remote LLM (OpenAI-compatible)
 
@@ -325,8 +343,10 @@ Use a remote model instead of the local MiniCPM5-1B GGUF:
 | `MNEMOSYNE_LLM_API_KEY` | *(none)* | API key for authenticated endpoints |
 | `MNEMOSYNE_LLM_MODEL` | *(none)* | Model identifier sent in requests |
 | `MNEMOSYNE_LLM_TIMEOUT` | `60` | HTTP timeout in seconds for remote LLM calls. Increase for slow proxies or models with long generation times (e.g. `300` for reasoning models routed through local proxies). |
+| `MNEMOSYNE_LLM_EXTRA_BODY` | *(none)* | JSON object merged last into every request body, for provider-specific keys the OpenAI shape has no name for (e.g. `{"thinking":{"type":"disabled"}}` to keep a thinking model from spending the whole `max_tokens` budget on reasoning). Ignored when unset, blank or not a JSON object; `messages`, `model` and `stream` are reserved and dropped from an otherwise valid object. Every rejected case is noted on stderr. Read at module import, so `mnemosyne config set` does not reach it and a change needs a restart. |
+| `MNEMOSYNE_LLM_FALLBACK_EXTRA_BODY` | *(none)* | Same, including the reserved keys and the import-time read, for requests to `MNEMOSYNE_LLM_FALLBACK_MODELS`. |
 
-With `MNEMOSYNE_LLM_ENABLED` enabled, Mnemosyne uses the remote endpoint when no host call was attempted, an explicit or provider-preset-resolved remote base URL is available, and `MNEMOSYNE_FORCE_LOCAL` is not enabled. On failure it falls back to the local GGUF backend, then AAAK encoding.
+With `MNEMOSYNE_LLM_ENABLED` enabled, Mnemosyne uses the remote endpoint when no host call was attempted, an explicit or provider-preset-resolved remote base URL is available, and `MNEMOSYNE_FORCE_LOCAL` is not enabled. A retryable failure from the primary model tries each model in `MNEMOSYNE_LLM_FALLBACK_MODELS` in order first; once every remote candidate has failed it falls back to the local GGUF backend, then AAAK encoding. An empty answer (a 2xx with no answer text) is not retried; it ends the remote stage and `last_llm_failure()` keeps the reason for the AAAK WARNING.
 
 Works with: llama.cpp server, vLLM, Ollama, LM Studio, or any OpenAI-compatible API.
 
@@ -378,7 +398,9 @@ With `MNEMOSYNE_LLM_ENABLED=true`:
 0. Host LLM adapter (if MNEMOSYNE_HOST_LLM_ENABLED=true AND a backend is registered)
    ↓ (on failure: skip remote, go to local)
 1. Remote LLM (if no host call was attempted, an explicit or provider-preset-resolved remote base URL is available, AND MNEMOSYNE_FORCE_LOCAL is not enabled)
-   ↓ (on failure)
+   ↓ (on a retryable failure; an empty answer is not retried)
+1b. Each model in MNEMOSYNE_LLM_FALLBACK_MODELS, in order
+   ↓ (on failure of every remote candidate)
 2. Local LLM (llama-cpp-python / ctransformers + MiniCPM5-1B GGUF)
    ↓ (on failure or not installed)
 3. AAAK encoding (keyword-based, no LLM required)

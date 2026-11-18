@@ -1,31 +1,42 @@
 # Mnemosyne Memory Provider for Hermes
 
-Deploy Mnemosyne as a **first-class MemoryProvider** through Hermes' plugin system.
+**Deprecated installation path:** this is the legacy `hermes_memory_provider`
+implementation, retained for existing imports. Do not use it for new Hermes
+installations. The supported integration is the standalone `mnemosyne-hermes`
+package; follow the [canonical Hermes setup guide](../docs/hermes-integration.md#setup).
 
-## What This Gives You
+That guide covers package prerequisites, install-mode selection, activation,
+restart and verification. Choose the mode for your deployment: local mutable
+environments and persistent side-venv wrappers have different requirements.
+Container-specific paths are not defaults for every Hermes installation.
 
-When deployed, Mnemosyne gets the **same integration tier** as Honcho, mem0, and supermemory:
+This documentation change does not remove the legacy package or change its
+imports, runtime behavior or tool schemas. Future removal and compatibility
+boundaries are tracked in [#655](https://github.com/mnemosyne-oss/mnemosyne/issues/655);
+no removal date or future shim is promised here.
+
+## Legacy integration reference
+
+The remaining sections describe the retained legacy implementation, not a
+supported installation procedure or a guarantee about the standalone package:
 
 - **System prompt injection** — `# Mnemosyne Memory` header in every prompt
 - **Pre-turn prefetch** — Relevant memories injected via `<memory-context>` fence before each API call
 - **Post-turn sync** — User and assistant messages automatically stored to episodic memory
-- **Tool dispatch** — 15 memory tools auto-injected into the model's tool surface
+- **Tool dispatch** — Memory tools exposed through the provider
 - **CLI commands** — `hermes mnemosyne {stats|sleep|version|inspect|clear|export|import}`
 - **Setup wizard** — Listed in `hermes memory setup`
 
-**All of this without touching Hermes core.** Deployed purely through the plugin directory.
 
-## Deploy
+## Legacy configuration reference
 
-```bash
-# One-time setup: symlink into Hermes plugin directory
-ln -s $(pwd)/hermes_memory_provider ~/.hermes/plugins/mnemosyne
+The former direct source-checkout symlink installation is obsolete and is not
+reproduced here. For supported installation and legacy-link handling, use the
+[canonical guide](../docs/hermes-integration.md#migrating-from-the-legacy-mnemosyne-install-route).
+Do not delete or replace an existing plugin target based on this legacy README.
 
-# Activate in config
-hermes config set memory.provider mnemosyne
-```
-
-Or manually edit `~/.hermes/config.yaml`:
+The retained legacy provider reads settings under `memory.mnemosyne` in Hermes'
+`config.yaml`, for example:
 
 ```yaml
 memory:
@@ -50,14 +61,13 @@ classifier but stores classified content with warnings; and `strict` rejects
 content classified as noise or secret-like. Unset, blank, or invalid classifier
 values fall back to `off` (invalid values also log a warning).
 
-## Verify
+## Verification
 
-```bash
-hermes memory status    # Should show "mnemosyne" as active provider
-hermes mnemosyne stats  # Show memory statistics
-```
+Use the [current verification steps](../docs/hermes-integration.md#step-4-verify-the-active-provider)
+for the supported standalone integration. Provider status alone does not prove
+end-to-end memory writes or a completed data migration.
 
-## Architecture
+## Legacy layout reference (not an installation instruction)
 
 ```
 ~/.hermes/plugins/mnemosyne/   ← symlink to hermes_memory_provider/
@@ -73,7 +83,7 @@ The provider is discovered by `plugins.memory.discover_memory_providers()` which
 
 User plugins take precedence over bundled plugins on name collision.
 
-## Tools (Auto-Injected)
+## Legacy tool examples (not an exhaustive inventory)
 
 | Tool | Purpose |
 |------|---------|
@@ -93,11 +103,8 @@ User plugins take precedence over bundled plugins on name collision.
 | `mnemosyne_forget` | Delete a memory |
 | `mnemosyne_diagnose` | Run diagnostics on the memory store |
 
-## Undeploy
+## Existing installations
 
-```bash
-rm ~/.hermes/plugins/mnemosyne
-hermes config set memory.provider null
-```
-
-Hermes falls back to built-in memory only.
+Consult the canonical guide before changing an existing installation. This
+README does not prescribe automatic plugin deletion, package downgrades or
+memory-data migration.

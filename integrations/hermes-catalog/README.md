@@ -19,6 +19,20 @@ This directory is the Hermes **directory plugin** that the catalog installs
 The package itself lives in `../hermes/` and is released to PyPI from there.
 Nothing in this directory is imported by the package or its tests.
 
+## Platform boundary and shipping gates
+
+Both dependency edges exclude Android and Emscripten with the same marker. The
+provider shim and early CLI sibling also refuse those platforms before looking
+up/importing the installed runtime, even when dependencies are already present.
+Static discovery remains possible; provider/tool activation does not.
+
+See [the native integration support contract](../hermes/PLATFORM_SUPPORT.md).
+The current `>=0.7.6,<0.8` provider floor is retained, not claimed to contain the
+new standalone guards. Before shipping the full guarantee, maintainers must
+publish the guard-bearing package, then require that actually published version
+in the eventual catalog. Resolver checks do not establish native acceptance.
+No version is invented or published by this source repair.
+
 ## Wrapper installs
 
 Existing wrapper-mode installs (`mnemosyne-hermes install --mode wrapper`)

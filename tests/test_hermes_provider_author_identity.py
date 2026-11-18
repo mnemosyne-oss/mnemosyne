@@ -17,6 +17,7 @@ the actual write path end to end.
 import json
 from pathlib import Path
 
+
 from hermes_memory_provider import MnemosyneMemoryProvider
 
 

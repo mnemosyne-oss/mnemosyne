@@ -8,6 +8,7 @@ for fuzzy matching. No spaCy, no PyTorch, no external NLP libraries.
 Storage: TripleStore triples (subject=memory_id, predicate="mentions", object="entity_name")
 """
 
+import os
 import re
 from typing import List, Set, Tuple
 
@@ -17,7 +18,7 @@ from typing import List, Set, Tuple
 # =============================================================================
 
 ENTITY_EXTRACTION_STOP_WORDS: Set[str] = {
-    # Standard stop words
+    # --- upstream standard stop words ---
     "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
     "of", "with", "by", "from", "as", "is", "was", "are", "were", "be",
     "been", "being", "have", "has", "had", "do", "does", "did", "will",
@@ -26,16 +27,100 @@ ENTITY_EXTRACTION_STOP_WORDS: Set[str] = {
     "us", "them", "my", "your", "his", "its", "our", "their",
     "this", "that", "these", "those", "here", "there", "where",
     "when", "what", "which", "who", "whom", "whose", "how", "why",
-    # Meta/system words that are NOT meaningful entities — extracted noise
-    # from LLM-generated summaries and extraction prompts
     "assistant", "user", "skill", "review", "target", "class",
     "level", "signals", "phase", "api", "pi", "summary", "added",
     "active", "be", "not", "whether", "all", "no", "replying",
     "ai", "memory", "conversation", "fact",
     "false", "true", "none", "null", "signal",
-    "hermes", "assistant", "agent", "model", "system", "memory",
+    "hermes", "agent", "model", "system",
     "note", "task", "project", "result", "output", "input", "data",
     "step", "process", "point", "way", "thing", "time", "work",
+    # --- expanded: capitalized English sentence-words (chat noise) ---
+    "after", "again", "also", "although", "always", "another", "any",
+    "anyone", "anything", "around", "away", "back", "because", "before",
+    "being", "better", "both", "but", "can", "cannot", "certain", "could",
+    "different", "does", "doing", "done", "down", "during", "each",
+    "either", "else", "enough", "every", "everyone", "everything",
+    "finally", "first", "following", "for", "from", "frustration",
+    "further", "getting", "going", "good", "great", "has", "have",
+    "having", "however", "if", "into", "just", "keep", "know", "last",
+    "like", "look", "looking", "made", "make", "makes", "many", "maybe",
+    "might", "more", "most", "much", "must", "need", "needs", "negative",
+    "never", "next", "nothing", "off", "once", "one", "only",
+    "onto", "other", "others", "otherwise", "out", "over", "part",
+    "please", "possible", "rather", "really", "right", "same", "say",
+    "see", "seen", "several", "should", "show", "shows", "since", "so",
+    "something", "sometimes", "soon", "still", "such", "sure", "take",
+    "than", "them", "then", "there", "these", "they", "thing", "things",
+    "this", "those", "through", "thus", "time", "times", "today",
+    "together", "too", "try", "under", "until", "updated", "upon",
+    "used", "using", "very", "want", "wants", "was", "way", "ways",
+    "well", "were", "what", "when", "where", "whether", "which",
+    "while", "whole", "will", "with", "within", "without", "would",
+    "yes", "yet", "you", "your",
+    # --- code/UI tokens observed in real extraction noise ---
+    "add", "app", "auth", "backup", "bank", "banks", "bootstrap", "bundled",
+    "capture", "capturing", "clean", "cleared", "click", "code", "command",
+    "commands", "confirmed", "convention", "create", "currently", "db",
+    "design", "docs", "encode", "environment", "existing", "file", "files",
+    "fixes", "full", "health", "hub", "ids", "image", "load", "loaded",
+    "memories", "mode", "net", "nightly", "non", "okay", "operator",
+    "option", "overlap", "patch", "pinned", "preference", "pr", "prompt",
+    "protected", "read", "rebuild", "redundant", "repo", "research",
+    "retire", "session", "shared", "skills", "support", "tonight",
+    "todo", "umbrella", "unresolved", "update", "verified", "write",
+    "writing",
+    # observed high-frequency single-cap words in dev-chat (2nd wave)
+    "action", "audit", "august", "check", "commit", "commits", "current",
+    "live", "ok", "per", "provider", "run", "status", "two", "verification",
+    "let", "acceptance", "account", "accounts", "act", "activities",
+    "activity", "additional", "administration", "alternative", "applications",
+    "applies", "approve", "archived", "assignment", "audience", "background",
+    "blocked", "branch", "bridge", "build", "built", "cancel", "candidate",
+    "canonical", "capability", "central", "chat", "cheap", "client",
+    "close", "complete", "completed", "config", "confirm", "connected",
+    "container", "contents", "convert", "core", "correct", "cost", "created",
+    "creating", "credential", "credentials", "cron", "dashboard", "decision",
+    "default", "deferred", "delete", "deletion", "deliver", "delivery",
+    "deploy", "deployment", "description", "developer", "distinguishing",
+    "documentation", "documented", "documenting", "domain", "draft", "drop",
+    "durable", "dynamic", "earlier", "encrypt", "endpoints", "english",
+    "europe", "even", "events", "evidence", "execute", "execution",
+    "explicit", "explicitly", "export", "extended", "facts", "failure",
+    "fetch", "filter", "final", "fine", "fix", "fixed", "focus", "follow",
+    "fork", "found", "functional", "gaps", "goal", "group", "hard",
+    "header", "history", "home", "hook", "housekeeping", "human", "humans",
+    "hybrid", "identity", "implemented", "independent", "initial", "install",
+    "installed", "instead", "interesting", "invalid", "inventory",
+    "investigation", "isolation", "item", "job", "keeping", "kept", "key",
+    "kind", "layer", "lifecycle", "likely", "limitation", "line", "list",
+    "local", "log", "lost", "main", "maintaining", "mandatory", "mapping",
+    "match", "meaning", "middle", "minor", "mixture", "monday", "mondays",
+    "mounts", "multiple", "name", "notable", "noted", "notes", "object",
+    "open", "operations", "optional", "options", "outcome", "parallel",
+    "password", "paste", "pending", "persist", "pin", "plan", "plugin",
+    "plus", "positioning", "post", "predicate", "prefer", "preserved",
+    "primary", "private", "problem", "procedure", "proceed", "proof",
+    "proposal", "proposed", "prose", "public", "pull", "purpose", "push",
+    "pushed", "qualify", "quota", "rate", "reading", "reads", "ready",
+    "real", "reasoning", "rebase", "receive", "recommended", "reconcile",
+    "record", "recorded", "reference", "references", "register", "related",
+    "relevant", "remaining", "remind", "remote", "remove", "renamed",
+    "renaming", "reorganize", "replaced", "repository", "required",
+    "requirement", "resume", "reviews", "revocation", "rewrite", "rewrote",
+    "risks", "root", "rotate", "rotation", "router", "routing", "row",
+    "runs", "runtime", "safety", "save", "saved", "saves", "schedule",
+    "scheduled", "scope", "scripts", "second", "secret", "section",
+    "security", "self", "separate", "separating", "server", "service",
+    "settings", "shell", "short", "signed", "smoke", "source", "sources",
+    "sovereignty", "split", "stable", "stale", "standing", "state",
+    "subject", "summarize", "switch", "syntax", "technically", "tell",
+    "temporary", "test", "text", "therefore", "tiny", "tomorrow", "tool",
+    "tools", "topic", "total", "transformation", "transient", "transversal",
+    "treat", "triggered", "trimmed", "triples", "unset", "unsigned",
+    "updating", "upstream", "valid", "validate", "validation", "value",
+    "verify", "vision", "wait", "watchdog", "websocket", "webhook",
+    "welcome", "whenever", "working", "works", "writes", "zero",
 }
 
 # Backward compatibility alias
@@ -45,6 +130,93 @@ _STOP_WORDS = ENTITY_EXTRACTION_STOP_WORDS
 # =============================================================================
 # REGEX PATTERNS FOR ENTITY EXTRACTION
 # =============================================================================
+
+# Single capitalized word (fallback): Abdias, Python, John.
+# Named so extract_entities_regex can tell this pattern's matches apart:
+# they alone get the position drop below.
+_SINGLE_CAP_WORD = re.compile(r'\b([A-Z][a-zA-Z]{1,20})\b')
+
+# Opt-in position rule, read per call: MNEMOSYNE_ENTITY_POSITION_FILTER=1.
+# In conversation text a single capitalized word is capitalized by where it
+# stands far more often than because it is a name: a sentence opener
+# ("Then", "So", "Okay"), a contraction stem, the first word of a quoted
+# phrase. Off by default because short declarative facts open with their
+# subject ("Jane is an architect."), and the rule would drop that name.
+_POSITION_FILTER_ENV = "MNEMOSYNE_ENTITY_POSITION_FILTER"
+
+# A word is sentence-initial at the start of the text, or when the nearest
+# non-space character before it (closing quotes and brackets are skipped too,
+# and the * closing a markdown emphasis span) ends a sentence, or when it is
+# the first word of a stored turn: a speaker prefix such as `[USER] ` or
+# `[ASSISTANT] `, a bracketed uppercase word opening its line and followed by
+# a space, counts as a sentence start. Only that shape does: a bracket
+# closing mid-sentence is skipped like any closer; it does not by itself
+# create a sentence boundary.
+_SENTENCE_TERMINATORS = frozenset(".!?:;\u2026\n\r")
+_TRAILING_CLOSERS = frozenset("\"')]}*\u2019\u201d")
+_SPEAKER_PREFIX = re.compile(r'\[[A-Z]+\]')
+# A dot after these bounded name prefixes does not start a new sentence.
+# Keep this small: it is not general abbreviation or sentence segmentation.
+_NAME_PREFIX_ABBREVIATION = re.compile(r"\b(?:Dr|Mr|Mrs|Ms|Prof|St)\.\Z", re.IGNORECASE)
+
+# A contraction stem is not a name: an apostrophe is a word boundary, so
+# "Don't" matched "Don" and "Haven't" matched "Haven". A single word followed
+# by an apostrophe and an unambiguous contraction tail is rejected. The 's
+# tail is ambiguous ("Let's", "Alice's") and is not rejected as a contraction
+# stem. The other position checks can still reject a possessive.
+_CONTRACTION_TAIL = re.compile(r"['\u2019](?:t|ll|re|ve|d|m)\b", re.IGNORECASE)
+
+# The word opening a quoted phrase is capitalized by position, like a
+# sentence opener: the title case of a quoted heading ("Guarded canonical
+# calls"), the first word of quoted speech ('Still us.'). Only the phrase
+# shape is dropped, an opening quote right before the word and a lowercase
+# word right after it. A quoted name standing alone ('Alice'), a quoted
+# possessive ("Alice's notes") and a quoted list (['Alice', 'Maya']) are not
+# rejected by this quoted-phrase check.
+_OPENING_QUOTES = frozenset("\"'\u201c\u2018")
+_LOWERCASE_FOLLOWER = re.compile(r'[ \t]+[a-z]')
+
+
+def _position_filter_enabled() -> bool:
+    value = os.environ.get(_POSITION_FILTER_ENV, "").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def _is_sentence_initial(text: str, pos: int) -> bool:
+    i = pos - 1
+    while i >= 0 and (
+        text[i] in " \t" or text[i] in _TRAILING_CLOSERS or text[i] in _OPENING_QUOTES
+    ):
+        if text[i] == "]" and text[i + 1] in " \t":
+            line_start = max(text.rfind("\n", 0, i), text.rfind("\r", 0, i)) + 1
+            if _SPEAKER_PREFIX.fullmatch(text, line_start, i + 1):
+                return True
+        i -= 1
+    if (
+        i >= 0
+        and text[i] == "."
+        and not text[i + 1:pos].strip(" \t")
+        and _NAME_PREFIX_ABBREVIATION.search(text, max(0, i - 4), i + 1)
+    ):
+        return False
+    return i < 0 or text[i] in _SENTENCE_TERMINATORS
+
+
+def _opens_quoted_phrase(text: str, start: int, end: int) -> bool:
+    if start == 0 or text[start - 1] not in _OPENING_QUOTES:
+        return False
+    if start > 1 and text[start - 2].isalnum():
+        return False
+    return _LOWERCASE_FOLLOWER.match(text, end) is not None
+
+
+def _capitalized_by_position(text: str, start: int, end: int) -> bool:
+    return (
+        _is_sentence_initial(text, start)
+        or _CONTRACTION_TAIL.match(text, end) is not None
+        or _opens_quoted_phrase(text, start, end)
+    )
+
 
 _ENTITY_PATTERNS = [
     # @mentions: @username
@@ -59,7 +231,7 @@ _ENTITY_PATTERNS = [
     # Capitalized word sequences (2-5 words): New York, Abdias J, San Francisco Bay Area
     re.compile(r'\b([A-Z][a-zA-Z]*(?:\s+[A-Z][a-zA-Z]*){1,4})\b'),
     # Single capitalized word (fallback): Abdias, Python, John
-    re.compile(r'\b([A-Z][a-zA-Z]{1,20})\b'),
+    _SINGLE_CAP_WORD,
 ]
 
 
@@ -141,11 +313,15 @@ def extract_entities_regex(text: str) -> List[str]:
 
     Returns list of unique entity strings. No external dependencies.
     Filters out stop words, single lowercase words, and pure numbers.
+    With MNEMOSYNE_ENTITY_POSITION_FILTER set, also drops a single
+    capitalized word that is capitalized by its position: a sentence opener,
+    a contraction stem, or the first word of a quoted phrase.
     """
     if not text or not isinstance(text, str):
         return []
 
     entities: Set[str] = set()
+    position_filter = _position_filter_enabled()
 
     for pattern in _ENTITY_PATTERNS:
         for match in pattern.finditer(text):
@@ -156,13 +332,42 @@ def extract_entities_regex(text: str) -> List[str]:
             # Filter out stop words (single word only); case-insensitive
             words = entity.split()
             if len(words) == 1 and entity.lower() in _STOP_WORDS:
+                # @mentions / hashtags are explicit entity signals — bypass
+                # the stopword filter (mirrors the lowercase check below)
+                match_start = match.start(1)
+                prefix_char = text[match_start - 1] if match_start > 0 else ''
+                if prefix_char not in ('@', '#'):
+                    continue
+            # Multi-word entities: drop when ANY word is a stopword
+            # (upstream contract — "The Quick Brown Fox" drops on "the").
+            if len(words) > 1 and any(w.lower() in _STOP_WORDS for w in words):
                 continue
-            # Filter entities where ANY word is a stopword (e.g. "The USER",
-            # "Active Signal" -- the stopword contaminates the whole phrase)
-            if any(w.lower() in _STOP_WORDS for w in words):
+            # Multi-word entities must be proper-noun shaped: every word starts
+            # uppercase, is a digit, or is a stopword. Keeps "PMO City",
+            # rejects quoted sentence fragments ("reliable workflow").
+            if len(words) > 1 and not all(
+                w[0].isupper() or w[0].isdigit() or w.lower() in _STOP_WORDS
+                for w in words
+            ):
                 continue
             # Filter out pure numbers
             if entity.replace('.', '').replace(',', '').isdigit():
+                continue
+            # Template/code junk
+            if any(ch in entity for ch in ';/\\'):
+                continue
+            # Single-word ALL-CAPS tokens (emphasis/code, not names)
+            if len(words) == 1 and entity.isupper():
+                continue
+            # Opt-in: drop a single capitalized word capitalized by position.
+            # Apply the three position checks only to this fallback pattern.
+            # Multi-word sequences and @/# prefixes use other patterns, which
+            # skip this check. Other filters and longer-name merging still apply.
+            if (
+                position_filter
+                and pattern is _SINGLE_CAP_WORD
+                and _capitalized_by_position(text, match.start(1), match.end(1))
+            ):
                 continue
             # Filter out standalone lowercase words (unless @-mentioned/#-tagged)
             # But allow @mentions and hashtags which are lowercase by nature
