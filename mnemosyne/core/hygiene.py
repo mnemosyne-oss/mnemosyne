@@ -33,11 +33,18 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from mnemosyne.core.filters import (
     DEFAULT_NOISE_PATTERNS,
+    _count_sentence_boundaries,
     detect_secrets,
     matches_patterns,
 )
 
 logger = logging.getLogger(__name__)
+
+DELETE_OVERRIDE_ERROR = (
+    "Explicit delete override includes candidates not suggested for deletion; "
+    "review the audit and use --force (CLI), force=True (Python core), "
+    "or force=true (MCP) to override deliberately."
+)
 
 # ---------------------------------------------------------------------------
 # Schema: hygiene_audit_log table
@@ -144,6 +151,11 @@ def _hygiene_delete_cascade(
         ).fetchone()
         if gists_table is not None:
             cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
+        from mnemosyne.core.beam import BeamMemory
+
+        if not BeamMemory._memory_has_surviving_parent(cursor, memory_id):
+            BeamMemory._delete_derived_memory_rows(cursor, memory_id)
+            BeamMemory._delete_orphaned_legacy_mirror(cursor, memory_id)
     except Exception:
         cursor.execute("ROLLBACK TO SAVEPOINT hygiene_delete")
         cursor.execute("RELEASE hygiene_delete")
@@ -330,7 +342,7 @@ def _score_noise(content: str, importance: float, source: str) -> Tuple[float, L
     # 6. High line count + low semantic structure (likely a dump)
     line_count = content.count("\n") + 1
     if line_count > 30 and len(content) > 1000:
-        sentences = content.count(". ")
+        sentences = _count_sentence_boundaries(content)
         if sentences < line_count * 0.1:
             score = max(score, 0.65)
             reasons.append("likely_dump")
@@ -718,12 +730,25 @@ def hygiene_status(
 # Cleanup
 # ---------------------------------------------------------------------------
 
+def validate_delete_override(candidates: List[NoiseCandidate], action: str, force: bool) -> Optional[str]:
+    """Validate the explicit delete override before opening or mutating a bank."""
+    if type(force) is not bool:
+        return "force must be a boolean"
+    if action == "delete" and not force and any(
+        c.suggested_action != "delete" for c in candidates
+    ):
+        return DELETE_OVERRIDE_ERROR
+    return None
+
+
 def clean_noise(
     db_path: Path,
     candidates: List[NoiseCandidate],
     action: str = "archive",
     confirm: bool = False,
     dry_run: bool = True,
+    *,
+    force: bool = False,
 ) -> CleanResult:
     """Process noise candidates and apply cleanup actions.
 
@@ -731,16 +756,25 @@ def clean_noise(
         db_path: Path to the mnemosyne SQLite database.
         candidates: Candidates from ``audit_noise()``.
         action: Override action for all candidates: ``delete``, ``archive``,
-            ``flag``, or ``keep``.  If empty, uses each candidate's
+            ``flag``, or ``keep``. If ``keep``, uses each candidate's
             ``suggested_action``.
         confirm: Must be True for any destructive action.  If False,
             only dry-run analysis is performed.
         dry_run: If True, no changes are made; returns what *would* happen.
+        force: Literal True permits an explicit delete override of candidates
+            not suggested for deletion. Does not replace confirmation.
 
     Returns:
-        ``CleanResult`` with counts and any errors.
+        ``CleanResult`` with counts and any errors. Applied archives of rows
+        already marked archived count as kept, without a new audit entry.
+        Dry-run counts remain candidate-based (no current-row inspection).
     """
     result = CleanResult()
+
+    override_error = validate_delete_override(candidates, action, force)
+    if override_error:
+        result.errors.append(override_error)
+        return result
 
     if dry_run:
         for c in candidates:
@@ -766,11 +800,24 @@ def clean_noise(
     try:
         _ensure_hygiene_log_table(conn)
         cursor = conn.cursor()
+        cursor.execute("BEGIN")
         now = datetime.now().isoformat()
 
         for c in candidates:
+            if c.table_name not in _ALLOWED_HYGIENE_TABLES:
+                result.errors.append(f"Invalid table name: {c.table_name}:{c.memory_id}")
+                continue
+
             effective_action = action if action != "keep" else c.suggested_action
 
+            # Isolate each candidate in its own savepoint so a failure on one
+            # candidate (partial mutation, audit-log write error, etc.) rolls
+            # back ONLY that candidate's staged changes. Without this, a
+            # mid-candidate raise leaves the partial mutation staged in the
+            # shared transaction and committed at the end alongside every
+            # other candidate, producing a half-applied row that the audit
+            # log does not describe.
+            cursor.execute("SAVEPOINT hygiene_candidate")
             try:
                 # Fetch original content + metadata for audit log
                 cursor.execute(
@@ -779,16 +826,23 @@ def clean_noise(
                 )
                 row = cursor.fetchone()
                 if row is None:
+                    cursor.execute("ROLLBACK TO hygiene_candidate")
+                    cursor.execute("RELEASE hygiene_candidate")
                     result.errors.append(f"Row not found: {c.table_name}:{c.memory_id}")
                     continue
 
                 original_content = row["content"] or ""
                 original_metadata = row["metadata_json"] or "{}"
 
+                # Stage the mutation and audit write, then bump counters ONLY
+                # after the savepoint releases successfully. Previously the
+                # counters were incremented before the audit INSERT; an audit
+                # failure rolled back the row mutation (savepoint) but left a
+                # success count that did not match the committed state.
+                committed_action = None
                 if effective_action == "delete":
                     _hygiene_delete_cascade(cursor, conn, c.table_name, c.memory_id, vec_loaded)
-                    result.deleted += 1
-                    log_action = "deleted"
+                    committed_action = "deleted"
                 elif effective_action == "archive":
                     # Archive = set importance to 0 and add metadata flag.
                     # This decays the row out of active retrieval without
@@ -796,6 +850,18 @@ def clean_noise(
                     # preserved in metadata so restore_archived can recover
                     # the exact value instead of guessing.
                     meta = json.loads(original_metadata) if original_metadata else {}
+                    # Match restore's existing truthy archive-marker semantics.
+                    # Reusing candidates must not replace the first transition's
+                    # restore value/provenance or append a second archive event.
+                    if meta.get("_archived"):
+                        cursor.execute("RELEASE hygiene_candidate")
+                        result.kept += 1
+                        continue
+                    # An unarchived row with a saved value is inconsistent.
+                    # Preserve that evidence (including zero/null), rather than
+                    # silently choosing between it and the current importance.
+                    if "_original_importance" in meta:
+                        raise ValueError("Unarchived row has saved archive importance")
                     # Fetch and preserve original importance before zeroing.
                     cursor.execute(
                         f"SELECT importance FROM {c.table_name} WHERE id = ?",
@@ -811,8 +877,7 @@ def clean_noise(
                         f"UPDATE {c.table_name} SET importance = 0, metadata_json = ? WHERE id = ?",
                         (json.dumps(meta), c.memory_id),
                     )
-                    result.archived += 1
-                    log_action = "archived"
+                    committed_action = "archived"
                 elif effective_action == "flag":
                     # Flag = mark in metadata for operator review. No content change.
                     meta = json.loads(original_metadata) if original_metadata else {}
@@ -822,11 +887,9 @@ def clean_noise(
                         f"UPDATE {c.table_name} SET metadata_json = ? WHERE id = ?",
                         (json.dumps(meta), c.memory_id),
                     )
-                    result.flagged += 1
-                    log_action = "flagged"
+                    committed_action = "flagged"
                 else:
-                    result.kept += 1
-                    log_action = "kept"
+                    committed_action = "kept"
 
                 # Write audit log entry
                 cursor.execute(
@@ -838,7 +901,7 @@ def clean_noise(
                     (
                         c.memory_id,
                         c.table_name,
-                        log_action,
+                        committed_action,
                         json.dumps(c.noise_reasons),
                         c.noise_score,
                         json.dumps(c.secret_flags),
@@ -848,17 +911,51 @@ def clean_noise(
                         None,  # session_id not tracked at log level
                     ),
                 )
+                cursor.execute("RELEASE hygiene_candidate")
+                # Counters are only truthful once the savepoint has released.
+                if committed_action == "deleted":
+                    result.deleted += 1
+                elif committed_action == "archived":
+                    result.archived += 1
+                elif committed_action == "flagged":
+                    result.flagged += 1
+                else:
+                    result.kept += 1
                 result.log_entries += 1
 
-            except Exception as e:
-                result.errors.append(f"Error processing {c.table_name}:{c.memory_id}: {e}")
-                logger.warning("Hygiene cleanup error for %s:%s: %s",
-                               c.table_name, c.memory_id, e)
+            except Exception:
+                try:
+                    cursor.execute("ROLLBACK TO hygiene_candidate")
+                    cursor.execute("RELEASE hygiene_candidate")
+                except sqlite3.Error:
+                    logger.warning("hygiene_savepoint_rollback_failed: %s:%s",
+                                   c.table_name, c.memory_id)
+                    conn.rollback()
+                    result.deleted = 0
+                    result.archived = 0
+                    result.flagged = 0
+                    result.kept = 0
+                    result.log_entries = 0
+                    result.errors.append("hygiene_savepoint_rollback_failed")
+                    return result
+                # Structural, content-free error: identify which candidate
+                # failed without leaking raw exception text or a traceback.
+                # table_name:memory_id are candidate references (not content),
+                # required by the cleanup status contract so operators can
+                # see which candidate to retry.
+                result.errors.append(f"hygiene_candidate_failed: {c.table_name}:{c.memory_id}")
+                logger.warning("hygiene_candidate_failed: %s:%s",
+                               c.table_name, c.memory_id)
 
         conn.commit()
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        result.errors.append(f"Transaction failed: {e}")
+        result.deleted = 0
+        result.archived = 0
+        result.flagged = 0
+        result.kept = 0
+        result.log_entries = 0
+        result.errors.append("hygiene_transaction_failed")
     finally:
         conn.close()
 
@@ -926,6 +1023,16 @@ def restore_archived(
                 continue
             current_meta = row["metadata_json"] or "{}"
             meta = json.loads(current_meta)
+
+            # Idempotency guard: only restore rows that are still archived.
+            # The audit log is append-only, so a second restore_archived()
+            # call would otherwise re-select already-restored entries, find
+            # no _original_importance (it was popped on the first restore),
+            # fall back to 0.5, and overwrite the correct importance value.
+            # Skipping rows whose _archived flag is gone makes repeat calls a
+            # safe no-op.
+            if not meta.get("_archived"):
+                continue
 
             # Use the preserved _original_importance from metadata if
             # available; fall back to 0.5 for entries archived before

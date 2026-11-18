@@ -28,6 +28,7 @@ from typing import Any, Dict, List
 
 from mnemosyne.core.beam import _normalize_valid_until
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
+from mnemosyne.core.user_agent import application_user_agent
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +95,10 @@ class HindsightImporter(BaseImporter):
         while True:
             query = urllib.parse.urlencode({"limit": self.page_size, "offset": offset})
             url = f"{self.base_url}/v1/default/banks/{self.bank}/memories/list?{query}"
-            with urllib.request.urlopen(url, timeout=60) as resp:
+            request = urllib.request.Request(
+                url, headers={"User-Agent": application_user_agent()}
+            )
+            with urllib.request.urlopen(request, timeout=60) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             page = self._unwrap_items(data)
             if not page:

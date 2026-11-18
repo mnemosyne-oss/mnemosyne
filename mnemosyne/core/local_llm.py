@@ -9,16 +9,21 @@ Model cache: ~/.hermes/mnemosyne/models/
 Default model: openbmb/MiniCPM5-1B-GGUF (Q4_K_M, ~656MB)
 """
 
+import hashlib
 import logging
 import os
 import sys
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+from mnemosyne.core.user_agent import application_user_agent
 
 # --- Config ------------------------------------------------------------------
-DEFAULT_MODEL_REPO = "openbmb/MiniCPM5-1B-GGUF"
-DEFAULT_MODEL_FILE = "MiniCPM5-1B-Q4_K_M.gguf"
+# The shipped artifact, in one place: the size notice below has to recognise it
+# however it was selected.
+_SHIPPED_MODEL = ("openbmb/MiniCPM5-1B-GGUF", "MiniCPM5-1B-Q4_K_M.gguf")
+DEFAULT_MODEL_REPO, DEFAULT_MODEL_FILE = _SHIPPED_MODEL
 MODEL_CACHE_DIR = Path.home() / ".hermes" / "mnemosyne" / "models"
 
 logger = logging.getLogger(__name__)
@@ -28,15 +33,11 @@ LLM_MAX_TOKENS=int(os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "2048") or "2048")
 LLM_N_THREADS = int(os.environ.get("MNEMOSYNE_LLM_N_THREADS", "4"))
 LLM_N_CTX = int(os.environ.get("MNEMOSYNE_LLM_N_CTX", "2048"))
 
-# Override model via env
-_env_repo = os.environ.get("MNEMOSYNE_LLM_REPO")
-_env_file = os.environ.get("MNEMOSYNE_LLM_FILE")
-if _env_repo and _env_file:
-    DEFAULT_MODEL_REPO = _env_repo
-    DEFAULT_MODEL_FILE = _env_file
+# Model selection is resolved per call, not captured here, so REPO and FILE set
+# after import still apply. See _resolve_model_selection().
 
-# Override the cache location via env. Environment-only and read at import, like
-# the repo/file overrides above. Unset or blank keeps the historical path.
+# Override the cache location via env. Environment-only and read at import,
+# unlike the model selection above. Unset or blank keeps the historical path.
 #
 # `strip()` decides only whether anything was named; the raw value is what
 # becomes the path, because a POSIX directory name may legitimately begin or end
@@ -156,9 +157,63 @@ def _ensure_sys_path():
         sys.path.append(sp)
 
 
+def _resolve_model_selection() -> Tuple[str, str]:
+    """Return the (repo id, filename) pair to load, resolved on every call.
+
+    FILE names the artifact and REPO names where to fetch it, and either one
+    works alone. A blank value counts as unset, matching the cache-dir override.
+    """
+    repo = (os.environ.get("MNEMOSYNE_LLM_REPO") or "").strip() or DEFAULT_MODEL_REPO
+    filename = (
+        (os.environ.get("MNEMOSYNE_LLM_FILE") or "").strip() or DEFAULT_MODEL_FILE
+    )
+    return repo, _checked_cache_filename(filename)
+
+
+def _checked_cache_filename(filename: str) -> str:
+    """Reject a parent-directory component in the selected filename.
+
+    A ``..`` component climbs out of the repository cache root, so one selection
+    could reach another repository's cached file, which is the collision this
+    change set out to remove. An absolute path is left alone: naming one exact
+    file is an explicit operator choice, and REPO does not apply to it.
+    """
+    if ".." in Path(filename).parts:
+        raise ValueError(
+            "MNEMOSYNE_LLM_FILE must not contain a parent-directory component, "
+            f"got {filename!r}"
+        )
+    return filename
+
+
+def _model_cache_root(repo_id: str) -> Path:
+    """Return the cache directory that holds this repository's artifacts.
+
+    The shipped repo keeps the historical flat root so existing caches keep
+    working. Any other repo is namespaced by a hash, because a filename alone
+    does not identify an artifact: two repos can ship the same name.
+    """
+    if repo_id == _SHIPPED_MODEL[0]:
+        return MODEL_CACHE_DIR
+    repo_key = hashlib.sha256(repo_id.encode("utf-8")).hexdigest()
+    return MODEL_CACHE_DIR / ".repositories" / repo_key
+
+
+def _model_cache_path(repo_id: str, filename: str) -> Path:
+    """Return the full cache path for one (repo id, filename) pair."""
+    return _model_cache_root(repo_id) / filename
+
+
 def _model_path() -> Optional[Path]:
-    """Return path to the local GGUF model file, or None if not downloaded."""
-    candidate = MODEL_CACHE_DIR / DEFAULT_MODEL_FILE
+    """Return path to the cached GGUF model file, or None if it is not there."""
+    try:
+        repo_id, filename = _resolve_model_selection()
+    except ValueError as exc:
+        # _load_llm() calls this outside its own try, so degrade here and say why
+        # rather than let an invalid selection escape to the caller.
+        logger.warning("%s", exc)
+        return None
+    candidate = _model_cache_path(repo_id, filename)
     return candidate if candidate.exists() else None
 
 
@@ -201,11 +256,27 @@ def _ensure_model_cache_dir() -> Path:
 
 
 def _download_model() -> Path:
-    """Download the GGUF model from HuggingFace if not present."""
+    """Download the selected GGUF model from HuggingFace if it is not cached."""
     _ensure_model_cache_dir()
-    local_path = MODEL_CACHE_DIR / DEFAULT_MODEL_FILE
+    repo_id, filename = _resolve_model_selection()
+    local_path = _model_cache_path(repo_id, filename)
     if local_path.exists():
         return local_path
+
+    if Path(filename).is_absolute():
+        # Nothing to fetch by name: the Hub needs a relative filename, and the
+        # selection already said exactly which file it means. Log first, because
+        # _load_llm() swallows this exception, so the record is the only
+        # diagnostic the operator ever sees.
+        logger.warning(
+            "MNEMOSYNE_LLM_FILE=%s is an absolute path that does not exist; "
+            "an absolute selection cannot be downloaded by name.",
+            filename,
+        )
+        raise ValueError(
+            "MNEMOSYNE_LLM_FILE is an absolute path, so the file must already "
+            f"exist; {filename!r} is not there and cannot be downloaded."
+        )
 
     try:
         from huggingface_hub import hf_hub_download
@@ -214,27 +285,55 @@ def _download_model() -> Path:
             "huggingface_hub not installed. Run: pip install huggingface-hub"
         )
 
-    default_artifact = (
-        DEFAULT_MODEL_REPO == "openbmb/MiniCPM5-1B-GGUF"
-        and DEFAULT_MODEL_FILE == "MiniCPM5-1B-Q4_K_M.gguf"
+    # The download root, not the file's parent: hf_hub_download joins the root
+    # with the filename, so a nested filename must keep its own separators.
+    cache_root = _model_cache_root(repo_id)
+    try:
+        cache_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "Could not create the local model cache directory %s for %s from %s: %s. "
+            "Point MNEMOSYNE_MODEL_CACHE_DIR at a writable directory, or fix its "
+            "permissions.",
+            cache_root,
+            filename,
+            repo_id,
+            exc,
+        )
+        raise
+    size_notice = (
+        " (approximately 656 MB)" if (repo_id, filename) == _SHIPPED_MODEL else ""
     )
-    size_notice = " (approximately 656 MB)" if default_artifact else ""
     logger.warning(
         "Downloading local LLM model %s from %s%s to %s. "
         "The current operation will block until the download completes. "
         "Set MNEMOSYNE_LLM_ENABLED=false for AAAK-only consolidation, "
         "or pre-cache the GGUF to avoid this download.",
-        DEFAULT_MODEL_FILE,
-        DEFAULT_MODEL_REPO,
+        filename,
+        repo_id,
         size_notice,
-        MODEL_CACHE_DIR,
+        local_path.parent,
     )
-    downloaded = hf_hub_download(
-        repo_id=DEFAULT_MODEL_REPO,
-        filename=DEFAULT_MODEL_FILE,
-        local_dir=str(MODEL_CACHE_DIR),
-        local_dir_use_symlinks=False,
-    )
+    try:
+        downloaded = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            local_dir=str(cache_root),
+            local_dir_use_symlinks=False,
+        )
+    except Exception as exc:
+        # _load_llm() swallows this and degrades to AAAK, so the message has to
+        # reach the log or a wrong repo/filename stays invisible.
+        logger.warning(
+            "Could not download local LLM model %s from %s into %s: %s. "
+            "Check MNEMOSYNE_LLM_REPO and MNEMOSYNE_LLM_FILE, or pre-cache the "
+            "GGUF at that path.",
+            filename,
+            repo_id,
+            local_path.parent,
+            exc,
+        )
+        raise
     return Path(downloaded)
 
 
@@ -513,8 +612,8 @@ def _sanitize_reasoning_output(text: str):
     ).strip()
 
 
-def _clean_output(text: str):
-    """Strip assistant tokens and extra whitespace from model output."""
+def _clean_output(text: str, *, preserve_bullets: bool = False):
+    """Clean model output, optionally retaining remote summary bullet content."""
     text = _sanitize_reasoning_output(text)
     if _is_invalid_reasoning_output(text):
         return text
@@ -523,8 +622,55 @@ def _clean_output(text: str):
     text = re.sub(r"^(Summarize the following memories.*?[.!?:]\s*)", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"^(Preserve facts.*?[.!?:]\s*)", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"^Source:.*?\n", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^\s*[-*]\s.*\n", "", text, flags=re.MULTILINE)
+    if not preserve_bullets:
+        # Small local models may echo the prompt's memory bullet lines.
+        text = re.sub(r"^\s*[-*]\s.*\n", "", text, flags=re.MULTILINE)
     return text.strip()
+
+
+_CONSOLIDATION_META_RE = re.compile(
+    r"^(?:memories:[ \t]*|summary:[ \t]*|memorandum:[ \t]*|"
+    r"the following (?:memories|text|notes) are concise and brief[.!?:]\s*|"
+    r"here (?:is|are) (?:a |the )?summary[.!?:]\s*|"
+    r"the following (?:memories|text|notes)\s*$)",
+    re.IGNORECASE,
+)
+_CONSOLIDATION_ENUM_RE = re.compile(r"^\s*(?:\d{1,2}[.)]|[-*•])\s+")
+_CONSOLIDATION_INSTRUCTION = (
+    "Distill the following memories into 1-3 concise sentences of plain fact. "
+    "Preserve names, numbers, dates, decisions, preferences, and outcomes. "
+    "Do not address the reader. Do not describe what you are doing. "
+    "Do not restate these instructions. Do not number the sentences. "
+    "Output only the distilled fact."
+)
+_CONSOLIDATION_INSTRUCTION_RE = re.compile(
+    r"^" + r"\s+".join(re.escape(word) for word in _CONSOLIDATION_INSTRUCTION.split()) + r"\s*",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_consolidation_output(text):
+    """Remove recognized consolidation headers while retaining factual sentences.
+
+    In particular, a sentence beginning 'The following memories confirm ...'
+    is not a header. Never scan through arbitrary text to its first decimal
+    point or punctuation mark. Enumeration is stripped only before a known
+    header, leaving factual bullet lists intact.
+    """
+    if not isinstance(text, str):
+        return text
+    cleaned = text.strip()
+    for _ in range(3):
+        before = cleaned
+        candidate = _CONSOLIDATION_ENUM_RE.sub("", cleaned, count=1)
+        if _CONSOLIDATION_META_RE.match(candidate) or _CONSOLIDATION_INSTRUCTION_RE.match(candidate):
+            cleaned = candidate
+        match = _CONSOLIDATION_INSTRUCTION_RE.match(cleaned) or _CONSOLIDATION_META_RE.match(cleaned)
+        if match:
+            cleaned = cleaned[match.end():].lstrip()
+        if cleaned == before:
+            break
+    return cleaned
 
 
 def _estimate_tokens(text: str) -> int:
@@ -616,12 +762,14 @@ def _is_retryable_status(status_code: int) -> bool:
 
     404/400: the requested model is missing or unrecognized on this endpoint —
     another model name on the same host may exist. 5xx: transient server-side
-    failure. 401/403/429 are NOT retryable: a bad key or rate limit won't be
-    fixed by swapping model names.
+    failure. 401/403 are NOT retryable: a bad key won't be fixed by swapping
+    model names. 429 IS retryable: on OpenAI-compatible gateways and proxies
+    the quota is usually attached to the model, not the endpoint, so a
+    sibling model on the same host may still have quota remaining (#1000).
     """
-    if status_code in (401, 403, 429):
+    if status_code in (401, 403):
         return False
-    if status_code in (404, 400) or 500 <= status_code < 600:
+    if status_code in (404, 400, 429) or 500 <= status_code < 600:
         return True
     return False
 
@@ -718,7 +866,10 @@ def _call_remote_llm_with_model(
         has_httpx = False
 
     url = f"{base_url}/chat/completions"
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": application_user_agent(),
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
@@ -869,6 +1020,8 @@ def _summarize_memories(
     # Chunk large memory lists to stay within context window limits.
     # chunk_memories_by_budget() respects LLM_N_CTX and safety margins.
     chunks = chunk_memories_by_budget(memories, source=source)
+    if sum(len(chunk) for chunk in chunks) != len(memories):
+        return None  # Caller must encode all input, including oversized items.
 
     def _summarize_chunk(chunk_memories: List[str], chunk_source: str = ""):
         """Summarize a single chunk of memories via the fallback chain."""
@@ -881,23 +1034,29 @@ def _summarize_memories(
             if _is_invalid_reasoning_output(text):
                 return _INVALID_REASONING_OUTPUT
             if text:
-                return text
+                cleaned = _sanitize_consolidation_output(text)
+                if cleaned:
+                    return cleaned
             raw = _call_local_llm(prompt)
             if raw:
                 cleaned = _clean_output(raw)
                 if _is_invalid_reasoning_output(cleaned):
                     return _INVALID_REASONING_OUTPUT
-                return cleaned if cleaned else None
+                cleaned = _sanitize_consolidation_output(cleaned)
+                if cleaned:
+                    return cleaned
             return None
 
         # 1. Remote API (skip if MNEMOSYNE_FORCE_LOCAL=1 or remote call fails).
         if LLM_ENABLED and LLM_BASE_URL and not os.environ.get("MNEMOSYNE_FORCE_LOCAL", "").lower() in ("1", "true", "yes"):
             raw = _call_remote_llm(prompt)
             if raw:
-                cleaned = _clean_output(raw)
+                cleaned = _clean_output(raw, preserve_bullets=True)
                 if _is_invalid_reasoning_output(cleaned):
                     return _INVALID_REASONING_OUTPUT
-                return cleaned if cleaned else None
+                cleaned = _sanitize_consolidation_output(cleaned)
+                if cleaned:
+                    return cleaned
 
         # 2. Local LLM (llama-cpp-python or ctransformers fallback).
         raw = _call_local_llm(prompt)
@@ -905,7 +1064,7 @@ def _summarize_memories(
             cleaned = _clean_output(raw)
             if _is_invalid_reasoning_output(cleaned):
                 return _INVALID_REASONING_OUTPUT
-            return cleaned if cleaned else None
+            return _sanitize_consolidation_output(cleaned) or None
         return None
 
     # Summarize each chunk individually.
@@ -914,8 +1073,9 @@ def _summarize_memories(
         summary = _summarize_chunk(chunk, chunk_source=source)
         if _is_invalid_reasoning_output(summary):
             return _INVALID_REASONING_OUTPUT
-        if summary:
-            chunk_summaries.append(summary)
+        if not summary:
+            return None  # Never publish a subset of the input as a complete summary.
+        chunk_summaries.append(summary)
 
     if not chunk_summaries:
         return None
@@ -925,7 +1085,7 @@ def _summarize_memories(
         final = _summarize_chunk(chunk_summaries, chunk_source=f"{source} [chunked {len(chunks)} parts]")
         if _is_invalid_reasoning_output(final):
             return _INVALID_REASONING_OUTPUT
-        return final if final else chunk_summaries[0]
+        return final if final else None
 
     return chunk_summaries[0]
 

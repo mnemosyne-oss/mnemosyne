@@ -25,7 +25,7 @@ This doc encodes what those fixes opened up: the ability to run **per-tool A/B t
 
 ## Setup
 
-These prerequisites are benchmark-only. They are **not** required to run Mnemosyne under normal use.
+These prerequisites are benchmark-only. They are **not** required to run Mnemosyne under normal use. The following setup and API-key preflight apply to the end-to-end BEAM quality harness. The independent [offline throughput signal](#offline-absolute-linear-throughput-signal-901) below requires neither API keys nor datasets/models.
 
 ### Python dependencies
 
@@ -298,6 +298,47 @@ python _benchmarks/evaluate_beam_end_to_end.py --scales 100K --sample 3
 ```
 
 Pin each toggle in your `.env` or shell environment across an A/B run. The harness preflight snapshots all `MNEMOSYNE_*` env vars into the results JSON under `metadata.config.env` so you can verify the configuration retroactively.
+
+---
+
+## Offline absolute linear throughput signal (#901)
+
+`_benchmarks/bench_beam_throughput.py` is a separate **advisory** latency/throughput signal for regressions shared by the control and temporal paths of the relative test from #899. It adds no CI wall-clock threshold and does not change that test. It measures synthetic, warm, single-process **linear lexical recall**, not end-to-end BEAM accuracy, dense/vector recall, polyphonic recall, ingestion, cold start, or concurrent service capacity.
+
+### Workload and measurement contract
+
+- A fresh worker imports the source from the checkout, clears inherited `MNEMOSYNE_*` settings, fixes `PYTHONHASHSEED=0`, and uses a new temporary `MNEMOSYNE_DATA_DIR` and SQLite database. User config and memory stores are not read. Embeddings, local/host LLM use, polyphonic recall and provenance-file writes are disabled. Other Core settings use the checkout's defaults, so a change to those defaults can affect this signal. No API keys, models or network calls are needed.
+- Version `beam-warm-linear-v1` seeds 1,000 working and 1,000 episodic rows by SQL, with real schema/FTS triggers, fixed IDs, timestamps (`2026-01-01T12:00:00`), content and importance. No extraction, consolidation, graph edges or vector rows are seeded. Eight fixed queries (`zephyr0 calibration` through `zephyr7 calibration`) run in that order with `top_k=10`, `temporal_weight=0.0` and cross-session recall disabled. This fixes the corpus and query sequence; normal wall-clock recency scoring still runs.
+- An untimed explain probe verifies nonempty **linear** recall. Three full query cycles warm the connection and caches. Each of five measured rounds then runs ten full cycles: **400 measured calls**, plus 24 warmup calls and the initial probe. Counts and last-recalled updates, commits and default diagnostics remain part of normal recall; state carries forward through the query sequence. The harness calls `recall()`, not `recall_enhanced()` or a query-cache wrapper.
+- Each `perf_counter_ns()` sample spans one complete call. Latencies are reported in milliseconds, with mean/min/max and nearest-rank p50/p95 (`sorted[ceil(p*N)-1]`, no interpolation). Each round's sequential QPS is call count divided by its whole wall time, including loop/timer/result-validation overhead; the headline is **median round QPS**. Startup, schema setup, SQL seeding, the probe, warmup, metadata collection and report serialization are outside the measured rounds. Empty results abort rather than publish a misleading fast report.
+- JSON includes raw per-call nanoseconds, per-round wall times and result counts, source commit and dirty status, harness SHA-256, UTC run time, an explicit machine label, OS/CPU/Python/SQLite and relevant optional-package versions, effective pinned settings and SQLite pragmas. It does not dump the user's environment or credentials. A missing Git executable/checkout is reported as a null revision; use a clean Git checkout for a reviewable baseline. There is no bundled universal machine baseline.
+
+### Run and retain a local baseline
+
+Use a local disk and a dedicated, otherwise idle machine with a stable power profile and the same Python environment/dependencies. Run from the repository root (Python 3.10+ with the normal Core dependencies; no benchmark extras are needed):
+
+```bash
+python -m pip install -e .
+python _benchmarks/bench_beam_throughput.py --machine workstation-a --output results/beam-throughput/main-01.json
+```
+
+Save that report on a clean reference revision. Switch to the candidate revision and run with the same options:
+
+```bash
+python _benchmarks/bench_beam_throughput.py --machine workstation-a --baseline results/beam-throughput/main-01.json --output results/beam-throughput/candidate-01.json
+```
+
+Use identical harness bytes for both revisions (the comparison checks their SHA-256). If an older reference predates this script, copy this script to `_benchmarks/bench_beam_throughput.py` in that checkout. Its report will correctly mark the tree dirty; retain the harness hash and verify that it is the only source addition. The worker still imports that checkout's Core. A workload/harness change requires fresh paired baselines, not comparison to a previous harness.
+
+`--rows-per-tier`, `--top-k`, `--warmup-cycles`, `--cycles-per-round` and `--rounds` accept positive integers; their values are recorded. Use longer rounds to investigate noise, applying the **same** options to reference and candidate. `--timeout` bounds the entire worker (including setup) in seconds, defaults to 600, and must be positive; increase it for larger workloads. A timeout fails without publishing a timing report. Git metadata commands have a separate 10-second timeout and fall back to a null revision on failure. Baseline files and their comparison metrics are validated before the worker starts. All reports are also printed as JSON on stdout; diagnostics go to stderr.
+
+Keep at least three independently started runs per revision, preferably alternating reference/candidate order on the same host. Retain the reference and candidate JSON files together under `results/beam-throughput/` (already Git-ignored) through review; attach them to the performance investigation/PR when sharing evidence. File names should distinguish revision and repeat number so runs are not overwritten. Preserve the baseline until the change is accepted and a replacement baseline is recorded; do not silently refresh it from the candidate.
+
+### Interpretation policy
+
+`--baseline` checks the workload version/options, harness hash, pinned settings, machine/environment metadata, runtime validation and SQLite pragmas before computing percentages. A mismatch emits `comparison.compatible=false` with the differing fields and no performance delta. The machine label is supplied by the runner; it cannot prove hardware identity, disk placement, power state or lack of background load. Check those manually. Commits are expected to differ; dirty trees must be inspected before interpreting results.
+
+For compatible reports, negative `median_qps_change_pct` means lower throughput; positive p50/p95 latency changes mean slower calls. Review raw samples, result counts and all repeats: a consistent shift across repeats is grounds to profile/investigate, not an automatic regression verdict. If the returned workload changes, investigate that before comparing speed. Mismatches, thermal throttling or noisy repeats require a new controlled pair, not a claimed improvement. Reports remain advisory and timing changes never determine the script's exit code; execution/setup failures still fail. Any future CI gate needs runner-specific calibration and a separately reviewed noise/threshold policy.
 
 ---
 

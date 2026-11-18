@@ -45,7 +45,7 @@ def test_run_diagnostics_counts_lowercase_error_status(tmp_path, monkeypatch):
     monkeypatch.setattr(
         diagnose,
         "collect_runtime_diagnostics",
-        lambda: {
+        lambda **kwargs: {
             "checks": [
                 {"category": "test", "check": "lowercase_error", "status": "error", "detail": ""},
             ]
@@ -67,7 +67,7 @@ def test_diagnose_vector_guidance_uses_valid_sleep_actions(tmp_path, monkeypatch
     monkeypatch.setattr(
         diagnose,
         "collect_runtime_diagnostics",
-        lambda: {
+        lambda **kwargs: {
             "checks": [
                 {"category": "deps", "check": "embeddings_available", "status": "YES", "detail": ""},
                 {"category": "deps", "check": "sqlite_vec_available", "status": "YES", "detail": ""},
