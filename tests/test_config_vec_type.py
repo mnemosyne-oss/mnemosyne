@@ -87,3 +87,25 @@ def test_vec_type_invalid_yaml_falls_back(tmp_path: Path):
         _vec_type_in_subprocess(tmp_path, {"MNEMOSYNE_DATA_DIR": str(data_dir)})
         == "float32"
     )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits cannot deny the owner on Windows")
+def test_vec_type_unreadable_data_dir_falls_back(tmp_path: Path):
+    """An unreadable data dir (e.g. root-owned volume) must not break import.
+
+    Path.exists() propagates EACCES for an unreachable config.yaml, which used
+    to crash the module import in the non-root container acceptance check.
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    data_dir.chmod(0)
+    try:
+        assert (
+            _vec_type_in_subprocess(
+                tmp_path,
+                {"MNEMOSYNE_DATA_DIR": str(data_dir), "MNEMOSYNE_VEC_TYPE": "bit"},
+            )
+            == "bit"
+        )
+    finally:
+        data_dir.chmod(0o700)

@@ -844,7 +844,13 @@ def peek(key: str, default: Any = None) -> Any:
     a read into a write.
     """
     path = _default_config_path()
-    if path.exists():
+    try:
+        # Path.exists() still propagates EACCES for an unreadable parent;
+        # read-only callers must not fail on a config they cannot reach.
+        has_file = path.exists()
+    except OSError:
+        has_file = False
+    if has_file:
         import yaml
 
         try:
