@@ -21,7 +21,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _vec_type_in_subprocess(tmp_path: Path, env: dict[str, str]) -> str:
+def _vec_type_in_subprocess(
+    tmp_path: Path,
+    env: dict[str, str],
+    code: str = "from mnemosyne.core.beam import VEC_TYPE; print(VEC_TYPE)",
+) -> str:
     environment = os.environ.copy()
     environment.pop("MNEMOSYNE_VEC_TYPE", None)
     environment.update(env)
@@ -30,7 +34,7 @@ def _vec_type_in_subprocess(tmp_path: Path, env: dict[str, str]) -> str:
         [str(ROOT), environment.get("PYTHONPATH", "")]
     )
     proc = subprocess.run(
-        [sys.executable, "-c", "from mnemosyne.core.beam import VEC_TYPE; print(VEC_TYPE)"],
+        [sys.executable, "-c", code],
         text=True,
         capture_output=True,
         env=environment,
@@ -109,3 +113,33 @@ def test_vec_type_unreadable_data_dir_falls_back(tmp_path: Path):
         )
     finally:
         data_dir.chmod(0o700)
+
+
+def test_vec_type_forced_oserror_falls_back(tmp_path: Path):
+    """Deterministically cover peek's OSError guard on every Python version.
+
+    The chmod-0 case above exercises a real permission denial, but on Python
+    >= 3.14 Path.exists() returns False for EACCES instead of raising, so the
+    except-branch is never hit there. Forcing the raise pins the handler's
+    contract: env fallback when set, the passed default otherwise.
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    code = """
+import os, pathlib
+_target = pathlib.Path(os.environ["MNEMOSYNE_DATA_DIR"]) / "config.yaml"
+_real_exists = pathlib.Path.exists
+def _deny_config(self):
+    if self == _target:
+        raise PermissionError(13, "Permission denied")
+    return _real_exists(self)
+pathlib.Path.exists = _deny_config
+from mnemosyne.core.beam import VEC_TYPE
+print(VEC_TYPE)
+"""
+    env = {"MNEMOSYNE_DATA_DIR": str(data_dir)}
+    assert (
+        _vec_type_in_subprocess(tmp_path, {**env, "MNEMOSYNE_VEC_TYPE": "bit"}, code=code)
+        == "bit"
+    )
+    assert _vec_type_in_subprocess(tmp_path, env, code=code) == "int8"
