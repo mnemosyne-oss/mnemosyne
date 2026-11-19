@@ -137,28 +137,35 @@ def test_vec_type_malformed_yaml_falls_back(tmp_path: Path):
     assert _vec_type_in_subprocess(tmp_path, env) == "int8"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits cannot deny the owner on Windows")
 def test_vec_type_unreadable_yaml_falls_back(tmp_path: Path):
     """A config.yaml that exists but cannot be read falls back the same way.
 
-    stat() needs execute permission on the parent, not read on the file, so
-    exists() succeeds and the read_text PermissionError is the path covered
-    here on every Python version.
+    Path.read_text is patched to raise PermissionError so the read-error path
+    is deterministic: chmod(0) is ignored under elevated credentials such as
+    CAP_DAC_OVERRIDE, which would let the file contents leak through. The file
+    deliberately holds a third value so a leaked read is distinguishable.
     """
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    config = data_dir / "config.yaml"
-    config.write_text("vec_type: bit\n")
-    config.chmod(0)
+    (data_dir / "config.yaml").write_text("vec_type: float32\n")
+    code = """
+import os, pathlib
+_target = pathlib.Path(os.environ["MNEMOSYNE_DATA_DIR"]) / "config.yaml"
+_real_read = pathlib.Path.read_text
+def _deny_read(self, *args, **kwargs):
+    if self == _target:
+        raise PermissionError(13, "Permission denied")
+    return _real_read(self, *args, **kwargs)
+pathlib.Path.read_text = _deny_read
+from mnemosyne.core.beam import VEC_TYPE
+print(VEC_TYPE)
+"""
     env = {"MNEMOSYNE_DATA_DIR": str(data_dir)}
-    try:
-        assert (
-            _vec_type_in_subprocess(tmp_path, {**env, "MNEMOSYNE_VEC_TYPE": "bit"})
-            == "bit"
-        )
-        assert _vec_type_in_subprocess(tmp_path, env) == "int8"
-    finally:
-        config.chmod(0o600)
+    assert (
+        _vec_type_in_subprocess(tmp_path, {**env, "MNEMOSYNE_VEC_TYPE": "bit"}, code=code)
+        == "bit"
+    )
+    assert _vec_type_in_subprocess(tmp_path, env, code=code) == "int8"
 
 
 def test_vec_type_env_still_applies_without_yaml(tmp_path: Path):
