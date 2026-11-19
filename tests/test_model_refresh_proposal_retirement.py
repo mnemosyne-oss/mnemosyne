@@ -483,20 +483,41 @@ def test_failed_terminal_write_rolls_back_canonical_value(tmp_path):
     assert model_refresh.reject_model_refresh_proposal(beam, proposal_id)["status"] == "rejected"
 
 
-def test_resolution_leaves_the_callers_transaction_open(tmp_path):
+@pytest.mark.parametrize("outcome", ["applied", "rejected"])
+@pytest.mark.parametrize("commit", [True, False], ids=["commit", "rollback"])
+def test_resolution_leaves_the_callers_transaction_open(tmp_path, monkeypatch, outcome, commit):
     import sqlite3
 
     beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
     proposal_id = _store_proposal(beam, "caller_transaction")
+    invalidations = []
+    monkeypatch.setattr(beam, "_invalidate_query_cache_after_commit", invalidations.append)
     beam.conn.execute("BEGIN IMMEDIATE")
     beam.conn.execute("UPDATE working_memory SET importance = 0 WHERE id = ?", (proposal_id,))
-    assert model_refresh.apply_model_refresh_proposal(beam, proposal_id)["status"] == "applied"
+    resolve = (
+        model_refresh.apply_model_refresh_proposal
+        if outcome == "applied"
+        else model_refresh.reject_model_refresh_proposal
+    )
+    assert resolve(beam, proposal_id)["status"] == outcome
     assert beam.conn.in_transaction
+    assert invalidations == []
     with sqlite3.connect(beam.db_path) as observer:
         assert observer.execute("SELECT count(*) FROM canonical_facts").fetchone()[0] == 0
-    beam.conn.rollback()
-    assert json.loads(_row(beam, proposal_id)["metadata_json"])["status"] == "pending"
-    assert beam.conn.execute("SELECT count(*) FROM canonical_facts").fetchone()[0] == 0
+
+    finish = beam.conn.commit if commit else beam.conn.rollback
+    finish()
+    assert invalidations == (["model_refresh"] if commit else [])
+    assert json.loads(_row(beam, proposal_id)["metadata_json"])["status"] == (
+        outcome if commit else "pending"
+    )
+    assert beam.conn.execute("SELECT count(*) FROM canonical_facts").fetchone()[0] == (
+        int(commit and outcome == "applied")
+    )
+    # Rolling back discards the hook instead of handing it to a later commit.
+    beam.conn.execute("BEGIN IMMEDIATE")
+    beam.conn.commit()
+    assert invalidations == (["model_refresh"] if commit else [])
 
 
 def test_rejected_proposal_does_not_fill_memoria_preference_limit(tmp_path):
@@ -539,3 +560,86 @@ def test_rejected_proposal_is_hidden_from_existing_preference_history(tmp_path):
     assert "weekly reporting" in result["context"]
     assert "compact charts" not in result["context"]
     assert result["facts"][0]["evolution"] is None
+
+
+@pytest.mark.parametrize(
+    ("ability", "query", "table", "columns", "retired_values", "eligible_values"),
+    [
+        ("IE", "what is the latency", "memoria_facts", "fact_type,key,value",
+         ("metric", "ms", "250"), ("metric", "ms", "80")),
+        ("TR", "what happened", "memoria_timelines", "date,description",
+         ("2026-06-03", "retired timeline"), ("2026-06-02", "eligible timeline")),
+        ("CR", "Reporting", "memoria_kg", "subject,predicate,object",
+         ("user", "negation", "Reporting retired"), ("user", "negation", "Reporting eligible")),
+        ("MR", "Reporting", "memoria_kg", "subject,predicate,object",
+         ("Reporting", "requires", "retired tool"), ("Reporting", "requires", "eligible tool")),
+        ("EO", "list sequence", "memoria_facts", "fact_type,value",
+         ("sequence", "retired step"), ("sequence", "eligible step")),
+        ("IF", "which reporting instruction", "memoria_instructions", "instruction,topic",
+         ("retired rule", "reporting"), ("eligible rule", "reporting")),
+        ("PF", "what do i prefer reporting", "memoria_preferences", "preference,topic",
+         ("retired preference", "reporting"), ("eligible preference", "reporting")),
+    ],
+)
+def test_memoria_specialists_filter_retired_sources_before_limit(
+    tmp_path, ability, query, table, columns, retired_values, eligible_values,
+):
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    proposal_id = _store_proposal(beam, "specialist")
+    statement = (
+        f"INSERT INTO {table} (session_id,message_idx,source_memory_id,{columns}) "
+        f"VALUES (?,?,?,{','.join('?' for _ in retired_values)})"
+    )
+    beam.conn.execute(statement, ("retire", 1, proposal_id, *retired_values))
+    beam.conn.execute(statement, ("retire", 2, None, *eligible_values))
+    beam.conn.commit()
+    value_index = 0 if ability in ("IF", "PF") else -1
+    retired_text = retired_values[value_index]
+    eligible_text = eligible_values[value_index]
+    pending = beam.memoria_retrieve(query, ability=ability, top_k=1)
+    assert retired_text in pending["context"]
+    model_refresh.reject_model_refresh_proposal(beam, proposal_id)
+    resolved = beam.memoria_retrieve(query, ability=ability, top_k=1)
+    assert eligible_text in resolved["context"]
+    assert retired_text not in resolved["context"]
+    assert retired_text not in str(resolved["facts"])
+
+
+def test_cross_session_preference_history_excludes_retired_source(tmp_path):
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    proposal_id = _store_proposal(beam, "cross_session")
+    beam.conn.executemany(
+        "INSERT INTO memoria_preferences (session_id,message_idx,preference,topic,source_memory_id) "
+        "VALUES (?,?,?,?,?)",
+        [
+            ("other", 1, "use compact charts", "reporting", proposal_id),
+            ("retire", 2, "use weekly summaries", "reporting", None),
+        ],
+    )
+    beam.conn.commit()
+    beam._deduplicate_memoria_cross_session()
+    query = "what do i prefer reporting"
+    assert "use compact charts" in beam.memoria_retrieve(query, ability="PF")["context"]
+    model_refresh.reject_model_refresh_proposal(beam, proposal_id)
+    assert "use compact charts" not in beam.memoria_retrieve(query, ability="PF")["context"]
+
+    beam.conn.execute("UPDATE memoria_preferences SET evolution = NULL")
+    beam.conn.commit()
+    beam._deduplicate_memoria_cross_session()
+    assert beam.conn.execute(
+        "SELECT evolution FROM memoria_preferences WHERE session_id = 'retire'"
+    ).fetchone()[0] is None
+
+
+
+def test_fact_history_omits_value_copied_from_retired_proposal(tmp_path):
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    retired = _store_proposal(beam, "fact_history")
+    beam._insert_fact("retire", 1, "metric", "ms", "250", "", 0.5, source_memory_id=retired)
+    beam._insert_fact("retire", 2, "metric", "ms", "80", "", 0.5)
+    beam.conn.commit()
+    model_refresh.reject_model_refresh_proposal(beam, retired)
+    result = beam.memoria_retrieve("what is the latency", ability="IE", top_k=1)
+    assert result["facts"][0]["value"] == "80"
+    assert result["facts"][0]["previous_value"] is None
+    assert "250" not in result["context"]

@@ -9508,7 +9508,7 @@ class BeamMemory:
                 if w.lower() not in _FACT_MATCH_STOPWORDS
             )[:30] or topic[:20]
             # Check for evolution: did this topic already have a preference?
-            eligible_preference = self._preference_source_is_eligible_sql("pref")
+            eligible_preference = self._memoria_source_is_eligible_sql("pref")
             existing = self.conn.execute(
                 "SELECT preference, topic FROM memoria_preferences pref "
                 "WHERE session_id = ? AND (topic LIKE ? OR preference LIKE ?) "
@@ -9617,6 +9617,14 @@ class BeamMemory:
     # ------------------------------------------------------------------
     # MEMORIA: Structured Fact Retrieval (Phase 2)
     # ------------------------------------------------------------------
+    def _memoria_source_is_eligible_sql(self, derived_alias: str) -> str:
+        """Exclude features derived from a retired working-memory proposal."""
+        eligibility = _proposal_recall_eligibility_sql(self.conn, "wm")
+        return (
+            "NOT EXISTS (SELECT 1 FROM working_memory wm "
+            f"WHERE wm.id = {derived_alias}.source_memory_id AND NOT {eligibility})"
+        )
+
     def _derived_source_is_alive(self, source_id: Optional[str]) -> bool:
         """True when a derived row's source memory still exists.
 
@@ -9755,13 +9763,24 @@ class BeamMemory:
         seen = set()
         cursor = self.conn
         q_lower = query.lower()
+        eligible = self._memoria_source_is_eligible_sql("derived")
+        eligible_history = self._memoria_source_is_eligible_sql("prior")
+        select = (
+            "SELECT fact_type, key, value, context_snippet, "
+            "CASE WHEN derived.previous_value IS NOT NULL AND EXISTS ("
+            "SELECT 1 FROM memoria_facts prior WHERE prior.session_id = derived.session_id "
+            "AND prior.key = derived.key AND prior.fact_type = derived.fact_type "
+            "AND prior.version_id = derived.version_id - 1 AND prior.value = derived.previous_value "
+            f"AND NOT {eligible_history}) THEN NULL ELSE derived.previous_value END, "
+            "updated_msg_idx, version_id, source_memory_id FROM memoria_facts derived"
+        )
 
         # -- Pass 1: Numbers in query → find matching fact values --
         numbers = _re.findall(r'\b(\d+)\b', query)
         for num in numbers[:3]:
             rows = cursor.execute(
-                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id FROM memoria_facts "
-                "WHERE value LIKE ? AND session_id = ? LIMIT ?",
+                f"{select} "
+                f"WHERE value LIKE ? AND session_id = ? AND {eligible} LIMIT ?",
                 (f'%{num}%', self.session_id, top_k)
             ).fetchall()
             for row in rows:
@@ -9779,8 +9798,8 @@ class BeamMemory:
         terms = [t for t in terms if t not in stop_words]
         for term in terms[:5]:
             rows = cursor.execute(
-                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id FROM memoria_facts "
-                "WHERE (key LIKE ? OR value LIKE ?) AND session_id = ? LIMIT ?",
+                f"{select} "
+                f"WHERE (key LIKE ? OR value LIKE ?) AND session_id = ? AND {eligible} LIMIT ?",
                 (f'%{term}%', f'%{term}%', self.session_id, top_k)
             ).fetchall()
             for row in rows:
@@ -9813,14 +9832,14 @@ class BeamMemory:
                     if unit_hints:
                         for unit in unit_hints:
                             rows = cursor.execute(
-                                "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id FROM memoria_facts "
-                                "WHERE fact_type = ? AND key LIKE ? AND session_id = ? LIMIT ?",
+                                f"{select} "
+                                f"WHERE fact_type = ? AND key LIKE ? AND session_id = ? AND {eligible} LIMIT ?",
                                 (ftype, f'%{unit}%', self.session_id, top_k)
                             ).fetchall()
                     else:
                         rows = cursor.execute(
-                            "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id FROM memoria_facts "
-                            "WHERE fact_type = ? AND session_id = ? LIMIT ?",
+                            f"{select} "
+                            f"WHERE fact_type = ? AND session_id = ? AND {eligible} LIMIT ?",
                             (ftype, self.session_id, top_k)
                         ).fetchall()
                     for row in rows:
@@ -9847,8 +9866,8 @@ class BeamMemory:
                        if w not in q_stop]
             for word in q_words[:5]:
                 rows = cursor.execute(
-                    "SELECT fact_type, key, value, context_snippet, previous_value, updated_msg_idx, version_id, source_memory_id FROM memoria_facts "
-                    "WHERE context_snippet LIKE ? AND session_id = ? LIMIT ?",
+                    f"{select} "
+                    f"WHERE context_snippet LIKE ? AND session_id = ? AND {eligible} LIMIT ?",
                     (f'%{word}%', self.session_id, top_k)
                 ).fetchall()
                 for row in rows:
@@ -9902,6 +9921,7 @@ class BeamMemory:
         """Query memoria_timelines for chronological events matching query terms."""
         import re as _re
         cursor = self.conn
+        eligible = self._memoria_source_is_eligible_sql("derived")
 
         # Extract dates from query
         date_terms = _re.findall(r'\b(\d{4}-\d{2}-\d{2})\b', query)
@@ -9911,22 +9931,22 @@ class BeamMemory:
 
         if date_terms:
             rows = cursor.execute(
-                "SELECT date, description, message_idx FROM memoria_timelines "
-                "WHERE date LIKE ? AND session_id = ? ORDER BY date LIMIT ?",
+                "SELECT date, description, message_idx FROM memoria_timelines derived "
+                f"WHERE date LIKE ? AND session_id = ? AND {eligible} ORDER BY date LIMIT ?",
                 (f'%{date_terms[0]}%', self.session_id, top_k)
             ).fetchall()
         elif months_in_query:
             month = months_in_query[0][:3]
             rows = cursor.execute(
-                "SELECT date, description, message_idx FROM memoria_timelines "
-                "WHERE date LIKE ? AND session_id = ? ORDER BY date LIMIT ?",
+                "SELECT date, description, message_idx FROM memoria_timelines derived "
+                f"WHERE date LIKE ? AND session_id = ? AND {eligible} ORDER BY date LIMIT ?",
                 (f'{month}%', self.session_id, top_k)
             ).fetchall()
         else:
             # Recent timeline events
             rows = cursor.execute(
-                "SELECT date, description, message_idx FROM memoria_timelines "
-                "WHERE session_id = ? ORDER BY date DESC LIMIT ?",
+                "SELECT date, description, message_idx FROM memoria_timelines derived "
+                f"WHERE session_id = ? AND {eligible} ORDER BY date DESC LIMIT ?",
                 (self.session_id, top_k)
             ).fetchall()
 
@@ -9940,6 +9960,7 @@ class BeamMemory:
         """Query memoria_kg for negation predicates matching query terms."""
         import re as _re
         cursor = self.conn
+        eligible = self._memoria_source_is_eligible_sql("derived")
 
         terms = _re.findall(r'\b[A-Z][a-z]+\b', query)
         stop_words = {'Have', 'Did', 'Do', 'Can', 'Will', 'Would', 'Should'}
@@ -9950,9 +9971,9 @@ class BeamMemory:
 
         for term in terms:
             rows = cursor.execute(
-                "SELECT subject, object, message_idx FROM memoria_kg "
+                "SELECT subject, object, message_idx FROM memoria_kg derived "
                 "WHERE predicate='negation' AND (subject LIKE ? OR object LIKE ?) "
-                "AND session_id = ? LIMIT ?",
+                f"AND session_id = ? AND {eligible} LIMIT ?",
                 (f'%{term}%', f'%{term}%', self.session_id, top_k)
             ).fetchall()
             if rows:
@@ -9966,6 +9987,7 @@ class BeamMemory:
         """Query memoria_kg for entity-action pairs (predicates: requires, decision)."""
         import re as _re
         cursor = self.conn
+        eligible = self._memoria_source_is_eligible_sql("derived")
 
         terms = _re.findall(r'\b[A-Z][a-z]+\b', query)
         stop_words = {'Have', 'Did', 'Do', 'Can', 'Will', 'Would', 'Should',
@@ -9976,8 +9998,8 @@ class BeamMemory:
         if entities:
             for entity in entities[:3]:
                 rows = cursor.execute(
-                    "SELECT subject, predicate, object, message_idx FROM memoria_kg "
-                    "WHERE (subject LIKE ? OR object LIKE ?) AND session_id = ? LIMIT ?",
+                    "SELECT subject, predicate, object, message_idx FROM memoria_kg derived "
+                    f"WHERE (subject LIKE ? OR object LIKE ?) AND session_id = ? AND {eligible} LIMIT ?",
                     (f'%{entity}%', f'%{entity}%', self.session_id, top_k)
                 ).fetchall()
                 if rows:
@@ -9985,8 +10007,8 @@ class BeamMemory:
 
         if not rows:
             rows = cursor.execute(
-                "SELECT subject, predicate, object, message_idx FROM memoria_kg "
-                "WHERE session_id = ? ORDER BY message_idx LIMIT ?",
+                "SELECT subject, predicate, object, message_idx FROM memoria_kg derived "
+                f"WHERE session_id = ? AND {eligible} ORDER BY message_idx LIMIT ?",
                 (self.session_id, top_k)
             ).fetchall()
 
@@ -9999,9 +10021,10 @@ class BeamMemory:
     def _memoria_chrono_retrieve(self, query: str, top_k: int = 10) -> dict:
         """Query memoria_facts for sequence markers, ordered by message_idx."""
         cursor = self.conn
+        eligible = self._memoria_source_is_eligible_sql("derived")
         rows = cursor.execute(
-            "SELECT value, message_idx FROM memoria_facts "
-            "WHERE fact_type='sequence' AND session_id = ? "
+            "SELECT value, message_idx FROM memoria_facts derived "
+            f"WHERE fact_type='sequence' AND session_id = ? AND {eligible} "
             "ORDER BY message_idx ASC LIMIT ?",
             (self.session_id, top_k)
         ).fetchall()
@@ -10015,6 +10038,7 @@ class BeamMemory:
         """Query memoria_instructions for user constraints matching query terms."""
         import re as _re
         cursor = self.conn
+        eligible = self._memoria_source_is_eligible_sql("derived")
         q_lower = query.lower()
 
         # Extract topic words from query
@@ -10032,8 +10056,8 @@ class BeamMemory:
         if q_words:
             for word in q_words[:5]:
                 rows = cursor.execute(
-                    "SELECT instruction, topic, message_idx, context_snippet FROM memoria_instructions "
-                    "WHERE (instruction LIKE ? OR topic LIKE ?) AND session_id = ? AND active = 1 LIMIT ?",
+                    "SELECT instruction, topic, message_idx, context_snippet FROM memoria_instructions derived "
+                    f"WHERE (instruction LIKE ? OR topic LIKE ?) AND session_id = ? AND {eligible} AND active = 1 LIMIT ?",
                     (f'%{word}%', f'%{word}%', self.session_id, top_k)
                 ).fetchall()
                 if rows:
@@ -10042,8 +10066,8 @@ class BeamMemory:
         if not rows:
             # Fallback: return all active instructions
             rows = cursor.execute(
-                "SELECT instruction, topic, message_idx, context_snippet FROM memoria_instructions "
-                "WHERE session_id = ? AND active = 1 ORDER BY message_idx DESC LIMIT ?",
+                "SELECT instruction, topic, message_idx, context_snippet FROM memoria_instructions derived "
+                f"WHERE session_id = ? AND {eligible} AND active = 1 ORDER BY message_idx DESC LIMIT ?",
                 (self.session_id, top_k)
             ).fetchall()
 
@@ -10052,14 +10076,6 @@ class BeamMemory:
             ctx_lines = [f"[Instruction] {r[0][:120]}" for r in rows]
             return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_instructions"}
         return {"context": "", "facts": [], "source": "fallback"}
-
-    def _preference_source_is_eligible_sql(self, preference_alias: str) -> str:
-        """Prevent retired working proposals from contributing a preference."""
-        eligibility = _proposal_recall_eligibility_sql(self.conn, "wm")
-        return (
-            "NOT EXISTS (SELECT 1 FROM working_memory wm "
-            f"WHERE wm.id = {preference_alias}.source_memory_id AND NOT {eligibility})"
-        )
 
     def _memoria_preference_retrieve(self, query: str, top_k: int = 10) -> dict:
         """Query memoria_preferences for evolving user tastes matching query terms."""
@@ -10077,15 +10093,16 @@ class BeamMemory:
         q_words = [w for w in _re.findall(r'\b[a-zA-Z]{3,}\b', q_lower)
                    if w not in stop_words]
 
-        eligible_preference = self._preference_source_is_eligible_sql("pref")
-        eligible_history = self._preference_source_is_eligible_sql("prior")
+        eligible_preference = self._memoria_source_is_eligible_sql("pref")
+        eligible_history = self._memoria_source_is_eligible_sql("prior")
         # Older evolution strings copied the previous preference without its
         # source ID. Hide a matching retired value while keeping the newer row.
         select = (
             "SELECT preference, topic, message_idx, "
             "CASE WHEN pref.evolution IS NOT NULL AND EXISTS ("
             "SELECT 1 FROM memoria_preferences prior "
-            "WHERE prior.session_id = pref.session_id AND prior.message_idx <= pref.message_idx "
+            "WHERE ((prior.session_id = pref.session_id AND prior.message_idx <= pref.message_idx) "
+            "OR (prior.topic = pref.topic AND prior.message_idx < pref.message_idx)) "
             "AND pref.evolution = 'was: ' || substr(prior.preference, 1, 120) "
             f"AND NOT {eligible_history}) THEN NULL ELSE pref.evolution END, "
             "context_snippet, source_memory_id FROM memoria_preferences pref"
@@ -14093,13 +14110,17 @@ class BeamMemory:
                         # Proposal rows are review artifacts from this sleep pass,
                         # not fresh raw memories that should recursively trigger
                         # another sleep loop.
-                        cursor.execute(
-                            "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = NULL WHERE id = ?",
-                            (proposal_ts, proposal_id),
-                        )
-                        if model_refresh.maybe_auto_apply_model_refresh_proposal(self, proposal_id, owner_id=model_refresh_owner_id):
-                            model_refresh_applied += 1
-                    self.conn.commit()
+                        # Finish this write before the next remember() can
+                        # call the embedding provider with the writer locked.
+                        with _write_locked_transaction(self.conn):
+                            cursor.execute(
+                                "UPDATE working_memory SET consolidated_at = ?, consolidation_claimed_at = NULL WHERE id = ?",
+                                (proposal_ts, proposal_id),
+                            )
+                            if model_refresh.maybe_auto_apply_model_refresh_proposal(
+                                self, proposal_id, owner_id=model_refresh_owner_id,
+                            ):
+                                model_refresh_applied += 1
                 for _chunk in _recall_id_batches(self.conn, ids, 1):
                     group_placeholders = ",".join("?" * len(_chunk))
                     cursor.execute(
@@ -14876,11 +14897,12 @@ class BeamMemory:
         """)
         dup_prefs = cursor.fetchall()
         merged_evo = 0
+        eligible_prior = self._memoria_source_is_eligible_sql("prior")
         for topic, cnt, latest_idx in dup_prefs:
-            # Get previous preference to set as evolution
-            prev = cursor.execute("""
-                SELECT preference FROM memoria_preferences
-                WHERE topic = ? AND message_idx < ?
+            # Get the latest eligible previous preference, across sessions.
+            prev = cursor.execute(f"""
+                SELECT preference FROM memoria_preferences prior
+                WHERE topic = ? AND message_idx < ? AND {eligible_prior}
                 ORDER BY message_idx DESC LIMIT 1
             """, (topic, latest_idx)).fetchone()
             if prev:

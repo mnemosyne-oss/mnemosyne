@@ -10,10 +10,11 @@ relevant.
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 from mnemosyne.core.beam import BeamMemory
 from mnemosyne.core.canonical import CanonicalStore
@@ -233,3 +234,42 @@ def test_model_refresh_tool_is_diagnostic_only(tmp_path):
 
     response = json.loads(provider.handle_tool_call("mnemosyne_model_refresh", {"action": "apply", "proposal_id": "x"}))
     assert "diagnostic-only" in response["error"]
+
+
+@pytest.mark.parametrize("auto_apply", [True, False])
+def test_sleep_releases_writer_before_remembering_next_proposal(tmp_path, monkeypatch, auto_apply):
+    db_path = tmp_path / "proposals.db"
+    beam = BeamMemory(session_id="stress", db_path=db_path)
+    _old_rows(db_path, [("evidence-a", "Durable workflow."), ("evidence-b", "Durable workflow twice.")])
+    proposals = [
+        {
+            "category": "model:workflow", "name": name, "body": f"Durable workflow for {name}.",
+            "confidence": 0.99, "evidence_ids": ["evidence-a", "evidence-b"],
+            "action": "update", "reason": "Repeated preference.",
+        }
+        for name in ("planning", "reporting")
+    ]
+    monkeypatch.setattr(model_refresh, "infer_model_update_proposals", lambda items: proposals)
+    monkeypatch.setattr(model_refresh, "auto_apply_enabled", lambda: auto_apply)
+
+    real_remember = beam.remember
+    writer_available = []
+
+    def remember(content, **kwargs):
+        if kwargs.get("source") == model_refresh.PROPOSAL_SOURCE:
+            with sqlite3.connect(db_path, timeout=0) as observer:
+                try:
+                    observer.execute("BEGIN IMMEDIATE")
+                except sqlite3.OperationalError as exc:
+                    assert "locked" in str(exc)
+                    writer_available.append(False)
+                else:
+                    observer.rollback()
+                    writer_available.append(True)
+        return real_remember(content, **kwargs)
+
+    monkeypatch.setattr(beam, "remember", remember)
+    result = beam.sleep()
+    assert result["model_refresh"]["proposals"] == 2
+    assert result["model_refresh"]["applied"] == (2 if auto_apply else 0)
+    assert writer_available == [True, True]
