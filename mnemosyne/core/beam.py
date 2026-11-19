@@ -28,7 +28,7 @@ import operator
 from dataclasses import dataclass, field
 
 from mnemosyne.core._connection_gc import collect_connection_cycles
-from mnemosyne.core.config import resolve_beam_runtime
+from mnemosyne.core.config import resolve_beam_runtime, peek
 from mnemosyne.core.filters import _SYSTEM_DERIVED_WRITE_CAPABILITY
 from mnemosyne.core.journal import journal_mode
 from mnemosyne.core.recall_provenance import append_recall_provenance
@@ -1341,8 +1341,10 @@ def _episodic_recall_where(
     return " AND ".join(clauses), params
 
 
-# Vector compression: float32 | int8 | bit
-VEC_TYPE = os.environ.get("MNEMOSYNE_VEC_TYPE", "int8").lower()
+# Vector compression: float32 | int8 | bit. Resolved through the config
+# layer (config.yaml > env > default) rather than the env var alone, and
+# peek() so the import-time read never seeds config.yaml (#1378).
+VEC_TYPE = str(peek("vec_type", "int8")).lower()
 if VEC_TYPE not in ("float32", "int8", "bit"):
     VEC_TYPE = "float32"
 
