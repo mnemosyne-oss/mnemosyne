@@ -40,6 +40,12 @@ from mnemosyne.core.filters import (
 
 logger = logging.getLogger(__name__)
 
+DELETE_OVERRIDE_ERROR = (
+    "Explicit delete override includes candidates not suggested for deletion; "
+    "review the audit and use --force (CLI), force=True (Python core), "
+    "or force=true (MCP) to override deliberately."
+)
+
 # ---------------------------------------------------------------------------
 # Schema: hygiene_audit_log table
 # ---------------------------------------------------------------------------
@@ -724,12 +730,25 @@ def hygiene_status(
 # Cleanup
 # ---------------------------------------------------------------------------
 
+def validate_delete_override(candidates: List[NoiseCandidate], action: str, force: bool) -> Optional[str]:
+    """Validate the explicit delete override before opening or mutating a bank."""
+    if type(force) is not bool:
+        return "force must be a boolean"
+    if action == "delete" and not force and any(
+        c.suggested_action != "delete" for c in candidates
+    ):
+        return DELETE_OVERRIDE_ERROR
+    return None
+
+
 def clean_noise(
     db_path: Path,
     candidates: List[NoiseCandidate],
     action: str = "archive",
     confirm: bool = False,
     dry_run: bool = True,
+    *,
+    force: bool = False,
 ) -> CleanResult:
     """Process noise candidates and apply cleanup actions.
 
@@ -737,11 +756,13 @@ def clean_noise(
         db_path: Path to the mnemosyne SQLite database.
         candidates: Candidates from ``audit_noise()``.
         action: Override action for all candidates: ``delete``, ``archive``,
-            ``flag``, or ``keep``.  If empty, uses each candidate's
+            ``flag``, or ``keep``. If ``keep``, uses each candidate's
             ``suggested_action``.
         confirm: Must be True for any destructive action.  If False,
             only dry-run analysis is performed.
         dry_run: If True, no changes are made; returns what *would* happen.
+        force: Literal True permits an explicit delete override of candidates
+            not suggested for deletion. Does not replace confirmation.
 
     Returns:
         ``CleanResult`` with counts and any errors. Applied archives of rows
@@ -749,6 +770,11 @@ def clean_noise(
         Dry-run counts remain candidate-based (no current-row inspection).
     """
     result = CleanResult()
+
+    override_error = validate_delete_override(candidates, action, force)
+    if override_error:
+        result.errors.append(override_error)
+        return result
 
     if dry_run:
         for c in candidates:

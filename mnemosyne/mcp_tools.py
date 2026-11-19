@@ -42,9 +42,12 @@ from mnemosyne.core.beam import (
 from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
 from mnemosyne.batch_tool import (
     BatchValidationError,
+    BatchPreviewTarget,
     apply_beam_batch,
     batch_validation_error_payload,
     dry_run_batch,
+    snapshot_preview_batch,
+    preview_unavailable,
     validate_batch_operations,
 )
 
@@ -357,7 +360,35 @@ def _handle_batch(arguments: Dict[str, Any]) -> Dict[str, Any]:
         return batch_validation_error_payload(exc)
 
     if bool(arguments.get("dry_run", False)):
-        return dry_run_batch(normalized)
+        from mnemosyne.core.banks import get_bank_db_path_read_only
+        from mnemosyne.runtime_context import get_request_token_name
+
+        try:
+            bank = _resolve_bank(arguments)
+            token = get_request_token_name()
+            if token and arguments.get("author_id") and arguments["author_id"] != token:
+                return preview_unavailable()
+            path = get_bank_db_path_read_only(bank)
+            if not path.is_file():
+                return preview_unavailable()
+            # Conservatively reject WAL stores already missing sidecars. This
+            # preflight is not a lifetime lock: a concurrent last-connection
+            # close can remove them, and SQLite may recreate reader coordination
+            # at the read-only open. Database/user-data writes remain prohibited.
+            with path.open("rb") as file:
+                header = file.read(20)
+            if header[18:20] == b"\x02\x02":
+                if not all(Path(str(path) + suffix).is_file() for suffix in ("-wal", "-shm")):
+                    return preview_unavailable()
+            conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+            try:
+                return snapshot_preview_batch(normalized, target=BatchPreviewTarget(
+                    conn, f"mcp_{bank}", adapter="wrapper",
+                ))
+            finally:
+                conn.close()
+        except (OSError, ValueError, sqlite3.Error):
+            return preview_unavailable()
 
     bank = _resolve_bank(arguments)
     mem = _create_instance(
@@ -1139,6 +1170,7 @@ def _handle_diagnose(arguments: Dict[str, Any]) -> Dict[str, Any]:
         repair_vec_working=bool(arguments.get("repair_vec_working", False)),
         dry_run=bool(arguments.get("dry_run", False)),
         bank=bank,
+        scope="mcp_server",
     )
     db_path = None
     try:
@@ -1254,7 +1286,14 @@ def _handle_hygiene_audit(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_hygiene_clean tool call."""
-    from mnemosyne.core.hygiene import NoiseCandidate, clean_noise, validate_hygiene_candidate
+    from mnemosyne.core.hygiene import NoiseCandidate, clean_noise, validate_delete_override, validate_hygiene_candidate
+
+    force = arguments.get("force", False)
+    if type(force) is not bool:
+        return {"error": "force must be a boolean"}
+    confirm = arguments.get("confirm", False)
+    if type(confirm) is not bool:
+        return {"error": "confirm must be a boolean"}
 
     candidates_json = arguments.get("candidates_json", "[]")
     try:
@@ -1287,12 +1326,14 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
             )
         )
 
+    action = arguments.get("action", "keep")
+    override_error = validate_delete_override(candidates, action, force)
+    if override_error:
+        return {"error": override_error}
+
     bank = _resolve_bank(arguments)
     mem = _create_instance(bank=bank)
     db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
-
-    action = arguments.get("action", "keep")
-    confirm = arguments.get("confirm", False)
     dry_run = not confirm
 
     result = clean_noise(
@@ -1301,9 +1342,10 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
         action=action,
         confirm=confirm,
         dry_run=dry_run,
+        force=force,
     )
     return {
-        "status": "dry_run" if dry_run else "applied",
+        "status": "failed" if result.errors else ("dry_run" if dry_run else "applied"),
         "result": result.to_dict(),
         "bank": bank,
     }

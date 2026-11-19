@@ -12,7 +12,6 @@ Strategies (4 voices):
 Deterministic re-ranker:
 - Combines 4 scores with learned weights
 - No neural network (rule-based weighting)
-- Budget-aware context assembly
 - Diversity penalty (avoid duplicates)
 
 Building on:
@@ -152,7 +151,9 @@ class PolyphonicRecallEngine:
             query: Text query
             query_embedding: Optional pre-computed embedding
             top_k: Number of results to return
-            context_budget: Max tokens for context assembly
+            context_budget: Ignored. It used to trim results by metadata
+                size, which could leave fewer than top_k. It stays in the
+                signature so existing callers keep working.
             default_dense_source_filter: When True (default), the vector
                 voice's working-memory tier applies the default dense-source
                 predicate (exclude raw dialog / honcho sources and
@@ -194,7 +195,13 @@ class PolyphonicRecallEngine:
                     excluded = resolve_exclusions(conn, exclude_captures)
                 finally:
                     conn.close()
-        graph_results = self._graph_voice(query)
+        # Each voice must be able to supply a full top_k on its own; a fixed
+        # per-voice cap silently short-changes callers asking for more.
+        voice_limit = max(20, top_k)
+        graph_results = (
+            self._graph_voice(query) if scope_where is None else
+            self._graph_voice(query, scope_where=scope_where, scope_params=scope_params)
+        )
         fact_results = self._fact_voice(query)
         if excluded:
             # These voices carry no producing-tier evidence. An ambiguous
@@ -208,6 +215,7 @@ class PolyphonicRecallEngine:
             topic=topic,
             episodic_where=episodic_where,
             episodic_params=episodic_params,
+            limit=voice_limit,
             scope_where=scope_where,
             scope_params=scope_params,
             **({"excluded_wm_ids": excluded} if excluded else {}),
@@ -220,7 +228,7 @@ class PolyphonicRecallEngine:
                     and result.metadata.get("embedding_tier") == "episodic"):
                 result.metadata["_self_echo_tier"] = "episodic"
         temporal_results = self._temporal_voice(
-            query, scope_where=scope_where, scope_params=scope_params,
+            query, scope_where=scope_where, scope_params=scope_params, limit=voice_limit,
             **({"excluded_wm_ids": excluded} if excluded else {})
         )
         combined = self._combine_voices(
@@ -232,12 +240,7 @@ class PolyphonicRecallEngine:
         self._hydrate_result_content(combined)
 
         # Diversity re-rank
-        reranked = self._diversity_rerank(combined, top_k)
-
-        # Assemble context within budget
-        context = self._assemble_context(reranked, context_budget)
-        
-        return context
+        return self._diversity_rerank(combined, top_k)
 
     def _legacy_episodic_vector_voice(
         self,
@@ -248,8 +251,9 @@ class PolyphonicRecallEngine:
         topic=None,
         episodic_where=None,
         episodic_params=(),
+        limit=20,
     ):
-        """Scan eligible vec rows, retaining only their top-20 hits."""
+        """Scan eligible vec rows, retaining only their top-``limit`` hits."""
         import heapq
         from mnemosyne.core.beam import (
             EM_VEC_ADMIT,
@@ -323,7 +327,7 @@ class PolyphonicRecallEngine:
                     },
                 )
 
-        return heapq.nlargest(20, candidates(), key=lambda result: result.score)
+        return heapq.nlargest(limit, candidates(), key=lambda result: result.score)
 
     def _vector_voice(
         self,
@@ -334,6 +338,7 @@ class PolyphonicRecallEngine:
         episodic_where: Optional[str] = None,
         episodic_params: Sequence[Any] = (),
         excluded_wm_ids: Optional[Set[str]] = None,
+        limit: int = 20,
         scope_where: Optional[str] = None,
         scope_params: Sequence[Any] = (),
     ) -> List[RecallResult]:
@@ -371,7 +376,7 @@ class PolyphonicRecallEngine:
         Dedups across WM/EM by `memory_id` keeping the
         higher-similarity occurrence -- without this, a memory that
         exists in both tiers post-E3 would be double-counted in RRF
-        and silently cap unique candidates below `top_k=20`.
+        and silently cap unique candidates below `limit`.
 
         A/B toggle: `MNEMOSYNE_VOICE_VECTOR=0` disables this voice for
         ablation experiments. Returns empty so RRF fusion sees no
@@ -472,6 +477,7 @@ class PolyphonicRecallEngine:
                             topic=topic,
                             episodic_where=episodic_where,
                             episodic_params=episodic_params,
+                            limit=limit,
                         )
                         by_id.update((r.memory_id, r) for r in legacy_results)
                         # A successful vec scan is authoritative even when
@@ -624,6 +630,7 @@ class PolyphonicRecallEngine:
                                     topic=topic,
                                     episodic_where=episodic_where,
                                     episodic_params=episodic_params,
+                                    limit=limit,
                                 )
                                 by_id.update(
                                     (r.memory_id, r) for r in exact_results
@@ -760,7 +767,10 @@ class PolyphonicRecallEngine:
                     " AND wm.consolidated_at IS NULL"
                 )
             echo_clause, echo_params = exclusion_sql(excluded_wm_ids, "wm.id")
-            wm_dense_predicate += echo_clause
+            from mnemosyne.core.beam import _working_recall_eligibility_sql
+
+            retirement = _working_recall_eligibility_sql(conn, alias="wm", exclude_superseded=False)
+            wm_dense_predicate += f" AND {retirement}" + echo_clause
             wm_dense_params.extend(echo_params)
             if scope_where is not None:
                 wm_dense_predicate += f" AND {scope_where}"
@@ -821,12 +831,13 @@ class PolyphonicRecallEngine:
             # WM tier always uses numpy cosine today (no sqlite-vec
             # WM index exists), so WM is never a degraded path here.
             self.last_call_fallback["em"] = not em_consumed_via_vec_episodes
-            return results[:20]
+            return results[:limit]
         finally:
             if own_conn:
                 conn.close()
     
-    def _graph_voice(self, query: str) -> List[RecallResult]:
+    def _graph_voice(self, query: str, scope_where: Optional[str] = None,
+                     scope_params: Sequence[Any] = ()) -> List[RecallResult]:
         """
         Voice 2: Episodic graph traversal.
 
@@ -874,21 +885,37 @@ class PolyphonicRecallEngine:
                     metadata={"entity": entity, "fact": f"{fact.subject} {fact.predicate} {fact.object}"}
                 ))
 
+        # Pruned seeds cannot become output rows through another seed's walk.
+        seed_exclusion_ids = set(seed_ids)
+        if scope_where is not None and seed_ids:
+            # Gists/facts have no shared scope column. Resolve their derived
+            # memory IDs against both backing tiers before they can influence
+            # traversal or fusion. Visibility and active validity must hold
+            # on the same backing row; two ineligible tier copies cannot
+            # supply one half each. Unscoped standalone calls are unchanged.
+            eligible = {mid: PolyphonicResult(mid, 0.0, {}, {}) for mid in seed_ids}
+            self._drop_out_of_scope(eligible, scope_where, scope_params, require_active=True)
+            seed_ids = {mid: None for mid in seed_ids if mid in eligible}
+            results = [result for result in results if result.memory_id in seed_ids]
+
         # Graph traversal: from seed memory IDs, walk edges to
         # discover indirectly related memories (ctx edges only,
         # moderate weight threshold to avoid noise).
-        traversed_ids = set()
+        traversed = {}
         for seed_id in seed_ids:
             related = self.graph.find_related_memories(
                 seed_id, depth=2, edge_type="ctx", min_weight=0.3
             )
             for rel in related:
                 mid = rel["memory_id"]
-                if mid not in traversed_ids and mid not in seed_ids:
-                    traversed_ids.add(mid)
-                    results.append(RecallResult(
+                if mid in seed_exclusion_ids:
+                    continue
+                score = 0.4 / rel["depth"]  # Score decays with hop distance
+                previous = traversed.get(mid)
+                if previous is None or score > previous.score:
+                    traversed[mid] = RecallResult(
                         memory_id=mid,
-                        score=0.4 / rel["depth"],  # Score decays with hop distance
+                        score=score,
                         voice="graph_traversal",
                         metadata={
                             "seed": seed_id,
@@ -896,8 +923,9 @@ class PolyphonicRecallEngine:
                             "depth": rel["depth"],
                             "weight": rel["weight"],
                         }
-                    ))
+                    )
 
+        results.extend(traversed.values())
         return results
     
     def _fact_voice(self, query: str) -> List[RecallResult]:
@@ -951,7 +979,8 @@ class PolyphonicRecallEngine:
     
     def _temporal_voice(self, query: str, excluded_wm_ids=None,
                         scope_where: Optional[str] = None,
-                        scope_params: Sequence[Any] = ()) -> List[RecallResult]:
+                        scope_params: Sequence[Any] = (),
+                        limit: int = 20) -> List[RecallResult]:
         """
         Voice 4: Time-aware scoring.
 
@@ -1019,13 +1048,16 @@ class PolyphonicRecallEngine:
             if scope_where is not None:
                 echo_clause += f" AND {scope_where}"
                 echo_params = [*echo_params, *scope_params]
+            from mnemosyne.core.beam import _working_recall_eligibility_sql
+
+            retirement = _working_recall_eligibility_sql(conn, exclude_superseded=False)
             cursor.execute(f"""
                 SELECT id, content, timestamp, importance
                 FROM working_memory
-                WHERE julianday(timestamp) > julianday(?) {echo_clause}
+                WHERE julianday(timestamp) > julianday(?) AND {retirement} {echo_clause}
                 ORDER BY julianday(timestamp) DESC
-                LIMIT 20
-            """, (week_ago, *echo_params))
+                LIMIT ?
+            """, (week_ago, *echo_params, limit))
 
             results = []
             for row in cursor.fetchall():
@@ -1037,7 +1069,11 @@ class PolyphonicRecallEngine:
                 # as if it were `offset` hours older than it is, and the ranking is off by
                 # exactly the host offset. #1094.
                 try:
-                    row_dt = datetime.fromisoformat(row["timestamp"])
+                    stamp = row["timestamp"]
+                    # Python 3.10 does not accept the ISO UTC Z suffix.
+                    if isinstance(stamp, str) and stamp.endswith("Z"):
+                        stamp = stamp[:-1] + "+00:00"
+                    row_dt = datetime.fromisoformat(stamp)
                 except (TypeError, ValueError):
                     continue
                 if row_dt.tzinfo is not None:
@@ -1066,7 +1102,8 @@ class PolyphonicRecallEngine:
         return list(dict.fromkeys(entities))
     
     def _drop_out_of_scope(self, results: Dict[str, PolyphonicResult],
-                           scope_where: str, scope_params: Sequence[Any]) -> None:
+                           scope_where: str, scope_params: Sequence[Any], *,
+                           require_active: bool = False) -> None:
         """Remove memories outside the caller's scope before the fused cut.
 
         Graph and fact hits come from stores with no session column, so they
@@ -1074,6 +1111,9 @@ class PolyphonicRecallEngine:
         any tier holding it is in scope. Ids with no memory row in either tier
         (consolidated facts, gists) are removed too: BeamMemory can only
         resolve memory rows, so they would hold a slot and then be discarded.
+        Graph seeds additionally require an unsuperseded, unexpired backing
+        row in that same scope. Minimal standalone schemas without validity
+        columns retain their existing visibility-only behavior.
         """
         if not results:
             return
@@ -1089,6 +1129,7 @@ class PolyphonicRecallEngine:
         try:
             memory_ids = tuple(results)
             in_scope, out_of_scope = set(), set()
+            now_iso = datetime.now(timezone.utc).isoformat()
             for table in ("working_memory", "episodic_memory"):
                 # A standalone engine may point at a store without one of the
                 # tiers; any other failure must surface, or foreign rows would
@@ -1097,14 +1138,28 @@ class PolyphonicRecallEngine:
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
                 ).fetchone() is None:
                     continue
+                visible = f"({scope_where})"
+                visible_params = list(scope_params)
+                if table == "working_memory":
+                    from mnemosyne.core.beam import _working_recall_eligibility_sql
+
+                    retirement = _working_recall_eligibility_sql(conn, exclude_superseded=False)
+                    visible += f" AND {retirement}"
+                if require_active:
+                    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                    if "superseded_by" in columns:
+                        visible += " AND superseded_by IS NULL"
+                    if "valid_until" in columns:
+                        visible += " AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))"
+                        visible_params.append(now_iso)
                 # Chunked under SQLite's bound-variable limit, as the vec scans do.
                 for offset in range(0, len(memory_ids), 900):
                     chunk = memory_ids[offset : offset + 900]
                     placeholders = ", ".join("?" for _ in chunk)
                     rows = conn.execute(
-                        f"SELECT id, ({scope_where}) AS visible FROM {table} "
+                        f"SELECT id, ({visible}) AS visible FROM {table} "
                         f"WHERE id IN ({placeholders})",
-                        (*scope_params, *chunk),
+                        (*visible_params, *chunk),
                     ).fetchall()
                     for row in rows:
                         (in_scope if row["visible"] else out_of_scope).add(row["id"])
@@ -1129,21 +1184,24 @@ class PolyphonicRecallEngine:
 
         try:
             memory_ids = tuple(results)
-            placeholders = ", ".join("?" for _ in memory_ids)
             for table in ("working_memory", "episodic_memory"):
-                try:
-                    rows = conn.execute(
-                        f"SELECT id, content FROM {table} WHERE id IN ({placeholders})",
-                        memory_ids,
-                    ).fetchall()
-                except sqlite3.OperationalError:
-                    continue
-                for row in rows:
-                    result = results.get(row["id"])
-                    tier = "working" if table == "working_memory" else "episodic"
-                    if (result is not None and not result.content
-                            and result.metadata.get("_self_echo_tier", tier) == tier):
-                        result.content = row["content"] or ""
+                tier = "working" if table == "working_memory" else "episodic"
+                # Chunked under SQLite's bound-variable limit, as the vec scans do.
+                for offset in range(0, len(memory_ids), 900):
+                    chunk = memory_ids[offset : offset + 900]
+                    placeholders = ", ".join("?" for _ in chunk)
+                    try:
+                        rows = conn.execute(
+                            f"SELECT id, content FROM {table} WHERE id IN ({placeholders})",
+                            chunk,
+                        ).fetchall()
+                    except sqlite3.OperationalError:
+                        break
+                    for row in rows:
+                        result = results.get(row["id"])
+                        if (result is not None and not result.content
+                                and result.metadata.get("_self_echo_tier", tier) == tier):
+                            result.content = row["content"] or ""
         finally:
             if own_conn:
                 conn.close()
@@ -1206,20 +1264,29 @@ class PolyphonicRecallEngine:
         )
         
         selected = []
+        # Word sets are built once per selected result: rebuilding them for
+        # every pair made this loop dominate recall at large top_k.
+        selected_words = []
         for result in sorted_results:
             if len(selected) >= top_k:
                 break
             
             # Check diversity against selected
+            words = self._content_words(result)
             is_diverse = True
-            for sel in selected:
-                similarity = self._estimate_similarity(result, sel)
-                if similarity > 0.8:  # Too similar
+            for sel_words in selected_words:
+                # Jaccard can never exceed min/max of the set sizes, and float
+                # division is monotone, so this skip cannot change a verdict.
+                small, large = sorted((len(words), len(sel_words)))
+                if not small or small / large <= 0.8:
+                    continue
+                if self._jaccard(words, sel_words) > 0.8:  # Too similar
                     is_diverse = False
                     break
             
             if is_diverse:
                 selected.append(result)
+                selected_words.append(words)
         
         return selected
     
@@ -1231,40 +1298,18 @@ class PolyphonicRecallEngine:
         dominates the candidate set, causing MMR diversity reranking to
         discard all but one result (#389).
         """
-        content_a = (a.content or a.metadata.get("content") or "").lower().split()
-        content_b = (b.content or b.metadata.get("content") or "").lower().split()
+        return self._jaccard(self._content_words(a), self._content_words(b))
 
-        if not content_a or not content_b:
+    @staticmethod
+    def _content_words(result: PolyphonicResult) -> Set[str]:
+        return set((result.content or result.metadata.get("content") or "").lower().split())
+
+    @staticmethod
+    def _jaccard(set_a: Set[str], set_b: Set[str]) -> float:
+        if not set_a or not set_b:
             return 0.0
-
-        set_a = set(content_a)
-        set_b = set(content_b)
-        intersection = set_a & set_b
-        union = set_a | set_b
-
-        return len(intersection) / len(union) if union else 0.0
-    
-    def _assemble_context(self, results: List[PolyphonicResult],
-                         budget: int) -> List[PolyphonicResult]:
-        """
-        Assemble context within token budget.
-        
-        Approximate 4 chars per token.
-        """
-        current_chars = 0
-        selected = []
-        
-        for result in results:
-            # Estimate result size
-            result_chars = len(str(result.metadata)) + 100
-            
-            if current_chars + result_chars > budget * 4:
-                break
-            
-            selected.append(result)
-            current_chars += result_chars
-        
-        return selected
+        shared = len(set_a & set_b)
+        return shared / (len(set_a) + len(set_b) - shared)
     
     def get_stats(self) -> Dict:
         """Get engine statistics."""

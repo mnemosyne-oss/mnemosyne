@@ -1,23 +1,18 @@
 """Resolved model-refresh proposals must stop being recall candidates.
 
-Sleep writes every model-refresh proposal as a ``working_memory`` row with
-``source='sleep_model_refresh_proposal'`` and sets ``consolidated_at``
-immediately, so consolidation never retires it. The resolution paths only
-flipped ``metadata["status"]``; ``superseded_by`` stayed NULL, and recall
-selects on ``superseded_by IS NULL``. The result: every applied or rejected
-proposal was recalled forever -- on a real bank 998 of 6,493 working rows
-(15%) were resolved proposals still competing for recall slots.
-
-These tests pin the whole contract: a resolved proposal is retired from
-recall while the row survives for audit, the FTS candidate budget no longer
-counts retired rows, a pending proposal in the same bank stays visible (the
-negative control that keeps the assertions from passing vacuously), and a
-resolved proposal keeps its outcome when a second resolution is attempted.
+Sleep stores proposals in working memory for audit. Resolved proposals
+retain their metadata status and any real supersession edges. Pending rows
+must remain eligible even when resolved rows would fill the candidate pool.
 """
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
 
 from mnemosyne.core.beam import (
     BeamMemory,
@@ -95,7 +90,7 @@ class TestResolvedProposalRetirement:
 
         model_refresh.apply_model_refresh_proposal(beam, proposal_id)
 
-        assert _row(beam, proposal_id)["superseded_by"] == "model_refresh:applied"
+        assert _row(beam, proposal_id)["superseded_by"] is None
         assert proposal_id not in _recalled_ids(beam, "applied")
 
     def test_rejected_proposal_is_retired_from_recall(self, tmp_path):
@@ -106,8 +101,37 @@ class TestResolvedProposalRetirement:
 
         model_refresh.reject_model_refresh_proposal(beam, proposal_id, reason="stale")
 
-        assert _row(beam, proposal_id)["superseded_by"] == "model_refresh:rejected"
+        assert _row(beam, proposal_id)["superseded_by"] is None
         assert proposal_id not in _recalled_ids(beam, "rejected")
+
+    def test_resolving_proposals_preserves_a5_typed_edges(self, tmp_path):
+        db_path = tmp_path / "mnemo.db"
+        beam = BeamMemory(session_id="retire", db_path=db_path)
+        historical = beam.remember("Historical control")
+        replacement = beam.remember("Replacement control")
+        beam.conn.execute(
+            "UPDATE working_memory SET superseded_by = ? WHERE id = ?",
+            (replacement, historical),
+        )
+        beam.conn.commit()
+
+        applied = _store_proposal(beam, "a5_applied")
+        rejected = _store_proposal(beam, "a5_rejected")
+        beam.conn.execute(
+            "UPDATE working_memory SET superseded_by = ? WHERE id = ?",
+            (replacement, rejected),
+        )
+        beam.conn.commit()
+        model_refresh.apply_model_refresh_proposal(beam, applied)
+        model_refresh.reject_model_refresh_proposal(beam, rejected)
+        assert _row(beam, rejected)["superseded_by"] == replacement
+
+        gate = Path(__file__).with_name("canon_sign_head_test.py")
+        report = subprocess.run(
+            [sys.executable, str(gate), str(db_path)], capture_output=True, text=True,
+        )
+        a5 = next(line for line in report.stdout.splitlines() if line.startswith("ARM A5 "))
+        assert a5.startswith("ARM A5 GREEN :: 2 typed edges checked"), a5
 
     def test_row_and_metadata_are_kept_verbatim_for_audit(self, tmp_path):
         beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
@@ -143,7 +167,7 @@ class TestResolvedProposalRetirement:
 
         model_refresh.reject_model_refresh_proposal(beam, first, reason="stale")
 
-        assert _row(beam, first)["superseded_by"] == "model_refresh:rejected"
+        assert _row(beam, first)["superseded_by"] is None
         assert _row(beam, second)["superseded_by"] is None
         assert second in _recalled_ids(beam, "shared")
 
@@ -247,11 +271,11 @@ class TestResolvedProposalRetirement:
 
         assert result["status"] == "applied"
         row = _row(beam, proposal_id)
-        assert row["superseded_by"] == "model_refresh:applied"
+        assert row["superseded_by"] is None
         assert json.loads(row["metadata_json"])["status"] == "applied"
 
-    def test_retry_repairs_a_resolution_left_eligible(self, tmp_path):
-        """A row resolved before the fix (or by an interrupted write) heals."""
+    def test_preexisting_resolution_is_retired_without_retry(self, tmp_path):
+        """Banks resolved before this fix already carry the retirement status."""
         beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
         proposal_id = _store_proposal(beam, "legacy")
 
@@ -264,9 +288,29 @@ class TestResolvedProposalRetirement:
         beam.conn.commit()
         assert _row(beam, proposal_id)["superseded_by"] is None
 
-        model_refresh.reject_model_refresh_proposal(beam, proposal_id, reason="again")
+        assert proposal_id not in _recalled_ids(beam, "legacy")
+        assert _row(beam, proposal_id)["superseded_by"] is None
 
-        assert _row(beam, proposal_id)["superseded_by"] == "model_refresh:rejected"
+    def test_temporal_voice_excludes_retired_rows_before_limit(self, tmp_path):
+        pytest.importorskip("numpy")
+        from mnemosyne.core.polyphonic_recall import PolyphonicRecallEngine
+
+        beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+        pending = _store_proposal(beam, "temporal_pending")
+        retired = _store_proposal(beam, "temporal_retired")
+        beam.conn.execute(
+            "UPDATE working_memory SET timestamp = datetime('now', '-1 day') WHERE id = ?",
+            (pending,),
+        )
+        beam.conn.commit()
+        engine = PolyphonicRecallEngine(db_path=beam.db_path, conn=beam.conn)
+
+        def first_result():
+            return [result.memory_id for result in engine._temporal_voice("what happened recently", limit=1)]
+
+        assert first_result() == [retired]
+        model_refresh.reject_model_refresh_proposal(beam, retired)
+        assert first_result() == [pending]
 
     def test_pending_proposal_stays_recall_eligible(self, tmp_path):
         """A proposal nobody resolved must not be hidden by this fix."""

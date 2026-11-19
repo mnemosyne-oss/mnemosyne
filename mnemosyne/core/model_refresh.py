@@ -333,67 +333,32 @@ def _proposal_row(beam, proposal_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
 
 
-def _load_metadata(row: Dict[str, Any]) -> Dict[str, Any]:
+def _parse_metadata(raw: Any) -> Dict[str, Any]:
     try:
-        metadata = json.loads(row.get("metadata_json") or "{}")
+        metadata = json.loads(raw or "{}")
     except Exception:
         metadata = {}
     return metadata if isinstance(metadata, dict) else {}
 
 
-def _invalidate_recall_cache(beam) -> None:
-    """Drop cached recall results after a row's eligibility changed."""
-
-    invalidate = getattr(beam, "_invalidate_query_cache", None)
-    if callable(invalidate):
-        invalidate()
+def _load_metadata(row: Dict[str, Any]) -> Dict[str, Any]:
+    return _parse_metadata(row.get("metadata_json"))
 
 
-def _resolve_proposal(
-    beam, proposal_id: str, metadata: Dict[str, Any], status: str
-) -> None:
-    """Persist a resolution and retire the row in a single transaction.
+def _is_resolved_proposal_metadata(raw: Any) -> bool:
+    return _parse_metadata(raw).get("status") in ("applied", "rejected")
 
-    Metadata and ``superseded_by`` must land together: a resolution that
-    commits without the retirement marker leaves the proposal recall-eligible
-    forever, because the resolution paths return early on a non-pending row.
-    """
 
+def _save_metadata(beam, proposal_id: str, metadata: Dict[str, Any]) -> None:
+    """Persist the proposal outcome and invalidate its old recall eligibility."""
     beam.conn.execute(
-        "UPDATE working_memory SET metadata_json = ?, superseded_by = ? "
-        "WHERE id = ? AND source = ?",
-        (
-            json.dumps(metadata, sort_keys=True),
-            f"model_refresh:{status}",
-            proposal_id,
-            PROPOSAL_SOURCE,
-        ),
+        "UPDATE working_memory SET metadata_json = ? WHERE id = ? AND source = ?",
+        (json.dumps(metadata, sort_keys=True), proposal_id, PROPOSAL_SOURCE),
     )
     beam.conn.commit()
-    _invalidate_recall_cache(beam)
-
-
-def _repair_retirement(beam, proposal_id: str, metadata: Dict[str, Any]) -> None:
-    """Retire an already-resolved proposal that is still recall-eligible.
-
-    Covers rows resolved before the retirement marker existed and rows whose
-    two writes were interrupted, so a retry heals the partial state instead of
-    returning early and leaving it in place.
-    """
-
-    status = metadata.get("status")
-    if status not in ("applied", "rejected"):
-        return
-    cursor = beam.conn.execute(
-        "UPDATE working_memory SET superseded_by = ? "
-        "WHERE id = ? AND source = ? AND superseded_by IS NULL",
-        (f"model_refresh:{status}", proposal_id, PROPOSAL_SOURCE),
-    )
-    beam.conn.commit()
-    if cursor.rowcount:
-        _invalidate_recall_cache(beam)
-
-
+    invalidate = getattr(beam, "_invalidate_query_cache_after_commit", None)
+    if callable(invalidate):
+        invalidate("model_refresh")
 
 
 def list_model_refresh_proposals(
@@ -435,7 +400,6 @@ def apply_model_refresh_proposal(
         raise ValueError(f"model refresh proposal not found: {proposal_id}")
     metadata = _load_metadata(row)
     if metadata.get("status", "pending") != "pending":
-        _repair_retirement(beam, proposal_id, metadata)
         return {"status": metadata.get("status"), "proposal_id": proposal_id, "metadata": metadata}
     if metadata.get("action", "update") != "update":
         raise ValueError("only update proposals can be applied")
@@ -460,7 +424,7 @@ def apply_model_refresh_proposal(
     metadata["applied_owner_id"] = owner_id
     metadata["canonical_id"] = canonical.get("id")
     metadata["auto_applied"] = bool(auto_applied)
-    _resolve_proposal(beam, proposal_id, metadata, "applied")
+    _save_metadata(beam, proposal_id, metadata)
     return {"status": "applied", "proposal_id": proposal_id, "canonical": canonical, "metadata": metadata}
 
 
@@ -479,13 +443,12 @@ def reject_model_refresh_proposal(
     metadata = _load_metadata(row)
     if metadata.get("status", "pending") != "pending":
         # A resolved proposal keeps its outcome: rejecting an applied one
-        # must not rewrite the audit row or flip the retirement marker.
-        _repair_retirement(beam, proposal_id, metadata)
+        # must not rewrite the recorded outcome.
         return {"status": metadata.get("status"), "proposal_id": proposal_id, "metadata": metadata}
     metadata["status"] = "rejected"
     metadata["rejected_by"] = validator or "system"
     metadata["rejection_reason"] = reason
-    _resolve_proposal(beam, proposal_id, metadata, "rejected")
+    _save_metadata(beam, proposal_id, metadata)
     return {"status": "rejected", "proposal_id": proposal_id, "metadata": metadata}
 
 

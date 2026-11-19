@@ -477,6 +477,7 @@ def test_hermes_file_import_dry_run_preserves_data_and_audit_rows(
 def test_hermes_cli_file_import_forwards_dry_run_and_keeps_exit_compat(
     tmp_path, monkeypatch, module_name, capsys
 ):
+    monkeypatch.delenv("HERMES_HOME", raising=False)
     export_path = _export_source(tmp_path)
     target = _target(tmp_path, name=module_name.replace(".", "-"))
     before = _table_snapshot(target.db_path)
@@ -535,6 +536,7 @@ def test_hermes_cli_file_import_forwards_dry_run_and_keeps_exit_compat(
 def test_hermes_cli_file_import_dry_run_failure_preserves_data(
     tmp_path, monkeypatch, module_name
 ):
+    monkeypatch.delenv("HERMES_HOME", raising=False)
     export_path = _export_source(tmp_path)
     target = _target(tmp_path, name=f"failure-{module_name.replace('.', '-')}")
     before = _table_snapshot(target.db_path)
