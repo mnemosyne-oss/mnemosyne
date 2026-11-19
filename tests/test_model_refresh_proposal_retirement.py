@@ -319,3 +319,195 @@ class TestResolvedProposalRetirement:
 
         assert _row(beam, proposal_id)["superseded_by"] is None
         assert proposal_id in _recalled_ids(beam, "pending")
+
+
+class TestResolutionClaim:
+    """A resolution is a guarded transition, not a read-then-write.
+
+    The canonical write commits on its own connection transaction, so the
+    proposal is claimed first (a conditional UPDATE) and the terminal write
+    carries the claim token. Two resolvers can therefore never leave the
+    proposal status and the canonical store disagreeing.
+    """
+
+    def test_second_claim_is_refused(self, tmp_path):
+        beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+        proposal_id = _store_proposal(beam, "claim")
+        metadata = json.loads(_row(beam, proposal_id)["metadata_json"])
+
+        first = model_refresh._claim_pending_proposal(beam, proposal_id, metadata)
+        assert first, "the first claim must win"
+        second = model_refresh._claim_pending_proposal(beam, proposal_id, metadata)
+        assert second is None, "a claimed proposal must not be claimable twice"
+
+    def test_stale_claim_can_be_taken_over_after_the_lease(self, tmp_path):
+        """A crashed resolver must not strand the proposal forever."""
+        beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+        proposal_id = _store_proposal(beam, "lease")
+        metadata = json.loads(_row(beam, proposal_id)["metadata_json"])
+        assert model_refresh._claim_pending_proposal(beam, proposal_id, metadata)
+        assert model_refresh._claim_pending_proposal(beam, proposal_id, metadata) is None
+
+        record = json.loads(_row(beam, proposal_id)["metadata_json"])
+        record[model_refresh.RESOLUTION_CLAIMED_AT_KEY] = "2020-01-01T00:00:00+00:00"
+        beam.conn.execute(
+            "UPDATE working_memory SET metadata_json = ? WHERE id = ?",
+            (json.dumps(record), proposal_id),
+        )
+        beam.conn.commit()
+
+        assert model_refresh._claim_pending_proposal(
+            beam, proposal_id, metadata
+        ), "a claim older than the lease must be reclaimable"
+
+    def test_terminal_write_requires_the_claim(self, tmp_path):
+        beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+        proposal_id = _store_proposal(beam, "token")
+        metadata = json.loads(_row(beam, proposal_id)["metadata_json"])
+        model_refresh._claim_pending_proposal(beam, proposal_id, metadata)
+
+        applied = dict(metadata, status="applied")
+        assert model_refresh._save_metadata(
+            beam, proposal_id, applied, token="not-the-claim"
+        ) is False
+        assert json.loads(_row(beam, proposal_id)["metadata_json"])["status"] == "pending"
+
+    def test_apply_reports_a_concurrent_rejection_instead_of_overwriting_it(
+        self, tmp_path, monkeypatch
+    ):
+        beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+        proposal_id = _store_proposal(beam, "race")
+        real_claim = model_refresh._claim_pending_proposal
+
+        def racing_claim(beam_, proposal_id_, metadata_):
+            # Simulate another connection that commits its outcome between our
+            # read and our claim.
+            other = dict(metadata_, status="rejected", rejected_by="other")
+            model_refresh._save_metadata(beam_, proposal_id_, other)
+            return real_claim(beam_, proposal_id_, metadata_)
+
+        monkeypatch.setattr(model_refresh, "_claim_pending_proposal", racing_claim)
+        assert model_refresh.auto_apply_enabled()  # normal product path, not config-off
+        result = model_refresh.apply_model_refresh_proposal(beam, proposal_id)
+
+        assert result["status"] == "rejected"
+        record = json.loads(_row(beam, proposal_id)["metadata_json"])
+        assert record["status"] == "rejected"
+        assert record["rejected_by"] == "other"
+        canonical = beam.conn.execute("SELECT COUNT(*) FROM canonical_facts").fetchone()[0]
+        assert canonical == 0, "the losing resolver must not write canonical truth"
+
+    def test_failed_canonical_write_releases_the_claim(self, tmp_path, monkeypatch):
+        beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+        proposal_id = _store_proposal(beam, "release")
+        metadata = json.loads(_row(beam, proposal_id)["metadata_json"])
+
+        from mnemosyne.core.canonical import CanonicalStore
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("canonical store unavailable")
+
+        monkeypatch.setattr(CanonicalStore, "remember", boom)
+        with pytest.raises(RuntimeError):
+            model_refresh.apply_model_refresh_proposal(beam, proposal_id)
+
+        record = json.loads(_row(beam, proposal_id)["metadata_json"])
+        assert record["status"] == "pending"
+        assert model_refresh.RESOLUTION_TOKEN_KEY not in record
+        assert model_refresh._claim_pending_proposal(beam, proposal_id, metadata)
+
+
+class TestEligibilityMatrixAcrossPaths:
+    """The retirement predicate must hold on every retrieval path, not just FTS."""
+
+    @pytest.mark.parametrize("state", ["pending", "applied", "rejected"])
+    def test_context_retrieval_matches_the_matrix(self, tmp_path, monkeypatch, state):
+        monkeypatch.setenv("MNEMOSYNE_CONTEXT_INCLUDE_CONSOLIDATED", "1")
+        beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+        proposal_id = _store_proposal(beam, f"ctx_{state}")
+        if state != "pending":
+            resolver = (
+                model_refresh.apply_model_refresh_proposal
+                if state == "applied"
+                else model_refresh.reject_model_refresh_proposal
+            )
+            resolver(beam, proposal_id)
+
+        ids = {row["id"] for row in beam.get_context(limit=50)}
+        assert (proposal_id in ids) is (state == "pending")
+
+    @pytest.mark.parametrize("state", ["pending", "applied", "rejected"])
+    def test_standalone_connection_uses_the_same_predicate(self, tmp_path, state):
+        import sqlite3
+
+        from mnemosyne.core.beam import _working_recall_eligibility_sql
+
+        beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+        proposal_id = _store_proposal(beam, f"raw_{state}")
+        if state != "pending":
+            resolver = (
+                model_refresh.apply_model_refresh_proposal
+                if state == "applied"
+                else model_refresh.reject_model_refresh_proposal
+            )
+            resolver(beam, proposal_id)
+
+        # A connection outside BeamMemory must see the same eligibility rule.
+        raw = sqlite3.connect(beam.db_path)
+        try:
+            sql = _working_recall_eligibility_sql(raw)
+            rows = {
+                row[0]
+                for row in raw.execute(
+                    f"SELECT id FROM working_memory WHERE {sql}"
+                ).fetchall()
+            }
+        finally:
+            raw.close()
+        assert (proposal_id in rows) is (state == "pending")
+
+    @pytest.mark.parametrize("state", ["pending", "applied", "rejected"])
+    def test_dense_working_search_matches_the_matrix(self, tmp_path, state):
+        np = pytest.importorskip("numpy")
+        from mnemosyne.core.beam import _wm_vec_search
+
+        beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+        proposal_id = _store_proposal(beam, f"vec_{state}")
+        if state != "pending":
+            resolver = (
+                model_refresh.apply_model_refresh_proposal
+                if state == "applied"
+                else model_refresh.reject_model_refresh_proposal
+            )
+            resolver(beam, proposal_id)
+        beam.conn.execute(
+            "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json) "
+            "VALUES (?, ?)",
+            (proposal_id, json.dumps([1.0, 0.0, 0.0])),
+        )
+        beam.conn.commit()
+
+        hits = _wm_vec_search(
+            beam.conn, np.array([1.0, 0.0, 0.0], dtype=np.float32), k=5
+        )
+        assert (proposal_id in {hit["id"] for hit in hits}) is (state == "pending")
+
+    def test_ordinary_and_malformed_metadata_stay_eligible(self, tmp_path):
+        """Controls: the CASE on source may not swallow non-proposal rows."""
+        beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+        ordinary = beam.remember(
+            "Ordinary memory about retirement_controls reporting preference.",
+            metadata={"status": "applied"},
+        )
+        malformed = beam.remember(
+            "Malformed proposal metadata control, retirement_controls reporting preference."
+        )
+        beam.conn.execute(
+            "UPDATE working_memory SET source = ?, metadata_json = ? WHERE id = ?",
+            (model_refresh.PROPOSAL_SOURCE, "{not json", malformed),
+        )
+        beam.conn.commit()
+
+        recalled = _recalled_ids(beam, "retirement_controls")
+        assert ordinary in recalled
+        assert malformed in recalled

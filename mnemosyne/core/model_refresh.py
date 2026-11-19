@@ -12,6 +12,8 @@ import json
 import math
 import os
 import re
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 from mnemosyne.core.filters import _SYSTEM_DERIVED_WRITE_CAPABILITY
@@ -243,6 +245,10 @@ def proposal_to_memory_content(proposal: Dict[str, Any]) -> str:
 
 PROPOSAL_SOURCE = "sleep_model_refresh_proposal"
 
+# Set on the row while a resolution is in flight; see _claim_pending_proposal.
+RESOLUTION_TOKEN_KEY = "resolution_token"
+RESOLUTION_CLAIMED_AT_KEY = "resolution_claimed_at"
+
 
 def auto_apply_enabled() -> bool:
     """Whether sleep may apply validated proposals immediately.
@@ -349,16 +355,113 @@ def _is_resolved_proposal_metadata(raw: Any) -> bool:
     return _parse_metadata(raw).get("status") in ("applied", "rejected")
 
 
-def _save_metadata(beam, proposal_id: str, metadata: Dict[str, Any]) -> None:
-    """Persist the proposal outcome and invalidate its old recall eligibility."""
-    beam.conn.execute(
-        "UPDATE working_memory SET metadata_json = ? WHERE id = ? AND source = ?",
-        (json.dumps(metadata, sort_keys=True), proposal_id, PROPOSAL_SOURCE),
-    )
+def _dump_metadata(metadata: Dict[str, Any]) -> str:
+    """Serialise metadata to JSON that SQLite's json_valid() accepts.
+
+    Proposal metadata can carry non-finite floats (a NaN confidence is exactly
+    what the stored-confidence hardening path must persist rather than drop),
+    and ``json.dumps`` emits those as bare ``NaN``. SQLite treats that as
+    invalid JSON, which would make the claim guard unable to see its own token.
+    Non-finite floats therefore become null.
+    """
+
+    def _finite(value: Any) -> Any:
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        if isinstance(value, dict):
+            return {key: _finite(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_finite(item) for item in value]
+        return value
+
+    return json.dumps(_finite(metadata), sort_keys=True)
+
+
+def _save_metadata(
+    beam,
+    proposal_id: str,
+    metadata: Dict[str, Any],
+    *,
+    token: Optional[str] = None,
+) -> bool:
+    """Persist the proposal outcome and invalidate its old recall eligibility.
+
+    When ``token`` is given the write only lands if this caller still holds the
+    claim it took in ``_claim_pending_proposal``. The canonical write and the
+    terminal status then belong to one guarded transition: a concurrent
+    resolver cannot overwrite the outcome that was recorded first.
+    """
+    sql = "UPDATE working_memory SET metadata_json = ? WHERE id = ? AND source = ?"
+    params: List[Any] = [_dump_metadata(metadata), proposal_id, PROPOSAL_SOURCE]
+    if token is not None:
+        sql += (
+            " AND json_valid(metadata_json)"
+            " AND json_extract(metadata_json, '$.resolution_token') = ?"
+        )
+        params.append(token)
+    cursor = beam.conn.execute(sql, params)
     beam.conn.commit()
     invalidate = getattr(beam, "_invalidate_query_cache_after_commit", None)
     if callable(invalidate):
         invalidate("model_refresh")
+    return cursor.rowcount == 1
+
+
+# A resolution may only start from `pending` and must be claimed exactly once.
+# Malformed or NULL metadata is read as pending everywhere else in this module
+# (``_parse_metadata`` -> {}), so the SQL guard mirrors that instead of raising.
+_PENDING_CLAIM_GUARD_SQL = (
+    " AND (metadata_json IS NULL"
+    " OR NOT json_valid(metadata_json)"
+    " OR COALESCE(json_extract(metadata_json, '$.status'), 'pending') = 'pending')"
+    " AND (metadata_json IS NULL"
+    " OR NOT json_valid(metadata_json)"
+    " OR json_extract(metadata_json, '$.resolution_token') IS NULL"
+    " OR julianday(COALESCE(json_extract(metadata_json,"
+    " '$.resolution_claimed_at'), '1970-01-01'))"
+    " < julianday('now', '-15 minutes'))"
+)
+
+
+def _claim_pending_proposal(
+    beam,
+    proposal_id: str,
+    metadata: Dict[str, Any],
+) -> Optional[str]:
+    """Atomically claim one still-pending proposal for resolution.
+
+    Returns the claim token, or ``None`` when the row was resolved (or claimed)
+    between the read and this call. The claim keeps ``status`` at ``pending`` so
+    every existing reader — recall eligibility, listings, audits — is unchanged
+    while the side effect is in flight.
+    """
+    token = uuid.uuid4().hex
+    claimed = dict(metadata)
+    claimed[RESOLUTION_TOKEN_KEY] = token
+    claimed[RESOLUTION_CLAIMED_AT_KEY] = datetime.now(timezone.utc).isoformat()
+    cursor = beam.conn.execute(
+        "UPDATE working_memory SET metadata_json = ? WHERE id = ? AND source = ?"
+        + _PENDING_CLAIM_GUARD_SQL,
+        (_dump_metadata(claimed), proposal_id, PROPOSAL_SOURCE),
+    )
+    beam.conn.commit()
+    return token if cursor.rowcount == 1 else None
+
+
+def _release_claim(
+    beam,
+    proposal_id: str,
+    metadata: Dict[str, Any],
+    token: str,
+) -> None:
+    """Drop a claim after the side effect failed, so the row can be retried."""
+    beam.conn.execute(
+        "UPDATE working_memory SET metadata_json = ? WHERE id = ? AND source = ?"
+        " AND json_valid(metadata_json)"
+        " AND json_extract(metadata_json, '$.resolution_token') = ?",
+        (_dump_metadata(metadata), proposal_id, PROPOSAL_SOURCE, token),
+    )
+    beam.conn.commit()
 
 
 def list_model_refresh_proposals(
@@ -409,22 +512,37 @@ def apply_model_refresh_proposal(
 
     from mnemosyne.core.canonical import CanonicalStore
 
+    token = _claim_pending_proposal(beam, proposal_id, metadata)
+    if token is None:
+        # Another connection resolved (or claimed) the row after our read.
+        # Report its outcome instead of overwriting it.
+        current = _load_metadata(_proposal_row(beam, proposal_id) or row)
+        return {"status": current.get("status"), "proposal_id": proposal_id, "metadata": current}
+
     store = CanonicalStore(db_path=beam.db_path, conn=beam.conn)
-    canonical = store.remember(
-        owner_id,
-        metadata["category"],
-        metadata["name"],
-        metadata["body"],
-        source="sleep_model_refresh",
-        confidence=coerce_confidence(metadata.get("confidence"), 0.5),
-        _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
-    )
+    try:
+        canonical = store.remember(
+            owner_id,
+            metadata["category"],
+            metadata["name"],
+            metadata["body"],
+            source="sleep_model_refresh",
+            confidence=coerce_confidence(metadata.get("confidence"), 0.5),
+            _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
+        )
+    except Exception:
+        _release_claim(beam, proposal_id, metadata, token)
+        raise
     metadata["status"] = "applied"
     metadata["applied_by"] = validator or "system"
     metadata["applied_owner_id"] = owner_id
     metadata["canonical_id"] = canonical.get("id")
     metadata["auto_applied"] = bool(auto_applied)
-    _save_metadata(beam, proposal_id, metadata)
+    if not _save_metadata(beam, proposal_id, metadata, token=token):
+        raise RuntimeError(
+            f"model refresh proposal {proposal_id} lost its resolution claim "
+            "after the canonical write"
+        )
     return {"status": "applied", "proposal_id": proposal_id, "canonical": canonical, "metadata": metadata}
 
 
@@ -445,10 +563,17 @@ def reject_model_refresh_proposal(
         # A resolved proposal keeps its outcome: rejecting an applied one
         # must not rewrite the recorded outcome.
         return {"status": metadata.get("status"), "proposal_id": proposal_id, "metadata": metadata}
+    token = _claim_pending_proposal(beam, proposal_id, metadata)
+    if token is None:
+        current = _load_metadata(_proposal_row(beam, proposal_id) or row)
+        return {"status": current.get("status"), "proposal_id": proposal_id, "metadata": current}
     metadata["status"] = "rejected"
     metadata["rejected_by"] = validator or "system"
     metadata["rejection_reason"] = reason
-    _save_metadata(beam, proposal_id, metadata)
+    if not _save_metadata(beam, proposal_id, metadata, token=token):
+        raise RuntimeError(
+            f"model refresh proposal {proposal_id} lost its resolution claim"
+        )
     return {"status": "rejected", "proposal_id": proposal_id, "metadata": metadata}
 
 
