@@ -6001,14 +6001,18 @@ _CJK_SUPPLEMENT_MAX_PAIRS = 32
 _CJK_SUPPLEMENT_MAX_RUNS = 4
 
 
-def _cjk_supplement_seen_ids(conn, query, rows, k, terms):
-    """Return all raw FTS IDs, or decline a saturated raw pool."""
+def _cjk_supplement_seen_ids(conn, query, rows, k, terms, eligibility_predicate=""):
+    """Return eligible raw FTS IDs, or decline a saturated eligible pool."""
     seen = {row["id"] for row in rows}
     precise_terms = _fts_precise_terms(query) if len(rows) < k else None
     if precise_terms is not None and (not precise_terms or precise_terms == terms):
         return seen
+    eligibility = (
+        " AND " + eligibility_predicate.format(id="fts_working.id")
+        if eligibility_predicate else ""
+    )
     raw = conn.execute(
-        "SELECT id FROM fts_working WHERE fts_working MATCH ? LIMIT ?",
+        f"SELECT id FROM fts_working WHERE fts_working MATCH ?{eligibility} LIMIT ?",
         (" OR ".join(terms), _CJK_SUPPLEMENT_RAW_LIMIT),
     ).fetchall()
     if len(raw) == _CJK_SUPPLEMENT_RAW_LIMIT:
@@ -6055,7 +6059,9 @@ def _cjk_supplement_candidates(conn, groups, where_sql=None, where_params=()):
     return rows
 
 
-def _supplement_cjk_working(conn, query, rows, k, terms, *, where_sql=None, where_params=()):
+def _supplement_cjk_working(
+    conn, query, rows, k, terms, *, where_sql=None, where_params=(), eligibility_predicate="",
+):
     """Recover strong CJK rows outside a nonempty FTS pool, with bounded work."""
     cap = min(k, _CJK_SUPPLEMENT_CAP)
     if cap <= 0 or not rows or not _has_cjk(query):
@@ -6077,7 +6083,7 @@ def _supplement_cjk_working(conn, query, rows, k, terms, *, where_sql=None, wher
         for group in groups
     ]
     try:
-        seen = _cjk_supplement_seen_ids(conn, query, rows, k, terms)
+        seen = _cjk_supplement_seen_ids(conn, query, rows, k, terms, eligibility_predicate)
         if seen is None:
             return rows
         candidates = _cjk_supplement_candidates(conn, groups, where_sql, where_params)
@@ -6140,6 +6146,7 @@ def _fts_search_working(
     return _supplement_cjk_working(
         conn, query, rows, k, terms,
         where_sql=supplement_eligibility, where_params=where_params,
+        eligibility_predicate=candidate_filter,
     )
 
 
@@ -9501,10 +9508,11 @@ class BeamMemory:
                 if w.lower() not in _FACT_MATCH_STOPWORDS
             )[:30] or topic[:20]
             # Check for evolution: did this topic already have a preference?
+            eligible_preference = self._preference_source_is_eligible_sql("pref")
             existing = self.conn.execute(
-                "SELECT preference, topic FROM memoria_preferences "
+                "SELECT preference, topic FROM memoria_preferences pref "
                 "WHERE session_id = ? AND (topic LIKE ? OR preference LIKE ?) "
-                "ORDER BY message_idx DESC LIMIT 1",
+                f"AND {eligible_preference} ORDER BY message_idx DESC LIMIT 1",
                 (session, f'%{_topic_key}%', f'%{_topic_key}%')
             ).fetchone()
             evolution = None
@@ -10045,6 +10053,14 @@ class BeamMemory:
             return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_instructions"}
         return {"context": "", "facts": [], "source": "fallback"}
 
+    def _preference_source_is_eligible_sql(self, preference_alias: str) -> str:
+        """Prevent retired working proposals from contributing a preference."""
+        eligibility = _proposal_recall_eligibility_sql(self.conn, "wm")
+        return (
+            "NOT EXISTS (SELECT 1 FROM working_memory wm "
+            f"WHERE wm.id = {preference_alias}.source_memory_id AND NOT {eligibility})"
+        )
+
     def _memoria_preference_retrieve(self, query: str, top_k: int = 10) -> dict:
         """Query memoria_preferences for evolving user tastes matching query terms."""
         import re as _re
@@ -10061,12 +10077,25 @@ class BeamMemory:
         q_words = [w for w in _re.findall(r'\b[a-zA-Z]{3,}\b', q_lower)
                    if w not in stop_words]
 
+        eligible_preference = self._preference_source_is_eligible_sql("pref")
+        eligible_history = self._preference_source_is_eligible_sql("prior")
+        # Older evolution strings copied the previous preference without its
+        # source ID. Hide a matching retired value while keeping the newer row.
+        select = (
+            "SELECT preference, topic, message_idx, "
+            "CASE WHEN pref.evolution IS NOT NULL AND EXISTS ("
+            "SELECT 1 FROM memoria_preferences prior "
+            "WHERE prior.session_id = pref.session_id AND prior.message_idx <= pref.message_idx "
+            "AND pref.evolution = 'was: ' || substr(prior.preference, 1, 120) "
+            f"AND NOT {eligible_history}) THEN NULL ELSE pref.evolution END, "
+            "context_snippet, source_memory_id FROM memoria_preferences pref"
+        )
         rows = []
         if q_words:
             for word in q_words[:5]:
                 rows = cursor.execute(
-                    "SELECT preference, topic, message_idx, evolution, context_snippet FROM memoria_preferences "
-                    "WHERE (preference LIKE ? OR topic LIKE ?) AND session_id = ? LIMIT ?",
+                    f"{select} WHERE (preference LIKE ? OR topic LIKE ?) AND session_id = ? "
+                    f"AND {eligible_preference} LIMIT ?",
                     (f'%{word}%', f'%{word}%', self.session_id, top_k)
                 ).fetchall()
                 if rows:
@@ -10075,13 +10104,13 @@ class BeamMemory:
         if not rows:
             # Fallback: return all preferences
             rows = cursor.execute(
-                "SELECT preference, topic, message_idx, evolution, context_snippet FROM memoria_preferences "
-                "WHERE session_id = ? ORDER BY message_idx DESC LIMIT ?",
+                f"{select} WHERE session_id = ? AND {eligible_preference} "
+                "ORDER BY message_idx DESC LIMIT ?",
                 (self.session_id, top_k)
             ).fetchall()
 
         if rows:
-            facts = [dict(zip(['preference', 'topic', 'msg_idx', 'evolution', 'context'], r)) for r in rows]
+            facts = [dict(zip(['preference', 'topic', 'msg_idx', 'evolution', 'context', 'source_memory_id'], r)) for r in rows]
             ctx_lines = []
             for r in rows:
                 line = f"[Preference] {r[0][:120]}"

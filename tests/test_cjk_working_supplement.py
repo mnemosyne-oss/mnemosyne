@@ -426,3 +426,24 @@ def test_bind_fallback_preserves_groups_filters_and_row_windows(supplement_conn)
         conn.execute(f"SELECT {i}").fetchall()
     actual = beam._cjk_supplement_candidates(conn, groups, "visible = ?", (1,))
     assert {row["id"] for row in actual} == {"1", "600"}
+
+
+def test_saturation_probe_ignores_retired_proposals(supplement_conn):
+    conn = supplement_conn
+    conn.execute("ALTER TABLE working_memory ADD COLUMN source TEXT")
+    conn.execute("ALTER TABLE working_memory ADD COLUMN metadata_json TEXT")
+    entries = [
+        (f"literal-{i:03}", "鹽田參觀名額", "sleep_model_refresh_proposal", '{"status":"rejected"}')
+        for i in range(257)
+    ]
+    entries.extend(
+        (f"pending-{i:03}", "鹽田參觀名額", None, None)
+        for i in range(50)
+    )
+    conn.executemany("INSERT INTO working_memory VALUES (?,?,?,?)", entries)
+    conn.executemany("INSERT INTO fts_working VALUES (?,?)", [row[:2] for row in entries])
+    conn.execute("INSERT INTO working_memory (id,content) VALUES ('gold',?)", (TARGET,))
+    got = beam._fts_search_working(conn, QUERY, 50)
+    assert len(got) == 51
+    assert got[-1] == {"id": "gold", "rank": None, "cjk_supplement": True}
+    assert all(row["id"].startswith("pending-") for row in got[:-1])

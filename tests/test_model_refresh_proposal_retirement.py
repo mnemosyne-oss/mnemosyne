@@ -321,100 +321,51 @@ class TestResolvedProposalRetirement:
         assert proposal_id in _recalled_ids(beam, "pending")
 
 
-class TestResolutionClaim:
-    """A resolution is a guarded transition, not a read-then-write.
+def test_competing_connection_cannot_resolve_during_apply(tmp_path, monkeypatch):
+    import sqlite3
 
-    The canonical write commits on its own connection transaction, so the
-    proposal is claimed first (a conditional UPDATE) and the terminal write
-    carries the claim token. Two resolvers can therefore never leave the
-    proposal status and the canonical store disagreeing.
-    """
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    proposal_id = _store_proposal(beam, "race")
+    real_read = model_refresh._proposal_row
+    lock_observed = []
 
-    def test_second_claim_is_refused(self, tmp_path):
-        beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
-        proposal_id = _store_proposal(beam, "claim")
-        metadata = json.loads(_row(beam, proposal_id)["metadata_json"])
+    def racing_read(beam_, proposal_id_):
+        row = real_read(beam_, proposal_id_)
+        with sqlite3.connect(beam.db_path, timeout=0) as competitor:
+            with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                competitor.execute(
+                    "UPDATE working_memory SET metadata_json = ? WHERE id = ?",
+                    ('{"status":"rejected"}', proposal_id_),
+                )
+        lock_observed.append(True)
+        return row
 
-        first = model_refresh._claim_pending_proposal(beam, proposal_id, metadata)
-        assert first, "the first claim must win"
-        second = model_refresh._claim_pending_proposal(beam, proposal_id, metadata)
-        assert second is None, "a claimed proposal must not be claimable twice"
-
-    def test_stale_claim_can_be_taken_over_after_the_lease(self, tmp_path):
-        """A crashed resolver must not strand the proposal forever."""
-        beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
-        proposal_id = _store_proposal(beam, "lease")
-        metadata = json.loads(_row(beam, proposal_id)["metadata_json"])
-        assert model_refresh._claim_pending_proposal(beam, proposal_id, metadata)
-        assert model_refresh._claim_pending_proposal(beam, proposal_id, metadata) is None
-
-        record = json.loads(_row(beam, proposal_id)["metadata_json"])
-        record[model_refresh.RESOLUTION_CLAIMED_AT_KEY] = "2020-01-01T00:00:00+00:00"
-        beam.conn.execute(
-            "UPDATE working_memory SET metadata_json = ? WHERE id = ?",
-            (json.dumps(record), proposal_id),
-        )
-        beam.conn.commit()
-
-        assert model_refresh._claim_pending_proposal(
-            beam, proposal_id, metadata
-        ), "a claim older than the lease must be reclaimable"
-
-    def test_terminal_write_requires_the_claim(self, tmp_path):
-        beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
-        proposal_id = _store_proposal(beam, "token")
-        metadata = json.loads(_row(beam, proposal_id)["metadata_json"])
-        model_refresh._claim_pending_proposal(beam, proposal_id, metadata)
-
-        applied = dict(metadata, status="applied")
-        assert model_refresh._save_metadata(
-            beam, proposal_id, applied, token="not-the-claim"
-        ) is False
-        assert json.loads(_row(beam, proposal_id)["metadata_json"])["status"] == "pending"
-
-    def test_apply_reports_a_concurrent_rejection_instead_of_overwriting_it(
-        self, tmp_path, monkeypatch
-    ):
-        beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
-        proposal_id = _store_proposal(beam, "race")
-        real_claim = model_refresh._claim_pending_proposal
-
-        def racing_claim(beam_, proposal_id_, metadata_):
-            # Simulate another connection that commits its outcome between our
-            # read and our claim.
-            other = dict(metadata_, status="rejected", rejected_by="other")
-            model_refresh._save_metadata(beam_, proposal_id_, other)
-            return real_claim(beam_, proposal_id_, metadata_)
-
-        monkeypatch.setattr(model_refresh, "_claim_pending_proposal", racing_claim)
-        assert model_refresh.auto_apply_enabled()  # normal product path, not config-off
+    with monkeypatch.context() as race:
+        race.setattr(model_refresh, "_proposal_row", racing_read)
         result = model_refresh.apply_model_refresh_proposal(beam, proposal_id)
 
-        assert result["status"] == "rejected"
-        record = json.loads(_row(beam, proposal_id)["metadata_json"])
-        assert record["status"] == "rejected"
-        assert record["rejected_by"] == "other"
-        canonical = beam.conn.execute("SELECT COUNT(*) FROM canonical_facts").fetchone()[0]
-        assert canonical == 0, "the losing resolver must not write canonical truth"
+    assert lock_observed == [True]
+    assert result["status"] == "applied"
+    assert model_refresh.reject_model_refresh_proposal(beam, proposal_id)["status"] == "applied"
+    assert beam.conn.execute("SELECT count(*) FROM canonical_facts").fetchone()[0] == 1
 
-    def test_failed_canonical_write_releases_the_claim(self, tmp_path, monkeypatch):
-        beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
-        proposal_id = _store_proposal(beam, "release")
-        metadata = json.loads(_row(beam, proposal_id)["metadata_json"])
 
-        from mnemosyne.core.canonical import CanonicalStore
+def test_failed_canonical_write_leaves_proposal_retryable(tmp_path, monkeypatch):
+    from mnemosyne.core.canonical import CanonicalStore
 
-        def boom(*args, **kwargs):
-            raise RuntimeError("canonical store unavailable")
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    proposal_id = _store_proposal(beam, "retry")
 
-        monkeypatch.setattr(CanonicalStore, "remember", boom)
-        with pytest.raises(RuntimeError):
+    def fail(*args, **kwargs):
+        raise RuntimeError("canonical store unavailable")
+
+    with monkeypatch.context() as unavailable:
+        unavailable.setattr(CanonicalStore, "remember", fail)
+        with pytest.raises(RuntimeError, match="canonical store unavailable"):
             model_refresh.apply_model_refresh_proposal(beam, proposal_id)
 
-        record = json.loads(_row(beam, proposal_id)["metadata_json"])
-        assert record["status"] == "pending"
-        assert model_refresh.RESOLUTION_TOKEN_KEY not in record
-        assert model_refresh._claim_pending_proposal(beam, proposal_id, metadata)
+    assert json.loads(_row(beam, proposal_id)["metadata_json"])["status"] == "pending"
+    assert model_refresh.apply_model_refresh_proposal(beam, proposal_id)["status"] == "applied"
 
 
 class TestEligibilityMatrixAcrossPaths:
@@ -511,3 +462,80 @@ class TestEligibilityMatrixAcrossPaths:
         recalled = _recalled_ids(beam, "retirement_controls")
         assert ordinary in recalled
         assert malformed in recalled
+
+
+def test_failed_terminal_write_rolls_back_canonical_value(tmp_path):
+    import sqlite3
+
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    proposal_id = _store_proposal(beam, "atomic_failure")
+    beam.conn.execute("""
+        CREATE TRIGGER abort_proposal_resolution BEFORE UPDATE OF metadata_json
+        ON working_memory WHEN NEW.metadata_json LIKE '%"status": "applied"%'
+        BEGIN SELECT RAISE(ABORT, 'injected terminal write failure'); END
+    """)
+    with pytest.raises(sqlite3.IntegrityError, match="injected terminal write failure"):
+        model_refresh.apply_model_refresh_proposal(beam, proposal_id)
+
+    assert beam.conn.execute("SELECT count(*) FROM canonical_facts").fetchone()[0] == 0
+    assert json.loads(_row(beam, proposal_id)["metadata_json"])["status"] == "pending"
+    beam.conn.execute("DROP TRIGGER abort_proposal_resolution")
+    assert model_refresh.reject_model_refresh_proposal(beam, proposal_id)["status"] == "rejected"
+
+
+def test_resolution_leaves_the_callers_transaction_open(tmp_path):
+    import sqlite3
+
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    proposal_id = _store_proposal(beam, "caller_transaction")
+    beam.conn.execute("BEGIN IMMEDIATE")
+    beam.conn.execute("UPDATE working_memory SET importance = 0 WHERE id = ?", (proposal_id,))
+    assert model_refresh.apply_model_refresh_proposal(beam, proposal_id)["status"] == "applied"
+    assert beam.conn.in_transaction
+    with sqlite3.connect(beam.db_path) as observer:
+        assert observer.execute("SELECT count(*) FROM canonical_facts").fetchone()[0] == 0
+    beam.conn.rollback()
+    assert json.loads(_row(beam, proposal_id)["metadata_json"])["status"] == "pending"
+    assert beam.conn.execute("SELECT count(*) FROM canonical_facts").fetchone()[0] == 0
+
+
+def test_rejected_proposal_does_not_fill_memoria_preference_limit(tmp_path):
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    retired = beam.remember(
+        "I prefer compact reporting for weekly updates.",
+        source=model_refresh.PROPOSAL_SOURCE,
+        metadata={"status": "pending"},
+    )
+    assert "compact reporting" in beam.memoria_retrieve(
+        "what do i prefer reporting", ability="PF", top_k=1,
+    )["context"]
+    model_refresh.reject_model_refresh_proposal(beam, retired)
+    assert "compact reporting" not in beam.memoria_retrieve(
+        "what do i prefer reporting", ability="PF", top_k=1,
+    )["context"]
+
+    ordinary = beam.remember("I prefer clear reporting for project updates.")
+    assert ordinary
+    result = beam.memoria_retrieve("what do i prefer reporting", ability="PF", top_k=1)
+    assert "clear reporting" in result["context"]
+    assert "compact reporting" not in result["context"]
+    assert "compact reporting" not in result["facts"][0]["preference"]
+
+
+def test_rejected_proposal_is_hidden_from_existing_preference_history(tmp_path):
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    retired = beam.remember(
+        "I prefer weekly reporting via compact charts.",
+        source=model_refresh.PROPOSAL_SOURCE,
+        metadata={"status": "pending"},
+    )
+    ordinary = beam.remember("I prefer weekly reporting.")
+    assert beam.conn.execute(
+        "SELECT evolution FROM memoria_preferences WHERE source_memory_id = ?", (ordinary,),
+    ).fetchone()[0].endswith("via compact charts")
+    model_refresh.reject_model_refresh_proposal(beam, retired)
+
+    result = beam.memoria_retrieve("what do i prefer reporting", ability="PF", top_k=1)
+    assert "weekly reporting" in result["context"]
+    assert "compact charts" not in result["context"]
+    assert result["facts"][0]["evolution"] is None

@@ -38,7 +38,7 @@ ACCEPTED_SCAN_MS = 250.0
 SCHEMA = """
 CREATE TABLE working_memory (
     id TEXT PRIMARY KEY, content TEXT, source TEXT, timestamp TEXT,
-    session_id TEXT, importance REAL, valid_until TEXT, superseded_by TEXT
+    session_id TEXT, importance REAL, valid_until TEXT, superseded_by TEXT, metadata_json TEXT
 );
 CREATE INDEX idx_wm_timestamp ON working_memory(timestamp);
 """
