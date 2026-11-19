@@ -793,3 +793,99 @@ def test_instruction_repair_invalidates_warmed_enhanced_recall_cache(tmp_path, m
     beam._deduplicate_memoria_cross_session()
     assert beam.memoria_retrieve("reporting checklists", ability="IF")["facts"]
     assert any("Use reporting checklists" in row["content"] for row in recall())
+
+
+@pytest.mark.parametrize("retired_would_win", [True, False], ids=["retired-primary", "retired-opponent"])
+def test_auto_conflicts_ignore_retired_only_proposal_facts(tmp_path, retired_would_win):
+    from mnemosyne.core.veracity_consolidation import VeracityConsolidator
+
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    consolidator = VeracityConsolidator(db_path=beam.db_path, conn=beam.conn, federation_probe=False)
+    proposals = [_store_proposal(beam, f"conflict_{index}") for index in range(3)]
+    for proposal_id in proposals:
+        retired = consolidator.consolidate_fact("Atlas", "uses", "draft", "inferred", proposal_id)
+    for _ in range(1 if retired_would_win else 4):
+        ordinary = consolidator.consolidate_fact("Atlas", "uses", "approved", "stated", "legacy")
+    assert (retired.confidence > ordinary.confidence) is retired_would_win
+    for proposal_id in proposals:
+        model_refresh.reject_model_refresh_proposal(beam, proposal_id)
+
+    assert consolidator.run_consolidation_pass() == 0
+    assert [fact.object for fact in consolidator.get_consolidated_facts("Atlas")] == ["approved"]
+    assert all(
+        row["superseded_by"] is None
+        for row in beam.conn.execute("SELECT superseded_by FROM consolidated_facts")
+    )
+
+
+def test_consolidation_repairs_only_invalid_retired_winner_links(tmp_path):
+    from mnemosyne.core.veracity_consolidation import VeracityConsolidator, compute_fact_id
+
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    consolidator = VeracityConsolidator(db_path=beam.db_path, conn=beam.conn, federation_probe=False)
+    proposal_id = _store_proposal(beam, "repair_winner")
+
+    def fact(subject, value, source=None):
+        consolidator.consolidate_fact(subject, "uses", value, "stated", source)
+        return compute_fact_id(subject, "uses", value)
+
+    retired = fact("Atlas", "draft", proposal_id)
+    ordinary = fact("Atlas", "approved")
+    separate = fact("Other", "plan")
+    valid_winner = fact("Elm", "current")
+    valid_loser = fact("Elm", "past")
+    mixed_winner = fact("Oak", "current", proposal_id)
+    assert fact("Oak", "current", "42") == mixed_winner
+    mixed_loser = fact("Oak", "past")
+    intermediate = fact("Elm", "proposal", proposal_id)
+    chained = fact("Elm", "older")
+    retired_loser = fact("Atlas", "early draft", proposal_id)
+    chained_to_retired = fact("Atlas", "previous approved")
+
+    edges = {
+        ordinary: retired,
+        separate: retired,
+        valid_loser: valid_winner,
+        mixed_loser: mixed_winner,
+        intermediate: valid_winner,
+        chained: intermediate,
+        retired_loser: retired,
+        chained_to_retired: retired_loser,
+    }
+    for loser, winner in edges.items():
+        beam.conn.execute("UPDATE consolidated_facts SET superseded_by = ? WHERE id = ?", (winner, loser))
+        beam.conn.execute(
+            "INSERT OR IGNORE INTO conflicts (fact_a_id,fact_b_id) VALUES (?,?)",
+            (loser, winner),
+        )
+        beam.conn.execute(
+            "UPDATE conflicts SET resolution = ?, resolved_at = '2026-01-01' "
+            "WHERE min(fact_a_id,fact_b_id) = min(?,?) AND max(fact_a_id,fact_b_id) = max(?,?)",
+            (f"superseded_by_{winner}", loser, winner, loser, winner),
+        )
+    beam.conn.commit()
+    model_refresh.reject_model_refresh_proposal(beam, proposal_id)
+
+    def assert_repaired():
+        assert {item.object for item in consolidator.get_consolidated_facts("Atlas")} == {
+            "approved", "previous approved",
+        }
+        assert {
+            row["id"]: row["superseded_by"] for row in beam.conn.execute(
+                "SELECT id,superseded_by FROM consolidated_facts WHERE superseded_by IS NOT NULL"
+            )
+        } == {
+            loser: winner for loser, winner in edges.items()
+            if loser not in {ordinary, chained_to_retired}
+        }
+        ledger = beam.conn.execute(
+            "SELECT resolution,resolved_at FROM conflicts "
+            "WHERE min(fact_a_id,fact_b_id) = min(?,?) AND max(fact_a_id,fact_b_id) = max(?,?)",
+            (ordinary, retired, ordinary, retired),
+        ).fetchone()
+        assert tuple(ledger) == (None, None)
+
+    consolidator.run_consolidation_pass(pair_budget=0)
+    assert_repaired()
+    consolidator.run_consolidation_pass(pair_budget=0)
+    assert_repaired()
