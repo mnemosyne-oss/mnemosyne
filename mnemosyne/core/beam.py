@@ -9617,12 +9617,14 @@ class BeamMemory:
     # ------------------------------------------------------------------
     # MEMORIA: Structured Fact Retrieval (Phase 2)
     # ------------------------------------------------------------------
-    def _memoria_source_is_eligible_sql(self, derived_alias: str) -> str:
+    def _memoria_source_is_eligible_sql(
+        self, derived_alias: str, source_column: str = "source_memory_id",
+    ) -> str:
         """Exclude features derived from a retired working-memory proposal."""
         eligibility = _proposal_recall_eligibility_sql(self.conn, "wm")
         return (
             "NOT EXISTS (SELECT 1 FROM working_memory wm "
-            f"WHERE wm.id = {derived_alias}.source_memory_id AND NOT {eligibility})"
+            f"WHERE wm.id = {derived_alias}.{source_column} AND NOT {eligibility})"
         )
 
     def _derived_source_is_alive(self, source_id: Optional[str]) -> bool:
@@ -12721,9 +12723,13 @@ class BeamMemory:
         query_lower = query.lower()
 
         # --- Source 1: raw facts table (FTS5 + LIKE fallback) ---
+        eligible = self._memoria_source_is_eligible_sql("raw_fact", "source_msg_id")
         try:
             fts_rows = cursor.execute(
-                "SELECT rowid, rank FROM fts_facts WHERE fts_facts MATCH ? ORDER BY rank, rowid LIMIT ?",
+                "SELECT fts_facts.rowid, fts_facts.rank FROM fts_facts "
+                "JOIN facts raw_fact ON raw_fact.rowid = fts_facts.rowid "
+                f"WHERE fts_facts MATCH ? AND {eligible} "
+                "ORDER BY fts_facts.rank, fts_facts.rowid LIMIT ?",
                 (query, top_k * 3)
             ).fetchall()
         except Exception:
@@ -12735,7 +12741,9 @@ class BeamMemory:
                     continue
                 try:
                     like_rows = cursor.execute(
-                        "SELECT rowid FROM facts WHERE subject LIKE ? OR predicate LIKE ? OR object LIKE ? LIMIT ?",
+                        "SELECT rowid FROM facts raw_fact "
+                        "WHERE (subject LIKE ? OR predicate LIKE ? OR object LIKE ?) "
+                        f"AND {eligible} LIMIT ?",
                         (f"%{word}%", f"%{word}%", f"%{word}%", top_k)
                     ).fetchall()
                 except Exception:
@@ -14870,22 +14878,45 @@ class BeamMemory:
         result = {}
         cursor = self.conn.cursor()
 
-        # 1. Instructions: deactivate duplicates by topic
-        cursor.execute("""
-            SELECT topic, COUNT(*) as cnt, MAX(message_idx) as latest
-            FROM memoria_instructions
-            GROUP BY topic
-            HAVING cnt > 1
-        """)
-        dup_topics = cursor.fetchall()
+        # Proposal-derived rows can retire later. They never decide which
+        # ordinary instruction stays active, even while still pending.
+        proposal_eligible = _proposal_recall_eligibility_sql(self.conn, "proposal")
+        dup_topics = cursor.execute(f"""
+            SELECT instruction.topic,
+                   MAX(CASE WHEN proposal.id IS NULL THEN instruction.message_idx END),
+                   MAX(CASE WHEN instruction.active = 1 AND NOT {proposal_eligible}
+                            THEN instruction.message_idx END)
+            FROM memoria_instructions instruction
+            LEFT JOIN working_memory proposal
+                ON proposal.id = instruction.source_memory_id AND proposal.source = ?
+            WHERE instruction.topic IS NOT NULL
+            GROUP BY instruction.topic
+            HAVING COUNT(*) > 1
+        """, (PROPOSAL_SOURCE,)).fetchall()
+        ordinary_instruction = (
+            "NOT EXISTS (SELECT 1 FROM working_memory proposal "
+            "WHERE proposal.id = memoria_instructions.source_memory_id AND proposal.source = ?)"
+        )
         deactivated = 0
-        for topic, cnt, latest_idx in dup_topics:
-            cursor.execute("""
+        for topic, latest_idx, retired_idx in dup_topics:
+            if latest_idx is None:
+                continue
+            cursor.execute(f"""
                 UPDATE memoria_instructions
                 SET active = 0
                 WHERE topic = ? AND message_idx < ? AND active = 1
-            """, (topic, latest_idx))
+                  AND {ordinary_instruction}
+            """, (topic, latest_idx, PROPOSAL_SOURCE))
             deactivated += cursor.rowcount
+            if retired_idx is not None and retired_idx > latest_idx:
+                # Repair an ordinary winner hidden by a retired proposal
+                # under the former cross-source policy.
+                cursor.execute(f"""
+                    UPDATE memoria_instructions
+                    SET active = 1
+                    WHERE topic = ? AND message_idx = ? AND active = 0
+                      AND {ordinary_instruction}
+                """, (topic, latest_idx, PROPOSAL_SOURCE))
         result["instructions_deactivated"] = deactivated
 
         # 2. Preferences: merge evolution chains by topic key
@@ -14914,14 +14945,17 @@ class BeamMemory:
                 merged_evo += 1
         result["preference_evolutions_merged"] = merged_evo
 
-        # 3. KG: remove exact duplicate triples
+        # 3. KG: dedup ordinary triples together and keep each proposal's
+        # provenance separate so retiring it cannot remove ordinary evidence.
         cursor.execute("""
             DELETE FROM memoria_kg
             WHERE rowid NOT IN (
-                SELECT MIN(rowid) FROM memoria_kg
-                GROUP BY subject, predicate, object
+                SELECT MIN(triple.rowid) FROM memoria_kg triple
+                LEFT JOIN working_memory proposal
+                    ON proposal.id = triple.source_memory_id AND proposal.source = ?
+                GROUP BY triple.subject, triple.predicate, triple.object, proposal.id
             )
-        """)
+        """, (PROPOSAL_SOURCE,))
         result["kg_duplicates_removed"] = cursor.rowcount
 
         self.conn.commit()

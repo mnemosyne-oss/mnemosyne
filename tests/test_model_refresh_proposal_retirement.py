@@ -643,3 +643,80 @@ def test_fact_history_omits_value_copied_from_retired_proposal(tmp_path):
     assert result["facts"][0]["value"] == "80"
     assert result["facts"][0]["previous_value"] is None
     assert "250" not in result["context"]
+
+
+@pytest.mark.parametrize("previously_deactivated", [False, True], ids=["fresh", "legacy"])
+def test_instruction_dedup_keeps_latest_ordinary_instruction(tmp_path, previously_deactivated):
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    proposal_id = _store_proposal(beam, "instruction_dedup")
+    beam.conn.executemany(
+        "INSERT INTO memoria_instructions (session_id,message_idx,instruction,topic,source_memory_id,active) "
+        "VALUES (?,?,?,?,?,?)",
+        [
+            ("retire", 1, "Older ordinary rule", "reporting", None, int(not previously_deactivated)),
+            ("retire", 2, "Latest ordinary rule", "reporting", None, int(not previously_deactivated)),
+            ("other", 3, "Proposal-only rule", "reporting", proposal_id, 1),
+        ],
+    )
+    beam.conn.commit()
+    if not previously_deactivated:
+        beam._deduplicate_memoria_cross_session()
+        ordinary = beam.memoria_retrieve("reporting", ability="IF")
+        assert [fact["instruction"] for fact in ordinary["facts"]] == ["Latest ordinary rule"]
+    model_refresh.reject_model_refresh_proposal(beam, proposal_id)
+    if previously_deactivated:
+        beam._deduplicate_memoria_cross_session()
+    result = beam.memoria_retrieve("reporting", ability="IF")
+    assert [fact["instruction"] for fact in result["facts"]] == ["Latest ordinary rule"]
+
+
+def test_kg_dedup_preserves_ordinary_triple_when_proposal_is_retired(tmp_path):
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    proposal_id = _store_proposal(beam, "kg_dedup")
+    beam.conn.executemany(
+        "INSERT INTO memoria_kg (session_id,message_idx,subject,predicate,object,source_memory_id) "
+        "VALUES (?,?,?,?,?,?)",
+        [
+            ("retire", 1, "Reporting", "requires", "a checklist", proposal_id),
+            ("retire", 2, "Reporting", "requires", "a checklist", None),
+            ("other", 3, "Reporting", "requires", "a checklist", None),
+        ],
+    )
+    beam.conn.commit()
+    # A pending proposal must not consume the only durable copy.
+    beam._deduplicate_memoria_cross_session()
+    model_refresh.reject_model_refresh_proposal(beam, proposal_id)
+    result = beam.memoria_retrieve("Reporting", ability="MR")
+    assert [fact["object"] for fact in result["facts"]] == ["a checklist"]
+    assert [
+        row["session_id"]
+        for row in beam.conn.execute(
+            "SELECT session_id FROM memoria_kg WHERE source_memory_id IS NULL"
+        )
+    ] == ["retire"]
+
+
+@pytest.mark.parametrize("query", ["atlas", "atlas OR"], ids=["fts", "like-fallback"])
+def test_fact_recall_filters_retired_proposals_before_candidate_limits(tmp_path, monkeypatch, query):
+    monkeypatch.setenv("MNEMOSYNE_FACT_RECALL_ENABLED", "1")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    proposal_id = _store_proposal(beam, "raw_fact")
+    beam.conn.executemany(
+        "INSERT INTO facts (fact_id,session_id,subject,predicate,object,source_msg_id,confidence) "
+        "VALUES (?,?,?,?,?,?,?)",
+        [
+            (f"retired-{idx}", "retire", "Atlas", "tracks", f"draft-{idx}", proposal_id, 0.99)
+            for idx in range(4)
+        ] + [("legacy-fact", "retire", "Atlas", "tracks", "approved note", "42", 0.9)],
+    )
+    beam.conn.commit()
+
+    assert beam.fact_recall(query, top_k=1)[0]["source_msg_id"] == proposal_id
+    assert any(row["id"].startswith("cf_retired-") for row in beam.recall(query, top_k=10))
+    model_refresh.reject_model_refresh_proposal(beam, proposal_id)
+    assert [row["fact_id"] for row in beam.fact_recall(query, top_k=1)] == ["legacy-fact"]
+    results = beam.recall(query, top_k=10)
+    assert any(row["id"] == "cf_legacy-fact" for row in results)
+    assert not any(row["id"].startswith("cf_retired-") for row in results)
