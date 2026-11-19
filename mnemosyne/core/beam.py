@@ -10178,7 +10178,7 @@ class BeamMemory:
         # so the engine path enforces the same isolation/validity
         # contract as the linear path. /review found that omitting
         # them under flag=ON was a data-isolation regression (P1).
-        if os.environ.get("MNEMOSYNE_POLYPHONIC_RECALL", "0") == "1":
+        if resolve_beam_runtime().polyphonic_recall:
             poly_results = self._recall_polyphonic(
                 query, top_k,
                 from_date=from_date, to_date=to_date,
@@ -11743,7 +11743,7 @@ class BeamMemory:
                 "embedding_dimension": getattr(_embeddings, "EMBEDDING_DIM", None),
                 "embedding_query_prefix": os.environ.get("MNEMOSYNE_EMBEDDING_QUERY_PREFIX", ""),
                 "beam_optimizations": _BEAM_MODE,
-                "polyphonic_recall": os.environ.get("MNEMOSYNE_POLYPHONIC_RECALL", "0") == "1",
+                "polyphonic_recall": resolve_beam_runtime().polyphonic_recall,
                 "query_intent": os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1",
                 "fact_recall": os.environ.get("MNEMOSYNE_FACT_RECALL_ENABLED", "0") == "1",
                 "lenient_fact_match": _env_truthy("MNEMOSYNE_LENIENT_FACT_MATCH"),

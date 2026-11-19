@@ -390,6 +390,7 @@ class BeamRuntimeConfig:
     """Typed runtime settings consumed by Beam on each configuration lookup."""
 
     cross_session: bool
+    polyphonic_recall: bool
 
 
 class MnemosyneConfig:
@@ -709,7 +710,10 @@ class MnemosyneConfig:
 
     def resolve_beam_runtime(self) -> BeamRuntimeConfig:
         """Resolve Beam's hot-reloadable runtime settings with typed values."""
-        return BeamRuntimeConfig(cross_session=self.get_bool("cross_session", False))
+        return BeamRuntimeConfig(
+            cross_session=self.get_bool("cross_session", False),
+            polyphonic_recall=self.get_bool("polyphonic_recall", False),
+        )
 
     def set(self, key: str, value: Any) -> None:
         """Write a config value to config.yaml.
