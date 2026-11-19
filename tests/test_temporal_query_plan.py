@@ -61,12 +61,14 @@ def engine(tmp_path_factory):
     return PolyphonicRecallEngine(db_path=path)
 
 
-def _shipped_sql():
+def _shipped_sql(conn=None):
     """The statement `_temporal_voice` runs, lifted from the module source.
 
-    The f-string interpolates ``{echo_clause}`` — an empty string when no ids are excluded —
-    so the literal braces are stripped here before the SQL is handed to EXPLAIN. Anything
-    else and sqlite3 reads the braces as syntax.
+    The f-string interpolates two fragments: ``{retirement}`` (the recall-eligibility
+    predicate) and ``{echo_clause}`` (an empty string when no ids are excluded). Both are
+    substituted here before the SQL is handed to EXPLAIN — a bare brace is a syntax error
+    to sqlite3. Without a connection the eligibility predicate falls back to ``1``, which
+    is enough for the static assertions below.
     """
     from mnemosyne.core import polyphonic_recall as mod
 
@@ -75,7 +77,18 @@ def _shipped_sql():
     start = text.index("SELECT id, content, timestamp, importance")
     end = text.index('"""', start)
     sql = " ".join(text[start:end].split())
-    return sql.replace("{echo_clause}", "").strip()
+    sql = sql.replace("{echo_clause}", "")
+    if "{retirement}" in sql:
+        from mnemosyne.core.beam import _working_recall_eligibility_sql
+
+        predicate = (
+            _working_recall_eligibility_sql(conn, exclude_superseded=False)
+            if conn is not None
+            else "1"
+        )
+        sql = sql.replace("{retirement}", predicate)
+    assert "{" not in sql, f"unsubstituted f-string placeholder in the shipped SQL: {sql}"
+    return sql.strip()
 
 
 def _cutoff():
@@ -97,8 +110,8 @@ def test_shipped_query_plan_is_pinned(engine):
     idx_wm_timestamp. If this ever reports SEARCH, an expression index landed and
     ACCEPTED_SCAN_MS should be revisited in the same change.
     """
-    sql = _shipped_sql()
     conn = sqlite3.connect(str(engine.db_path))
+    sql = _shipped_sql(conn)
     plan = " ".join(row[3] for row in conn.execute(f"EXPLAIN QUERY PLAN {sql}", (_cutoff(), 20)))
     conn.close()
     assert "idx_wm_timestamp" not in plan, (
@@ -109,8 +122,8 @@ def test_shipped_query_plan_is_pinned(engine):
 
 def test_shipped_query_stays_within_the_accepted_budget(engine):
     """Median wall clock of the real statement, 20 executions on 50k rows."""
-    sql = _shipped_sql()
     conn = sqlite3.connect(str(engine.db_path))
+    sql = _shipped_sql(conn)
     samples = []
     for _ in range(20):
         start = time.perf_counter()
