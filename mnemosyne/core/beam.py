@@ -14897,7 +14897,7 @@ class BeamMemory:
             "NOT EXISTS (SELECT 1 FROM working_memory proposal "
             "WHERE proposal.id = memoria_instructions.source_memory_id AND proposal.source = ?)"
         )
-        deactivated = 0
+        deactivated = reactivated = 0
         for topic, latest_idx, retired_idx in dup_topics:
             if latest_idx is None:
                 continue
@@ -14917,6 +14917,7 @@ class BeamMemory:
                     WHERE topic = ? AND message_idx = ? AND active = 0
                       AND {ordinary_instruction}
                 """, (topic, latest_idx, PROPOSAL_SOURCE))
+                reactivated += cursor.rowcount
         result["instructions_deactivated"] = deactivated
 
         # 2. Preferences: merge evolution chains by topic key
@@ -14959,6 +14960,13 @@ class BeamMemory:
         result["kg_duplicates_removed"] = cursor.rowcount
 
         self.conn.commit()
+        if deactivated or reactivated:
+            if isinstance(self.conn, _BeamConnection) and self.conn.in_transaction:
+                self.conn._after_commit_hooks.append(
+                    lambda: self._invalidate_query_cache_after_commit("memoria_dedup")
+                )
+            else:
+                self._invalidate_query_cache_after_commit("memoria_dedup")
         result["status"] = "ok"
         return result
 

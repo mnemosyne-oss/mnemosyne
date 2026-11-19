@@ -720,3 +720,76 @@ def test_fact_recall_filters_retired_proposals_before_candidate_limits(tmp_path,
     results = beam.recall(query, top_k=10)
     assert any(row["id"] == "cf_legacy-fact" for row in results)
     assert not any(row["id"].startswith("cf_retired-") for row in results)
+
+
+def test_consolidated_fact_recall_keeps_mixed_and_legacy_sources(tmp_path):
+    from mnemosyne.core.veracity_consolidation import VeracityConsolidator
+
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    rejected = _store_proposal(beam, "consolidated_rejected")
+    applied = _store_proposal(beam, "consolidated_applied")
+    pending = _store_proposal(beam, "consolidated_pending")
+    ordinary = beam.remember("Durable reporting source.")
+    assert ordinary
+    consolidator = VeracityConsolidator(db_path=beam.db_path, conn=beam.conn)
+    cases = {
+        "obsolete": [rejected, applied],
+        "confirmed": [rejected, ordinary],
+        "pending": [applied, pending],
+        "legacy": [rejected, "42"],
+        "unattributed": [None],
+    }
+    for value, sources in cases.items():
+        for source_id in sources:
+            consolidator.consolidate_fact(
+                "Atlas", f"tracks_{value}", value, veracity="stated", source=source_id,
+            )
+
+    expected = {f"Atlas tracks_{value} {value}" for value in cases}
+    assert {item["content"] for item in beam.fact_recall("atlas")} == expected
+    model_refresh.reject_model_refresh_proposal(beam, rejected)
+    model_refresh.apply_model_refresh_proposal(beam, applied)
+
+    expected.remove("Atlas tracks_obsolete obsolete")
+    assert {item["content"] for item in beam.fact_recall("atlas")} == expected
+    assert {item.object for item in consolidator.get_consolidated_facts("Atlas")} == (
+        cases.keys() - {"obsolete"}
+    )
+    assert {
+        item.metadata["object"] for item in beam._get_polyphonic_engine()._fact_voice("atlas")
+    } == cases.keys() - {"obsolete"}
+
+
+def test_instruction_repair_invalidates_warmed_enhanced_recall_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    # Exercise the IF reader through the actual cache and recall supplement
+    # without expanding the production query classifier's routes.
+    monkeypatch.setattr(beam, "_classify_ability", lambda query: "IF")
+    proposal_id = _store_proposal(beam, "cached_instruction")
+    beam.conn.executemany(
+        "INSERT INTO memoria_instructions (session_id,message_idx,instruction,topic,source_memory_id,active) "
+        "VALUES (?,?,?,?,?,?)",
+        [
+            ("retire", 1, "Use reporting checklists", "reporting", None, 0),
+            ("other", 2, "Skip reporting checklists", "reporting", proposal_id, 1),
+        ],
+    )
+    beam.conn.commit()
+    model_refresh.reject_model_refresh_proposal(beam, proposal_id)
+
+    def recall():
+        return beam.recall_enhanced(
+            "reporting checklists", top_k=5, use_mmr=False,
+            use_synonyms=False, use_weibull=False, use_intent=False, _track_recall=False,
+        )
+
+    assert recall() == []
+    hits_before = beam._query_cache.stats()["hits"]
+    assert recall() == []
+    assert beam._query_cache.stats()["hits"] == hits_before + 1
+    beam._deduplicate_memoria_cross_session()
+    assert beam.memoria_retrieve("reporting checklists", ability="IF")["facts"]
+    assert any("Use reporting checklists" in row["content"] for row in recall())

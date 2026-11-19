@@ -1030,6 +1030,10 @@ class VeracityConsolidator:
     def get_consolidated_facts(self, subject: str = None, min_confidence: float = 0.5) -> List[ConsolidatedFact]:
         """
         Get consolidated facts, optionally filtered by subject and confidence.
+
+        A fact remains visible unless every recorded source is a known
+        retired model-refresh proposal. Unattributed and legacy sources
+        retain their existing behavior.
         
         Args:
             subject: Filter by subject
@@ -1073,7 +1077,34 @@ class VeracityConsolidator:
                 id=row["id"],
             ))
         
-        return facts
+        source_ids = {
+            source
+            for fact in facts if isinstance(fact.sources, list)
+            for source in fact.sources if isinstance(source, str) and source
+        }
+        if not source_ids:
+            return facts
+
+        from mnemosyne.core.beam import _select_recall_rows_by_ids, _working_recall_eligibility_sql
+
+        source_eligible = _working_recall_eligibility_sql(self.conn, exclude_superseded=False)
+        if source_eligible == "1":
+            return facts
+        retired_sources = {
+            row[0] for row in _select_recall_rows_by_ids(
+                self.conn,
+                "SELECT id FROM working_memory WHERE id IN ({placeholders}) "
+                f"AND NOT ({source_eligible})",
+                source_ids,
+            )
+        }
+        return [
+            fact for fact in facts
+            if not (
+                isinstance(fact.sources, list) and fact.sources
+                and all(isinstance(source, str) and source in retired_sources for source in fact.sources)
+            )
+        ]
     
     def get_high_confidence_summary(self, subject: str, threshold: float = 0.8) -> str:
         """
