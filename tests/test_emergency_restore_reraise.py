@@ -154,6 +154,88 @@ def test_emergency_restore_reports_newest_of_two_refusals(tmp_path, newest_kind)
     assert db.read_bytes() == before
 
 
+def test_emergency_restore_reports_target_sidecars_over_bad_backup(tmp_path):
+    db = tmp_path / "source.db"
+    with closing(sqlite3.connect(db)) as conn, conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE t(v)")
+        conn.execute("INSERT INTO t VALUES ('original')")
+    directory = tmp_path / "backups"
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute("SELECT v FROM t").fetchall()
+        older = Path(recovery.create_backup(db, directory)["backup_path"])
+        newer = Path(recovery.create_backup(db, directory)["backup_path"])
+    assert newer.name > older.name
+    meta_path = newer.with_suffix(".gz.json")
+    metadata = json.loads(meta_path.read_text())
+    metadata["backup_checksum"] = "0" * 16
+    meta_path.write_text(json.dumps(metadata))
+
+    assert recovery.verify_integrity(db)
+    sidecars = [db.with_name(db.name + suffix) for suffix in ("-wal", "-shm")]
+    before = [path.read_bytes() for path in (db, *sidecars)]
+    with pytest.raises(recovery._RestoreRefusedError, match="sidecar exists"):
+        recovery.emergency_restore(directory, db)
+    assert [path.read_bytes() for path in (db, *sidecars)] == before
+
+    with closing(sqlite3.connect(db)) as conn:
+        assert conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+    assert recovery.emergency_restore(directory, db)["backup_used"] == str(older)
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+def test_emergency_restore_stops_when_sidecar_appears_after_preflight(
+    tmp_path, monkeypatch, suffix,
+):
+    db = tmp_path / "source.db"
+    _make_simple_db(db)
+    directory = tmp_path / "backups"
+    older = Path(recovery.create_backup(db, directory)["backup_path"])
+    newer = Path(recovery.create_backup(db, directory)["backup_path"])
+    assert newer.name > older.name
+    before = db.read_bytes()
+    sidecar = db.with_name(db.name + suffix)
+
+    attempts = []
+    restore_backup = recovery.restore_backup
+
+    def restore_after_sidecar_appears(backup, target):
+        if not attempts:
+            assert not sidecar.exists()
+            sidecar.touch()
+        attempts.append(backup)
+        return restore_backup(backup, target)
+
+    monkeypatch.setattr(recovery, "restore_backup", restore_after_sidecar_appears)
+    with pytest.raises(recovery._RestoreRefusedError, match="sidecar exists") as caught:
+        recovery.emergency_restore(directory, db)
+    assert str(sidecar) in str(caught.value)
+    assert attempts == [newer]
+    assert db.read_bytes() == before
+    assert sidecar.read_bytes() == b""
+
+
+def test_emergency_restore_reports_target_writer_over_bad_backup(tmp_path):
+    db = tmp_path / "source.db"
+    _make_simple_db(db)
+    directory = tmp_path / "backups"
+    older = Path(recovery.create_backup(db, directory)["backup_path"])
+    newer = Path(recovery.create_backup(db, directory)["backup_path"])
+    assert newer.name > older.name
+    meta_path = newer.with_suffix(".gz.json")
+    metadata = json.loads(meta_path.read_text())
+    metadata["backup_checksum"] = "0" * 16
+    meta_path.write_text(json.dumps(metadata))
+
+    before = db.read_bytes()
+    with closing(sqlite3.connect(db)) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        with pytest.raises(recovery._RestoreRefusedError, match="live writer"):
+            recovery.emergency_restore(directory, db)
+        assert db.read_bytes() == before
+    assert recovery.emergency_restore(directory, db)["backup_used"] == str(older)
+
+
 def test_emergency_restore_logs_and_chains_non_refusal_failures(tmp_path, caplog):
     db_path = tmp_path / "source.db"
     _make_simple_db(db_path)
