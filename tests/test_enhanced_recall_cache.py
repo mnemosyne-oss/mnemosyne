@@ -1080,6 +1080,8 @@ def test_pipeline_flags_and_process_ranking_configuration_change_digest(enhanced
         mmr_lambda=0.7,
         recall_kwargs={},
     )
+    monkeypatch.delenv("MNEMOSYNE_CROSS_TIER_DEDUP", raising=False)
+    monkeypatch.setattr(beam_module, "weibull_boost", object())
     baseline = memory._enhanced_recall_cache_key(**common)
 
     assert memory._enhanced_recall_cache_key(**(common | {"use_mmr": True})) != baseline
@@ -1088,16 +1090,20 @@ def test_pipeline_flags_and_process_ranking_configuration_change_digest(enhanced
     assert memory._enhanced_recall_cache_key(**(common | {"use_synonyms": True})) != baseline
     assert memory._enhanced_recall_cache_key(**(common | {"use_associative": True})) != baseline
 
-    monkeypatch.setattr(beam_module, "TIER2_DAYS", beam_module.TIER2_DAYS + 1)
-    assert memory._enhanced_recall_cache_key(**common) != baseline
+    with monkeypatch.context() as context:
+        context.setattr(beam_module, "TIER2_DAYS", beam_module.TIER2_DAYS + 1)
+        assert memory._enhanced_recall_cache_key(**common) != baseline
+    assert memory._enhanced_recall_cache_key(**common) == baseline
 
-    monkeypatch.undo()
-    monkeypatch.setenv("MNEMOSYNE_CROSS_TIER_DEDUP", "0")
-    assert memory._enhanced_recall_cache_key(**common) != baseline
+    with monkeypatch.context() as context:
+        context.setenv("MNEMOSYNE_CROSS_TIER_DEDUP", "0")
+        assert memory._enhanced_recall_cache_key(**common) != baseline
+    assert memory._enhanced_recall_cache_key(**common) == baseline
 
-    monkeypatch.undo()
-    monkeypatch.setattr(beam_module, "weibull_boost", None)
-    assert memory._enhanced_recall_cache_key(**common) != baseline
+    with monkeypatch.context() as context:
+        context.setattr(beam_module, "weibull_boost", None)
+        assert memory._enhanced_recall_cache_key(**common) != baseline
+    assert memory._enhanced_recall_cache_key(**common) == baseline
 
 
 @pytest.mark.parametrize("restart", [False, True])
