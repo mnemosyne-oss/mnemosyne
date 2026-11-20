@@ -30,7 +30,7 @@ def enhanced(monkeypatch, tmp_path: Path):
     """A deterministic enhanced-recall instance whose base pipeline is observable."""
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     memory = BeamMemory(session_id="session-a", db_path=tmp_path / "memories.db")
     calls = []
@@ -182,7 +182,7 @@ def test_successful_invalidate_clears_persisted_enhanced_recall_cache(monkeypatc
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     db_path = tmp_path / "memories.db"
     memory = None
@@ -224,7 +224,7 @@ def test_successful_forget_working_clears_persisted_enhanced_recall_cache(
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     db_path = tmp_path / "memories.db"
     memory = forgetter = fresh = None
@@ -277,7 +277,7 @@ def test_failed_cross_session_forget_keeps_cache_and_memory(
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     owner = other = None
     try:
@@ -314,7 +314,7 @@ def test_invalidate_without_local_query_cache_clears_persisted_enhanced_recall_c
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     db_path = tmp_path / "memories.db"
     source = None
@@ -357,7 +357,7 @@ def test_remember_without_local_query_cache_clears_persisted_enhanced_recall_cac
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     db_path = tmp_path / "memories.db"
     source = None
@@ -403,7 +403,7 @@ def test_dedup_remember_without_local_query_cache_evicts_persisted_result(
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     db_path = tmp_path / "memories.db"
     source = None
@@ -451,7 +451,7 @@ def test_remember_invalidates_persisted_cache_when_post_commit_trim_raises(
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     db_path = tmp_path / "memories.db"
     source = None
@@ -522,7 +522,7 @@ def test_remember_finally_invalidates_cache_refilled_during_enrichment(monkeypat
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     db_path = tmp_path / "memories.db"
     memory = None
@@ -556,7 +556,7 @@ def test_new_remember_finally_invalidates_cache_refilled_during_enrichment(monke
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     db_path = tmp_path / "memories.db"
     memory = None
@@ -591,7 +591,7 @@ def test_new_remember_finally_invalidates_cache_refilled_during_enrichment_excep
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     db_path = tmp_path / "memories.db"
     writer = None
@@ -654,7 +654,7 @@ def test_dedup_remember_finally_invalidates_cache_refilled_during_enrichment_exc
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     db_path = tmp_path / "memories.db"
     writer = None
@@ -929,7 +929,7 @@ def test_successful_invalidate_episodic_memory_invalidates_enhanced_recall_cache
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     memory = None
     fresh = None
@@ -1065,7 +1065,7 @@ def test_effective_request_variants_do_not_cross_hit(enhanced):
 
 def test_pipeline_flags_and_process_ranking_configuration_change_digest(enhanced, monkeypatch):
     memory, _ = enhanced
-    runtime = SimpleNamespace(cross_session=False)
+    runtime = SimpleNamespace(cross_session=False, polyphonic_recall=False)
     common = dict(
         original_query="private query",
         expanded_query="private query",
@@ -1266,7 +1266,7 @@ def test_private_enhanced_cache_key_weight_fallback_honors_yaml_over_env(
         original_query="private query",
         expanded_query="private query",
         top_k=3,
-        runtime=SimpleNamespace(cross_session=False),
+        runtime=SimpleNamespace(cross_session=False, polyphonic_recall=False),
         use_weibull=False,
         use_mmr=False,
         use_intent=False,
@@ -1305,7 +1305,7 @@ def test_private_enhanced_cache_key_normalizes_intent_adjustment_fallback(
         original_query="private query",
         expanded_query="private query",
         top_k=3,
-        runtime=SimpleNamespace(cross_session=False),
+        runtime=SimpleNamespace(cross_session=False, polyphonic_recall=False),
         use_weibull=False,
         use_mmr=False,
         use_intent=True,
@@ -1491,7 +1491,7 @@ def test_enhanced_cache_key_uses_effective_finite_temporal_halflife(enhanced):
         original_query="nonfinite temporal cache key",
         expanded_query="nonfinite temporal cache key",
         top_k=3,
-        runtime=SimpleNamespace(cross_session=False),
+        runtime=SimpleNamespace(cross_session=False, polyphonic_recall=False),
         use_weibull=False,
         use_mmr=False,
         use_intent=False,
@@ -1557,7 +1557,7 @@ def test_enhanced_extreme_python_int_uses_defaults_and_finite_cache_material(
 
 def test_sessions_cross_session_and_sibling_databases_are_isolated(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
-    runtime = SimpleNamespace(cross_session=False)
+    runtime = SimpleNamespace(cross_session=False, polyphonic_recall=False)
     monkeypatch.setattr(beam_module, "resolve_beam_runtime", lambda: runtime)
     db_a = tmp_path / "a.db"
     session_a = BeamMemory(session_id="session-a", db_path=db_a)
@@ -1640,7 +1640,7 @@ def test_consolidate_to_episodic_invalidates_warmed_v3_cache(monkeypatch, tmp_pa
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     memory = None
     try:
@@ -1690,7 +1690,7 @@ def test_consolidate_enrichment_failure_still_invalidates_warmed_v3_cache(
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     memory = None
     try:
@@ -1741,7 +1741,7 @@ def test_reclaim_orphans_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     memory = None
     try:
@@ -1793,7 +1793,7 @@ def test_degrade_episodic_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     memory = None
     try:
@@ -1849,7 +1849,7 @@ def test_sleep_invalidates_warmed_v3_cache(monkeypatch, tmp_path):
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     memory = None
     try:
@@ -1933,7 +1933,7 @@ def test_persistent_cache_does_not_reuse_main_16_graph_ranking(monkeypatch, tmp_
     """
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
     db_path = tmp_path / "memories.db"
     cache_path = tmp_path / "query_cache.db"
@@ -1998,7 +1998,7 @@ def test_warm_persistent_cache_does_not_serve_a_pre_clamp_score(monkeypatch, tmp
     """
     monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
     monkeypatch.setattr(
-        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False, polyphonic_recall=False)
     )
 
     legacy_stamp = (
