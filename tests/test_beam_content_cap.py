@@ -265,7 +265,7 @@ class TestEnhancedCacheIdentity:
         monkeypatch.setattr(beam_module, "RECALL_CONTENT_CAP", cap_value)
         runtime = beam_module._cross_session_enabled()  # noqa: F841
         from types import SimpleNamespace
-        runtime = SimpleNamespace(cross_session=False)
+        runtime = SimpleNamespace(cross_session=False, polyphonic_recall=False)
         return beam._enhanced_recall_cache_key(
             original_query="q", expanded_query="q", top_k=10, runtime=runtime,
             use_weibull=False, use_mmr=False, use_intent=False, use_synonyms=False,
