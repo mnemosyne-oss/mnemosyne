@@ -600,14 +600,13 @@ def _is_contentless_fts5(ddl: str) -> bool:
     options_start = tokens.index("(")
     if tokens[options_start - 1].strip("\"'`[]") != "fts5":
         return False
-    options = tokens[options_start:]
-    return any(
-        delimiter in ("(", ",") and key == "content" and equals == "="
-        and value in ("''", '""', "``", "[]") and end in (",", ")")
-        for delimiter, key, equals, value, end in zip(
-            options, options[1:], options[2:], options[3:], options[4:]
-        )
-    )
+    # FTS5 accepts a prefix of "content" and interprets an omitted value
+    # as empty. The DDL has already been parsed successfully by SQLite.
+    for index in range(options_start, len(tokens) - 3):
+        delimiter, key, equals, value = tokens[index:index + 4]
+        if delimiter in ("(", ",") and "content".startswith(key) and equals == "=":
+            return value in (",", ")", "''", '""', "``", "[]")
+    return False
 
 
 _VT_MASTER_RE = re.compile(

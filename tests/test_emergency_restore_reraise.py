@@ -183,6 +183,38 @@ def test_emergency_restore_reports_target_sidecars_over_bad_backup(tmp_path):
     assert recovery.emergency_restore(directory, db)["backup_used"] == str(older)
 
 
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+def test_emergency_restore_stops_when_sidecar_appears_after_preflight(
+    tmp_path, monkeypatch, suffix,
+):
+    db = tmp_path / "source.db"
+    _make_simple_db(db)
+    directory = tmp_path / "backups"
+    older = Path(recovery.create_backup(db, directory)["backup_path"])
+    newer = Path(recovery.create_backup(db, directory)["backup_path"])
+    assert newer.name > older.name
+    before = db.read_bytes()
+    sidecar = db.with_name(db.name + suffix)
+
+    attempts = []
+    restore_backup = recovery.restore_backup
+
+    def restore_after_sidecar_appears(backup, target):
+        if not attempts:
+            assert not sidecar.exists()
+            sidecar.touch()
+        attempts.append(backup)
+        return restore_backup(backup, target)
+
+    monkeypatch.setattr(recovery, "restore_backup", restore_after_sidecar_appears)
+    with pytest.raises(recovery._RestoreRefusedError, match="sidecar exists") as caught:
+        recovery.emergency_restore(directory, db)
+    assert str(sidecar) in str(caught.value)
+    assert attempts == [newer]
+    assert db.read_bytes() == before
+    assert sidecar.read_bytes() == b""
+
+
 def test_emergency_restore_reports_target_writer_over_bad_backup(tmp_path):
     db = tmp_path / "source.db"
     _make_simple_db(db)

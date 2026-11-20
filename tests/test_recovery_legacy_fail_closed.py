@@ -219,7 +219,11 @@ def test_legacy_sql_restore_preserves_fts_snapshot_rowid_gaps(tmp_path):
 @pytest.mark.parametrize(("dump_style", "missing"), [
     ("direct", None), ("bootstrap", None),
     ("direct", "one"), ("bootstrap", "one"), ("bootstrap", "all"),
-    ("direct", "all"), ("direct-quoted", "all"),
+    ("direct", "all"),
+    ("direct-quoted", None), ("direct-quoted", "all"),
+    ("direct-omitted", "all"), ("direct-prefix", "all"),
+    ("direct-prefix-omitted", "all"),
+    ("direct-brackets", "all"), ("direct-backticks", "all"),
 ])
 def test_legacy_sql_restore_contentless_shadow_snapshot(tmp_path, dump_style, missing):
     source = tmp_path / "source.db"
@@ -237,6 +241,16 @@ def test_legacy_sql_restore_contentless_shadow_snapshot(tmp_path, dump_style, mi
     header = "CREATE VIRTUAL TABLE ft USING fts5(body, content='');"
     if dump_style == "direct-quoted":
         header = """CREATE VIRTUAL TABLE ft USING "FTS5"(body, CONTENT = "");"""
+    elif dump_style == "direct-omitted":
+        header = "CREATE VIRTUAL TABLE ft USING fts5(body, content=);"
+    elif dump_style == "direct-prefix":
+        header = "CREATE VIRTUAL TABLE ft USING fts5(body, c='');"
+    elif dump_style == "direct-prefix-omitted":
+        header = "CREATE VIRTUAL TABLE ft USING fts5(body, conten=, columnsize=1);"
+    elif dump_style == "direct-brackets":
+        header = "CREATE VIRTUAL TABLE ft USING fts5(body, content=[]);"
+    elif dump_style == "direct-backticks":
+        header = "CREATE VIRTUAL TABLE ft USING fts5(body, content=``);"
     elif dump_style == "bootstrap":
         header = (
             "PRAGMA writable_schema=ON;\n"
