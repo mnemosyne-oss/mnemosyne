@@ -10152,6 +10152,7 @@ class BeamMemory:
                importance_weight: float = None,
                explain: bool = False,
                _cross_session: Optional[bool] = None,
+               _polyphonic_recall: Optional[bool] = None,
                _skip_provenance: bool = False,
                _resolved_weights: Optional[_RecallWeightSnapshot] = None,
                exclude_captures: Optional[ExclusionSnapshot] = None,
@@ -10220,7 +10221,12 @@ class BeamMemory:
         # so the engine path enforces the same isolation/validity
         # contract as the linear path. /review found that omitting
         # them under flag=ON was a data-isolation regression (P1).
-        if resolve_beam_runtime().polyphonic_recall:
+        polyphonic_recall = (
+            resolve_beam_runtime().polyphonic_recall
+            if _polyphonic_recall is None
+            else _polyphonic_recall
+        )
+        if polyphonic_recall:
             poly_results = self._recall_polyphonic(
                 query, top_k,
                 from_date=from_date, to_date=to_date,
@@ -11785,7 +11791,7 @@ class BeamMemory:
                 "embedding_dimension": getattr(_embeddings, "EMBEDDING_DIM", None),
                 "embedding_query_prefix": os.environ.get("MNEMOSYNE_EMBEDDING_QUERY_PREFIX", ""),
                 "beam_optimizations": _BEAM_MODE,
-                "polyphonic_recall": resolve_beam_runtime().polyphonic_recall,
+                "polyphonic_recall": runtime.polyphonic_recall,
                 "query_intent": os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1",
                 "fact_recall": os.environ.get("MNEMOSYNE_FACT_RECALL_ENABLED", "0") == "1",
                 "lenient_fact_match": _env_truthy("MNEMOSYNE_LENIENT_FACT_MATCH"),
@@ -11934,6 +11940,7 @@ class BeamMemory:
             expanded_query,
             top_k=top_k * 2,
             _cross_session=runtime.cross_session,
+            _polyphonic_recall=runtime.polyphonic_recall,
             _resolved_weights=weight_snapshot,
             _skip_provenance=True,
             **kwargs,
