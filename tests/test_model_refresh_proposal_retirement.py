@@ -842,8 +842,10 @@ def test_consolidation_repairs_only_invalid_retired_winner_links(tmp_path):
     retired_loser = fact("Atlas", "early draft", proposal_id)
     chained_to_retired = fact("Atlas", "previous approved")
 
+    other_ordinary = fact("Atlas", "another approved")
     edges = {
         ordinary: retired,
+        other_ordinary: retired,
         separate: retired,
         valid_loser: valid_winner,
         mixed_loser: mixed_winner,
@@ -852,6 +854,7 @@ def test_consolidation_repairs_only_invalid_retired_winner_links(tmp_path):
         retired_loser: retired,
         chained_to_retired: retired_loser,
     }
+    unrelated_resolution = "manual_review"
     for loser, winner in edges.items():
         beam.conn.execute("UPDATE consolidated_facts SET superseded_by = ? WHERE id = ?", (winner, loser))
         beam.conn.execute(
@@ -861,14 +864,28 @@ def test_consolidation_repairs_only_invalid_retired_winner_links(tmp_path):
         beam.conn.execute(
             "UPDATE conflicts SET resolution = ?, resolved_at = '2026-01-01' "
             "WHERE min(fact_a_id,fact_b_id) = min(?,?) AND max(fact_a_id,fact_b_id) = max(?,?)",
-            (f"superseded_by_{winner}", loser, winner, loser, winner),
+            (unrelated_resolution if loser == other_ordinary else f"superseded_by_{winner}",
+             loser, winner, loser, winner),
         )
     beam.conn.commit()
     model_refresh.reject_model_refresh_proposal(beam, proposal_id)
 
+    def read_ledger():
+        return {
+            tuple(sorted((row["fact_a_id"], row["fact_b_id"]))): (row["resolution"], row["resolved_at"])
+            for row in beam.conn.execute("SELECT fact_a_id,fact_b_id,resolution,resolved_at FROM conflicts")
+        }
+
+    expected_ledger = read_ledger()
+    for loser in (ordinary, chained_to_retired):
+        key = tuple(sorted((loser, edges[loser])))
+        assert expected_ledger[key] == (f"superseded_by_{edges[loser]}", "2026-01-01")
+        expected_ledger[key] = (None, None)
+    assert expected_ledger[tuple(sorted((other_ordinary, retired)))] == (unrelated_resolution, "2026-01-01")
+
     def assert_repaired():
         assert {item.object for item in consolidator.get_consolidated_facts("Atlas")} == {
-            "approved", "previous approved",
+            "approved", "previous approved", "another approved",
         }
         assert {
             row["id"]: row["superseded_by"] for row in beam.conn.execute(
@@ -876,16 +893,92 @@ def test_consolidation_repairs_only_invalid_retired_winner_links(tmp_path):
             )
         } == {
             loser: winner for loser, winner in edges.items()
-            if loser not in {ordinary, chained_to_retired}
+            if loser not in {ordinary, chained_to_retired, other_ordinary}
         }
-        ledger = beam.conn.execute(
-            "SELECT resolution,resolved_at FROM conflicts "
-            "WHERE min(fact_a_id,fact_b_id) = min(?,?) AND max(fact_a_id,fact_b_id) = max(?,?)",
-            (ordinary, retired, ordinary, retired),
-        ).fetchone()
-        assert tuple(ledger) == (None, None)
+        assert read_ledger() == expected_ledger
 
     consolidator.run_consolidation_pass(pair_budget=0)
     assert_repaired()
     consolidator.run_consolidation_pass(pair_budget=0)
     assert_repaired()
+
+
+def test_consolidated_facts_read_one_snapshot_across_source_classification(tmp_path, monkeypatch):
+    import sqlite3
+
+    from mnemosyne.core.veracity_consolidation import VeracityConsolidator
+
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    assert beam.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    proposal_id = _store_proposal(beam, "snapshot")
+    consolidator = VeracityConsolidator(db_path=beam.db_path, conn=beam.conn, federation_probe=False)
+    consolidator.consolidate_fact("Atlas", "uses", "reporting", "stated", proposal_id)
+    classify = consolidator._eligible_consolidated_rows
+
+    def commit_between_reads(rows):
+        with sqlite3.connect(beam.db_path) as writer:
+            writer.execute(
+                "UPDATE consolidated_facts SET sources_json = ? WHERE subject = 'Atlas'",
+                (json.dumps([proposal_id, "ordinary"]),),
+            )
+            writer.execute(
+                "UPDATE working_memory SET metadata_json = ? WHERE id = ?",
+                (json.dumps({"status": "rejected"}), proposal_id),
+            )
+        return classify(rows)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(consolidator, "_eligible_consolidated_rows", commit_between_reads)
+        assert [fact.sources for fact in consolidator.get_consolidated_facts("Atlas")] == [[proposal_id]]
+    assert not beam.conn.in_transaction
+    assert [fact.sources for fact in consolidator.get_consolidated_facts("Atlas")] == [
+        [proposal_id, "ordinary"],
+    ]
+
+
+@pytest.mark.parametrize("caller_owned", [False, True])
+def test_consolidated_facts_read_failure_preserves_transaction_ownership(tmp_path, monkeypatch, caller_owned):
+    import sqlite3
+
+    from mnemosyne.core.veracity_consolidation import VeracityConsolidator
+
+    path = tmp_path / "mnemo.db"
+    with sqlite3.connect(path) as conn:
+        consolidator = VeracityConsolidator(db_path=path, conn=conn, federation_probe=False)
+        if caller_owned:
+            conn.execute("BEGIN")
+            conn.execute("CREATE TABLE caller_marker(value INTEGER)")
+            conn.execute("INSERT INTO caller_marker VALUES (1)")
+
+        def fail(rows):
+            assert conn.in_transaction
+            raise RuntimeError("read failed")
+
+        monkeypatch.setattr(consolidator, "_eligible_consolidated_rows", fail)
+        with pytest.raises(RuntimeError, match="read failed"):
+            consolidator.get_consolidated_facts()
+        assert conn.in_transaction is caller_owned
+        if caller_owned:
+            assert conn.execute("SELECT value FROM caller_marker").fetchone()[0] == 1
+            with sqlite3.connect(path) as observer:
+                assert observer.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name = 'caller_marker'"
+                ).fetchone() is None
+
+
+@pytest.mark.parametrize("mixed_source", [False, True], ids=["ordinary", "mixed"])
+def test_auto_conflicts_still_resolve_eligible_facts(tmp_path, mixed_source):
+    from mnemosyne.core.veracity_consolidation import VeracityConsolidator, compute_fact_id
+
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    consolidator = VeracityConsolidator(db_path=beam.db_path, conn=beam.conn, federation_probe=False)
+    proposal_id = _store_proposal(beam, "eligible_winner")
+    for source in ("ordinary", (proposal_id if mixed_source else "other"), "ordinary"):
+        consolidator.consolidate_fact("Atlas", "uses", "current", "stated", source)
+    consolidator.consolidate_fact("Atlas", "uses", "previous", "inferred", "legacy")
+    model_refresh.reject_model_refresh_proposal(beam, proposal_id)
+
+    assert consolidator.run_consolidation_pass() == 1
+    winner = compute_fact_id("Atlas", "uses", "current")
+    assert [fact.id for fact in consolidator.get_consolidated_facts("Atlas")] == [winner]
+    assert beam.conn.execute("SELECT resolution FROM conflicts").fetchone()[0] == f"superseded_by_{winner}"

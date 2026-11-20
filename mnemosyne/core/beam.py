@@ -14190,11 +14190,13 @@ class BeamMemory:
                 )
                 veracity_conflict_pass = {"error": type(exc).__name__}
 
-        # Run tiered degradation after consolidation
-        degrade_result = self.degrade_episodic(dry_run=dry_run)
-        if not dry_run:
-            # Summaries + degradation both changed recallable content.
-            self._invalidate_query_cache_after_commit("sleep")
+        # Consolidation can already have changed recallable content even
+        # if the subsequent tiered degradation fails.
+        try:
+            degrade_result = self.degrade_episodic(dry_run=dry_run)
+        finally:
+            if not dry_run:
+                self._invalidate_query_cache_after_commit("sleep")
 
         logger.info(
             "sleep: consolidated=%d summaries=%d conflicts=%d llm=%s method=%s",

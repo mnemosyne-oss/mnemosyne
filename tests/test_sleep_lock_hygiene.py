@@ -200,3 +200,30 @@ class TestRecallTouchRollback:
         beam.remember("write after failed touch", source="test")
         rows = beam.get_context(limit=5)
         assert any("write after failed touch" in r["content"] for r in rows)
+
+
+def test_sleep_invalidates_cache_when_degradation_raises(temp_db, monkeypatch):
+    from mnemosyne.core.query_cache import QueryCache
+
+    beam = BeamMemory(session_id="lock-hygiene", db_path=temp_db)
+    beam.agent_context = "cron"
+    _seed_old_wm(temp_db, beam.session_id, "conversation", n=2)
+    monkeypatch.setattr(local_llm, "llm_available", lambda: False)
+    cache = QueryCache(db_path=temp_db.parent / "query_cache.db")
+    beam._query_cache = cache
+    key = "sleep-failure-regression"
+
+    def failing_degradation(*, dry_run):
+        assert not dry_run
+        assert not beam.conn.in_transaction
+        cache.put_opaque(key, [{"id": "before-conflict-repair"}])
+        assert cache.get_opaque(key) is not None
+        raise RuntimeError("degradation failed")
+
+    monkeypatch.setattr(beam, "degrade_episodic", failing_degradation)
+    try:
+        with pytest.raises(RuntimeError, match="degradation failed"):
+            beam.sleep()
+        assert cache.get_opaque(key) is None
+    finally:
+        cache.close()

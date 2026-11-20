@@ -1084,23 +1084,29 @@ class VeracityConsolidator:
         Returns:
             List of ConsolidatedFact
         """
-        cursor = self.conn.cursor()
-        
-        if subject:
-            cursor.execute("""
-                SELECT * FROM consolidated_facts
-                WHERE subject = ? AND confidence >= ? AND superseded_by IS NULL
-                ORDER BY confidence DESC, mention_count DESC
-            """, (subject, min_confidence))
-        else:
-            cursor.execute("""
-                SELECT * FROM consolidated_facts
-                WHERE confidence >= ? AND superseded_by IS NULL
-                ORDER BY confidence DESC, mention_count DESC
-            """, (min_confidence,))
-        
+        from mnemosyne.core.beam import _guarded_transaction
+
+        # Both reads must see the same snapshot. Respect an existing caller
+        # transaction and acquire no writer lock for standalone reads.
+        with self._write_lock:
+            conn = self.conn
+            owns_snapshot = not conn.in_transaction
+            transaction = _guarded_transaction(conn) if owns_snapshot else contextlib.nullcontext()
+            with transaction:
+                if owns_snapshot:
+                    conn.execute("BEGIN")
+                params = (subject, min_confidence) if subject else (min_confidence,)
+                subject_filter = "subject = ? AND " if subject else ""
+                rows = conn.execute(
+                    f"SELECT * FROM consolidated_facts WHERE {subject_filter}"
+                    "confidence >= ? AND superseded_by IS NULL "
+                    "ORDER BY confidence DESC, mention_count DESC",
+                    params,
+                ).fetchall()
+                eligible_rows = self._eligible_consolidated_rows(rows)
+
         facts = []
-        for row, sources in self._eligible_consolidated_rows(cursor.fetchall()):
+        for row, sources in eligible_rows:
             facts.append(ConsolidatedFact(
                 subject=row["subject"],
                 predicate=row["predicate"],
