@@ -982,3 +982,37 @@ def test_auto_conflicts_still_resolve_eligible_facts(tmp_path, mixed_source):
     winner = compute_fact_id("Atlas", "uses", "current")
     assert [fact.id for fact in consolidator.get_consolidated_facts("Atlas")] == [winner]
     assert beam.conn.execute("SELECT resolution FROM conflicts").fetchone()[0] == f"superseded_by_{winner}"
+
+
+def test_auto_apply_counts_only_the_winning_transition(tmp_path, monkeypatch):
+    import sqlite3
+    from contextlib import closing
+    from types import SimpleNamespace
+
+    beam = BeamMemory(session_id="retire", db_path=tmp_path / "mnemo.db")
+    proposal_id = _store_proposal(beam, "counter")
+    apply = model_refresh.apply_model_refresh_proposal
+    competing_results = []
+
+    with closing(sqlite3.connect(beam.db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        competitor = SimpleNamespace(conn=conn, db_path=beam.db_path)
+
+        def apply_after_competitor(beam_, proposal_id_, **kwargs):
+            if beam_ is beam:
+                # Both callers have observed pending by the time the second
+                # caller enters the real, serialized terminal transition.
+                competing_results.append(
+                    model_refresh.maybe_auto_apply_model_refresh_proposal(competitor, proposal_id_)
+                )
+            return apply(beam_, proposal_id_, **kwargs)
+
+        with monkeypatch.context() as concurrent:
+            concurrent.setattr(model_refresh, "apply_model_refresh_proposal", apply_after_competitor)
+            first_result = model_refresh.maybe_auto_apply_model_refresh_proposal(beam, proposal_id)
+
+    assert competing_results == [True]
+    assert first_result is False
+    assert beam.conn.execute("SELECT count(*) FROM canonical_facts").fetchone()[0] == 1
+    assert json.loads(_row(beam, proposal_id)["metadata_json"])["status"] == "applied"
+    assert model_refresh.maybe_auto_apply_model_refresh_proposal(beam, proposal_id) is False

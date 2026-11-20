@@ -401,7 +401,7 @@ def apply_model_refresh_proposal(
     validator: str = "",
     auto_applied: bool = False,
 ) -> Dict[str, Any]:
-    """Apply one pending proposal to CanonicalStore and mark it applied."""
+    """Apply a pending proposal and report whether this call made the transition."""
 
     from mnemosyne.core.beam import _write_locked_transaction
     from mnemosyne.core.canonical import CanonicalStore
@@ -413,7 +413,7 @@ def apply_model_refresh_proposal(
         metadata = _load_metadata(row)
         status = metadata.get("status", "pending")
         if status != "pending":
-            return {"status": status, "proposal_id": proposal_id, "metadata": metadata}
+            return {"status": status, "applied_now": False, "proposal_id": proposal_id, "metadata": metadata}
         if metadata.get("action", "update") != "update":
             raise ValueError("only update proposals can be applied")
         for key in ("category", "name", "body"):
@@ -431,7 +431,7 @@ def apply_model_refresh_proposal(
             _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
         )
         if canonical is None:
-            return {"status": "pending", "proposal_id": proposal_id, "metadata": metadata}
+            return {"status": "pending", "applied_now": False, "proposal_id": proposal_id, "metadata": metadata}
         metadata["status"] = "applied"
         metadata["applied_by"] = validator or "system"
         metadata["applied_owner_id"] = owner_id
@@ -439,7 +439,10 @@ def apply_model_refresh_proposal(
         metadata["auto_applied"] = bool(auto_applied)
         _save_metadata(beam, proposal_id, metadata)
     _invalidate_resolved_proposal_cache(beam)
-    return {"status": "applied", "proposal_id": proposal_id, "canonical": canonical, "metadata": metadata}
+    return {
+        "status": "applied", "applied_now": True, "proposal_id": proposal_id,
+        "canonical": canonical, "metadata": metadata,
+    }
 
 
 def reject_model_refresh_proposal(
@@ -555,4 +558,4 @@ def maybe_auto_apply_model_refresh_proposal(
         validator="sleep_model_refresh_auto_apply",
         auto_applied=True,
     )
-    return result["status"] == "applied"
+    return result["applied_now"]
