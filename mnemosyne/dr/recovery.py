@@ -26,6 +26,10 @@ class _RestoreRefusedError(RuntimeError):
     """An unusable backup or unsafe target deliberately refused by restore."""
 
 
+class _RestoreTargetRefusedError(_RestoreRefusedError):
+    """A target condition that an older backup cannot resolve."""
+
+
 def get_default_paths():
     """Get default Mnemosyne paths.
 
@@ -386,7 +390,7 @@ def _reject_active_sidecars(db_path: Path) -> None:
     for suffix in ("-wal", "-shm"):
         sidecar = db_path.with_name(db_path.name + suffix)
         if sidecar.exists():
-            raise _RestoreRefusedError(
+            raise _RestoreTargetRefusedError(
                 f"Refusing to restore while a sidecar exists: {sidecar}. "
                 "It may be active or a leftover from read-only backup/verification. "
                 "Stop all processes using this store, including readers; then run "
@@ -417,7 +421,7 @@ def _acquire_writer_lock(db_path: Path) -> Optional[sqlite3.Connection]:
         lock_conn.execute("BEGIN IMMEDIATE")
     except sqlite3.OperationalError as exc:
         lock_conn.close()
-        raise _RestoreRefusedError(
+        raise _RestoreTargetRefusedError(
             f"Refusing to restore: a live writer appears to hold {db_path} "
             f"({exc}). Stop all Mnemosyne processes before restoring."
         ) from exc
@@ -581,6 +585,31 @@ def _is_shadow_stmt(stmt: str, shadow_tables: Set[str]) -> bool:
 
 
 _SQL_STRING_LITERAL = r"'(?:[^']|'')*'"
+_SQL_DDL_TOKEN = re.compile(rf"/\*.*?\*/|--[^\n]*|{_SQL_IDENTIFIER}|[^\s]", re.DOTALL)
+
+
+def _is_contentless_fts5(ddl: str) -> bool:
+    """Detect FTS5's empty content option in already accepted SQLite DDL."""
+    tokens = [
+        match.lower()
+        for match in _SQL_DDL_TOKEN.findall(ddl)
+        if not match.startswith(("/*", "--"))
+    ]
+    if "(" not in tokens:
+        return False
+    options_start = tokens.index("(")
+    if tokens[options_start - 1].strip("\"'`[]") != "fts5":
+        return False
+    options = tokens[options_start:]
+    return any(
+        delimiter in ("(", ",") and key == "content" and equals == "="
+        and value in ("''", '""', "``", "[]") and end in (",", ")")
+        for delimiter, key, equals, value, end in zip(
+            options, options[1:], options[2:], options[3:], options[4:]
+        )
+    )
+
+
 _VT_MASTER_RE = re.compile(
     r"^\s*INSERT\s+INTO\s+['\"]?sqlite_master['\"]?\s*"
     r"\(\s*type\s*,\s*name\s*,\s*tbl_name\s*,\s*rootpage\s*,\s*sql\s*\)\s*"
@@ -823,7 +852,12 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
                         }
                         owned = {name.translate(_SQLITE_NAME_LOWER) for name in created}
                         shadow_tables.update(owned)
-                        if owned and (is_bootstrap or owned & declared_tables):
+                        # A contentless FTS logical row carries NULL instead
+                        # of indexed text, so replay needs the physical index.
+                        if owned and (
+                            is_bootstrap or owned & declared_tables
+                            or _is_contentless_fts5(virtual_ddl)
+                        ):
                             if not owned <= declared_tables:
                                 raise _RestoreRefusedError("Incomplete virtual-table snapshot in legacy SQL dump")
                             snapshot_virtual_tables.add(resolved_target)
@@ -962,6 +996,10 @@ def emergency_restore(backup_dir: Path = None, db_path: Path = None) -> Dict:
             )
         raise FileNotFoundError("No backups found in " + str(backup_dir))
 
+    # A blocked target applies to all candidates. Keep the check in
+    # restore_backup too, since sidecars may appear after this preflight.
+    _reject_active_sidecars(Path(db_path))
+
     # Try each backup until one works. A candidate refusal (e.g. a missing or
     # checksum-mismatched metadata sidecar) means THAT backup is unusable —
     # it must not stop the search for an older valid one. Refusals are
@@ -975,6 +1013,8 @@ def emergency_restore(backup_dir: Path = None, db_path: Path = None) -> Dict:
             result = restore_backup(backup, db_path)
             if result["integrity_check"]:
                 return {"restored": True, "backup_used": str(backup), "attempts": attempt}
+        except _RestoreTargetRefusedError:
+            raise
         except _RestoreRefusedError as exc:
             if newest_refusal is None:
                 newest_refusal = (attempt, backup, exc)

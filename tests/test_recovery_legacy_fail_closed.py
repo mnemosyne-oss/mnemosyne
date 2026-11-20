@@ -219,6 +219,7 @@ def test_legacy_sql_restore_preserves_fts_snapshot_rowid_gaps(tmp_path):
 @pytest.mark.parametrize(("dump_style", "missing"), [
     ("direct", None), ("bootstrap", None),
     ("direct", "one"), ("bootstrap", "one"), ("bootstrap", "all"),
+    ("direct", "all"), ("direct-quoted", "all"),
 ])
 def test_legacy_sql_restore_contentless_shadow_snapshot(tmp_path, dump_style, missing):
     source = tmp_path / "source.db"
@@ -234,7 +235,9 @@ def test_legacy_sql_restore_contentless_shadow_snapshot(tmp_path, dump_style, mi
     )]
     assert len(headers) == 1
     header = "CREATE VIRTUAL TABLE ft USING fts5(body, content='');"
-    if dump_style == "bootstrap":
+    if dump_style == "direct-quoted":
+        header = """CREATE VIRTUAL TABLE ft USING "FTS5"(body, CONTENT = "");"""
+    elif dump_style == "bootstrap":
         header = (
             "PRAGMA writable_schema=ON;\n"
             "INSERT INTO sqlite_master(type,name,tbl_name,rootpage,sql)"
@@ -247,9 +250,6 @@ def test_legacy_sql_restore_contentless_shadow_snapshot(tmp_path, dump_style, mi
     )] if missing else []
     if missing:
         assert len(removed) > 1 if missing == "all" else len(removed) == 1
-    # With all physical tables removed, direct DDL is indistinguishable from
-    # a supported logical dump. Only bootstrap syntax unambiguously requires
-    # a complete physical snapshot in that case.
     _rewrite_backup_payload(backup, "".join(s for s in statements if s not in removed).encode())
     target = tmp_path / "target.db"
     _make_simple_db(target)
@@ -266,12 +266,13 @@ def test_legacy_sql_restore_contentless_shadow_snapshot(tmp_path, dump_style, mi
     assert not list(tmp_path.glob("*.restore_staged*"))
 
 
-def test_legacy_sql_restore_accepts_direct_logical_fts_dump(tmp_path):
+@pytest.mark.parametrize("columns", ["body", "body, \"note, content='', value\""])
+def test_legacy_sql_restore_accepts_direct_logical_fts_dump(tmp_path, columns):
     source = tmp_path / "source.db"
     _make_simple_db(source)
     backup = Path(recovery.create_backup(source, tmp_path / "backups", format="sql")["backup_path"])
     _rewrite_backup_payload(backup, (
-        "CREATE VIRTUAL TABLE ft USING fts5(body);"
+        f"CREATE VIRTUAL TABLE ft USING fts5({columns});"
         "INSERT INTO ft(rowid, body) VALUES(17, 'orchid');"
     ).encode())
     target = tmp_path / "target.db"
@@ -279,29 +280,6 @@ def test_legacy_sql_restore_accepts_direct_logical_fts_dump(tmp_path):
     with sqlite3.connect(target) as conn:
         assert conn.execute("SELECT rowid, body FROM ft").fetchall() == [(17, "orchid")]
         assert conn.execute("SELECT rowid FROM ft WHERE ft MATCH 'orchid'").fetchall() == [(17,)]
-
-
-def test_legacy_direct_ddl_without_shadows_replays_encoded_logical_rows(tmp_path):
-    source = tmp_path / "source.db"
-    with sqlite3.connect(source) as conn:
-        conn.execute("CREATE VIRTUAL TABLE ft USING fts5(body, content='')")
-        conn.execute("INSERT INTO ft(rowid, body) VALUES(17, 'orchid')")
-    backup = Path(recovery.create_backup(source, tmp_path / "backups", format="sql")["backup_path"])
-    statements = list(recovery._sql_statements(gzip.decompress(backup.read_bytes()).decode()))
-    logical_rows = [s for s in statements if s.lstrip().startswith('INSERT INTO "ft" VALUES')]
-    assert len(logical_rows) == 1
-    # Remove every physical shadow statement and normalize to Python 3.10's
-    # direct DDL. Without a bootstrap marker this is also valid logical SQL.
-    # Its visible NULL row encodes neither the original rowid nor index terms;
-    # this compatibility case does not claim a lossless physical round trip.
-    payload = "CREATE VIRTUAL TABLE ft USING fts5(body, content='');" + "".join(logical_rows)
-    _rewrite_backup_payload(backup, payload.encode())
-    target = tmp_path / "target.db"
-    result = recovery.restore_backup(backup, target)
-    assert result["restored"] and result["integrity_check"]
-    with sqlite3.connect(target) as conn:
-        assert conn.execute("SELECT rowid, body FROM ft").fetchall() == [(1, None)]
-        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 
 
 @pytest.mark.parametrize("tail", [
