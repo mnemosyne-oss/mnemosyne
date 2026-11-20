@@ -146,14 +146,21 @@ dropped:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `MNEMOSYNE_POLYPHONIC_RECALL` | `0` (off) | Routes recall through `PolyphonicRecallEngine` (RRF fusion over vector / graph / fact / temporal voices). Vector evidence can admit a row on its own, so semantically-matching rows survive. |
+| `polyphonic_recall` (YAML), `MNEMOSYNE_POLYPHONIC_RECALL` (env fallback) | `false` (linear) | Routes recall through `PolyphonicRecallEngine` (RRF fusion over vector / graph / fact / temporal voices). Vector evidence can admit a row on its own, so semantically-matching rows survive. |
 | `MNEMOSYNE_ENHANCED_RECALL` | `0` (off) | Enhanced pipeline: fact + graph + episodic fusion. |
 | `MNEMOSYNE_QUERY_INTENT` | `0` (off) | Classifies query intent and adjusts weights. |
 | `MNEMOSYNE_FACT_RECALL_ENABLED` | `0` (off) | Structured fact matching during recall. |
 
+Recall resolves the mode on each call from `config.yaml`, then the environment, then
+the linear default. Set it in the active configuration with this command.
+
 ```bash
-export MNEMOSYNE_POLYPHONIC_RECALL=1
+mnemosyne config set polyphonic_recall true
 ```
+
+If YAML omits the key, set `MNEMOSYNE_POLYPHONIC_RECALL` to `1`, `true`, `yes`, or
+`on` to enable the engine. Use `polyphonic_recall: false` in YAML to select linear
+recall regardless of the environment.
 
 Measured effect of each flag **in isolation**, same 8 natural-language probes over the same
 62-item corpus (`mnemosyne-memory` 3.15.1):
