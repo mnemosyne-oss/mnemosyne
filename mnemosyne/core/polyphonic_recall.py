@@ -767,7 +767,10 @@ class PolyphonicRecallEngine:
                     " AND wm.consolidated_at IS NULL"
                 )
             echo_clause, echo_params = exclusion_sql(excluded_wm_ids, "wm.id")
-            wm_dense_predicate += echo_clause
+            from mnemosyne.core.beam import _working_recall_eligibility_sql
+
+            retirement = _working_recall_eligibility_sql(conn, alias="wm", exclude_superseded=False)
+            wm_dense_predicate += f" AND {retirement}" + echo_clause
             wm_dense_params.extend(echo_params)
             if scope_where is not None:
                 wm_dense_predicate += f" AND {scope_where}"
@@ -1045,10 +1048,13 @@ class PolyphonicRecallEngine:
             if scope_where is not None:
                 echo_clause += f" AND {scope_where}"
                 echo_params = [*echo_params, *scope_params]
+            from mnemosyne.core.beam import _working_recall_eligibility_sql
+
+            retirement = _working_recall_eligibility_sql(conn, exclude_superseded=False)
             cursor.execute(f"""
                 SELECT id, content, timestamp, importance
                 FROM working_memory
-                WHERE julianday(timestamp) > julianday(?) {echo_clause}
+                WHERE julianday(timestamp) > julianday(?) AND {retirement} {echo_clause}
                 ORDER BY julianday(timestamp) DESC
                 LIMIT ?
             """, (week_ago, *echo_params, limit))
@@ -1134,6 +1140,11 @@ class PolyphonicRecallEngine:
                     continue
                 visible = f"({scope_where})"
                 visible_params = list(scope_params)
+                if table == "working_memory":
+                    from mnemosyne.core.beam import _working_recall_eligibility_sql
+
+                    retirement = _working_recall_eligibility_sql(conn, exclude_superseded=False)
+                    visible += f" AND {retirement}"
                 if require_active:
                     columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
                     if "superseded_by" in columns:

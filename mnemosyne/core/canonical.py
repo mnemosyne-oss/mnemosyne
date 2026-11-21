@@ -138,6 +138,7 @@ def init_canonical(db_path: Optional[Path] = None) -> None:
 
 def _init_canonical_with_conn(conn: sqlite3.Connection) -> None:
     """Run schema DDL on an existing connection. Caller owns conn lifetime."""
+    caller_transaction = conn.in_transaction
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -184,7 +185,8 @@ def _init_canonical_with_conn(conn: sqlite3.Connection) -> None:
         if _add not in _cols:
             cursor.execute("ALTER TABLE canonical_facts ADD COLUMN %s TEXT" % _add)
 
-    conn.commit()
+    if not caller_transaction:
+        conn.commit()
 
 
 class CanonicalStore:
@@ -274,13 +276,12 @@ class CanonicalStore:
         if not admit_memory_write(body, write_kind=_write_kind)[0]:
             return None
 
-        cursor = self.conn.cursor()
-        # BEGIN IMMEDIATE so the read-current + supersede + insert sequence is
-        # atomic against a concurrent writer racing on the same slot (the
-        # partial unique index would otherwise reject a second live row, but we
-        # want a clean transaction rather than an IntegrityError).
-        cursor.execute("BEGIN IMMEDIATE")
-        try:
+        from mnemosyne.core.beam import _write_locked_transaction
+
+        # Serialize slot read/replace and support a caller-owned transaction
+        # that also persists the outcome of a model-refresh proposal.
+        with _write_locked_transaction(self.conn):
+            cursor = self.conn.cursor()
             current = cursor.execute(
                 "SELECT * FROM canonical_facts "
                 "WHERE owner_id = ? AND category = ? AND name = ? "
@@ -289,7 +290,6 @@ class CanonicalStore:
             ).fetchone()
 
             if current is not None and current["body"] == body:
-                self.conn.commit()
                 row = dict(current)
                 row["status"] = "unchanged"
                 return row
@@ -326,18 +326,12 @@ class CanonicalStore:
                  writer_id or "", writer_home or ""),
             )
             new_id = cursor.lastrowid
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
 
-        row = dict(
-            self.conn.execute(
+            row = dict(cursor.execute(
                 "SELECT * FROM canonical_facts WHERE id = ?", (new_id,)
-            ).fetchone()
-        )
-        row["status"] = status
-        return row
+            ).fetchone())
+            row["status"] = status
+            return row
 
     def forget(self, owner_id: str, category: str, name: str) -> bool:
         """Retire a canonical slot without replacing it.
