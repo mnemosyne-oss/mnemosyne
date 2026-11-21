@@ -11749,6 +11749,12 @@ class BeamMemory:
                 "embedding_query_prefix": os.environ.get("MNEMOSYNE_EMBEDDING_QUERY_PREFIX", ""),
                 "beam_optimizations": _BEAM_MODE,
                 "polyphonic_recall": os.environ.get("MNEMOSYNE_POLYPHONIC_RECALL", "0") == "1",
+                # Voice knobs change what the polyphonic voices retain and how
+                # fusion weighs them, so raw values belong in the key: a flip
+                # must never replay a result computed under the earlier value.
+                # Two spellings of the same setting cost a harmless miss.
+                "voice_retention": os.environ.get("MNEMOSYNE_VOICE_RETENTION", ""),
+                "voice_weighing": os.environ.get("MNEMOSYNE_VOICE_WEIGHING", ""),
                 "query_intent": os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1",
                 "fact_recall": os.environ.get("MNEMOSYNE_FACT_RECALL_ENABLED", "0") == "1",
                 "lenient_fact_match": _env_truthy("MNEMOSYNE_LENIENT_FACT_MATCH"),

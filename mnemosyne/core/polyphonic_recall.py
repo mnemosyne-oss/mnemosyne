@@ -58,6 +58,39 @@ def _env_disabled(name: str) -> bool:
     return val in ("0", "false", "no", "off")
 
 
+def _voice_retention() -> int:
+    """How many candidates a voice retains before fusion, as a floor.
+
+    Applies to the vector and temporal voices, which take the limit;
+    graph and fact results are voice-shaped queries without a retention
+    cap and stay unaffected. Default 20 keeps the current behavior.
+    Read per call, like the other toggles in this module; invalid values
+    fall back to the default.
+    """
+    raw = os.environ.get("MNEMOSYNE_VOICE_RETENTION", "").strip()
+    if not raw:
+        return 20
+    try:
+        value = int(raw)
+    except ValueError:
+        return 20
+    return value if value > 0 else 20
+
+
+def _voice_weighting_enabled() -> bool:
+    """Whether the declared per-voice weights reach the RRF fusion.
+
+    `self.voice_weights` is set in __init__ ("deterministic, learned from
+    validation") but `_combine_voices` never read it, so fusion runs as
+    flat equal-weight RRF. Consequence: a distractor surfaced by TWO
+    weaker voices outranks a target the dense voice ranks first. Opt-in
+    so the default behavior is unchanged unless
+    MNEMOSYNE_VOICE_WEIGHING is set.
+    """
+    val = os.environ.get("MNEMOSYNE_VOICE_WEIGHING", "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
 @dataclass
 class RecallResult:
     """Result from a single recall voice."""
@@ -197,7 +230,12 @@ class PolyphonicRecallEngine:
                     conn.close()
         # Each voice must be able to supply a full top_k on its own; a fixed
         # per-voice cap silently short-changes callers asking for more.
-        voice_limit = max(20, top_k)
+        # MNEMOSYNE_VOICE_RETENTION raises the FLOOR (default 20 = the
+        # current constant): with WM and EM competing for the same fused
+        # top_k, a target ranked deeper than the retention cap can never
+        # surface no matter how good its score, so the cap is itself a
+        # recall ceiling for voice arms with long candidate tails.
+        voice_limit = max(_voice_retention(), top_k)
         graph_results = (
             self._graph_voice(query) if scope_where is None else
             self._graph_voice(query, scope_where=scope_where, scope_params=scope_params)
@@ -1232,6 +1270,14 @@ class PolyphonicRecallEngine:
                 # RRF contribution: higher rank (lower number) = higher score
                 rank = voice_ranks.get(voice_name, {}).get(r.memory_id, 999)
                 rrf_contribution = 1.0 / (RRF_K + rank)
+                if _voice_weighting_enabled():
+                    # Traversal hits are graph evidence with separate
+                    # attribution: read the declared "graph" weight for them,
+                    # keyed under the producing label below. Unmapped, the
+                    # 1.0 fallback would let a weighted-out voice outrank the
+                    # vector voice's rank 1 and invert flat fusion.
+                    weight_voice = "graph" if r.voice == "graph_traversal" else r.voice
+                    rrf_contribution *= self.voice_weights.get(weight_voice, 1.0)
                 combined[r.memory_id].voice_scores[r.voice] = rrf_contribution
                 combined[r.memory_id].combined_score += rrf_contribution
                 combined[r.memory_id].metadata.update(r.metadata)
