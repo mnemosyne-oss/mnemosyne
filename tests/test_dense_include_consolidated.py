@@ -86,9 +86,91 @@ def test_linear_recall_dense_predicate_follows_the_switch(tmp_path, monkeypatch,
         return real(conn, query_embedding, k=k, **kwargs)
 
     monkeypatch.setattr(beam_module, "_wm_vec_search", spy)
-    beam.recall("zulu yankee", top_k=5)
+    # Second consolidated row WITH lexical overlap on the query: the linear
+    # scorer blends dense evidence into lexically matched rows only, so this
+    # is the row that can show a functional dense_score difference. The
+    # zero-overlap "archived" row stays for the polyphonic end-to-end test.
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    beam.conn.execute(
+        "INSERT INTO working_memory "
+        "(id, content, source, timestamp, importance, session_id, scope) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("archived-lexical", "zulu yankee archiving notes", "fact", now, 0.7, "s-979", "session"),
+    )
+    beam.conn.execute(
+        "UPDATE working_memory SET consolidated_at = ? WHERE id = 'archived-lexical'", (now,)
+    )
+    beam.conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) "
+        "VALUES (?, ?, ?)",
+        ("archived-lexical", json.dumps(query_vec.astype(np.float32).tolist()), "test-model"),
+    )
+    beam.conn.commit()
+    results = beam.recall("zulu yankee", top_k=5)
     assert seen["where_sql"], "the dense pool was never queried"
     assert ("consolidated_at IS NULL" in seen["where_sql"]) is (not opt_in)
+    # Functional half of the predicate assertion: with the opt-in the dense
+    # voice must score the consolidated row; without it the row may still
+    # surface lexically via FTS but must carry no dense evidence.
+    archived = [r for r in results if r.get("id") == "archived-lexical"]
+    if opt_in:
+        assert archived, "the consolidated row was not recalled despite the dense match"
+        assert float(archived[0].get("dense_score") or 0.0) > 0.0
+    else:
+        assert not archived or float(archived[0].get("dense_score") or 0.0) == 0.0
+
+
+def test_enhanced_recall_cache_is_fresh_across_toggle_flips(monkeypatch, tmp_path):
+    """unset -> enabled -> disabled must each compute, never replay a cached state.
+
+    The toggle changes which rows the dense pool admits inside recall(),
+    which recall_enhanced() may serve from its request cache, so the
+    effective boolean belongs in the cache key next to the other toggles.
+    """
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    memory = BeamMemory(session_id="s-979", db_path=tmp_path / "cache.db")
+    calls: list = []
+
+    def fake_recall(query, top_k=40, **kwargs):
+        calls.append((query, top_k))
+        return [{"id": f"result-{len(calls)}", "content": query, "score": 1.0}]
+
+    memory.recall = fake_recall
+    try:
+        def run() -> tuple[list, int]:
+            out = memory.recall_enhanced(
+                "cache isolation query",
+                use_weibull=False, use_mmr=False, use_intent=False,
+                use_synonyms=False,
+            )
+            return [r["id"] for r in out], len(calls)
+
+        # A same-state repeat may replay; a state TRANSITION must never
+        # replay the OTHER state's entry. Before the toggle entered the key
+        # material, enabling returned the unset-state result from cache and
+        # disabling returned the enabled-state result (consolidated rows the
+        # current setting would not admit).
+        monkeypatch.delenv(ENV, raising=False)
+        assert run() == (["result-1"], 1), "first call must compute"
+        assert run() == (["result-1"], 1), "identical request must hit the cache (fixture sanity)"
+        monkeypatch.setenv(ENV, "1")
+        assert run() == (["result-2"], 2), "enabling the toggle must not replay the unset-state cache entry"
+        monkeypatch.delenv(ENV, raising=False)
+        result, computed = run()
+        assert result == ["result-1"], "disabling must not serve the enabled-state entry"
+        assert computed == 2, "the original unset-state entry may be replayed again"
+        monkeypatch.setenv(ENV, "1")
+        assert run() == (["result-2"], 2), "the enabled-state entry must still be intact"
+    finally:
+        cache = getattr(memory, "_query_cache", None)
+        if cache is not None:
+            cache.close()
+        memory.conn.close()
 
 
 @pytest.mark.parametrize("opt_in", [False, True])

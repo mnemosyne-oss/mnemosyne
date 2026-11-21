@@ -11768,6 +11768,10 @@ class BeamMemory:
                 "embedding_query_prefix": os.environ.get("MNEMOSYNE_EMBEDDING_QUERY_PREFIX", ""),
                 "beam_optimizations": _BEAM_MODE,
                 "polyphonic_recall": os.environ.get("MNEMOSYNE_POLYPHONIC_RECALL", "0") == "1",
+                # Same predicate as the dense-voice inclusion check in
+                # recall(): flipping the opt-in must never replay a cached
+                # result computed under the other setting.
+                "dense_include_consolidated": _env_truthy("MNEMOSYNE_DENSE_INCLUDE_CONSOLIDATED"),
                 "query_intent": os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1",
                 "fact_recall": os.environ.get("MNEMOSYNE_FACT_RECALL_ENABLED", "0") == "1",
                 "lenient_fact_match": _env_truthy("MNEMOSYNE_LENIENT_FACT_MATCH"),
