@@ -141,6 +141,22 @@ def _prefetch_model_slot_tokens(content: str) -> Set[str]:
     return tokens
 
 
+def _prefetch_rrf_norm(value: float) -> float:
+    """Normalize a reciprocal-rank-fusion score back to the 0-1 gate scale.
+
+    mnemosyne-memory 4.0.0 emits RRF contributions (voice and fused scores are
+    ~1/(60+rank), so rank 1 in one arm is ~0.0164). The prefetch gates were
+    calibrated against the older 0-1 weighted-sum scale, so every row scored
+    below min_score/topic-signal and the whole bank source silently starved.
+    Rank 1 in one arm normalizes to 1.0.
+    """
+    try:
+        k = max(1.0, float(os.environ.get("MNEMOSYNE_RRF_NORM_K", "61")))
+    except ValueError:
+        k = 61.0
+    return value * k
+
+
 def _prefetch_topic_signal(row: Dict[str, Any]) -> float:
     """Best available non-importance relevance signal for a recall row."""
     signal = max(
@@ -148,6 +164,16 @@ def _prefetch_topic_signal(row: Dict[str, Any]) -> float:
         float(row.get("fts_score") or 0.0),
         float(row.get("dense_score") or 0.0),
     )
+    # 4.0.0 polyphonic rows carry per-voice RRF contributions under
+    # voice_scores (keyword_score/fts_score/dense_score no longer exist).
+    voices = row.get("voice_scores")
+    if isinstance(voices, dict) and voices:
+        voice_values: list = []
+        for value in voices.values():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                voice_values.append(float(value))
+        if voice_values:
+            signal = max(signal, _prefetch_rrf_norm(max(voice_values)))
     # Fact/entity matches are explicit relevance signals even when recall() did
     # not fill keyword/FTS scores for that path.
     if row.get("fact_match") or row.get("entity_match"):
@@ -531,7 +557,7 @@ def render_bank_source(
         if profile.exclude_assistant and _prefetch_source_quality(r) <= 0:
             continue
         signal = _prefetch_topic_signal(r)
-        score = float(r.get("score") or 0.0)
+        score = _prefetch_rrf_norm(float(r.get("score") or 0.0))
         importance = float(r.get("importance") or 0.0)
         required_signal = profile.raw_min_topic_signal if _prefetch_is_raw(r) else profile.min_topic_signal
         if signal < required_signal:
