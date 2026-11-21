@@ -1448,7 +1448,7 @@ def cmd_bank(args):
         _fail(str(e))
 
 
-def _resolve_reindex_target(db_override, bank_override):
+def _resolve_reindex_target(db_override, bank_override, *, dry_run=False):
     """Resolve the database path reindex should open, honoring --db/--bank.
 
     An explicit ``--db`` or ``--bank`` target must already exist. It is
@@ -1458,7 +1458,7 @@ def _resolve_reindex_target(db_override, bank_override):
     """
     if db_override is not None:
         db_path = Path(db_override).expanduser()
-    elif bank_override is not None:
+    elif bank_override is not None or dry_run:
         from mnemosyne.core.banks import get_bank_db_path_read_only
 
         try:
@@ -1478,6 +1478,34 @@ def _resolve_reindex_target(db_override, bank_override):
     if not db_path.is_file():
         _fail(f"Database not found: {db_path}")
     return db_path
+
+
+def _preview_reindex(db_path: Path, batch_size: int):
+    """Plan from an offline SQLite database without creating or changing sidecars."""
+    import sqlite3
+    from contextlib import closing
+
+    from mnemosyne.core.beam import reindex_vectors
+    from mnemosyne.dr.recovery import _load_sqlite_vec
+
+    path = db_path.resolve()
+    # immutable avoids WAL/SHM writes even for a database in WAL mode, but it
+    # can omit pending WAL frames and cannot recover a rollback journal.
+    for suffix in ("-wal", "-journal"):
+        try:
+            size = path.with_name(path.name + suffix).stat().st_size
+        except FileNotFoundError:
+            continue
+        if size:
+            _fail(
+                "Reindex preview requires an offline, checkpointed database. "
+                "Close active clients and let SQLite finish recovery or checkpointing before retrying.",
+                exit_code=1,
+            )
+
+    with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro&immutable=1", uri=True)) as conn:
+        _load_sqlite_vec(conn)
+        return reindex_vectors(conn, batch_size=batch_size, dry_run=True)
 
 
 def cmd_reindex(args):
@@ -1529,29 +1557,27 @@ def cmd_reindex(args):
     if db_override is not None and bank_override is not None:
         _fail("--db and --bank cannot be used together")
 
-    db_path = _resolve_reindex_target(db_override, bank_override)
+    db_path = _resolve_reindex_target(db_override, bank_override, dry_run=dry_run)
 
     # --model has to win before the embedding module is imported: it freezes the
     # model + dimension from the env at import time.
     if model_override is not None:
         os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = model_override
 
-    from mnemosyne.core import embeddings as _emb
-    # Open the target through BeamMemory, not Mnemosyne: importing
-    # mnemosyne.core.memory runs init_db() on the ambient default database,
-    # which a targeted reindex must leave untouched.
-    from mnemosyne.core.beam import BeamMemory, reindex_vectors
-
-    beam = BeamMemory(db_path=str(db_path))
-
     if dry_run:
-        plan = reindex_vectors(beam.conn, batch_size=batch_size, dry_run=True)
+        plan = _preview_reindex(db_path, batch_size)
         print(f"Reindex plan (dry run -- nothing written), db: {db_path}")
         for key in ("model", "dim", "vec_type", "sqlite_vec",
                     "working_memory", "episodic_memory"):
             if key in plan:
                 print(f"  {key}: {plan[key]}")
         return
+
+    from mnemosyne.core import embeddings as _emb
+    # Importing core.memory would initialize the ambient default database.
+    from mnemosyne.core.beam import BeamMemory, reindex_vectors
+
+    beam = BeamMemory(db_path=str(db_path))
 
     print(
         f"Reindex will re-embed working + episodic memory with "
