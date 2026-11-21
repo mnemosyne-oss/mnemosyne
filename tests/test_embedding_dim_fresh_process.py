@@ -118,7 +118,12 @@ def test_unknown_model_fails_at_import_before_any_write(tmp_path, model, extra_e
     [
         pytest.param("from mnemosyne.core import beam", None, True, id="direct-core"),
         pytest.param("import hermes_memory_provider", str(PROJECT_ROOT), True, id="hermes_memory_provider"),
-        pytest.param("import mnemosyne_hermes", str(INTEGRATION_SRC), False, id="mnemosyne_hermes"),
+        pytest.param(
+            "import mnemosyne_hermes\nmnemosyne_hermes.apply_beam_batch",
+            str(INTEGRATION_SRC),
+            False,
+            id="mnemosyne_hermes",
+        ),
     ],
 )
 def test_unknown_model_parity_across_surfaces(tmp_path, code, pythonpath, fail_fast):
@@ -126,11 +131,12 @@ def test_unknown_model_parity_across_surfaces(tmp_path, code, pythonpath, fail_f
     configuration failure for an unknown model with no explicit dim.
 
     Direct core and ``hermes_memory_provider`` fail fast (non-zero exit at
-    import). ``mnemosyne_hermes`` graceful-degrades by design: it catches the
-    configuration error, logs it with the actionable message, and disables the
-    affected batch tools rather than crashing the provider. Every surface must
-    expose the actionable error; the two fail-fast surfaces must also exit
-    non-zero, so a future regression that swallows the error is caught.
+    import). ``mnemosyne_hermes`` does not import the batch or embedding stack
+    at import. Resolving a batch helper catches the configuration error, logs
+    it with the actionable message, and disables the batch tools rather than
+    crashing the provider. Every surface must expose the actionable error; the
+    two fail-fast surfaces must also exit non-zero, so a future regression that
+    swallows the error is caught.
     """
     result = _run_fresh(
         code,
