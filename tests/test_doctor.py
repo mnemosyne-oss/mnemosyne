@@ -288,6 +288,22 @@ def test_open_readonly_doctor_db_does_not_create_a_missing_path(tmp_path):
     assert not db_path.exists()
 
 
+def test_doctor_reports_relative_mnemosyne_load_location(tmp_path, monkeypatch):
+    import mnemosyne
+
+    monkeypatch.setattr(
+        mnemosyne, "__file__", str(tmp_path / "site-packages" / "mnemosyne" / "__init__.py")
+    )
+    db_path = tmp_path / "doctor.db"
+    sqlite3.connect(db_path).close()
+
+    runtime = build_doctor_report("work", db_path).to_dict()["runtime_diagnostics"]
+
+    assert [check["detail"] for check in runtime["checks"] if check["check"] == "mnemosyne_loaded_from"] == [
+        "site-packages/mnemosyne/__init__.py"
+    ]
+
+
 def test_doctor_runtime_dependency_failure_is_safe_and_unknown(tmp_path, monkeypatch):
     db_path = tmp_path / "doctor.db"
     sqlite3.connect(db_path).close()

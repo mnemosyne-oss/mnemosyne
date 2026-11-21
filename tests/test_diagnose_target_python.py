@@ -55,11 +55,24 @@ def test_runtime_checks_run_in_the_selected_venv(tmp_path, monkeypatch, explicit
     assert _check(payload, "fastembed")["status"] == "OK"
     assert _check(payload, "fastembed")["detail"] == "version=provider-only"
     assert _check(payload, "fastembed")["scope"] == "target_interpreter"
+    assert _check(payload, "mnemosyne_loaded_from")["detail"] == "site-packages/mnemosyne/__init__.py"
     assert str(environment) not in json.dumps(payload)
     if explicit_db:
         assert Path(payload["resolved_db"]).resolve() == selected_db.resolve()
         assert _check(payload, "working_total")["status"] == "1"
         assert not (tmp_path / "data" / "mnemosyne.db").exists()
+
+
+def test_runtime_diagnostics_recognize_dist_packages(tmp_path, monkeypatch):
+    import mnemosyne
+
+    monkeypatch.setattr(
+        mnemosyne, "__file__", str(tmp_path / "dist-packages" / "mnemosyne" / "__init__.py")
+    )
+
+    payload = diagnose.collect_runtime_diagnostics()
+
+    assert _check(payload, "mnemosyne_loaded_from")["detail"] == "dist-packages/mnemosyne/__init__.py"
 
 
 def test_default_runtime_checks_are_labeled_as_cli_interpreter(tmp_path, monkeypatch):
