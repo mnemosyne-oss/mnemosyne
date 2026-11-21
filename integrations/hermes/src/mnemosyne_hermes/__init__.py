@@ -5277,14 +5277,26 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # The active provider bank shares its SQLite database with auto_sleep.
         # Serialize the complete active-bank diagnostic operation (#498).
         with self._ensure_beam_access_lock():
-            result = collect(**diagnostic_kwargs)
-            result["sync_turn"] = self._sync_turn_diagnostics()
-
             active_db = None
             try:
                 active_db = getattr(self._beam, "db_path", None)
             except Exception:
                 active_db = None
+
+            # run_diagnostics() constructs its own Mnemosyne, and BeamMemory
+            # binds its connection through a per-thread cache keyed by DB
+            # path - for the active profile bank that is the very connection
+            # every later provider call uses. A "database is locked"
+            # collision during its in-session vec_working repair left that
+            # connection inside the half-finished transaction and wedged the
+            # whole session. When the active provider DB is known, the repair
+            # runs on a dedicated short-lived connection below instead, so
+            # keep the base diagnostics read-only.
+            base_kwargs = diagnostic_kwargs
+            if repair_requested and active_db:
+                base_kwargs = dict(diagnostic_kwargs, repair_vec_working=False)
+            result = collect(**base_kwargs)
+            result["sync_turn"] = self._sync_turn_diagnostics()
 
             if active_db:
                 result["active_provider_db_path"] = str(active_db)
@@ -5313,16 +5325,71 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     try:
                         from mnemosyne.core.beam import repair_vec_working as _repair_vec_working, vec_working_coverage
                         if repair_requested:
-                            result["active_provider_vec_working_repair"] = _repair_vec_working(
-                                self._beam.conn, dry_run=dry_run
+                            # Dedicated short-lived connection for the WRITE
+                            # path: a "database is locked" collision during
+                            # the repair used to leave the provider's
+                            # long-lived connection inside the half-finished
+                            # transaction, wedging every later remember/recall
+                            # in the session. vec_working needs the sqlite-vec
+                            # extension loaded, so this connection is opened
+                            # here rather than reusing the count connection.
+                            repair_conn = sqlite3.connect(
+                                str(active_db), check_same_thread=False
                             )
-                            result["active_provider_vec_working"] = result[
-                                "active_provider_vec_working_repair"
-                            ].get("after", {})
+                            repair_conn.row_factory = sqlite3.Row
+                            try:
+                                try:
+                                    from mnemosyne.core.journal import journal_mode
+                                    repair_conn.execute(
+                                        f"PRAGMA journal_mode={journal_mode()}"
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    from mnemosyne.core.sqlite_config import (
+                                        configure_busy_timeout,
+                                    )
+                                    configure_busy_timeout(repair_conn)
+                                except Exception:
+                                    pass
+                                try:
+                                    import sqlite_vec
+                                    repair_conn.enable_load_extension(True)
+                                    sqlite_vec.load(repair_conn)
+                                except Exception:
+                                    logger.warning(
+                                        "diagnose: sqlite-vec load failed on the "
+                                        "dedicated repair connection; vec_working "
+                                        "repair reports unavailable instead of "
+                                        "touching the provider connection"
+                                    )
+                                result["active_provider_vec_working_repair"] = _repair_vec_working(
+                                    repair_conn, dry_run=dry_run
+                                )
+                                result["active_provider_vec_working"] = result[
+                                    "active_provider_vec_working_repair"
+                                ].get("after", {})
+                            finally:
+                                try:
+                                    repair_conn.rollback()
+                                except Exception:
+                                    pass
+                                repair_conn.close()
                         else:
+                            # Read-only coverage on the provider connection:
+                            # no transaction can be left open behind.
                             result["active_provider_vec_working"] = vec_working_coverage(self._beam.conn)
                     except Exception as exc:
                         result["active_provider_vec_working_error"] = str(exc)
+                        # Defense in depth: if this path ever faults against
+                        # the provider connection again, drop whatever
+                        # transaction it opened so later calls stay healthy.
+                        try:
+                            beam_conn = getattr(self._beam, "conn", None)
+                            if beam_conn is not None:
+                                beam_conn.rollback()
+                        except Exception:
+                            pass
                 except Exception as exc:
                     result["active_provider_counts_error"] = str(exc)
 
