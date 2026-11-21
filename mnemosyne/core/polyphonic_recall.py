@@ -58,6 +58,15 @@ def _env_disabled(name: str) -> bool:
     return val in ("0", "false", "no", "off")
 
 
+def _env_enabled(name: str) -> bool:
+    """Opt-in toggle helper: True iff env var is `1`/`true`/`yes`/`on`.
+    Complement of `_env_disabled`; mirrors `beam._env_truthy`, duplicated
+    rather than imported for the same self-containment reason.
+    """
+    val = os.environ.get(name, "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
 @dataclass
 class RecallResult:
     """Result from a single recall voice."""
@@ -764,8 +773,16 @@ class PolyphonicRecallEngine:
                 wm_dense_predicate = (
                     " AND (wm.source IS NULL OR (wm.source <> 'conversation'"
                     " AND wm.source <> 'honcho_message'))"
-                    " AND wm.consolidated_at IS NULL"
                 )
+                # Consolidated rows are excluded from the default dense pool
+                # (mirrors beam.recall and #979): on an additive store they
+                # are most of the archive and frequently have no episodic
+                # twin to carry their embedding. Set
+                # MNEMOSYNE_DENSE_INCLUDE_CONSOLIDATED=1 to opt them back
+                # in; the same env var governs the beam.recall dense
+                # predicate.
+                if not _env_enabled("MNEMOSYNE_DENSE_INCLUDE_CONSOLIDATED"):
+                    wm_dense_predicate += " AND wm.consolidated_at IS NULL"
             echo_clause, echo_params = exclusion_sql(excluded_wm_ids, "wm.id")
             wm_dense_predicate += echo_clause
             wm_dense_params.extend(echo_params)
