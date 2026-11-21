@@ -88,6 +88,91 @@ def test_repair_runs_on_dedicated_connection_and_leaves_session_writable(
     )
 
 
+def test_public_tools_still_work_after_the_failed_repair(provider, monkeypatch):
+    """Direct SQL proves the connection is writable; the tools prove the session is.
+
+    The production incident surfaced as every later mnemosyne_remember /
+    mnemosyne_recall returning "database is locked" for the life of the
+    process. Reproduce the contained lock collision here, then pin the
+    actual public entry points, not just the connection.
+    """
+    def fake_repair(conn, *, dry_run=False):
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "INSERT INTO working_memory (id, content, source) VALUES (?, ?, ?)",
+            ("mid-transaction", "wedge probe", "test"),
+        )
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(beam_module, "repair_vec_working", fake_repair)
+    result = json.loads(provider.handle_tool_call(
+        "mnemosyne_diagnose", {"repair_vec_working": True}
+    ))
+    assert "database is locked" in result["active_provider_vec_working_error"]
+
+    remember = json.loads(provider.handle_tool_call(
+        "mnemosyne_remember",
+        {"content": "the session kept working after the wedged repair",
+         "source": "test", "importance": 0.5},
+    ))
+    assert "error" not in remember, f"remember failed after contained repair error: {remember}"
+
+    recall = json.loads(provider.handle_tool_call(
+        "mnemosyne_recall",
+        {"query": "session kept working wedged repair", "limit": 5},
+    ))
+    assert "error" not in recall, f"recall failed after contained repair error: {recall}"
+    assert isinstance(recall.get("results"), list)
+
+
+def test_real_repair_backfills_vec_working_and_leaves_provider_healthy(
+    provider, monkeypatch
+):
+    """Success path of the repair on the DEDICATED connection, not a stub.
+
+    The lock-collision test replaces repair_vec_working entirely, so nothing
+    there exercises the real backfill running on the short-lived connection.
+    Seed a memory embedding whose vec_working row is missing, repair, and
+    demand the documented result: repaired, one row inserted, coverage
+    complete - and the session still writable afterwards.
+    """
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("sqlite_vec")
+    if not beam_module._wm_vec_available(provider._beam.conn):
+        pytest.skip("sqlite-vec vec_working table unavailable")
+    now = "2026-01-01T00:00:00"
+    memory_id = "active-gap"
+    embedding = np.array([1.0] + [0.0] * (beam_module.EMBEDDING_DIM - 1), dtype=np.float32)
+    provider._beam.conn.execute(
+        """
+        INSERT INTO working_memory
+            (id, content, source, timestamp, session_id, scope, importance)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (memory_id, "active provider vector gap", "test", now,
+         "diagnose-repair", "session", 0.5),
+    )
+    provider._beam.conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+        (memory_id, beam_module._embeddings.serialize(embedding), "test"),
+    )
+    provider._beam.conn.commit()
+
+    result = json.loads(provider.handle_tool_call(
+        "mnemosyne_diagnose", {"repair_vec_working": True}
+    ))
+    assert result["active_provider_vec_working_repair"]["status"] == "repaired"
+    assert result["active_provider_vec_working_repair"]["inserted"] == 1
+    assert result["active_provider_vec_working"]["missing_vec_working_rows"] == 0
+    assert result["active_provider_vec_working"]["status"] == "complete"
+
+    # Public write path on the provider's own connection, after the repair ran.
+    remember = json.loads(provider.handle_tool_call(
+        "mnemosyne_remember", {"content": "written after real repair", "source": "test"}
+    ))
+    assert "error" not in remember
+
+
 def test_base_diagnostics_are_read_only_when_provider_db_active(
     provider, monkeypatch
 ):
