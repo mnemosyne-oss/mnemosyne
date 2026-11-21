@@ -1212,6 +1212,14 @@ def _recall_canonical_gate_enabled() -> bool:
     return val in ("1", "true", "yes", "on")
 
 
+# When the gate is enabled the canonical producer is fetched with this
+# candidate window instead of its shortlist cap, so a row that only the
+# gate would reject-and-replace is still visible to the gate. The producer
+# scores every store row before slicing, so the window costs no extra scan;
+# it only stops dict construction from being unbounded on huge stores.
+_RECALL_CANONICAL_GATE_WINDOW = 1000
+
+
 def _recall_has_distinctive_lexical_evidence(query: str, content: str) -> bool:
     """Recall-path variant of the prefetch predicate, with its own coverage floor."""
     generic_tokens = _PREFETCH_LEXICAL_GENERIC_TOKENS
@@ -4098,17 +4106,31 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 from mnemosyne.core.canonical import CanonicalStore
                 store = CanonicalStore(db_path=self._beam.db_path, conn=self._beam.conn)
                 self._beam.canonical = store
-            canonical_rows = _canonical_recall_rows(store, self._canonical_owner(), query, limit=max(2, min(top_k, 5)))
-            if _recall_canonical_gate_enabled():
-                # Admit at most ONE canonical row, and only when it carries
-                # distinctive lexical evidence for this query; fail-closed.
-                # The predicate is the one the prefetch path already applies
-                # (_prefetch_has_distinctive_lexical_evidence), with its own
-                # recall-side coverage floor.
+            gate = _recall_canonical_gate_enabled()
+            if gate:
+                # The gate runs BEFORE any row cap, on a full-window fetch:
+                # the producer counts tokens like 'preference'/
+                # 'recommendation' as distinctive overlap that the gate's
+                # generic list excludes, so an eligible row can rank below
+                # the ungated shortlist cap and would never be considered.
+                # The producer scores every store row regardless of `limit`
+                # (the limit only slices the already-ranked tail), so the
+                # wide window costs nothing new; then at most ONE gated row
+                # is admitted, fail-closed.
+                canonical_rows = _canonical_recall_rows(
+                    store, self._canonical_owner(), query,
+                    limit=_RECALL_CANONICAL_GATE_WINDOW,
+                )
                 canonical_rows = [
                     r for r in canonical_rows
                     if _recall_has_distinctive_lexical_evidence(query, r.get("content", ""))
                 ][:1]
+            else:
+                # Gate off: the pinned broad-merge contract is unchanged,
+                # including the producer's own candidate cap.
+                canonical_rows = _canonical_recall_rows(
+                    store, self._canonical_owner(), query, limit=max(2, min(top_k, 5))
+                )
         except Exception:
             canonical_rows = []
         if canonical_rows:
