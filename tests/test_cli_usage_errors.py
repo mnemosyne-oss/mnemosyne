@@ -2,8 +2,10 @@
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 
 import pytest
 
@@ -155,6 +157,99 @@ def test_reindex_db_dry_run_leaves_default_store_untouched(tmp_path):
     assert "working_memory: 1" in result.stdout
     assert not (default_dir / "mnemosyne.db").exists()
     assert not (tmp_path / "home" / ".hermes" / "mnemosyne" / "data" / "mnemosyne.db").exists()
+
+
+@pytest.mark.parametrize("selection", ["ambient", "db", "bank"])
+def test_reindex_dry_run_does_not_initialize_or_backfill_target(tmp_path, monkeypatch, selection):
+    monkeypatch.delenv("MNEMOSYNE_BANK", raising=False)
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setenv("MNEMOSYNE_VEC_TYPE", "int8")
+    data_dir = tmp_path / "data #%"
+    target_dir = data_dir / "banks" / "test" if selection == "bank" else data_dir
+    target = target_dir / "mnemosyne.db"
+    seeded = run_cli_in(
+        ["store", "A disposable memory backed by JSON", "cli", "0.5"], tmp_path, target_dir
+    )
+    assert seeded.returncode == 0, seeded.stderr
+
+    with closing(sqlite3.connect(target)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("DELETE FROM memory_embeddings")
+        row = conn.execute("SELECT id FROM working_memory").fetchone()
+        vec_schema = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'vec_episodes'"
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO memory_embeddings(memory_id, embedding_json, model) VALUES (?, ?, ?)",
+            (row[0], json.dumps([1.0] + [0.0] * 383), "fixture"),
+        )
+        conn.commit()
+    if selection == "ambient":
+        (data_dir / "banks").rmdir()
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    tree_before = _tree(tmp_path)
+    args = {
+        "ambient": [],
+        "db": ["--db", str(target)],
+        "bank": ["--bank", "test"],
+    }[selection]
+
+    monkeypatch.setenv("MNEMOSYNE_VEC_TYPE", "float32")
+    result = run_cli_in(["reindex", "--dry-run", *args], tmp_path, data_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert str(target) in result.stdout
+    assert "working_memory: 1" in result.stdout
+    if vec_schema is not None:
+        assert "sqlite_vec: True" in result.stdout
+        assert "vec_type: int8" in result.stdout
+    assert _tree(tmp_path) == tree_before
+    assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize("journal_mode, suffix", [("WAL", "-wal"), ("DELETE", "-journal")])
+def test_reindex_dry_run_refuses_pending_journal_without_writes(tmp_path, journal_mode, suffix):
+    target = tmp_path / "pending.db"
+    with closing(sqlite3.connect(target)) as conn:
+        conn.execute(f"PRAGMA journal_mode={journal_mode}")
+        conn.execute("CREATE TABLE working_memory(content TEXT)")
+        conn.execute("CREATE TABLE episodic_memory(content TEXT)")
+        conn.execute("INSERT INTO working_memory VALUES ('initial')")
+        conn.commit()
+        if journal_mode == "WAL":
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("UPDATE working_memory SET content = 'new text'")
+        if journal_mode == "WAL":
+            conn.commit()  # A committed row exists only in the WAL.
+        tree_before = _tree(tmp_path)
+        before = {path: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()}
+        assert target.with_name(target.name + suffix).stat().st_size > 0
+
+        result = run_cli(["reindex", "--dry-run", "--db", str(target)], tmp_path)
+
+        assert result.returncode != 0
+        assert "checkpoint" in result.stderr.lower()
+        assert "Traceback" not in result.stderr
+        assert _tree(tmp_path) == tree_before
+        assert {path: path.read_bytes() for path in before} == before
+
+
+def test_reindex_dry_run_counts_existing_rows_in_legacy_store(tmp_path):
+    target = tmp_path / "legacy.db"
+    with closing(sqlite3.connect(target)) as conn:
+        conn.execute("CREATE TABLE working_memory(content TEXT)")
+        conn.execute("INSERT INTO working_memory VALUES ('legacy memory')")
+        conn.commit()
+    before = target.read_bytes()
+
+    result = run_cli(["reindex", "--dry-run", "--db", str(target)], tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "working_memory: 1" in result.stdout
+    assert "episodic_memory: 0" in result.stdout
+    assert "sqlite_vec: False" in result.stdout
+    assert _tree(tmp_path) == ["legacy.db"]
+    assert target.read_bytes() == before
 
 
 def test_help_lists_reindex_target_options(tmp_path):

@@ -41,7 +41,7 @@ The three flags on `sleep` are parsed but undocumented in the built-in help. `--
 | `verify` | `verify [db_path] [--quick]`. Integrity check |
 | `reindex` | `reindex [--db PATH \| --bank NAME] [--model NAME] [--batch-size N] [--dry-run] [--yes] [--no-backup]`. Re-embeds everything and rebuilds the sqlite-vec tables |
 
-`reindex` is the recovery path for a vector dimension mismatch. It is synchronous, backs up first unless told otherwise, and prompts unless `--yes`. Its `--dry-run` option prints a rebuild plan without writing.
+`reindex` is the recovery path for a vector dimension mismatch. It is synchronous, backs up first unless told otherwise, and prompts unless `--yes`. Its `--dry-run` option prints a rebuild plan from the existing schema without creating a bank, backfilling vectors, or making a backup. Stop the provider or gateway first. The preview requires an offline, checkpointed database and refuses a nonempty SQLite WAL or rollback journal.
 
 `mnemosyne diagnose --python /path/to/python` runs its runtime, dependency, and capability checks in that exact interpreter. The selected environment must have `mnemosyne-memory` installed; diagnostics use isolated execution, so `PYTHON*` variables and user site-packages do not provide dependencies. Without the option, those checks use the CLI interpreter. Database and integrity checks always use the CLI interpreter. The output includes the runtime-check scope and only the executable basename. If the selected interpreter cannot run Mnemosyne diagnostics, dependency status is unknown and the command does not fall back to the CLI environment. With `--fix`, installations use the selected interpreter's `-m pip`. Each pip installation is limited to 600 seconds; a timeout is reported as a failed repair. A dependency is reported as fixed only after it passes diagnostics again in the selected interpreter.
 
@@ -49,7 +49,7 @@ The three flags on `sleep` are parsed but undocumented in the built-in help. `--
 
 For automation, do not treat a non-zero exit from a non-dry-run `mnemosyne reindex` as success: it means the vector rebuild did not complete. A rebuild that did not complete changes nothing: it runs as a single transaction (and holds the database write lock until it commits), so a failed or killed run leaves the previous vectors and format marker in place and the command can simply be run again. Likewise, non-dry-run `mnemosyne diagnose --repair-vec-working` exits non-zero unless the requested repair reaches `repaired`; its `--dry-run` mode reports what it would repair without writing.
 
-`doctor` and `repair` do not create the data directory as a side effect. `reindex` without `--db` or `--bank` creates it. `reindex --db PATH` creates it only when `MNEMOSYNE_DATA_DIR` is set, since `config.yaml` lives there in that case. A missing `--db` file or `--bank` name, or an invalid option, makes `reindex` exit before it creates anything.
+`doctor`, `repair`, and `reindex --dry-run` do not create the data directory as a side effect. A normal `reindex` without `--db` or `--bank` creates it. A normal `reindex --db PATH` creates it only when `MNEMOSYNE_DATA_DIR` is set, since `config.yaml` lives there in that case. A missing `--db` file or `--bank` name, or an invalid option, makes `reindex` exit before it creates anything.
 
 ## Backup and restore
 

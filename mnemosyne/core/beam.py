@@ -4792,8 +4792,15 @@ def _reindex_vectors_impl(conn, *, batch_size, dry_run, progress):
     vec_type = _effective_vec_type(conn)
     vec_ok = _vec_available(conn)
 
-    def _count(sql: str) -> int:
-        return int(conn.execute(sql).fetchone()[0])
+    def _count(tier: str) -> int:
+        if dry_run and conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (tier,)
+        ).fetchone() is None:
+            # The CLI preview plans from disk without creating missing tiers.
+            return 0
+        return int(conn.execute(
+            f"SELECT COUNT(*) FROM {tier} WHERE content IS NOT NULL AND length(content) > 0"
+        ).fetchone()[0])
 
     def _commit_reindex_writes() -> None:
         """Really commit, even when BEAM normally defers commits."""
@@ -4857,10 +4864,8 @@ def _reindex_vectors_impl(conn, *, batch_size, dry_run, progress):
                     )
         return vectors
 
-    wm_total = _count("SELECT COUNT(*) FROM working_memory "
-                      "WHERE content IS NOT NULL AND length(content) > 0")
-    ep_total = _count("SELECT COUNT(*) FROM episodic_memory "
-                      "WHERE content IS NOT NULL AND length(content) > 0")
+    wm_total = _count("working_memory")
+    ep_total = _count("episodic_memory")
 
     plan: Dict[str, Any] = {
         "model": _embeddings._DEFAULT_MODEL,
