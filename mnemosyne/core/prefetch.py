@@ -141,6 +141,57 @@ def _prefetch_model_slot_tokens(content: str) -> Set[str]:
     return tokens
 
 
+def _prefetch_rrf_norm(value: float) -> float:
+    """Normalize a reciprocal-rank-fusion score back to the gate scale.
+
+    mnemosyne-memory 4.0.0 emits RRF contributions (voice and fused scores are
+    ~1/(60+rank), so rank 1 in one arm is ~0.0164). The prefetch gates were
+    calibrated against the older 0-1 weighted-sum scale, so every row scored
+    below min_score/topic-signal and the whole bank source silently starved.
+    A SINGLE rank-one contribution normalizes to 1.0; a fused multi-voice
+    score can legitimately exceed 1.0 (rank 1 in two voices maps to 2.0).
+    """
+    try:
+        k = max(1.0, float(os.environ.get("MNEMOSYNE_RRF_NORM_K", "61")))
+    except ValueError:
+        k = 61.0
+    return value * k
+
+
+# Both recall producers emit a `voice_scores` dict, but with disjoint key
+# sets and different scales, so the key names are the explicit contract for
+# which scale a row uses:
+#   - the polyphonic RRF engine (polyphonic_recall.py `_fuse_results`) keys
+#     per-voice contributions of ~1/(60+rank) by VOICE name;
+#   - the linear path (beam.py "Gap G" parity block) keys raw 0-1 per-signal
+#     scores by SIGNAL name (vec/fts/keyword) and adds two entries that are
+#     ranking inputs, not query relevance: importance and recency_decay.
+_PREFETCH_RRF_VOICES = frozenset(
+    {"vector", "temporal", "graph", "graph_traversal", "fact"}
+)
+# The temporal voice ranks by recency, not query relevance: it is the RRF-side
+# twin of the linear path's recency_decay, and recency alone has never been
+# accepted as topical evidence by these gates.
+_PREFETCH_RRF_TOPICAL_VOICES = _PREFETCH_RRF_VOICES - {"temporal"}
+
+
+def _prefetch_is_rrf_row(row: Dict[str, Any]) -> bool:
+    """True when a recall row's scores come from polyphonic RRF fusion."""
+    voices = row.get("voice_scores")
+    return isinstance(voices, dict) and not _PREFETCH_RRF_VOICES.isdisjoint(voices)
+
+
+def _prefetch_gate_score(row: Dict[str, Any]) -> float:
+    """The row's fused score expressed on the 0-1 scale the gates expect.
+
+    RRF-scale rows (combined ~1/(60+rank)) are rescaled; linear rows already
+    carry a 0-1 weighted-sum score and must pass through untouched, or a
+    legacy 0.10 would inflate past min_score and get injected.
+    """
+    score = float(row.get("score") or 0.0)
+    return _prefetch_rrf_norm(score) if _prefetch_is_rrf_row(row) else score
+
+
 def _prefetch_topic_signal(row: Dict[str, Any]) -> float:
     """Best available non-importance relevance signal for a recall row."""
     signal = max(
@@ -148,6 +199,24 @@ def _prefetch_topic_signal(row: Dict[str, Any]) -> float:
         float(row.get("fts_score") or 0.0),
         float(row.get("dense_score") or 0.0),
     )
+    # 4.0.0 polyphonic rows carry per-voice RRF contributions under
+    # voice_scores (keyword_score/fts_score/dense_score no longer exist).
+    # Only query-relevance voices count: linear voice_scores are skipped
+    # entirely (their topical entries are the same values as the top-level
+    # fields above, and importance/recency_decay are not topical evidence),
+    # and the temporal voice is excluded on the RRF side for the same reason
+    # recency_decay is.
+    if _prefetch_is_rrf_row(row):
+        voices = row["voice_scores"]
+        topical = [
+            float(value)
+            for name, value in voices.items()
+            if name in _PREFETCH_RRF_TOPICAL_VOICES
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ]
+        if topical:
+            signal = max(signal, _prefetch_rrf_norm(max(topical)))
     # Fact/entity matches are explicit relevance signals even when recall() did
     # not fill keyword/FTS scores for that path.
     if row.get("fact_match") or row.get("entity_match"):
@@ -189,7 +258,7 @@ def _prefetch_is_raw(row: Dict[str, Any]) -> bool:
 
 
 def _prefetch_adjusted_score(row: Dict[str, Any]) -> float:
-    score = float(row.get("score") or 0.0)
+    score = _prefetch_gate_score(row)
     signal = _prefetch_topic_signal(row)
     importance = min(max(float(row.get("importance") or 0.0), 0.0), 1.0)
     return (score * 0.65 + signal * 0.35 + importance * 0.05) * _prefetch_source_quality(row)
@@ -531,7 +600,7 @@ def render_bank_source(
         if profile.exclude_assistant and _prefetch_source_quality(r) <= 0:
             continue
         signal = _prefetch_topic_signal(r)
-        score = float(r.get("score") or 0.0)
+        score = _prefetch_gate_score(r)
         importance = float(r.get("importance") or 0.0)
         required_signal = profile.raw_min_topic_signal if _prefetch_is_raw(r) else profile.min_topic_signal
         if signal < required_signal:
