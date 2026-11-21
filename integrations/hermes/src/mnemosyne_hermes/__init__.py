@@ -1179,6 +1179,58 @@ def _prefetch_has_distinctive_lexical_evidence(query: str, content: str) -> bool
     )
 
 
+def _recall_min_query_coverage() -> float:
+    """Coverage floor for letting a canonical/surface row outrank the beam arm.
+
+    Deliberately separate from `_prefetch_min_query_coverage()`: that value
+    also governs the context-injection path, so raising it there to fix
+    recall would silently change what gets injected. Defaults to the prefetch
+    value, so behaviour is unchanged unless a deployment pins
+    `MNEMOSYNE_RECALL_CANONICAL_MIN_COVERAGE`.
+    """
+    return _parse_unit_float_env(
+        "MNEMOSYNE_RECALL_CANONICAL_MIN_COVERAGE", _prefetch_min_query_coverage()
+    )
+
+
+def _recall_canonical_gate_enabled() -> bool:
+    """Whether the explicit-recall canonical/surface arms are relevance-gated.
+
+    Off by default: the pinned contract keeps explicit recall a broad merge
+    (see test_explicit_recall_preserves_broad_canonical_merge), which is the
+    right default for a caller asking for everything it can get. The gate
+    exists for autonomous injection-style consumers of the recall tool:
+    canonical rows score on an absolute 0.72..1.0 scale while the beam arm
+    returns RRF-weighted scores of roughly 0.016 per voice, so an ungated
+    merge lets an unrelated canonical row take a top slot in EVERY query by
+    scale alone. Measured on a 43-question set over a long-lived store:
+    hit@3 4% ungated vs 38% gated. Set
+    `MNEMOSYNE_RECALL_CANONICAL_GATE=1` to require distinctive lexical
+    evidence and admit at most one row per gated arm (fail-closed).
+    """
+    val = os.environ.get("MNEMOSYNE_RECALL_CANONICAL_GATE", "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
+# When the gate is enabled the canonical producer is fetched with this
+# candidate window instead of its shortlist cap, so a row that only the
+# gate would reject-and-replace is still visible to the gate. The producer
+# scores every store row before slicing, so the window costs no extra scan;
+# it only stops dict construction from being unbounded on huge stores.
+_RECALL_CANONICAL_GATE_WINDOW = 1000
+
+
+def _recall_has_distinctive_lexical_evidence(query: str, content: str) -> bool:
+    """Recall-path variant of the prefetch predicate, with its own coverage floor."""
+    generic_tokens = _PREFETCH_LEXICAL_GENERIC_TOKENS
+    query_tokens = _prefetch_tokens(query) - generic_tokens
+    overlap = query_tokens & _prefetch_tokens(content)
+    return (
+        len(overlap) >= _prefetch_min_distinctive_tokens()
+        and (len(overlap) / max(len(query_tokens), 1)) >= _recall_min_query_coverage()
+    )
+
+
 def _sanitize_prefetch_query(query: str) -> str:
     """Use core's shared sanitizer lazily to preserve diagnostic CLI imports."""
     from mnemosyne.core.query_sanitize import sanitize_prefetch_query
@@ -4054,7 +4106,31 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 from mnemosyne.core.canonical import CanonicalStore
                 store = CanonicalStore(db_path=self._beam.db_path, conn=self._beam.conn)
                 self._beam.canonical = store
-            canonical_rows = _canonical_recall_rows(store, self._canonical_owner(), query, limit=max(2, min(top_k, 5)))
+            gate = _recall_canonical_gate_enabled()
+            if gate:
+                # The gate runs BEFORE any row cap, on a full-window fetch:
+                # the producer counts tokens like 'preference'/
+                # 'recommendation' as distinctive overlap that the gate's
+                # generic list excludes, so an eligible row can rank below
+                # the ungated shortlist cap and would never be considered.
+                # The producer scores every store row regardless of `limit`
+                # (the limit only slices the already-ranked tail), so the
+                # wide window costs nothing new; then at most ONE gated row
+                # is admitted, fail-closed.
+                canonical_rows = _canonical_recall_rows(
+                    store, self._canonical_owner(), query,
+                    limit=_RECALL_CANONICAL_GATE_WINDOW,
+                )
+                canonical_rows = [
+                    r for r in canonical_rows
+                    if _recall_has_distinctive_lexical_evidence(query, r.get("content", ""))
+                ][:1]
+            else:
+                # Gate off: the pinned broad-merge contract is unchanged,
+                # including the producer's own candidate cap.
+                canonical_rows = _canonical_recall_rows(
+                    store, self._canonical_owner(), query, limit=max(2, min(top_k, 5))
+                )
         except Exception:
             canonical_rows = []
         if canonical_rows:
@@ -4084,6 +4160,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     for r in surface_results:
                         r["shared_surface"] = True
                         r["bank"] = self._shared_surface_bank
+                    if _recall_canonical_gate_enabled():
+                        # Same gate as the canonical arm: the surface beam
+                        # scores on its own scale, so an ungated row wins a
+                        # top slot by scale rather than by relevance.
+                        surface_results = [
+                            r for r in surface_results
+                            if _recall_has_distinctive_lexical_evidence(query, r.get("content", ""))
+                        ][:1]
                     combined = list(results) + list(surface_results)
                     combined.sort(key=lambda x: x.get("score") or 0.0, reverse=True)
                     results = combined[:top_k]
