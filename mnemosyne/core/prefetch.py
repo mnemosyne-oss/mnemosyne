@@ -142,13 +142,14 @@ def _prefetch_model_slot_tokens(content: str) -> Set[str]:
 
 
 def _prefetch_rrf_norm(value: float) -> float:
-    """Normalize a reciprocal-rank-fusion score back to the 0-1 gate scale.
+    """Normalize a reciprocal-rank-fusion score back to the gate scale.
 
     mnemosyne-memory 4.0.0 emits RRF contributions (voice and fused scores are
     ~1/(60+rank), so rank 1 in one arm is ~0.0164). The prefetch gates were
     calibrated against the older 0-1 weighted-sum scale, so every row scored
     below min_score/topic-signal and the whole bank source silently starved.
-    Rank 1 in one arm normalizes to 1.0.
+    A SINGLE rank-one contribution normalizes to 1.0; a fused multi-voice
+    score can legitimately exceed 1.0 (rank 1 in two voices maps to 2.0).
     """
     try:
         k = max(1.0, float(os.environ.get("MNEMOSYNE_RRF_NORM_K", "61")))
