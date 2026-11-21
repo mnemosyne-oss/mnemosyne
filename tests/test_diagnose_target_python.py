@@ -1,8 +1,10 @@
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 import venv
+from importlib.machinery import PathFinder
 from pathlib import Path
 
 import pytest
@@ -104,6 +106,39 @@ def test_runtime_diagnostics_classify_normalized_load_location(tmp_path, monkeyp
 
     locations = [row["detail"] for row in payload["checks"] if row["check"] == "mnemosyne_loaded_from"]
     assert locations == ([] if expected is None else [expected])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Exercises POSIX symlink and parent traversal")
+def test_diagnostics_classify_import_through_symlink_parent(tmp_path, monkeypatch):
+    """Both reports identify the file Python finds through a symlink and parent component."""
+    import mnemosyne
+    from mnemosyne.doctor import build_doctor_report
+
+    site_packages = tmp_path / "site-packages"
+    checkout = tmp_path / "source-checkout"
+    site_packages.mkdir()
+    vendor = checkout / "vendor"
+    vendor.mkdir(parents=True)
+    package = checkout / "mnemosyne"
+    package.mkdir()
+    init_file = package / "__init__.py"
+    init_file.write_text("", encoding="utf-8")
+    link = site_packages / "link"
+    link.symlink_to(vendor, target_is_directory=True)
+
+    spec = PathFinder.find_spec("mnemosyne", [str(link / "..")])
+    assert spec is not None and spec.origin is not None
+    assert Path(spec.origin).samefile(init_file)
+    monkeypatch.setattr(mnemosyne, "__file__", spec.origin)
+    monkeypatch.setattr(diagnose, "LOG_DIR", tmp_path / "logs")
+    db_path = tmp_path / "diagnostics.db"
+    sqlite3.connect(db_path).close()
+
+    diagnostic = diagnose.run_diagnostics(db_path=db_path)
+    doctor_runtime = build_doctor_report("work", db_path).to_dict()["runtime_diagnostics"]
+
+    assert _check(diagnostic, "mnemosyne_loaded_from")["detail"] == "tree:source-checkout"
+    assert _check(doctor_runtime, "mnemosyne_loaded_from")["detail"] == "tree:source-checkout"
 
 
 def test_default_runtime_checks_are_labeled_as_cli_interpreter(tmp_path, monkeypatch):

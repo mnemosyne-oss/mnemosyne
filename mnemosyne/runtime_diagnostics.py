@@ -159,8 +159,10 @@ def collect_runtime_diagnostics(
         # so never emit an absolute path — classify the layer and keep at most a relative tail.
         loaded_from = getattr(mnemosyne, "__file__", None)
         if loaded_from:
-            # Collapse dot components while preserving the import path's symlink spelling.
-            loaded_path = Path(os.path.normpath(loaded_from))
+            loaded_path = Path(loaded_from)
+            # A symlink can change the meaning of a following parent component.
+            if ".." in loaded_path.parts:
+                loaded_path = Path(os.path.realpath(loaded_path))
             package_dir = next(
                 (parent for parent in loaded_path.parents if parent.name in {"site-packages", "dist-packages"}),
                 None,
