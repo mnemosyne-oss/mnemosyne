@@ -147,6 +147,8 @@ dropped:
 | Variable | Default | Effect |
 |---|---|---|
 | `MNEMOSYNE_POLYPHONIC_RECALL` | `0` (off) | Routes recall through `PolyphonicRecallEngine` (RRF fusion over vector / graph / fact / temporal voices). Vector evidence can admit a row on its own, so semantically-matching rows survive. |
+| `MNEMOSYNE_VOICE_RETENTION` | `20` | Per-voice retention FLOOR feeding RRF fusion. A target ranked deeper than a voice's retained top-N can never surface, so the floor is itself a recall ceiling for voices with long candidate tails. Values `<= 0` or invalid values fall back to 20; the requested `top_k` always beats a lower floor. |
+| `MNEMOSYNE_VOICE_WEIGHING` | `0` (off) | Multiplies each RRF contribution by the engine's declared `voice_weights` (vector 0.35 / graph 0.25 / fact 0.25 / temporal 0.15). Off, fusion stays flat equal-weight RRF, as before this option existed. |
 | `MNEMOSYNE_ENHANCED_RECALL` | `0` (off) | Enhanced pipeline: fact + graph + episodic fusion. |
 | `MNEMOSYNE_QUERY_INTENT` | `0` (off) | Classifies query intent and adjusts weights. |
 | `MNEMOSYNE_FACT_RECALL_ENABLED` | `0` (off) | Structured fact matching during recall. |
