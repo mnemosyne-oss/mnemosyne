@@ -168,8 +168,9 @@ def test_standalone_hermes_wheel_keeps_plugin_manifest(tmp_path):
     assert manifest_version == runtime_version
     assert manifest_version == metadata_version
     assert entry_points["hermes_agent.plugins"]["mnemosyne"] == (
-        "mnemosyne_hermes:register"
+        "_mnemosyne_hermes_plugin:register"
     )
+    assert "_mnemosyne_hermes_plugin.py" in members
     assert (
         entry_points["hermes_agent.memory_providers"]["mnemosyne"] == "mnemosyne_hermes"
     )
