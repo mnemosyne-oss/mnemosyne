@@ -537,6 +537,27 @@ class TestAuditNoise:
         assert report.summary["table_counts"]["episodic_memory"] == 1
         assert any(c.table_name == "episodic_memory" for c in report.candidates)
 
+    def test_audit_scan_all_scratchpad_without_source_column(self, temp_db):
+        db_path, beam = temp_db
+        beam.conn.execute("DELETE FROM scratchpad")
+        beam.conn.execute(
+            "INSERT INTO scratchpad (id, content, session_id) VALUES (?, ?, ?)",
+            ("scratch-noise", "heartbeat", "test"),
+        )
+        beam.conn.commit()
+
+        report = audit_noise(
+            db_path=db_path,
+            tables=["scratchpad"],
+            scan_all=True,
+            batch_size=1,
+            min_score=0.3,
+        )
+
+        assert report.total_scanned == 1
+        assert report.summary["table_counts"]["scratchpad"] == 1
+        assert [candidate.memory_id for candidate in report.candidates] == ["scratch-noise"]
+
     def test_audit_offset_and_scan_all(self, temp_db):
         db_path, beam = temp_db
         for idx in range(3):
