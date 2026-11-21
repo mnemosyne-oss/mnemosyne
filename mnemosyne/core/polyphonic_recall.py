@@ -59,10 +59,13 @@ def _env_disabled(name: str) -> bool:
 
 
 def _voice_retention() -> int:
-    """How many candidates each voice retains before fusion, as a floor.
+    """How many candidates a voice retains before fusion, as a floor.
 
-    Default 20 keeps the current behavior. Read per call, like the other
-    toggles in this module; invalid values fall back to the default.
+    Applies to the vector and temporal voices, which take the limit;
+    graph and fact results are voice-shaped queries without a retention
+    cap and stay unaffected. Default 20 keeps the current behavior.
+    Read per call, like the other toggles in this module; invalid values
+    fall back to the default.
     """
     raw = os.environ.get("MNEMOSYNE_VOICE_RETENTION", "").strip()
     if not raw:
@@ -1268,7 +1271,13 @@ class PolyphonicRecallEngine:
                 rank = voice_ranks.get(voice_name, {}).get(r.memory_id, 999)
                 rrf_contribution = 1.0 / (RRF_K + rank)
                 if _voice_weighting_enabled():
-                    rrf_contribution *= self.voice_weights.get(r.voice, 1.0)
+                    # Traversal hits are graph evidence with separate
+                    # attribution: read the declared "graph" weight for them,
+                    # keyed under the producing label below. Unmapped, the
+                    # 1.0 fallback would let a weighted-out voice outrank the
+                    # vector voice's rank 1 and invert flat fusion.
+                    weight_voice = "graph" if r.voice == "graph_traversal" else r.voice
+                    rrf_contribution *= self.voice_weights.get(weight_voice, 1.0)
                 combined[r.memory_id].voice_scores[r.voice] = rrf_contribution
                 combined[r.memory_id].combined_score += rrf_contribution
                 combined[r.memory_id].metadata.update(r.metadata)
