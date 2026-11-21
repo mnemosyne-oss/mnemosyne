@@ -244,3 +244,59 @@ def test_weighted_fusion_sums_multi_voice_contributions(tmp_path, monkeypatch):
     assert combined["shared"].combined_score == pytest.approx(expected)
     # The multi-voice memory still outranks a single-voice fact hit ranked below it.
     assert combined["shared"].combined_score > combined["fact-only"].combined_score
+
+
+# ---------------------------------------------------------------------------
+# Enhanced-recall cache regression: both knobs must key the cache
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("knob,other", [
+    ("MNEMOSYNE_VOICE_RETENTION", "64"),
+    ("MNEMOSYNE_VOICE_WEIGHING", "1"),
+])
+def test_enhanced_cache_recomputes_when_a_voice_knob_changes(
+    tmp_path, monkeypatch, knob, other
+):
+    """Warm the cache, flip ONE knob, demand a recompute; unchanged value replays.
+
+    Both settings change polyphonic output (per-voice candidate limit and
+    per-voice RRF weight), so they are result-affecting inputs and belong in
+    the enhanced-recall cache key.
+    """
+    from types import SimpleNamespace
+
+    from mnemosyne.core import beam as beam_module
+
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setattr(
+        beam_module, "resolve_beam_runtime", lambda: SimpleNamespace(cross_session=False)
+    )
+    monkeypatch.delenv("MNEMOSYNE_VOICE_RETENTION", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_VOICE_WEIGHING", raising=False)
+    memory = BeamMemory(session_id="knobs-cache", db_path=tmp_path / "kc.db")
+    calls: list = []
+
+    def fake_recall(query, top_k=40, **kwargs):
+        calls.append((query, top_k))
+        return [{"id": f"result-{len(calls)}", "content": query, "score": 1.0}]
+
+    memory.recall = fake_recall
+    try:
+        def run() -> tuple[list, int]:
+            out = memory.recall_enhanced(
+                "voice knob cache query",
+                use_weibull=False, use_mmr=False, use_intent=False,
+                use_synonyms=False,
+            )
+            return [r["id"] for r in out], len(calls)
+
+        assert run() == (["result-1"], 1), "first call must compute"
+        assert run() == (["result-1"], 1), "unchanged settings must reuse the cache"
+        monkeypatch.setenv(knob, other)
+        assert run() == (["result-2"], 2), f"changing {knob} must recompute"
+        assert run() == (["result-2"], 2), "the new value's entry must then be reused"
+    finally:
+        cache = getattr(memory, "_query_cache", None)
+        if cache is not None:
+            cache.close()
+        memory.conn.close()
