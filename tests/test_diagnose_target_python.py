@@ -56,7 +56,9 @@ def test_runtime_checks_run_in_the_selected_venv(tmp_path, monkeypatch, explicit
     assert _check(payload, "fastembed")["detail"] == "version=provider-only"
     assert _check(payload, "fastembed")["scope"] == "target_interpreter"
     assert _check(payload, "mnemosyne_loaded_from")["detail"] == "site-packages/mnemosyne/__init__.py"
-    assert str(environment) not in json.dumps(payload)
+    # Match the serialized spelling, including escaped Windows separators.
+    encoded_environment = json.dumps(str(environment))[1:-1]
+    assert encoded_environment not in json.dumps(payload)
     if explicit_db:
         assert Path(payload["resolved_db"]).resolve() == selected_db.resolve()
         assert _check(payload, "working_total")["status"] == "1"
@@ -73,6 +75,35 @@ def test_runtime_diagnostics_recognize_dist_packages(tmp_path, monkeypatch):
     payload = diagnose.collect_runtime_diagnostics()
 
     assert _check(payload, "mnemosyne_loaded_from")["detail"] == "dist-packages/mnemosyne/__init__.py"
+
+
+@pytest.mark.parametrize(
+    ("parts", "expected"),
+    [
+        (
+            ("site-packages", "local-folder", "..", "mnemosyne", "__init__.py"),
+            "site-packages/mnemosyne/__init__.py",
+        ),
+        (
+            ("site-packages", "..", "source-checkout", "mnemosyne", "__init__.py"),
+            "tree:source-checkout",
+        ),
+        (("source-checkout", "mnemosyne", "__init__.py"), "tree:source-checkout"),
+        (None, None),
+    ],
+)
+def test_runtime_diagnostics_classify_normalized_load_location(tmp_path, monkeypatch, parts, expected):
+    import mnemosyne
+
+    if parts is None:
+        monkeypatch.delattr(mnemosyne, "__file__")
+    else:
+        monkeypatch.setattr(mnemosyne, "__file__", str(tmp_path.joinpath(*parts)))
+
+    payload = diagnose.collect_runtime_diagnostics()
+
+    locations = [row["detail"] for row in payload["checks"] if row["check"] == "mnemosyne_loaded_from"]
+    assert locations == ([] if expected is None else [expected])
 
 
 def test_default_runtime_checks_are_labeled_as_cli_interpreter(tmp_path, monkeypatch):
