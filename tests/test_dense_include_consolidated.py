@@ -173,6 +173,61 @@ def test_enhanced_recall_cache_is_fresh_across_toggle_flips(monkeypatch, tmp_pat
         memory.conn.close()
 
 
+def test_dense_native_vec_working_selection_not_json_fallback(tmp_path, monkeypatch):
+    """Native sqlite-vec selection is covered SEPARATELY from the JSON fallback.
+
+    The functional test above seeds memory_embeddings, which is exactly what
+    the compatibility fallback reads, so a broken native query could fall
+    through to the fallback and still pass there. Here the vec_working table
+    is populated with the same backfill the diagnose repair uses, the JSON
+    fallback is trapped, and recall under the opt-in must score the
+    consolidated row from the native table alone.
+    """
+    pytest.importorskip("sqlite_vec")
+    beam = BeamMemory(session_id="s-979", db_path=tmp_path / "native.db")
+    if not beam_module._wm_vec_available(beam.conn):
+        pytest.skip("sqlite-vec vec_working table unavailable")
+    query_vec = _unit(11)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    beam.conn.execute(
+        "INSERT INTO working_memory "
+        "(id, content, source, timestamp, importance, session_id, scope) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("archived-native", "zulu yankee archive note", "fact", now, 0.7, "s-979", "session"),
+    )
+    beam.conn.execute(
+        "UPDATE working_memory SET consolidated_at = ? WHERE id = 'archived-native'", (now,)
+    )
+    beam.conn.execute(
+        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) "
+        "VALUES (?, ?, ?)",
+        ("archived-native", json.dumps(query_vec.astype(np.float32).tolist()), "test-model"),
+    )
+    beam.conn.commit()
+    report = beam_module.repair_vec_working(beam.conn)
+    assert report.get("inserted", 0) >= 1, "backfill must put the row in vec_working"
+
+    monkeypatch.setenv(ENV, "1")
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
+    monkeypatch.setattr(beam_module._embeddings, "embed_query", lambda _q: query_vec)
+    fallback_calls: list = []
+    real_fallback = beam_module._wm_vec_search_fallback
+
+    def spy(*args, **kwargs):
+        fallback_calls.append(args)
+        return real_fallback(*args, **kwargs)
+
+    monkeypatch.setattr(beam_module, "_wm_vec_search_fallback", spy)
+
+    results = beam.recall("zulu yankee", top_k=5)
+    native = [r for r in results if r.get("id") == "archived-native"]
+    assert native, "the consolidated row was not recalled via native vec_working"
+    assert float(native[0].get("dense_score") or 0.0) > 0.0
+    assert not fallback_calls, (
+        "native vec_working selection must not consult the JSON fallback"
+    )
+
+
 @pytest.mark.parametrize("opt_in", [False, True])
 def test_polyphonic_dense_voice_follows_the_switch(tmp_path, monkeypatch, opt_in):
     beam = BeamMemory(session_id="s-979", db_path=tmp_path / "m.db")
