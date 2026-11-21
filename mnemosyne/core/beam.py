@@ -4657,6 +4657,17 @@ def repair_vec_working(conn: sqlite3.Connection, *, dry_run: bool = False) -> Di
         result["inserted"] = _backfill_vec_working_from_memory_embeddings(conn)
         conn.commit()
     except Exception as exc:
+        # A lock collision ("database is locked") surfaces here after the
+        # backfill has opened an implicit transaction. Without a rollback the
+        # connection stays inside the half-finished transaction, and every
+        # later write on it fails for the life of the session. The repair
+        # path in the Hermes provider used to run on the provider's
+        # long-lived connection, so one collision wedged all later
+        # remember/recall calls. Roll back best-effort before reporting.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         result["status"] = "error"
         result["error"] = f"{type(exc).__name__}: {exc}"
     result["after"] = vec_working_coverage(conn)
