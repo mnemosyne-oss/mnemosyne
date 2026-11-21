@@ -63,7 +63,9 @@ This path defaults to `~/.hermes/` because Hermes persists that directory across
 
 Consolidated rows (those stamped `consolidated_at` by `sleep()`) are exempt from both limits. They remain queryable through `recall()` until explicitly removed via `forget()`. This is by design — the E3 additive memory contract guarantees that consolidated content persists.
 
-By default, consolidated working-memory rows are **excluded** from hot prompt-injection context (`get_context()`), so they do not compete with unconsolidated memories. Set `MNEMOSYNE_CONTEXT_INCLUDE_CONSOLIDATED=1` to restore legacy behavior where consolidated rows appear in `get_context()`. This override does not affect `recall()` — consolidated rows are always recallable.
+By default, consolidated working-memory rows are **excluded** from hot prompt-injection context (`get_context()`), so they do not compete with unconsolidated memories. Set `MNEMOSYNE_CONTEXT_INCLUDE_CONSOLIDATED=1` to restore legacy behavior where consolidated rows appear in `get_context()`. This override does not affect `recall()`.
+
+`recall()` has a separate, denser question: its default working-memory **dense candidate predicate** also excludes consolidated rows (#979), so on a long-lived additive store - where nearly every older row carries `consolidated_at` - the vector voice converges to "rows written since the last sleep". The rows stay reachable through the lexical (FTS5) voice, which is why nothing errors while this happens. Set `MNEMOSYNE_DENSE_INCLUDE_CONSOLIDATED=1` to admit consolidated rows into the dense pool of both the `beam.recall()` and polyphonic arms; the default is unchanged.
 
 If you see `working.total: 673` and wonder why it's above `WM_MAX_ITEMS`, run `mnemosyne_stats` to check the consolidated vs unconsolidated breakdown (available in v3.5.0+).
 

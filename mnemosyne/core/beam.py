@@ -444,6 +444,27 @@ def _env_truthy(name: str) -> bool:
     return val in ("1", "true", "yes", "on")
 
 
+def _dense_consolidated_exclusion() -> str:
+    """SQL clause keeping consolidated rows out of the default dense pool.
+
+    `MNEMOSYNE_CONTEXT_INCLUDE_CONSOLIDATED` has never covered `recall()`
+    (#979): the default dense candidate predicate drops every
+    `consolidated_at IS NOT NULL` row, so on an additive store - where
+    consolidation is the normal state of older working memory - the dense
+    voice converges to "everything written since the last sleep". Those
+    rows stay FTS-reachable, which is why nothing errors when the dense
+    arm goes quiet. A consolidated row often has no episodic twin at all,
+    so there is nothing to carry its embedding. This escape hatch opts the
+    consolidated rows into the dense pool via
+    ``MNEMOSYNE_DENSE_INCLUDE_CONSOLIDATED=1``; the default keeps the
+    current behaviour. The polyphonic engine mirrors the predicate (see
+    polyphonic_recall.py), so the same env var governs both dense arms.
+    """
+    if _env_truthy("MNEMOSYNE_DENSE_INCLUDE_CONSOLIDATED"):
+        return ""
+    return " AND consolidated_at IS NULL"
+
+
 # BEAM benchmark optimizations (opt-in via env var, zero impact on production)
 # When enabled: broader FTS5 OR semantics, larger vector scan limits, always-include vectors.
 # Set MNEMOSYNE_BEAM_OPTIMIZATIONS=1 to activate for BEAM benchmarking only.
@@ -10444,15 +10465,18 @@ class BeamMemory:
         # importance, honcho_import is a generic import default. Consolidated
         # rows (consolidated_at IS NOT NULL) are likewise kept out of the
         # default dense candidates: per #427 they must not compete with hot
-        # unconsolidated memories (mirrors get_context). An explicit
-        # source=/topic= filter keeps the caller in control — asking for
-        # conversation rows directly still works.
+        # unconsolidated memories (mirrors get_context). On a long-lived
+        # additive store that exclusion shrinks the dense pool to the rows
+        # written since the last sleep (#979);
+        # MNEMOSYNE_DENSE_INCLUDE_CONSOLIDATED=1 opts them back in.
+        # An explicit source=/topic= filter keeps the caller in control —
+        # asking for conversation rows directly still works.
         wm_vec_where = wm_where
         if not (source or topic):
             wm_vec_where = (
                 f"{wm_where} AND (source IS NULL OR "
                 f"(source <> 'conversation' AND source <> 'honcho_message'))"
-                f" AND consolidated_at IS NULL"
+                f"{_dense_consolidated_exclusion()}"
             )
 
         # ---- Working memory (vector search) ----
