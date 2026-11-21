@@ -154,6 +154,24 @@ def collect_runtime_diagnostics(
         if not version:
             version = importlib.metadata.version("mnemosyne-memory")
         add("package", "mnemosyne_version", "OK", str(version))
+        # Which core file actually loaded: three "installed" versions can coexist (plugin tree,
+        # source clone, environment-venv dist) and only one of them runs. Diagnostics are shared,
+        # so never emit an absolute path — classify the layer and keep at most a relative tail.
+        loaded_from = getattr(mnemosyne, "__file__", None)
+        if loaded_from:
+            loaded_path = Path(loaded_from)
+            # A symlink can change the meaning of a following parent component.
+            if ".." in loaded_path.parts:
+                loaded_path = Path(os.path.realpath(loaded_path))
+            package_dir = next(
+                (parent for parent in loaded_path.parents if parent.name in {"site-packages", "dist-packages"}),
+                None,
+            )
+            if package_dir is not None:
+                where = loaded_path.relative_to(package_dir.parent).as_posix()
+            else:
+                where = "tree:" + loaded_path.parent.parent.name
+            add("package", "mnemosyne_loaded_from", "OK", where)
     except Exception:
         add("package", "mnemosyne_version", "ERROR", "package version unavailable")
 

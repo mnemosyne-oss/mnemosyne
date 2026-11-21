@@ -492,6 +492,7 @@ _RUNTIME_CHECK_NAMES = frozenset(
         "python_executable",
         "checks_scope",
         "mnemosyne_version",
+        "mnemosyne_loaded_from",
         "fastembed",
         "sqlite_vec",
         "numpy",
