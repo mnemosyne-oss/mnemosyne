@@ -1179,6 +1179,50 @@ def _prefetch_has_distinctive_lexical_evidence(query: str, content: str) -> bool
     )
 
 
+def _recall_min_query_coverage() -> float:
+    """Coverage floor for letting a canonical/surface row outrank the beam arm.
+
+    Deliberately separate from `_prefetch_min_query_coverage()`: that value
+    also governs the context-injection path, so raising it there to fix
+    recall would silently change what gets injected. Defaults to the prefetch
+    value, so behaviour is unchanged unless a deployment pins
+    `MNEMOSYNE_RECALL_CANONICAL_MIN_COVERAGE`.
+    """
+    return _parse_unit_float_env(
+        "MNEMOSYNE_RECALL_CANONICAL_MIN_COVERAGE", _prefetch_min_query_coverage()
+    )
+
+
+def _recall_canonical_gate_enabled() -> bool:
+    """Whether the explicit-recall canonical/surface arms are relevance-gated.
+
+    Off by default: the pinned contract keeps explicit recall a broad merge
+    (see test_explicit_recall_preserves_broad_canonical_merge), which is the
+    right default for a caller asking for everything it can get. The gate
+    exists for autonomous injection-style consumers of the recall tool:
+    canonical rows score on an absolute 0.72..1.0 scale while the beam arm
+    returns RRF-weighted scores of roughly 0.016 per voice, so an ungated
+    merge lets an unrelated canonical row take a top slot in EVERY query by
+    scale alone. Measured on a 43-question set over a long-lived store:
+    hit@3 4% ungated vs 38% gated. Set
+    `MNEMOSYNE_RECALL_CANONICAL_GATE=1` to require distinctive lexical
+    evidence and admit at most one row per gated arm (fail-closed).
+    """
+    val = os.environ.get("MNEMOSYNE_RECALL_CANONICAL_GATE", "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
+def _recall_has_distinctive_lexical_evidence(query: str, content: str) -> bool:
+    """Recall-path variant of the prefetch predicate, with its own coverage floor."""
+    generic_tokens = _PREFETCH_LEXICAL_GENERIC_TOKENS
+    query_tokens = _prefetch_tokens(query) - generic_tokens
+    overlap = query_tokens & _prefetch_tokens(content)
+    return (
+        len(overlap) >= _prefetch_min_distinctive_tokens()
+        and (len(overlap) / max(len(query_tokens), 1)) >= _recall_min_query_coverage()
+    )
+
+
 def _sanitize_prefetch_query(query: str) -> str:
     """Use core's shared sanitizer lazily to preserve diagnostic CLI imports."""
     from mnemosyne.core.query_sanitize import sanitize_prefetch_query
@@ -4055,6 +4099,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 store = CanonicalStore(db_path=self._beam.db_path, conn=self._beam.conn)
                 self._beam.canonical = store
             canonical_rows = _canonical_recall_rows(store, self._canonical_owner(), query, limit=max(2, min(top_k, 5)))
+            if _recall_canonical_gate_enabled():
+                # Admit at most ONE canonical row, and only when it carries
+                # distinctive lexical evidence for this query; fail-closed.
+                # The predicate is the one the prefetch path already applies
+                # (_prefetch_has_distinctive_lexical_evidence), with its own
+                # recall-side coverage floor.
+                canonical_rows = [
+                    r for r in canonical_rows
+                    if _recall_has_distinctive_lexical_evidence(query, r.get("content", ""))
+                ][:1]
         except Exception:
             canonical_rows = []
         if canonical_rows:
@@ -4084,6 +4138,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     for r in surface_results:
                         r["shared_surface"] = True
                         r["bank"] = self._shared_surface_bank
+                    if _recall_canonical_gate_enabled():
+                        # Same gate as the canonical arm: the surface beam
+                        # scores on its own scale, so an ungated row wins a
+                        # top slot by scale rather than by relevance.
+                        surface_results = [
+                            r for r in surface_results
+                            if _recall_has_distinctive_lexical_evidence(query, r.get("content", ""))
+                        ][:1]
                     combined = list(results) + list(surface_results)
                     combined.sort(key=lambda x: x.get("score") or 0.0, reverse=True)
                     results = combined[:top_k]
