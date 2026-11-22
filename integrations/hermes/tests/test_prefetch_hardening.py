@@ -65,6 +65,32 @@ def _provider(results):
     return p
 
 
+def test_prefetch_renders_answer_after_higher_ranked_question():
+    question = {"content": "[USER] What is the ORCHID password?", "source": "conversation",
+                "importance": 0.5, "score": 0.9, "fts_score": 0.8, "trust_tier": "STATED"}
+    fact = {"content": "[USER] Synthetic fact: ORCHID password is copperotter482. Remember it.",
+            "source": "conversation", "importance": 0.5, "score": 0.8,
+            "fts_score": 0.8, "trust_tier": "STATED"}
+    p = _provider([question, fact, dict(fact)])
+
+    block = p.prefetch("What is the ORCHID password?", session_id="orchid-session")
+
+    assert "copperotter482" in block
+    assert block.count("copperotter482") == 1
+    assert p._beam.last_kwargs["query"] == "What is the ORCHID password?"
+    assert "author_id" not in p._beam.last_kwargs
+
+
+def test_prefetch_fact_first_drops_redundant_question():
+    fact = {"content": "ORCHID password is copperotter482", "source": "fact",
+            "importance": 0.8, "score": 0.9, "fts_score": 0.8}
+    question = {"content": "What is the ORCHID password?", "source": "conversation",
+                "importance": 0.5, "score": 0.8, "fts_score": 0.8}
+    block = _provider([fact, question]).prefetch("What is the ORCHID password?")
+    assert "copperotter482" in block
+    assert "What is the ORCHID password?" not in block
+
+
 def test_prefetch_excludes_assistant_transcript_rows():
     p = _provider([
         {"content": "[ASSISTANT] stale answer that should not inject", "source": "conversation",

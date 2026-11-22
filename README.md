@@ -385,7 +385,7 @@ See [docs/configuration.md#custom-embedding-models](docs/configuration.md#custom
 
 ## Hermes Plugin
 
-When used with Hermes Agent, Mnemosyne exposes provider tools for the memory lifecycle, lifecycle hooks for automatic context injection, and MCP support.
+When used with Hermes Agent, Mnemosyne exposes provider tools for the memory lifecycle, lifecycle hooks for automatic context injection, and MCP support. Automatic prefetch retains an answer-bearing conversation fact when an earlier question contains only a subset of its content; exact and near duplicates are still removed. Explicit recall uses its existing duplicate rules.
 
 The packaged `hermes mnemosyne` CLI uses the provider's database under `HERMES_HOME/mnemosyne/data`, even when `MNEMOSYNE_DATA_DIR` points elsewhere. Profile-isolated commands select the active profile bank below that root; `doctor` reports its selected database. Standalone Core commands still honor `MNEMOSYNE_DATA_DIR`, and the packaged CLI uses the Core resolver when `HERMES_HOME` is unset. Existing stores are not moved or merged.
 

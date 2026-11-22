@@ -1,6 +1,8 @@
 """Real-store regressions for #1263's function-word canonical injection."""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import mnemosyne_hermes
@@ -299,6 +301,53 @@ def test_prefetch_retains_ordinary_recovery_instructions_containing_canonical_fa
         assert "[CANONICAL]" in block
         assert ordinary_body in block
         assert block.index("[CANONICAL]") < block.index(ordinary_body)
+    finally:
+        provider.shutdown()
+
+
+def test_automatic_prefetch_keeps_answer_after_contained_question():
+    question = {"content": "[USER] What is the ORCHID password?", "trust_tier": "STATED"}
+    fact = {"content": "[USER] Synthetic fact: ORCHID password is copperotter482. Remember it.",
+            "trust_tier": "STATED"}
+
+    assert _semantic_dedup_prefetch(
+        [question, fact], preserve_canonical_extensions=True
+    ) == [question, fact]
+    assert _semantic_dedup_prefetch([question, fact]) == [question]
+    assert _semantic_dedup_prefetch(
+        [fact, question], preserve_canonical_extensions=True
+    ) == [fact]
+
+
+def test_automatic_prefetch_still_drops_duplicate_questions_and_facts():
+    question = {"content": "What is the ORCHID password?"}
+    fact = {"content": "ORCHID password is copperotter482"}
+    near_question = {"content": "What is the ORCHID password please?"}
+    assert _semantic_dedup_prefetch(
+        [question, near_question, fact, dict(fact)], preserve_canonical_extensions=True
+    ) == [question, fact]
+
+
+def test_stored_session_answer_survives_question_first_prefetch(tmp_path, monkeypatch):
+    provider = MnemosyneMemoryProvider()
+    provider.initialize("orchid", hermes_home=str(tmp_path), agent_identity="default", profile_isolation=False)
+    try:
+        question = "[USER] What is the ORCHID password?"
+        fact = "[USER] Synthetic fact: ORCHID password is copperotter482. Remember it."
+        assert provider._beam.remember(fact, source="conversation", importance=0.5, scope="session")
+        assert provider._beam.remember(question, source="conversation", importance=0.5, scope="session")
+        original_recall = provider._beam.recall
+
+        def question_first(*args, **kwargs):
+            return sorted(original_recall(*args, **kwargs), key=lambda row: row["content"] != question)
+
+        monkeypatch.setattr(provider._beam, "recall", question_first)
+        block = provider.prefetch("What is the ORCHID password?")
+        assert fact in block
+        assert block.count("copperotter482") == 1
+        assert provider.prefetch("What is the ORCHID password?", session_id="other") == ""
+        explicit = json.loads(provider._handle_recall({"query": "What is the ORCHID password?", "limit": 5}))
+        assert {row["content"] for row in explicit["results"]} == {question, fact}
     finally:
         provider.shutdown()
 
