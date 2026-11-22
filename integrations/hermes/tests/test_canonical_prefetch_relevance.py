@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -318,6 +319,16 @@ def test_automatic_prefetch_keeps_answer_after_contained_question():
         [fact, question], preserve_canonical_extensions=True
     ) == [fact]
 
+@pytest.mark.parametrize("mark", ["?", "？", "؟"])
+def test_automatic_prefetch_keeps_fact_with_followup_question(mark):
+    question = {"content": f"[USER] What is the ORCHID password{mark}"}
+    fact = {"content": f"[USER] Synthetic fact: ORCHID password is copperotter482. Can you remember it{mark}"}
+
+    assert _semantic_dedup_prefetch(
+        [question, fact, dict(fact)], preserve_canonical_extensions=True
+    ) == [question, fact]
+    assert _semantic_dedup_prefetch([question, fact]) == [question]
+
 
 def test_automatic_prefetch_still_drops_duplicate_questions_and_facts():
     question = {"content": "What is the ORCHID password?"}
@@ -327,22 +338,55 @@ def test_automatic_prefetch_still_drops_duplicate_questions_and_facts():
         [question, near_question, fact, dict(fact)], preserve_canonical_extensions=True
     ) == [question, fact]
 
+@pytest.mark.parametrize("mark", ["?", "？", "؟"])
+def test_automatic_prefetch_drops_longer_question_only_row(mark):
+    question = {"content": f"What is the ORCHID password{mark}"}
+    followup = {"content": f"What is the ORCHID password{mark} Could you repeat the ORCHID password{mark}"}
+    assert _semantic_dedup_prefetch(
+        [question, followup], preserve_canonical_extensions=True
+    ) == [question]
 
-def test_stored_session_answer_survives_question_first_prefetch(tmp_path, monkeypatch):
+
+@pytest.mark.parametrize(("followup", "answer_count"), [
+    ("Remember it.", 1),
+    ("Can you remember it?", 1),
+    ("Can you remember it?", 2),
+])
+def test_stored_session_answer_survives_question_first_prefetch(tmp_path, monkeypatch, followup, answer_count):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("MNEMOSYNE_HOME", str(tmp_path / "mnemosyne"))
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_DOCUMENT_PREFIX", "")
+    monkeypatch.setenv("MNEMOSYNE_QUERY_PREFIX", "")
     provider = MnemosyneMemoryProvider()
-    provider.initialize("orchid", hermes_home=str(tmp_path), agent_identity="default", profile_isolation=False)
+    provider.initialize("orchid", hermes_home=str(tmp_path / "hermes"), agent_identity="default", profile_isolation=False)
     try:
+        assert provider._beam is not None
         question = "[USER] What is the ORCHID password?"
-        fact = "[USER] Synthetic fact: ORCHID password is copperotter482. Remember it."
-        assert provider._beam.remember(fact, source="conversation", importance=0.5, scope="session")
+        fact = f"[USER] Synthetic fact: ORCHID password is copperotter482. {followup}"
+        answer_ids = [provider._beam.remember(
+            fact, source="conversation", importance=0.5, scope="session", dedupe=False
+        ) for _ in range(answer_count)]
+        assert all(answer_ids) and len(set(answer_ids)) == answer_count
+        older = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        provider._beam.conn.executemany(
+            "UPDATE working_memory SET timestamp = ? WHERE id = ?",
+            [(older, answer_id) for answer_id in answer_ids],
+        )
+        provider._beam.conn.commit()
         assert provider._beam.remember(question, source="conversation", importance=0.5, scope="session")
-        original_recall = provider._beam.recall
-
-        def question_first(*args, **kwargs):
-            return sorted(original_recall(*args, **kwargs), key=lambda row: row["content"] != question)
-
-        monkeypatch.setattr(provider._beam, "recall", question_first)
+        recalled = provider._beam.recall(
+            "What is the ORCHID password?", top_k=16, temporal_weight=0.2, temporal_halflife=48,
+        )
+        assert [row["content"] for row in recalled] == [question] + [fact] * answer_count
+        assert recalled[0]["score"] > recalled[1]["score"]
+        assert recalled[0]["importance"] == recalled[1]["importance"] == 0.5
+        assert recalled[0]["fts_score"] > 0  # ordinary linear FTS ranking
         block = provider.prefetch("What is the ORCHID password?")
+        assert question in block
         assert fact in block
         assert block.count("copperotter482") == 1
         assert provider.prefetch("What is the ORCHID password?", session_id="other") == ""

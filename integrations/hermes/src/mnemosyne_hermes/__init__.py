@@ -1197,7 +1197,8 @@ def _semantic_dedup_prefetch(
     least 86% contained in the larger set. Automatic prefetch opts into
     ``preserve_canonical_extensions``:
     after a kept canonical row or an ordinary question, containment covers the
-    incoming ordinary row instead, so a longer fact can retain its answer.
+    incoming ordinary row instead, so a longer fact can retain its answer,
+    including a fact followed by a separate question.
     Jaccard still removes near duplicates. The default retains explicit-recall
     and ordinary-to-ordinary containment behavior. Input rows are not modified.
 
@@ -1227,7 +1228,10 @@ def _semantic_dedup_prefetch(
                     kept_row.get("trust_tier") == "CANONICAL"
                     or (
                         _strip_prefetch_prefix(kept_row.get("content", "")).endswith(("?", "？", "؟"))
-                        and not _strip_prefetch_prefix(row.get("content", "")).endswith(("?", "？", "؟"))
+                        and (
+                            not _strip_prefetch_prefix(row.get("content", "")).endswith(("?", "？", "؟"))
+                            or ". " in _strip_prefetch_prefix(row.get("content", ""))
+                        )
                     )
                 )
             ):
