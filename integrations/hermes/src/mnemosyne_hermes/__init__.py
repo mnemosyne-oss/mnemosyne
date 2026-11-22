@@ -1186,6 +1186,24 @@ def _sanitize_prefetch_query(query: str) -> str:
     return sanitize_prefetch_query(query)
 
 
+def _has_prefetch_sentence_separator(content: str) -> bool:
+    """Recognize a bounded separator before a final question, not sentence grammar."""
+    for index, mark in enumerate(content[:-1]):
+        if mark not in {".", "。", "！"}:
+            continue
+        before = content[:index].strip()
+        if not before:
+            continue
+        if mark == ".":
+            if not content[index + 1].isspace():
+                continue
+            # Common titles before a name do not establish a prior sentence.
+            if before.rsplit(maxsplit=1)[-1].lower() in {"dr", "mr", "mrs", "ms", "prof"}:
+                continue
+        if content[index + 1:].strip():
+            return True
+    return False
+
 def _semantic_dedup_prefetch(
     rows: List[Dict[str, Any]], threshold: float = 0.72, *, preserve_canonical_extensions: bool = False,
     limit: Optional[int] = None,
@@ -1230,7 +1248,7 @@ def _semantic_dedup_prefetch(
                         _strip_prefetch_prefix(kept_row.get("content", "")).endswith(("?", "？", "؟"))
                         and (
                             not _strip_prefetch_prefix(row.get("content", "")).endswith(("?", "？", "؟"))
-                            or ". " in _strip_prefetch_prefix(row.get("content", ""))
+                            or _has_prefetch_sentence_separator(_strip_prefetch_prefix(row.get("content", "")))
                         )
                     )
                 )

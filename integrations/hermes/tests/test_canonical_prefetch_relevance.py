@@ -329,6 +329,16 @@ def test_automatic_prefetch_keeps_fact_with_followup_question(mark):
     ) == [question, fact]
     assert _semantic_dedup_prefetch([question, fact]) == [question]
 
+@pytest.mark.parametrize("separator", [".\n", ".\t", "。", "！"])
+def test_automatic_prefetch_keeps_fact_with_other_sentence_boundaries(separator):
+    question = {"content": "[USER] What is the ORCHID password?"}
+    fact = {"content": f"[USER] Synthetic fact: ORCHID password is copperotter482{separator}Can you remember it?"}
+
+    assert _semantic_dedup_prefetch(
+        [question, fact, dict(fact)], preserve_canonical_extensions=True
+    ) == [question, fact]
+    assert _semantic_dedup_prefetch([question, fact]) == [question]
+
 
 def test_automatic_prefetch_still_drops_duplicate_questions_and_facts():
     question = {"content": "What is the ORCHID password?"}
@@ -346,13 +356,30 @@ def test_automatic_prefetch_drops_longer_question_only_row(mark):
         [question, followup], preserve_canonical_extensions=True
     ) == [question]
 
-
-@pytest.mark.parametrize(("followup", "answer_count"), [
-    ("Remember it.", 1),
-    ("Can you remember it?", 1),
-    ("Can you remember it?", 2),
+@pytest.mark.parametrize("content", [
+    "What is the ORCHID password? Could you repeat the ORCHID password?",
+    "What is the ORCHID password？ Could you repeat the ORCHID password？",
+    "What is the ORCHID password؟ Could you repeat the ORCHID password؟",
+    "What is Dr. ORCHID password?",
+    "What is Dr. ORCHID password recovery procedure?",
+    ". What is the ORCHID password recovery procedure?",
 ])
-def test_stored_session_answer_survives_question_first_prefetch(tmp_path, monkeypatch, followup, answer_count):
+def test_automatic_prefetch_does_not_treat_question_or_title_as_statement(content):
+    question = {"content": "What is the ORCHID password?"}
+    assert _semantic_dedup_prefetch(
+        [question, {"content": content}], preserve_canonical_extensions=True
+    ) == [question]
+
+
+@pytest.mark.parametrize(("separator", "followup", "answer_count"), [
+    (". ", "Remember it.", 1),
+    (". ", "Can you remember it?", 1),
+    (". ", "Can you remember it?", 2),
+    (".\n", "Can you remember it?", 1),
+    ("。", "Can you remember it?", 1),
+    ("！", "Can you remember it?", 1),
+])
+def test_stored_session_answer_survives_question_first_prefetch(tmp_path, monkeypatch, separator, followup, answer_count):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("MNEMOSYNE_HOME", str(tmp_path / "mnemosyne"))
@@ -366,7 +393,7 @@ def test_stored_session_answer_survives_question_first_prefetch(tmp_path, monkey
     try:
         assert provider._beam is not None
         question = "[USER] What is the ORCHID password?"
-        fact = f"[USER] Synthetic fact: ORCHID password is copperotter482. {followup}"
+        fact = f"[USER] Synthetic fact: ORCHID password is copperotter482{separator}{followup}"
         answer_ids = [provider._beam.remember(
             fact, source="conversation", importance=0.5, scope="session", dedupe=False
         ) for _ in range(answer_count)]
@@ -387,7 +414,7 @@ def test_stored_session_answer_survives_question_first_prefetch(tmp_path, monkey
         assert recalled[0]["fts_score"] > 0  # ordinary linear FTS ranking
         block = provider.prefetch("What is the ORCHID password?")
         assert question in block
-        assert fact in block
+        assert " ".join(fact.split()) in block  # context rendering folds embedded whitespace
         assert block.count("copperotter482") == 1
         assert provider.prefetch("What is the ORCHID password?", session_id="other") == ""
         explicit = json.loads(provider._handle_recall({"query": "What is the ORCHID password?", "limit": 5}))
