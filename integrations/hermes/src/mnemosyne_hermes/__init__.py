@@ -1226,8 +1226,8 @@ def _semantic_dedup_prefetch(
                 and (
                     kept_row.get("trust_tier") == "CANONICAL"
                     or (
-                        _strip_prefetch_prefix(kept_row.get("content", "")).endswith("?")
-                        and not _strip_prefetch_prefix(row.get("content", "")).endswith("?")
+                        _strip_prefetch_prefix(kept_row.get("content", "")).endswith(("?", "？", "؟"))
+                        and not _strip_prefetch_prefix(row.get("content", "")).endswith(("?", "？", "؟"))
                     )
                 )
             ):

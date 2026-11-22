@@ -352,6 +352,19 @@ def test_stored_session_answer_survives_question_first_prefetch(tmp_path, monkey
         provider.shutdown()
 
 
+@pytest.mark.parametrize(("question", "fact"), [
+    ("ORCHID 密码？", "ORCHID 密码是铜獭482，请记住它。"),
+    ("What is the ORCHID password؟", "Synthetic fact: ORCHID password is copperotter482. Remember it."),
+])
+def test_automatic_prefetch_retains_answers_after_localized_questions(question, fact):
+    earlier = {"content": question, "trust_tier": "STATED"}
+    answer = {"content": fact, "trust_tier": "STATED"}
+    assert _semantic_dedup_prefetch(
+        [earlier, answer], preserve_canonical_extensions=True
+    ) == [earlier, answer]
+    assert _semantic_dedup_prefetch([earlier, answer]) == [earlier]
+
+
 @pytest.mark.parametrize("canonical", [False, True])
 def test_default_dedup_keeps_existing_containment_behavior(canonical):
     shorter = {"content": "Vaultwarden Passwort sichern", "trust_tier": "CANONICAL" if canonical else "STATED"}
