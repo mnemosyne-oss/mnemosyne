@@ -1,6 +1,9 @@
 """Real-store regressions for #1263's function-word canonical injection."""
 from __future__ import annotations
 
+import json
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 import mnemosyne_hermes
@@ -301,6 +304,136 @@ def test_prefetch_retains_ordinary_recovery_instructions_containing_canonical_fa
         assert block.index("[CANONICAL]") < block.index(ordinary_body)
     finally:
         provider.shutdown()
+
+
+def test_automatic_prefetch_keeps_answer_after_contained_question():
+    question = {"content": "[USER] What is the ORCHID password?", "trust_tier": "STATED"}
+    fact = {"content": "[USER] Synthetic fact: ORCHID password is copperotter482. Remember it.",
+            "trust_tier": "STATED"}
+
+    assert _semantic_dedup_prefetch(
+        [question, fact], preserve_canonical_extensions=True
+    ) == [question, fact]
+    assert _semantic_dedup_prefetch([question, fact]) == [question]
+    assert _semantic_dedup_prefetch(
+        [fact, question], preserve_canonical_extensions=True
+    ) == [fact]
+
+@pytest.mark.parametrize("mark", ["?", "？", "؟"])
+def test_automatic_prefetch_keeps_fact_with_followup_question(mark):
+    question = {"content": f"[USER] What is the ORCHID password{mark}"}
+    fact = {"content": f"[USER] Synthetic fact: ORCHID password is copperotter482. Can you remember it{mark}"}
+
+    assert _semantic_dedup_prefetch(
+        [question, fact, dict(fact)], preserve_canonical_extensions=True
+    ) == [question, fact]
+    assert _semantic_dedup_prefetch([question, fact]) == [question]
+
+@pytest.mark.parametrize("separator", [".\n", ".\t", "。", "！"])
+def test_automatic_prefetch_keeps_fact_with_other_sentence_boundaries(separator):
+    question = {"content": "[USER] What is the ORCHID password?"}
+    fact = {"content": f"[USER] Synthetic fact: ORCHID password is copperotter482{separator}Can you remember it?"}
+
+    assert _semantic_dedup_prefetch(
+        [question, fact, dict(fact)], preserve_canonical_extensions=True
+    ) == [question, fact]
+    assert _semantic_dedup_prefetch([question, fact]) == [question]
+
+
+def test_automatic_prefetch_still_drops_duplicate_questions_and_facts():
+    question = {"content": "What is the ORCHID password?"}
+    fact = {"content": "ORCHID password is copperotter482"}
+    near_question = {"content": "What is the ORCHID password please?"}
+    assert _semantic_dedup_prefetch(
+        [question, near_question, fact, dict(fact)], preserve_canonical_extensions=True
+    ) == [question, fact]
+
+@pytest.mark.parametrize("mark", ["?", "？", "؟"])
+def test_automatic_prefetch_drops_longer_question_only_row(mark):
+    question = {"content": f"What is the ORCHID password{mark}"}
+    followup = {"content": f"What is the ORCHID password{mark} Could you repeat the ORCHID password{mark}"}
+    assert _semantic_dedup_prefetch(
+        [question, followup], preserve_canonical_extensions=True
+    ) == [question]
+
+@pytest.mark.parametrize("content", [
+    "What is the ORCHID password? Could you repeat the ORCHID password?",
+    "What is the ORCHID password？ Could you repeat the ORCHID password？",
+    "What is the ORCHID password؟ Could you repeat the ORCHID password؟",
+    "What is Dr. ORCHID password?",
+    "What is Dr. ORCHID password recovery procedure?",
+    ". What is the ORCHID password recovery procedure?",
+])
+def test_automatic_prefetch_does_not_treat_question_or_title_as_statement(content):
+    question = {"content": "What is the ORCHID password?"}
+    assert _semantic_dedup_prefetch(
+        [question, {"content": content}], preserve_canonical_extensions=True
+    ) == [question]
+
+
+@pytest.mark.parametrize(("separator", "followup", "answer_count"), [
+    (". ", "Remember it.", 1),
+    (". ", "Can you remember it?", 1),
+    (". ", "Can you remember it?", 2),
+    (".\n", "Can you remember it?", 1),
+    ("。", "Can you remember it?", 1),
+    ("！", "Can you remember it?", 1),
+])
+def test_stored_session_answer_survives_question_first_prefetch(tmp_path, monkeypatch, separator, followup, answer_count):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("MNEMOSYNE_HOME", str(tmp_path / "mnemosyne"))
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_DOCUMENT_PREFIX", "")
+    monkeypatch.setenv("MNEMOSYNE_QUERY_PREFIX", "")
+    provider = MnemosyneMemoryProvider()
+    provider.initialize("orchid", hermes_home=str(tmp_path / "hermes"), agent_identity="default", profile_isolation=False)
+    try:
+        assert provider._beam is not None
+        question = "[USER] What is the ORCHID password?"
+        fact = f"[USER] Synthetic fact: ORCHID password is copperotter482{separator}{followup}"
+        answer_ids = [provider._beam.remember(
+            fact, source="conversation", importance=0.5, scope="session", dedupe=False
+        ) for _ in range(answer_count)]
+        assert all(answer_ids) and len(set(answer_ids)) == answer_count
+        older = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        provider._beam.conn.executemany(
+            "UPDATE working_memory SET timestamp = ? WHERE id = ?",
+            [(older, answer_id) for answer_id in answer_ids],
+        )
+        provider._beam.conn.commit()
+        assert provider._beam.remember(question, source="conversation", importance=0.5, scope="session")
+        recalled = provider._beam.recall(
+            "What is the ORCHID password?", top_k=16, temporal_weight=0.2, temporal_halflife=48,
+        )
+        assert [row["content"] for row in recalled] == [question] + [fact] * answer_count
+        assert recalled[0]["score"] > recalled[1]["score"]
+        assert recalled[0]["importance"] == recalled[1]["importance"] == 0.5
+        assert recalled[0]["fts_score"] > 0  # ordinary linear FTS ranking
+        block = provider.prefetch("What is the ORCHID password?")
+        assert question in block
+        assert " ".join(fact.split()) in block  # context rendering folds embedded whitespace
+        assert block.count("copperotter482") == 1
+        assert provider.prefetch("What is the ORCHID password?", session_id="other") == ""
+        explicit = json.loads(provider._handle_recall({"query": "What is the ORCHID password?", "limit": 5}))
+        assert {row["content"] for row in explicit["results"]} == {question, fact}
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize(("question", "fact"), [
+    ("ORCHID 密码？", "ORCHID 密码是铜獭482，请记住它。"),
+    ("What is the ORCHID password؟", "Synthetic fact: ORCHID password is copperotter482. Remember it."),
+])
+def test_automatic_prefetch_retains_answers_after_localized_questions(question, fact):
+    earlier = {"content": question, "trust_tier": "STATED"}
+    answer = {"content": fact, "trust_tier": "STATED"}
+    assert _semantic_dedup_prefetch(
+        [earlier, answer], preserve_canonical_extensions=True
+    ) == [earlier, answer]
+    assert _semantic_dedup_prefetch([earlier, answer]) == [earlier]
 
 
 @pytest.mark.parametrize("canonical", [False, True])

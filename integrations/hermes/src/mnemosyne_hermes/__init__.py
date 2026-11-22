@@ -1186,6 +1186,24 @@ def _sanitize_prefetch_query(query: str) -> str:
     return sanitize_prefetch_query(query)
 
 
+def _has_prefetch_sentence_separator(content: str) -> bool:
+    """Recognize a bounded separator before a final question, not sentence grammar."""
+    for index, mark in enumerate(content[:-1]):
+        if mark not in {".", "。", "！"}:
+            continue
+        before = content[:index].strip()
+        if not before:
+            continue
+        if mark == ".":
+            if not content[index + 1].isspace():
+                continue
+            # Common titles before a name do not establish a prior sentence.
+            if before.rsplit(maxsplit=1)[-1].lower() in {"dr", "mr", "mrs", "ms", "prof"}:
+                continue
+        if content[index + 1:].strip():
+            return True
+    return False
+
 def _semantic_dedup_prefetch(
     rows: List[Dict[str, Any]], threshold: float = 0.72, *, preserve_canonical_extensions: bool = False,
     limit: Optional[int] = None,
@@ -1196,10 +1214,11 @@ def _semantic_dedup_prefetch(
     ``threshold`` against an earlier row, or whose smaller token set is at
     least 86% contained in the larger set. Automatic prefetch opts into
     ``preserve_canonical_extensions``:
-    after a kept canonical row, containment covers the incoming ordinary row
-    instead, so a longer instruction can retain additional content. Jaccard
-    still removes near duplicates. The default retains explicit-recall and
-    ordinary-to-ordinary containment behavior. Input rows are not modified.
+    after a kept canonical row or an ordinary question, containment covers the
+    incoming ordinary row instead, so a longer fact can retain its answer,
+    including a fact followed by a separate question.
+    Jaccard still removes near duplicates. The default retains explicit-recall
+    and ordinary-to-ordinary containment behavior. Input rows are not modified.
 
     A positive ``limit`` stops scanning once that many distinct rows are kept;
     zero returns no rows. ``None`` scans all rows, and negative limits retain
@@ -1222,11 +1241,20 @@ def _semantic_dedup_prefetch(
             containment = overlap / max(min(len(tokens), len(existing)), 1)
             if (
                 preserve_canonical_extensions
-                and kept_row.get("trust_tier") == "CANONICAL"
                 and row.get("trust_tier") != "CANONICAL"
+                and (
+                    kept_row.get("trust_tier") == "CANONICAL"
+                    or (
+                        _strip_prefetch_prefix(kept_row.get("content", "")).endswith(("?", "？", "؟"))
+                        and (
+                            not _strip_prefetch_prefix(row.get("content", "")).endswith(("?", "？", "؟"))
+                            or _has_prefetch_sentence_separator(_strip_prefetch_prefix(row.get("content", "")))
+                        )
+                    )
+                )
             ):
-                # A short canonical fact does not make a longer ordinary
-                # instruction redundant. Require coverage of the incoming
+                # A canonical fact or earlier question does not make a longer
+                # ordinary answer redundant. Require coverage of the incoming
                 # row; exact/near duplicates and shorter subsets still drop.
                 containment = overlap / max(len(tokens), 1)
             if jaccard >= threshold or containment >= 0.86:
