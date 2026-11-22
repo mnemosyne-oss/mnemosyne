@@ -262,3 +262,28 @@ def local_llm_enabled(monkeypatch):
     monkeypatch.setattr(local_llm, "_llm_available", True, raising=False)
     monkeypatch.setattr(local_llm, "_llm_backend", "llamacpp", raising=False)
     return fake
+
+
+@pytest.fixture(autouse=True)
+def _register_cjk_bigram_for_test_connections(monkeypatch):
+    """Register cjk_bigram UDF on raw sqlite3 connections opened during tests.
+
+    BEAM triggers invoke cjk_bigram on episodic and working memory writes.
+    Tests frequently create direct sqlite3 connections to seed or manipulate
+    test databases; registering the UDF ensures those writes succeed without
+    modifying every upstream test file.
+    """
+    import sqlite3
+    from mnemosyne.core.beam import _register_cjk_bigram
+
+    orig_connect = sqlite3.connect
+
+    def _test_connect(*args, **kwargs):
+        conn = orig_connect(*args, **kwargs)
+        try:
+            _register_cjk_bigram(conn)
+        except Exception:
+            pass
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", _test_connect)

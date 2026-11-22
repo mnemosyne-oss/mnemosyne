@@ -793,7 +793,10 @@ def clean_noise(
         result.errors.append("Confirmation required for non-dry-run cleanup. Pass confirm=True.")
         return result
 
+    from mnemosyne.core.beam import _register_cjk_bigram
+
     conn = sqlite3.connect(str(db_path))
+    _register_cjk_bigram(conn)
     conn.row_factory = sqlite3.Row
     vec_loaded = _hygiene_ensure_vec(conn)
 
@@ -986,7 +989,10 @@ def restore_archived(
     Returns:
         Number of entries restored.
     """
+    from mnemosyne.core.beam import _register_cjk_bigram
+
     conn = sqlite3.connect(str(db_path))
+    _register_cjk_bigram(conn)
     conn.row_factory = sqlite3.Row
     restored = 0
 

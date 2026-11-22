@@ -238,6 +238,120 @@ try:
 except ImportError:
     EpisodicGraph = None
     GraphEdge = None
+
+import re as _re
+
+# ---------------------------------------------------------------------------
+# CJK bigram tokenizer
+# ---------------------------------------------------------------------------
+# The default unicode61 FTS5 tokenizer keeps contiguous CJK text as a token,
+# preventing substring word matches inside that run.  We register a
+# pure-Python UDF so that Chinese text is indexed as unigrams AND bigrams,
+# enabling both single-character and two-character (word-level) FTS5 MATCH.
+#
+# Rules:
+#   • CJK Unified Ideographs (U+4E00-U+9FFF) and Extension A (U+3400-U+4DBF)
+#     are emitted as unigram then, if the next character is also CJK, as a
+#     bigram pair.  This covers the vast majority of Simplified/Traditional
+#     Chinese without requiring any external dependency.
+#   • Non-CJK runs are kept as-is using word-boundary splitting so that Latin,
+#     digits, and other scripts are not altered (Cyrillic, accented Latin, etc.
+#     are preserved by the catch-all buf flush).
+#   • If the text contains no CJK characters the original text is returned
+#     unchanged, making the function a no-op for pure-ASCII/Latin content.
+# ---------------------------------------------------------------------------
+
+def _cjk_bigram(text: str) -> str:
+    """CJK-aware bigram tokenizer for FTS5.
+
+    Returns a space-separated token string for use as FTS5 index content.
+    Non-CJK runs are split on whitespace/punctuation boundaries; CJK
+    characters emit unigrams and consecutive-CJK bigrams.
+    """
+    if not isinstance(text, str):
+        return text
+    result: list[str] = []
+    buf = ''
+    for i, c in enumerate(text):
+        if '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf':
+            if buf:
+                # Flush non-CJK buffer preserving all non-whitespace runs
+                for tok in _re.split(r'\s+', buf):
+                    if tok:
+                        result.append(tok)
+                buf = ''
+            result.append(c)                          # unigram
+            nxt = text[i + 1] if i + 1 < len(text) else ''
+            if '\u4e00' <= nxt <= '\u9fff' or '\u3400' <= nxt <= '\u4dbf':
+                result.append(c + nxt)                # bigram
+        else:
+            buf += c
+    if buf:
+        for tok in _re.split(r'\s+', buf):
+            if tok:
+                result.append(tok)
+    return ' '.join(result) if result else text
+
+
+def _register_cjk_bigram(conn: sqlite3.Connection) -> None:
+    """Register cjk_bigram UDF on *conn* (idempotent — SQLite replaces on re-register)."""
+    conn.create_function('cjk_bigram', 1, _cjk_bigram, deterministic=True)
+
+
+def _migrate_cjk_fts(conn: sqlite3.Connection) -> None:
+    """Atomically upgrade both FTS indexes and their writers, once per version.
+
+    External-content FTS must be rebuilt explicitly with tokenized source text;
+    FTS5's native rebuild would index raw content. A savepoint preserves an
+    enclosing transaction and rolls back DDL, postings and marker on failure.
+    All writers must be stopped before upgrading a database from an old runtime.
+    """
+    conn.execute("SAVEPOINT cjk_fts_upgrade")
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS cjk_fts_schema (version INTEGER PRIMARY KEY)")
+        version = conn.execute("SELECT MAX(version) FROM cjk_fts_schema").fetchone()[0]
+        if version is not None and version != 1:
+            raise RuntimeError(f"Unsupported CJK FTS schema version: {version}")
+        if version is None:
+            for name in ("em_ai", "em_ad", "em_au", "wm_ai", "wm_ad", "wm_au"):
+                conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            for sql in (
+                """CREATE TRIGGER em_ai AFTER INSERT ON episodic_memory BEGIN
+                    INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, cjk_bigram(new.content));
+                END""",
+                """CREATE TRIGGER em_ad AFTER DELETE ON episodic_memory BEGIN
+                    INSERT INTO fts_episodes(fts_episodes, rowid, content)
+                    VALUES ('delete', old.rowid, cjk_bigram(old.content));
+                END""",
+                """CREATE TRIGGER em_au AFTER UPDATE OF content ON episodic_memory
+                WHEN old.content IS NOT new.content BEGIN
+                    INSERT INTO fts_episodes(fts_episodes, rowid, content)
+                    VALUES ('delete', old.rowid, cjk_bigram(old.content));
+                    INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, cjk_bigram(new.content));
+                END""",
+                """CREATE TRIGGER wm_ai AFTER INSERT ON working_memory BEGIN
+                    INSERT INTO fts_working(id, content) VALUES (new.id, cjk_bigram(new.content));
+                END""",
+                """CREATE TRIGGER wm_ad AFTER DELETE ON working_memory BEGIN
+                    DELETE FROM fts_working WHERE id = old.id;
+                END""",
+                """CREATE TRIGGER wm_au AFTER UPDATE OF content ON working_memory
+                WHEN old.content IS NOT new.content BEGIN
+                    DELETE FROM fts_working WHERE id = old.id;
+                    INSERT INTO fts_working(id, content) VALUES (new.id, cjk_bigram(new.content));
+                END""",
+            ):
+                conn.execute(sql)
+            conn.execute("INSERT INTO fts_episodes(fts_episodes) VALUES ('delete-all')")
+            conn.execute("INSERT INTO fts_episodes(rowid, content) SELECT rowid, cjk_bigram(content) FROM episodic_memory")
+            conn.execute("DELETE FROM fts_working")
+            conn.execute("INSERT INTO fts_working(id, content) SELECT id, cjk_bigram(content) FROM working_memory")
+            conn.execute("INSERT INTO cjk_fts_schema(version) VALUES (1)")
+        conn.execute("RELEASE SAVEPOINT cjk_fts_upgrade")
+    except BaseException:
+        conn.execute("ROLLBACK TO SAVEPOINT cjk_fts_upgrade")
+        conn.execute("RELEASE SAVEPOINT cjk_fts_upgrade")
+        raise
 try:
     from mnemosyne.core.veracity_consolidation import (
         VeracityConsolidator,
@@ -1398,6 +1512,7 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
                 )
         else:
             conn._mnemosyne_vec_loaded = False
+        _register_cjk_bigram(conn)
         _thread_local.conn = conn
         _thread_local.db_path = str(path)
         collect_connection_cycles()
@@ -1871,48 +1986,8 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
         )
     """)
 
-    # --- FTS5 Triggers for episodic ---
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS em_ai AFTER INSERT ON episodic_memory BEGIN
-            INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, new.content);
-        END
-    """)
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS em_ad AFTER DELETE ON episodic_memory BEGIN
-            INSERT INTO fts_episodes(fts_episodes, rowid, content) VALUES ('delete', old.rowid, old.content);
-        END
-    """)
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS em_au AFTER UPDATE ON episodic_memory BEGIN
-            INSERT INTO fts_episodes(fts_episodes, rowid, content) VALUES ('delete', old.rowid, old.content);
-            INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, new.content);
-        END
-    """)
-
-    # --- FTS5 Triggers for working memory ---
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS wm_ai AFTER INSERT ON working_memory BEGIN
-            INSERT INTO fts_working(id, content) VALUES (new.id, new.content);
-        END
-    """)
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS wm_ad AFTER DELETE ON working_memory BEGIN
-            DELETE FROM fts_working WHERE id = old.id;
-        END
-    """)
-    # The wm_au trigger restricts to UPDATE OF content so sleep's
-    # consolidated_at marker writes don't churn the FTS index. Pre-E3
-    # this trigger fired on every UPDATE -- fine when UPDATEs were rare;
-    # post-E3 sleep marks SLEEP_BATCH_SIZE rows per cycle and would
-    # otherwise generate 2*N FTS round-trips per sleep with no content
-    # delta. SQLite column-list triggers handle the perf concern.
-    cursor.execute("DROP TRIGGER IF EXISTS wm_au")
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS wm_au AFTER UPDATE OF content ON working_memory BEGIN
-            DELETE FROM fts_working WHERE id = old.id;
-            INSERT INTO fts_working(id, content) VALUES (new.id, new.content);
-        END
-    """)
+    # Upgrade trigger definitions and historical postings as one atomic unit.
+    _migrate_cjk_fts(conn)
 
     # --- MEMORIA: Structured Fact Tables (Phase 1) ---
     cursor.execute("""
@@ -2363,6 +2438,9 @@ class _BeamConnection(sqlite3.Connection):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Register CJK bigram UDF on every connection created via factory=
+        # (covers worker-thread connections that bypass _get_connection).
+        _register_cjk_bigram(self)
         self._defer_commit = False
         self._savepoint_counter = 0
         self._vec_working_count_cache: Optional[Tuple[int, int, int]] = None
@@ -5501,6 +5579,15 @@ def _fts_query_terms(query: str) -> List[str]:
     candidates with noise; they are matched exact-only by the lexical
     layer via ``_symbolic_code_tokens()``.
     """
+    if any("\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf" for ch in query):
+        # Produce the same token stream that was written into the index.
+        tokens = _cjk_bigram(query).split()
+        cjk_terms: List[str] = []
+        for tok in tokens:
+            tok = tok.replace('"', '""').strip()
+            if tok:
+                cjk_terms.append(f'"{tok}"')
+        return cjk_terms
     terms: List[str] = []
     seen: Set[str] = set()
     symbolic = set(_symbolic_code_tokens(query))
@@ -9399,50 +9486,52 @@ class BeamMemory:
                               source_memory_id=source_memory_id)
             counts["sequence"] += 1
 
-        # Instructions (IF support): language-aware
-        _INSTRUCTION_FALSE_POSITIVES = pat['instruction_false_positives']
-        _INSTR_IMPERATIVE_VERBS = pat['instruction_imperative']
-        _instr_re = pat['instruction'].replace('IMPVERBS', _INSTR_IMPERATIVE_VERBS)
-        for m in _re.finditer(_instr_re, content, _re.IGNORECASE):
-            instr = m.group(0).strip()
-            topic = m.group(1).strip()[:60]
-            # Skip known false positives
-            _instr_lower = instr.lower()
-            if any(fp in _instr_lower for fp in _INSTRUCTION_FALSE_POSITIVES):
-                continue
-            # Skip bare "should"/"sollte"/"dovrebbe"/"dovresti" questions not directed at anyone
-            if _re.match(r'^(?:should|sollte|dovrebbe|dovresti)\s+(?:i|we|it|they|he|she|the|ich|wir|es|man|der|die|das|io|noi|lui|lei|loro)\b', instr, _re.IGNORECASE):
-                continue
-            self.conn.execute(
-                "INSERT INTO memoria_instructions (session_id, message_idx, instruction, topic, context_snippet, source_memory_id) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (session, message_idx, instr[:200], topic, self._context_snippet(content, m.start()), source_memory_id))
-            counts["instruction"] = counts.get("instruction", 0) + 1
+        _disable_regex_extraction = os.environ.get("MNEMOSYNE_DISABLE_REGEX_EXTRACTION", "").strip().lower() in ("1", "true", "yes", "on")
+        if not _disable_regex_extraction:
+            # Instructions (IF support): language-aware
+            _INSTRUCTION_FALSE_POSITIVES = pat['instruction_false_positives']
+            _INSTR_IMPERATIVE_VERBS = pat['instruction_imperative']
+            _instr_re = pat['instruction'].replace('IMPVERBS', _INSTR_IMPERATIVE_VERBS)
+            for m in _re.finditer(_instr_re, content, _re.IGNORECASE):
+                instr = m.group(0).strip()
+                topic = m.group(1).strip()[:60]
+                # Skip known false positives
+                _instr_lower = instr.lower()
+                if any(fp in _instr_lower for fp in _INSTRUCTION_FALSE_POSITIVES):
+                    continue
+                # Skip bare "should"/"sollte"/"dovrebbe"/"dovresti" questions not directed at anyone
+                if _re.match(r'^(?:should|sollte|dovrebbe|dovresti)\s+(?:i|we|it|they|he|she|the|ich|wir|es|man|der|die|das|io|noi|lui|lei|loro)\b', instr, _re.IGNORECASE):
+                    continue
+                self.conn.execute(
+                    "INSERT INTO memoria_instructions (session_id, message_idx, instruction, topic, context_snippet, source_memory_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (session, message_idx, instr[:200], topic, self._context_snippet(content, m.start()), source_memory_id))
+                counts["instruction"] = counts.get("instruction", 0) + 1
 
-        # Preferences (PF support): evolving user tastes — language-aware
-        for m in _re.finditer(pat['preference'], content, _re.IGNORECASE):
-            pref = m.group(0).strip()
-            topic = m.group(1).strip()[:60]
-            # Extract a clean topic key from the preference for dedup
-            _topic_key = ' '.join(
-                w for w in _re.findall(r'[a-zA-Z]{4,}', topic)
-                if w.lower() not in _FACT_MATCH_STOPWORDS
-            )[:30] or topic[:20]
-            # Check for evolution: did this topic already have a preference?
-            existing = self.conn.execute(
-                "SELECT preference, topic FROM memoria_preferences "
-                "WHERE session_id = ? AND (topic LIKE ? OR preference LIKE ?) "
-                "ORDER BY message_idx DESC LIMIT 1",
-                (session, f'%{_topic_key}%', f'%{_topic_key}%')
-            ).fetchone()
-            evolution = None
-            if existing:
-                evolution = f"was: {existing[0][:120]}"
-            self.conn.execute(
-                "INSERT INTO memoria_preferences (session_id, message_idx, preference, topic, evolution, context_snippet, source_memory_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (session, message_idx, pref[:200], topic, evolution, self._context_snippet(content, m.start()), source_memory_id))
-            counts["preference"] = counts.get("preference", 0) + 1
+            # Preferences (PF support): evolving user tastes — language-aware
+            for m in _re.finditer(pat['preference'], content, _re.IGNORECASE):
+                pref = m.group(0).strip()
+                topic = m.group(1).strip()[:60]
+                # Extract a clean topic key from the preference for dedup
+                _topic_key = ' '.join(
+                    w for w in _re.findall(r'[a-zA-Z]{4,}', topic)
+                    if w.lower() not in _FACT_MATCH_STOPWORDS
+                )[:30] or topic[:20]
+                # Check for evolution: did this topic already have a preference?
+                existing = self.conn.execute(
+                    "SELECT preference, topic FROM memoria_preferences "
+                    "WHERE session_id = ? AND (topic LIKE ? OR preference LIKE ?) "
+                    "ORDER BY message_idx DESC LIMIT 1",
+                    (session, f'%{_topic_key}%', f'%{_topic_key}%')
+                ).fetchone()
+                evolution = None
+                if existing:
+                    evolution = f"was: {existing[0][:120]}"
+                self.conn.execute(
+                    "INSERT INTO memoria_preferences (session_id, message_idx, preference, topic, evolution, context_snippet, source_memory_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (session, message_idx, pref[:200], topic, evolution, self._context_snippet(content, m.start()), source_memory_id))
+                counts["preference"] = counts.get("preference", 0) + 1
 
         self.conn.commit()
         counts["_lang"] = lang  # Tag extraction with detected language

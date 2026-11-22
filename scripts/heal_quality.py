@@ -444,7 +444,10 @@ def run_heal_pipeline(detect_only: bool = False, entry_id: str | None = None, dr
         print(f"Error: database not found at {db_path}")
         sys.exit(1)
 
+    from mnemosyne.core.beam import _register_cjk_bigram
+
     conn = sqlite3.connect(db_path)
+    _register_cjk_bigram(conn)
 
     if entry_id:
         result = heal_entry(entry_id, conn, dry_run=dry_run)

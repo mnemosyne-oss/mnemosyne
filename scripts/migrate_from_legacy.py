@@ -262,7 +262,10 @@ def main():
     print()
 
     CANONICAL_DB.parent.mkdir(parents=True, exist_ok=True)
+    from mnemosyne.core.beam import _register_cjk_bigram
+
     canonical_conn = sqlite3.connect(str(CANONICAL_DB))
+    _register_cjk_bigram(canonical_conn)
     ensure_schema(canonical_conn)
 
     # Pre-check stats
