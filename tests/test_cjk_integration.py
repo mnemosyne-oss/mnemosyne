@@ -403,6 +403,28 @@ class TestPublicRecallEdgeCases:
     """Verify public BeamMemory.recall() lexical admission for Extension A and mixed Han/Hangul."""
 
     @pytest.mark.parametrize("tier", ["working", "episodic"])
+    def test_crowded_han_pool_retains_exact_public_recall_hit(self, tmp_path, monkeypatch, tier):
+        """Short partial matches must leave room for an exact Han phrase."""
+        from mnemosyne.core.beam import BeamMemory
+
+        monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+        monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+        bank = BeamMemory(session_id="han", db_path=tmp_path / "crowded.db")
+        try:
+            rows = [("exact", "北京市 " + "長篇記錄的背景說明 " * 32)]
+            rows.extend((f"partial-{i:03}", "北京 京市") for i in range(300))
+            with bank.conn:
+                bank.conn.executemany(
+                    f"INSERT INTO {tier}_memory (id, content, source, timestamp, session_id, importance) "
+                    "VALUES (?, ?, 'user', '2026-11-22T00:00:00', 'han', 0.7)",
+                    rows,
+                )
+            results = bank.recall("北京市", top_k=5, _track_recall=False)
+            assert results[0]["id"] == "exact"
+        finally:
+            bank.conn.close()
+
+    @pytest.mark.parametrize("tier", ["working", "episodic"])
     @pytest.mark.parametrize("query", ["㐀", "㐀㐁"])
     def test_extension_a_public_recall(self, tmp_path, monkeypatch, tier, query):
         from mnemosyne.core.beam import BeamMemory

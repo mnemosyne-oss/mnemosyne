@@ -5549,6 +5549,9 @@ def _fts_precise_terms(query: str, *, widen: bool = True) -> List[str]:
     without Hangul. The caller uses that equality to skip the extra stages
     entirely, so non-Korean recall pays nothing for this.
 
+    Han words also get a phrase in index token order, so a whole word can
+    reserve a slot before unigram and bigram expansion.
+
     Synonym expansion is deliberately absent: widening recall is the last
     stage's job.
     """
@@ -5567,6 +5570,8 @@ def _fts_precise_terms(query: str, *, widen: bool = True) -> List[str]:
         if not token or token in seen:
             continue
         seen.add(token)
+        if len(token) > 1 and all(_is_han_char(ch) for ch in token):
+            terms.append(f'"{_cjk_bigram(token)}"')
         if widen and (_has_hangul(token) or query_has_hangul):
             terms.append(f'"{token}"*')
         else:
