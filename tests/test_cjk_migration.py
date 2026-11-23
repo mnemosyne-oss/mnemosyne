@@ -111,7 +111,9 @@ def test_ddl_failure_rolls_back_trigger_drops(legacy):
         with pytest.raises(sqlite3.DatabaseError):
             _migrate_cjk_fts(legacy)
     finally:
-        legacy.set_authorizer(None)
+        # Python 3.10 treats set_authorizer(None) as calling None -> SQLITE_DENY;
+        # pass an explicit allow-all callback for 3.10+ compatibility.
+        legacy.set_authorizer(lambda *_args: sqlite3.SQLITE_OK)
     assert snapshot(legacy) == triggers
     _migrate_cjk_fts(legacy)
     assert hits(legacy, "fts_episodes", "腾讯")
