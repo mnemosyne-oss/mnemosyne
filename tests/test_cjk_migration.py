@@ -137,5 +137,6 @@ def test_future_version_is_rejected(legacy):
 
 
 def test_factory_udf_preserves_mixed_scripts():
-    with closing(sqlite3.connect(":memory:", factory=_BeamConnection)) as conn:
+    # Exercise the production factory without conftest's connect wrapper.
+    with closing(sqlite3.dbapi2.connect(":memory:", factory=_BeamConnection)) as conn:
         assert conn.execute("SELECT cjk_bigram(?)", ("腾讯Привет café",)).fetchone()[0] == _cjk_bigram("腾讯Привет café")

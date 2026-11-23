@@ -339,7 +339,8 @@ class TestThreadConnection:
 
         def worker():
             try:
-                c = sqlite3.connect(str(db), factory=_BeamConnection)
+                # Exercise the production factory without conftest's connect wrapper.
+                c = sqlite3.dbapi2.connect(str(db), factory=_BeamConnection)
                 row = c.execute("SELECT cjk_bigram('腾讯云')").fetchone()
                 result.append(row[0])
                 c.close()

@@ -7455,7 +7455,8 @@ class BeamMemory:
                 keywords = [w for w in words if len(w) > 2 and w not in stop_words]
                 keywords = [kw for kw in keywords if kw.isalpha()]  # FTS5-safe only
                 if len(keywords) >= 3:
-                    fts_query = " OR ".join(keywords)
+                    # Match each whole keyword in the same token order as the index.
+                    fts_query = " OR ".join(f'"{_cjk_bigram(keyword)}"' for keyword in keywords)
                     cursor = self.conn.execute(
                         "SELECT DISTINCT id FROM fts_working WHERE fts_working MATCH ? ORDER BY rank LIMIT 5",
                         (fts_query,)
@@ -11685,7 +11686,7 @@ class BeamMemory:
     # 21: UTC-Z timestamps remain temporally eligible on Python 3.10.
     # 22: polyphonic voices return the requested top_k.
     # Recheck the actual predecessor before each semantic integration.
-    _ENHANCED_RECALL_CACHE_VERSION = 22
+    _ENHANCED_RECALL_CACHE_VERSION = 23
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.

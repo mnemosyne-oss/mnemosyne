@@ -26,6 +26,17 @@ def _references(beam):
         "SELECT source, target FROM graph_edges WHERE edge_type = 'references' ORDER BY id")]
 
 
+def test_cjk_keyword_keeps_its_content_link(beam):
+    """An indexed Han keyword links the matching row without linking a shared prefix."""
+    target = beam.remember("北京城市 舊資料", source="note", scope="session")
+    distractor = beam.remember("北京城樓 觀光地圖", source="note", scope="session")
+    current = beam.remember("北京城市 延伸資料 運輸備忘", source="note", scope="session")
+    assert all((target, distractor, current)) and len({target, distractor, current}) == 3
+
+    edges = beam.episodic_graph.find_related_memories(current, depth=1)
+    assert {edge["memory_id"] for edge in edges} == {target}
+
+
 def test_duplicate_check_searches_the_new_memorys_edges(beam):
     """Require the duplicate lookup to use the new memory's source index."""
     beam.remember("Alice met Bob in Paris.", source="user", extract_entities=True)
