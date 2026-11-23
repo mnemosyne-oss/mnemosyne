@@ -263,15 +263,22 @@ def test_filtered_supplements_do_not_consume_visible_slots(
 
 
 def test_supplement_rejects_insufficient_pair_evidence(supplement_conn):
-    """Reject a candidate matching too few independent character pairs."""
+    """Reject a candidate outside MATCH with too few independent character pairs."""
+    conn = supplement_conn
+    conn.execute("INSERT INTO working_memory VALUES('literal', '天地玄黃')")
+    conn.execute("INSERT INTO working_memory VALUES('weak', '天地')")
+    conn.execute("INSERT INTO fts_working VALUES('literal', '天地玄黃')")
+    assert [row["id"] for row in beam._fts_search_working(conn, "天地玄黃", 50)] == ["literal"]
+
+
+def test_bigram_fts_admits_weak_pair_ranked_after_literal(supplement_conn):
+    """With CJK bigram FTS5, a weak-pair candidate in FTS ranks after literal by BM25."""
     conn = supplement_conn
     for table in ("working_memory", "fts_working"):
         conn.executemany(
             f"INSERT INTO {table} VALUES(?,?)",
             [("literal", "天地玄黃"), ("weak", "天地")],
         )
-    # With CJK bigram FTS5, "天地" shares unigrams/bigram with "天地玄黃"
-    # and matches FTS directly, with "literal" ranked first by BM25.
     assert [row["id"] for row in beam._fts_search_working(conn, "天地玄黃", 50)] == ["literal", "weak"]
 
 
@@ -342,6 +349,37 @@ def test_supplement_preserves_multiple_bm25_scores(tmp_path, monkeypatch):
     result = {row["id"]: row for row in memory.recall(QUERY, top_k=5, _track_recall=False)}
     assert set(result) == set(original) | {"gold"}
     assert result["gold"]["keyword_score"] == result["gold"]["fts_score"] >= 0.5455
+    for mid in original:
+        assert result[mid]["fts_score"] == original[mid]["fts_score"]
+
+
+def test_supplement_preserves_multiple_bm25_scores_for_appended_candidate(tmp_path, monkeypatch):
+    """Leave distinct existing BM25 scores unchanged when appending an outside-MATCH candidate."""
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    query = "전시장안내, 주차장요금"
+    memory = beam.BeamMemory(session_id="cjk", db_path=tmp_path / "ranks_appended.db")
+    with memory.conn:
+        memory.conn.executemany(
+            "INSERT INTO working_memory(id,content,source,timestamp,scope)"
+            " VALUES(?,?,'preference','2026-09-15T10:00:00','global')",
+            [
+                ("short", "전시장안내"),
+                ("long", "전시장안내 " + "background " * 30),
+                ("gold", "전시장 안내는 입구에서 받고 주차장 요금은 출구에서 냅니다."),
+            ],
+        )
+    ranked = beam._fts_staged_rows(
+        memory.conn, "fts_working", "id", query, 50, beam._fts_query_terms(query),
+    )
+    assert len({row["rank"] for row in ranked}) == 2
+    with monkeypatch.context() as baseline:
+        baseline.setattr(beam, "_supplement_cjk_working", lambda conn, q, rows, k, terms, **kw: rows)
+        original = {row["id"]: row for row in memory.recall(query, top_k=5, _track_recall=False)}
+    assert set(original) == {"short", "long"}
+    result = {row["id"]: row for row in memory.recall(query, top_k=5, _track_recall=False)}
+    assert set(result) == {"short", "long", "gold"}
+    assert result["gold"]["keyword_score"] == result["gold"]["fts_score"] == 1.0
     for mid in original:
         assert result[mid]["fts_score"] == original[mid]["fts_score"]
 
