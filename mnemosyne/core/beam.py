@@ -3904,13 +3904,22 @@ def _fact_match_tokens(text: str) -> Set[str]:
     return set(_recall_tokens(text))
 
 
-def _contains_spaceless_cjk(text: str) -> bool:
-    return any(
-        "\u4e00" <= ch <= "\u9fff"
+def _is_han_char(ch: str) -> bool:
+    """Return whether *ch* is a CJK Unified Ideograph or Extension A character."""
+    return "\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf"
+
+
+def _is_cjk_char(ch: str) -> bool:
+    """Return whether *ch* is a CJK Unified/Ext-A, Kana, or Hangul character."""
+    return (
+        _is_han_char(ch)
         or "\u3040" <= ch <= "\u30ff"
         or "\uac00" <= ch <= "\ud7af"
-        for ch in text
     )
+
+
+def _contains_spaceless_cjk(text: str) -> bool:
+    return any(_is_cjk_char(ch) for ch in text)
 
 
 def _cjk_fts_terms(text: str) -> List[str]:
@@ -3920,12 +3929,7 @@ def _cjk_fts_terms(text: str) -> List[str]:
     individual token. Unquoted character terms match directly. Bigrams
     are quoted as phrases for multi-character matching.
     """
-    cjk_chars = [
-        ch for ch in text
-        if "\u4e00" <= ch <= "\u9fff"
-        or "\u3040" <= ch <= "\u30ff"
-        or "\uac00" <= ch <= "\ud7af"
-    ]
+    cjk_chars = [ch for ch in text if _is_cjk_char(ch)]
     if not cjk_chars:
         return []
     terms: List[str] = []
@@ -4021,12 +4025,7 @@ def _substring_overlap(query: "_LexicalQuery", token: str, content: "_LexicalCon
 
 def _prepare_lexical_query(query_tokens: Sequence[str], query_lower: str = "") -> _LexicalQuery:
     """Build the row-independent inputs of ``_lexical_relevance()``."""
-    query_cjk = {
-        ch for ch in query_lower
-        if "\u4e00" <= ch <= "\u9fff"
-        or "\u3040" <= ch <= "\u30ff"
-        or "\uac00" <= ch <= "\ud7af"
-    }
+    query_cjk = {ch for ch in query_lower if _is_cjk_char(ch)}
     query_tokens = list(query_tokens)
     if query_lower:
         query_tokens = [*query_tokens, *_hyphen_fragment_tokens(query_lower)]
@@ -4266,12 +4265,7 @@ def _prepared_lexical_relevance(query: _LexicalQuery, content: _LexicalContent) 
 
     if score == 0.0:
         if query_cjk:
-            content_cjk = {
-                ch for ch in content_lower
-                if "\u4e00" <= ch <= "\u9fff"
-                or "\u3040" <= ch <= "\u30ff"
-                or "\uac00" <= ch <= "\ud7af"
-            }
+            content_cjk = {ch for ch in content_lower if _is_cjk_char(ch)}
             score = len(query_cjk & content_cjk) / len(query_cjk)
         elif query.has_cyrillic:
             # Cyrillic inflected forms (тёмная/тёмную, резервная/резервное)
@@ -5502,6 +5496,26 @@ def _strip_ko_josa(token: str) -> str:
             return token
 
 
+def _han_fts_terms(query: str) -> tuple[List[str], Set[str], str]:
+    """Extract quoted unigram/bigram FTS terms for Han runs and return the non-Han remainder."""
+    if not any(_is_han_char(ch) for ch in query):
+        return [], set(), query
+    terms: List[str] = []
+    seen: Set[str] = set()
+    non_han_chars: List[str] = []
+    for i, ch in enumerate(query):
+        if _is_han_char(ch):
+            non_han_chars.append(" ")
+            for tok in (ch, ch + query[i + 1] if i + 1 < len(query) and _is_han_char(query[i + 1]) else ""):
+                if tok and tok not in seen:
+                    seen.add(tok)
+                    escaped = tok.replace('"', '""')
+                    terms.append(f'"{escaped}"')
+        else:
+            non_han_chars.append(ch)
+    return terms, seen, "".join(non_han_chars)
+
+
 def _fts_precise_terms(query: str, *, widen: bool = True) -> List[str]:
     """FTS terms built from the raw query tokens, before particle stripping.
 
@@ -5579,25 +5593,15 @@ def _fts_query_terms(query: str) -> List[str]:
     candidates with noise; they are matched exact-only by the lexical
     layer via ``_symbolic_code_tokens()``.
     """
-    if any("\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf" for ch in query):
-        # Produce the same token stream that was written into the index.
-        tokens = _cjk_bigram(query).split()
-        cjk_terms: List[str] = []
-        for tok in tokens:
-            tok = tok.replace('"', '""').strip()
-            if tok:
-                cjk_terms.append(f'"{tok}"')
-        return cjk_terms
-    terms: List[str] = []
-    seen: Set[str] = set()
-    symbolic = set(_symbolic_code_tokens(query))
+    terms, seen, non_han_query = _han_fts_terms(query)
+    symbolic = set(_symbolic_code_tokens(non_han_query))
     # unicode61 glues a Korean particle onto whatever precedes it, including
     # a Latin word: `ModelForge가` is one index token, and so is `honcho는`.
     # An exact phrase term can never match either, so every term in a
     # Hangul-bearing query must take the prefix form -- even the ones that
     # `_recall_tokens()` has already stripped down to pure Latin.
     query_has_hangul = _has_hangul(query)
-    for term in _expanded_query_tokens(_recall_tokens(query)):
+    for term in _expanded_query_tokens(_recall_tokens(non_han_query)):
         if term.startswith("-"):
             # FTS5-only terms never reach MATCH verbatim. The fragment's
             # components are added below via _hyphen_fragment_tokens().
@@ -5623,7 +5627,7 @@ def _fts_query_terms(query: str) -> List[str]:
         if term not in seen:
             seen.add(term)
             terms.append(f'"{term}"')
-    for component in _hyphen_fragment_tokens(query):
+    for component in _hyphen_fragment_tokens(non_han_query):
         component = component.replace('"', '""').strip()
         if component and component not in seen:
             seen.add(component)
@@ -5633,12 +5637,7 @@ def _fts_query_terms(query: str) -> List[str]:
 
 def _has_cjk(text: str) -> bool:
     """Check if text contains any CJK characters."""
-    return any(
-        "\u4e00" <= ch <= "\u9fff"
-        or "\u3040" <= ch <= "\u30ff"
-        or "\uac00" <= ch <= "\ud7af"
-        for ch in text
-    )
+    return any(_is_cjk_char(ch) for ch in text)
 
 
 def _cjk_like_search(conn: sqlite3.Connection, query: str, k: int = 20, working: bool = False) -> List[Dict]:
@@ -5653,12 +5652,7 @@ def _cjk_like_search(conn: sqlite3.Connection, query: str, k: int = 20, working:
     underserved CJK users. Once FTS5 gets tokenchars or ICU support,
     this function can be removed.
     """
-    cjk_chars = sorted(set(
-        ch for ch in query
-        if "\u4e00" <= ch <= "\u9fff"
-        or "\u3040" <= ch <= "\u30ff"
-        or "\uac00" <= ch <= "\ud7af"
-    ))
+    cjk_chars = sorted(set(ch for ch in query if _is_cjk_char(ch)))
     if not cjk_chars:
         return []
 
@@ -6095,7 +6089,7 @@ def _supplement_cjk_working(conn, query, rows, k, terms, *, where_sql=None, wher
         return rows
     groups = [
         tuple(dict.fromkeys(run[i:i + 2] for i in range(len(run) - 1)))
-        for run in re.findall(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+", query)
+        for run in re.findall(r"[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\uac00-\ud7af]+", query)
         if len(run) >= 2
     ]
     anchors = tuple(dict.fromkeys(anchor for group in groups for anchor in group))

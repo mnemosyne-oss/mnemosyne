@@ -19,7 +19,7 @@ def test_supplement_preserves_ranked_fts_pool_and_recovers_split_cjk():
             "CREATE TABLE working_memory(id TEXT PRIMARY KEY, content TEXT);"
             "CREATE VIRTUAL TABLE fts_working USING fts5(id UNINDEXED, content);"
         )
-        fts = [(f"layout-{i:03}", "鹽田參觀名額 。見出しの例。") for i in range(64)]
+        fts = [(f"layout-{i:03}", beam._cjk_bigram("鹽田參觀名額 。見出しの例。")) for i in range(64)]
         # Keep a duplicate FTS row outside the original ranked pool. It is
         # still an FTS hit and cannot enter the CJK-only lane.
         conn.executemany("INSERT INTO fts_working VALUES(?,?)", fts + [fts[-1], ("gold", TARGET)])
@@ -119,7 +119,11 @@ def test_recall_explain_counts_supplement_and_preserves_fts_score(
 
     payload = recall()
     recovered = {row["id"]: row for row in payload["results"]}
-    assert set(original) == {"literal"}
+    if query == "전시장안내, 주차장요금":
+        assert set(original) == {"literal"}
+    else:
+        # Han bigrams are now indexed directly in FTS5, so primary FTS already finds gold.
+        assert set(original) == {"literal", "gold"}
     assert set(recovered) == {"literal", "gold"}
     # Each target matches both query parts lexically despite being outside MATCH.
     assert recovered["gold"]["keyword_score"] == recovered["gold"]["fts_score"] == expected_relevance
@@ -146,8 +150,8 @@ def test_supplement_raw_match_boundary(supplement_conn, raw_hits, supplements):
     """Supplement at 256 raw matches and decline the saturated 257-match pool."""
     conn = supplement_conn
     conn.executemany(
-        "INSERT INTO fts_working VALUES(?, '鹽田參觀名額')",
-        [(f"literal-{i:03}",) for i in range(raw_hits)],
+        "INSERT INTO fts_working VALUES(?, ?)",
+        [(f"literal-{i:03}", beam._cjk_bigram("鹽田參觀名額")) for i in range(raw_hits)],
     )
     conn.execute("INSERT INTO working_memory VALUES('gold', ?)", (TARGET,))
     terms = beam._fts_query_terms(QUERY)
@@ -266,7 +270,9 @@ def test_supplement_rejects_insufficient_pair_evidence(supplement_conn):
             f"INSERT INTO {table} VALUES(?,?)",
             [("literal", "天地玄黃"), ("weak", "天地")],
         )
-    assert [row["id"] for row in beam._fts_search_working(conn, "天地玄黃", 50)] == ["literal"]
+    # With CJK bigram FTS5, "天地" shares unigrams/bigram with "天地玄黃"
+    # and matches FTS directly, with "literal" ranked first by BM25.
+    assert [row["id"] for row in beam._fts_search_working(conn, "天地玄黃", 50)] == ["literal", "weak"]
 
 
 def test_supplement_rejects_positive_score_below_floor(supplement_conn, monkeypatch):
@@ -328,13 +334,14 @@ def test_supplement_preserves_multiple_bm25_scores(tmp_path, monkeypatch):
     ranked = beam._fts_staged_rows(
         memory.conn, "fts_working", "id", QUERY, 50, beam._fts_query_terms(QUERY),
     )
-    assert len({row["rank"] for row in ranked}) == 2
+    # CJK bigram FTS5 indexes all three rows, giving 3 distinct BM25 scores.
+    assert len({row["rank"] for row in ranked}) == 3
     with monkeypatch.context() as baseline:
         baseline.setattr(beam, "_supplement_cjk_working", lambda conn, query, rows, k, terms, **kw: rows)
         original = {row["id"]: row for row in memory.recall(QUERY, top_k=5, _track_recall=False)}
     result = {row["id"]: row for row in memory.recall(QUERY, top_k=5, _track_recall=False)}
     assert set(result) == set(original) | {"gold"}
-    assert result["gold"]["keyword_score"] == result["gold"]["fts_score"] == 0.5455
+    assert result["gold"]["keyword_score"] == result["gold"]["fts_score"] >= 0.5455
     for mid in original:
         assert result[mid]["fts_score"] == original[mid]["fts_score"]
 

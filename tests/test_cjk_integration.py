@@ -8,7 +8,6 @@ an independent ``_BeamConnection`` for assertions.  UDF is registered by
 """
 from __future__ import annotations
 
-import os
 import sqlite3
 import sys
 import threading
@@ -20,9 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from mnemosyne.core.beam import (
     _cjk_bigram,
-    _register_cjk_bigram,
     _fts_query_terms,
-    _has_cjk,
     _BeamConnection,
     init_beam,
 )
@@ -399,3 +396,56 @@ class TestRegexExtractionToggle:
         bm.extract_and_store_facts(text, message_idx=2)
         count_enabled = bm.conn.execute("SELECT COUNT(*) FROM memoria_preferences").fetchone()[0]
         assert count_enabled > 0
+
+
+class TestPublicRecallEdgeCases:
+    """Verify public BeamMemory.recall() lexical admission for Extension A and mixed Han/Hangul."""
+
+    @pytest.mark.parametrize("tier", ["working", "episodic"])
+    @pytest.mark.parametrize("query", ["㐀", "㐀㐁"])
+    def test_extension_a_public_recall(self, tmp_path, monkeypatch, tier, query):
+        from mnemosyne.core.beam import BeamMemory
+
+        monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+        monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+        bm = BeamMemory(session_id="ext-a", db_path=tmp_path / "ext_a.db")
+        with bm.conn:
+            if tier == "working":
+                bm.conn.execute(
+                    "INSERT INTO working_memory (id, content, source, timestamp, scope) "
+                    "VALUES (?, ?, 'user', '2026-11-22T00:00:00', 'global')",
+                    ("exta-1", "前缀 㐀㐁 后缀"),
+                )
+            else:
+                bm.conn.execute(
+                    "INSERT INTO episodic_memory (id, content, source, timestamp, importance) "
+                    "VALUES (?, ?, 'user', '2026-11-22T00:00:00', 0.8)",
+                    ("exta-1", "前缀 㐀㐁 后缀"),
+                )
+        results = bm.recall(query, top_k=5, _track_recall=False)
+        assert [r["id"] for r in results] == ["exta-1"]
+
+    @pytest.mark.parametrize("tier", ["working", "episodic"])
+    @pytest.mark.parametrize("query", ["中文 백업은", "中 백업은"])
+    def test_mixed_han_hangul_public_recall(self, tmp_path, monkeypatch, tier, query):
+        from mnemosyne.core.beam import BeamMemory
+
+        monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+        monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+        assert '"백업"*' in _fts_query_terms(query)
+        bm = BeamMemory(session_id="han-ko", db_path=tmp_path / "han_ko.db")
+        with bm.conn:
+            if tier == "working":
+                bm.conn.executemany(
+                    "INSERT INTO working_memory (id, content, source, timestamp, scope) "
+                    "VALUES (?, ?, 'user', '2026-11-22T00:00:00', 'global')",
+                    [("ko-target", "백업을 설정했다"), ("han-distractor", "中文")],
+                )
+            else:
+                bm.conn.executemany(
+                    "INSERT INTO episodic_memory (id, content, source, timestamp, importance) "
+                    "VALUES (?, ?, 'user', '2026-11-22T00:00:00', 0.8)",
+                    [("ko-target", "백업을 설정했다"), ("han-distractor", "中文")],
+                )
+        results = bm.recall(query, top_k=5, _track_recall=False)
+        assert "ko-target" in {r["id"] for r in results}
