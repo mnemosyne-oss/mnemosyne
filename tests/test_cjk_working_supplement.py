@@ -274,12 +274,15 @@ def test_supplement_rejects_insufficient_pair_evidence(supplement_conn):
 def test_bigram_fts_admits_weak_pair_ranked_after_literal(supplement_conn):
     """With CJK bigram FTS5, a weak-pair candidate in FTS ranks after literal by BM25."""
     conn = supplement_conn
-    for table in ("working_memory", "fts_working"):
-        conn.executemany(
-            f"INSERT INTO {table} VALUES(?,?)",
-            [("literal", "天地玄黃"), ("weak", "天地")],
-        )
-    assert [row["id"] for row in beam._fts_search_working(conn, "天地玄黃", 50)] == ["literal", "weak"]
+    rows = [("literal", "天地玄黃"), ("weak", "天地")]
+    conn.executemany("INSERT INTO working_memory VALUES(?,?)", rows)
+    conn.executemany(
+        "INSERT INTO fts_working VALUES(?,?)",
+        [(rid, beam._cjk_bigram(text)) for rid, text in rows],
+    )
+    results = beam._fts_search_working(conn, "天地玄黃", 50)
+    assert [row["id"] for row in results] == ["literal", "weak"]
+    assert results[0]["rank"] < results[1]["rank"]
 
 
 def test_supplement_rejects_positive_score_below_floor(supplement_conn, monkeypatch):
