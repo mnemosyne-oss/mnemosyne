@@ -93,3 +93,52 @@ def test_explain_has_no_raw_sql_or_embedding_values(temp_db):
     assert " MATCH " not in serialized_explain.upper()
     assert "embedding" in payload["explain"]
     assert "values" not in payload["explain"]["embedding"]
+
+
+def test_linear_explain_distinguishes_dense_candidates_with_zero_scores(temp_db, monkeypatch):
+    import numpy as np
+
+    from mnemosyne.core import embeddings
+
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setattr(embeddings, "available", lambda: False)
+    beam = BeamMemory(session_id="s1", db_path=temp_db)
+    controls = (
+        ("Quartz telescope mirror shipped from Zurich last April.", None, (False, 0.0)),
+        ("Quartz telescope calibration tracks drift near Orion.", [0.0, 1.0], (True, 0.0)),
+        ("Quartz telescope instruments record diffraction through the solar filter.", [0.00001, 1.0], (True, 0.0)),
+        ("Quartz telescope tracking campaign uses the main detector.", [0.8, 0.6], (True, 0.8)),
+    )
+    expected = {}
+    for content, embedding, values in controls:
+        mid = beam.remember(content, source="fact", importance=0.5)
+        expected[mid] = values
+        if embedding is not None:
+            beam.conn.execute(
+                "INSERT INTO memory_embeddings(memory_id, embedding_json, model) VALUES (?, ?, ?)",
+                (mid, json.dumps(embedding + [0.0] * 382), "test"),
+            )
+    beam.conn.commit()
+    monkeypatch.setattr(embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        embeddings, "embed_query", lambda *_a, **_kw: np.array([1.0] + [0.0] * 383, dtype=np.float32),
+    )
+
+    payload = beam.recall("quartz telescope", top_k=10, explain=True)
+
+    assert payload["engine"] == "linear"
+    assert {r["id"]: r["dense_score"] for r in payload["results"]} == {
+        mid: scores[1] for mid, scores in expected.items()
+    }
+    assert {
+        c["id"]: (c["dense_candidate"], c["scores"]["dense"])
+        for c in payload["explain"]["candidates"]
+    } == expected
+    assert all("dense_candidate" not in r for r in payload["results"])
+
+    beam.conn.execute("DELETE FROM memory_embeddings")
+    beam.conn.commit()
+    without_candidates = beam.recall("quartz telescope", top_k=10, explain=True)
+    assert {
+        c["id"]: c["dense_candidate"] for c in without_candidates["explain"]["candidates"]
+    } == dict.fromkeys(expected, False)

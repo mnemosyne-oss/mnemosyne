@@ -10462,6 +10462,7 @@ class BeamMemory:
 
         # ---- Working memory (vector search) ----
         wm_vec_sims = {}
+        wm_dense_search_completed = False
         if embeddings_available:
             try:
                 emb_result = _get_query_embedding()
@@ -10473,6 +10474,7 @@ class BeamMemory:
                     for vr in wm_vec:
                         wm_vec_sims[vr["id"]] = vr["sim"]
                         wm_ids.add(vr["id"])  # Merge vector results with FTS5 results
+                    wm_dense_search_completed = True
             except Exception:
                 logger.info("Regex extraction failed, skipping", exc_info=True)
         # Track whether the FTS+vec layer produced any candidates
@@ -11564,7 +11566,10 @@ class BeamMemory:
                 computed=query_embedding_computed,
                 refusal=_embeddings.policy_refusal_message(),
             )
-            _explain_trace.add_ranked_candidates(_ranked_results_for_explain or [], final_results)
+            _explain_trace.add_ranked_candidates(
+                _ranked_results_for_explain or [], final_results,
+                wm_dense_candidate_ids=wm_vec_sims if wm_dense_search_completed else None,
+            )
             return {
                 "query": query,
                 "top_k": top_k,
