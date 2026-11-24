@@ -6077,16 +6077,18 @@ def _fts_search_working(
 
 def _wm_vec_search(conn: sqlite3.Connection, query_embedding, k: int = 20,
                    *, where_sql: Optional[str] = None,
-                   where_params: Tuple[Any, ...] = ()) -> List[Dict]:
+                   where_params: Tuple[Any, ...] = (),
+                   report_incomplete: bool = False) -> Optional[List[Dict]]:
     """Vector search against working_memory.
 
     Prefer the dedicated sqlite-vec ``vec_working`` table when available.
     Fall back to the compatibility ``memory_embeddings`` JSON scan for older
     databases, unavailable sqlite-vec builds, or rows not yet backfilled.
-    Returns list of dicts with 'id' (memory_id) and 'sim' (cosine similarity).
+    Returns dicts with 'id' and 'sim'. With report_incomplete, None signals
+    that neither backend produced a completed search.
     """
     if np is None:
-        return []
+        return None if report_incomplete else []
     if where_sql is None:
         where_sql = "wm.superseded_by IS NULL AND (wm.valid_until IS NULL OR julianday(wm.valid_until) > julianday(?))"
         where_params = (datetime.now(timezone.utc).isoformat(),)
@@ -6096,9 +6098,12 @@ def _wm_vec_search(conn: sqlite3.Connection, query_embedding, k: int = 20,
                                            where_params=where_params)
     if sqlite_results:
         return sqlite_results
-    return _wm_vec_search_fallback(conn, query_embedding, k=k,
-                                   where_sql=where_sql,
-                                   where_params=where_params)
+    fallback = _wm_vec_search_fallback(conn, query_embedding, k=k,
+                                       where_sql=where_sql,
+                                       where_params=where_params)
+    if fallback is None and not report_incomplete:
+        return []
+    return fallback
 
 
 def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20,
@@ -6235,8 +6240,8 @@ def _wm_vec_search_sqlite(conn: sqlite3.Connection, query_embedding, k: int = 20
 
 def _wm_vec_search_fallback(conn: sqlite3.Connection, query_embedding, k: int = 20,
                             *, where_sql: str,
-                            where_params: Tuple[Any, ...] = ()) -> List[Dict]:
-    """Compatibility vector search using memory_embeddings + numpy cosine."""
+                            where_params: Tuple[Any, ...] = ()) -> Optional[List[Dict]]:
+    """Search JSON vectors, returning None if the compatibility scan cannot run."""
     cursor = conn.cursor()
     try:
         # BEAM mode: scan up to 500K rows for broad vector recall on large benchmark datasets
@@ -6249,7 +6254,7 @@ def _wm_vec_search_fallback(conn: sqlite3.Connection, query_embedding, k: int = 
             LIMIT ?
         """, (*where_params, _vec_limit))
     except Exception:
-        return []
+        return None
     rows = cursor.fetchall()
     if not rows:
         return []
@@ -10470,11 +10475,13 @@ class BeamMemory:
                     wm_vec = _wm_vec_search(self.conn, emb_result,
                                               k=max(top_k, 20) if _BEAM_MODE else max(top_k * 3, 50),
                                               where_sql=wm_vec_where,
-                                              where_params=tuple(wm_params))
-                    for vr in wm_vec:
-                        wm_vec_sims[vr["id"]] = vr["sim"]
-                        wm_ids.add(vr["id"])  # Merge vector results with FTS5 results
-                    wm_dense_search_completed = True
+                                              where_params=tuple(wm_params),
+                                              report_incomplete=True)
+                    if wm_vec is not None:
+                        for vr in wm_vec:
+                            wm_vec_sims[vr["id"]] = vr["sim"]
+                            wm_ids.add(vr["id"])  # Merge vector results with FTS5 results
+                        wm_dense_search_completed = True
             except Exception:
                 logger.info("Regex extraction failed, skipping", exc_info=True)
         # Track whether the FTS+vec layer produced any candidates

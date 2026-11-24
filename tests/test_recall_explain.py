@@ -142,3 +142,100 @@ def test_linear_explain_distinguishes_dense_candidates_with_zero_scores(temp_db,
     assert {
         c["id"]: c["dense_candidate"] for c in without_candidates["explain"]["candidates"]
     } == dict.fromkeys(expected, False)
+
+
+def test_linear_explain_omits_dense_membership_after_backend_error(temp_db, monkeypatch):
+    """A failed compatibility scan leaves lexical results and no membership flag."""
+    import sqlite3
+
+    np = pytest.importorskip("numpy")
+    from mnemosyne.core import beam as beam_module
+    from mnemosyne.core import embeddings
+
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setattr(embeddings, "available", lambda: False)
+    beam = BeamMemory(session_id="s1", db_path=temp_db)
+    mid = beam.remember("Quartz telescope tracks stars in Orion.", source="fact")
+    monkeypatch.setattr(embeddings, "available", lambda: True)
+    query_vec = np.zeros(beam_module.EMBEDDING_DIM, dtype=np.float32)
+    query_vec[0] = 1
+    monkeypatch.setattr(embeddings, "embed_query", lambda *_a, **_kw: query_vec)
+
+    denied = False
+
+    def authorize(action, table, column, _db, _trigger):
+        """Reject only the actual compatibility-scan payload read."""
+        nonlocal denied
+        if action == sqlite3.SQLITE_READ and table == "memory_embeddings" and column == "embedding_json":
+            denied = True
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    beam.conn.set_authorizer(authorize)
+    try:
+        payload = beam.recall("quartz telescope", explain=True)
+        ordinary = beam.recall("quartz telescope")
+    finally:
+        beam.conn.set_authorizer(None)
+
+    assert denied
+    assert [r["id"] for r in payload["results"]] == [mid]
+    assert [r["id"] for r in ordinary] == [mid]
+    candidate, = payload["explain"]["candidates"]
+    assert candidate["id"] == mid
+    assert "dense_candidate" not in candidate
+
+
+@pytest.mark.parametrize("vec_type", ["float32", "int8"])
+def test_linear_explain_native_dense_membership_survives_truncation(temp_db, monkeypatch, vec_type):
+    """Keep native WM membership in the trace through truncation and tier lookup."""
+    np = pytest.importorskip("numpy")
+    from mnemosyne.core import beam as beam_module
+    from mnemosyne.core import embeddings
+
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setattr(embeddings, "available", lambda: False)
+    beam = BeamMemory(session_id="s1", db_path=temp_db)
+    if not beam_module._wm_vec_available(beam.conn):
+        pytest.skip("sqlite-vec working-memory table unavailable")
+    dim = beam_module.EMBEDDING_DIM
+    beam.conn.execute("DROP TABLE vec_working")
+    beam.conn.execute(f"CREATE VIRTUAL TABLE vec_working USING vec0(embedding {vec_type}[{dim}])")
+    aligned = np.zeros(dim, dtype=np.float32)
+    aligned[0] = 1
+    orthogonal = np.zeros(dim, dtype=np.float32)
+    orthogonal[1] = 1
+    strongest = beam.remember("Quartz telescope observes Orion from the mountaintop.", source="fact", importance=0.9)
+    zero = beam.remember("Quartz telescope equipment shipped by rail last April.", source="fact", importance=0.2)
+    for mid, embedding in ((strongest, aligned), (zero, orthogonal)):
+        rowid = beam.conn.execute("SELECT rowid FROM working_memory WHERE id=?", (mid,)).fetchone()[0]
+        beam_module._vec_table_insert(beam.conn, "vec_working", rowid, embedding, commit=False)
+    beam.conn.commit()
+    assert beam.conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0] == 0
+    monkeypatch.setattr(embeddings, "available", lambda: True)
+    monkeypatch.setattr(embeddings, "embed_query", lambda *_a, **_kw: aligned)
+
+    payload = beam.recall("quartz telescope", top_k=1, explain=True)
+
+    assert [r["id"] for r in payload["results"]] == [strongest]
+    kept, truncated = payload["explain"]["candidates"]
+    assert kept["id"] == strongest and kept["dense_candidate"] is True
+    assert kept["scores"]["dense"] == pytest.approx(1.0)
+    assert truncated["dense_candidate"] is True and truncated["scores"]["dense"] == 0.0
+    assert truncated["kept"] is False and truncated["drop_reason"] == "top_k_truncated"
+    assert truncated["id"] is None and truncated["content_preview"] is None
+
+    beam.conn.execute(
+        "INSERT INTO episodic_memory(id, content, source, timestamp, session_id, importance) "
+        "VALUES (?, 'Quartz telescope repair completed in the workshop.', 'test', CURRENT_TIMESTAMP, 's1', 0.5)",
+        (zero,),
+    )
+    beam.conn.commit()
+
+    shared_id = beam.recall("quartz telescope", top_k=10, explain=True)
+    twins = {
+        c["tier"]: c for c in shared_id["explain"]["candidates"] if c["id"] == zero
+    }
+    assert set(twins) == {"episodic", "working"}
+    assert twins["working"]["dense_candidate"] is True
+    assert "dense_candidate" not in twins["episodic"]
