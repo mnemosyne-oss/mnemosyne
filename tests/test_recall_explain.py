@@ -197,7 +197,8 @@ def test_linear_explain_omits_dense_membership_after_backend_error(temp_db, monk
         ordinary = beam.recall("quartz telescope")
     finally:
         beam.conn.set_trace_callback(None)
-        beam.conn.set_authorizer(None)
+        # Disabling an authorizer with None requires Python 3.11.
+        beam.conn.set_authorizer(lambda *_: sqlite3.SQLITE_OK)
 
     assert denied
     assert any("vw.embedding MATCH" in statement for statement in statements) == native_available
