@@ -144,7 +144,8 @@ def test_linear_explain_distinguishes_dense_candidates_with_zero_scores(temp_db,
     } == dict.fromkeys(expected, False)
 
 
-def test_linear_explain_omits_dense_membership_after_backend_error(temp_db, monkeypatch):
+@pytest.mark.parametrize("native_available", [False, True], ids=["unavailable", "empty-native"])
+def test_linear_explain_omits_dense_membership_after_backend_error(temp_db, monkeypatch, native_available):
     """A failed compatibility scan leaves lexical results and no membership flag."""
     import sqlite3
 
@@ -155,13 +156,31 @@ def test_linear_explain_omits_dense_membership_after_backend_error(temp_db, monk
     monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
     monkeypatch.setattr(embeddings, "available", lambda: False)
     beam = BeamMemory(session_id="s1", db_path=temp_db)
-    mid = beam.remember("Quartz telescope tracks stars in Orion.", source="fact")
-    monkeypatch.setattr(embeddings, "available", lambda: True)
-    query_vec = np.zeros(beam_module.EMBEDDING_DIM, dtype=np.float32)
+    mid = beam.remember("Quartz telescope tracks stars in Orion.", source="fact", scope="session")
+    dim = beam_module.EMBEDDING_DIM
+    query_vec = np.zeros(dim, dtype=np.float32)
     query_vec[0] = 1
+    if native_available and not beam_module._wm_vec_available(beam.conn):
+        pytest.skip("sqlite-vec working-memory table unavailable")
+    beam.conn.execute("DROP TABLE IF EXISTS vec_working")
+    if native_available:
+        beam.conn.execute(f"CREATE VIRTUAL TABLE vec_working USING vec0(embedding float32[{dim}])")
+        foreign = beam.remember("Quartz telescope tracks stars over Chile.", source="fact", scope="session")
+        beam.conn.execute(
+            "UPDATE working_memory SET session_id='other', channel_id='other' WHERE id=?", (foreign,),
+        )
+        rowid = beam.conn.execute("SELECT rowid FROM working_memory WHERE id=?", (foreign,)).fetchone()[0]
+        beam_module._vec_table_insert(beam.conn, "vec_working", rowid, query_vec, commit=False)
+    beam.conn.execute(
+        "INSERT INTO memory_embeddings(memory_id, embedding_json, model) VALUES (?, ?, 'test')",
+        (mid, json.dumps(query_vec.tolist())),
+    )
+    beam.conn.commit()
+    monkeypatch.setattr(embeddings, "available", lambda: True)
     monkeypatch.setattr(embeddings, "embed_query", lambda *_a, **_kw: query_vec)
 
     denied = False
+    statements = []
 
     def authorize(action, table, column, _db, _trigger):
         """Reject only the actual compatibility-scan payload read."""
@@ -172,18 +191,27 @@ def test_linear_explain_omits_dense_membership_after_backend_error(temp_db, monk
         return sqlite3.SQLITE_OK
 
     beam.conn.set_authorizer(authorize)
+    beam.conn.set_trace_callback(statements.append)
     try:
         payload = beam.recall("quartz telescope", explain=True)
         ordinary = beam.recall("quartz telescope")
     finally:
+        beam.conn.set_trace_callback(None)
         beam.conn.set_authorizer(None)
 
     assert denied
+    assert any("vw.embedding MATCH" in statement for statement in statements) == native_available
     assert [r["id"] for r in payload["results"]] == [mid]
     assert [r["id"] for r in ordinary] == [mid]
     candidate, = payload["explain"]["candidates"]
     assert candidate["id"] == mid
     assert "dense_candidate" not in candidate
+
+    recovered = beam.recall("quartz telescope", explain=True)
+    recovered_candidate, = recovered["explain"]["candidates"]
+    assert recovered_candidate["id"] == mid
+    assert recovered_candidate["dense_candidate"] is True
+    assert recovered_candidate["scores"]["dense"] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize("vec_type", ["float32", "int8"])
