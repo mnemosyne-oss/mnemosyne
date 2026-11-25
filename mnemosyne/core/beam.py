@@ -6596,12 +6596,14 @@ class BeamMemory:
     # Working Memory
     # ------------------------------------------------------------------
     def _find_duplicate(self, content: str) -> Optional[str]:
-        """Check if exact same content already exists in working_memory for this session.
+        """Check for active exact content in working_memory for this session.
         Returns the existing memory_id if found, else None."""
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT id FROM working_memory
             WHERE session_id = ? AND content = ?
+              AND superseded_by IS NULL
+              AND (valid_until IS NULL OR julianday(valid_until) > julianday('now'))
             LIMIT 1
         """, (self.session_id, content))
         row = cursor.fetchone()
