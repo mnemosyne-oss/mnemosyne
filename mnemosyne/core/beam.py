@@ -4527,12 +4527,18 @@ def _backfill_vec_working_from_memory_embeddings(conn: sqlite3.Connection) -> in
     """Idempotently mirror fallback working embeddings into vec_working."""
     if not _wm_vec_available(conn) or np is None:
         return 0
+    # Materialize vec_working's rowid list instead of joining the vec0 table:
+    # a join cannot probe a virtual table by rowid, so `LEFT JOIN vec_working
+    # ... WHERE vw.rowid IS NULL` scans the whole table for every outer row
+    # group (~7 s on a 7k-row bank that needs no backfill at all). A correlated
+    # `NOT EXISTS` is planned the same way (~6.4 s). The `NOT IN` subquery below
+    # builds the rowid list once and probes it per row (~0.01 s). vec0 rowids
+    # are never NULL, so NOT IN's NULL-comparison pitfall cannot apply here.
     rows = conn.execute("""
         SELECT wm.id, wm.rowid, me.embedding_json
         FROM working_memory wm
         JOIN memory_embeddings me ON me.memory_id = wm.id
-        LEFT JOIN vec_working vw ON vw.rowid = wm.rowid
-        WHERE vw.rowid IS NULL
+        WHERE wm.rowid NOT IN (SELECT rowid FROM vec_working)
     """).fetchall()
     inserted = 0
     for _wm_id, wm_rowid, embedding_json in rows:
@@ -4607,12 +4613,15 @@ def vec_working_coverage(conn: sqlite3.Connection) -> Dict[str, Any]:
         coverage["vec_working_rows_error"] = f"{type(exc).__name__}: {exc}"
 
     try:
+        # Same materialized-subquery shape as the backfill above: joining the
+        # vec0 table by rowid is planned as a full virtual-table scan (~7 s on a
+        # 7k-row bank), while the NOT IN list is built once (~0.01 s). vec0
+        # rowids are never NULL, so the NOT IN NULL pitfall cannot apply.
         coverage["missing_vec_working_rows"] = int(conn.execute("""
             SELECT COUNT(*)
             FROM working_memory wm
             JOIN memory_embeddings me ON me.memory_id = wm.id
-            LEFT JOIN vec_working vw ON vw.rowid = wm.rowid
-            WHERE vw.rowid IS NULL
+            WHERE wm.rowid NOT IN (SELECT rowid FROM vec_working)
         """).fetchone()[0])
     except Exception as exc:
         coverage["missing_vec_working_rows_error"] = f"{type(exc).__name__}: {exc}"
