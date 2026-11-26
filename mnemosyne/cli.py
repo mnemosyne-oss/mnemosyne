@@ -1534,6 +1534,19 @@ def _convert_reindex_vectors(db_path, target_vec_type, batch_size, progress):
         )
 
 
+def _print_reindex_vector_tables(plan):
+    for table, details in plan.get("vector_tables", {}).items():
+        current = (
+            f"{details['current_type']}[{details['current_dim']}]"
+            if details["current_type"] is not None else "missing"
+        )
+        print(
+            f"  {table}: {current} -> "
+            f"{details['target_type']}[{details['target_dim']}] "
+            f"({details['current_rows']} current vectors)"
+        )
+
+
 def cmd_reindex(args):
     """Rebuild vector indexes from source text with the active embedding model.
 
@@ -1614,21 +1627,15 @@ def cmd_reindex(args):
                     "working_memory", "episodic_memory"):
             if key in plan:
                 print(f"  {key}: {plan[key]}")
-        for table, details in plan.get("vector_tables", {}).items():
-            current = (
-                f"{details['current_type']}[{details['current_dim']}]"
-                if details["current_type"] is not None else "missing"
-            )
-            print(
-                f"  {table}: {current} -> "
-                f"{details['target_type']}[{details['target_dim']}] "
-                f"({details['current_rows']} current vectors)"
-            )
+        _print_reindex_vector_tables(plan)
         return
 
     if target_vec_type is not None:
         if not assume_yes:
             print(f"Stop all clients before converting {db_path} to {target_vec_type}.")
+            print(f"  model: {plan['model']}")
+            print(f"  dim: {plan['dim']}")
+            _print_reindex_vector_tables(plan)
             try:
                 response = input("Proceed? [y/N] ").strip().lower()
             except EOFError:
