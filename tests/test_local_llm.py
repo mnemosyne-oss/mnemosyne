@@ -33,18 +33,23 @@ def _isolate_model_selection(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("yaml_flag", "env_flag", "host_error", "expected"),
+    ("yaml_flag", "env_flag", "host_registered", "host_error", "expected"),
     [
-        (None, "true", False, ["Host summary.", ["host"]]),
-        (True, None, False, ["Host summary.", ["host"]]),
-        (True, "false", False, ["Host summary.", ["host"]]),
-        (False, "true", False, ["Remote summary.", ["remote"]]),
-        (True, "false", True, ["Local summary.", ["host", "local"]]),
+        (None, "true", True, False, ["Host summary.", ["host"]]),
+        (True, None, True, False, ["Host summary.", ["host"]]),
+        (True, "false", True, False, ["Host summary.", ["host"]]),
+        (False, "true", True, False, ["Remote summary.", ["remote"]]),
+        (True, "false", True, True, ["Local summary.", ["host", "local"]]),
+        (None, None, True, False, ["Remote summary.", ["remote"]]),
+        (True, None, False, False, ["Remote summary.", ["remote"]]),
     ],
-    ids=["env", "yaml", "yaml-over-env-off", "yaml-off-over-env", "yaml-host-error"],
+    ids=[
+        "env", "yaml", "yaml-over-env-off", "yaml-off-over-env", "yaml-host-error",
+        "default-off-with-host", "yaml-opt-in-without-host",
+    ],
 )
 def test_consolidation_resolves_host_opt_in_before_dispatch(
-    tmp_path, yaml_flag, env_flag, host_error, expected
+    tmp_path, yaml_flag, env_flag, host_registered, host_error, expected
 ):
     """The YAML decision must reach the real host and fallback routing paths."""
     env = {name: value for name, value in os.environ.items() if not name.startswith("MNEMOSYNE_")}
@@ -81,12 +86,13 @@ def local(*args, **kwargs):
     calls.append("local")
     return "Local summary."
 
-set_host_llm_backend(CallableLLMBackend("fixture", complete))
+if sys.argv[2] == "1":
+    set_host_llm_backend(CallableLLMBackend("fixture", complete))
 local_llm._call_remote_llm = remote
 local_llm._call_local_llm = local
 summary = local_llm.summarize_memories(["The observatory will install a thermal regulator."])
 print(json.dumps([summary, calls]))
-""", str(int(host_error))],
+""", str(int(host_error)), str(int(host_registered))],
         cwd=Path(__file__).resolve().parents[1],
         env=env,
         check=True,
