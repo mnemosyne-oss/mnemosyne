@@ -1,5 +1,6 @@
 import builtins
 import importlib
+import json
 import logging
 import os
 import subprocess
@@ -29,6 +30,71 @@ def _isolate_model_selection(monkeypatch):
     """
     monkeypatch.delenv("MNEMOSYNE_LLM_REPO", raising=False)
     monkeypatch.delenv("MNEMOSYNE_LLM_FILE", raising=False)
+
+
+@pytest.mark.parametrize(
+    ("yaml_flag", "env_flag", "host_error", "expected"),
+    [
+        (None, "true", False, ["Host summary.", ["host"]]),
+        (True, None, False, ["Host summary.", ["host"]]),
+        (True, "false", False, ["Host summary.", ["host"]]),
+        (False, "true", False, ["Remote summary.", ["remote"]]),
+        (True, "false", True, ["Local summary.", ["host", "local"]]),
+    ],
+    ids=["env", "yaml", "yaml-over-env-off", "yaml-off-over-env", "yaml-host-error"],
+)
+def test_consolidation_resolves_host_opt_in_before_dispatch(
+    tmp_path, yaml_flag, env_flag, host_error, expected
+):
+    """The YAML decision must reach the real host and fallback routing paths."""
+    env = {name: value for name, value in os.environ.items() if not name.startswith("MNEMOSYNE_")}
+    env.update(
+        HOME=str(tmp_path), HERMES_HOME=str(tmp_path), MNEMOSYNE_DATA_DIR=str(tmp_path),
+        MNEMOSYNE_LLM_ENABLED="true", MNEMOSYNE_LLM_BASE_URL="http://127.0.0.1:1/v1",
+    )
+    if yaml_flag is not None:
+        (tmp_path / "config.yaml").write_text(
+            f"host_llm_enabled: {str(yaml_flag).lower()}\n", encoding="utf-8"
+        )
+    if env_flag is not None:
+        env["MNEMOSYNE_HOST_LLM_ENABLED"] = env_flag
+
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import json
+import sys
+from mnemosyne.core import local_llm
+from mnemosyne.core.llm_backends import CallableLLMBackend, set_host_llm_backend
+
+calls = []
+def complete(*args, **kwargs):
+    calls.append("host")
+    if sys.argv[1] == "1":
+        raise RuntimeError("synthetic host failure")
+    return "Host summary."
+
+def remote(*args, **kwargs):
+    calls.append("remote")
+    return "Remote summary."
+
+def local(*args, **kwargs):
+    calls.append("local")
+    return "Local summary."
+
+set_host_llm_backend(CallableLLMBackend("fixture", complete))
+local_llm._call_remote_llm = remote
+local_llm._call_local_llm = local
+summary = local_llm.summarize_memories(["The observatory will install a thermal regulator."])
+print(json.dumps([summary, calls]))
+""", str(int(host_error))],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert json.loads(result.stdout) == expected
 
 
 class TestLocalModelDownloadNotice:
