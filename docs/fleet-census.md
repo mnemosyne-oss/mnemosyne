@@ -4,9 +4,10 @@ The sleep-time census discovers nonempty `*.db` candidates below the fleet
 root. A candidate is counted as a bank only if it can be read and contains a
 `conflicts` table. Below the selected root, the fixed skip list prunes child
 directories named `backups`, `cache`, `.cache`, `__pycache__`, `node_modules`,
-`.git` or `site-packages`. The selected root is not excluded merely because
-its own name is on this list; selecting `/fleet/backups` still scans its
-root-level `*.db` files.
+`.git` or `site-packages`. The walk also skips Hermes' `backup/` directly
+below the fleet root or a `profiles/<name>/` directory. A profile or bank
+named `backup` can still be discovered. Selecting `/fleet/backups` as the
+root still scans its root-level `*.db` files.
 A directory named `build` is not on that list and is still searched. Directories ending in `.partial` are also pruned when
 they are inside a snapshot tree: the selected root resolves to a directory
 named `state-snapshots` (including through an alias), or a `state-snapshots`

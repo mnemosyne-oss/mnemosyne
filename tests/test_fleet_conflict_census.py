@@ -21,6 +21,7 @@ import logging
 import re
 import sqlite3
 import time
+from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -613,6 +614,44 @@ class TestReadOnly:
         report = fleet_census.census()
         assert report["banks_scanned"] == 0
         assert report["unreadable"] == []
+
+    @pytest.mark.parametrize("backup_dir", ["backup", "backups"])
+    def test_census_skips_profile_backup_trees(self, fleet_env, backup_dir):
+        profile = fleet_env / "profiles" / "active"
+        live = _make_bank(
+            profile / "mnemosyne" / "data" / "banks" / "default" / "mnemosyne.db",
+            [_TWIN + (None,)],
+        )
+        archived = _make_bank(
+            profile / backup_dir / "snapshot" / "mnemosyne.db",
+            [_TWIN + (None,)],
+        )
+        with closing(sqlite3.connect(archived)) as conn:
+            assert conn.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+
+        report = fleet_census.census()
+
+        assert [Path(bank["path"]) for bank in report["banks"]] == [live]
+        assert report["home_home_twin_count"] == 0
+        assert sorted(archived.parent.iterdir()) == [archived]
+
+    @pytest.mark.parametrize("root_relative", [".", "profiles", "profiles/backup"])
+    def test_census_keeps_a_live_profile_and_bank_named_backup(
+            self, fleet_env, root_relative):
+        profile = fleet_env / "profiles" / "backup"
+        live = _make_bank(
+            profile / "mnemosyne" / "data" / "banks" / "backup" / "mnemosyne.db",
+            [_TWIN + (None,)],
+        )
+        for archive_root in (fleet_env, profile):
+            _make_bank(
+                archive_root / "backup" / "snapshot" / "mnemosyne.db",
+                [_TWIN + (None,)],
+            )
+
+        report = fleet_census.census(root=fleet_env / root_relative)
+
+        assert [Path(bank["path"]) for bank in report["banks"]] == [live]
 
     def test_partial_snapshot_dirs_are_pruned_without_hiding_completed_banks(
             self, fleet_env, caplog):

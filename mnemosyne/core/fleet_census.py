@@ -175,13 +175,21 @@ def discover_banks(root: Path) -> List[Path]:
     candidates: List[Path] = []
     if not root.is_dir():
         return candidates
-    root_is_snapshot_tree = root.resolve().name == "state-snapshots"
+    resolved_root = root.resolve()
+    root_is_snapshot_tree = resolved_root.name == "state-snapshots"
+    root_is_profiles = resolved_root.name == "profiles" and resolved_root.parent.name != "profiles"
     for dirpath, dirnames, filenames in os.walk(root):
         relative_parts = Path(dirpath).relative_to(root).parts
         in_snapshot_tree = root_is_snapshot_tree or "state-snapshots" in relative_parts
+        is_backup_parent = (
+            (not relative_parts and not root_is_profiles)
+            or (len(relative_parts) == 2 and relative_parts[0] == "profiles")
+            or (root_is_profiles and len(relative_parts) == 1)
+        )
         dirnames[:] = sorted(
             d for d in dirnames
             if d not in _SKIP_DIR_NAMES
+            and (d != "backup" or not is_backup_parent)
             and (not in_snapshot_tree or not d.endswith(".partial"))
         )
         for filename in sorted(filenames):
