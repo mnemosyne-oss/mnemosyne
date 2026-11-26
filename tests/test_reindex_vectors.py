@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import zlib
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -788,3 +789,152 @@ def test_reindex_works_with_a_bare_sqlite3_connect_row_factory_unset(
 if __name__ == "__main__":  # allow direct execution without pytest
     test_reindex_rebuilds_all_vector_stores_at_active_dim()
     print("ok")
+
+
+def test_explicit_float32_conversion_rebuilds_both_native_tiers(tmp_path, monkeypatch):
+    memory = _seeded_store(tmp_path, monkeypatch)
+    if not beam_module._vec_available(memory.conn):
+        pytest.skip("sqlite-vec unavailable")
+    path = tmp_path / "m.db"
+    target_type = (
+        "float32" if "int8" in _ddl(memory.conn, "vec_episodes") else "int8"
+    )
+    result = reindex_vectors(memory.conn, target_vec_type=target_type, batch_size=2)
+    state = _store_state(path)
+    assert result["status"] == "reindexed"
+    assert state["quick_check"] == "ok"
+    for table in ("vec_working", "vec_episodes"):
+        assert f"embedding {target_type}[" in state[table]
+        assert len(state[f"{table} rows"]) == 3
+
+
+def test_interrupted_explicit_conversion_restores_vectors_and_schema(tmp_path, monkeypatch):
+    memory = _seeded_store(tmp_path, monkeypatch)
+    if not beam_module._vec_available(memory.conn):
+        pytest.skip("sqlite-vec unavailable")
+    path = tmp_path / "m.db"
+    before = _store_state(path)
+    monkeypatch.setattr(E, "embed", _fake_embedder("other", fail_on_call=2))
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        reindex_vectors(memory.conn, target_vec_type="int8", batch_size=2)
+    assert _store_state(path) == before
+
+
+def test_conversion_plan_reports_each_native_table_without_writing(tmp_path, capsys):
+    from mnemosyne.cli import cmd_reindex
+
+    path = tmp_path / "mixed.db"
+    with closing(_open_fresh(path)) as conn:
+        if not beam_module._SQLITE_VEC_AVAILABLE:
+            pytest.skip("sqlite-vec unavailable")
+        conn.executescript(
+            "CREATE VIRTUAL TABLE vec_working USING vec0(embedding float32[8]);"
+            "CREATE VIRTUAL TABLE vec_episodes USING vec0(embedding int8[8]);"
+        )
+    before = path.read_bytes()
+    cmd_reindex(["--db", str(path), "--dry-run", "--vec-type", "float32"])
+    output = capsys.readouterr().out
+    assert "vec_working: float32[8] -> float32[" in output
+    assert "vec_episodes: int8[8] -> float32[" in output
+    assert "vec_facts: missing -> float32[" in output
+    assert path.read_bytes() == before
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_conversion_cli_verifies_recoverable_backup_before_rebuilding(
+    tmp_path, monkeypatch, capsys
+):
+    from mnemosyne.cli import cmd_reindex
+    from mnemosyne.dr.recovery import restore_backup
+
+    memory = _seeded_store(tmp_path, monkeypatch)
+    if not beam_module._vec_available(memory.conn):
+        pytest.skip("sqlite-vec unavailable")
+    path = tmp_path / "m.db"
+    before = _store_state(path)
+    target = "int8" if "float32" in before["vec_episodes"] else "float32"
+    assert memory.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+    memory.conn.close()
+    backup_dir = tmp_path / "backups"
+    monkeypatch.setenv("MNEMOSYNE_BACKUP_DIR", str(backup_dir))
+
+    cmd_reindex(["--db", str(path), "--vec-type", target, "--yes"])
+
+    output = capsys.readouterr().out
+    assert "Backup verified" in output
+    assert f"converted to {target}" in output
+    archives = list(backup_dir.rglob("*.gz"))
+    assert len(archives) == 1
+    recovered = tmp_path / "recovered.db"
+    restore_backup(archives[0], db_path=recovered)
+    assert _store_state(recovered) == before
+    assert f"embedding {target}[" in _store_state(path)["vec_episodes"]
+
+
+def test_invalid_conversion_backup_aborts_before_rebuild(tmp_path, monkeypatch, capsys):
+    from mnemosyne.cli import cmd_reindex
+    from mnemosyne.dr import recovery
+
+    memory = _seeded_store(tmp_path, monkeypatch)
+    if not beam_module._vec_available(memory.conn):
+        pytest.skip("sqlite-vec unavailable")
+    path = tmp_path / "m.db"
+    before = _store_state(path)
+    assert memory.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+    memory.conn.close()
+    backup = tmp_path / "broken.db.gz"
+    backup.write_bytes(b"not a recoverable archive")
+    monkeypatch.setattr(recovery, "create_backup", lambda **kwargs: {"backup_path": backup})
+    monkeypatch.setattr(E, "embed", lambda *_args: pytest.fail("embedding ran before backup validation"))
+
+    with pytest.raises(SystemExit) as aborted:
+        cmd_reindex(["--db", str(path), "--vec-type", "float32", "--yes"])
+
+    assert aborted.value.code == 1
+    assert "Backup metadata sidecar not found" in capsys.readouterr().err
+    assert _store_state(path) == before
+
+
+_EXIT_DURING_CONVERSION = """
+import os, sys
+import mnemosyne.core.embeddings as embeddings
+from mnemosyne.cli import cmd_reindex
+
+batches = 0
+
+def embed(contents):
+    global batches
+    batches += 1
+    if batches == 2:
+        os._exit(73)
+    return [[0.5] * embeddings.EMBEDDING_DIM for _ in contents]
+
+embeddings.available = lambda: True
+embeddings.embed = embed
+cmd_reindex([
+    "--db", sys.argv[1], "--vec-type", sys.argv[2], "--batch-size", "2", "--yes",
+])
+"""
+
+
+def test_conversion_cli_recovers_when_process_exits_after_first_batch(tmp_path, monkeypatch):
+    memory = _seeded_store(tmp_path, monkeypatch)
+    if not beam_module._vec_available(memory.conn):
+        pytest.skip("sqlite-vec unavailable")
+    path = tmp_path / "m.db"
+    before = _store_state(path)
+    target = "int8" if "float32" in before["vec_episodes"] else "float32"
+    assert memory.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+    memory.conn.close()
+    backup_dir = tmp_path / "backups"
+    proc = subprocess.run(
+        [sys.executable, "-c", _EXIT_DURING_CONVERSION, str(path), target],
+        cwd=_REPO_ROOT,
+        env={**os.environ, "MNEMOSYNE_BACKUP_DIR": str(backup_dir)},
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 73, proc.stderr.decode()
+    assert len(list(backup_dir.rglob("*.gz"))) == 1
+    assert _store_state(path) == before

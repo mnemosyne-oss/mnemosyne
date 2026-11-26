@@ -4716,7 +4716,9 @@ def _invalidate_query_cache_for_conn(conn, operation: str) -> None:
 
 
 def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
-                    dry_run: bool = False, progress=None) -> Dict[str, Any]:
+                    dry_run: bool = False, progress=None,
+                    target_vec_type: Optional[str] = None,
+                    _before_conversion=None) -> Dict[str, Any]:
     """Rebuild every vector representation from source text with the ACTIVE
     embedding model, recreating the sqlite-vec tables at the active dimension.
 
@@ -4743,6 +4745,7 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     (#1075). The transaction's journal/WAL grows with the rewrite, so leave
     disk headroom on a large store.
 
+    ``target_vec_type`` explicitly selects int8 or float32 for every native table.
     ``dry_run`` returns the plan (model, dim, per-store counts) without writing.
     ``batch_size`` must support the integer index protocol (not a bool) and be
     positive, including for dry-run.
@@ -4761,6 +4764,11 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
         raise ValueError("batch_size must be a positive integer")
 
 
+    if target_vec_type is not None and target_vec_type not in ("int8", "float32"):
+        raise ValueError("target_vec_type must be int8 or float32")
+    if target_vec_type is not None and not dry_run and conn.in_transaction:
+        raise ValueError("Vector conversion requires a connection with no pending transaction.")
+
     # Standalone callers may pass a bare sqlite3.connect() connection whose
     # default row_factory yields plain tuples; the row reads below index by
     # column name, so the rebuild runs on a sqlite3.Row connection and the
@@ -4778,8 +4786,9 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
 
     conn.row_factory = sqlite3.Row
     try:
-        return _reindex_vectors_impl(conn, batch_size=batch_size, dry_run=dry_run,
-                                     progress=progress)
+        return _reindex_vectors_impl(conn, batch_size=batch_size, dry_run=dry_run, progress=progress,
+                                     target_vec_type=target_vec_type,
+                                     before_conversion=_before_conversion)
     finally:
         try:
             conn.row_factory = _caller_row_factory
@@ -4787,10 +4796,20 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
             pass
 
 
-def _reindex_vectors_impl(conn, *, batch_size, dry_run, progress):
+_REINDEX_VEC_TABLES = ("vec_episodes", "vec_working", "vec_facts")
+
+
+def _reindex_vectors_impl(conn, *, batch_size, dry_run, progress,
+                          target_vec_type, before_conversion):
     target_dim = int(_embeddings.EMBEDDING_DIM)
-    vec_type = _effective_vec_type(conn)
+    vec_type = target_vec_type or _effective_vec_type(conn)
     vec_ok = _vec_available(conn)
+    if target_vec_type is not None:
+        try:
+            conn.execute("SELECT vec_version()").fetchone()
+        except sqlite3.Error as exc:
+            raise RuntimeError("Vector conversion requires a usable sqlite-vec extension.") from exc
+        vec_ok = True
 
     def _count(tier: str) -> int:
         if dry_run and conn.execute(
@@ -4875,6 +4894,17 @@ def _reindex_vectors_impl(conn, *, batch_size, dry_run, progress):
         "working_memory": wm_total,
         "episodic_memory": ep_total,
     }
+    if target_vec_type is not None:
+        plan["vector_tables"] = {}
+        for table in _REINDEX_VEC_TABLES:
+            row = conn.execute("SELECT sql FROM sqlite_schema WHERE name = ?", (table,)).fetchone()
+            plan["vector_tables"][table] = {
+                "current_type": _vec_type_from_ddl(row) if row else None,
+                "current_dim": _dim_from_ddl(row[0]) if row else None,
+                "current_rows": conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] if row else 0,
+                "target_type": target_vec_type,
+                "target_dim": target_dim,
+            }
     if dry_run:
         plan["dry_run"] = True
         return plan
@@ -4908,6 +4938,13 @@ def _reindex_vectors_impl(conn, *, batch_size, dry_run, progress):
             "and retry. Nothing was changed."
         ) from exc
     try:
+        if target_vec_type is not None:
+            if _vec_table_exists(conn, "vec_facts") and conn.execute(
+                "SELECT 1 FROM vec_facts LIMIT 1"
+            ).fetchone():
+                raise RuntimeError("Cannot convert a populated vec_facts table without a source rebuild.")
+            if before_conversion is not None:
+                before_conversion()
         # 1) Recreate the sqlite-vec tables at the active dimension. vec_facts
         #    has no writer yet but is recreated so its declared dim can't
         #    mismatch a query. The marker is cleared first and re-set on
@@ -4927,7 +4964,7 @@ def _reindex_vectors_impl(conn, *, batch_size, dry_run, progress):
                     "Could not clear the normalized-format marker before rebuild; "
                     "aborting before vec tables are changed."
                 ) from exc
-            for table in ("vec_episodes", "vec_working", "vec_facts"):
+            for table in _REINDEX_VEC_TABLES:
                 conn.execute(f"DROP TABLE IF EXISTS {table}")
                 conn.execute(
                     f"CREATE VIRTUAL TABLE {table} USING vec0(embedding {vec_type}[{target_dim}])"
