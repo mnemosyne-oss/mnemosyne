@@ -17,6 +17,7 @@ import re
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from mnemosyne.core.config import peek_bool
 from mnemosyne.core.user_agent import application_user_agent
 
 # --- Config ------------------------------------------------------------------
@@ -127,11 +128,11 @@ LLM_EXTRA_BODY = _parse_extra_body("MNEMOSYNE_LLM_EXTRA_BODY")
 LLM_FALLBACK_EXTRA_BODY = _parse_extra_body("MNEMOSYNE_LLM_FALLBACK_EXTRA_BODY")
 
 # Host LLM adapter (Hermes or another agent). Disabled by default to preserve
-# existing standalone behavior. When MNEMOSYNE_HOST_LLM_ENABLED=true and a
-# backend is registered via mnemosyne.core.llm_backends.set_host_llm_backend(),
+# existing standalone behavior. When the host opt-in is enabled and a backend
+# is registered via mnemosyne.core.llm_backends.set_host_llm_backend(),
 # the host backend is consulted before the existing remote/local chain.
 # See docs/hermes-llm-integration.md for the full behavior model.
-HOST_LLM_ENABLED = os.environ.get("MNEMOSYNE_HOST_LLM_ENABLED", "false").lower() in ("1", "true", "yes")
+HOST_LLM_ENABLED = peek_bool("host_llm_enabled", False)
 HOST_LLM_PROVIDER = os.environ.get("MNEMOSYNE_HOST_LLM_PROVIDER", "").strip() or None
 HOST_LLM_MODEL = os.environ.get("MNEMOSYNE_HOST_LLM_MODEL", "").strip() or None
 HOST_LLM_TIMEOUT = float(os.environ.get("MNEMOSYNE_HOST_LLM_TIMEOUT", "15"))  # Configurable via env
