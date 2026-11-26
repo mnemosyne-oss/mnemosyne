@@ -6599,13 +6599,14 @@ class BeamMemory:
         """Check for active exact content in working_memory for this session.
         Returns the existing memory_id if found, else None."""
         cursor = self.conn.cursor()
+        now = datetime.now(timezone.utc).isoformat()
         cursor.execute("""
             SELECT id FROM working_memory
             WHERE session_id = ? AND content = ?
               AND superseded_by IS NULL
-              AND (valid_until IS NULL OR julianday(valid_until) > julianday('now'))
+              AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))
             LIMIT 1
-        """, (self.session_id, content))
+        """, (self.session_id, content, now))
         row = cursor.fetchone()
         return row["id"] if row else None
 
