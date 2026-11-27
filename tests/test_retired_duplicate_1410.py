@@ -10,7 +10,9 @@ from mnemosyne.core.beam import BeamMemory
 from mnemosyne.core.memory import Mnemosyne
 
 
-@pytest.mark.parametrize("retirement", ["invalidate", "supersede", "expire"])
+@pytest.mark.parametrize(
+    "retirement", ["invalidate", "supersede", "supersede-no-expiry", "expire"]
+)
 def test_remember_reasserts_retired_content_as_new_active_row(tmp_path, retirement):
     memory = BeamMemory(session_id="s1", db_path=tmp_path / "memory.db")
     content = "Prefers replies in metric units"
@@ -19,14 +21,16 @@ def test_remember_reasserts_retired_content_as_new_active_row(tmp_path, retireme
     assert any(hit["id"] == first for hit in memory.recall("metric units"))
 
     replacement = None
-    if retirement == "supersede":
+    if retirement in ("supersede", "supersede-no-expiry"):
         replacement = memory.remember("Prefers replies in imperial units")
         assert replacement is not None
         assert memory.invalidate(first, replacement_id=replacement)
-        # Keep expiry in the future to isolate the superseded_by filter.
-        future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        # A future expiry or NULL leaves superseded_by as the only exclusion.
+        valid_until = None
+        if retirement == "supersede":
+            valid_until = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
         memory.conn.execute(
-            "UPDATE working_memory SET valid_until = ? WHERE id = ?", (future, first)
+            "UPDATE working_memory SET valid_until = ? WHERE id = ?", (valid_until, first)
         )
         memory.conn.commit()
     elif retirement == "invalidate":
@@ -42,8 +46,8 @@ def test_remember_reasserts_retired_content_as_new_active_row(tmp_path, retireme
         "SELECT valid_until, superseded_by, timestamp, created_at, metadata_json "
         "FROM working_memory WHERE id = ?", (first,)
     ).fetchone()
-    if retirement == "supersede":
-        assert datetime.fromisoformat(old["valid_until"]) > datetime.now(timezone.utc)
+    if replacement is not None:
+        assert old["valid_until"] == valid_until
         assert old["superseded_by"] == replacement
     second = memory.remember(content, importance=0.9)
     rows = memory.conn.execute(
