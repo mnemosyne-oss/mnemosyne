@@ -70,6 +70,38 @@ def test_remember_reasserts_retired_content_as_new_active_row(tmp_path, retireme
     ).fetchone()[0] == 2
 
 
+def test_reassertion_evicts_cached_empty_enhanced_recall(tmp_path, monkeypatch):
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    memory = BeamMemory(session_id="s1", db_path=tmp_path / "memory.db")
+    content = "Prefers replies in metric units"
+
+    def recall():
+        return memory.recall_enhanced(
+            content,
+            top_k=3,
+            use_weibull=False,
+            use_mmr=False,
+            use_intent=False,
+            use_synonyms=False,
+        )
+
+    original = memory.remember(content, importance=0.9)
+    assert original is not None
+    assert memory.invalidate(original)
+
+    assert recall() == []
+    cache = memory._query_cache
+    hits = cache.stats()["hits"]
+    assert recall() == []
+    assert cache.stats()["hits"] == hits + 1
+
+    restored = memory.remember(content, importance=0.9)
+    assert restored not in {None, original}
+    assert [hit["id"] for hit in recall()] == [restored]
+
+
 def test_duplicate_control_and_opt_out(tmp_path):
     memory = BeamMemory(session_id="s1", db_path=tmp_path / "memory.db")
     content = "Prefers replies in metric units"
