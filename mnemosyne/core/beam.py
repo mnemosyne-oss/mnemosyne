@@ -14188,6 +14188,9 @@ class BeamMemory:
         """, (cutoff, selection_time.isoformat(), _orphan_cutoff()))
         session_rows = cursor.fetchall()
         if not session_rows:
+            maintenance = self._run_sleep_maintenance(dry_run)
+            if not dry_run:
+                self._deduplicate_memoria_cross_session()
             return self._attach_fleet_conflict_census({
                 "status": "no_op",
                 "message": "No old working memories to consolidate",
@@ -14202,7 +14205,7 @@ class BeamMemory:
                 "errors": 0,
                 "model_refresh": {"proposals": 0, "applied": 0},
                 "session_results": [],
-                **self._run_sleep_maintenance(dry_run),
+                **maintenance,
             })
 
         session_results = []
