@@ -8,11 +8,9 @@ costs seconds on a multi-thousand-row bank even when nothing needs inserting.
 The materialized ``NOT IN (SELECT rowid FROM vec_working)`` form returns the
 same rows in milliseconds.
 
-These tests pin the functional contract of that rewrite: the same gap is found,
-a vector already stored in ``vec_working`` keeps its exact bytes (the backfill
-only inserts, it never rewrites), an orphan vector row neither suppresses a
-missing row nor gets deleted, an empty vector table is filled completely, and
-repeated runs are no-ops.
+These tests check the SQL shape for both gap lookups and the functional contract
+of the rewrite. Backfill preserves existing vectors and orphans, fills the gap
+only for working rows with compatibility embeddings, and is idempotent.
 """
 
 from datetime import datetime
@@ -45,8 +43,8 @@ def _unit_embedding(axis: int = 0):
     return np.array(vector, dtype=np.float32)
 
 
-def _insert_working(beam, memory_id, embedding):
-    """Insert one working memory plus its fallback embedding row; return its rowid."""
+def _insert_working(beam, memory_id, embedding=None):
+    """Insert a working row with an optional fallback embedding and return its rowid."""
     beam.conn.execute(
         """
         INSERT INTO working_memory
@@ -56,10 +54,11 @@ def _insert_working(beam, memory_id, embedding):
         (memory_id, f"content {memory_id}", "test", datetime.now().isoformat(),
          "vec-backfill-scan", "session", 0.5),
     )
-    beam.conn.execute(
-        "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
-        (memory_id, beam_module._embeddings.serialize(embedding), "test"),
-    )
+    if embedding is not None:
+        beam.conn.execute(
+            "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+            (memory_id, beam_module._embeddings.serialize(embedding), "test"),
+        )
     beam.conn.commit()
     row = beam.conn.execute(
         "SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)
@@ -86,6 +85,62 @@ def _expected_stored_vector(conn, unit_vector):
         return unit_vector.tobytes()
     encoded = beam_module._embeddings.serialize(unit_vector)
     return conn.execute(query, (encoded,)).fetchone()[0]
+
+
+@pytest.mark.parametrize(
+    "lookup_gap",
+    (
+        beam_module._backfill_vec_working_from_memory_embeddings,
+        beam_module.vec_working_coverage,
+    ),
+    ids=("backfill", "coverage"),
+)
+def test_gap_query_uses_uncorrelated_vector_rowid_subquery(temp_db, lookup_gap):
+    beam = BeamMemory(session_id="vec-backfill-sql", db_path=temp_db)
+    _require_vec_working(beam.conn)
+    _insert_working(beam, "needs-backfill", _unit_embedding())
+
+    statements = []
+    beam.conn.set_trace_callback(statements.append)
+    try:
+        lookup_gap(beam.conn)
+    finally:
+        beam.conn.set_trace_callback(None)
+
+    selects = [" ".join(sql.lower().split()) for sql in statements]
+    gap_queries = [
+        sql for sql in selects
+        if sql.startswith("select ")
+        and all(table in sql for table in ("working_memory", "memory_embeddings", "vec_working"))
+    ]
+    assert len(gap_queries) == 1, statements
+    (gap_query,) = gap_queries
+    # Guard against repeated vec0 scans without relying on SQLite's plan labels.
+    assert "not in (select rowid from vec_working)" in gap_query
+    assert " join vec_working " not in gap_query
+
+
+def test_backfill_and_coverage_skip_working_rows_without_fallback_embeddings(temp_db):
+    beam = BeamMemory(session_id="vec-backfill-no-embedding", db_path=temp_db)
+    _require_vec_working(beam.conn)
+    unembedded_rowid = _insert_working(beam, "no-embedding")
+    vector = _unit_embedding()
+    embedded_rowid = _insert_working(beam, "needs-backfill", vector)
+
+    before = beam_module.vec_working_coverage(beam.conn)
+    assert before["working_memory_rows"] == 2
+    assert before["working_embedding_rows"] == 1
+    assert before["missing_vec_working_rows"] == 1
+
+    assert beam_module._backfill_vec_working_from_memory_embeddings(beam.conn) == 1
+    beam.conn.commit()
+    assert _stored_vector(beam.conn, unembedded_rowid) is None
+    assert _stored_vector(beam.conn, embedded_rowid) == _expected_stored_vector(beam.conn, vector)
+
+    after = beam_module.vec_working_coverage(beam.conn)
+    assert after["vec_working_rows"] == 1
+    assert after["missing_vec_working_rows"] == 0
+    assert after["status"] == "complete"
 
 
 def test_backfill_preserves_stored_bytes_and_keeps_orphans(temp_db):
