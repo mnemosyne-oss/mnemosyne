@@ -177,8 +177,10 @@ def discover_banks(root: Path) -> List[Path]:
         return candidates
     resolved_root = root.resolve()
     root_is_snapshot_tree = resolved_root.name == "state-snapshots"
-    root_is_profiles = resolved_root.name == "profiles" and resolved_root.parent.name != "profiles"
-    root_is_archive_parent = not root_is_profiles and resolved_root.name != "banks"
+    # A profile can itself be named "profiles" or "banks".
+    root_is_profile = resolved_root.parent.name == "profiles"
+    root_is_profiles = resolved_root.name == "profiles" and not root_is_profile
+    root_is_archive_parent = root_is_profile or resolved_root.name not in {"profiles", "banks"}
     for dirpath, dirnames, filenames in os.walk(root):
         relative_parts = Path(dirpath).relative_to(root).parts
         in_snapshot_tree = root_is_snapshot_tree or "state-snapshots" in relative_parts

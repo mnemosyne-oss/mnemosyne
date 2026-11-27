@@ -656,6 +656,19 @@ class TestReadOnly:
 
         assert [Path(bank["path"]) for bank in report["banks"]] == [live]
 
+    def test_census_skips_backup_at_root_of_profile_named_banks(self, fleet_env):
+        profile = fleet_env / "profiles" / "banks"
+        live = _make_bank(
+            profile / "mnemosyne" / "data" / "banks" / "backup" / "mnemosyne.db",
+            [_TWIN + (None,)],
+        )
+        _make_bank(profile / "backup" / "snapshot" / "mnemosyne.db", [_TWIN + (None,)])
+
+        report = fleet_census.census(root=profile)
+
+        assert [Path(bank["path"]) for bank in report["banks"]] == [live]
+        assert report["home_home_twin_count"] == 0
+
     def test_census_reads_committed_wal_content_with_an_open_writer(self, fleet_env):
         bank = _make_bank(fleet_env / "active" / "mnemosyne.db", [])
         with closing(sqlite3.connect(bank)) as writer:
