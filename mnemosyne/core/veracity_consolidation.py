@@ -1027,9 +1027,55 @@ class VeracityConsolidator:
         
         return conflicts
     
+    @staticmethod
+    def _stored_fact_sources(raw_sources):
+        try:
+            return json.loads(raw_sources or "[]")
+        except (TypeError, ValueError):
+            # Legacy or damaged provenance is insufficient to retire a fact.
+            return []
+
+    def _retired_only_fact_ids(self, sources_by_fact):
+        """Use one source rule for retrieval, conflict selection, and repair."""
+        source_ids = {
+            source
+            for sources in sources_by_fact.values() if isinstance(sources, list)
+            for source in sources if isinstance(source, str) and source
+        }
+        if not source_ids:
+            return set()
+
+        from mnemosyne.core.beam import _select_recall_rows_by_ids, _working_recall_eligibility_sql
+
+        source_eligible = _working_recall_eligibility_sql(self.conn, exclude_superseded=False)
+        if source_eligible == "1":
+            return set()
+        retired_sources = {
+            row[0] for row in _select_recall_rows_by_ids(
+                self.conn,
+                "SELECT id FROM working_memory WHERE id IN ({placeholders}) "
+                f"AND NOT ({source_eligible})",
+                source_ids,
+            )
+        }
+        return {
+            fact_id for fact_id, sources in sources_by_fact.items()
+            if isinstance(sources, list) and sources
+            and all(isinstance(source, str) and source in retired_sources for source in sources)
+        }
+
+    def _eligible_consolidated_rows(self, rows):
+        sources = {row["id"]: self._stored_fact_sources(row["sources_json"]) for row in rows}
+        retired = self._retired_only_fact_ids(sources)
+        return [(row, sources[row["id"]]) for row in rows if row["id"] not in retired]
+
     def get_consolidated_facts(self, subject: str = None, min_confidence: float = 0.5) -> List[ConsolidatedFact]:
         """
         Get consolidated facts, optionally filtered by subject and confidence.
+
+        A fact remains visible unless every recorded source is a known
+        retired model-refresh proposal. Unattributed and legacy sources
+        retain their existing behavior.
         
         Args:
             subject: Filter by subject
@@ -1038,23 +1084,29 @@ class VeracityConsolidator:
         Returns:
             List of ConsolidatedFact
         """
-        cursor = self.conn.cursor()
-        
-        if subject:
-            cursor.execute("""
-                SELECT * FROM consolidated_facts
-                WHERE subject = ? AND confidence >= ? AND superseded_by IS NULL
-                ORDER BY confidence DESC, mention_count DESC
-            """, (subject, min_confidence))
-        else:
-            cursor.execute("""
-                SELECT * FROM consolidated_facts
-                WHERE confidence >= ? AND superseded_by IS NULL
-                ORDER BY confidence DESC, mention_count DESC
-            """, (min_confidence,))
-        
+        from mnemosyne.core.beam import _guarded_transaction
+
+        # Both reads must see the same snapshot. Respect an existing caller
+        # transaction and acquire no writer lock for standalone reads.
+        with self._write_lock:
+            conn = self.conn
+            owns_snapshot = not conn.in_transaction
+            transaction = _guarded_transaction(conn) if owns_snapshot else contextlib.nullcontext()
+            with transaction:
+                if owns_snapshot:
+                    conn.execute("BEGIN")
+                params = (subject, min_confidence) if subject else (min_confidence,)
+                subject_filter = "subject = ? AND " if subject else ""
+                rows = conn.execute(
+                    f"SELECT * FROM consolidated_facts WHERE {subject_filter}"
+                    "confidence >= ? AND superseded_by IS NULL "
+                    "ORDER BY confidence DESC, mention_count DESC",
+                    params,
+                ).fetchall()
+                eligible_rows = self._eligible_consolidated_rows(rows)
+
         facts = []
-        for row in cursor.fetchall():
+        for row, sources in eligible_rows:
             facts.append(ConsolidatedFact(
                 subject=row["subject"],
                 predicate=row["predicate"],
@@ -1063,7 +1115,7 @@ class VeracityConsolidator:
                 mention_count=row["mention_count"],
                 first_seen=row["first_seen"],
                 last_seen=row["last_seen"],
-                sources=json.loads(row["sources_json"] or "[]"),
+                sources=sources,
                 veracity=row["veracity"],
                 superseded=row["superseded_by"] is not None,
                 # Preserve the stored id (pre-fix legacy or post-fix
@@ -1074,7 +1126,7 @@ class VeracityConsolidator:
             ))
         
         return facts
-    
+
     def get_high_confidence_summary(self, subject: str, threshold: float = 0.8) -> str:
         """
         Generate a summary of high-confidence facts about a subject.
@@ -1098,9 +1150,72 @@ class VeracityConsolidator:
         
         return "\n".join(lines)
     
+    def _repair_retired_winner_links(self, cursor, deadline):
+        """Restore eligible facts whose successor chain ends in retired-only evidence.
+
+        Follow same-slot links back from a retired-only terminal winner.
+        Restore the first eligible predecessor on each branch so earlier links
+        can still point to that fact. Leave valid or indeterminate chains alone.
+        """
+        links = cursor.execute("""
+            SELECT loser.id AS loser_id, loser.sources_json AS loser_sources,
+                   winner.id AS winner_id, winner.sources_json AS winner_sources,
+                   winner.superseded_by AS winner_successor
+            FROM consolidated_facts loser
+            JOIN consolidated_facts winner ON winner.id = loser.superseded_by
+            WHERE loser.subject = winner.subject AND loser.predicate = winner.predicate
+              AND loser.object != winner.object
+        """).fetchall()
+        sources = {}
+        for link in links:
+            for side in ("loser", "winner"):
+                fact_id = link[f"{side}_id"]
+                if fact_id not in sources:
+                    sources[fact_id] = self._stored_fact_sources(link[f"{side}_sources"])
+        retired = self._retired_only_fact_ids(sources)
+        predecessors = {}
+        terminal_winners = set()
+        for link in links:
+            winner_id = link["winner_id"]
+            if winner_id in retired:
+                predecessors.setdefault(winner_id, []).append(link["loser_id"])
+                if link["winner_successor"] is None:
+                    terminal_winners.add(winner_id)
+
+        pending = list(terminal_winners)
+        while pending:
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            winner_id = pending.pop()
+            for loser_id in predecessors.get(winner_id, ()):
+                if deadline is not None and time.monotonic() >= deadline:
+                    return
+                if loser_id in retired:
+                    pending.append(loser_id)
+                    continue
+                self._restore_consolidated_fact(cursor, loser_id, winner_id)
+
+    @staticmethod
+    def _restore_consolidated_fact(cursor, loser_id, winner_id):
+        cursor.execute("""
+            UPDATE consolidated_facts SET superseded_by = NULL, updated_at = ?
+            WHERE id = ? AND superseded_by = ?
+        """, (datetime.now().isoformat(), loser_id, winner_id))
+        # Only undo the matching ledger decision. An unrelated resolution
+        # for this pair remains exactly as recorded.
+        cursor.execute("""
+            UPDATE conflicts SET resolution = NULL, resolved_at = NULL
+            WHERE resolution = ?
+              AND min(fact_a_id, fact_b_id) = min(?, ?)
+              AND max(fact_a_id, fact_b_id) = max(?, ?)
+        """, (f"superseded_by_{winner_id}", loser_id, winner_id, loser_id, winner_id))
+
     def run_consolidation_pass(self, pair_budget=None, time_budget_s=None):
         """
         Background consolidation pass.
+
+        Repair eligible facts hidden by a retired-only winner before choosing
+        new conflicts. Repairs do not count as resolutions.
 
         1. Find facts with multiple mentions
         2. Boost confidence
@@ -1140,6 +1255,8 @@ class VeracityConsolidator:
         resolved = 0
         with self._serialized_write():
             cursor = self.conn.cursor()
+            if deadline is None or time.monotonic() < deadline:
+                self._repair_retired_winner_links(cursor, deadline)
 
             # Find facts ready for consolidation (mention_count > 2)
             cursor.execute(
@@ -1153,9 +1270,9 @@ class VeracityConsolidator:
             # Materialize the row list before iterating + writing --
             # mixing fetch with writes on the same cursor can confuse
             # the iteration state under some sqlite3 builds.
-            primary_rows = cursor.fetchall()
+            primary_rows = self._eligible_consolidated_rows(cursor.fetchall())
 
-            for row in primary_rows:
+            for row, _ in primary_rows:
                 if pair_budget is not None and resolved >= pair_budget:
                     break
                 if deadline is not None and time.monotonic() >= deadline:
@@ -1174,8 +1291,8 @@ class VeracityConsolidator:
                     (subject, predicate, row["object"]),
                 )
 
-                conflicts = cursor.fetchall()
-                for conflict in conflicts:
+                conflicts = self._eligible_consolidated_rows(cursor.fetchall())
+                for conflict, _ in conflicts:
                     if pair_budget is not None and resolved >= pair_budget:
                         break
                     if deadline is not None and time.monotonic() >= deadline:

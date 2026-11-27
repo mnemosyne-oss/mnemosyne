@@ -243,7 +243,6 @@ def proposal_to_memory_content(proposal: Dict[str, Any]) -> str:
 
 PROPOSAL_SOURCE = "sleep_model_refresh_proposal"
 
-
 def auto_apply_enabled() -> bool:
     """Whether sleep may apply validated proposals immediately.
 
@@ -333,20 +332,41 @@ def _proposal_row(beam, proposal_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
 
 
-def _load_metadata(row: Dict[str, Any]) -> Dict[str, Any]:
+def _parse_metadata(raw: Any) -> Dict[str, Any]:
     try:
-        metadata = json.loads(row.get("metadata_json") or "{}")
+        metadata = json.loads(raw or "{}")
     except Exception:
         metadata = {}
     return metadata if isinstance(metadata, dict) else {}
 
 
+def _load_metadata(row: Dict[str, Any]) -> Dict[str, Any]:
+    return _parse_metadata(row.get("metadata_json"))
+
+
+def _is_resolved_proposal_metadata(raw: Any) -> bool:
+    return _parse_metadata(raw).get("status") in ("applied", "rejected")
+
+
 def _save_metadata(beam, proposal_id: str, metadata: Dict[str, Any]) -> None:
+    """Persist an outcome inside the caller's serialized resolution."""
     beam.conn.execute(
-        "UPDATE working_memory SET metadata_json = ? WHERE id = ?",
-        (json.dumps(metadata, sort_keys=True), proposal_id),
+        "UPDATE working_memory SET metadata_json = ? WHERE id = ? AND source = ?",
+        (json.dumps(metadata, sort_keys=True), proposal_id, PROPOSAL_SOURCE),
     )
-    beam.conn.commit()
+
+
+def _invalidate_resolved_proposal_cache(beam) -> None:
+    from mnemosyne.core.beam import _BeamConnection
+
+    invalidate = getattr(beam, "_invalidate_query_cache_after_commit", None)
+    if not callable(invalidate):
+        return
+    conn = beam.conn
+    if isinstance(conn, _BeamConnection) and conn.in_transaction:
+        conn._after_commit_hooks.append(lambda: invalidate("model_refresh"))
+    else:
+        invalidate("model_refresh")
 
 
 def list_model_refresh_proposals(
@@ -381,39 +401,48 @@ def apply_model_refresh_proposal(
     validator: str = "",
     auto_applied: bool = False,
 ) -> Dict[str, Any]:
-    """Apply one pending proposal to CanonicalStore and mark it applied."""
+    """Apply a pending proposal and report whether this call made the transition."""
 
-    row = _proposal_row(beam, proposal_id)
-    if row is None:
-        raise ValueError(f"model refresh proposal not found: {proposal_id}")
-    metadata = _load_metadata(row)
-    if metadata.get("status", "pending") != "pending":
-        return {"status": metadata.get("status"), "proposal_id": proposal_id, "metadata": metadata}
-    if metadata.get("action", "update") != "update":
-        raise ValueError("only update proposals can be applied")
-    for key in ("category", "name", "body"):
-        if not str(metadata.get(key) or "").strip():
-            raise ValueError(f"proposal metadata missing {key}")
-
+    from mnemosyne.core.beam import _write_locked_transaction
     from mnemosyne.core.canonical import CanonicalStore
 
-    store = CanonicalStore(db_path=beam.db_path, conn=beam.conn)
-    canonical = store.remember(
-        owner_id,
-        metadata["category"],
-        metadata["name"],
-        metadata["body"],
-        source="sleep_model_refresh",
-        confidence=coerce_confidence(metadata.get("confidence"), 0.5),
-        _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
-    )
-    metadata["status"] = "applied"
-    metadata["applied_by"] = validator or "system"
-    metadata["applied_owner_id"] = owner_id
-    metadata["canonical_id"] = canonical.get("id")
-    metadata["auto_applied"] = bool(auto_applied)
-    _save_metadata(beam, proposal_id, metadata)
-    return {"status": "applied", "proposal_id": proposal_id, "canonical": canonical, "metadata": metadata}
+    with _write_locked_transaction(beam.conn):
+        row = _proposal_row(beam, proposal_id)
+        if row is None:
+            raise ValueError(f"model refresh proposal not found: {proposal_id}")
+        metadata = _load_metadata(row)
+        status = metadata.get("status", "pending")
+        if status != "pending":
+            return {"status": status, "applied_now": False, "proposal_id": proposal_id, "metadata": metadata}
+        if metadata.get("action", "update") != "update":
+            raise ValueError("only update proposals can be applied")
+        for key in ("category", "name", "body"):
+            if not str(metadata.get(key) or "").strip():
+                raise ValueError(f"proposal metadata missing {key}")
+
+        store = CanonicalStore(db_path=beam.db_path, conn=beam.conn)
+        canonical = store.remember(
+            owner_id,
+            metadata["category"],
+            metadata["name"],
+            metadata["body"],
+            source="sleep_model_refresh",
+            confidence=coerce_confidence(metadata.get("confidence"), 0.5),
+            _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
+        )
+        if canonical is None:
+            return {"status": "pending", "applied_now": False, "proposal_id": proposal_id, "metadata": metadata}
+        metadata["status"] = "applied"
+        metadata["applied_by"] = validator or "system"
+        metadata["applied_owner_id"] = owner_id
+        metadata["canonical_id"] = canonical["id"]
+        metadata["auto_applied"] = bool(auto_applied)
+        _save_metadata(beam, proposal_id, metadata)
+    _invalidate_resolved_proposal_cache(beam)
+    return {
+        "status": "applied", "applied_now": True, "proposal_id": proposal_id,
+        "canonical": canonical, "metadata": metadata,
+    }
 
 
 def reject_model_refresh_proposal(
@@ -424,15 +453,21 @@ def reject_model_refresh_proposal(
     validator: str = "",
 ) -> Dict[str, Any]:
     """Reject one pending proposal without touching canonical facts."""
+    from mnemosyne.core.beam import _write_locked_transaction
 
-    row = _proposal_row(beam, proposal_id)
-    if row is None:
-        raise ValueError(f"model refresh proposal not found: {proposal_id}")
-    metadata = _load_metadata(row)
-    metadata["status"] = "rejected"
-    metadata["rejected_by"] = validator or "system"
-    metadata["rejection_reason"] = reason
-    _save_metadata(beam, proposal_id, metadata)
+    with _write_locked_transaction(beam.conn):
+        row = _proposal_row(beam, proposal_id)
+        if row is None:
+            raise ValueError(f"model refresh proposal not found: {proposal_id}")
+        metadata = _load_metadata(row)
+        status = metadata.get("status", "pending")
+        if status != "pending":
+            return {"status": status, "proposal_id": proposal_id, "metadata": metadata}
+        metadata["status"] = "rejected"
+        metadata["rejected_by"] = validator or "system"
+        metadata["rejection_reason"] = reason
+        _save_metadata(beam, proposal_id, metadata)
+    _invalidate_resolved_proposal_cache(beam)
     return {"status": "rejected", "proposal_id": proposal_id, "metadata": metadata}
 
 
@@ -516,11 +551,11 @@ def maybe_auto_apply_model_refresh_proposal(
             )
             return False
 
-    apply_model_refresh_proposal(
+    result = apply_model_refresh_proposal(
         beam,
         proposal_id,
         owner_id=owner_id,
         validator="sleep_model_refresh_auto_apply",
         auto_applied=True,
     )
-    return True
+    return result["applied_now"]
