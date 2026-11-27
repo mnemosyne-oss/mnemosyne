@@ -177,8 +177,11 @@ def discover_banks(root: Path) -> List[Path]:
         return candidates
     resolved_root = root.resolve()
     root_is_snapshot_tree = resolved_root.name == "state-snapshots"
-    # A profile can itself be named "profiles" or "banks".
-    root_is_profile = resolved_root.parent.name == "profiles"
+    # A profiles directory under another profiles directory can be a
+    # profile home or a collection. A home has its own Mnemosyne data.
+    root_is_profile = resolved_root.parent.name == "profiles" and (
+        resolved_root.name != "profiles" or (resolved_root / "mnemosyne" / "data").is_dir()
+    )
     root_is_profiles = resolved_root.name == "profiles" and not root_is_profile
     root_is_archive_parent = root_is_profile or resolved_root.name not in {"profiles", "banks"}
     for dirpath, dirnames, filenames in os.walk(root):
