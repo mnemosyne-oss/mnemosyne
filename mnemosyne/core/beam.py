@@ -108,10 +108,13 @@ def _claim_completed_sql(alias: str) -> str:
     )
 
 
-# Rows sleep() may take: never-consolidated rows, plus rows whose claim is
-# stale and has no summary completing it. One bind parameter: the orphan cutoff.
+# Active rows that were never consolidated or have an unfinished stale claim.
+# Bind the selection time first and the orphan cutoff second. Filter before
+# batching so expired rows never enter a summary or consume a batch slot.
 _SLEEP_ELIGIBLE_SQL = (
-    "(consolidated_at IS NULL OR ("
+    "superseded_by IS NULL "
+    "AND (valid_until IS NULL OR julianday(valid_until) > julianday(?)) "
+    "AND (consolidated_at IS NULL OR ("
     "consolidation_claimed_at IS NOT NULL AND consolidation_claimed_at < ? "
     f"AND NOT {_claim_completed_sql('working_memory')}))"
 )
@@ -136,6 +139,10 @@ def _select_recall_rows_by_ids(conn, sql, ids, params=(), *, key="id"):
 
 class MemoryTransactionStateError(RuntimeError):
     """An event-emitting write cannot be ordered after its caller's commit."""
+
+
+class MemoryIdConflictError(sqlite3.IntegrityError):
+    """A new working-memory row cannot reuse an occupied ID."""
 
 
 def _event_date_valid(value: str) -> bool:
@@ -6708,7 +6715,8 @@ class BeamMemory:
             metadata: Optional dict of additional fields
             valid_until: ISO timestamp when this memory expires
             scope: "session" or "global"
-            memory_id: Optional pre-generated ID from legacy layer
+            memory_id: Optional ID for a new row. An occupied ID raises
+                MemoryIdConflictError when a new row is required.
             extract_entities: If True, extract and store entity mentions as triples
             extract: If True, extract structured facts from content using LLM
                 and store as triples. Default False.
@@ -6867,9 +6875,12 @@ class BeamMemory:
                     (id, content, source, timestamp, session_id, importance, metadata_json, valid_until, scope,
                      author_id, author_type, channel_id, veracity, memory_type, trust_tier)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO NOTHING
                 """, (memory_id, content, source, timestamp, self.session_id, importance,
                       json.dumps(metadata or {}), valid_until, scope,
                       _write_author_id, _write_author_type, self.channel_id, veracity, memory_type, trust_tier))
+                if cursor.rowcount == 0:
+                    raise MemoryIdConflictError("Working-memory ID is already in use")
 
         if existing_id:
             # Cache failures must not turn a committed dedup update into a retry.
@@ -8201,7 +8212,7 @@ class BeamMemory:
             f"AND {_SLEEP_ELIGIBLE_SQL} "
             f"AND (pinned IS NULL OR pinned = 0) "
             f"AND COALESCE(session_id, 'default') = ?",
-            (cutoff, _orphan_cutoff(), self.session_id),
+            (cutoff, datetime.now(timezone.utc).isoformat(), _orphan_cutoff(), self.session_id),
         )
         return cursor.fetchone()[0]
 
@@ -13494,9 +13505,9 @@ class BeamMemory:
 
         sleep_write_policy = None
         cursor = self.conn.cursor()
+        selection_time = datetime.now(timezone.utc)
         _cutoff_raw = (
-            datetime.now(timezone.utc)
-            - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
+            selection_time - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
         ).isoformat()
         if force:
             # Skip age cutoff: consolidate all non-consolidated working memories
@@ -13540,10 +13551,9 @@ class BeamMemory:
               AND {_SQL_PLACEABLE_TS}
               AND {_SLEEP_ELIGIBLE_SQL}
               AND (pinned IS NULL OR pinned = 0)
-              AND superseded_by IS NULL
             ORDER BY {_SQL_CHRONO_TS} ASC
             LIMIT {SLEEP_BATCH_SIZE}
-        """, (self.session_id, cutoff, _orphan_cutoff()))
+        """, (self.session_id, cutoff, selection_time.isoformat(), _orphan_cutoff()))
         rows = cursor.fetchall()
         # Skip rows whose timestamp cannot actually be placed on the
         # timeline (round-6 F3a): consolidating an all-bad group stamped
@@ -14155,9 +14165,9 @@ class BeamMemory:
         # same pass, so there is no window between "released" and "summarized".
         reclaimed_orphans = 0
         cursor = self.conn.cursor()
+        selection_time = datetime.now(timezone.utc)
         _cutoff_raw = (
-            datetime.now(timezone.utc)
-            - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
+            selection_time - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
         ).isoformat()
         if force:
             _cutoff_raw = datetime.max.isoformat()
@@ -14173,7 +14183,7 @@ class BeamMemory:
               AND (pinned IS NULL OR pinned = 0)
             GROUP BY session_id
             ORDER BY MIN({_SQL_CHRONO_TS}) ASC
-        """, (cutoff, _orphan_cutoff()))
+        """, (cutoff, selection_time.isoformat(), _orphan_cutoff()))
         session_rows = cursor.fetchall()
         if not session_rows:
             return self._attach_fleet_conflict_census({

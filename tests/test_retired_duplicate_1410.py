@@ -106,6 +106,83 @@ def test_reassertion_evicts_cached_empty_enhanced_recall(tmp_path, monkeypatch):
     assert [hit["id"] for hit in recall()] == [restored]
 
 
+@pytest.mark.parametrize("all_sessions", [False, True], ids=["session", "all-sessions"])
+@pytest.mark.parametrize("case", ["reasserted", "expired-only", "future-expiry"])
+def test_sleep_summarizes_only_active_working_rows(tmp_path, monkeypatch, all_sessions, case):
+    """Expired inputs stay out of summaries and do not hide live sources."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+    clock = datetime(2030, 6, 15, 12, tzinfo=timezone.utc)
+
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock.replace(tzinfo=None) if tz is None else clock.astimezone(tz)
+
+    monkeypatch.setattr(beam_module, "datetime", FixedClock)
+    memory = Mnemosyne(session_id="s1", db_path=tmp_path / "memory.db")
+    active_text = "observatory relay insulation policy"
+    retired_text = active_text if case == "reasserted" else "retired cedar packing"
+    retired = memory.remember(retired_text, source="notes")
+    assert retired is not None and memory.invalidate(retired)
+
+    # Advance the clock so a reassertion can generate a distinct ID.
+    clock += timedelta(seconds=1)
+    active_ids = []
+    expiry = None
+    if case != "expired-only":
+        active_ids.append(memory.remember(active_text, source="notes"))
+    if case == "future-expiry":
+        expiry = clock + timedelta(hours=1)
+        offset_expiry = expiry.astimezone(timezone(timedelta(hours=-7))).isoformat()
+        active_ids.append(memory.remember(
+            "copper relay housing inspection", source="notes", valid_until=offset_expiry
+        ))
+        # An expired oldest row must not consume a slot before the LIMIT.
+        monkeypatch.setattr(beam_module, "SLEEP_BATCH_SIZE", len(active_ids))
+    assert None not in active_ids and retired not in active_ids
+
+    backlog = memory.beam._count_unconsolidated_before("9999-12-31 00:00:00")
+    if all_sessions:
+        result = memory.beam.sleep_all_sessions(force=True)
+    else:
+        result = memory.sleep(force=True)
+
+    summaries = memory.beam.conn.execute(
+        "SELECT id, summary_of, valid_until, content FROM episodic_memory "
+        "WHERE source = 'sleep_consolidation'"
+    ).fetchall()
+    assert backlog == len(active_ids)
+    assert result.get("items_consolidated", 0) == len(active_ids)
+    if all_sessions:
+        assert result["sessions_scanned"] == int(bool(active_ids))
+    retired_after = memory.beam.conn.execute(
+        "SELECT valid_until, consolidated_at FROM working_memory WHERE id = ?", (retired,)
+    ).fetchone()
+    assert retired_after is not None and retired_after["consolidated_at"] is None
+    assert datetime.fromisoformat(retired_after["valid_until"]) < clock
+
+    if not active_ids:
+        assert result["status"] == "no_op"
+        assert summaries == []
+        assert memory.recall(retired_text) == []
+        return
+
+    (summary,) = summaries
+    assert set(summary["summary_of"].split(",")) == set(active_ids)
+    assert "retired cedar" not in summary["content"]
+    if expiry is None:
+        assert summary["valid_until"] is None
+    else:
+        assert datetime.fromisoformat(summary["valid_until"]) == expiry
+    recalled_ids = {hit["id"] for hit in memory.recall(active_text, top_k=10)}
+    assert active_ids[0] in recalled_ids
+    assert retired not in recalled_ids
+    summarized_hits = memory.recall(active_text, top_k=10, source="sleep_consolidation")
+    assert summary["id"] in {hit["id"] for hit in summarized_hits}
+
+
 def test_duplicate_control_and_opt_out(tmp_path):
     memory = BeamMemory(session_id="s1", db_path=tmp_path / "memory.db")
     content = "Prefers replies in metric units"
@@ -129,6 +206,25 @@ def test_caller_provided_id_used_for_reassertion(tmp_path):
     assert memory.conn.execute(
         "SELECT superseded_by FROM working_memory WHERE id = ?", ("new-external-id",)
     ).fetchone()[0] is None
+
+
+@pytest.mark.parametrize("superseded", [False, True], ids=["expired", "superseded"])
+def test_reassertion_reports_occupied_explicit_id(tmp_path, superseded):
+    memory = BeamMemory(session_id="s1", db_path=tmp_path / "memory.db")
+    content = "Prefers replies in metric units"
+    retired = memory.remember(content, memory_id="caller-supplied")
+    assert retired == "caller-supplied"
+    replacement = memory.remember("Prefers replies in imperial units") if superseded else None
+    if superseded:
+        assert replacement is not None
+    assert memory.invalidate(retired, replacement_id=replacement)
+    read_retired = "SELECT * FROM working_memory WHERE id = ?"
+    before = tuple(memory.conn.execute(read_retired, (retired,)).fetchone())
+
+    with pytest.raises(beam_module.MemoryIdConflictError):
+        memory.remember(content, memory_id=retired)
+    assert tuple(memory.conn.execute(read_retired, (retired,)).fetchone()) == before
+    assert memory.remember(content, memory_id="unused-id") == "unused-id"
 
 
 def test_future_expiration_remains_eligible_for_deduplication(tmp_path):

@@ -33,6 +33,7 @@ except ImportError:
 
 from mnemosyne.core.beam import (
     BeamMemory,
+    MemoryIdConflictError,
     _cross_session_enabled,
     _guarded_transaction,
     _session_scope_filter,
@@ -504,15 +505,18 @@ def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
     stable_id = "sf_" + content_hash
     meta = dict(metadata)
     meta.update({"shared_memory": True, "surface_kind": kind, "write_path": "mcp_tool"})
-    memory_id = surface_beam.remember(
-        content=surface_content,
-        source="surface_manual",
-        importance=importance,
-        metadata=meta,
-        scope="global",
-        memory_id=stable_id,
-        _write_policy_content=content,
-    )
+    try:
+        memory_id = surface_beam.remember(
+            content=surface_content,
+            source="surface_manual",
+            importance=importance,
+            metadata=meta,
+            scope="global",
+            memory_id=stable_id,
+            _write_policy_content=content,
+        )
+    except MemoryIdConflictError:
+        return {"error": "memory_id_conflict", "memory_id": stable_id}
 
     if memory_id is None:
         return {"status": "filtered_shared", "kind": kind}
