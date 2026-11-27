@@ -31,8 +31,9 @@ from mnemosyne.core.beam import (
 )
 
 
-def test_config_enabled_polyphonic_recall_applies_temporal_boost(tmp_path, monkeypatch):
-    """Exercise the YAML gate and temporal scoring through public Recall."""
+@pytest.fixture
+def config_enabled_polyphonic_memory(tmp_path, monkeypatch):
+    """Seed two vector matches that swap rank when temporal scoring applies."""
     import json
 
     from mnemosyne.core import embeddings
@@ -70,6 +71,12 @@ def test_config_enabled_polyphonic_recall_applies_temporal_boost(tmp_path, monke
     memory.conn.commit()
     monkeypatch.setattr(embeddings, "available", lambda: True)
     monkeypatch.setattr(embeddings, "embed_query", lambda _query: vector(1, 1))
+    return memory, query_time, old, recent
+
+
+def test_config_enabled_polyphonic_recall_applies_temporal_boost(config_enabled_polyphonic_memory):
+    """Exercise the YAML gate and temporal scoring through public Recall."""
+    memory, query_time, old, recent = config_enabled_polyphonic_memory
 
     def recall(weight):
         results = memory.recall(
@@ -81,6 +88,50 @@ def test_config_enabled_polyphonic_recall_applies_temporal_boost(tmp_path, monke
 
     assert recall(0.0) == [old, recent]
     assert recall(0.5) == [recent, old]
+
+
+def test_polyphonic_temporal_cache_upgrade(config_enabled_polyphonic_memory, monkeypatch):
+    """The upgraded engine must recompute an unboosted generation-22 cache entry."""
+    memory, query_time, old, recent = config_enabled_polyphonic_memory
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    recall = memory.recall
+
+    def recall_without_temporal_boost(query, **kwargs):
+        # Leave the requested weight in the cache key, as the old engine did.
+        kwargs["temporal_weight"] = 0.0
+        return recall(query, **kwargs)
+
+    def enhanced_order(beam):
+        return [
+            row["id"]
+            for row in beam.recall_enhanced(
+                "observatory relay",
+                top_k=2,
+                temporal_weight=0.5,
+                query_time=query_time.isoformat(),
+                temporal_halflife=24.0,
+                use_weibull=False,
+                use_mmr=False,
+                use_intent=False,
+                use_synonyms=False,
+                _track_recall=False,
+            )
+        ]
+
+    with monkeypatch.context() as legacy:
+        legacy.setattr(memory, "_ENHANCED_RECALL_CACHE_VERSION", 22)
+        legacy.setattr(memory, "recall", recall_without_temporal_boost)
+        assert enhanced_order(memory) == [old, recent]
+        hits = memory._query_cache.stats()["hits"]
+        assert enhanced_order(memory) == [old, recent]
+        assert memory._query_cache.stats()["hits"] == hits + 1
+
+    upgraded = BeamMemory(session_id=memory.session_id, db_path=memory.db_path)
+    assert enhanced_order(upgraded) == [recent, old]
+    stats = upgraded._query_cache.stats()
+    assert stats["misses"] == 1
+    assert enhanced_order(upgraded) == [recent, old]
+    assert upgraded._query_cache.stats()["hits"] == stats["hits"] + 1
 
 
 class _StaticPolyphonicEngine:

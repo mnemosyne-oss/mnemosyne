@@ -11653,8 +11653,9 @@ class BeamMemory:
     # 20: Bounded CJK supplement for linear working-memory recall.
     # 21: UTC-Z timestamps remain temporally eligible on Python 3.10.
     # 22: polyphonic voices return the requested top_k.
+    # 23: apply temporal scoring when YAML enables polyphonic recall.
     # Recheck the actual predecessor before each semantic integration.
-    _ENHANCED_RECALL_CACHE_VERSION = 22
+    _ENHANCED_RECALL_CACHE_VERSION = 23
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.
