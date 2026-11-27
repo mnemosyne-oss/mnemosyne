@@ -1480,7 +1480,7 @@ def _resolve_reindex_target(db_override, bank_override, *, dry_run=False):
     return db_path
 
 
-def _preview_reindex(db_path: Path, batch_size: int):
+def _preview_reindex(db_path: Path, batch_size: int, target_vec_type: str | None = None):
     """Plan from an offline SQLite database without creating or changing sidecars."""
     import sqlite3
     from contextlib import closing
@@ -1505,26 +1505,67 @@ def _preview_reindex(db_path: Path, batch_size: int):
 
     with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro&immutable=1", uri=True)) as conn:
         _load_sqlite_vec(conn)
+        if target_vec_type is not None:
+            return reindex_vectors(
+                conn, batch_size=batch_size, dry_run=True, target_vec_type=target_vec_type
+            )
         return reindex_vectors(conn, batch_size=batch_size, dry_run=True)
+
+
+def _convert_reindex_vectors(db_path, target_vec_type, batch_size, progress):
+    import sqlite3
+    from contextlib import closing
+    from tempfile import TemporaryDirectory
+
+    from mnemosyne.core.beam import reindex_vectors
+    from mnemosyne.dr.recovery import _load_sqlite_vec, create_backup, restore_backup
+
+    def backup_and_verify():
+        backup = Path(create_backup(db_path=db_path, format="sqlite3")["backup_path"])
+        with TemporaryDirectory(prefix="mnemosyne-verify-conversion-") as directory:
+            restore_backup(backup, db_path=Path(directory) / "verify.db")
+        print(f"Backup verified at {backup}")
+
+    with closing(sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=rw", uri=True)) as conn:
+        _load_sqlite_vec(conn)
+        return reindex_vectors(
+            conn, target_vec_type=target_vec_type, batch_size=batch_size,
+            progress=progress, _before_conversion=backup_and_verify,
+        )
+
+
+def _print_reindex_vector_tables(plan):
+    for table, details in plan.get("vector_tables", {}).items():
+        current = (
+            f"{details['current_type']}[{details['current_dim']}]"
+            if details["current_type"] is not None else "missing"
+        )
+        print(
+            f"  {table}: {current} -> "
+            f"{details['target_type']}[{details['target_dim']}] "
+            f"({details['current_rows']} current vectors)"
+        )
 
 
 def cmd_reindex(args):
     """Rebuild vector indexes from source text with the active embedding model.
 
     Usage: mnemosyne reindex [--db PATH | --bank NAME] [--model NAME]
-                              [--batch-size N] [--dry-run] [--yes] [--no-backup]
+                              [--batch-size N] [--vec-type int8|float32] [--dry-run] [--yes] [--no-backup]
 
     Use after changing the embedding model/dimension. Synchronous and blocking —
     re-embeds working + episodic memory, so it can take minutes on a large DB.
-    Run it with any provider/gateway stopped.
+    Run it with any provider/gateway stopped. Explicit format conversion
+    requires a verified backup and cannot be combined with --no-backup.
     """
     usage = (
         "Usage: mnemosyne reindex [--db PATH | --bank NAME] [--model NAME] "
-        "[--batch-size N] [--dry-run] [--yes] [--no-backup]"
+        "[--batch-size N] [--vec-type int8|float32] [--dry-run] [--yes] [--no-backup]"
     )
     db_override = None
     bank_override = None
     model_override = None
+    target_vec_type = None
     batch_size = 64
     dry_run = False
     assume_yes = False
@@ -1542,6 +1583,10 @@ def cmd_reindex(args):
             batch_size, i = _require_value(args, i, "--batch-size", _parse_int)
             if batch_size <= 0:
                 _fail("batch-size must be a positive integer")
+        elif arg == "--vec-type":
+            target_vec_type, i = _require_value(args, i, "--vec-type", lambda value, _name: value)
+            if target_vec_type not in ("int8", "float32"):
+                _fail("--vec-type must be int8 or float32")
         elif arg == "--dry-run":
             dry_run = True
             i += 1
@@ -1557,20 +1602,56 @@ def cmd_reindex(args):
     if db_override is not None and bank_override is not None:
         _fail("--db and --bank cannot be used together")
 
-    db_path = _resolve_reindex_target(db_override, bank_override, dry_run=dry_run)
+    if target_vec_type is not None and no_backup:
+        _fail("Vector conversion requires a verified backup.")
+    db_path = _resolve_reindex_target(
+        db_override, bank_override, dry_run=dry_run or target_vec_type is not None
+    )
 
     # --model has to win before the embedding module is imported: it freezes the
     # model + dimension from the env at import time.
     if model_override is not None:
         os.environ["MNEMOSYNE_EMBEDDING_MODEL"] = model_override
 
+    if dry_run or target_vec_type is not None:
+        try:
+            plan = (
+                _preview_reindex(db_path, batch_size) if target_vec_type is None
+                else _preview_reindex(db_path, batch_size, target_vec_type)
+            )
+        except (OSError, RuntimeError) as exc:
+            _fail(str(exc), exit_code=1)
     if dry_run:
-        plan = _preview_reindex(db_path, batch_size)
         print(f"Reindex plan (dry run -- nothing written), db: {db_path}")
         for key in ("model", "dim", "vec_type", "sqlite_vec",
                     "working_memory", "episodic_memory"):
             if key in plan:
                 print(f"  {key}: {plan[key]}")
+        _print_reindex_vector_tables(plan)
+        return
+
+    if target_vec_type is not None:
+        if not assume_yes:
+            print(f"Stop all clients before converting {db_path} to {target_vec_type}.")
+            print(f"  model: {plan['model']}")
+            print(f"  dim: {plan['dim']}")
+            _print_reindex_vector_tables(plan)
+            try:
+                response = input("Proceed? [y/N] ").strip().lower()
+            except EOFError:
+                response = ""
+            if response not in ("y", "yes"):
+                print("Aborted.")
+                return
+
+        def progress(store, done, total):
+            print(f"  {store}: {done}/{total}", flush=True)
+
+        try:
+            result = _convert_reindex_vectors(db_path, target_vec_type, batch_size, progress)
+        except Exception as exc:
+            _fail(str(exc), exit_code=1)
+        print(f"Reindexed and converted to {result['vec_type']} (dim {result['dim']}).")
         return
 
     from mnemosyne.core import embeddings as _emb
@@ -2232,7 +2313,7 @@ def run_cli():
         print("  import <file.json>                     Import memories")
         print("  import-hindsight <file|url> [bank]     Import Hindsight memories")
         print("  bank list|create|delete [name]         Manage memory banks")
-        print("  reindex [--db PATH|--bank NAME] [--model NAME] [--batch-size N] [--dry-run] [--yes] [--no-backup]")
+        print("  reindex [--db PATH|--bank NAME] [--model NAME] [--batch-size N] [--vec-type int8|float32] [--dry-run] [--yes] [--no-backup]")
         print("                                      Rebuild vector indexes with the active model")
         print("                                      --batch-size: positive inputs per request (default 64)")
         print("  backup [output_dir]                    Back up the bank selected by MNEMOSYNE_BANK")

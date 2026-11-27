@@ -21,6 +21,7 @@ import logging
 import re
 import sqlite3
 import time
+from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -613,6 +614,115 @@ class TestReadOnly:
         report = fleet_census.census()
         assert report["banks_scanned"] == 0
         assert report["unreadable"] == []
+
+    @pytest.mark.parametrize("backup_dir", ["backup", "backups"])
+    def test_census_skips_profile_backup_trees(self, fleet_env, backup_dir):
+        profile = fleet_env / "profiles" / "active"
+        live = _make_bank(
+            profile / "mnemosyne" / "data" / "banks" / "default" / "mnemosyne.db",
+            [_TWIN + (None,)],
+        )
+        archived = _make_bank(
+            profile / backup_dir / "snapshot" / "mnemosyne.db",
+            [_TWIN + (None,)],
+        )
+        with closing(sqlite3.connect(archived)) as conn:
+            assert conn.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+
+        report = fleet_census.census()
+
+        assert [Path(bank["path"]) for bank in report["banks"]] == [live]
+        assert report["home_home_twin_count"] == 0
+        assert sorted(archived.parent.iterdir()) == [archived]
+
+    @pytest.mark.parametrize(
+        "root_relative",
+        [".", "profiles", "profiles/backup", "profiles/backup/mnemosyne/data/banks"],
+    )
+    def test_census_keeps_a_live_profile_and_bank_named_backup(
+            self, fleet_env, root_relative):
+        profile = fleet_env / "profiles" / "backup"
+        live = _make_bank(
+            profile / "mnemosyne" / "data" / "banks" / "backup" / "mnemosyne.db",
+            [_TWIN + (None,)],
+        )
+        for archive_root in (fleet_env, profile):
+            _make_bank(
+                archive_root / "backup" / "snapshot" / "mnemosyne.db",
+                [_TWIN + (None,)],
+            )
+
+        report = fleet_census.census(root=fleet_env / root_relative)
+
+        assert [Path(bank["path"]) for bank in report["banks"]] == [live]
+
+    def test_census_skips_backup_at_root_of_profile_named_banks(self, fleet_env):
+        profile = fleet_env / "profiles" / "banks"
+        live = _make_bank(
+            profile / "mnemosyne" / "data" / "banks" / "backup" / "mnemosyne.db",
+            [_TWIN + (None,)],
+        )
+        _make_bank(profile / "backup" / "snapshot" / "mnemosyne.db", [_TWIN + (None,)])
+
+        report = fleet_census.census(root=profile)
+
+        assert [Path(bank["path"]) for bank in report["banks"]] == [live]
+        assert report["home_home_twin_count"] == 0
+
+    @pytest.mark.parametrize("root_relative", [".", "profiles", "profiles/profiles"])
+    def test_census_discovers_profiles_in_a_nested_profiles_directory(
+            self, fleet_env, root_relative):
+        profiles = fleet_env / "profiles" / "profiles"
+        backup_profile = _make_bank(
+            profiles / "backup" / "mnemosyne" / "data" / "mnemosyne.db",
+            [("cf_other_a", "cf_other_b", None)],
+        )
+        active_profile = _make_bank(
+            profiles / "active" / "mnemosyne" / "data" / "mnemosyne.db",
+            [_TWIN + (None,)],
+        )
+        _make_bank(
+            profiles / "active" / "backup" / "snapshot" / "mnemosyne.db",
+            [_TWIN + (None,)],
+        )
+
+        report = fleet_census.census(root=fleet_env / root_relative)
+
+        assert {Path(bank["path"]) for bank in report["banks"]} == {
+            active_profile, backup_profile,
+        }
+        assert report["home_home_twin_count"] == 0
+
+    @pytest.mark.parametrize("root_relative", [".", "profiles", "profiles/profiles"])
+    def test_census_skips_backup_of_profile_named_profiles(self, fleet_env, root_relative):
+        profile = fleet_env / "profiles" / "profiles"
+        live = _make_bank(
+            profile / "mnemosyne" / "data" / "banks" / "backup" / "mnemosyne.db",
+            [_TWIN + (None,)],
+        )
+        _make_bank(profile / "backup" / "snapshot" / "mnemosyne.db", [_TWIN + (None,)])
+
+        report = fleet_census.census(root=fleet_env / root_relative)
+
+        assert [Path(bank["path"]) for bank in report["banks"]] == [live]
+        assert report["home_home_twin_count"] == 0
+
+    def test_census_reads_committed_wal_content_with_an_open_writer(self, fleet_env):
+        bank = _make_bank(fleet_env / "active" / "mnemosyne.db", [])
+        with closing(sqlite3.connect(bank)) as writer:
+            assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute(
+                "INSERT INTO conflicts (fact_a_id, fact_b_id) VALUES (?, ?)", _TWIN,
+            )
+            writer.commit()
+            assert bank.with_suffix(".db-wal").stat().st_size > 0
+
+            report = fleet_census.census()
+
+            assert report["unreadable"] == []
+            assert report["banks_scanned"] == 1
+            assert report["banks"][0]["open_conflicts"] == 1
 
     def test_partial_snapshot_dirs_are_pruned_without_hiding_completed_banks(
             self, fleet_env, caplog):

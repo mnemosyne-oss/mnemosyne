@@ -436,6 +436,20 @@ class TestConfigReader:
         temp_config.set("data_dir", "/some/new/path")
         assert any("requires restart" in r.message.lower() for r in caplog.records)
 
+    @pytest.mark.parametrize("operation", ["set", "reload"])
+    def test_host_llm_opt_out_warns_that_restart_is_required(self, temp_config, caplog, operation):
+        temp_config.set("host_llm_enabled", True)
+        caplog.clear()
+
+        if operation == "set":
+            temp_config.set("host_llm_enabled", False)
+        else:
+            temp_config.config_path.write_text("host_llm_enabled: false\n", encoding="utf-8")
+            assert "host_llm_enabled" in temp_config.reload()
+
+        assert temp_config.get_bool("host_llm_enabled") is False
+        assert "Config key 'host_llm_enabled' requires restart" in caplog.text
+
     def test_no_yaml_no_crash(self, temp_config, monkeypatch):
         """Config works without a config.yaml file."""
         monkeypatch.delenv("MNEMOSYNE_WM_MAX_ITEMS", raising=False)
