@@ -108,12 +108,15 @@ def _claim_completed_sql(alias: str) -> str:
     )
 
 
-# Active rows that were never consolidated or have an unfinished stale claim.
-# Bind the selection time first and the orphan cutoff second. Filter before
-# batching so expired rows never enter a summary or consume a batch slot.
+# Exclude superseded rows and known expirations before batching. Legacy
+# non-text or unparseable expiry values keep the existing consolidation path.
+# Require a calendar date so bare Julian numbers and time-only strings do not
+# count as expirations. Bind the selection time first and the orphan cutoff second.
 _SLEEP_ELIGIBLE_SQL = (
     "superseded_by IS NULL "
-    "AND (valid_until IS NULL OR julianday(valid_until) > julianday(?)) "
+    "AND (typeof(valid_until) <> 'text' "
+    "OR date(substr(valid_until, 1, 10)) IS NOT substr(valid_until, 1, 10) "
+    "OR COALESCE(julianday(valid_until) > julianday(?), 1)) "
     "AND (consolidated_at IS NULL OR ("
     "consolidation_claimed_at IS NOT NULL AND consolidation_claimed_at < ? "
     f"AND NOT {_claim_completed_sql('working_memory')}))"
@@ -13690,11 +13693,13 @@ class BeamMemory:
             for item in items:
                 if item.get("scope") == "global":
                     aggregated_scope = "global"
-                if item.get("valid_until"):
+                valid_until = item.get("valid_until")
+                # Non-text legacy values are normalized to no expiry on write.
+                if isinstance(valid_until, str) and valid_until:
                     if aggregated_valid_until is None or _valid_until_active(
-                        aggregated_valid_until, item["valid_until"]
+                        aggregated_valid_until, valid_until
                     ):
-                        aggregated_valid_until = item["valid_until"]
+                        aggregated_valid_until = valid_until
 
             # E4.a.1: aggregate per-row veracity into the summary's
             # veracity label. Mode of sources with conservative tie-break.
