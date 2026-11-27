@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from mnemosyne.core import beam as beam_module
 from mnemosyne.core.beam import BeamMemory
 from mnemosyne.core.memory import Mnemosyne
 
@@ -104,6 +105,47 @@ def test_future_expiration_remains_eligible_for_deduplication(tmp_path):
     assert memory.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE content = ?", (content,)
     ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("expiry_delta_ms", "offset_hours", "reasserts"),
+    [
+        (-1, 0, True),
+        (0, 0, True),
+        (1, 0, False),
+        (-1, 7, True),
+        (0, 7, True),
+        (1, -5, False),
+    ],
+)
+def test_exact_dedup_expiry_boundary(tmp_path, monkeypatch, expiry_delta_ms, offset_hours, reasserts):
+    memory = Mnemosyne(session_id="s1", db_path=tmp_path / "memory.db")
+    content = "Prefers replies in metric units"
+    original = memory.remember(content)
+    assert original is not None
+
+    lookup_time = datetime(2026, 1, 20, 12, tzinfo=timezone.utc)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return lookup_time.replace(tzinfo=None)
+            return lookup_time.astimezone(tz)
+
+    expiry = (lookup_time + timedelta(milliseconds=expiry_delta_ms)).astimezone(
+        timezone(timedelta(hours=offset_hours))
+    ).isoformat()
+    memory.beam.conn.execute(
+        "UPDATE working_memory SET valid_until = ? WHERE id = ?", (expiry, original)
+    )
+    memory.beam.conn.commit()
+
+    monkeypatch.setattr(beam_module, "datetime", FixedDatetime)
+    result = memory.remember(content)
+
+    assert result is not None
+    assert (result != original) is reasserts
 
 
 def test_wrapper_reassertion_writes_new_legacy_id(tmp_path):
