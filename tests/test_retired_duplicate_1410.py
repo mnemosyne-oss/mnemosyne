@@ -183,6 +183,38 @@ def test_sleep_summarizes_only_active_working_rows(tmp_path, monkeypatch, all_se
     assert summary["id"] in {hit["id"] for hit in summarized_hits}
 
 
+@pytest.mark.parametrize("entrypoint", ["sleep", "sleep_all_sessions"])
+def test_sleep_respects_supersession_and_session_scope(tmp_path, monkeypatch, entrypoint):
+    monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+    db_path = tmp_path / "memory.db"
+    memory = BeamMemory(session_id="s1", db_path=db_path)
+    other_session = BeamMemory(session_id="s2", db_path=db_path)
+    retired = memory.remember("observatory relay uses old cedar packing", source="notes")
+    active = memory.remember("observatory relay uses copper housing", source="notes")
+    peer = other_session.remember("telescope enclosure inspection", source="notes")
+    assert retired is not None and active is not None and peer is not None
+    assert memory.invalidate(retired, replacement_id=active)
+    memory.conn.execute("UPDATE working_memory SET valid_until = NULL WHERE id = ?", (retired,))
+    memory.conn.commit()
+
+    result = getattr(memory, entrypoint)(force=True)
+
+    expected_sources = {active, peer} if entrypoint == "sleep_all_sessions" else {active}
+    assert result["items_consolidated"] == len(expected_sources)
+    summaries = memory.conn.execute(
+        "SELECT summary_of FROM episodic_memory WHERE source = 'sleep_consolidation'"
+    ).fetchall()
+    assert {source for row in summaries for source in row[0].split(",")} == expected_sources
+    assert tuple(memory.conn.execute(
+        "SELECT superseded_by, valid_until, consolidated_at FROM working_memory WHERE id = ?",
+        (retired,),
+    ).fetchone()) == (active, None, None)
+    peer_stamp = memory.conn.execute(
+        "SELECT consolidated_at FROM working_memory WHERE id = ?", (peer,),
+    ).fetchone()[0]
+    assert (peer_stamp is not None) == (entrypoint == "sleep_all_sessions")
+
+
 def test_duplicate_control_and_opt_out(tmp_path):
     memory = BeamMemory(session_id="s1", db_path=tmp_path / "memory.db")
     content = "Prefers replies in metric units"

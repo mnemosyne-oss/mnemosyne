@@ -13464,6 +13464,28 @@ class BeamMemory:
             result["fleet_conflict_census"] = {"error": type(exc).__name__}
         return result
 
+    def _run_sleep_maintenance(self, dry_run: bool) -> Dict:
+        """Retry queued conflicts and degrade episodic rows independently of working rows."""
+        veracity_conflict_pass = None
+        if not dry_run and self.veracity_consolidator is not None:
+            try:
+                resolutions = self.veracity_consolidator.run_consolidation_pass(
+                    pair_budget=_CONFLICT_PAIR_BUDGET,
+                    time_budget_s=_CONFLICT_TIME_BUDGET_S,
+                )
+                veracity_conflict_pass = {"resolutions": resolutions}
+            except Exception as exc:
+                logger.warning(
+                    "veracity conflict pass failed (%s); sleep result unaffected",
+                    type(exc).__name__,
+                )
+                veracity_conflict_pass = {"error": type(exc).__name__}
+
+        return {
+            "veracity_conflict_pass": veracity_conflict_pass,
+            "degradation": self.degrade_episodic(dry_run=dry_run),
+        }
+
     def sleep(self, dry_run: bool = False, force: bool = False,
               _fleet_census: bool = True) -> Dict:
         """
@@ -13610,8 +13632,7 @@ class BeamMemory:
                         "are exempt from consolidation (import quarantine); "
                         "re-date or unpin via update_working"
                     )
-            # The bound is recomputed on the no-op path too: a pass with
-            # nothing to consolidate still ran a sleep.
+            result.update(self._run_sleep_maintenance(dry_run))
             return self._attach_fleet_conflict_census(result, _fleet_census)
 
         # Atomic claim: mark rows consolidated_at BEFORE writing the
@@ -14098,30 +14119,7 @@ class BeamMemory:
                 " skipped this sleep", pairs_skipped_budget,
             )
 
-        # Conflict-ledger drain (the documented sleep retry hook, PR
-        # #1082 review): run the veracity consolidator's conflict pass
-        # once so pairs left queued by a refused probe are re-probed and
-        # obvious conflicts among consolidated facts resolve here.
-        # Bounded by the same pair/time budgets as LLM conflict
-        # validation; best-effort -- a resolution failure must never
-        # fail the sleep. Dry runs skip it: the pass writes.
-        veracity_conflict_pass = None
-        if not dry_run and self.veracity_consolidator is not None:
-            try:
-                resolutions = self.veracity_consolidator.run_consolidation_pass(
-                    pair_budget=_CONFLICT_PAIR_BUDGET,
-                    time_budget_s=_CONFLICT_TIME_BUDGET_S,
-                )
-                veracity_conflict_pass = {"resolutions": resolutions}
-            except Exception as exc:
-                logger.warning(
-                    "veracity conflict pass failed (%s); sleep result unaffected",
-                    type(exc).__name__,
-                )
-                veracity_conflict_pass = {"error": type(exc).__name__}
-
-        # Run tiered degradation after consolidation
-        degrade_result = self.degrade_episodic(dry_run=dry_run)
+        maintenance = self._run_sleep_maintenance(dry_run)
         if not dry_run:
             # Summaries + degradation both changed recallable content.
             self._invalidate_query_cache_after_commit("sleep")
@@ -14143,8 +14141,7 @@ class BeamMemory:
             "consolidated_ids": consolidated_ids,
             "recovered_orphans": recovered_orphans,
             "claims_lost": claims_lost,
-            "degradation": degrade_result,
-            "veracity_conflict_pass": veracity_conflict_pass,
+            **maintenance,
             "model_refresh": {
                 "proposals": model_refresh_proposals,
                 "applied": model_refresh_applied,
@@ -14205,6 +14202,7 @@ class BeamMemory:
                 "errors": 0,
                 "model_refresh": {"proposals": 0, "applied": 0},
                 "session_results": [],
+                **self._run_sleep_maintenance(dry_run),
             })
 
         session_results = []
