@@ -669,7 +669,9 @@ class TestReadOnly:
         assert [Path(bank["path"]) for bank in report["banks"]] == [live]
         assert report["home_home_twin_count"] == 0
 
-    def test_census_discovers_profiles_in_a_nested_profiles_directory(self, fleet_env):
+    @pytest.mark.parametrize("root_relative", [".", "profiles", "profiles/profiles"])
+    def test_census_discovers_profiles_in_a_nested_profiles_directory(
+            self, fleet_env, root_relative):
         profiles = fleet_env / "profiles" / "profiles"
         backup_profile = _make_bank(
             profiles / "backup" / "mnemosyne" / "data" / "mnemosyne.db",
@@ -684,14 +686,15 @@ class TestReadOnly:
             [_TWIN + (None,)],
         )
 
-        report = fleet_census.census(root=profiles)
+        report = fleet_census.census(root=fleet_env / root_relative)
 
         assert {Path(bank["path"]) for bank in report["banks"]} == {
             active_profile, backup_profile,
         }
         assert report["home_home_twin_count"] == 0
 
-    def test_census_skips_backup_at_root_of_profile_named_profiles(self, fleet_env):
+    @pytest.mark.parametrize("root_relative", [".", "profiles", "profiles/profiles"])
+    def test_census_skips_backup_of_profile_named_profiles(self, fleet_env, root_relative):
         profile = fleet_env / "profiles" / "profiles"
         live = _make_bank(
             profile / "mnemosyne" / "data" / "banks" / "backup" / "mnemosyne.db",
@@ -699,7 +702,7 @@ class TestReadOnly:
         )
         _make_bank(profile / "backup" / "snapshot" / "mnemosyne.db", [_TWIN + (None,)])
 
-        report = fleet_census.census(root=profile)
+        report = fleet_census.census(root=fleet_env / root_relative)
 
         assert [Path(bank["path"]) for bank in report["banks"]] == [live]
         assert report["home_home_twin_count"] == 0

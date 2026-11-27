@@ -177,20 +177,27 @@ def discover_banks(root: Path) -> List[Path]:
         return candidates
     resolved_root = root.resolve()
     root_is_snapshot_tree = resolved_root.name == "state-snapshots"
-    # A profiles directory under another profiles directory can be a
-    # profile home or a collection. A home has its own Mnemosyne data.
-    root_is_profile = resolved_root.parent.name == "profiles" and (
-        resolved_root.name != "profiles" or (resolved_root / "mnemosyne" / "data").is_dir()
-    )
-    root_is_profiles = resolved_root.name == "profiles" and not root_is_profile
-    root_is_archive_parent = root_is_profile or resolved_root.name not in {"profiles", "banks"}
+    profile_collections: set[Path] = set()
     for dirpath, dirnames, filenames in os.walk(root):
-        relative_parts = Path(dirpath).relative_to(root).parts
+        directory = Path(dirpath)
+        relative_parts = directory.relative_to(root).parts
+        at_root = not relative_parts
+        layout_path = resolved_root if at_root else directory
         in_snapshot_tree = root_is_snapshot_tree or "state-snapshots" in relative_parts
-        is_backup_parent = (
-            (not relative_parts and root_is_archive_parent)
-            or (len(relative_parts) == 2 and relative_parts[0] == "profiles")
-            or (root_is_profiles and len(relative_parts) == 1)
+        has_profile_parent = directory.parent in profile_collections or (
+            at_root and resolved_root.parent.name == "profiles"
+        )
+        # A child named "profiles" can itself be a collection. A profile
+        # home with that name has its own Mnemosyne data directory.
+        is_profile_collection = (
+            layout_path.name == "profiles"
+            and (len(relative_parts) <= 1 or has_profile_parent)
+            and (not has_profile_parent or not (layout_path / "mnemosyne" / "data").is_dir())
+        )
+        if is_profile_collection:
+            profile_collections.add(directory)
+        is_backup_parent = not is_profile_collection and (
+            has_profile_parent or (at_root and layout_path.name != "banks")
         )
         dirnames[:] = sorted(
             d for d in dirnames
@@ -201,7 +208,7 @@ def discover_banks(root: Path) -> List[Path]:
         for filename in sorted(filenames):
             if not filename.endswith(".db"):
                 continue
-            path = Path(dirpath) / filename
+            path = directory / filename
             try:
                 if path.stat().st_size == 0:
                     continue
