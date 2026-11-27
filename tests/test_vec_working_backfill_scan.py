@@ -75,6 +75,19 @@ def _stored_vector(conn, rowid):
     return None if row is None else row[0]
 
 
+def _expected_stored_vector(conn, unit_vector):
+    """Encode a fixture vector in the table's storage format."""
+    vec_type = beam_module._effective_vec_type(conn, "vec_working")
+    query = {
+        "bit": "SELECT vec_quantize_binary(?)",
+        "int8": "SELECT vec_quantize_int8(?, 'unit')",
+    }.get(vec_type)
+    if query is None:
+        return unit_vector.tobytes()
+    encoded = beam_module._embeddings.serialize(unit_vector)
+    return conn.execute(query, (encoded,)).fetchone()[0]
+
+
 def test_backfill_preserves_stored_bytes_and_keeps_orphans(temp_db):
     beam = BeamMemory(session_id="vec-backfill-preserve", db_path=temp_db)
     _require_vec_working(beam.conn)
@@ -106,12 +119,9 @@ def test_backfill_preserves_stored_bytes_and_keeps_orphans(temp_db):
     assert _stored_vector(beam.conn, kept_rowid) == kept_before
     assert _stored_vector(beam.conn, orphan_rowid) == orphan_before
 
-    # The gap was filled from the compatibility embedding, not from the
-    # already-stored vector: the two differ, so this also proves the backfill
-    # did not simply copy the neighbouring row.
-    filled = _stored_vector(beam.conn, missing_rowid)
-    assert filled is not None
-    assert filled != kept_before
+    filled = _expected_stored_vector(beam.conn, compat)
+    assert filled not in (kept_before, orphan_before)
+    assert _stored_vector(beam.conn, missing_rowid) == filled
 
     after = beam_module.vec_working_coverage(beam.conn)
     assert after["missing_vec_working_rows"] == 0
@@ -120,6 +130,7 @@ def test_backfill_preserves_stored_bytes_and_keeps_orphans(temp_db):
     # Second run is a no-op and rewrites nothing.
     assert beam_module._backfill_vec_working_from_memory_embeddings(beam.conn) == 0
     assert _stored_vector(beam.conn, kept_rowid) == kept_before
+    assert _stored_vector(beam.conn, orphan_rowid) == orphan_before
     assert _stored_vector(beam.conn, missing_rowid) == filled
 
 
@@ -129,7 +140,10 @@ def test_backfill_fills_an_empty_vector_table(temp_db):
 
     assert beam_module.vec_working_coverage(beam.conn)["status"] == "empty"
 
-    rowids = [_insert_working(beam, f"wm-{axis}", _unit_embedding(axis)) for axis in range(3)]
+    vectors = [_unit_embedding(axis) for axis in range(3)]
+    rowids = [_insert_working(beam, f"wm-{axis}", vector) for axis, vector in enumerate(vectors)]
+    expected = [_expected_stored_vector(beam.conn, vector) for vector in vectors]
+    assert len(set(expected)) == len(rowids)
 
     coverage = beam_module.vec_working_coverage(beam.conn)
     assert coverage["working_embedding_rows"] == 3
@@ -139,11 +153,11 @@ def test_backfill_fills_an_empty_vector_table(temp_db):
 
     assert beam_module._backfill_vec_working_from_memory_embeddings(beam.conn) == 3
     beam.conn.commit()
+    assert [_stored_vector(beam.conn, rowid) for rowid in rowids] == expected
 
     assert beam_module._backfill_vec_working_from_memory_embeddings(beam.conn) == 0
     after = beam_module.vec_working_coverage(beam.conn)
     assert after["vec_working_rows"] == 3
     assert after["missing_vec_working_rows"] == 0
     assert after["status"] == "complete"
-    for rowid in rowids:
-        assert _stored_vector(beam.conn, rowid) is not None
+    assert [_stored_vector(beam.conn, rowid) for rowid in rowids] == expected
