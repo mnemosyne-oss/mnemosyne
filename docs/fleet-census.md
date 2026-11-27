@@ -6,7 +6,8 @@ root. A candidate is counted as a bank only if it can be read and contains a
 directories named `backups`, `cache`, `.cache`, `__pycache__`, `node_modules`,
 `.git` or `site-packages`. The walk also skips Hermes' `backup/` directly
 below the fleet root or a `profiles/<name>/` directory. A profile or bank
-named `backup` can still be discovered. Selecting `/fleet/backups` as the
+named `backup` can still be discovered, including when `banks/` is the
+selected root. Selecting `/fleet/backups` as the
 root still scans its root-level `*.db` files.
 A directory named `build` is not on that list and is still searched. Directories ending in `.partial` are also pruned when
 they are inside a snapshot tree: the selected root resolves to a directory

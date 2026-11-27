@@ -168,7 +168,7 @@ def discover_banks(root: Path) -> List[Path]:
 
     Candidates still have to prove they hold a ``conflicts`` table when
     read; this only spares the reader a connect on obviously-empty files.
-    Snapshot pruning uses the resolved root name, while returned paths
+    Snapshot and backup pruning use the resolved root, while returned paths
     preserve the caller's root spelling.
     """
     root = Path(root)
@@ -178,11 +178,12 @@ def discover_banks(root: Path) -> List[Path]:
     resolved_root = root.resolve()
     root_is_snapshot_tree = resolved_root.name == "state-snapshots"
     root_is_profiles = resolved_root.name == "profiles" and resolved_root.parent.name != "profiles"
+    root_is_archive_parent = not root_is_profiles and resolved_root.name != "banks"
     for dirpath, dirnames, filenames in os.walk(root):
         relative_parts = Path(dirpath).relative_to(root).parts
         in_snapshot_tree = root_is_snapshot_tree or "state-snapshots" in relative_parts
         is_backup_parent = (
-            (not relative_parts and not root_is_profiles)
+            (not relative_parts and root_is_archive_parent)
             or (len(relative_parts) == 2 and relative_parts[0] == "profiles")
             or (root_is_profiles and len(relative_parts) == 1)
         )

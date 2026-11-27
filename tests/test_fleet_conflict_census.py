@@ -635,7 +635,10 @@ class TestReadOnly:
         assert report["home_home_twin_count"] == 0
         assert sorted(archived.parent.iterdir()) == [archived]
 
-    @pytest.mark.parametrize("root_relative", [".", "profiles", "profiles/backup"])
+    @pytest.mark.parametrize(
+        "root_relative",
+        [".", "profiles", "profiles/backup", "profiles/backup/mnemosyne/data/banks"],
+    )
     def test_census_keeps_a_live_profile_and_bank_named_backup(
             self, fleet_env, root_relative):
         profile = fleet_env / "profiles" / "backup"
@@ -652,6 +655,23 @@ class TestReadOnly:
         report = fleet_census.census(root=fleet_env / root_relative)
 
         assert [Path(bank["path"]) for bank in report["banks"]] == [live]
+
+    def test_census_reads_committed_wal_content_with_an_open_writer(self, fleet_env):
+        bank = _make_bank(fleet_env / "active" / "mnemosyne.db", [])
+        with closing(sqlite3.connect(bank)) as writer:
+            assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute(
+                "INSERT INTO conflicts (fact_a_id, fact_b_id) VALUES (?, ?)", _TWIN,
+            )
+            writer.commit()
+            assert bank.with_suffix(".db-wal").stat().st_size > 0
+
+            report = fleet_census.census()
+
+            assert report["unreadable"] == []
+            assert report["banks_scanned"] == 1
+            assert report["banks"][0]["open_conflicts"] == 1
 
     def test_partial_snapshot_dirs_are_pruned_without_hiding_completed_banks(
             self, fleet_env, caplog):
