@@ -60,7 +60,7 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `force_local` | `MNEMOSYNE_FORCE_LOCAL` | `false` | no | Skip the remote chain and use the local GGUF model directly. |
 | `fts_weight` | `MNEMOSYNE_FTS_WEIGHT` | `0.3` | no | FTS5 rank weight in hybrid ranking. |
 | `home` | `MNEMOSYNE_HOME` | *(unset)* | **yes** | Base Hermes home directory used to derive default paths. |
-| `host_llm_enabled` | `MNEMOSYNE_HOST_LLM_ENABLED` | `false` | no | Route LLM work through a host-registered backend. See `core/llm_backends.py`. |
+| `host_llm_enabled` | `MNEMOSYNE_HOST_LLM_ENABLED` | `false` | **yes** | Route LLM work through a host-registered backend. See `core/llm_backends.py`. |
 | `host_llm_model` | `MNEMOSYNE_HOST_LLM_MODEL` | *(unset)* | no | Model override passed to the host backend. |
 | `host_llm_n_ctx` | `MNEMOSYNE_HOST_LLM_N_CTX` | `32000` [^host_llm_n_ctx] (declared `2048`) | no | Context budget assumed for the host backend. |
 | `host_llm_provider` | `MNEMOSYNE_HOST_LLM_PROVIDER` | *(unset)* | no | Provider override passed to the host backend. |

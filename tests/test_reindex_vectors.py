@@ -8,13 +8,16 @@ working. Also checks that --dry-run writes nothing.
 """
 from __future__ import annotations
 
+import json
 import os
 import signal
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
 import zlib
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -224,7 +227,6 @@ def test_reindex_commits_once_at_the_end_even_when_commits_are_deferred(tmp_path
 
 def test_reindex_success_rebuilds_exact_source_vectors_and_recalls_target(tmp_path, monkeypatch):
     """A deterministic core rebuild maps every derived vector back to its source row."""
-    import json
     import numpy as np
     import mnemosyne.core.beam as beam_module
 
@@ -788,3 +790,219 @@ def test_reindex_works_with_a_bare_sqlite3_connect_row_factory_unset(
 if __name__ == "__main__":  # allow direct execution without pytest
     test_reindex_rebuilds_all_vector_stores_at_active_dim()
     print("ok")
+
+
+@pytest.mark.parametrize(
+    ("source_type", "target_type"), [("int8", "float32"), ("float32", "int8")]
+)
+def test_explicit_conversion_rebuilds_exact_vectors_in_both_native_tiers(
+    tmp_path, monkeypatch, source_type, target_type
+):
+    memory = _seeded_store(tmp_path, monkeypatch)
+    conn = memory.conn
+    if not beam_module._vec_available(conn):
+        pytest.skip("sqlite-vec unavailable")
+    reindex_vectors(conn, target_vec_type=source_type)
+    tiers = {"vec_working": "working_memory", "vec_episodes": "episodic_memory"}
+    sources = {
+        table: dict(conn.execute(f"SELECT rowid, content FROM {source_table}"))
+        for table, source_table in tiers.items()
+    }
+    vectors = {}
+    for position, content in enumerate(text for rows in sources.values() for text in rows.values()):
+        unit = [0.0] * E.EMBEDDING_DIM
+        unit[position] = 1.0
+        vectors[content] = unit
+    monkeypatch.setattr(E, "embed", lambda contents: [vectors[text] for text in contents])
+
+    for table in tiers:
+        assert f"embedding {source_type}[" in _ddl(conn, table)
+
+    result = reindex_vectors(conn, target_vec_type=target_type, batch_size=2)
+    assert result["status"] == "reindexed"
+    with closing(_open_fresh(tmp_path / "m.db")) as rebuilt:
+        assert rebuilt.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        for table, rows in sources.items():
+            assert f"embedding {target_type}[" in _ddl(rebuilt, table)
+            assert dict(rebuilt.execute(f"SELECT rowid, content FROM {tiers[table]}")) == rows
+            assert len(rows) == 3
+            stored = dict(rebuilt.execute(f"SELECT rowid, embedding FROM {table}"))
+            assert stored.keys() == rows.keys()
+            for rowid, content in rows.items():
+                vector = vectors[content]
+                if target_type == "int8":
+                    encoded = rebuilt.execute(
+                        "SELECT vec_quantize_int8(?, 'unit')", (json.dumps(vector),)
+                    ).fetchone()[0]
+                    query = "vec_int8(?)"
+                else:
+                    encoded = struct.pack(f"<{len(vector)}f", *vector)
+                    query = "?"
+                assert stored[rowid] == encoded
+                match = rebuilt.execute(
+                    f"SELECT rowid FROM {table} WHERE embedding MATCH {query} AND k = 1",
+                    (encoded,),
+                ).fetchone()
+                assert match == (rowid,)
+
+
+def test_interrupted_explicit_conversion_restores_vectors_and_schema(tmp_path, monkeypatch):
+    memory = _seeded_store(tmp_path, monkeypatch)
+    if not beam_module._vec_available(memory.conn):
+        pytest.skip("sqlite-vec unavailable")
+    path = tmp_path / "m.db"
+    before = _store_state(path)
+    monkeypatch.setattr(E, "embed", _fake_embedder("other", fail_on_call=2))
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        reindex_vectors(memory.conn, target_vec_type="int8", batch_size=2)
+    assert _store_state(path) == before
+
+
+def test_conversion_plan_reports_each_native_table_without_writing(tmp_path, capsys):
+    from mnemosyne.cli import cmd_reindex
+
+    path = tmp_path / "mixed.db"
+    with closing(_open_fresh(path)) as conn:
+        if not beam_module._SQLITE_VEC_AVAILABLE:
+            pytest.skip("sqlite-vec unavailable")
+        conn.executescript(
+            "CREATE VIRTUAL TABLE vec_working USING vec0(embedding float32[8]);"
+            "CREATE VIRTUAL TABLE vec_episodes USING vec0(embedding int8[8]);"
+        )
+    before = path.read_bytes()
+    cmd_reindex(["--db", str(path), "--dry-run", "--vec-type", "float32"])
+    output = capsys.readouterr().out
+    assert "vec_working: float32[8] -> float32[" in output
+    assert "vec_episodes: int8[8] -> float32[" in output
+    assert "vec_facts: missing -> float32[" in output
+    assert path.read_bytes() == before
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_conversion_prompt_shows_rebuild_plan_before_confirmation(tmp_path, monkeypatch, capsys):
+    from mnemosyne.cli import cmd_reindex
+
+    path = tmp_path / "mixed.db"
+    with closing(_open_fresh(path)) as conn:
+        if not beam_module._SQLITE_VEC_AVAILABLE:
+            pytest.skip("sqlite-vec unavailable")
+        conn.executescript(
+            "CREATE VIRTUAL TABLE vec_working USING vec0(embedding float32[8]);"
+            "CREATE VIRTUAL TABLE vec_episodes USING vec0(embedding int8[8]);"
+        )
+    before = path.read_bytes()
+    monkeypatch.setattr(E, "_DEFAULT_MODEL", "prompt-test-model")
+    monkeypatch.setattr(E, "EMBEDDING_DIM", 16)
+
+    def decline(_prompt):
+        output = capsys.readouterr().out
+        assert "model: prompt-test-model" in output
+        assert "dim: 16" in output
+        assert "vec_working: float32[8] -> float32[16]" in output
+        assert "vec_episodes: int8[8] -> float32[16]" in output
+        return "n"
+
+    monkeypatch.setattr("builtins.input", decline)
+    cmd_reindex(["--db", str(path), "--vec-type", "float32"])
+    assert "Aborted." in capsys.readouterr().out
+    assert path.read_bytes() == before
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_conversion_cli_verifies_recoverable_backup_before_rebuilding(
+    tmp_path, monkeypatch, capsys
+):
+    from mnemosyne.cli import cmd_reindex
+    from mnemosyne.dr.recovery import restore_backup
+
+    memory = _seeded_store(tmp_path, monkeypatch)
+    if not beam_module._vec_available(memory.conn):
+        pytest.skip("sqlite-vec unavailable")
+    path = tmp_path / "m.db"
+    before = _store_state(path)
+    target = "int8" if "float32" in before["vec_episodes"] else "float32"
+    assert memory.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+    memory.conn.close()
+    backup_dir = tmp_path / "backups"
+    monkeypatch.setenv("MNEMOSYNE_BACKUP_DIR", str(backup_dir))
+
+    cmd_reindex(["--db", str(path), "--vec-type", target, "--yes"])
+
+    output = capsys.readouterr().out
+    assert "Backup verified" in output
+    assert f"converted to {target}" in output
+    archives = list(backup_dir.rglob("*.gz"))
+    assert len(archives) == 1
+    recovered = tmp_path / "recovered.db"
+    restore_backup(archives[0], db_path=recovered)
+    assert _store_state(recovered) == before
+    assert f"embedding {target}[" in _store_state(path)["vec_episodes"]
+
+
+def test_invalid_conversion_backup_aborts_before_rebuild(tmp_path, monkeypatch, capsys):
+    from mnemosyne.cli import cmd_reindex
+    from mnemosyne.dr import recovery
+
+    memory = _seeded_store(tmp_path, monkeypatch)
+    if not beam_module._vec_available(memory.conn):
+        pytest.skip("sqlite-vec unavailable")
+    path = tmp_path / "m.db"
+    before = _store_state(path)
+    assert memory.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+    memory.conn.close()
+    backup = tmp_path / "broken.db.gz"
+    backup.write_bytes(b"not a recoverable archive")
+    monkeypatch.setattr(recovery, "create_backup", lambda **kwargs: {"backup_path": backup})
+    monkeypatch.setattr(E, "embed", lambda *_args: pytest.fail("embedding ran before backup validation"))
+
+    with pytest.raises(SystemExit) as aborted:
+        cmd_reindex(["--db", str(path), "--vec-type", "float32", "--yes"])
+
+    assert aborted.value.code == 1
+    assert "Backup metadata sidecar not found" in capsys.readouterr().err
+    assert _store_state(path) == before
+
+
+_EXIT_DURING_CONVERSION = """
+import os, sys
+import mnemosyne.core.embeddings as embeddings
+from mnemosyne.cli import cmd_reindex
+
+batches = 0
+
+def embed(contents):
+    global batches
+    batches += 1
+    if batches == 2:
+        os._exit(73)
+    return [[0.5] * embeddings.EMBEDDING_DIM for _ in contents]
+
+embeddings.available = lambda: True
+embeddings.embed = embed
+cmd_reindex([
+    "--db", sys.argv[1], "--vec-type", sys.argv[2], "--batch-size", "2", "--yes",
+])
+"""
+
+
+def test_conversion_cli_recovers_when_process_exits_after_first_batch(tmp_path, monkeypatch):
+    memory = _seeded_store(tmp_path, monkeypatch)
+    if not beam_module._vec_available(memory.conn):
+        pytest.skip("sqlite-vec unavailable")
+    path = tmp_path / "m.db"
+    before = _store_state(path)
+    target = "int8" if "float32" in before["vec_episodes"] else "float32"
+    assert memory.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+    memory.conn.close()
+    backup_dir = tmp_path / "backups"
+    proc = subprocess.run(
+        [sys.executable, "-c", _EXIT_DURING_CONVERSION, str(path), target],
+        cwd=_REPO_ROOT,
+        env={**os.environ, "MNEMOSYNE_BACKUP_DIR": str(backup_dir)},
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 73, proc.stderr.decode()
+    assert len(list(backup_dir.rglob("*.gz"))) == 1
+    assert _store_state(path) == before

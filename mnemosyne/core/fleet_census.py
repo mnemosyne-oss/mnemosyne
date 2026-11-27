@@ -168,26 +168,47 @@ def discover_banks(root: Path) -> List[Path]:
 
     Candidates still have to prove they hold a ``conflicts`` table when
     read; this only spares the reader a connect on obviously-empty files.
-    Snapshot pruning uses the resolved root name, while returned paths
+    Snapshot and backup pruning use the resolved root, while returned paths
     preserve the caller's root spelling.
     """
     root = Path(root)
     candidates: List[Path] = []
     if not root.is_dir():
         return candidates
-    root_is_snapshot_tree = root.resolve().name == "state-snapshots"
+    resolved_root = root.resolve()
+    root_is_snapshot_tree = resolved_root.name == "state-snapshots"
+    profile_collections: set[Path] = set()
     for dirpath, dirnames, filenames in os.walk(root):
-        relative_parts = Path(dirpath).relative_to(root).parts
+        directory = Path(dirpath)
+        relative_parts = directory.relative_to(root).parts
+        at_root = not relative_parts
+        layout_path = resolved_root if at_root else directory
         in_snapshot_tree = root_is_snapshot_tree or "state-snapshots" in relative_parts
+        has_profile_parent = directory.parent in profile_collections or (
+            at_root and resolved_root.parent.name == "profiles"
+        )
+        # A child named "profiles" can itself be a collection. A profile
+        # home with that name has its own Mnemosyne data directory.
+        is_profile_collection = (
+            layout_path.name == "profiles"
+            and (len(relative_parts) <= 1 or has_profile_parent)
+            and (not has_profile_parent or not (layout_path / "mnemosyne" / "data").is_dir())
+        )
+        if is_profile_collection:
+            profile_collections.add(directory)
+        is_backup_parent = not is_profile_collection and (
+            has_profile_parent or (at_root and layout_path.name != "banks")
+        )
         dirnames[:] = sorted(
             d for d in dirnames
             if d not in _SKIP_DIR_NAMES
+            and (d != "backup" or not is_backup_parent)
             and (not in_snapshot_tree or not d.endswith(".partial"))
         )
         for filename in sorted(filenames):
             if not filename.endswith(".db"):
                 continue
-            path = Path(dirpath) / filename
+            path = directory / filename
             try:
                 if path.stat().st_size == 0:
                     continue

@@ -33,8 +33,8 @@ when Mnemosyne is loaded as a Hermes memory provider):
    - On failure (errors, empty response, no extractable content):
      skip MNEMOSYNE_LLM_BASE_URL entirely. Fall to the local GGUF path,
      then return None / [].
-1. Remote OpenAI-compatible API (only if MNEMOSYNE_LLM_BASE_URL is set
-   AND MNEMOSYNE_HOST_LLM_ENABLED is unset/false).
+1. Remote OpenAI-compatible API, if MNEMOSYNE_LLM_BASE_URL is set and
+   no host call was attempted.
 2. Local llama-cpp-python / ctransformers GGUF (MiniCPM5-1B by default).
 3. Return None (consolidation) or [] (extraction) — caller falls back to
    the existing non-LLM path.
@@ -120,13 +120,33 @@ This protects Hermes from getting stuck on a slow LLM provider during
 session shutdown without losing the chance for consolidation to complete on
 faster paths.
 
-## Standalone (non-Hermes) use
+## Scheduled consolidation from the standalone CLI
 
-Standalone Mnemosyne is unaffected. The host backend is opt-in, never imports
-Hermes at module load, and the existing
-`MNEMOSYNE_LLM_BASE_URL`/`MNEMOSYNE_LLM_API_KEY`/`MNEMOSYNE_LLM_MODEL` and
-local GGUF paths continue to work exactly as before when
-`MNEMOSYNE_HOST_LLM_ENABLED` is unset or false.
+A standalone `mnemosyne sleep` process can use a configured OpenAI-compatible
+endpoint or a local GGUF model. The Hermes auxiliary backend requires a
+registered provider in the same process. For a scheduled CLI job, give the job
+the target bank's environment and configure its own endpoint. For example:
+
+```bash
+export MNEMOSYNE_LLM_ENABLED=true
+export MNEMOSYNE_LLM_BASE_URL=http://localhost:8080/v1
+export MNEMOSYNE_LLM_MODEL=my-model
+mnemosyne sleep --all-sessions
+```
+
+Set `MNEMOSYNE_LLM_API_KEY` in the job's environment if the endpoint requires
+one. The command processes rows eligible under the normal age cutoff. Use
+`--force` when you intend to include newer eligible rows as well. Check the
+completed run's `llm_used` count and per-session `method` to see how many
+summaries used an LLM. With no usable LLM the command can still succeed using
+AAAK and logs a fallback warning. A `--dry-run` previews eligible work
+without invoking an LLM. Its method and usage counts do not predict the actual
+backend.
+
+For consolidation inside Hermes, set `host_llm_enabled: true` in
+Mnemosyne's `config.yaml` or export `MNEMOSYNE_HOST_LLM_ENABLED=true` before
+starting Hermes. Mnemosyne reads this setting at startup. When both are
+present, the YAML value takes precedence.
 
 ## For other agents
 

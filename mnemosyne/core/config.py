@@ -47,6 +47,7 @@ REQUIRES_RESTART: Set[str] = {
     "vec_type",
     "llm_repo",
     "llm_file",
+    "host_llm_enabled",
     "author_id",
     "author_type",
     "channel_id",
