@@ -162,6 +162,11 @@ If YAML omits the key, set `MNEMOSYNE_POLYPHONIC_RECALL` to `1`, `true`, `yes`, 
 `on` to enable the engine. Use `polyphonic_recall: false` in YAML to select linear
 recall regardless of the environment.
 
+On the polyphonic path, `temporal_weight`, `query_time`, and `temporal_halflife`
+keep their usual meaning as a post-fusion score boost. `vec_weight`, `fts_weight`,
+and `importance_weight` tune only the linear hybrid scorer; polyphonic recall fuses
+voice ranks instead, so those three knobs do not alter its ranking.
+
 Measured effect of each flag **in isolation**, same 8 natural-language probes over the same
 62-item corpus (`mnemosyne-memory` 3.15.1):
 

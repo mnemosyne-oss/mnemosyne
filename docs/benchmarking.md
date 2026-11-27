@@ -99,7 +99,7 @@ temporary data directory and verifies the selected engine before measuring.
 | `MNEMOSYNE_VEC_WEIGHT` | `0.5` | Weight of vector similarity in the linear hybrid score. Normalized to sum to 1.0 with FTS + importance. |
 | `MNEMOSYNE_FTS_WEIGHT` | `0.4` | Weight of FTS5 score in the linear hybrid score. |
 | `MNEMOSYNE_IMPORTANCE_WEIGHT` | `0.1` | Weight of stored `importance` in the linear hybrid score. |
-| `MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS` | (caller arg) | Temporal-boost half-life for the linear path's `_temporal_boost`. Only active when caller passes `temporal_weight > 0`. |
+| `MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS` | (caller arg) | Temporal-boost half-life for `_temporal_boost`. The linear path applies it inside hybrid scoring; the polyphonic path applies it after RRF fusion. Only active when caller passes `temporal_weight > 0`. |
 
 These three (`VEC` / `FTS` / `IMPORTANCE`) interact -- changing one alters the relative weight of the others. Treat as a triple to pin together.
 

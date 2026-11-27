@@ -29,6 +29,16 @@ from mnemosyne.core.beam import (
 )
 
 
+class _StaticPolyphonicEngine:
+    last_call_fallback = {"em": False, "wm": False}
+
+    def __init__(self, results):
+        self._results = results
+
+    def recall(self, **kwargs):
+        return self._results
+
+
 class TestTemporalBoostFunction(unittest.TestCase):
     """Unit tests for _temporal_boost helper."""
     def test_boost_one_halflife_ago(self):
@@ -314,6 +324,83 @@ class TestTemporalRecallEndToEnd(unittest.TestCase):
 
         self.assertGreater(score_long, score_short,
                            "Longer halflife should give higher score for 2-day-old memory")
+
+    @patch.dict(os.environ, {"MNEMOSYNE_POLYPHONIC_RECALL": "1"})
+    def test_polyphonic_temporal_boost_recent_vs_old(self):
+        """The polyphonic path applies temporal scoring after fusion."""
+        from mnemosyne.core.polyphonic_recall import PolyphonicResult
+
+        now = datetime.now(timezone.utc)
+        rows = (
+            ("poly-old", "Meeting about project alpha", (now - timedelta(days=5)).isoformat()),
+            ("poly-recent", "Meeting about project beta", (now - timedelta(hours=2)).isoformat()),
+        )
+        for memory_id, content, timestamp in rows:
+            self.beam.conn.execute(
+                "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (memory_id, content, "test", timestamp, "test_temporal", 0.5),
+            )
+        self.beam.conn.commit()
+        engine = _StaticPolyphonicEngine([
+            PolyphonicResult(memory_id="poly-old", combined_score=0.5,
+                             voice_scores={"vector": 0.5},
+                             metadata={"_self_echo_tier": "working"}),
+            PolyphonicResult(memory_id="poly-recent", combined_score=0.5,
+                             voice_scores={"vector": 0.5},
+                             metadata={"_self_echo_tier": "working"}),
+        ])
+
+        with patch.object(self.beam, "_get_polyphonic_engine", return_value=engine):
+            control = self.beam.recall(
+                "meeting", top_k=5, temporal_weight=0.0,
+                query_time=now.isoformat(), temporal_halflife=24.0,
+            )
+            boosted = self.beam.recall(
+                "meeting", top_k=5, temporal_weight=0.5,
+                query_time=now.isoformat(), temporal_halflife=24.0,
+            )
+
+        tracked = {"poly-old", "poly-recent"}
+        control_order = [r["id"] for r in control if r["id"] in tracked]
+        boosted_order = [r["id"] for r in boosted if r["id"] in tracked]
+        self.assertEqual(control_order, ["poly-old", "poly-recent"])
+        self.assertEqual(boosted_order, ["poly-recent", "poly-old"])
+        scores = {r["id"]: r["score"] for r in boosted if r["id"] in tracked}
+        self.assertGreater(scores["poly-recent"], scores["poly-old"])
+
+    @patch.dict(os.environ, {"MNEMOSYNE_POLYPHONIC_RECALL": "1"})
+    def test_polyphonic_temporal_halflife_override(self):
+        """Per-call temporal_halflife reaches polyphonic temporal scoring."""
+        from mnemosyne.core.polyphonic_recall import PolyphonicResult
+
+        now = datetime.now(timezone.utc)
+        timestamp = (now - timedelta(hours=12)).isoformat()
+        self.beam.conn.execute(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("poly-half", "Memory from twelve hours ago", "test", timestamp, "test_temporal", 0.5),
+        )
+        self.beam.conn.commit()
+        engine = _StaticPolyphonicEngine([
+            PolyphonicResult(memory_id="poly-half", combined_score=0.5,
+                             voice_scores={"vector": 0.5},
+                             metadata={"_self_echo_tier": "working"}),
+        ])
+
+        with patch.object(self.beam, "_get_polyphonic_engine", return_value=engine):
+            short = self.beam.recall(
+                "memory", top_k=5, temporal_weight=0.5,
+                query_time=now, temporal_halflife=6.0,
+            )
+            long = self.beam.recall(
+                "memory", top_k=5, temporal_weight=0.5,
+                query_time=now, temporal_halflife=48.0,
+            )
+
+        score_short = next(r["score"] for r in short if r["id"] == "poly-half")
+        score_long = next(r["score"] for r in long if r["id"] == "poly-half")
+        self.assertGreater(score_long, score_short)
 
     def test_temporal_with_entities(self):
         """Temporal scoring works alongside entity extraction (Phase 1)."""
