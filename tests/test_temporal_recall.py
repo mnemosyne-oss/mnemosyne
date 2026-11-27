@@ -22,11 +22,65 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from mnemosyne.core.beam import (
     BeamMemory, init_beam, _temporal_boost, _parse_query_time
 )
+
+
+def test_config_enabled_polyphonic_recall_applies_temporal_boost(tmp_path, monkeypatch):
+    """Exercise the YAML gate and temporal scoring through public Recall."""
+    import json
+
+    from mnemosyne.core import embeddings
+    from mnemosyne.core.beam import EMBEDDING_DIM
+
+    np = pytest.importorskip("numpy")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("polyphonic_recall: true\n", encoding="utf-8")
+    monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "0")
+    monkeypatch.setenv("MNEMOSYNE_VOICE_VECTOR", "1")
+    for voice in ("GRAPH", "FACT", "TEMPORAL"):
+        monkeypatch.setenv(f"MNEMOSYNE_VOICE_{voice}", "0")
+
+    def vector(cosine, axis):
+        result = np.zeros(EMBEDDING_DIM, dtype=np.float32)
+        result[0] = cosine
+        result[axis] = (1.0 - cosine**2)**0.5
+        return result
+
+    monkeypatch.setattr(embeddings, "available", lambda: False)
+    memory = BeamMemory(session_id="temporal-review", db_path=tmp_path / "beam.db")
+    query_time = datetime(2026, 1, 20, 12, tzinfo=timezone.utc)
+    old = memory.remember("observatory relay insulation policy", source="note", extract=False)
+    recent = memory.remember("observatory relay inspection at dawn", source="note", extract=False)
+    assert old is not None and recent is not None and old != recent
+    for memory_id, similarity, axis, age_hours in ((old, 0.96, 1, 120), (recent, 0.90, 2, 2)):
+        memory.conn.execute(
+            "UPDATE working_memory SET timestamp = ?, veracity = 'stated' WHERE id = ?",
+            ((query_time - timedelta(hours=age_hours)).isoformat(), memory_id),
+        )
+        memory.conn.execute(
+            "INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)",
+            (memory_id, json.dumps(vector(similarity, axis).tolist()), "test"),
+        )
+    memory.conn.commit()
+    monkeypatch.setattr(embeddings, "available", lambda: True)
+    monkeypatch.setattr(embeddings, "embed_query", lambda _query: vector(1, 1))
+
+    def recall(weight):
+        results = memory.recall(
+            "observatory relay", top_k=2, temporal_weight=weight,
+            query_time=query_time, temporal_halflife=24.0, _track_recall=False,
+        )
+        assert all("vector" in row.get("voice_scores", {}) for row in results)
+        return [row["id"] for row in results]
+
+    assert recall(0.0) == [old, recent]
+    assert recall(0.5) == [recent, old]
 
 
 class _StaticPolyphonicEngine:
