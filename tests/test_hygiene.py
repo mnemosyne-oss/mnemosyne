@@ -537,6 +537,128 @@ class TestAuditNoise:
         assert report.summary["table_counts"]["episodic_memory"] == 1
         assert any(c.table_name == "episodic_memory" for c in report.candidates)
 
+    @pytest.mark.parametrize(
+        ("columns", "batch_size"),
+        [
+            (("content",), 1),
+            (("id",), 2),
+            ((), 1),
+        ],
+    )
+    def test_audit_skips_tables_missing_required_columns(self, tmp_path, columns, batch_size, caplog):
+        """Incompatible rows are skipped visibly, without manufactured identities."""
+        db_path = tmp_path / "incompatible.db"
+        conn = sqlite3.connect(db_path)
+        definitions = {"id": "TEXT", "content": "TEXT"}
+        schema = ", ".join(
+            f"{column} {definitions[column]}" for column in columns
+        ) or "placeholder TEXT"
+        conn.execute(f"CREATE TABLE malformed ({schema})")
+        names = columns or ("placeholder",)
+        for index in range(3):
+            values = {"id": f"row-{index}", "content": "", "placeholder": "x"}
+            conn.execute(
+                f"INSERT INTO malformed VALUES ({', '.join('?' for _ in names)})",
+                tuple(values[column] for column in names),
+            )
+        conn.commit()
+        conn.close()
+
+        report = audit_noise(
+            db_path=db_path,
+            tables=["malformed"],
+            scan_all=True,
+            batch_size=batch_size,
+            min_score=0.0,
+        )
+
+        assert report.total_scanned == 0
+        assert report.summary["table_counts"]["malformed"] == 0
+        assert report.candidates == []
+        assert any(
+            record.levelname == "WARNING" and "malformed" in record.message
+            and "id" in record.message and "content" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 2, 10])
+    @pytest.mark.parametrize("offset", [0, 1])
+    def test_audit_scan_all_scratchpad_without_source_column(self, temp_db, batch_size, offset):
+        """Every page preserves real row IDs, without gaps, duplicates or writes."""
+        db_path, beam = temp_db
+        beam.conn.execute("DELETE FROM scratchpad")
+        beam.conn.executemany(
+            "INSERT INTO scratchpad (id, content, session_id) VALUES (?, ?, ?)",
+            [(f"scratch-{i}", "heartbeat", "test") for i in range(5)],
+        )
+        beam.conn.commit()
+        before = beam.conn.execute("SELECT id, content, session_id FROM scratchpad ORDER BY id").fetchall()
+        report = audit_noise(
+            db_path=db_path, tables=["scratchpad"], scan_all=True,
+            offset=offset, batch_size=batch_size, min_score=0.0,
+        )
+        expected = {f"scratch-{i}" for i in range(5 - offset)}
+        assert report.total_scanned == 5 - offset
+        assert report.summary["table_counts"]["scratchpad"] == 5 - offset
+        ids = [candidate.memory_id for candidate in report.candidates]
+        assert set(ids) == expected and len(ids) == len(expected)
+        assert all(c.content_preview == "heartbeat" for c in report.candidates)
+        assert all(c.noise_score == 0.8 for c in report.candidates)
+        assert all(c.content_length == 9 for c in report.candidates)
+        assert beam.conn.execute("SELECT id, content, session_id FROM scratchpad ORDER BY id").fetchall() == before
+
+    @pytest.mark.parametrize("batch_size", [1, 2, 10])
+    @pytest.mark.parametrize("offset", [0, 1])
+    def test_audit_minimal_columns_keep_content_and_optional_defaults(self, tmp_path, batch_size, offset):
+        """Minimal tables retain authentic text and established metadata defaults."""
+        db_path = tmp_path / "minimal.db"
+        fixture = [
+            ("row-0", "heartbeat", 0.8),
+            ("row-1", "Storage handshake traces are retained for audit.", 0.0),
+            ("row-2", "ping", 0.8),
+            ("row-3", "Deployment architecture uses one writer.", 0.0),
+            ("row-4", "ok", 0.8),
+        ]
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("CREATE TABLE minimal (id TEXT PRIMARY KEY, content TEXT)")
+            conn.executemany("INSERT INTO minimal VALUES (?, ?)", [(i, text) for i, text, _ in fixture])
+            conn.commit()
+            assert hygiene_module._scan_table(conn, "minimal", 1) == [{
+                "id": "row-4", "content": "ok", "source": "", "timestamp": "",
+                "session_id": "", "importance": 0.5,
+            }]
+        report = audit_noise(db_path, tables=["minimal"], scan_all=True,
+                             batch_size=batch_size, offset=offset, min_score=0.0)
+        expected = {i: (text, score) for i, text, score in fixture[:5-offset]}
+        assert report.total_scanned == len(expected)
+        assert len(report.candidates) == len(expected)
+        assert {c.memory_id for c in report.candidates} == set(expected)
+        for candidate in report.candidates:
+            text, score = expected[candidate.memory_id]
+            assert (candidate.content_preview, candidate.noise_score) == (text, score)
+            assert candidate.content_length == len(text)
+            assert (candidate.source, candidate.timestamp, candidate.importance) == ("", "", 0.5)
+
+    def test_audit_populated_optional_metadata_is_preserved(self, tmp_path):
+        """Existing metadata drives scores and is never replaced by fallback values."""
+        db_path = tmp_path / "metadata.db"
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("CREATE TABLE complete (id TEXT, content TEXT, source TEXT, timestamp TEXT, session_id TEXT, importance REAL)")
+            conn.executemany("INSERT INTO complete VALUES (?, ?, ?, ?, ?, ?)", [
+                ("a", "Storage handshake traces retained.", "manual", "2026-01-01", "session-a", 0.1),
+                ("b", "Storage handshake traces retained.", "cron", "2026-01-02", "session-b", 0.9),
+            ])
+            conn.commit()
+            assert hygiene_module._scan_table(conn, "complete", 10) == [
+                {"id": "b", "content": "Storage handshake traces retained.", "source": "cron",
+                 "timestamp": "2026-01-02", "session_id": "session-b", "importance": 0.9},
+                {"id": "a", "content": "Storage handshake traces retained.", "source": "manual",
+                 "timestamp": "2026-01-01", "session_id": "session-a", "importance": 0.1},
+            ]
+        report = audit_noise(db_path, tables=["complete"], scan_all=True, batch_size=1, min_score=0.0)
+        actual = {c.memory_id: (c.source, c.timestamp, c.importance, c.noise_score) for c in report.candidates}
+        assert actual == {"a": ("manual", "2026-01-01", 0.1, 0.5), "b": ("cron", "2026-01-02", 0.9, 0.7)}
+
     def test_audit_offset_and_scan_all(self, temp_db):
         db_path, beam = temp_db
         for idx in range(3):
