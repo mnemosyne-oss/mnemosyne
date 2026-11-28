@@ -80,6 +80,40 @@ def _orphan_cutoff() -> str:
     ).isoformat()
 
 
+_SUMMARY_SOURCE_IDS_KEY = "_mnemosyne_summary_source_ids_v1"
+
+
+def _structured_summary_ids(metadata_json: Optional[str]) -> Tuple[str, ...]:
+    """Read the explicit source list from a summary's metadata."""
+    if not isinstance(metadata_json, str) or _SUMMARY_SOURCE_IDS_KEY not in metadata_json:
+        return ()
+    try:
+        metadata = json.loads(metadata_json)
+    except (ValueError, RecursionError):
+        return ()
+    ids = metadata.get(_SUMMARY_SOURCE_IDS_KEY) if isinstance(metadata, dict) else None
+    if not isinstance(ids, list) or not all(isinstance(item, str) and item for item in ids):
+        return ()
+    return tuple(ids)
+
+
+def _summary_source_ids(summary_of: Optional[str], metadata_json: Optional[str]) -> Tuple[str, ...]:
+    """Read exact source IDs, falling back to historical CSV for recall."""
+    return _structured_summary_ids(metadata_json) or tuple(
+        token.strip() for token in (summary_of or "").split(",") if token.strip()
+    )
+
+
+def _structured_summary_has_source(
+    metadata_json: Optional[str], source: str, sole: int,
+) -> Optional[bool]:
+    """Match a source for SQL, returning NULL when structured links are absent."""
+    ids = _structured_summary_ids(metadata_json)
+    if not ids:
+        return None
+    return all(item == source for item in ids) if sole else source in ids
+
+
 def _claim_completed_sql(alias: str) -> str:
     """SQL predicate: a summary completed THIS claim of working row ``alias``.
 
@@ -102,7 +136,9 @@ def _claim_completed_sql(alias: str) -> str:
     """
     return (
         "EXISTS (SELECT 1 FROM episodic_memory em "
-        f"WHERE instr(',' || COALESCE(em.summary_of, '') || ',', ',' || {alias}.id || ',') > 0 "
+        f"WHERE COALESCE(CASE WHEN instr(em.metadata_json, '{_SUMMARY_SOURCE_IDS_KEY}') > 0 "
+        f"THEN mnemosyne_summary_has_source(em.metadata_json, {alias}.id, 0) END, "
+        f"instr(',' || COALESCE(em.summary_of, '') || ',', ',' || {alias}.id || ',') > 0) "
         "AND (em.created_at IS NULL "
         f"OR datetime(em.created_at) >= datetime({alias}.consolidation_claimed_at)))"
     )
@@ -112,11 +148,14 @@ def _claim_completed_sql(alias: str) -> str:
 # non-text or unparseable expiry values keep the existing consolidation path.
 # Require a calendar date so bare Julian numbers and time-only strings do not
 # count as expirations. Bind the selection time first and the orphan cutoff second.
-_SLEEP_ELIGIBLE_SQL = (
+_SLEEP_SOURCE_ACTIVE_SQL = (
     "superseded_by IS NULL "
     "AND (typeof(valid_until) <> 'text' "
     "OR date(substr(valid_until, 1, 10)) IS NOT substr(valid_until, 1, 10) "
-    "OR COALESCE(julianday(valid_until) > julianday(?), 1)) "
+    "OR COALESCE(julianday(valid_until) > julianday(?), 1))"
+)
+_SLEEP_ELIGIBLE_SQL = (
+    f"{_SLEEP_SOURCE_ACTIVE_SQL} "
     "AND (consolidated_at IS NULL OR ("
     "consolidation_claimed_at IS NOT NULL AND consolidation_claimed_at < ? "
     f"AND NOT {_claim_completed_sql('working_memory')}))"
@@ -2373,6 +2412,9 @@ class _BeamConnection(sqlite3.Connection):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.create_function(
+            "mnemosyne_summary_has_source", 3, _structured_summary_has_source, deterministic=True,
+        )
         self._defer_commit = False
         self._savepoint_counter = 0
         self._vec_working_count_cache: Optional[Tuple[int, int, int]] = None
@@ -7821,7 +7863,9 @@ class BeamMemory:
         """
         Mark a memory as invalid/superseded.
         If replacement_id is provided, sets superseded_by.
-        Otherwise sets valid_until to now (immediate expiry).
+        Otherwise sets valid_until to now (immediate expiry). Active episodic
+        summaries whose sole source is the invalidated working row expire in
+        the same transaction.
 
         `bank` binds the supersession to a single table (`working_memory` or
         `episodic_memory`) when id values are shared across banks: without it,
@@ -7833,115 +7877,95 @@ class BeamMemory:
         """
         if bank is not None and bank not in ("working_memory", "episodic_memory"):
             raise ValueError(f"invalid bank: {bank!r}")
+        if replacement_id and replacement_id == memory_id:
+            return False
+
         cursor = self.conn.cursor()
-        if replacement_id:
-            if replacement_id == memory_id:
-                return False
+        owns_transaction = not self.conn.in_transaction
+        targets = (bank,) if bank is not None else ("working_memory", "episodic_memory")
+        # Legacy CSV containing a comma may encode a single literal ID or
+        # several references. Only retire a row if its sole source is certain.
+        structured_match = (
+            f"(CASE WHEN instr(metadata_json, '{_SUMMARY_SOURCE_IDS_KEY}') > 0 "
+            "THEN mnemosyne_summary_has_source(metadata_json, :source, 1) END)"
+        )
+        sole_source = (
+            f"COALESCE({structured_match}, "
+            "summary_of = :source AND instr(summary_of, ',') = 0 AND summary_of <> '')"
+        )
+        # A replacement should also be rejected if an ambiguous legacy row
+        # could have been derived solely from the source being invalidated.
+        possible_legacy_source = (
+            f"({structured_match} IS NULL AND instr(summary_of, ',') > 0 AND (summary_of = :source OR "
+            "(instr(:source, ',') = 0 AND replace(',' || summary_of, ',' || :source, '') = '')))"
+        )
+        with _guarded_transaction(self.conn):
+            # Lock before checking a replacement so its validity cannot change
+            # between the lookup and the write. A caller-owned transaction
+            # keeps control of the commit via the guarded savepoint.
+            if replacement_id and owns_transaction:
+                cursor.execute("BEGIN IMMEDIATE")
 
-            # The replacement lookup and target update are one write
-            # transaction. For a direct call, BEGIN IMMEDIATE obtains
-            # SQLite's write lock before validation, so another connection
-            # cannot delete a replacement between validation and the link
-            # update. A batch may already own a transaction after earlier
-            # DML; do not begin, commit, or roll back that caller-owned
-            # transaction here.
-            owns_transaction = not self.conn.in_transaction
-
-            def validate_and_invalidate() -> bool:
-                now = datetime.now(timezone.utc).isoformat()
-                # Both the replacement and the target must still be ACTIVE
-                # (not superseded, not expired): a concurrent resolver may have
-                # superseded either between our scan and this write, and we must
-                # not overwrite an existing successor.
-                # ``julianday`` parses offset-bearing values chronologically:
-                # a lexical ``>`` would judge ``18:30+07:00`` (11:30Z, already
-                # expired) later than a naive ``12:00`` now because its digits
-                # sort after it. Same predicate shape as the julianday-based
-                # surfaces above.
-                active = (
-                    "AND superseded_by IS NULL "
-                    "AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))"
-                )
-                replacement_found = False
+            now = datetime.now(timezone.utc).isoformat()
+            # Compare timestamps chronologically, including offsets.
+            active = (
+                "AND superseded_by IS NULL "
+                "AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))"
+            )
+            target_where = "id = ? AND (session_id = ? OR scope = 'global')"
+            target_params = (now, replacement_id, memory_id, self.session_id)
+            if replacement_id:
                 for table in ("working_memory", "episodic_memory"):
                     cursor.execute(
-                        f"""
-                        SELECT 1 FROM {table}
-                        WHERE id = ? AND (session_id = ? OR scope = 'global') {active}
-                        LIMIT 1
-                        """,
+                        f"""SELECT 1 FROM {table}
+                            WHERE id = ? AND (session_id = ? OR scope = 'global') {active}
+                            LIMIT 1""",
                         (replacement_id, self.session_id, now),
                     )
                     if cursor.fetchone() is not None:
-                        replacement_found = True
                         break
-                if not replacement_found:
-                    return False
-
-                if bank is not None:
-                    cursor.execute(
-                        f"UPDATE {bank} "
-                        f"SET valid_until = ?, superseded_by = ? "
-                        f"WHERE id = ? AND (session_id = ? OR scope = 'global') {active}",
-                        (now, replacement_id, memory_id, self.session_id, now),
-                    )
-                    return cursor.rowcount > 0
-                cursor.execute(
-                    f"UPDATE working_memory "
-                    f"SET valid_until = ?, superseded_by = ? "
-                    f"WHERE id = ? AND (session_id = ? OR scope = 'global') {active}",
-                    (now, replacement_id, memory_id, self.session_id, now),
-                )
-                if cursor.rowcount == 0:
-                    cursor.execute(
-                        f"UPDATE episodic_memory "
-                        f"SET valid_until = ?, superseded_by = ? "
-                        f"WHERE id = ? AND (session_id = ? OR scope = 'global') {active}",
-                        (now, replacement_id, memory_id, self.session_id, now),
-                    )
-                return cursor.rowcount > 0
-
-            if owns_transaction:
-                with _guarded_transaction(self.conn):
-                    cursor.execute("BEGIN IMMEDIATE")
-                    invalidated = validate_and_invalidate()
-            else:
-                invalidated = validate_and_invalidate()
-            if invalidated and not defer_cache_invalidation:
-                if owns_transaction:
-                    self._invalidate_query_cache_after_commit("invalidate")
                 else:
-                    self._invalidate_query_cache()
-            return invalidated
+                    return False
+                target_where = f"{target_where} {active}"
+                target_params += (now,)
+                if table == "episodic_memory" and "working_memory" in targets:
+                    dependent = cursor.execute(
+                        f"""SELECT 1 FROM episodic_memory
+                            WHERE id = :replacement AND ({sole_source} OR {possible_legacy_source})""",
+                        {"replacement": replacement_id, "source": memory_id},
+                    ).fetchone()
+                    if dependent and cursor.execute(
+                        f"SELECT 1 FROM working_memory WHERE {target_where}", target_params[2:],
+                    ).fetchone():
+                        return False
 
-        # The no-replacement path mutates a single row directly.  Snapshot
-        # ownership before its first UPDATE: a caller-owned transaction must
-        # retain both its commit boundary and cache-failure rollback behavior.
-        owns_transaction = not self.conn.in_transaction
-        now = datetime.now(timezone.utc).isoformat()
-        # With a bank binding, touch only that table; otherwise try
-        # working_memory first, then episodic_memory.
-        targets = (bank,) if bank is not None else ("working_memory", "episodic_memory")
-        invalidated = False
-        for table in targets:
-            cursor.execute(
-                f"""UPDATE {table}
-                    SET valid_until = ?, superseded_by = ?
-                    WHERE id = ? AND (session_id = ? OR scope = 'global')
-                """,
-                (now, replacement_id, memory_id, self.session_id),
-            )
-            if cursor.rowcount > 0:
-                invalidated = True
-                break
-        if owns_transaction:
-            self.conn.commit()
-        if invalidated and not defer_cache_invalidation:
+            for table in targets:
+                cursor.execute(
+                    f"UPDATE {table} SET valid_until = ?, superseded_by = ? WHERE {target_where}",
+                    target_params,
+                )
+                if cursor.rowcount > 0:
+                    if table == "working_memory":
+                        cursor.execute(
+                            f"""UPDATE episodic_memory SET valid_until = :now
+                                WHERE {sole_source} AND superseded_by IS NULL
+                                  AND (valid_until IS NULL OR julianday(valid_until) > julianday(:now))""",
+                            {"source": memory_id, "now": now},
+                        )
+                    break
+            else:
+                return False
+
+        if not defer_cache_invalidation:
             if owns_transaction:
                 self._invalidate_query_cache_after_commit("invalidate")
             else:
                 self._invalidate_query_cache()
-        return invalidated
+                # A reader can refill the cache before the outer commit.
+                self.conn._after_commit_hooks.append(
+                    lambda: self._invalidate_query_cache_after_commit("invalidate")
+                )
+        return True
 
     def _embedding_map(self, memory_ids: List[str]) -> Dict[str, np.ndarray]:
         """Load float32 embeddings for memory ids.
@@ -8604,10 +8628,10 @@ class BeamMemory:
     # Episodic Memory
     # ------------------------------------------------------------------
     def _require_sleep_claim(self, ids, stamp: str) -> None:
-        """Raise _SleepClaimLost unless every id still holds claim ``stamp``.
+        """Verify the claim and recheck a single source before publication.
 
-        Takes the write lock first so the check and the caller's following
-        write are one atomic step: nothing can re-stamp a claim in between.
+        Takes the write lock first so the checks and the caller's following
+        write are one atomic step.
         """
         if not self.conn.in_transaction:
             self.conn.execute("BEGIN IMMEDIATE")
@@ -8624,6 +8648,16 @@ class BeamMemory:
             raise _SleepClaimLost(
                 f"{len(wanted) - owned} of {len(wanted)} rows no longer carry claim {stamp}"
             )
+
+        if len(wanted) == 1:
+            # The source can be invalidated after it is claimed but before
+            # the summarizer returns. Avoid publishing its derived content.
+            active = self.conn.execute(
+                f"SELECT 1 FROM working_memory WHERE id = ? AND {_SLEEP_SOURCE_ACTIVE_SQL}",
+                (wanted[0], datetime.now(timezone.utc).isoformat()),
+            ).fetchone()
+            if active is None:
+                raise _SleepClaimLost("the sole source is no longer active")
 
     def _claim_sleep_rows(self, rows, stamp: str) -> set:
         """Take ownership of ``rows`` for one sleep pass; return the ids won.
@@ -8745,6 +8779,19 @@ class BeamMemory:
         )
         if not should_write:
             return None
+
+        source_wm_ids = list(dict.fromkeys(source_wm_ids))
+        summary_metadata = dict(metadata or {})
+        summary_metadata.pop(_SUMMARY_SOURCE_IDS_KEY, None)
+        summary_of = ",".join(source_wm_ids)
+        if "," in summary_of:
+            # The metadata field round-trips through export and sync. Record
+            # the exact list whenever CSV alone would be ambiguous.
+            summary_metadata[_SUMMARY_SOURCE_IDS_KEY] = source_wm_ids
+            if any("," in source_id for source_id in source_wm_ids):
+                # Older readers can still parse the ordinary CSV form.
+                # Omit it when it would split a literal ID.
+                summary_of = ""
 
         # Caller-owned transaction gate (round-4): the MEMORY_CONSOLIDATED
         # event must never precede the commit that persists the row. Under
@@ -8873,7 +8920,7 @@ class BeamMemory:
                  author_id, author_type, channel_id, memory_type, veracity, tier)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (memory_id, _sanitize_utf8(summary), source, timestamp, self.session_id, importance,
-                  json.dumps(metadata or {}), ",".join(source_wm_ids), valid_until, scope,
+                  json.dumps(summary_metadata), summary_of, valid_until, scope,
                   self.author_id, self.author_type, self.channel_id, ep_type, row_veracity, row_tier))
             rowid = cursor.lastrowid
 
@@ -11344,18 +11391,22 @@ class BeamMemory:
                         "tool": TOOL_WEIGHT, "imported": IMPORTED_WEIGHT,
                         "unknown": UNKNOWN_WEIGHT}
         em_ids_for_tier = [r["id"] for r in results if r.get("tier") == "episodic"]
-        # E3.a.3: pull summary_of in the same round trip so the dedup
+        # E3.a.3: pull source links in the same round trip so the dedup
         # helper can use a precomputed map instead of issuing a second
         # SELECT for the same ep ids.
-        ep_summary_of_map: Dict[str, str] = {}
+        ep_summary_of_map: Dict[str, Tuple[str, ...]] = {}
         if em_ids_for_tier:
             tier_rows = _select_recall_rows_by_ids(
-                self.conn, "SELECT id, tier, veracity, summary_of FROM episodic_memory WHERE id IN ({placeholders})",
+                self.conn,
+                "SELECT id, tier, veracity, summary_of, metadata_json FROM episodic_memory WHERE id IN ({placeholders})",
                 em_ids_for_tier
             )
             tier_lookup = {r["id"]: (r["tier"] or 1) for r in tier_rows}
             veracity_lookup = {r["id"]: (r["veracity"] or "unknown") for r in tier_rows}
-            ep_summary_of_map = {r["id"]: (r["summary_of"] or "") for r in tier_rows}
+            ep_summary_of_map = {
+                row["id"]: _summary_source_ids(row["summary_of"], row["metadata_json"])
+                for row in tier_rows
+            }
             # A/B toggle: `MNEMOSYNE_VERACITY_MULTIPLIER=0` short-circuits
             # the multiplier so ranking depends on hybrid score alone.
             # Useful for Phase 0/1 ablation in the BEAM-recovery
@@ -11407,7 +11458,7 @@ class BeamMemory:
         # duplicates before top-K truncation and recall_count attribution.
         # Post-E3 additive sleep leaves originals alongside summaries, so
         # a query matching both compounds recall_count twice per fact.
-        # Pass the precomputed summary_of map from the tier-lookup
+        # Pass the precomputed source map from the tier-lookup
         # SELECT above so the helper doesn't issue a redundant query.
         results = self._dedup_cross_tier_summary_links(
             results, ep_summary_of_map=ep_summary_of_map
@@ -11836,6 +11887,31 @@ class BeamMemory:
         # recognition keys off that exact prefix.
         return "v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
+    def _cached_recall_rows_active(self, results: List[Dict]) -> bool:
+        """Validate cached working and episodic hits against the memory bank.
+
+        Other connections can retain an in-memory hit or finish persisting a
+        pre-commit result after the writer clears the shared cache database.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        for tier in ("working", "episodic"):
+            ids = {row["id"] for row in results if row.get("tier") == tier}
+            if not ids:
+                continue
+            try:
+                active = _select_recall_rows_by_ids(
+                    self.conn,
+                    f"""SELECT id FROM {tier}_memory WHERE id IN ({{placeholders}})
+                        AND superseded_by IS NULL
+                        AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))""",
+                    ids, (now,),
+                )
+            except sqlite3.Error:
+                return False
+            if len(active) != len(ids):
+                return False
+        return True
+
     @_embeddings._embedding_cap_snapshot()
     def recall_enhanced(self, query: str, top_k: int = 40, *,
                         use_cache: bool = True,
@@ -11949,7 +12025,7 @@ class BeamMemory:
                 self._query_cache = QueryCache(db_path=cache_db)
             cached = self._query_cache.get_opaque(cache_key)
 
-        if cached is not None:
+        if cached is not None and self._cached_recall_rows_active(cached):
             # ``top_k`` is part of the v2 digest, so truncating here would
             # make a hit differ from the cached pipeline result (notably when
             # associative retrieval appends related memories after top-k).
@@ -12061,7 +12137,7 @@ class BeamMemory:
         self,
         results: List[Dict],
         *,
-        ep_summary_of_map: Optional[Dict[str, str]] = None,
+        ep_summary_of_map: Optional[Dict[str, Tuple[str, ...]]] = None,
     ) -> List[Dict]:
         """E3.a.3: drop the lower-scored side of any (episodic_summary,
         working_memory_sources) cluster where both surface in the same recall.
@@ -12074,7 +12150,7 @@ class BeamMemory:
         logical fact -- the row's history boost double-counts on every call.
 
         Dedup rule (per-cluster, not per-edge):
-          - For each episodic row with non-empty `summary_of`, collect the
+          - For each episodic row with source links, collect the
             wm_ids it covers that are also present in `results`.
           - If the ep's score is >= the score of EVERY covered wm in
             results, drop those wms and keep the ep (summary wins the
@@ -12103,14 +12179,14 @@ class BeamMemory:
 
         Args:
             results: scored row dicts; each carries `id`, `tier`, `score`.
-            ep_summary_of_map: optional precomputed `{ep_id: summary_of_str}`
+            ep_summary_of_map: optional precomputed `{ep_id: source_ids}`
                 from a caller that already SELECT-ed `episodic_memory`
                 rows. When provided, skips the helper's own SELECT -- keeps
                 a single source of truth and avoids one round-trip per
                 recall on paths that have already fetched the data.
 
         Caller pattern: linear path passes the tier-lookup SELECT's
-        precomputed `summary_of` rows; polyphonic path lets the helper
+        precomputed source links; the polyphonic path lets the helper
         do its own SELECT since it has no prior per-ep query.
 
         Caveats:
@@ -12139,18 +12215,17 @@ class BeamMemory:
         summary_map: Dict[str, set] = {}
         if ep_summary_of_map is not None:
             for ep_id in ep_ids:
-                raw = ep_summary_of_map.get(ep_id) or ""
-                wm_ids = {s.strip() for s in raw.split(",") if s.strip()}
+                wm_ids = set(ep_summary_of_map.get(ep_id, ()))
                 if wm_ids:
                     summary_map[ep_id] = wm_ids
         else:
             rows = _select_recall_rows_by_ids(
-                self.conn, "SELECT id, summary_of FROM episodic_memory WHERE id IN ({placeholders})",
+                self.conn,
+                "SELECT id, summary_of, metadata_json FROM episodic_memory WHERE id IN ({placeholders})",
                 ep_ids,
             )
             for row in rows:
-                raw = row["summary_of"] or ""
-                wm_ids = {s.strip() for s in raw.split(",") if s.strip()}
+                wm_ids = set(_summary_source_ids(row["summary_of"], row["metadata_json"]))
                 if wm_ids:
                     summary_map[row["id"]] = wm_ids
 
@@ -13324,7 +13399,7 @@ class BeamMemory:
         writes the episodic summary. A process crash in that narrow window can
         leave rows permanently skipped by later sleep() runs. This maintenance
         helper finds old claims whose id does not appear in any
-        ``episodic_memory.summary_of`` CSV token written at or after the claim
+        episodic source link written at or after the claim
         and clears the marker so a later sleep pass can summarize them. A
         summary of an EARLIER claim of the same row does not count as
         completion.
@@ -14033,12 +14108,11 @@ class BeamMemory:
                         }
                     )
                 except _SleepClaimLost:
-                    # Another pass recovered this claim while we were
-                    # summarizing. It owns the rows now: write nothing and
-                    # leave its claim marker alone.
+                    # An invalidation or another pass can make the claimed
+                    # input stale while the summarizer is running.
                     logger.warning(
-                        "sleep: claim %s on %d row(s) was recovered by another "
-                        "pass; discarding this summary", claim_stamp, len(ids),
+                        "sleep: claim %s on %d row(s) no longer allows publication; "
+                        "discarding this summary", claim_stamp, len(ids),
                     )
                     claims_lost += 1
                     continue
