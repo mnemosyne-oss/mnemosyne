@@ -7844,6 +7844,14 @@ class BeamMemory:
         cursor = self.conn.cursor()
         owns_transaction = not self.conn.in_transaction
         targets = (bank,) if bank is not None else ("working_memory", "episodic_memory")
+        # Prefixing the CSV with a comma lets replace() remove consecutive
+        # legacy references without consuming their neighboring separators.
+        # A different token that starts with the same ID leaves a suffix.
+        sole_source = (
+            "instr(:source, ',') = 0 AND (summary_of = :source OR "
+            "(instr(summary_of, ',') > 0 AND "
+            "replace(',' || summary_of, ',' || :source, '') = ''))"
+        )
         with _guarded_transaction(self.conn):
             # Lock before checking a replacement so its validity cannot change
             # between the lookup and the write. A caller-owned transaction
@@ -7873,6 +7881,15 @@ class BeamMemory:
                     return False
                 target_where = f"{target_where} {active}"
                 target_params += (now,)
+                if table == "episodic_memory" and "working_memory" in targets:
+                    dependent = cursor.execute(
+                        f"SELECT 1 FROM episodic_memory WHERE id = :replacement AND {sole_source}",
+                        {"replacement": replacement_id, "source": memory_id},
+                    ).fetchone()
+                    if dependent and cursor.execute(
+                        f"SELECT 1 FROM working_memory WHERE {target_where}", target_params[2:],
+                    ).fetchone():
+                        return False
 
             for table in targets:
                 cursor.execute(
@@ -7881,11 +7898,11 @@ class BeamMemory:
                 )
                 if cursor.rowcount > 0:
                     if table == "working_memory":
-                        # summary_of is a comma-separated list. Exact equality
-                        # selects just the summaries wholly derived from this row.
                         cursor.execute(
-                            f"UPDATE episodic_memory SET valid_until = ? WHERE summary_of = ? {active}",
-                            (now, memory_id, now),
+                            f"""UPDATE episodic_memory SET valid_until = :now
+                                WHERE {sole_source} AND superseded_by IS NULL
+                                  AND (valid_until IS NULL OR julianday(valid_until) > julianday(:now))""",
+                            {"source": memory_id, "now": now},
                         )
                     break
             else:
@@ -7896,6 +7913,10 @@ class BeamMemory:
                 self._invalidate_query_cache_after_commit("invalidate")
             else:
                 self._invalidate_query_cache()
+                # A reader can refill the cache before the outer commit.
+                self.conn._after_commit_hooks.append(
+                    lambda: self._invalidate_query_cache_after_commit("invalidate")
+                )
         return True
 
     def _embedding_map(self, memory_ids: List[str]) -> Dict[str, np.ndarray]:
@@ -8710,6 +8731,8 @@ class BeamMemory:
         )
         if not should_write:
             return None
+
+        source_wm_ids = list(dict.fromkeys(source_wm_ids))
 
         # Caller-owned transaction gate (round-4): the MEMORY_CONSOLIDATED
         # event must never precede the commit that persists the row. Under
@@ -11801,6 +11824,31 @@ class BeamMemory:
         # recognition keys off that exact prefix.
         return "v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
+    def _cached_recall_rows_active(self, results: List[Dict]) -> bool:
+        """Validate cached working and episodic hits against the memory bank.
+
+        Other connections can retain an in-memory hit or finish persisting a
+        pre-commit result after the writer clears the shared cache database.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        for tier in ("working", "episodic"):
+            ids = {row["id"] for row in results if row.get("tier") == tier}
+            if not ids:
+                continue
+            try:
+                active = _select_recall_rows_by_ids(
+                    self.conn,
+                    f"""SELECT id FROM {tier}_memory WHERE id IN ({{placeholders}})
+                        AND superseded_by IS NULL
+                        AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))""",
+                    ids, (now,),
+                )
+            except sqlite3.Error:
+                return False
+            if len(active) != len(ids):
+                return False
+        return True
+
     @_embeddings._embedding_cap_snapshot()
     def recall_enhanced(self, query: str, top_k: int = 40, *,
                         use_cache: bool = True,
@@ -11914,7 +11962,7 @@ class BeamMemory:
                 self._query_cache = QueryCache(db_path=cache_db)
             cached = self._query_cache.get_opaque(cache_key)
 
-        if cached is not None:
+        if cached is not None and self._cached_recall_rows_active(cached):
             # ``top_k`` is part of the v2 digest, so truncating here would
             # make a hit differ from the cached pipeline result (notably when
             # associative retrieval appends related memories after top-k).

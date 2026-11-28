@@ -1,6 +1,8 @@
 """Invalidating a sole working source retires its existing summaries."""
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import pytest
 
@@ -176,23 +178,171 @@ def test_sleep_discards_summary_when_its_sole_source_is_invalidated_during_summa
     old = memory.remember(WORKING, source="note")
     calls = []
 
-    def summarize(lines, **kwargs):
-        claim, = memory.conn.execute(
-            "SELECT consolidation_claimed_at FROM working_memory WHERE id = ?", (old,)
-        ).fetchone()
-        assert claim is not None
-        assert memory.invalidate(old)
-        calls.append(lines)
-        return SUMMARY
+    sleep_connection = memory.conn
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        writer = executor.submit(BeamMemory, session_id=memory.session_id, db_path=memory.db_path).result(5)
 
-    monkeypatch.setattr(local_llm, "llm_available", lambda: True)
-    monkeypatch.setattr(local_llm, "chunk_memories_by_budget", lambda lines, **kwargs: [lines])
-    monkeypatch.setattr(local_llm, "_summarize_memories", summarize)
+        def invalidate_on_other_connection():
+            assert writer.conn is not sleep_connection
+            writer.conn.execute("PRAGMA busy_timeout=250")
+            claim, = writer.conn.execute(
+                "SELECT consolidation_claimed_at FROM working_memory WHERE id = ?", (old,)
+            ).fetchone()
+            assert claim is not None
+            return writer.invalidate(old)
 
-    memory.sleep(force=True, _fleet_census=False)
+        def summarize(lines, **kwargs):
+            assert executor.submit(invalidate_on_other_connection).result(5)
+            calls.append(lines)
+            return SUMMARY
+
+        monkeypatch.setattr(local_llm, "llm_available", lambda: True)
+        monkeypatch.setattr(local_llm, "chunk_memories_by_budget", lambda lines, **kwargs: [lines])
+        monkeypatch.setattr(local_llm, "_summarize_memories", summarize)
+
+        result = memory.sleep(force=True, _fleet_census=False)
 
     assert len(calls) == 1
+    assert result["claims_lost"] == 1
     assert _state(memory, "working_memory", old)[0] is not None
     assert memory.conn.execute(
         "SELECT 1 FROM episodic_memory WHERE summary_of=?", (old,)
     ).fetchone() is None
+
+
+@pytest.mark.parametrize("repeated", [False, True], ids=["single-reference", "legacy-repeated"])
+def test_rejects_own_episodic_summary_as_replacement(memory, repeated):
+    old = memory.remember(WORKING, source="note")
+    dependent = _episode(memory, SUMMARY, old)
+    independent = _episode(memory, "The Atlas office has relocated to Denver.")
+    if repeated:
+        memory.conn.execute(
+            "UPDATE episodic_memory SET summary_of=? WHERE id=?", (f"{old},{old}", dependent),
+        )
+        memory.conn.commit()
+
+    assert not memory.invalidate(old, replacement_id=dependent)
+    assert _state(memory, "working_memory", old) == (None, None)
+    assert _state(memory, "episodic_memory", dependent) == (None, None)
+
+    assert memory.invalidate(old, replacement_id=independent)
+    stamp, successor = _state(memory, "working_memory", old)
+    assert stamp is not None and successor == independent
+    assert _state(memory, "episodic_memory", dependent) == (stamp, None)
+    assert _state(memory, "episodic_memory", independent) == (None, None)
+
+
+def test_preserves_source_order_and_retires_legacy_repeated_sole_source(memory):
+    old = memory.remember(WORKING, source="note", memory_id="atlas")
+    other = memory.remember("Badge pickup is at the Saffron Atrium.", source="note", memory_id="atlas-north")
+    single = _episode(memory, SUMMARY, old, old)
+    mixed = _episode(memory, SUMMARY + " Pick up badges at the Saffron Atrium.", other, old, other)
+    legacy = _episode(memory, "Atlas office and its older waterfront location.", old)
+    prefix = _episode(memory, "Atlas north badge pickup.", other)
+    memory.conn.execute(
+        "UPDATE episodic_memory SET summary_of=? WHERE id=?", (f"{old},{old},{old}", legacy),
+    )
+    memory.conn.commit()
+
+    def provenance(ident):
+        return memory.conn.execute(
+            "SELECT summary_of FROM episodic_memory WHERE id=?", (ident,),
+        ).fetchone()[0]
+
+    assert provenance(single) == old
+    assert provenance(mixed) == f"{other},{old}"
+    assert memory.invalidate(old)
+    stamp, _ = _state(memory, "working_memory", old)
+    assert stamp is not None
+    assert _state(memory, "episodic_memory", single) == (stamp, None)
+    assert _state(memory, "episodic_memory", legacy) == (stamp, None)
+    assert _state(memory, "episodic_memory", mixed) == (None, None)
+    assert _state(memory, "episodic_memory", prefix) == (None, None)
+
+
+@pytest.mark.parametrize("commit", [False, True], ids=["rollback", "commit"])
+def test_successful_caller_owned_invalidation_uses_outer_transaction(memory, monkeypatch, commit):
+    old = memory.remember(WORKING, source="note")
+    summary = _episode(memory, SUMMARY, old)
+    invalidations = []
+    original = memory._invalidate_query_cache
+
+    def track_cache_invalidation():
+        invalidations.append(memory.conn.in_transaction)
+        original()
+
+    monkeypatch.setattr(memory, "_invalidate_query_cache", track_cache_invalidation)
+    memory.conn.execute("BEGIN")
+    assert memory.invalidate(old)
+    assert memory.conn.in_transaction
+    assert invalidations == [True]
+    stamp, _ = _state(memory, "working_memory", old)
+    assert stamp is not None
+    assert _state(memory, "episodic_memory", summary) == (stamp, None)
+    if commit:
+        memory.conn.commit()
+    else:
+        memory.conn.rollback()
+    assert invalidations == ([True, False] if commit else [True])
+    final = (stamp if commit else None, None)
+    assert _state(memory, "working_memory", old) == final
+    assert _state(memory, "episodic_memory", summary) == final
+
+
+@pytest.mark.parametrize("refill_after_commit", [False, True], ids=["before-commit", "late-write"])
+def test_enhanced_cache_drops_summary_from_concurrent_reader(
+    memory, monkeypatch, refill_after_commit,
+):
+    old = memory.remember(WORKING, source="note")
+    summary = _episode(memory, SUMMARY, old)
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+
+    def hits(instance):
+        return {row["id"] for row in instance.recall_enhanced(
+            QUERY, top_k=10, use_intent=False, use_synonyms=False,
+            use_mmr=False, use_weibull=False, _track_recall=False,
+        )}
+
+    ready, start, before_write, written, committed = (Event() for _ in range(5))
+    original_put = beam.QueryCache.put_opaque
+
+    def sync_put(cache, key, rows):
+        if any(row["id"] == summary for row in rows):
+            before_write.set()
+            if refill_after_commit:
+                assert committed.wait(5)
+        original_put(cache, key, rows)
+        written.set()
+
+    monkeypatch.setattr(beam.QueryCache, "put_opaque", sync_put)
+
+    def read_across_commit():
+        reader = BeamMemory(session_id=memory.session_id, db_path=memory.db_path)
+        ready.set()
+        assert start.wait(5)
+        assert summary in hits(reader)
+        assert committed.wait(5)
+        return hits(reader)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(read_across_commit)
+        try:
+            assert ready.wait(5)
+            memory.conn.execute("BEGIN")
+            assert memory.invalidate(old)
+            start.set()
+            assert before_write.wait(5)
+            if not refill_after_commit:
+                assert written.wait(5)
+            memory.conn.commit()
+        finally:
+            if memory.conn.in_transaction:
+                memory.conn.rollback()
+            committed.set()
+            start.set()
+
+        stale_reader = future.result(5)
+    assert summary not in stale_reader
+
+    fresh = BeamMemory(session_id=memory.session_id, db_path=memory.db_path)
+    assert summary not in hits(fresh)
