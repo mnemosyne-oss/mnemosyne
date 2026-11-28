@@ -137,6 +137,12 @@ results = mem.recall(
 )
 ```
 
+When polyphonic recall is enabled, `temporal_weight`, `query_time`, and
+`temporal_halflife` still apply as a post-fusion score boost. `vec_weight`,
+`fts_weight`, and `importance_weight` tune only the linear hybrid scorer;
+polyphonic recall fuses voice ranks instead, so those three knobs do not
+alter its ranking.
+
 Returns a list of dicts with keys: `id`, `content`, `score`, `source`, `timestamp`, `importance`, `scope`, `metadata`.
 
 **Examples:**

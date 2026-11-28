@@ -83,7 +83,12 @@ Both parsers accept `1`/`true`/`yes`/`on` (case-insensitive, whitespace-stripped
 
 | Variable | Default | Effect |
 |---|---|---|
-| `MNEMOSYNE_POLYPHONIC_RECALL` | unset (`0`) | When truthy, routes `BeamMemory.recall()` through `PolyphonicRecallEngine` (RRF fusion across vector / graph / fact / temporal voices + diversity rerank). When unset, uses the linear scorer with inline `graph_bonus` / `fact_bonus` / `binary_bonus` terms. Read at recall time, not init time -- can be toggled per-call by changing the env. |
+| `polyphonic_recall` (YAML), `MNEMOSYNE_POLYPHONIC_RECALL` (env fallback) | `false` (linear) | When enabled, routes `BeamMemory.recall()` through `PolyphonicRecallEngine` (RRF fusion across vector, graph, fact, and temporal voices plus diversity reranking). The linear scorer uses inline `graph_bonus`, `fact_bonus`, and `binary_bonus` terms. |
+
+Recall resolves the mode on each call using `config.yaml > environment > default`.
+For environment-driven A/B runs, use a configuration that omits `polyphonic_recall`.
+The dedicated linear throughput benchmark sets the fallback to `0` in an isolated
+temporary data directory and verifies the selected engine before measuring.
 
 **Linear vs polyphonic implement related signals via DIFFERENT mechanisms.** The linear path's `graph_bonus` is an edge-count LIKE-match on `graph_edges`. The polyphonic engine's `_graph_voice` does entity extraction + `find_facts_by_subject`. They have different failure modes; do not assume an ablation on one engine carries over to the other.
 
@@ -94,7 +99,7 @@ Both parsers accept `1`/`true`/`yes`/`on` (case-insensitive, whitespace-stripped
 | `MNEMOSYNE_VEC_WEIGHT` | `0.5` | Weight of vector similarity in the linear hybrid score. Normalized to sum to 1.0 with FTS + importance. |
 | `MNEMOSYNE_FTS_WEIGHT` | `0.4` | Weight of FTS5 score in the linear hybrid score. |
 | `MNEMOSYNE_IMPORTANCE_WEIGHT` | `0.1` | Weight of stored `importance` in the linear hybrid score. |
-| `MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS` | (caller arg) | Temporal-boost half-life for the linear path's `_temporal_boost`. Only active when caller passes `temporal_weight > 0`. |
+| `MNEMOSYNE_TEMPORAL_HALFLIFE_HOURS` | (caller arg) | Temporal-boost half-life for `_temporal_boost`. The linear path applies it inside hybrid scoring; the polyphonic path applies it after RRF fusion. Only active when caller passes `temporal_weight > 0`. |
 
 These three (`VEC` / `FTS` / `IMPORTANCE`) interact -- changing one alters the relative weight of the others. Treat as a triple to pin together.
 
@@ -209,7 +214,7 @@ High `fallback_rate` (>30%) on a benchmark run is a red flag -- it means most re
 
 Call `reset_recall_diagnostics()` at the start of each phase to keep counters clean per-run.
 
-> **Polyphonic recall caveat:** when `MNEMOSYNE_POLYPHONIC_RECALL=1`, recall delegates to the polyphonic engine and the linear-path recording block is bypassed. Since v3.16.0 the polyphonic branch records diagnostics itself, mapping engine voices to tiers (`vector`→`wm_vec`, `graph`→`em_vec`, `fact`→`em_fts`, `temporal`→`wm_fts`). The `by_tier` counters reflect that approximate mapping. `wm_fallback_rate` stays `0` on the polyphonic path because the engine has no substring-scoring tier for working memory; `em_fallback_rate` is real and reflects the vector voice's sqlite-vec → numpy full-scan degradation (sqlite-vec absent, failing, or its top-K ANN hits all filtered out). A nonzero `em_fallback_rate` under polyphonic recall means the vec index is not serving the recall and the engine is scanning the embeddings table directly.
+> **Polyphonic recall caveat:** when the resolved `polyphonic_recall` setting is enabled, recall delegates to the polyphonic engine and the linear-path recording block is bypassed. Since v3.16.0 the polyphonic branch records diagnostics itself, mapping engine voices to tiers (`vector`→`wm_vec`, `graph`→`em_vec`, `fact`→`em_fts`, `temporal`→`wm_fts`). The `by_tier` counters reflect that approximate mapping. `wm_fallback_rate` stays `0` on the polyphonic path because the engine has no substring-scoring tier for working memory; `em_fallback_rate` is real and reflects the vector voice's sqlite-vec → numpy full-scan degradation (sqlite-vec absent, failing, or its top-K ANN hits all filtered out). A nonzero `em_fallback_rate` under polyphonic recall means the vec index is not serving the recall and the engine is scanning the embeddings table directly.
 
 ### Extraction diagnostics
 

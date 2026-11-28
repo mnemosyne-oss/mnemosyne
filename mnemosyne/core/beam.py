@@ -10178,6 +10178,7 @@ class BeamMemory:
                importance_weight: float = None,
                explain: bool = False,
                _cross_session: Optional[bool] = None,
+               _polyphonic_recall: Optional[bool] = None,
                _skip_provenance: bool = False,
                _resolved_weights: Optional[_RecallWeightSnapshot] = None,
                exclude_captures: Optional[ExclusionSnapshot] = None,
@@ -10227,16 +10228,22 @@ class BeamMemory:
                 No content-global/session-global exclusion or time window.
                 Explicit recall without this opt-in argument is unchanged.
 
-        Polyphonic recall (E5, gated by MNEMOSYNE_POLYPHONIC_RECALL=1):
-            When the env flag is set to "1", recall delegates to
-            PolyphonicRecallEngine (mnemosyne/core/polyphonic_recall.py).
-            The engine runs 4 voices in parallel -- vector / graph /
-            fact / temporal -- fuses them via RRF (k=60) and diversity-
-            reranks the combined results. Each result dict carries
-            `voice_scores` for per-signal provenance.
+        Polyphonic recall (E5, resolved per call):
+            When enabled by config.yaml or the MNEMOSYNE_POLYPHONIC_RECALL
+            fallback, recall delegates to PolyphonicRecallEngine
+            (mnemosyne/core/polyphonic_recall.py). The engine runs 4 voices
+            in parallel -- vector / graph / fact / temporal -- fuses them
+            via RRF (k=60) and diversity-reranks the combined results. Each
+            result dict carries `voice_scores` for per-signal provenance.
 
-            Flag unset or "0" (default): the existing linear scorer
-            below runs unchanged. Zero behavior change for production.
+            temporal_weight, query_time, and temporal_halflife keep their
+            linear-path meaning and are applied as a post-fusion score boost.
+            vec_weight, fts_weight, and importance_weight tune only the
+            linear hybrid scorer; the polyphonic engine fuses voice ranks
+            instead, so those three knobs do not alter its ranking.
+
+            Disabled (default): the existing linear scorer below runs
+            unchanged. Zero behavior change for production.
         """
         cross_session = _cross_session_enabled() if _cross_session is None else _cross_session
 
@@ -10246,7 +10253,12 @@ class BeamMemory:
         # so the engine path enforces the same isolation/validity
         # contract as the linear path. /review found that omitting
         # them under flag=ON was a data-isolation regression (P1).
-        if os.environ.get("MNEMOSYNE_POLYPHONIC_RECALL", "0") == "1":
+        polyphonic_recall = (
+            resolve_beam_runtime().polyphonic_recall
+            if _polyphonic_recall is None
+            else _polyphonic_recall
+        )
+        if polyphonic_recall:
             poly_results = self._recall_polyphonic(
                 query, top_k,
                 from_date=from_date, to_date=to_date,
@@ -10254,6 +10266,9 @@ class BeamMemory:
                 author_id=author_id, author_type=author_type,
                 channel_id=channel_id,
                 veracity=veracity, memory_type=memory_type,
+                temporal_weight=temporal_weight,
+                query_time=query_time,
+                temporal_halflife=temporal_halflife,
                 cross_session=cross_session,
                 exclude_captures=exclude_captures,
                 _track_recall=_track_recall,
@@ -11664,8 +11679,9 @@ class BeamMemory:
     # 20: Bounded CJK supplement for linear working-memory recall.
     # 21: UTC-Z timestamps remain temporally eligible on Python 3.10.
     # 22: polyphonic voices return the requested top_k.
+    # 23: apply temporal scoring when YAML enables polyphonic recall.
     # Recheck the actual predecessor before each semantic integration.
-    _ENHANCED_RECALL_CACHE_VERSION = 22
+    _ENHANCED_RECALL_CACHE_VERSION = 23
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.
@@ -11811,7 +11827,7 @@ class BeamMemory:
                 "embedding_dimension": getattr(_embeddings, "EMBEDDING_DIM", None),
                 "embedding_query_prefix": os.environ.get("MNEMOSYNE_EMBEDDING_QUERY_PREFIX", ""),
                 "beam_optimizations": _BEAM_MODE,
-                "polyphonic_recall": os.environ.get("MNEMOSYNE_POLYPHONIC_RECALL", "0") == "1",
+                "polyphonic_recall": runtime.polyphonic_recall,
                 "query_intent": os.environ.get("MNEMOSYNE_QUERY_INTENT", "0") == "1",
                 "fact_recall": os.environ.get("MNEMOSYNE_FACT_RECALL_ENABLED", "0") == "1",
                 "lenient_fact_match": _env_truthy("MNEMOSYNE_LENIENT_FACT_MATCH"),
@@ -11960,6 +11976,7 @@ class BeamMemory:
             expanded_query,
             top_k=top_k * 2,
             _cross_session=runtime.cross_session,
+            _polyphonic_recall=runtime.polyphonic_recall,
             _resolved_weights=weight_snapshot,
             _skip_provenance=True,
             **kwargs,
@@ -12283,21 +12300,24 @@ class BeamMemory:
                            channel_id: Optional[str] = None,
                            veracity: Optional[str] = None,
                            memory_type: Optional[str] = None,
+                           temporal_weight: float = 0.0,
+                           query_time: Optional[Any] = None,
+                           temporal_halflife: Optional[float] = None,
                            cross_session: Optional[bool] = None,
                            exclude_captures: Optional[ExclusionSnapshot] = None,
                            _track_recall: bool = True) -> List[Dict]:
         """[E5] Polyphonic recall path.
 
-        Delegates to PolyphonicRecallEngine when MNEMOSYNE_POLYPHONIC_RECALL=1.
-        Engine runs vector + graph + fact + temporal voices, fuses via RRF,
-        and diversity-reranks. Maps PolyphonicResult objects back to
-        recall()'s dict shape.
+        Delegates to PolyphonicRecallEngine when the resolved
+        polyphonic_recall setting is enabled. Engine runs vector + graph +
+        fact + temporal voices, fuses via RRF, and diversity-reranks. Maps
+        PolyphonicResult objects back to recall()'s dict shape.
 
         Each result carries `voice_scores` for per-signal provenance.
         Engine's RRF combined_score lands in the `score` field; the
-        post-E4 veracity multiplier and tier-degradation multiplier
-        are then composed on top so flag=ON callers don't lose the
-        recent ranking work.
+        post-E4 veracity multiplier, tier-degradation multiplier, and
+        caller-requested temporal boost are then composed on top so
+        flag=ON callers don't lose the recent ranking work.
 
         Filters from the caller (session/scope/valid_until/superseded/
         author/channel/source/veracity/memory_type/from_date/to_date)
@@ -12324,6 +12344,8 @@ class BeamMemory:
                 query_embedding = None
 
         now_iso = datetime.now(timezone.utc).isoformat()
+        parsed_query_time = _parse_query_time(query_time)
+        th_halflife = _resolve_temporal_halflife(temporal_halflife)
         em_where, em_params = _episodic_recall_where(
             session_id=self.session_id,
             now_iso=now_iso,
@@ -12426,6 +12448,11 @@ class BeamMemory:
             if row_dict.get("tier") == "episodic":
                 ep_tier = row_dict.get("degradation_tier") or 1
                 score *= tier_weight_map.get(ep_tier, 1.0)
+            if temporal_weight > 0.0:
+                t_boost = _temporal_boost(
+                    row_dict.get("timestamp") or "", parsed_query_time, th_halflife
+                )
+                score *= (1.0 + temporal_weight * t_boost)
 
             row_dict["score"] = score
             row_dict["voice_scores"] = dict(r.voice_scores)
