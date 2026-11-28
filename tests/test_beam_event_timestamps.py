@@ -1576,21 +1576,23 @@ class TestSleepNonTextEventDate:
         assert rows[0][2] == "unknown", (
             f"BLOB precision must degrade to unknown: {rows[0][2]!r}")
 
-    def test_blob_valid_until_does_not_strand(self, temp_db, monkeypatch):
-        # F1 witness (audit15-pr2): non-text valid_until on a stored row
-        # must not raise post-claim; the group consolidates and no row is
-        # stranded with claim markers set and no summary.
-        import sqlite3 as _sqlite3
+    @pytest.mark.parametrize(
+        "legacy_valid_until",
+        [sqlite3.Binary(b"\x00\x01valid-until"), sqlite3.Binary(b"2020-01-01"), 2451545, "12:00"],
+        ids=["blob", "date-shaped-blob", "julian-number", "time-only"],
+    )
+    def test_legacy_valid_until_does_not_strand(self, temp_db, monkeypatch, legacy_valid_until):
+        # Legacy values without a valid calendar timestamp still consolidate.
+        # SQLite may interpret some of these values as old Julian dates.
         import mnemosyne.core.local_llm as local_llm_mod
         monkeypatch.setattr(local_llm_mod, "llm_available", lambda: False)
-        beam = BeamMemory(session_id="s-blobvu", db_path=temp_db)
-        blob = _sqlite3.Binary(b"\x00\x01valid-until")
+        beam = BeamMemory(session_id="s-legacyvu", db_path=temp_db)
         for rid, ts in (("a", "2020-01-01T00:00:00"), ("b", "2020-01-02T00:00:00")):
             beam.conn.execute(
                 "INSERT INTO working_memory "
                 "(id, session_id, content, source, timestamp, importance, valid_until) "
                 "VALUES (?,?,?,?,?,?,?)",
-                (rid, "s-blobvu", "c", "conversation", ts, 0.5, blob))
+                (rid, "s-legacyvu", "c", "conversation", ts, 0.5, legacy_valid_until))
         beam.conn.commit()
         res = beam.sleep(dry_run=False)
         assert res.get("status") == "consolidated", f"sleep failed: {res}"

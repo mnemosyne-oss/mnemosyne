@@ -108,10 +108,16 @@ def _claim_completed_sql(alias: str) -> str:
     )
 
 
-# Rows sleep() may take: never-consolidated rows, plus rows whose claim is
-# stale and has no summary completing it. One bind parameter: the orphan cutoff.
+# Exclude superseded rows and known expirations before batching. Legacy
+# non-text or unparseable expiry values keep the existing consolidation path.
+# Require a calendar date so bare Julian numbers and time-only strings do not
+# count as expirations. Bind the selection time first and the orphan cutoff second.
 _SLEEP_ELIGIBLE_SQL = (
-    "(consolidated_at IS NULL OR ("
+    "superseded_by IS NULL "
+    "AND (typeof(valid_until) <> 'text' "
+    "OR date(substr(valid_until, 1, 10)) IS NOT substr(valid_until, 1, 10) "
+    "OR COALESCE(julianday(valid_until) > julianday(?), 1)) "
+    "AND (consolidated_at IS NULL OR ("
     "consolidation_claimed_at IS NOT NULL AND consolidation_claimed_at < ? "
     f"AND NOT {_claim_completed_sql('working_memory')}))"
 )
@@ -136,6 +142,10 @@ def _select_recall_rows_by_ids(conn, sql, ids, params=(), *, key="id"):
 
 class MemoryTransactionStateError(RuntimeError):
     """An event-emitting write cannot be ordered after its caller's commit."""
+
+
+class MemoryIdConflictError(sqlite3.IntegrityError):
+    """A new working-memory row cannot reuse an occupied ID."""
 
 
 def _event_date_valid(value: str) -> bool:
@@ -6642,14 +6652,17 @@ class BeamMemory:
     # Working Memory
     # ------------------------------------------------------------------
     def _find_duplicate(self, content: str) -> Optional[str]:
-        """Check if exact same content already exists in working_memory for this session.
+        """Check for active exact content in working_memory for this session.
         Returns the existing memory_id if found, else None."""
         cursor = self.conn.cursor()
+        now = datetime.now(timezone.utc).isoformat()
         cursor.execute("""
             SELECT id FROM working_memory
             WHERE session_id = ? AND content = ?
+              AND superseded_by IS NULL
+              AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))
             LIMIT 1
-        """, (self.session_id, content))
+        """, (self.session_id, content, now))
         row = cursor.fetchone()
         return row["id"] if row else None
 
@@ -6705,7 +6718,8 @@ class BeamMemory:
             metadata: Optional dict of additional fields
             valid_until: ISO timestamp when this memory expires
             scope: "session" or "global"
-            memory_id: Optional pre-generated ID from legacy layer
+            memory_id: Optional ID for a new row. An occupied ID raises
+                MemoryIdConflictError when a new row is required.
             extract_entities: If True, extract and store entity mentions as triples
             extract: If True, extract structured facts from content using LLM
                 and store as triples. Default False.
@@ -6864,9 +6878,12 @@ class BeamMemory:
                     (id, content, source, timestamp, session_id, importance, metadata_json, valid_until, scope,
                      author_id, author_type, channel_id, veracity, memory_type, trust_tier)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO NOTHING
                 """, (memory_id, content, source, timestamp, self.session_id, importance,
                       json.dumps(metadata or {}), valid_until, scope,
                       _write_author_id, _write_author_type, self.channel_id, veracity, memory_type, trust_tier))
+                if cursor.rowcount == 0:
+                    raise MemoryIdConflictError("Working-memory ID is already in use")
 
         if existing_id:
             # Cache failures must not turn a committed dedup update into a retry.
@@ -8198,7 +8215,7 @@ class BeamMemory:
             f"AND {_SLEEP_ELIGIBLE_SQL} "
             f"AND (pinned IS NULL OR pinned = 0) "
             f"AND COALESCE(session_id, 'default') = ?",
-            (cutoff, _orphan_cutoff(), self.session_id),
+            (cutoff, datetime.now(timezone.utc).isoformat(), _orphan_cutoff(), self.session_id),
         )
         return cursor.fetchone()[0]
 
@@ -13447,6 +13464,28 @@ class BeamMemory:
             result["fleet_conflict_census"] = {"error": type(exc).__name__}
         return result
 
+    def _run_sleep_maintenance(self, dry_run: bool) -> Dict:
+        """Retry queued conflicts and degrade episodic rows independently of working rows."""
+        veracity_conflict_pass = None
+        if not dry_run and self.veracity_consolidator is not None:
+            try:
+                resolutions = self.veracity_consolidator.run_consolidation_pass(
+                    pair_budget=_CONFLICT_PAIR_BUDGET,
+                    time_budget_s=_CONFLICT_TIME_BUDGET_S,
+                )
+                veracity_conflict_pass = {"resolutions": resolutions}
+            except Exception as exc:
+                logger.warning(
+                    "veracity conflict pass failed (%s); sleep result unaffected",
+                    type(exc).__name__,
+                )
+                veracity_conflict_pass = {"error": type(exc).__name__}
+
+        return {
+            "veracity_conflict_pass": veracity_conflict_pass,
+            "degradation": self.degrade_episodic(dry_run=dry_run),
+        }
+
     def sleep(self, dry_run: bool = False, force: bool = False,
               _fleet_census: bool = True) -> Dict:
         """
@@ -13491,9 +13530,9 @@ class BeamMemory:
 
         sleep_write_policy = None
         cursor = self.conn.cursor()
+        selection_time = datetime.now(timezone.utc)
         _cutoff_raw = (
-            datetime.now(timezone.utc)
-            - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
+            selection_time - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
         ).isoformat()
         if force:
             # Skip age cutoff: consolidate all non-consolidated working memories
@@ -13537,10 +13576,9 @@ class BeamMemory:
               AND {_SQL_PLACEABLE_TS}
               AND {_SLEEP_ELIGIBLE_SQL}
               AND (pinned IS NULL OR pinned = 0)
-              AND superseded_by IS NULL
             ORDER BY {_SQL_CHRONO_TS} ASC
             LIMIT {SLEEP_BATCH_SIZE}
-        """, (self.session_id, cutoff, _orphan_cutoff()))
+        """, (self.session_id, cutoff, selection_time.isoformat(), _orphan_cutoff()))
         rows = cursor.fetchall()
         # Skip rows whose timestamp cannot actually be placed on the
         # timeline (round-6 F3a): consolidating an all-bad group stamped
@@ -13594,8 +13632,7 @@ class BeamMemory:
                         "are exempt from consolidation (import quarantine); "
                         "re-date or unpin via update_working"
                     )
-            # The bound is recomputed on the no-op path too: a pass with
-            # nothing to consolidate still ran a sleep.
+            result.update(self._run_sleep_maintenance(dry_run))
             return self._attach_fleet_conflict_census(result, _fleet_census)
 
         # Atomic claim: mark rows consolidated_at BEFORE writing the
@@ -13677,11 +13714,13 @@ class BeamMemory:
             for item in items:
                 if item.get("scope") == "global":
                     aggregated_scope = "global"
-                if item.get("valid_until"):
+                valid_until = item.get("valid_until")
+                # Non-text legacy values are normalized to no expiry on write.
+                if isinstance(valid_until, str) and valid_until:
                     if aggregated_valid_until is None or _valid_until_active(
-                        aggregated_valid_until, item["valid_until"]
+                        aggregated_valid_until, valid_until
                     ):
-                        aggregated_valid_until = item["valid_until"]
+                        aggregated_valid_until = valid_until
 
             # E4.a.1: aggregate per-row veracity into the summary's
             # veracity label. Mode of sources with conservative tie-break.
@@ -14080,30 +14119,7 @@ class BeamMemory:
                 " skipped this sleep", pairs_skipped_budget,
             )
 
-        # Conflict-ledger drain (the documented sleep retry hook, PR
-        # #1082 review): run the veracity consolidator's conflict pass
-        # once so pairs left queued by a refused probe are re-probed and
-        # obvious conflicts among consolidated facts resolve here.
-        # Bounded by the same pair/time budgets as LLM conflict
-        # validation; best-effort -- a resolution failure must never
-        # fail the sleep. Dry runs skip it: the pass writes.
-        veracity_conflict_pass = None
-        if not dry_run and self.veracity_consolidator is not None:
-            try:
-                resolutions = self.veracity_consolidator.run_consolidation_pass(
-                    pair_budget=_CONFLICT_PAIR_BUDGET,
-                    time_budget_s=_CONFLICT_TIME_BUDGET_S,
-                )
-                veracity_conflict_pass = {"resolutions": resolutions}
-            except Exception as exc:
-                logger.warning(
-                    "veracity conflict pass failed (%s); sleep result unaffected",
-                    type(exc).__name__,
-                )
-                veracity_conflict_pass = {"error": type(exc).__name__}
-
-        # Run tiered degradation after consolidation
-        degrade_result = self.degrade_episodic(dry_run=dry_run)
+        maintenance = self._run_sleep_maintenance(dry_run)
         if not dry_run:
             # Summaries + degradation both changed recallable content.
             self._invalidate_query_cache_after_commit("sleep")
@@ -14125,8 +14141,7 @@ class BeamMemory:
             "consolidated_ids": consolidated_ids,
             "recovered_orphans": recovered_orphans,
             "claims_lost": claims_lost,
-            "degradation": degrade_result,
-            "veracity_conflict_pass": veracity_conflict_pass,
+            **maintenance,
             "model_refresh": {
                 "proposals": model_refresh_proposals,
                 "applied": model_refresh_applied,
@@ -14152,9 +14167,9 @@ class BeamMemory:
         # same pass, so there is no window between "released" and "summarized".
         reclaimed_orphans = 0
         cursor = self.conn.cursor()
+        selection_time = datetime.now(timezone.utc)
         _cutoff_raw = (
-            datetime.now(timezone.utc)
-            - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
+            selection_time - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)
         ).isoformat()
         if force:
             _cutoff_raw = datetime.max.isoformat()
@@ -14170,9 +14185,12 @@ class BeamMemory:
               AND (pinned IS NULL OR pinned = 0)
             GROUP BY session_id
             ORDER BY MIN({_SQL_CHRONO_TS}) ASC
-        """, (cutoff, _orphan_cutoff()))
+        """, (cutoff, selection_time.isoformat(), _orphan_cutoff()))
         session_rows = cursor.fetchall()
         if not session_rows:
+            maintenance = self._run_sleep_maintenance(dry_run)
+            if not dry_run:
+                self._deduplicate_memoria_cross_session()
             return self._attach_fleet_conflict_census({
                 "status": "no_op",
                 "message": "No old working memories to consolidate",
@@ -14187,6 +14205,7 @@ class BeamMemory:
                 "errors": 0,
                 "model_refresh": {"proposals": 0, "applied": 0},
                 "session_results": [],
+                **maintenance,
             })
 
         session_results = []

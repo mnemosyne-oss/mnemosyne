@@ -1422,6 +1422,55 @@ print(json.dumps({"result": result, "after": after}))
 
         asyncio.run(exercise())
 
+    def test_shared_remember_reports_retired_id_conflict_over_mcp(self, tmp_path, monkeypatch):
+        """Exercise conflict handling through a real tools/call request."""
+        import asyncio
+        from contextlib import closing, suppress
+
+        from mcp import ClientSession
+        from mcp.shared.memory import create_client_server_memory_streams
+        from mnemosyne.mcp_server import _build_mcp_server
+
+        shared_db = tmp_path / "shared.db"
+        monkeypatch.setenv("MNEMOSYNE_SHARED_DB_PATH", str(shared_db))
+
+        async def exercise():
+            server = _build_mcp_server()
+            async with create_client_server_memory_streams() as (client_streams, server_streams):
+                task = asyncio.create_task(
+                    server.run(*server_streams, server.create_initialization_options())
+                )
+                try:
+                    async with ClientSession(*client_streams) as client:
+                        await client.initialize()
+                        args = {"content": "Project reviews use UTC", "kind": "preference"}
+                        stored = await client.call_tool("mnemosyne_shared_remember", args)
+                        assert stored.is_error is False
+                        payload = json.loads(stored.content[0].text)
+                        assert payload["status"] == "stored_shared"
+                        stable_id = payload["memory_id"]
+                        duplicate = await client.call_tool("mnemosyne_shared_remember", args)
+                        assert duplicate.is_error is False
+                        assert json.loads(duplicate.content[0].text)["memory_id"] == stable_id
+
+                        shared = BeamMemory(session_id="mcp_shared_surface", db_path=shared_db)
+                        assert shared.invalidate(stable_id)
+                        with closing(sqlite3.connect(shared_db)) as reader:
+                            before = reader.execute("SELECT * FROM working_memory").fetchall()
+                            conflict = await client.call_tool("mnemosyne_shared_remember", args)
+                            assert conflict.is_error is True
+                            assert json.loads(conflict.content[0].text) == {
+                                "error": "memory_id_conflict",
+                                "memory_id": stable_id,
+                            }
+                            assert reader.execute("SELECT * FROM working_memory").fetchall() == before
+                finally:
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+
+        asyncio.run(exercise())
+
     def test_transport_builders_share_mcp_server(self):
         """stdio and SSE transport setup both obtain the shared server builder."""
         from mnemosyne import mcp_server

@@ -103,6 +103,60 @@ def test_sleep_invokes_pass_exactly_once_with_beam_budgets(beam, monkeypatch):
     assert calls[0]["time_budget_s"] == beam_module._CONFLICT_TIME_BUDGET_S
 
 
+@pytest.mark.parametrize("entrypoint", ["sleep", "sleep_all_sessions"])
+@pytest.mark.parametrize("dry_run", [False, True], ids=["apply", "dry-run"])
+def test_sleep_maintains_episodic_and_conflict_state_with_expired_only_backlog(
+    beam, monkeypatch, entrypoint, dry_run
+):
+    monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+    vc = beam.veracity_consolidator
+    winner, loser = _seed_pair(vc, "Eve", "CEO", "VP")
+    beam.conn.execute("UPDATE working_memory SET valid_until = '2021-01-01'")
+    beam.conn.execute(
+        "INSERT INTO episodic_memory (id, content, tier, created_at) VALUES (?, ?, 1, ?)",
+        ("due-episode", "Previously consolidated material", "2000-01-01T00:00:00"),
+    )
+    beam.conn.commit()
+    before = sorted(beam.conn.iterdump())
+    working_before = [tuple(row) for row in beam.conn.execute(
+        "SELECT id, valid_until, consolidated_at FROM working_memory ORDER BY id"
+    )]
+    calls = []
+    original = vc.run_consolidation_pass
+
+    def counting(**kwargs):
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(vc, "run_consolidation_pass", counting)
+    result = getattr(beam, entrypoint)(force=True, dry_run=dry_run)
+
+    assert result["degradation"]["tier1_to_tier2"] == 1
+    assert result["status"] == "no_op"
+    assert [tuple(row) for row in beam.conn.execute(
+        "SELECT id, valid_until, consolidated_at FROM working_memory ORDER BY id"
+    )] == working_before
+    assert [tuple(row) for row in beam.conn.execute(
+        "SELECT id, tier FROM episodic_memory"
+    )] == [("due-episode", 1 if dry_run else 2)]
+    if dry_run:
+        assert result["veracity_conflict_pass"] is None
+        assert calls == []
+        assert sorted(beam.conn.iterdump()) == before
+    else:
+        assert result["veracity_conflict_pass"] == {"resolutions": 1}
+        assert calls == [{
+            "pair_budget": beam_module._CONFLICT_PAIR_BUDGET,
+            "time_budget_s": beam_module._CONFLICT_TIME_BUDGET_S,
+        }]
+        assert beam.conn.execute(
+            "SELECT superseded_by FROM consolidated_facts WHERE id = ?", (loser,)
+        ).fetchone()[0] == winner
+        assert beam.conn.execute(
+            "SELECT COUNT(*) FROM conflicts WHERE resolution = ?", (f"superseded_by_{winner}",)
+        ).fetchone()[0] == 1
+
+
 # ---------------------------------------------------------------------------
 # (b) The matching conflicts row gets non-NULL resolution, and the
 #     losing fact gets superseded_by

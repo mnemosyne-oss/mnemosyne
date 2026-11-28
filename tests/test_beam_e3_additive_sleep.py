@@ -874,6 +874,38 @@ class TestE3AdditiveSleep:
         assert final[0] is not None
         assert final[1] is None
 
+    def test_sleep_all_sessions_deduplicates_memoria_with_only_expired_rows(
+            self, temp_db, monkeypatch):
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        beam = BeamMemory(session_id="maintenance", db_path=temp_db)
+        expired, = _seed_old_wm(temp_db, "s1", n=1)
+        beam.conn.execute("UPDATE working_memory SET valid_until = '2020-01-01' WHERE id = ?",
+                          (expired,))
+        beam.conn.executemany(
+            "INSERT INTO memoria_kg (id, session_id, subject, predicate, object) "
+            "VALUES (?, ?, 'relay', 'uses', ?)",
+            [(1, "s1", "copper"), (2, "s2", "copper"), (3, "s2", "ceramic")],
+        )
+        beam.conn.commit()
+        before = sorted(beam.conn.iterdump())
+
+        preview = beam.sleep_all_sessions(dry_run=True, force=True)
+
+        assert preview["summaries_created"] == 0
+        assert sorted(beam.conn.iterdump()) == before
+
+        applied = beam.sleep_all_sessions(force=True)
+
+        assert applied["status"] == "no_op"
+        assert applied["summaries_created"] == 0
+        assert [tuple(row) for row in beam.conn.execute(
+            "SELECT id, session_id, object FROM memoria_kg ORDER BY id"
+        )] == [(1, "s1", "copper"), (3, "s2", "ceramic")]
+        assert beam.conn.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0] == 0
+        assert tuple(beam.conn.execute(
+            "SELECT valid_until, consolidated_at FROM working_memory WHERE id = ?", (expired,)
+        ).fetchone()) == ("2020-01-01", None)
+
     def test_manual_reclaim_then_sleep_all_sessions_consolidates_orphan(self, temp_db, monkeypatch):
         monkeypatch.setattr(
             "mnemosyne.core.local_llm.llm_available", lambda: False
