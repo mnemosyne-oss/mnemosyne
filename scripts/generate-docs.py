@@ -287,7 +287,7 @@ CONFIG_DESCRIPTIONS = {
     "degrade_batch": "Rows degraded per maintenance pass.",
 
     # LLM
-    "llm_enabled": "Global gate for host, remote and local LLM calls. Fails closed: `false` in either `config.yaml` or the environment switches all of them off, and `true` in one never overrides `false` in the other.",
+    "llm_enabled": "Global gate for host, remote and local LLM calls, including conflict validation. Fails closed: `false` in either `config.yaml` or the environment switches all of them off, and `true` in one never overrides `false` in the other.",
     "llm_max_tokens": "Maximum output tokens per LLM summary.",
     "llm_n_threads": "CPU threads for local GGUF inference.",
     "llm_n_ctx": "Context window for local GGUF inference.",

@@ -70,7 +70,7 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `llm_api_key` | `MNEMOSYNE_LLM_API_KEY` | *(unset)* | no | API key for the remote chat endpoint. |
 | `llm_base_url` | `MNEMOSYNE_LLM_BASE_URL` | *(unset)* | no | Base URL of an OpenAI-compatible chat endpoint. |
 | `llm_conflict_detection` | `MNEMOSYNE_LLM_CONFLICT_DETECTION` | `false` | no | Enable LLM-based contradiction detection during sleep. |
-| `llm_enabled` | `MNEMOSYNE_LLM_ENABLED` | `true` | **yes** | Global gate for host, remote and local LLM calls. Fails closed: `false` in either `config.yaml` or the environment switches all of them off, and `true` in one never overrides `false` in the other. |
+| `llm_enabled` | `MNEMOSYNE_LLM_ENABLED` | `true` | **yes** | Global gate for host, remote and local LLM calls, including conflict validation. Fails closed: `false` in either `config.yaml` or the environment switches all of them off, and `true` in one never overrides `false` in the other. |
 | `llm_fallback_api_key` | `MNEMOSYNE_LLM_FALLBACK_API_KEY` | *(unset)* | no | API key for the fallback chat endpoint. |
 | `llm_fallback_base_url` | `MNEMOSYNE_LLM_FALLBACK_BASE_URL` | *(unset)* | no | Base URL for the fallback chat endpoint. |
 | `llm_fallback_models` | `MNEMOSYNE_LLM_FALLBACK_MODELS` | *(unset)* | no | Comma separated models to try if the primary fails. |
