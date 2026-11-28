@@ -103,6 +103,91 @@ print(json.dumps([summary, calls]))
     assert json.loads(result.stdout) == expected
 
 
+@pytest.mark.parametrize(
+    ("yaml_text", "env_vars", "expected"),
+    [
+        (
+            "llm_enabled: false\nhost_llm_enabled: true\n",
+            {},
+            [None, []],
+        ),
+        (
+            "llm_enabled: false\nhost_llm_enabled: true\n",
+            {"MNEMOSYNE_LLM_BASE_URL": "http://127.0.0.1:1/v1"},
+            [None, []],
+        ),
+        (
+            "llm_enabled: false\nhost_llm_enabled: true\n",
+            {
+                "MNEMOSYNE_LLM_ENABLED": "true",
+                "MNEMOSYNE_HOST_LLM_ENABLED": "true",
+                "MNEMOSYNE_LLM_BASE_URL": "http://127.0.0.1:1/v1",
+            },
+            [None, []],
+        ),
+        (
+            "llm_enabled: true\nhost_llm_enabled: true\n",
+            {"MNEMOSYNE_LLM_ENABLED": "false", "MNEMOSYNE_LLM_BASE_URL": "http://127.0.0.1:1/v1"},
+            [None, []],
+        ),
+        (
+            "llm_enabled: true\nhost_llm_enabled: true\n",
+            {},
+            ["Host summary.", ["host"]],
+        ),
+    ],
+    ids=[
+        "yaml-off-no-env", "yaml-off-stale-remote", "yaml-off-over-env-on",
+        "env-off-over-yaml-on", "yaml-on-control",
+    ],
+)
+def test_global_llm_off_blocks_host_remote_and_local_paths(tmp_path, yaml_text, env_vars, expected):
+    """#1157: an explicit off from config.yaml or the environment wins over any opt-in.
+
+    The host backend is registered in every case, so only the off-switch can keep
+    memory content from reaching it, the remote endpoint or the local GGUF.
+    """
+    env = {name: value for name, value in os.environ.items() if not name.startswith("MNEMOSYNE_")}
+    env.update(HOME=str(tmp_path), HERMES_HOME=str(tmp_path), MNEMOSYNE_DATA_DIR=str(tmp_path))
+    env.update(env_vars)
+    (tmp_path / "config.yaml").write_text(yaml_text, encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import json
+from mnemosyne.core import local_llm
+from mnemosyne.core.llm_backends import CallableLLMBackend, set_host_llm_backend
+
+calls = []
+def complete(*args, **kwargs):
+    calls.append("host")
+    return "Host summary."
+
+def remote(*args, **kwargs):
+    calls.append("remote")
+    return "Remote summary."
+
+def local_model(*args, **kwargs):
+    calls.append("local")
+    return None
+
+set_host_llm_backend(CallableLLMBackend("fixture", complete))
+local_llm._call_remote_llm = remote
+local_llm._model_path = local_model
+local_llm._download_model = local_model
+summary = local_llm.summarize_memories(["The observatory will install a thermal regulator."])
+print(json.dumps([summary, calls]))
+"""],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert json.loads(result.stdout) == expected
+
+
 class TestLocalModelDownloadNotice:
     def test_uncached_default_model_logs_notice_before_download(self, monkeypatch, tmp_path, caplog, capsys):
         """The default GGUF warning is logged before its network fetch, not printed."""

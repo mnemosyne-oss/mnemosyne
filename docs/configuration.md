@@ -330,7 +330,7 @@ See [Health and repair](cli-reference.md#health-and-repair) for the `reindex` co
 
 | Variable | Default | Description |
 |---|---|---|
-| `MNEMOSYNE_LLM_ENABLED` | `true` | Global gate for host, remote, and local LLM-backed consolidation. Resolved from the environment when the local-LLM module is imported; currently not controlled by `config.yaml` `llm_enabled`. |
+| `MNEMOSYNE_LLM_ENABLED` | `true` | Global gate for host, remote, and local LLM-backed consolidation. Resolved once when the local-LLM module is imported (restart required). Fails closed: `llm_enabled: false` in `config.yaml` or `MNEMOSYNE_LLM_ENABLED=false` in the environment switches all LLM paths off, and a `true` in one source never overrides a `false` in the other. |
 | `MNEMOSYNE_LLM_N_CTX` | `2048` | Context window size for the local model |
 | `MNEMOSYNE_LLM_MAX_TOKENS` | `2048` | Maximum output tokens per summary |
 | `MNEMOSYNE_LLM_N_THREADS` | `4` | CPU threads for local inference |
