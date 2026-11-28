@@ -47,6 +47,7 @@ REQUIRES_RESTART: Set[str] = {
     "vec_type",
     "llm_repo",
     "llm_file",
+    "llm_enabled",
     "host_llm_enabled",
     "author_id",
     "author_type",
@@ -263,7 +264,9 @@ DEFAULTS: Dict[str, Any] = {
     "tier3_max_chars": 300,
     "degrade_batch": 100,
     # LLM
-    "llm_enabled": False,
+    # Matches the runtime default in local_llm._resolve_llm_enabled(). Seeding
+    # a fresh config.yaml must not write an explicit off (#1157).
+    "llm_enabled": True,
     "llm_max_tokens": 512,
     "llm_n_threads": 4,
     "llm_n_ctx": 2048,

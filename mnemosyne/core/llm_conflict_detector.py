@@ -83,6 +83,14 @@ def _call_conflict_llm_with_retry(
     Call OpenAI-compatible completions endpoint with exponential backoff retry logic.
     Returns: Tuple[content_str, prompt_tokens, completion_tokens] or None
     """
+    # The global off-switch covers conflict validation too (#1157): every
+    # request below sends memory content to an LLM endpoint. Read at call
+    # time from local_llm, which resolves config.yaml and the environment.
+    from mnemosyne.core import local_llm
+
+    if not local_llm.LLM_ENABLED:
+        logger.info("Conflict detection: LLM disabled by llm_enabled; skipping validation.")
+        return None
     if not conflict_endpoint_is_safe():
         logger.warning("Conflict detection: LLM endpoint missing or unsafe.")
         return None

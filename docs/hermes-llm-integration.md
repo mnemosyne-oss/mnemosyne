@@ -148,6 +148,13 @@ Mnemosyne's `config.yaml` or export `MNEMOSYNE_HOST_LLM_ENABLED=true` before
 starting Hermes. Mnemosyne reads this setting at startup. When both are
 present, the YAML value takes precedence.
 
+The host opt-in never outranks the global off-switch. `llm_enabled: false` in
+`config.yaml`, or `MNEMOSYNE_LLM_ENABLED=false` in the environment, blocks the
+host, remote and local paths even when `host_llm_enabled: true` and a backend
+is registered. A `true` in one source does not override a `false` in the other.
+A `config.yaml` seeded by an earlier version may already contain
+`llm_enabled: false`; set it to `true` there if you rely on LLM consolidation.
+
 ## For other agents
 
 Any host that wants to expose its authenticated LLM to Mnemosyne can register

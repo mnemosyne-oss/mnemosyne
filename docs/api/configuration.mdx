@@ -70,7 +70,7 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `llm_api_key` | `MNEMOSYNE_LLM_API_KEY` | *(unset)* | no | API key for the remote chat endpoint. |
 | `llm_base_url` | `MNEMOSYNE_LLM_BASE_URL` | *(unset)* | no | Base URL of an OpenAI-compatible chat endpoint. |
 | `llm_conflict_detection` | `MNEMOSYNE_LLM_CONFLICT_DETECTION` | `false` | no | Enable LLM-based contradiction detection during sleep. |
-| `llm_enabled` | `MNEMOSYNE_LLM_ENABLED` | `true` [^llm_enabled] (declared `false`) | no | Enable LLM summarization during sleep consolidation. |
+| `llm_enabled` | `MNEMOSYNE_LLM_ENABLED` | `true` | **yes** | Global gate for host, remote and local LLM calls, including conflict validation. Fails closed: `false` in either `config.yaml` or the environment switches all of them off, and `true` in one never overrides `false` in the other. |
 | `llm_fallback_api_key` | `MNEMOSYNE_LLM_FALLBACK_API_KEY` | *(unset)* | no | API key for the fallback chat endpoint. |
 | `llm_fallback_base_url` | `MNEMOSYNE_LLM_FALLBACK_BASE_URL` | *(unset)* | no | Base URL for the fallback chat endpoint. |
 | `llm_fallback_models` | `MNEMOSYNE_LLM_FALLBACK_MODELS` | *(unset)* | no | Comma separated models to try if the primary fails. |
@@ -151,7 +151,7 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `wm_ttl_hours` | `MNEMOSYNE_WM_TTL_HOURS` | `168` | no | Age at which a working memory row becomes eligible for consolidation or trim. |
 | `write_classifier` | `MNEMOSYNE_WRITE_CLASSIFIER` | *(unset)* | no | Write classifier mode controlling which content is stored. |
 
-### Keys whose effective default bypasses `config.py` (22)
+### Keys whose effective default bypasses `config.py` (21)
 
 For these keys a module-level constant reads the environment variable directly with its own fallback, so the value in `DEFAULTS` is not what the runtime uses and a `config.yaml` entry alone does not reach the module. Treat the environment variable as authoritative.
 
@@ -159,7 +159,6 @@ This list is derived by scanning the package for `os.environ.get("MNEMOSYNE_..."
 
 [^fact_recall_enabled]: `fact_recall_enabled` -- effective default `0`, set in `mnemosyne/core/beam.py`, not the ``true`` declared in `config.py`.
 [^host_llm_n_ctx]: `host_llm_n_ctx` -- effective default `32000`, set in `mnemosyne/core/local_llm.py`, not the ``2048`` declared in `config.py`.
-[^llm_enabled]: `llm_enabled` -- effective default `true`, set in `mnemosyne/core/local_llm.py`, not the ``false`` declared in `config.py`. Note the direction: `config.py` declares this off while the module defaults it on.
 [^llm_max_tokens]: `llm_max_tokens` -- effective default `2048`, set in `mnemosyne/core/local_llm.py`, not the ``512`` declared in `config.py`.
 [^persona_interval]: `persona_interval` -- effective default `50`, set in `mnemosyne/core/persona.py`, not the ``10`` declared in `config.py`.
 [^persona_token_cap]: `persona_token_cap` -- effective default `1500`, set in `mnemosyne/core/persona.py`, not the ``500`` declared in `config.py`.

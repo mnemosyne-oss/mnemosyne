@@ -30,6 +30,27 @@ def test_llm_conflict_detector_gating(temp_db):
         assert status == "failed"
 
 
+@patch("urllib.request.OpenerDirector.open")
+def test_global_llm_off_blocks_conflict_validation(mock_urllib_open, temp_db):
+    """#1157: with the global LLM switch off, no memory content reaches the
+    conflict endpoint, even with conflict detection on and a safe endpoint."""
+    import sys
+
+    fake_httpx = MagicMock()
+    mock_client_class = fake_httpx.Client
+    with patch.dict(sys.modules, {"httpx": fake_httpx}), \
+         patch("mnemosyne.core.local_llm.LLM_ENABLED", False), \
+         patch("mnemosyne.core.llm_conflict_detector.LLM_CONFLICT_DETECTION_ENABLED", True), \
+         patch("mnemosyne.core.llm_conflict_detector.CONFLICT_LLM_BASE_URL", "https://conflict-llm.test"):
+        is_conflict, conf, correct, status = validate_conflict_pair(
+            "Event is on May 29th", "Actually the event is June 5th", "session_123", temp_db
+        )
+
+    assert (is_conflict, conf, correct, status) == (False, 0.0, None, "failed")
+    mock_client_class.assert_not_called()
+    mock_urllib_open.assert_not_called()
+
+
 @patch("mnemosyne.core.llm_conflict_detector._call_conflict_llm_with_retry")
 def test_llm_conflict_detector_success(mock_call, temp_db):
     """Test that a successful structured JSON response from the LLM is parsed correctly with actual tokens."""
@@ -67,7 +88,8 @@ def test_llm_conflict_detector_retry_logic(mock_sleep, mock_client_class):
     from mnemosyne.core.llm_conflict_detector import _call_conflict_llm_with_retry
     
     # Force a valid URL
-    with patch("mnemosyne.core.llm_conflict_detector.CONFLICT_LLM_BASE_URL", "https://api.openai.com/v1"):
+    with patch("mnemosyne.core.local_llm.LLM_ENABLED", True), \
+         patch("mnemosyne.core.llm_conflict_detector.CONFLICT_LLM_BASE_URL", "https://api.openai.com/v1"):
         mock_client = MagicMock()
         mock_client.post.side_effect = [
             Exception("Transient Network Error"),

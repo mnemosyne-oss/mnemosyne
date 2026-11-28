@@ -29,7 +29,24 @@ MODEL_CACHE_DIR = Path.home() / ".hermes" / "mnemosyne" / "models"
 
 logger = logging.getLogger(__name__)
 
-LLM_ENABLED = os.environ.get("MNEMOSYNE_LLM_ENABLED", "true").lower() in ("1", "true", "yes")
+
+def _resolve_llm_enabled() -> bool:
+    """Resolve the global LLM off-switch, failing closed (#1157).
+
+    An explicit ``false`` from either source turns every Mnemosyne LLM path off
+    (host, remote and local): ``llm_enabled: false`` in config.yaml, or
+    ``MNEMOSYNE_LLM_ENABLED=false`` in the process environment. A ``true`` from
+    one source never overrides a ``false`` from the other, so neither the
+    file nor the environment can re-enable inference the other has switched
+    off. With neither set, the historical default stays on.
+
+    Read once at import (restart-scoped), like ``HOST_LLM_ENABLED`` below.
+    """
+    env_enabled = os.environ.get("MNEMOSYNE_LLM_ENABLED", "true").lower() in ("1", "true", "yes")
+    return env_enabled and peek_bool("llm_enabled", True)
+
+
+LLM_ENABLED = _resolve_llm_enabled()
 LLM_MAX_TOKENS=int(os.environ.get("MNEMOSYNE_LLM_MAX_TOKENS", "2048") or "2048")
 LLM_N_THREADS = int(os.environ.get("MNEMOSYNE_LLM_N_THREADS", "4"))
 LLM_N_CTX = int(os.environ.get("MNEMOSYNE_LLM_N_CTX", "2048"))
