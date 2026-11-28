@@ -112,11 +112,14 @@ def _claim_completed_sql(alias: str) -> str:
 # non-text or unparseable expiry values keep the existing consolidation path.
 # Require a calendar date so bare Julian numbers and time-only strings do not
 # count as expirations. Bind the selection time first and the orphan cutoff second.
-_SLEEP_ELIGIBLE_SQL = (
+_SLEEP_SOURCE_ACTIVE_SQL = (
     "superseded_by IS NULL "
     "AND (typeof(valid_until) <> 'text' "
     "OR date(substr(valid_until, 1, 10)) IS NOT substr(valid_until, 1, 10) "
-    "OR COALESCE(julianday(valid_until) > julianday(?), 1)) "
+    "OR COALESCE(julianday(valid_until) > julianday(?), 1))"
+)
+_SLEEP_ELIGIBLE_SQL = (
+    f"{_SLEEP_SOURCE_ACTIVE_SQL} "
     "AND (consolidated_at IS NULL OR ("
     "consolidation_claimed_at IS NOT NULL AND consolidation_claimed_at < ? "
     f"AND NOT {_claim_completed_sql('working_memory')}))"
@@ -7821,7 +7824,9 @@ class BeamMemory:
         """
         Mark a memory as invalid/superseded.
         If replacement_id is provided, sets superseded_by.
-        Otherwise sets valid_until to now (immediate expiry).
+        Otherwise sets valid_until to now (immediate expiry). Active episodic
+        summaries whose sole source is the invalidated working row expire in
+        the same transaction.
 
         `bank` binds the supersession to a single table (`working_memory` or
         `episodic_memory`) when id values are shared across banks: without it,
@@ -7833,115 +7838,65 @@ class BeamMemory:
         """
         if bank is not None and bank not in ("working_memory", "episodic_memory"):
             raise ValueError(f"invalid bank: {bank!r}")
+        if replacement_id and replacement_id == memory_id:
+            return False
+
         cursor = self.conn.cursor()
-        if replacement_id:
-            if replacement_id == memory_id:
-                return False
+        owns_transaction = not self.conn.in_transaction
+        targets = (bank,) if bank is not None else ("working_memory", "episodic_memory")
+        with _guarded_transaction(self.conn):
+            # Lock before checking a replacement so its validity cannot change
+            # between the lookup and the write. A caller-owned transaction
+            # keeps control of the commit via the guarded savepoint.
+            if replacement_id and owns_transaction:
+                cursor.execute("BEGIN IMMEDIATE")
 
-            # The replacement lookup and target update are one write
-            # transaction. For a direct call, BEGIN IMMEDIATE obtains
-            # SQLite's write lock before validation, so another connection
-            # cannot delete a replacement between validation and the link
-            # update. A batch may already own a transaction after earlier
-            # DML; do not begin, commit, or roll back that caller-owned
-            # transaction here.
-            owns_transaction = not self.conn.in_transaction
-
-            def validate_and_invalidate() -> bool:
-                now = datetime.now(timezone.utc).isoformat()
-                # Both the replacement and the target must still be ACTIVE
-                # (not superseded, not expired): a concurrent resolver may have
-                # superseded either between our scan and this write, and we must
-                # not overwrite an existing successor.
-                # ``julianday`` parses offset-bearing values chronologically:
-                # a lexical ``>`` would judge ``18:30+07:00`` (11:30Z, already
-                # expired) later than a naive ``12:00`` now because its digits
-                # sort after it. Same predicate shape as the julianday-based
-                # surfaces above.
-                active = (
-                    "AND superseded_by IS NULL "
-                    "AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))"
-                )
-                replacement_found = False
+            now = datetime.now(timezone.utc).isoformat()
+            # Compare timestamps chronologically, including offsets.
+            active = (
+                "AND superseded_by IS NULL "
+                "AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))"
+            )
+            target_where = "id = ? AND (session_id = ? OR scope = 'global')"
+            target_params = (now, replacement_id, memory_id, self.session_id)
+            if replacement_id:
                 for table in ("working_memory", "episodic_memory"):
                     cursor.execute(
-                        f"""
-                        SELECT 1 FROM {table}
-                        WHERE id = ? AND (session_id = ? OR scope = 'global') {active}
-                        LIMIT 1
-                        """,
+                        f"""SELECT 1 FROM {table}
+                            WHERE id = ? AND (session_id = ? OR scope = 'global') {active}
+                            LIMIT 1""",
                         (replacement_id, self.session_id, now),
                     )
                     if cursor.fetchone() is not None:
-                        replacement_found = True
                         break
-                if not replacement_found:
-                    return False
-
-                if bank is not None:
-                    cursor.execute(
-                        f"UPDATE {bank} "
-                        f"SET valid_until = ?, superseded_by = ? "
-                        f"WHERE id = ? AND (session_id = ? OR scope = 'global') {active}",
-                        (now, replacement_id, memory_id, self.session_id, now),
-                    )
-                    return cursor.rowcount > 0
-                cursor.execute(
-                    f"UPDATE working_memory "
-                    f"SET valid_until = ?, superseded_by = ? "
-                    f"WHERE id = ? AND (session_id = ? OR scope = 'global') {active}",
-                    (now, replacement_id, memory_id, self.session_id, now),
-                )
-                if cursor.rowcount == 0:
-                    cursor.execute(
-                        f"UPDATE episodic_memory "
-                        f"SET valid_until = ?, superseded_by = ? "
-                        f"WHERE id = ? AND (session_id = ? OR scope = 'global') {active}",
-                        (now, replacement_id, memory_id, self.session_id, now),
-                    )
-                return cursor.rowcount > 0
-
-            if owns_transaction:
-                with _guarded_transaction(self.conn):
-                    cursor.execute("BEGIN IMMEDIATE")
-                    invalidated = validate_and_invalidate()
-            else:
-                invalidated = validate_and_invalidate()
-            if invalidated and not defer_cache_invalidation:
-                if owns_transaction:
-                    self._invalidate_query_cache_after_commit("invalidate")
                 else:
-                    self._invalidate_query_cache()
-            return invalidated
+                    return False
+                target_where = f"{target_where} {active}"
+                target_params += (now,)
 
-        # The no-replacement path mutates a single row directly.  Snapshot
-        # ownership before its first UPDATE: a caller-owned transaction must
-        # retain both its commit boundary and cache-failure rollback behavior.
-        owns_transaction = not self.conn.in_transaction
-        now = datetime.now(timezone.utc).isoformat()
-        # With a bank binding, touch only that table; otherwise try
-        # working_memory first, then episodic_memory.
-        targets = (bank,) if bank is not None else ("working_memory", "episodic_memory")
-        invalidated = False
-        for table in targets:
-            cursor.execute(
-                f"""UPDATE {table}
-                    SET valid_until = ?, superseded_by = ?
-                    WHERE id = ? AND (session_id = ? OR scope = 'global')
-                """,
-                (now, replacement_id, memory_id, self.session_id),
-            )
-            if cursor.rowcount > 0:
-                invalidated = True
-                break
-        if owns_transaction:
-            self.conn.commit()
-        if invalidated and not defer_cache_invalidation:
+            for table in targets:
+                cursor.execute(
+                    f"UPDATE {table} SET valid_until = ?, superseded_by = ? WHERE {target_where}",
+                    target_params,
+                )
+                if cursor.rowcount > 0:
+                    if table == "working_memory":
+                        # summary_of is a comma-separated list. Exact equality
+                        # selects just the summaries wholly derived from this row.
+                        cursor.execute(
+                            f"UPDATE episodic_memory SET valid_until = ? WHERE summary_of = ? {active}",
+                            (now, memory_id, now),
+                        )
+                    break
+            else:
+                return False
+
+        if not defer_cache_invalidation:
             if owns_transaction:
                 self._invalidate_query_cache_after_commit("invalidate")
             else:
                 self._invalidate_query_cache()
-        return invalidated
+        return True
 
     def _embedding_map(self, memory_ids: List[str]) -> Dict[str, np.ndarray]:
         """Load float32 embeddings for memory ids.
@@ -8604,10 +8559,10 @@ class BeamMemory:
     # Episodic Memory
     # ------------------------------------------------------------------
     def _require_sleep_claim(self, ids, stamp: str) -> None:
-        """Raise _SleepClaimLost unless every id still holds claim ``stamp``.
+        """Verify the claim and recheck a single source before publication.
 
-        Takes the write lock first so the check and the caller's following
-        write are one atomic step: nothing can re-stamp a claim in between.
+        Takes the write lock first so the checks and the caller's following
+        write are one atomic step.
         """
         if not self.conn.in_transaction:
             self.conn.execute("BEGIN IMMEDIATE")
@@ -8624,6 +8579,16 @@ class BeamMemory:
             raise _SleepClaimLost(
                 f"{len(wanted) - owned} of {len(wanted)} rows no longer carry claim {stamp}"
             )
+
+        if len(wanted) == 1:
+            # The source can be invalidated after it is claimed but before
+            # the summarizer returns. Avoid publishing its derived content.
+            active = self.conn.execute(
+                f"SELECT 1 FROM working_memory WHERE id = ? AND {_SLEEP_SOURCE_ACTIVE_SQL}",
+                (wanted[0], datetime.now(timezone.utc).isoformat()),
+            ).fetchone()
+            if active is None:
+                raise _SleepClaimLost("the sole source is no longer active")
 
     def _claim_sleep_rows(self, rows, stamp: str) -> set:
         """Take ownership of ``rows`` for one sleep pass; return the ids won.
@@ -14033,12 +13998,11 @@ class BeamMemory:
                         }
                     )
                 except _SleepClaimLost:
-                    # Another pass recovered this claim while we were
-                    # summarizing. It owns the rows now: write nothing and
-                    # leave its claim marker alone.
+                    # An invalidation or another pass can make the claimed
+                    # input stale while the summarizer is running.
                     logger.warning(
-                        "sleep: claim %s on %d row(s) was recovered by another "
-                        "pass; discarding this summary", claim_stamp, len(ids),
+                        "sleep: claim %s on %d row(s) no longer allows publication; "
+                        "discarding this summary", claim_stamp, len(ids),
                     )
                     claims_lost += 1
                     continue
