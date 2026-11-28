@@ -248,6 +248,120 @@ try:
 except ImportError:
     EpisodicGraph = None
     GraphEdge = None
+
+import re as _re
+
+# ---------------------------------------------------------------------------
+# CJK bigram tokenizer
+# ---------------------------------------------------------------------------
+# The default unicode61 FTS5 tokenizer keeps contiguous CJK text as a token,
+# preventing substring word matches inside that run.  We register a
+# pure-Python UDF so that Chinese text is indexed as unigrams AND bigrams,
+# enabling both single-character and two-character (word-level) FTS5 MATCH.
+#
+# Rules:
+#   • CJK Unified Ideographs (U+4E00-U+9FFF) and Extension A (U+3400-U+4DBF)
+#     are emitted as unigram then, if the next character is also CJK, as a
+#     bigram pair.  This covers the vast majority of Simplified/Traditional
+#     Chinese without requiring any external dependency.
+#   • Non-CJK runs are kept as-is using word-boundary splitting so that Latin,
+#     digits, and other scripts are not altered (Cyrillic, accented Latin, etc.
+#     are preserved by the catch-all buf flush).
+#   • If the text contains no CJK characters the original text is returned
+#     unchanged, making the function a no-op for pure-ASCII/Latin content.
+# ---------------------------------------------------------------------------
+
+def _cjk_bigram(text: str) -> str:
+    """CJK-aware bigram tokenizer for FTS5.
+
+    Returns a space-separated token string for use as FTS5 index content.
+    Non-CJK runs are split on whitespace/punctuation boundaries; CJK
+    characters emit unigrams and consecutive-CJK bigrams.
+    """
+    if not isinstance(text, str):
+        return text
+    result: list[str] = []
+    buf = ''
+    for i, c in enumerate(text):
+        if '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf':
+            if buf:
+                # Flush non-CJK buffer preserving all non-whitespace runs
+                for tok in _re.split(r'\s+', buf):
+                    if tok:
+                        result.append(tok)
+                buf = ''
+            result.append(c)                          # unigram
+            nxt = text[i + 1] if i + 1 < len(text) else ''
+            if '\u4e00' <= nxt <= '\u9fff' or '\u3400' <= nxt <= '\u4dbf':
+                result.append(c + nxt)                # bigram
+        else:
+            buf += c
+    if buf:
+        for tok in _re.split(r'\s+', buf):
+            if tok:
+                result.append(tok)
+    return ' '.join(result) if result else text
+
+
+def _register_cjk_bigram(conn: sqlite3.Connection) -> None:
+    """Register cjk_bigram UDF on *conn* (idempotent — SQLite replaces on re-register)."""
+    conn.create_function('cjk_bigram', 1, _cjk_bigram, deterministic=True)
+
+
+def _migrate_cjk_fts(conn: sqlite3.Connection) -> None:
+    """Atomically upgrade both FTS indexes and their writers, once per version.
+
+    External-content FTS must be rebuilt explicitly with tokenized source text;
+    FTS5's native rebuild would index raw content. A savepoint preserves an
+    enclosing transaction and rolls back DDL, postings and marker on failure.
+    All writers must be stopped before upgrading a database from an old runtime.
+    """
+    conn.execute("SAVEPOINT cjk_fts_upgrade")
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS cjk_fts_schema (version INTEGER PRIMARY KEY)")
+        version = conn.execute("SELECT MAX(version) FROM cjk_fts_schema").fetchone()[0]
+        if version is not None and version != 1:
+            raise RuntimeError(f"Unsupported CJK FTS schema version: {version}")
+        if version is None:
+            for name in ("em_ai", "em_ad", "em_au", "wm_ai", "wm_ad", "wm_au"):
+                conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            for sql in (
+                """CREATE TRIGGER em_ai AFTER INSERT ON episodic_memory BEGIN
+                    INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, cjk_bigram(new.content));
+                END""",
+                """CREATE TRIGGER em_ad AFTER DELETE ON episodic_memory BEGIN
+                    INSERT INTO fts_episodes(fts_episodes, rowid, content)
+                    VALUES ('delete', old.rowid, cjk_bigram(old.content));
+                END""",
+                """CREATE TRIGGER em_au AFTER UPDATE OF content ON episodic_memory
+                WHEN old.content IS NOT new.content BEGIN
+                    INSERT INTO fts_episodes(fts_episodes, rowid, content)
+                    VALUES ('delete', old.rowid, cjk_bigram(old.content));
+                    INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, cjk_bigram(new.content));
+                END""",
+                """CREATE TRIGGER wm_ai AFTER INSERT ON working_memory BEGIN
+                    INSERT INTO fts_working(id, content) VALUES (new.id, cjk_bigram(new.content));
+                END""",
+                """CREATE TRIGGER wm_ad AFTER DELETE ON working_memory BEGIN
+                    DELETE FROM fts_working WHERE id = old.id;
+                END""",
+                """CREATE TRIGGER wm_au AFTER UPDATE OF content ON working_memory
+                WHEN old.content IS NOT new.content BEGIN
+                    DELETE FROM fts_working WHERE id = old.id;
+                    INSERT INTO fts_working(id, content) VALUES (new.id, cjk_bigram(new.content));
+                END""",
+            ):
+                conn.execute(sql)
+            conn.execute("INSERT INTO fts_episodes(fts_episodes) VALUES ('delete-all')")
+            conn.execute("INSERT INTO fts_episodes(rowid, content) SELECT rowid, cjk_bigram(content) FROM episodic_memory")
+            conn.execute("DELETE FROM fts_working")
+            conn.execute("INSERT INTO fts_working(id, content) SELECT id, cjk_bigram(content) FROM working_memory")
+            conn.execute("INSERT INTO cjk_fts_schema(version) VALUES (1)")
+        conn.execute("RELEASE SAVEPOINT cjk_fts_upgrade")
+    except BaseException:
+        conn.execute("ROLLBACK TO SAVEPOINT cjk_fts_upgrade")
+        conn.execute("RELEASE SAVEPOINT cjk_fts_upgrade")
+        raise
 try:
     from mnemosyne.core.veracity_consolidation import (
         VeracityConsolidator,
@@ -1408,6 +1522,7 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
                 )
         else:
             conn._mnemosyne_vec_loaded = False
+        _register_cjk_bigram(conn)
         _thread_local.conn = conn
         _thread_local.db_path = str(path)
         collect_connection_cycles()
@@ -1881,48 +1996,8 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
         )
     """)
 
-    # --- FTS5 Triggers for episodic ---
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS em_ai AFTER INSERT ON episodic_memory BEGIN
-            INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, new.content);
-        END
-    """)
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS em_ad AFTER DELETE ON episodic_memory BEGIN
-            INSERT INTO fts_episodes(fts_episodes, rowid, content) VALUES ('delete', old.rowid, old.content);
-        END
-    """)
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS em_au AFTER UPDATE ON episodic_memory BEGIN
-            INSERT INTO fts_episodes(fts_episodes, rowid, content) VALUES ('delete', old.rowid, old.content);
-            INSERT INTO fts_episodes(rowid, content) VALUES (new.rowid, new.content);
-        END
-    """)
-
-    # --- FTS5 Triggers for working memory ---
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS wm_ai AFTER INSERT ON working_memory BEGIN
-            INSERT INTO fts_working(id, content) VALUES (new.id, new.content);
-        END
-    """)
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS wm_ad AFTER DELETE ON working_memory BEGIN
-            DELETE FROM fts_working WHERE id = old.id;
-        END
-    """)
-    # The wm_au trigger restricts to UPDATE OF content so sleep's
-    # consolidated_at marker writes don't churn the FTS index. Pre-E3
-    # this trigger fired on every UPDATE -- fine when UPDATEs were rare;
-    # post-E3 sleep marks SLEEP_BATCH_SIZE rows per cycle and would
-    # otherwise generate 2*N FTS round-trips per sleep with no content
-    # delta. SQLite column-list triggers handle the perf concern.
-    cursor.execute("DROP TRIGGER IF EXISTS wm_au")
-    cursor.execute("""
-        CREATE TRIGGER IF NOT EXISTS wm_au AFTER UPDATE OF content ON working_memory BEGIN
-            DELETE FROM fts_working WHERE id = old.id;
-            INSERT INTO fts_working(id, content) VALUES (new.id, new.content);
-        END
-    """)
+    # Upgrade trigger definitions and historical postings as one atomic unit.
+    _migrate_cjk_fts(conn)
 
     # --- MEMORIA: Structured Fact Tables (Phase 1) ---
     cursor.execute("""
@@ -2373,6 +2448,9 @@ class _BeamConnection(sqlite3.Connection):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Register CJK bigram UDF on every connection created via factory=
+        # (covers worker-thread connections that bypass _get_connection).
+        _register_cjk_bigram(self)
         self._defer_commit = False
         self._savepoint_counter = 0
         self._vec_working_count_cache: Optional[Tuple[int, int, int]] = None
@@ -3836,13 +3914,22 @@ def _fact_match_tokens(text: str) -> Set[str]:
     return set(_recall_tokens(text))
 
 
-def _contains_spaceless_cjk(text: str) -> bool:
-    return any(
-        "\u4e00" <= ch <= "\u9fff"
+def _is_han_char(ch: str) -> bool:
+    """Return whether *ch* is a CJK Unified Ideograph or Extension A character."""
+    return "\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf"
+
+
+def _is_cjk_char(ch: str) -> bool:
+    """Return whether *ch* is a CJK Unified/Ext-A, Kana, or Hangul character."""
+    return (
+        _is_han_char(ch)
         or "\u3040" <= ch <= "\u30ff"
         or "\uac00" <= ch <= "\ud7af"
-        for ch in text
     )
+
+
+def _contains_spaceless_cjk(text: str) -> bool:
+    return any(_is_cjk_char(ch) for ch in text)
 
 
 def _cjk_fts_terms(text: str) -> List[str]:
@@ -3852,12 +3939,7 @@ def _cjk_fts_terms(text: str) -> List[str]:
     individual token. Unquoted character terms match directly. Bigrams
     are quoted as phrases for multi-character matching.
     """
-    cjk_chars = [
-        ch for ch in text
-        if "\u4e00" <= ch <= "\u9fff"
-        or "\u3040" <= ch <= "\u30ff"
-        or "\uac00" <= ch <= "\ud7af"
-    ]
+    cjk_chars = [ch for ch in text if _is_cjk_char(ch)]
     if not cjk_chars:
         return []
     terms: List[str] = []
@@ -3953,12 +4035,7 @@ def _substring_overlap(query: "_LexicalQuery", token: str, content: "_LexicalCon
 
 def _prepare_lexical_query(query_tokens: Sequence[str], query_lower: str = "") -> _LexicalQuery:
     """Build the row-independent inputs of ``_lexical_relevance()``."""
-    query_cjk = {
-        ch for ch in query_lower
-        if "\u4e00" <= ch <= "\u9fff"
-        or "\u3040" <= ch <= "\u30ff"
-        or "\uac00" <= ch <= "\ud7af"
-    }
+    query_cjk = {ch for ch in query_lower if _is_cjk_char(ch)}
     query_tokens = list(query_tokens)
     if query_lower:
         query_tokens = [*query_tokens, *_hyphen_fragment_tokens(query_lower)]
@@ -4198,12 +4275,7 @@ def _prepared_lexical_relevance(query: _LexicalQuery, content: _LexicalContent) 
 
     if score == 0.0:
         if query_cjk:
-            content_cjk = {
-                ch for ch in content_lower
-                if "\u4e00" <= ch <= "\u9fff"
-                or "\u3040" <= ch <= "\u30ff"
-                or "\uac00" <= ch <= "\ud7af"
-            }
+            content_cjk = {ch for ch in content_lower if _is_cjk_char(ch)}
             score = len(query_cjk & content_cjk) / len(query_cjk)
         elif query.has_cyrillic:
             # Cyrillic inflected forms (тёмная/тёмную, резервная/резервное)
@@ -5480,6 +5552,26 @@ def _strip_ko_josa(token: str) -> str:
             return token
 
 
+def _han_fts_terms(query: str) -> tuple[List[str], Set[str], str]:
+    """Extract quoted unigram/bigram FTS terms for Han runs and return the non-Han remainder."""
+    if not any(_is_han_char(ch) for ch in query):
+        return [], set(), query
+    terms: List[str] = []
+    seen: Set[str] = set()
+    non_han_chars: List[str] = []
+    for i, ch in enumerate(query):
+        if _is_han_char(ch):
+            non_han_chars.append(" ")
+            for tok in (ch, ch + query[i + 1] if i + 1 < len(query) and _is_han_char(query[i + 1]) else ""):
+                if tok and tok not in seen:
+                    seen.add(tok)
+                    escaped = tok.replace('"', '""')
+                    terms.append(f'"{escaped}"')
+        else:
+            non_han_chars.append(ch)
+    return terms, seen, "".join(non_han_chars)
+
+
 def _fts_precise_terms(query: str, *, widen: bool = True) -> List[str]:
     """FTS terms built from the raw query tokens, before particle stripping.
 
@@ -5513,6 +5605,9 @@ def _fts_precise_terms(query: str, *, widen: bool = True) -> List[str]:
     without Hangul. The caller uses that equality to skip the extra stages
     entirely, so non-Korean recall pays nothing for this.
 
+    Han words also get a phrase in index token order, so a whole word can
+    reserve a slot before unigram and bigram expansion.
+
     Synonym expansion is deliberately absent: widening recall is the last
     stage's job.
     """
@@ -5521,7 +5616,8 @@ def _fts_precise_terms(query: str, *, widen: bool = True) -> List[str]:
     symbolic = set(_symbolic_code_tokens(query))
     query_has_hangul = _has_hangul(query)
     for token in _RECALL_TOKEN_RE.findall(query.lower()):
-        if not _is_meaningful_recall_token(token):
+        han_word = len(token) >= 2 and all(_is_han_char(ch) for ch in token)
+        if not han_word and not _is_meaningful_recall_token(token):
             continue
         if token in symbolic:
             # Same reason as in _fts_query_terms(): unicode61 shreds these
@@ -5531,6 +5627,8 @@ def _fts_precise_terms(query: str, *, widen: bool = True) -> List[str]:
         if not token or token in seen:
             continue
         seen.add(token)
+        if han_word:
+            terms.append(f'"{_cjk_bigram(token)}"')
         if widen and (_has_hangul(token) or query_has_hangul):
             terms.append(f'"{token}"*')
         else:
@@ -5557,16 +5655,15 @@ def _fts_query_terms(query: str) -> List[str]:
     candidates with noise; they are matched exact-only by the lexical
     layer via ``_symbolic_code_tokens()``.
     """
-    terms: List[str] = []
-    seen: Set[str] = set()
-    symbolic = set(_symbolic_code_tokens(query))
+    terms, seen, non_han_query = _han_fts_terms(query)
+    symbolic = set(_symbolic_code_tokens(non_han_query))
     # unicode61 glues a Korean particle onto whatever precedes it, including
     # a Latin word: `ModelForge가` is one index token, and so is `honcho는`.
     # An exact phrase term can never match either, so every term in a
     # Hangul-bearing query must take the prefix form -- even the ones that
     # `_recall_tokens()` has already stripped down to pure Latin.
     query_has_hangul = _has_hangul(query)
-    for term in _expanded_query_tokens(_recall_tokens(query)):
+    for term in _expanded_query_tokens(_recall_tokens(non_han_query)):
         if term.startswith("-"):
             # FTS5-only terms never reach MATCH verbatim. The fragment's
             # components are added below via _hyphen_fragment_tokens().
@@ -5592,7 +5689,7 @@ def _fts_query_terms(query: str) -> List[str]:
         if term not in seen:
             seen.add(term)
             terms.append(f'"{term}"')
-    for component in _hyphen_fragment_tokens(query):
+    for component in _hyphen_fragment_tokens(non_han_query):
         component = component.replace('"', '""').strip()
         if component and component not in seen:
             seen.add(component)
@@ -5602,12 +5699,7 @@ def _fts_query_terms(query: str) -> List[str]:
 
 def _has_cjk(text: str) -> bool:
     """Check if text contains any CJK characters."""
-    return any(
-        "\u4e00" <= ch <= "\u9fff"
-        or "\u3040" <= ch <= "\u30ff"
-        or "\uac00" <= ch <= "\ud7af"
-        for ch in text
-    )
+    return any(_is_cjk_char(ch) for ch in text)
 
 
 def _cjk_like_search(conn: sqlite3.Connection, query: str, k: int = 20, working: bool = False) -> List[Dict]:
@@ -5622,12 +5714,7 @@ def _cjk_like_search(conn: sqlite3.Connection, query: str, k: int = 20, working:
     underserved CJK users. Once FTS5 gets tokenchars or ICU support,
     this function can be removed.
     """
-    cjk_chars = sorted(set(
-        ch for ch in query
-        if "\u4e00" <= ch <= "\u9fff"
-        or "\u3040" <= ch <= "\u30ff"
-        or "\uac00" <= ch <= "\ud7af"
-    ))
+    cjk_chars = sorted(set(ch for ch in query if _is_cjk_char(ch)))
     if not cjk_chars:
         return []
 
@@ -6064,7 +6151,7 @@ def _supplement_cjk_working(conn, query, rows, k, terms, *, where_sql=None, wher
         return rows
     groups = [
         tuple(dict.fromkeys(run[i:i + 2] for i in range(len(run) - 1)))
-        for run in re.findall(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+", query)
+        for run in re.findall(r"[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\uac00-\ud7af]+", query)
         if len(run) >= 2
     ]
     anchors = tuple(dict.fromkeys(anchor for group in groups for anchor in group))
@@ -7437,7 +7524,8 @@ class BeamMemory:
                 keywords = [w for w in words if len(w) > 2 and w not in stop_words]
                 keywords = [kw for kw in keywords if kw.isalpha()]  # FTS5-safe only
                 if len(keywords) >= 3:
-                    fts_query = " OR ".join(keywords)
+                    # Match each whole keyword in the same token order as the index.
+                    fts_query = " OR ".join(f'"{_cjk_bigram(keyword)}"' for keyword in keywords)
                     cursor = self.conn.execute(
                         "SELECT DISTINCT id FROM fts_working WHERE fts_working MATCH ? ORDER BY rank LIMIT 5",
                         (fts_query,)
@@ -9462,50 +9550,52 @@ class BeamMemory:
                               source_memory_id=source_memory_id)
             counts["sequence"] += 1
 
-        # Instructions (IF support): language-aware
-        _INSTRUCTION_FALSE_POSITIVES = pat['instruction_false_positives']
-        _INSTR_IMPERATIVE_VERBS = pat['instruction_imperative']
-        _instr_re = pat['instruction'].replace('IMPVERBS', _INSTR_IMPERATIVE_VERBS)
-        for m in _re.finditer(_instr_re, content, _re.IGNORECASE):
-            instr = m.group(0).strip()
-            topic = m.group(1).strip()[:60]
-            # Skip known false positives
-            _instr_lower = instr.lower()
-            if any(fp in _instr_lower for fp in _INSTRUCTION_FALSE_POSITIVES):
-                continue
-            # Skip bare "should"/"sollte"/"dovrebbe"/"dovresti" questions not directed at anyone
-            if _re.match(r'^(?:should|sollte|dovrebbe|dovresti)\s+(?:i|we|it|they|he|she|the|ich|wir|es|man|der|die|das|io|noi|lui|lei|loro)\b', instr, _re.IGNORECASE):
-                continue
-            self.conn.execute(
-                "INSERT INTO memoria_instructions (session_id, message_idx, instruction, topic, context_snippet, source_memory_id) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (session, message_idx, instr[:200], topic, self._context_snippet(content, m.start()), source_memory_id))
-            counts["instruction"] = counts.get("instruction", 0) + 1
+        _disable_regex_extraction = os.environ.get("MNEMOSYNE_DISABLE_REGEX_EXTRACTION", "").strip().lower() in ("1", "true", "yes", "on")
+        if not _disable_regex_extraction:
+            # Instructions (IF support): language-aware
+            _INSTRUCTION_FALSE_POSITIVES = pat['instruction_false_positives']
+            _INSTR_IMPERATIVE_VERBS = pat['instruction_imperative']
+            _instr_re = pat['instruction'].replace('IMPVERBS', _INSTR_IMPERATIVE_VERBS)
+            for m in _re.finditer(_instr_re, content, _re.IGNORECASE):
+                instr = m.group(0).strip()
+                topic = m.group(1).strip()[:60]
+                # Skip known false positives
+                _instr_lower = instr.lower()
+                if any(fp in _instr_lower for fp in _INSTRUCTION_FALSE_POSITIVES):
+                    continue
+                # Skip bare "should"/"sollte"/"dovrebbe"/"dovresti" questions not directed at anyone
+                if _re.match(r'^(?:should|sollte|dovrebbe|dovresti)\s+(?:i|we|it|they|he|she|the|ich|wir|es|man|der|die|das|io|noi|lui|lei|loro)\b', instr, _re.IGNORECASE):
+                    continue
+                self.conn.execute(
+                    "INSERT INTO memoria_instructions (session_id, message_idx, instruction, topic, context_snippet, source_memory_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (session, message_idx, instr[:200], topic, self._context_snippet(content, m.start()), source_memory_id))
+                counts["instruction"] = counts.get("instruction", 0) + 1
 
-        # Preferences (PF support): evolving user tastes — language-aware
-        for m in _re.finditer(pat['preference'], content, _re.IGNORECASE):
-            pref = m.group(0).strip()
-            topic = m.group(1).strip()[:60]
-            # Extract a clean topic key from the preference for dedup
-            _topic_key = ' '.join(
-                w for w in _re.findall(r'[a-zA-Z]{4,}', topic)
-                if w.lower() not in _FACT_MATCH_STOPWORDS
-            )[:30] or topic[:20]
-            # Check for evolution: did this topic already have a preference?
-            existing = self.conn.execute(
-                "SELECT preference, topic FROM memoria_preferences "
-                "WHERE session_id = ? AND (topic LIKE ? OR preference LIKE ?) "
-                "ORDER BY message_idx DESC LIMIT 1",
-                (session, f'%{_topic_key}%', f'%{_topic_key}%')
-            ).fetchone()
-            evolution = None
-            if existing:
-                evolution = f"was: {existing[0][:120]}"
-            self.conn.execute(
-                "INSERT INTO memoria_preferences (session_id, message_idx, preference, topic, evolution, context_snippet, source_memory_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (session, message_idx, pref[:200], topic, evolution, self._context_snippet(content, m.start()), source_memory_id))
-            counts["preference"] = counts.get("preference", 0) + 1
+            # Preferences (PF support): evolving user tastes — language-aware
+            for m in _re.finditer(pat['preference'], content, _re.IGNORECASE):
+                pref = m.group(0).strip()
+                topic = m.group(1).strip()[:60]
+                # Extract a clean topic key from the preference for dedup
+                _topic_key = ' '.join(
+                    w for w in _re.findall(r'[a-zA-Z]{4,}', topic)
+                    if w.lower() not in _FACT_MATCH_STOPWORDS
+                )[:30] or topic[:20]
+                # Check for evolution: did this topic already have a preference?
+                existing = self.conn.execute(
+                    "SELECT preference, topic FROM memoria_preferences "
+                    "WHERE session_id = ? AND (topic LIKE ? OR preference LIKE ?) "
+                    "ORDER BY message_idx DESC LIMIT 1",
+                    (session, f'%{_topic_key}%', f'%{_topic_key}%')
+                ).fetchone()
+                evolution = None
+                if existing:
+                    evolution = f"was: {existing[0][:120]}"
+                self.conn.execute(
+                    "INSERT INTO memoria_preferences (session_id, message_idx, preference, topic, evolution, context_snippet, source_memory_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (session, message_idx, pref[:200], topic, evolution, self._context_snippet(content, m.start()), source_memory_id))
+                counts["preference"] = counts.get("preference", 0) + 1
 
         self.conn.commit()
         counts["_lang"] = lang  # Tag extraction with detected language
@@ -11665,7 +11755,7 @@ class BeamMemory:
     # 21: UTC-Z timestamps remain temporally eligible on Python 3.10.
     # 22: polyphonic voices return the requested top_k.
     # Recheck the actual predecessor before each semantic integration.
-    _ENHANCED_RECALL_CACHE_VERSION = 22
+    _ENHANCED_RECALL_CACHE_VERSION = 23
     # NOTE: the key carries the env MNEMOSYNE_VEC_TYPE, not the table's
     # live DDL type — a reindex under a different type without a version
     # bump serves stale admission/ranking. Reindex flows must bump.

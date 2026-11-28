@@ -25,7 +25,19 @@ Already on v3.0.0? See [Upgrading to v3.0.0](#upgrading-to-v300-memoria-architec
 | SQLite schema changed (wondering?) | See [How to confirm schema changes](#how-to-confirm-schema-changes) |
 | E6 TripleStore split (v2.8) | Auto-migrates on first init. Backup at `{db}.pre_e6_backup` |
 | MEMORIA architecture (v3.0) | Auto-creates 5 new tables on first init. No manual action needed |
+| CJK FTS5 bigram triggers (`cjk_fts_schema` v1) | Auto-migrates on first `init_beam()`. Upgrade all writers sharing the bank (see [CJK FTS5 writer compatibility](#cjk-fts5-writer-compatibility)) |
 | `plugin.yaml` / tool schema | Restart Hermes only |
+
+---
+
+## CJK FTS5 writer compatibility
+
+When `init_beam()` opens a database, `_migrate_cjk_fts()` atomically upgrades the `episodic_memory` and `working_memory` FTS5 triggers (`em_ai`, `em_ad`, `em_au`, `wm_ai`, `wm_au`) to invoke the `cjk_bigram()` SQLite UDF and records version `1` in `cjk_fts_schema`.
+
+Because SQLite UDFs are per-connection rather than persisted in the database file:
+
+- **Upgrade every writer sharing the bank together**: stop or upgrade any older Mnemosyne runtime (Hermes provider, standalone MCP server, CLI, or background jobs) before opening a shared SQLite bank on the new version, as an older runtime without `cjk_bigram` registered will fail on `INSERT`/`UPDATE`/`DELETE` with `sqlite3.OperationalError: no such function: cjk_bigram`.
+- **Custom or maintenance SQLite connections**: any script opening a direct `sqlite3.connect()` to write to `working_memory` or `episodic_memory` (instead of using `BeamMemory`, `init_beam()`, or `factory=_BeamConnection`) must call `_register_cjk_bigram(conn)` from `mnemosyne.core.beam` first. Read-only connections (`SELECT`) are unaffected.
 
 ---
 

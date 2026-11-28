@@ -20,7 +20,6 @@ import argparse
 import json
 import os
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -290,7 +289,7 @@ def get_session_path(session_id: str) -> Path | None:
         if path.exists():
             return path
     # Fallback: search
-    for p in sessions_dir.glob(f"session_*.json"):
+    for p in sessions_dir.glob("session_*.json"):
         if session_id.replace("hermes_", "") in p.stem:
             return p
     return None
@@ -378,7 +377,6 @@ def heal_entry(
 
     eid, old_content, session_id, source, meta_json, degraded_at = row
     source = source or f"session:{session_id}"
-    meta = json.loads(meta_json) if meta_json else {}
 
     # Stage 0: Extract memory units from session file
     session_path = get_session_path(session_id)
@@ -444,7 +442,10 @@ def run_heal_pipeline(detect_only: bool = False, entry_id: str | None = None, dr
         print(f"Error: database not found at {db_path}")
         sys.exit(1)
 
+    from mnemosyne.core.beam import _register_cjk_bigram
+
     conn = sqlite3.connect(db_path)
+    _register_cjk_bigram(conn)
 
     if entry_id:
         result = heal_entry(entry_id, conn, dry_run=dry_run)

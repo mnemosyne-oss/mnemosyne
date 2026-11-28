@@ -40,7 +40,7 @@ def shared_server(tmp_path):
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     env = {k: v for k, v in os.environ.items() if not k.startswith(("MNEMOSYNE_", "OPENROUTER_", "OPENAI_"))}
-    env.update(MNEMOSYNE_DATA_DIR=str(tmp_path), MNEMOSYNE_DISABLE_EMBEDDINGS="1",
+    env.update(MNEMOSYNE_DATA_DIR=str(tmp_path), MNEMOSYNE_DISABLE_EMBEDDINGS="1", MNEMOSYNE_NO_EMBEDDINGS="1",
                MNEMOSYNE_LLM_BACKEND="none", MNEMOSYNE_DEFAULT_SCOPE="global",
                MNEMOSYNE_MCP_TOKENS=json.dumps({"hermes": "test-hermes", "codex": "test-codex", "claude-code": "test-claude"}),
                MNEMOSYNE_MCP_ALLOWED_HOSTS=f"127.0.0.1:{port}")

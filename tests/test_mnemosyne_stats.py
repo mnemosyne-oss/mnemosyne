@@ -76,7 +76,10 @@ def _seed_stats_db(db_path, wiki_path):
     init_triples(Path(db_path))
     older = datetime(2024, 1, 1).isoformat()
     newer = datetime(2024, 1, 2).isoformat()
+    from mnemosyne.core.beam import _register_cjk_bigram
+
     conn = sqlite3.connect(str(db_path))
+    _register_cjk_bigram(conn)
     conn.execute(
         "INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, veracity, recall_count, scope, consolidated_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
