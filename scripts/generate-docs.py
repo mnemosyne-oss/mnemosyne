@@ -287,7 +287,7 @@ CONFIG_DESCRIPTIONS = {
     "degrade_batch": "Rows degraded per maintenance pass.",
 
     # LLM
-    "llm_enabled": "Enable LLM summarization during sleep consolidation.",
+    "llm_enabled": "Global gate for host, remote and local LLM calls. Fails closed: `false` in either `config.yaml` or the environment switches all of them off, and `true` in one never overrides `false` in the other.",
     "llm_max_tokens": "Maximum output tokens per LLM summary.",
     "llm_n_threads": "CPU threads for local GGUF inference.",
     "llm_n_ctx": "Context window for local GGUF inference.",
@@ -395,7 +395,6 @@ EFFECTIVE_DEFAULT_PROSE = {
     "vec_weight": "Recall weights resolve as `config.yaml > MNEMOSYNE_*_WEIGHT > defaults` at request time.",
     "fts_weight": "Recall weights resolve as `config.yaml > MNEMOSYNE_*_WEIGHT > defaults` at request time.",
     "importance_weight": "Recall weights resolve as `config.yaml > MNEMOSYNE_*_WEIGHT > defaults` at request time.",
-    "llm_enabled": "Note the direction: `config.py` declares this off while the module defaults it on. Fails closed and restart-scoped: an explicit `false` in either `config.yaml` or the environment switches off host, remote and local LLM calls, and a `true` in one never overrides a `false` in the other.",
     "prefetch_content_chars": "Zero disables truncation, but a zero can still fall back to a profile limit downstream -- `0` is not always unlimited.",
     "sync_turn_user_limit": "Per-message characters, not turns: caps user content per sync turn (500 chars).",
     "sync_turn_assistant_limit": "Per-message characters, not turns: caps assistant content per sync turn (800 chars).",

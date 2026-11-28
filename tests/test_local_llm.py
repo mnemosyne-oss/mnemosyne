@@ -135,10 +135,21 @@ print(json.dumps([summary, calls]))
             {},
             ["Host summary.", ["host"]],
         ),
+        (
+            "llm_enabled: true\nhost_llm_enabled: false\n",
+            {"MNEMOSYNE_LLM_BASE_URL": "http://127.0.0.1:1/v1"},
+            ["Remote summary.", ["remote"]],
+        ),
+        (
+            "llm_enabled: true\nhost_llm_enabled: false\n",
+            {},
+            [None, ["local"]],
+        ),
     ],
     ids=[
         "yaml-off-no-env", "yaml-off-stale-remote", "yaml-off-over-env-on",
-        "env-off-over-yaml-on", "yaml-on-control",
+        "env-off-over-yaml-on", "yaml-on-host-control", "yaml-on-remote-control",
+        "yaml-on-local-control",
     ],
 )
 def test_global_llm_off_blocks_host_remote_and_local_paths(tmp_path, yaml_text, env_vars, expected):
@@ -171,10 +182,13 @@ def local_model(*args, **kwargs):
     calls.append("local")
     return None
 
+def no_download(*args, **kwargs):
+    raise RuntimeError("download disabled in test")
+
 set_host_llm_backend(CallableLLMBackend("fixture", complete))
 local_llm._call_remote_llm = remote
 local_llm._model_path = local_model
-local_llm._download_model = local_model
+local_llm._download_model = no_download
 summary = local_llm.summarize_memories(["The observatory will install a thermal regulator."])
 print(json.dumps([summary, calls]))
 """],

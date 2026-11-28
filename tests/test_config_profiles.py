@@ -318,6 +318,22 @@ class TestConfigReader:
             "cron,flush,subagent,background,skill_loop"
         )
 
+    @pytest.mark.parametrize(("env_value", "expected"), [(None, True), ("false", False)])
+    def test_auto_seed_does_not_write_an_implicit_llm_off(
+        self, tmp_path, monkeypatch, env_value, expected
+    ):
+        """#1157: llm_enabled: false in config.yaml is a hard off, so the seed
+        may only write it when the operator chose it through the environment."""
+        import yaml
+
+        if env_value is None:
+            monkeypatch.delenv("MNEMOSYNE_LLM_ENABLED", raising=False)
+        else:
+            monkeypatch.setenv("MNEMOSYNE_LLM_ENABLED", env_value)
+        config_path = tmp_path / "config.yaml"
+        MnemosyneConfig(config_path=config_path).ensure_seeded()
+        assert yaml.safe_load(config_path.read_text())["llm_enabled"] is expected
+
     def test_auto_seeded_explicit_env_values_are_preserved(
         self, tmp_path, monkeypatch, caplog
     ):
