@@ -231,10 +231,13 @@ _FASTEMBED_CACHE_DIR = (
 # --- OpenAI-compatible API ---
 # Mnemosyne embedding config is independent of general OpenRouter/OpenAI settings.
 # Embedding models may use local llama.cpp, OpenAI, Anthropic, or any other provider.
+_INHERIT_OPENAI_KEY = str(_cfg("embedding_inherit_openai_key", True)).strip().lower() not in (
+    "0", "false", "no", "off",
+)
 _OPENAI_API_KEY = (
     _cfg("embedding_api_key")
     or os.environ.get("MNEMOSYNE_EMBEDDING_API_KEY")
-    or os.environ.get("OPENAI_API_KEY", "")
+    or (os.environ.get("OPENAI_API_KEY", "") if _INHERIT_OPENAI_KEY else "")
 )
 _OPENAI_BASE_URL = _configured_api_url() or "https://openrouter.ai/api/v1"
 

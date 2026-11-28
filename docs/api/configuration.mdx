@@ -1,7 +1,7 @@
 ---
 title: "Configuration"
 version: 4.2.0
-config_key_count: 117
+config_key_count: 118
 env_only_count: 53
 generated_at: "auto"
 ---
@@ -23,13 +23,13 @@ and `wm_max_items` are equivalent.
 Keys marked **restart** are read once at startup. Changing them at runtime warns
 and does not take effect until the process restarts.
 
-There are **117 configuration keys**. A further
+There are **118 configuration keys**. A further
 **53 environment variables** are read directly from the
 environment and are **not** settable in `config.yaml`; they are listed separately below.
 
 ---
 
-## Configuration keys (117)
+## Configuration keys (118)
 
 | Config key | Environment variable | Default | Restart | Description |
 |------------|----------------------|---------|---------|-------------|
@@ -47,9 +47,10 @@ environment and are **not** settable in `config.yaml`; they are listed separatel
 | `default_scope` | `MNEMOSYNE_DEFAULT_SCOPE` | `session` | no | Default scope for new memories: `session` or `global`. |
 | `degrade_batch` | `MNEMOSYNE_DEGRADE_BATCH` | `100` | no | Rows degraded per maintenance pass. |
 | `dream_active` | `MNEMOSYNE_DREAM_ACTIVE` | `false` | no | Whether Dream mode is active, disabling automated model-refresh mutations. |
-| `embedding_api_key` | `MNEMOSYNE_EMBEDDING_API_KEY` | *(unset)* | no | API key for a remote embedding provider. Falls back to `OPENAI_API_KEY`. |
+| `embedding_api_key` | `MNEMOSYNE_EMBEDDING_API_KEY` | *(unset)* | no | API key for a remote embedding provider. Falls back to `OPENAI_API_KEY` unless inheritance is disabled. |
 | `embedding_api_url` | `MNEMOSYNE_EMBEDDING_API_URL` | *(unset)* | **yes** | Base URL of an OpenAI-compatible embedding endpoint. |
 | `embedding_dim` | `MNEMOSYNE_EMBEDDING_DIM` | `384` | **yes** | Override the embedding dimension. Must match the dimension stored in the existing vec tables. |
+| `embedding_inherit_openai_key` | `MNEMOSYNE_EMBEDDING_INHERIT_OPENAI_KEY` | `true` | **yes** | Use `OPENAI_API_KEY` as a fallback when no embedding key is set. Disable for an intentionally keyless custom endpoint without changing chat credentials. |
 | `embedding_model` | `MNEMOSYNE_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | **yes** | Embedding model name. Local fastembed model, or an API model when routed to a provider. |
 | `embeddings_off` | `MNEMOSYNE_EMBEDDINGS_OFF` | `false` | no | Alias for `no_embeddings`. |
 | `embeddings_via_api` | `MNEMOSYNE_EMBEDDINGS_VIA_API` | `false` | no | Force API mode for embeddings instead of inferring it from the model name. |

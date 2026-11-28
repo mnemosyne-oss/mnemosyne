@@ -236,7 +236,8 @@ CONFIG_DESCRIPTIONS = {
     # Embeddings
     "embedding_model": "Embedding model name. Local fastembed model, or an API model when routed to a provider.",
     "embedding_dim": "Override the embedding dimension. Must match the dimension stored in the existing vec tables.",
-    "embedding_api_key": "API key for a remote embedding provider. Falls back to `OPENAI_API_KEY`.",
+    "embedding_api_key": "API key for a remote embedding provider. Falls back to `OPENAI_API_KEY` unless inheritance is disabled.",
+    "embedding_inherit_openai_key": "Use `OPENAI_API_KEY` as a fallback when no embedding key is set. Disable for an intentionally keyless custom endpoint without changing chat credentials.",
     "embedding_api_url": "Base URL of an OpenAI-compatible embedding endpoint.",
     "embeddings_via_api": "Force API mode for embeddings instead of inferring it from the model name.",
     "no_embeddings": "Disable dense retrieval entirely. Recall degrades to lexical FTS5.",

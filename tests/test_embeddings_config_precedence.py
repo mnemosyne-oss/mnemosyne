@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _run(tmp_path, config_text: str, env_extra: dict | None = None) -> dict:
     data_dir = tmp_path / "data"
@@ -41,6 +43,7 @@ def _run(tmp_path, config_text: str, env_extra: dict | None = None) -> dict:
         "  'available': E.available(),\n"
         "  'available_api': E.available_api(),\n"
         "  'base': E._effective_base_url(),\n"
+        "  'cleartext_refused': E._cleartext_refusal_applies(E._effective_base_url()),\n"
         "}))\n"
     )
     completed = subprocess.run(
@@ -78,7 +81,41 @@ def test_config_only_embeddings_are_honored(tmp_path):
         "available": True,
         "available_api": True,
         "base": "https://embeddings.example.test/v1",
+        "cleartext_refused": False,
     }
+
+
+@pytest.mark.parametrize(
+    "config, env, refused",
+    [
+        ("", {}, True),
+        ("", {"MNEMOSYNE_EMBEDDING_INHERIT_OPENAI_KEY": "fales"}, True),
+        ("embedding_inherit_openai_key: false\n", {}, False),
+        ("", {"MNEMOSYNE_EMBEDDING_INHERIT_OPENAI_KEY": "false"}, False),
+        (
+            "embedding_inherit_openai_key: false\n",
+            {"MNEMOSYNE_EMBEDDING_INHERIT_OPENAI_KEY": "true"},
+            False,
+        ),
+        (
+            "embedding_inherit_openai_key: false\nembedding_api_key: deliberate-embedding-key\n",
+            {},
+            True,
+        ),
+        (
+            "embedding_inherit_openai_key: false\n",
+            {"MNEMOSYNE_EMBEDDING_API_KEY": "deliberate-embedding-key"},
+            True,
+        ),
+    ],
+)
+def test_local_embedding_key_inheritance_is_explicit(tmp_path, config, env, refused):
+    result = _run(
+        tmp_path,
+        "embedding_api_url: http://127.0.0.1:8080/v1\n" + config,
+        env_extra={"OPENAI_API_KEY": "unrelated-chat-key", **env},
+    )
+    assert result["cleartext_refused"] is refused
 
 
 def test_known_model_dimension_is_not_overridden_by_the_seeded_default(tmp_path):
