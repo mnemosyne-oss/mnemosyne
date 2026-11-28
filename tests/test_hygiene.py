@@ -537,6 +537,65 @@ class TestAuditNoise:
         assert report.summary["table_counts"]["episodic_memory"] == 1
         assert any(c.table_name == "episodic_memory" for c in report.candidates)
 
+    @pytest.mark.parametrize(
+        ("columns", "batch_size"),
+        [
+            (("content",), 1),
+            (("id",), 2),
+            ((), 1),
+        ],
+    )
+    def test_audit_skips_tables_missing_required_columns(self, tmp_path, columns, batch_size):
+        db_path = tmp_path / "incompatible.db"
+        conn = sqlite3.connect(db_path)
+        definitions = {"id": "TEXT", "content": "TEXT"}
+        schema = ", ".join(
+            f"{column} {definitions[column]}" for column in columns
+        ) or "placeholder TEXT"
+        conn.execute(f"CREATE TABLE malformed ({schema})")
+        names = columns or ("placeholder",)
+        for index in range(3):
+            values = {"id": f"row-{index}", "content": "", "placeholder": "x"}
+            conn.execute(
+                f"INSERT INTO malformed VALUES ({', '.join('?' for _ in names)})",
+                tuple(values[column] for column in names),
+            )
+        conn.commit()
+        conn.close()
+
+        report = audit_noise(
+            db_path=db_path,
+            tables=["malformed"],
+            scan_all=True,
+            batch_size=batch_size,
+            min_score=0.0,
+        )
+
+        assert report.total_scanned == 0
+        assert report.summary["table_counts"]["malformed"] == 0
+        assert report.candidates == []
+
+    def test_audit_scan_all_scratchpad_without_source_column(self, temp_db):
+        db_path, beam = temp_db
+        beam.conn.execute("DELETE FROM scratchpad")
+        beam.conn.execute(
+            "INSERT INTO scratchpad (id, content, session_id) VALUES (?, ?, ?)",
+            ("scratch-noise", "heartbeat", "test"),
+        )
+        beam.conn.commit()
+
+        report = audit_noise(
+            db_path=db_path,
+            tables=["scratchpad"],
+            scan_all=True,
+            batch_size=1,
+            min_score=0.3,
+        )
+
+        assert report.total_scanned == 1
+        assert report.summary["table_counts"]["scratchpad"] == 1
+        assert [candidate.memory_id for candidate in report.candidates] == ["scratch-noise"]
+
     def test_audit_offset_and_scan_all(self, temp_db):
         db_path, beam = temp_db
         for idx in range(3):
