@@ -80,6 +80,40 @@ def _orphan_cutoff() -> str:
     ).isoformat()
 
 
+_SUMMARY_SOURCE_IDS_KEY = "_mnemosyne_summary_source_ids_v1"
+
+
+def _structured_summary_ids(metadata_json: Optional[str]) -> Tuple[str, ...]:
+    """Read the explicit source list from a summary's metadata."""
+    if not isinstance(metadata_json, str) or _SUMMARY_SOURCE_IDS_KEY not in metadata_json:
+        return ()
+    try:
+        metadata = json.loads(metadata_json)
+    except (ValueError, RecursionError):
+        return ()
+    ids = metadata.get(_SUMMARY_SOURCE_IDS_KEY) if isinstance(metadata, dict) else None
+    if not isinstance(ids, list) or not all(isinstance(item, str) and item for item in ids):
+        return ()
+    return tuple(ids)
+
+
+def _summary_source_ids(summary_of: Optional[str], metadata_json: Optional[str]) -> Tuple[str, ...]:
+    """Read exact source IDs, falling back to historical CSV for recall."""
+    return _structured_summary_ids(metadata_json) or tuple(
+        token.strip() for token in (summary_of or "").split(",") if token.strip()
+    )
+
+
+def _structured_summary_has_source(
+    metadata_json: Optional[str], source: str, sole: int,
+) -> Optional[bool]:
+    """Match a source for SQL, returning NULL when structured links are absent."""
+    ids = _structured_summary_ids(metadata_json)
+    if not ids:
+        return None
+    return all(item == source for item in ids) if sole else source in ids
+
+
 def _claim_completed_sql(alias: str) -> str:
     """SQL predicate: a summary completed THIS claim of working row ``alias``.
 
@@ -102,7 +136,9 @@ def _claim_completed_sql(alias: str) -> str:
     """
     return (
         "EXISTS (SELECT 1 FROM episodic_memory em "
-        f"WHERE instr(',' || COALESCE(em.summary_of, '') || ',', ',' || {alias}.id || ',') > 0 "
+        f"WHERE COALESCE(CASE WHEN instr(em.metadata_json, '{_SUMMARY_SOURCE_IDS_KEY}') > 0 "
+        f"THEN mnemosyne_summary_has_source(em.metadata_json, {alias}.id, 0) END, "
+        f"instr(',' || COALESCE(em.summary_of, '') || ',', ',' || {alias}.id || ',') > 0) "
         "AND (em.created_at IS NULL "
         f"OR datetime(em.created_at) >= datetime({alias}.consolidation_claimed_at)))"
     )
@@ -2376,6 +2412,9 @@ class _BeamConnection(sqlite3.Connection):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.create_function(
+            "mnemosyne_summary_has_source", 3, _structured_summary_has_source, deterministic=True,
+        )
         self._defer_commit = False
         self._savepoint_counter = 0
         self._vec_working_count_cache: Optional[Tuple[int, int, int]] = None
@@ -7844,13 +7883,21 @@ class BeamMemory:
         cursor = self.conn.cursor()
         owns_transaction = not self.conn.in_transaction
         targets = (bank,) if bank is not None else ("working_memory", "episodic_memory")
-        # Prefixing the CSV with a comma lets replace() remove consecutive
-        # legacy references without consuming their neighboring separators.
-        # A different token that starts with the same ID leaves a suffix.
+        # Legacy CSV containing a comma may encode a single literal ID or
+        # several references. Only retire a row if its sole source is certain.
+        structured_match = (
+            f"(CASE WHEN instr(metadata_json, '{_SUMMARY_SOURCE_IDS_KEY}') > 0 "
+            "THEN mnemosyne_summary_has_source(metadata_json, :source, 1) END)"
+        )
         sole_source = (
-            "instr(:source, ',') = 0 AND (summary_of = :source OR "
-            "(instr(summary_of, ',') > 0 AND "
-            "replace(',' || summary_of, ',' || :source, '') = ''))"
+            f"COALESCE({structured_match}, "
+            "summary_of = :source AND instr(summary_of, ',') = 0 AND summary_of <> '')"
+        )
+        # A replacement should also be rejected if an ambiguous legacy row
+        # could have been derived solely from the source being invalidated.
+        possible_legacy_source = (
+            f"({structured_match} IS NULL AND instr(summary_of, ',') > 0 AND (summary_of = :source OR "
+            "(instr(:source, ',') = 0 AND replace(',' || summary_of, ',' || :source, '') = '')))"
         )
         with _guarded_transaction(self.conn):
             # Lock before checking a replacement so its validity cannot change
@@ -7883,7 +7930,8 @@ class BeamMemory:
                 target_params += (now,)
                 if table == "episodic_memory" and "working_memory" in targets:
                     dependent = cursor.execute(
-                        f"SELECT 1 FROM episodic_memory WHERE id = :replacement AND {sole_source}",
+                        f"""SELECT 1 FROM episodic_memory
+                            WHERE id = :replacement AND ({sole_source} OR {possible_legacy_source})""",
                         {"replacement": replacement_id, "source": memory_id},
                     ).fetchone()
                     if dependent and cursor.execute(
@@ -8733,6 +8781,17 @@ class BeamMemory:
             return None
 
         source_wm_ids = list(dict.fromkeys(source_wm_ids))
+        summary_metadata = dict(metadata or {})
+        summary_metadata.pop(_SUMMARY_SOURCE_IDS_KEY, None)
+        summary_of = ",".join(source_wm_ids)
+        if "," in summary_of:
+            # The metadata field round-trips through export and sync. Record
+            # the exact list whenever CSV alone would be ambiguous.
+            summary_metadata[_SUMMARY_SOURCE_IDS_KEY] = source_wm_ids
+            if any("," in source_id for source_id in source_wm_ids):
+                # Older readers can still parse the ordinary CSV form.
+                # Omit it when it would split a literal ID.
+                summary_of = ""
 
         # Caller-owned transaction gate (round-4): the MEMORY_CONSOLIDATED
         # event must never precede the commit that persists the row. Under
@@ -8861,7 +8920,7 @@ class BeamMemory:
                  author_id, author_type, channel_id, memory_type, veracity, tier)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (memory_id, _sanitize_utf8(summary), source, timestamp, self.session_id, importance,
-                  json.dumps(metadata or {}), ",".join(source_wm_ids), valid_until, scope,
+                  json.dumps(summary_metadata), summary_of, valid_until, scope,
                   self.author_id, self.author_type, self.channel_id, ep_type, row_veracity, row_tier))
             rowid = cursor.lastrowid
 
@@ -11332,18 +11391,22 @@ class BeamMemory:
                         "tool": TOOL_WEIGHT, "imported": IMPORTED_WEIGHT,
                         "unknown": UNKNOWN_WEIGHT}
         em_ids_for_tier = [r["id"] for r in results if r.get("tier") == "episodic"]
-        # E3.a.3: pull summary_of in the same round trip so the dedup
+        # E3.a.3: pull source links in the same round trip so the dedup
         # helper can use a precomputed map instead of issuing a second
         # SELECT for the same ep ids.
-        ep_summary_of_map: Dict[str, str] = {}
+        ep_summary_of_map: Dict[str, Tuple[str, ...]] = {}
         if em_ids_for_tier:
             tier_rows = _select_recall_rows_by_ids(
-                self.conn, "SELECT id, tier, veracity, summary_of FROM episodic_memory WHERE id IN ({placeholders})",
+                self.conn,
+                "SELECT id, tier, veracity, summary_of, metadata_json FROM episodic_memory WHERE id IN ({placeholders})",
                 em_ids_for_tier
             )
             tier_lookup = {r["id"]: (r["tier"] or 1) for r in tier_rows}
             veracity_lookup = {r["id"]: (r["veracity"] or "unknown") for r in tier_rows}
-            ep_summary_of_map = {r["id"]: (r["summary_of"] or "") for r in tier_rows}
+            ep_summary_of_map = {
+                row["id"]: _summary_source_ids(row["summary_of"], row["metadata_json"])
+                for row in tier_rows
+            }
             # A/B toggle: `MNEMOSYNE_VERACITY_MULTIPLIER=0` short-circuits
             # the multiplier so ranking depends on hybrid score alone.
             # Useful for Phase 0/1 ablation in the BEAM-recovery
@@ -11395,7 +11458,7 @@ class BeamMemory:
         # duplicates before top-K truncation and recall_count attribution.
         # Post-E3 additive sleep leaves originals alongside summaries, so
         # a query matching both compounds recall_count twice per fact.
-        # Pass the precomputed summary_of map from the tier-lookup
+        # Pass the precomputed source map from the tier-lookup
         # SELECT above so the helper doesn't issue a redundant query.
         results = self._dedup_cross_tier_summary_links(
             results, ep_summary_of_map=ep_summary_of_map
@@ -12074,7 +12137,7 @@ class BeamMemory:
         self,
         results: List[Dict],
         *,
-        ep_summary_of_map: Optional[Dict[str, str]] = None,
+        ep_summary_of_map: Optional[Dict[str, Tuple[str, ...]]] = None,
     ) -> List[Dict]:
         """E3.a.3: drop the lower-scored side of any (episodic_summary,
         working_memory_sources) cluster where both surface in the same recall.
@@ -12087,7 +12150,7 @@ class BeamMemory:
         logical fact -- the row's history boost double-counts on every call.
 
         Dedup rule (per-cluster, not per-edge):
-          - For each episodic row with non-empty `summary_of`, collect the
+          - For each episodic row with source links, collect the
             wm_ids it covers that are also present in `results`.
           - If the ep's score is >= the score of EVERY covered wm in
             results, drop those wms and keep the ep (summary wins the
@@ -12116,14 +12179,14 @@ class BeamMemory:
 
         Args:
             results: scored row dicts; each carries `id`, `tier`, `score`.
-            ep_summary_of_map: optional precomputed `{ep_id: summary_of_str}`
+            ep_summary_of_map: optional precomputed `{ep_id: source_ids}`
                 from a caller that already SELECT-ed `episodic_memory`
                 rows. When provided, skips the helper's own SELECT -- keeps
                 a single source of truth and avoids one round-trip per
                 recall on paths that have already fetched the data.
 
         Caller pattern: linear path passes the tier-lookup SELECT's
-        precomputed `summary_of` rows; polyphonic path lets the helper
+        precomputed source links; the polyphonic path lets the helper
         do its own SELECT since it has no prior per-ep query.
 
         Caveats:
@@ -12152,18 +12215,17 @@ class BeamMemory:
         summary_map: Dict[str, set] = {}
         if ep_summary_of_map is not None:
             for ep_id in ep_ids:
-                raw = ep_summary_of_map.get(ep_id) or ""
-                wm_ids = {s.strip() for s in raw.split(",") if s.strip()}
+                wm_ids = set(ep_summary_of_map.get(ep_id, ()))
                 if wm_ids:
                     summary_map[ep_id] = wm_ids
         else:
             rows = _select_recall_rows_by_ids(
-                self.conn, "SELECT id, summary_of FROM episodic_memory WHERE id IN ({placeholders})",
+                self.conn,
+                "SELECT id, summary_of, metadata_json FROM episodic_memory WHERE id IN ({placeholders})",
                 ep_ids,
             )
             for row in rows:
-                raw = row["summary_of"] or ""
-                wm_ids = {s.strip() for s in raw.split(",") if s.strip()}
+                wm_ids = set(_summary_source_ids(row["summary_of"], row["metadata_json"]))
                 if wm_ids:
                     summary_map[row["id"]] = wm_ids
 
@@ -13337,7 +13399,7 @@ class BeamMemory:
         writes the episodic summary. A process crash in that narrow window can
         leave rows permanently skipped by later sleep() runs. This maintenance
         helper finds old claims whose id does not appear in any
-        ``episodic_memory.summary_of`` CSV token written at or after the claim
+        episodic source link written at or after the claim
         and clears the marker so a later sleep pass can summarize them. A
         summary of an EARLIER claim of the same row does not count as
         completion.

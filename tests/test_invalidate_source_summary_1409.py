@@ -228,11 +228,11 @@ def test_rejects_own_episodic_summary_as_replacement(memory, repeated):
     assert memory.invalidate(old, replacement_id=independent)
     stamp, successor = _state(memory, "working_memory", old)
     assert stamp is not None and successor == independent
-    assert _state(memory, "episodic_memory", dependent) == (stamp, None)
+    assert _state(memory, "episodic_memory", dependent) == ((None, None) if repeated else (stamp, None))
     assert _state(memory, "episodic_memory", independent) == (None, None)
 
 
-def test_preserves_source_order_and_retires_legacy_repeated_sole_source(memory):
+def test_preserves_source_order_and_leaves_ambiguous_legacy_provenance(memory):
     old = memory.remember(WORKING, source="note", memory_id="atlas")
     other = memory.remember("Badge pickup is at the Saffron Atrium.", source="note", memory_id="atlas-north")
     single = _episode(memory, SUMMARY, old, old)
@@ -255,7 +255,7 @@ def test_preserves_source_order_and_retires_legacy_repeated_sole_source(memory):
     stamp, _ = _state(memory, "working_memory", old)
     assert stamp is not None
     assert _state(memory, "episodic_memory", single) == (stamp, None)
-    assert _state(memory, "episodic_memory", legacy) == (stamp, None)
+    assert _state(memory, "episodic_memory", legacy) == (None, None)
     assert _state(memory, "episodic_memory", mixed) == (None, None)
     assert _state(memory, "episodic_memory", prefix) == (None, None)
 
@@ -346,3 +346,102 @@ def test_enhanced_cache_drops_summary_from_concurrent_reader(
 
     fresh = BeamMemory(session_id=memory.session_id, db_path=memory.db_path)
     assert summary not in hits(fresh)
+
+
+@pytest.mark.parametrize("target", ["atlas,atlas", "atlas"], ids=["actual-source", "other-id"])
+def test_summary_with_comma_bearing_source_expires_only_for_that_source(memory, target):
+    old = memory.remember(WORKING, source="note", memory_id="atlas,atlas")
+    other = memory.remember("Atlas garden contact is the groundskeeper.", source="note", memory_id="atlas")
+    assert (old, other) == ("atlas,atlas", "atlas")
+    summary = _episode(memory, SUMMARY, old, old)
+    mixed = _episode(memory, "Atlas office and garden contacts.", old, other)
+
+    assert memory.invalidate(target)
+
+    stamp, _ = _state(memory, "working_memory", target)
+    assert stamp is not None
+    assert _state(memory, "episodic_memory", summary) == ((stamp, None) if target == old else (None, None))
+    assert _state(memory, "episodic_memory", mixed) == (None, None)
+
+
+def test_ambiguous_legacy_summary_stays_active_after_other_possible_source_is_pruned(memory):
+    regular = memory.remember(WORKING, source="note", memory_id="atlas")
+    compound = memory.remember("Atlas office is beside the river.", source="note", memory_id="atlas,atlas")
+    legacy = _episode(memory, SUMMARY)
+    memory.conn.execute(
+        "UPDATE episodic_memory SET summary_of=? WHERE id=?", ("atlas,atlas", legacy),
+    )
+    memory.conn.execute("DELETE FROM working_memory WHERE id=?", (compound,))
+    memory.conn.commit()
+
+    assert not memory.invalidate(regular, replacement_id=legacy)
+    assert memory.invalidate(regular)
+    assert _state(memory, "episodic_memory", legacy) == (None, None)
+
+
+def test_dedup_uses_exact_sources_for_new_comma_id_summary(memory):
+    old = memory.remember(WORKING, source="note", memory_id="atlas,atlas")
+    other = memory.remember("Atlas garden contact is the groundskeeper.", source="note", memory_id="atlas")
+    summary = _episode(memory, SUMMARY, old)
+    results = [
+        {"id": summary, "tier": "episodic", "score": 1.0},
+        {"id": old, "tier": "working", "score": 0.5},
+        {"id": other, "tier": "working", "score": 0.5},
+    ]
+
+    hits = memory._dedup_cross_tier_summary_links(results)
+
+    assert {row["id"] for row in hits} == {summary, other}
+
+
+def test_export_import_preserves_exact_comma_id_provenance(memory, tmp_path):
+    old = memory.remember(WORKING, source="note", memory_id="atlas,atlas")
+    assert old == "atlas,atlas"
+    summary = _episode(memory, SUMMARY, old)
+    exported = memory.export_to_dict()
+    restored = BeamMemory(session_id=memory.session_id, db_path=tmp_path / "restored" / "memory.db")
+    restored.import_from_dict(exported)
+
+    assert restored.invalidate(old)
+    stamp, _ = _state(restored, "working_memory", old)
+    assert stamp is not None
+    assert _state(restored, "episodic_memory", summary) == (stamp, None)
+
+
+def test_reclaim_keeps_completed_comma_id_claim_and_releases_unrelated_claim(memory):
+    old = memory.remember(WORKING, source="note", memory_id="atlas,atlas")
+    other = memory.remember("Atlas garden contact is the groundskeeper.", source="note", memory_id="atlas")
+    stamp = "2000-01-01T00:00:00"
+    memory.conn.executemany(
+        "UPDATE working_memory SET consolidated_at=?, consolidation_claimed_at=? WHERE id=?",
+        [(stamp, stamp, ident) for ident in (old, other)],
+    )
+    memory.conn.commit()
+    _episode(memory, SUMMARY, old)
+
+    result = memory.reclaim_orphans(stale_after_seconds=1)
+
+    assert result["candidate_ids"] == [other]
+    assert result["reclaimed"] == 1
+    claims = dict(memory.conn.execute("SELECT id, consolidation_claimed_at FROM working_memory"))
+    assert claims == {old: stamp, other: None}
+
+
+def test_comma_id_summary_is_not_a_valid_replacement_for_its_source(memory):
+    old = memory.remember(WORKING, source="note", memory_id="atlas,atlas")
+    dependent = _episode(memory, SUMMARY, old)
+
+    assert not memory.invalidate(old, replacement_id=dependent)
+    assert _state(memory, "working_memory", old) == (None, None)
+    assert _state(memory, "episodic_memory", dependent) == (None, None)
+
+
+def test_new_mixed_replacement_is_distinct_from_a_comma_bearing_source(memory):
+    old = memory.remember(WORKING, source="note", memory_id="atlas,north")
+    first = memory.remember("The Atlas garden contact is the groundskeeper.", memory_id="atlas")
+    second = memory.remember("The North garden access code was rotated.", memory_id="north")
+    independent = _episode(memory, "Separate garden contacts for Atlas and North.", first, second)
+
+    assert memory.invalidate(old, replacement_id=independent)
+    assert _state(memory, "working_memory", old)[1] == independent
+    assert _state(memory, "episodic_memory", independent) == (None, None)
