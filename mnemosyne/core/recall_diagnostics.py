@@ -34,7 +34,7 @@ import logging
 import threading
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Collection, Dict, List, Optional
 
 
 logger = logging.getLogger(__name__)
@@ -103,13 +103,21 @@ class RecallExplainTrace:
             return "em_fallback"
         return str(tier)
 
-    def add_ranked_candidates(self, ranked_results: List[Dict[str, Any]], final_results: List[Dict[str, Any]], *, preview_chars: int = 120, max_candidates: int = 50) -> None:
+    def add_ranked_candidates(
+        self,
+        ranked_results: List[Dict[str, Any]],
+        final_results: List[Dict[str, Any]],
+        *,
+        preview_chars: int = 120,
+        max_candidates: int = 50,
+        wm_dense_candidate_ids: Optional[Collection[str]] = None,
+    ) -> None:
         final_ids = {r.get("id") for r in final_results}
         self.truncated_count = max(0, len(ranked_results) - len(final_results))
         for rank, result in enumerate(ranked_results[:max_candidates], start=1):
             kept = result.get("id") in final_ids
             content = str(result.get("content") or "")
-            self.candidates.append({
+            candidate = {
                 "id": result.get("id") if kept else None,
                 "tier": result.get("tier"),
                 "source_path": self._source_path(result),
@@ -125,7 +133,12 @@ class RecallExplainTrace:
                     "final": result.get("score", 0.0),
                 },
                 "content_preview": content[:preview_chars] if kept else None,
-            })
+            }
+            # Membership in the scored WM dense pool before fusion, even if
+            # the corresponding public similarity rounds to zero.
+            if wm_dense_candidate_ids is not None and result.get("tier") == "working":
+                candidate["dense_candidate"] = result.get("id") in wm_dense_candidate_ids
+            self.candidates.append(candidate)
 
     def to_dict(self) -> Dict[str, Any]:
         return {

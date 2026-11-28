@@ -142,6 +142,11 @@ dropped:
 
 `after_filter_count` ≫ `kept_count` means the gate culled, **not** that the data is missing.
 
+For linear recall, `explain.candidates[].dense_candidate` reports whether a working-memory
+row was in the scored dense pool before fusion. A row can have `dense_candidate: true` and
+`scores.dense: 0.0` if its similarity is zero or rounds to zero. The field is omitted when
+the working-memory dense search does not complete and for candidates from other tiers.
+
 ### Fixing it
 
 | Variable | Default | Effect |
