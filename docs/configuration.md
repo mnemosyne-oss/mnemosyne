@@ -339,7 +339,7 @@ See [Health and repair](cli-reference.md#health-and-repair) for the `reindex` co
 | `MNEMOSYNE_MODEL_CACHE_DIR` | `~/.hermes/mnemosyne/models` | Directory the GGUF model is cached in |
 | `MNEMOSYNE_SLEEP_PROMPT` | *(built-in)* | Optional sleep/consolidation prompt override. Supports `{source}`, `{memories}`, and `{memory_count}` placeholders for language-specific summaries. |
 
-`MNEMOSYNE_LLM_ENABLED=false` disables all LLM-backed consolidation, including Hermes host routing and configured remote endpoints; Mnemosyne then uses its AAAK/no-LLM fallback. The generated [configuration reference](api/configuration.mdx) records the current distinction between this environment gate and the separately declared `config.yaml` key.
+`llm_enabled: false` in `config.yaml` or `MNEMOSYNE_LLM_ENABLED=false` in the environment disables all LLM-backed consolidation, including Hermes host routing, configured remote endpoints and LLM conflict validation; Mnemosyne then uses its AAAK/no-LLM fallback. A `true` in one source does not override a `false` in the other. The generated [configuration reference](api/configuration.mdx) states the same rule under `llm_enabled`.
 
 When the gate is enabled and neither a usable host backend nor a configured remote endpoint succeeds, Mnemosyne falls back to the local GGUF model. The default `MiniCPM5-1B-Q4_K_M.gguf` model is approximately 656 MB and is cached in `~/.hermes/mnemosyne/models`, or in `MNEMOSYNE_MODEL_CACHE_DIR` when that is set. `sleep()` is synchronous, so the first uncached local fallback can block while it downloads the model from Hugging Face. To avoid a download, set `MNEMOSYNE_LLM_ENABLED=false` for AAAK-only consolidation or pre-cache the GGUF model; a cached local fallback does not require network access.
 
@@ -362,7 +362,7 @@ Use a remote model instead of the local MiniCPM5-1B GGUF:
 | `MNEMOSYNE_LLM_EXTRA_BODY` | *(none)* | JSON object merged last into every request body, for provider-specific keys the OpenAI shape has no name for (e.g. `{"thinking":{"type":"disabled"}}` to keep a thinking model from spending the whole `max_tokens` budget on reasoning). Ignored when unset, blank or not a JSON object; `messages`, `model` and `stream` are reserved and dropped from an otherwise valid object. Every rejected case is noted on stderr. Read at module import, so `mnemosyne config set` does not reach it and a change needs a restart. |
 | `MNEMOSYNE_LLM_FALLBACK_EXTRA_BODY` | *(none)* | Same, including the reserved keys and the import-time read, for requests to `MNEMOSYNE_LLM_FALLBACK_MODELS`. |
 
-With `MNEMOSYNE_LLM_ENABLED` enabled, Mnemosyne uses the remote endpoint when no host call was attempted, an explicit or provider-preset-resolved remote base URL is available, and `MNEMOSYNE_FORCE_LOCAL` is not enabled. A retryable failure from the primary model tries each model in `MNEMOSYNE_LLM_FALLBACK_MODELS` in order first; once every remote candidate has failed it falls back to the local GGUF backend, then AAAK encoding. An empty answer (a 2xx with no answer text) is not retried; it ends the remote stage and `last_llm_failure()` keeps the reason for the AAAK WARNING.
+When the global LLM gate is enabled (neither `llm_enabled: false` nor `MNEMOSYNE_LLM_ENABLED=false` is set), Mnemosyne uses the remote endpoint when no host call was attempted, an explicit or provider-preset-resolved remote base URL is available, and `MNEMOSYNE_FORCE_LOCAL` is not enabled. A retryable failure from the primary model tries each model in `MNEMOSYNE_LLM_FALLBACK_MODELS` in order first; once every remote candidate has failed it falls back to the local GGUF backend, then AAAK encoding. An empty answer (a 2xx with no answer text) is not retried; it ends the remote stage and `last_llm_failure()` keeps the reason for the AAAK WARNING.
 
 Works with: llama.cpp server, vLLM, Ollama, LM Studio, or any OpenAI-compatible API.
 
@@ -408,7 +408,7 @@ When the host call fails, the adapter falls back to the local GGUF model rather 
 
 ### Fallback Chain
 
-With `MNEMOSYNE_LLM_ENABLED=true`:
+When the global LLM gate is enabled (neither `llm_enabled: false` nor `MNEMOSYNE_LLM_ENABLED=false` is set):
 
 ```text
 0. Host LLM adapter (if MNEMOSYNE_HOST_LLM_ENABLED=true AND a backend is registered)

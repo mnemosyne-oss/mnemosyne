@@ -88,7 +88,8 @@ def test_llm_conflict_detector_retry_logic(mock_sleep, mock_client_class):
     from mnemosyne.core.llm_conflict_detector import _call_conflict_llm_with_retry
     
     # Force a valid URL
-    with patch("mnemosyne.core.llm_conflict_detector.CONFLICT_LLM_BASE_URL", "https://api.openai.com/v1"):
+    with patch("mnemosyne.core.local_llm.LLM_ENABLED", True), \
+         patch("mnemosyne.core.llm_conflict_detector.CONFLICT_LLM_BASE_URL", "https://api.openai.com/v1"):
         mock_client = MagicMock()
         mock_client.post.side_effect = [
             Exception("Transient Network Error"),
