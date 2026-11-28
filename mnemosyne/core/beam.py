@@ -6869,9 +6869,37 @@ class BeamMemory:
                       veracity, veracity,
                       trust_tier,
                       existing_id, self.session_id))
+                # Mirror scope into metadata_json on the dedup-update path too --
+                # same two-table trap as the INSERT path: the scope column updates
+                # but JSON-based readers would still see a stale $.scope in
+                # metadata. Assignment mirrors the column's COALESCE semantics:
+                # a None scope leaves the mirror untouched.
+                try:
+                    _mrow = cursor.execute(
+                        "SELECT metadata_json FROM working_memory WHERE id = ? AND session_id = ?",
+                        (existing_id, self.session_id)).fetchone()
+                    if _mrow is not None and scope is not None:
+                        try:
+                            _mmeta = json.loads(_mrow[0]) if _mrow[0] else {}
+                        except Exception:
+                            _mmeta = {}
+                        _mmeta["scope"] = scope
+                        cursor.execute(
+                            "UPDATE working_memory SET metadata_json = ? WHERE id = ? AND session_id = ?",
+                            (json.dumps(_mmeta), existing_id, self.session_id))
+                except Exception:
+                    pass
             else:
                 memory_id = memory_id or _generate_id(content)
                 timestamp = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+                # The scope lives in BOTH the dedicated column and metadata_json.
+                # JSON-based readers (curator checks, lr_dump, json_extract(...)) read
+                # scope from metadata_json; without this mirror every scoped write
+                # landed with scope in the column but '{}' in metadata_json -- the
+                # two-table trap. Assignment (not setdefault) keeps the mirror
+                # authoritative even when caller metadata already carries a scope key.
+                _meta = dict(metadata or {})
+                _meta["scope"] = scope
                 cursor = self.conn.cursor()
                 cursor.execute("""
                     INSERT INTO working_memory
@@ -6880,7 +6908,7 @@ class BeamMemory:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO NOTHING
                 """, (memory_id, content, source, timestamp, self.session_id, importance,
-                      json.dumps(metadata or {}), valid_until, scope,
+                      json.dumps(_meta), valid_until, scope,
                       _write_author_id, _write_author_type, self.channel_id, veracity, memory_type, trust_tier))
                 if cursor.rowcount == 0:
                     raise MemoryIdConflictError("Working-memory ID is already in use")
